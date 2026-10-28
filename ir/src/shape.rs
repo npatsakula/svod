@@ -595,6 +595,12 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
             }
         }
 
+        Op::Shuffle(ops::Shuffle { src, mask }) => {
+            let mut shape = src.shape()?.ok_or_else(|| crate::Error::VoidTypeInOp)?.clone();
+            shape[0] = SInt::from(mask.len());
+            Some(shape)
+        }
+
         Op::Unique(_) | Op::LUnique(_) | Op::Noop => None,
 
         // =====================================================================

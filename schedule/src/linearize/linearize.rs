@@ -38,7 +38,7 @@ fn op_value(op: &Op) -> u16 {
         Op::Sink(..) => 13,
         Op::After(..) => 14,
         Op::Group(..) => 15,
-        Op::Stack(..) | Op::VConst(..) => 16,
+        Op::Stack(..) | Op::Shuffle(..) | Op::VConst(..) => 16,
         Op::Tuple(..) => 17,
         Op::GetTuple(..) => 18,
         Op::GetAddr(..) => 19,

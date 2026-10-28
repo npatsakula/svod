@@ -1327,6 +1327,10 @@ impl UOp {
             Op::Stack(..) => {
                 return Self::stack(new_srcs.iter().cloned().collect());
             }
+            Op::Shuffle(ops::Shuffle { mask, .. }) => {
+                assert_eq!(new_srcs.len(), 1);
+                Op::Shuffle(ops::Shuffle { src: src(0), mask: mask.clone() })
+            }
 
             // Symbolic/Define operations
             Op::Bind(..) => {

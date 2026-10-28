@@ -191,6 +191,13 @@ pub enum Op {
     Stack {
         sources: SmallVec<[Arc<UOp>; 4]>,
     },
+    /// A vector of a vector's lanes in `mask` order: lane `i` of the result is
+    /// lane `mask[i]` of `src` — a stack of one value's elements, folded back
+    /// to where they came from.
+    Shuffle {
+        src: Arc<UOp>,
+        mask: SmallVec<[u32; 8]>,
+    },
     VConst {
         values: Vec<ConstValue>,
     },
@@ -400,6 +407,7 @@ impl Op {
 
             // Shaped value and late vector operations
             Self::Stack(ops::Stack { sources }) => sources.iter().collect(),
+            Self::Shuffle(ops::Shuffle { src, .. }) => SmallVec::from_slice(&[src]),
 
             // Symbolic/Define operations
             Self::Bind(ops::Bind { var, value }) => SmallVec::from_slice(&[var, value]),

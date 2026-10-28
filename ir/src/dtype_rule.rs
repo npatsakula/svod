@@ -4,7 +4,7 @@
 //! depends on legacy Svod metadata return `None` until that metadata moves into
 //! the operation itself.
 
-use svod_dtype::DType;
+use svod_dtype::{DType, ScalarDType};
 
 use crate::ops;
 use crate::{BinaryOp, ConstValue, Op, TernaryOp, UOp, UnaryOp};
@@ -127,6 +127,12 @@ pub fn dtype_from_op(op: &Op) -> Option<DType> {
 
         Op::Stack(ops::Stack { sources }) if sources.is_empty() => Some(DType::Void),
         Op::Stack(ops::Stack { sources }) => promote(sources.iter().map(|source| source.dtype())),
+        Op::Shuffle(ops::Shuffle { src, mask })
+            if src.dtype().is_vector() || src.dtype().scalar().is_some_and(|s| s != ScalarDType::Void) =>
+        {
+            Some(DType::Scalar(src.dtype().base()).vec(mask.len()).expect("a lane count"))
+        }
+        Op::Shuffle(..) => None,
 
         Op::DefineVar(..) => None,
         Op::Call(ops::Call { body, .. }) if body.dtype() == DType::Void => Some(DType::Void),

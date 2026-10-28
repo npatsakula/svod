@@ -242,6 +242,7 @@ impl OptimizerWireOp {
             Op::End(..) => Self::End,
             Op::Barrier(ops::Barrier { fence, .. }) => Self::Barrier(*fence),
             Op::Stack(..) => Self::Stack,
+            Op::Shuffle(..) => Self::Stack,
             Op::VConst(ops::VConst { values }) => Self::VConst(values.clone()),
             Op::DefineVar(ops::DefineVar { name, min_val, max_val }) => {
                 Self::DefineVar(name.clone(), *min_val, *max_val)

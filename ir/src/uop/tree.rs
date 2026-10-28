@@ -67,6 +67,7 @@ fn format_node(uop: &Arc<UOp>) -> String {
         }
         Op::Ins(ops::Ins { arg, .. }) => format!("INS({})", arg.opcode),
         Op::Stack(ops::Stack { sources }) => format!("STACK(len={})", sources.len()),
+        Op::Shuffle(ops::Shuffle { mask, .. }) => format!("SHUFFLE(mask={mask:?})"),
         Op::VConst(ops::VConst { values }) => format!("VCONST(len={})", values.len()),
         Op::Reshape(..) => "RESHAPE".to_string(),
         Op::Permute(ops::Permute { axes, .. }) => format!("PERMUTE(axes={axes:?})"),

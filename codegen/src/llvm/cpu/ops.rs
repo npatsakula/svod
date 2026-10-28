@@ -457,6 +457,18 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             Some(())
         }
 
+        Op::Shuffle(ops::Shuffle { src, mask }) => {
+            let vec = lshaped(src);
+            let lanes: Vec<String> = mask.iter().map(|lane| format!("i32 {lane}")).collect();
+            kernel.push(format!(
+                "  {dst} = shufflevector {vec} {}, {vec} poison, <{} x i32> <{}>",
+                ctx.get(src),
+                mask.len(),
+                lanes.join(", ")
+            ));
+            Some(())
+        }
+
         Op::Detach(ops::Detach { src }) => {
             let s = ctx.get(src);
             ctx.alias(uop.id, s.to_string());

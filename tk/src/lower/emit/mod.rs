@@ -152,6 +152,10 @@ struct Emit<'a> {
     scratch: HashMap<ScalarDType, (Arc<UOp>, usize)>,
     /// The lane moves of every shift, flip and deal, by their layouts.
     moves: Moves,
+    /// The value every register slot last held, and the nesting depth it was
+    /// stored at: the fold's window. A region closing drops the slots filled
+    /// inside it, so a value is folded only where its store still reaches.
+    slots: HashMap<(u64, u32), Stored>,
     lane: Arc<UOp>,
     warp: Arc<UOp>,
     tid: Arc<UOp>,
@@ -186,6 +190,13 @@ struct View {
     /// Added to a shared view's offset: a warp's region of the relayout
     /// scratch inside a [`Stmt::Warps`].
     region: Option<Arc<UOp>>,
+}
+
+/// What a register slot last held: the stored value, and the listing depth
+/// (open regions) at which the store listed it.
+struct Stored {
+    value: Arc<UOp>,
+    depth: usize,
 }
 
 /// A register's coordinate in its tile: the part the lane and warp decide,
@@ -263,6 +274,7 @@ impl<'a> Emit<'a> {
             typed: HashMap::new(),
             scratch: HashMap::new(),
             moves: Moves::new(prog.warp_grid.count(), low.device.target.wave),
+            slots: HashMap::new(),
             last: tid.clone(),
             lane,
             warp,
@@ -568,14 +580,57 @@ impl<'a> Emit<'a> {
         }
         let buf = self.reg_buf(v);
         let idx = self.access(&buf, &c32(j as i64), w);
-        self.push(idx.store(val));
+        self.push(idx.store(val.clone()));
+        self.filled(&buf, j, (0..w as usize).map(|e| elem(&val, e, w as usize)));
     }
 
     fn reg_store(&mut self, v: ValId, j: u32, vals: Vec<Arc<UOp>>) {
         let buf = self.reg_buf(v);
+        let depth = self.list.levels.len();
         for (e, val) in vals.into_iter().enumerate() {
             let idx = self.access(&buf, &c32(j as i64 + e as i64), 1);
-            self.push(store_at(&idx, vec![val]));
+            self.push(store_at(&idx, vec![val.clone()]));
+            self.slots.insert((buf.id, j + e as u32), Stored { value: val, depth });
+        }
+    }
+
+    /// Registers `j..j + w` of `v` as one `w`-wide value, where the slots were
+    /// all filled from one visible wide value — the value itself where its
+    /// lanes land in order, else one shuffle of it — else the scalar loads
+    /// stacked. This is the whole of the wide-load fold: an extract chain
+    /// (`elem(load, k)`) stored to the slots and consumed right here folds
+    /// back to the load, so the register buffer is written and never read for
+    /// this consumer; a slot filled any other way (a lane move, a select, a
+    /// re-store) keeps the loads, and SLP stays the backstop under them.
+    fn stacked(&mut self, v: ValId, j: u32, w: u32) -> Arc<UOp> {
+        /// The lane each slot of a fold reads: one shared source and its index.
+        type Lanes = Vec<(Arc<UOp>, u32)>;
+        let buf = self.reg_buf(v);
+        let lanes: Option<Lanes> = (0..w)
+            .map(|e| {
+                let stored = self.slots.get(&(buf.id, j + e))?;
+                let (src, lane) = lane_of(&stored.value)?;
+                Some((src.clone(), lane))
+            })
+            .collect();
+        if let Some(lanes) = lanes
+            && w > 1
+            && lanes.iter().all(|(src, _)| Arc::ptr_eq(src, &lanes[0].0))
+        {
+            let mask: smallvec::SmallVec<[u32; 8]> = lanes.iter().map(|(_, lane)| *lane).collect();
+            // One shuffle a use: the tag keeps two stacks over one source in
+            // sibling regions two nodes, each listed where it is used.
+            let tag = self.next_tag();
+            return UOp::shuffle(lanes[0].0.clone(), mask).rtag(Some(smallvec![tag as usize]));
+        }
+        UOp::stack(self.reg_loads(v, j, w).into_iter().collect())
+    }
+
+    /// Record registers `j..j + w` of `v` as holding `vals`.
+    fn filled(&mut self, buf: &Arc<UOp>, j: u32, vals: impl Iterator<Item = Arc<UOp>>) {
+        let depth = self.list.levels.len();
+        for (e, val) in vals.enumerate() {
+            self.slots.insert((buf.id, j + e as u32), Stored { value: val, depth });
         }
     }
 
@@ -659,6 +714,8 @@ impl<'a> Emit<'a> {
                     merge(self, merges)?;
                     let level = self.guards.pop().expect("the branch just opened");
                     self.list.close();
+                    let open = self.list.levels.len();
+                    self.slots.retain(|_, s| s.depth <= open);
                     // What was listed under the branch is out of reach past it.
                     self.scalars.retain(|_, (l, _)| *l < level);
                     self.row_scalars.retain(|_, (l, _)| *l < level);
@@ -738,6 +795,8 @@ impl<'a> Emit<'a> {
 
     fn close_range(&mut self, range: Arc<UOp>) {
         self.list.close();
+        let open = self.list.levels.len();
+        self.slots.retain(|_, s| s.depth <= open);
         let end = self.last.clone().end(smallvec![range]);
         self.push(end);
     }
@@ -846,6 +905,15 @@ pub(crate) fn die_order(linear: u64, total: u64, dies: u64) -> u64 {
 /// coordinate or a variable in its range.
 pub(crate) fn minimum(x: &Arc<UOp>, y: &Arc<UOp>) -> svod_ir::Result<Arc<UOp>> {
     Ok(x.neg().try_max(&y.neg())?.neg())
+}
+
+/// The lane `u` reads of one vector value, where `u` is an extract of one
+/// (`elem`): the value and the lane's index.
+fn lane_of(u: &Arc<UOp>) -> Option<(&Arc<UOp>, u32)> {
+    let Op::Index(svod_ir::ops::Index { buffer, indices }) = u.op() else { return None };
+    let [index] = indices.as_slice() else { return None };
+    let Op::Const(value) = index.op() else { return None };
+    Some((buffer, u32::try_from(value.0.try_int()?).ok()?))
 }
 
 /// Whether scalar `id` is a multiple of `m` whatever its inputs.

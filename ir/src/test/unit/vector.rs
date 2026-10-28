@@ -142,3 +142,36 @@ fn stack_reconstruction_preserves_hash_cons_identity() {
     assert!(Arc::ptr_eq(&stack, &rebuilt));
     assert!(matches!(rebuilt.op(), Op::Stack(..)));
 }
+
+/// A SHUFFLE is the stack of one vector's lanes: over constants it gathers
+/// exactly what stacking the lanes' INDEX extracts does, in order, permuted
+/// or repeating a lane — the equivalence the emitter's wide-load fold relies
+/// on when it replaces a stack of a load's re-read elements with one shuffle
+/// of the load.
+#[test_case(smallvec![0, 1, 2, 3]; "in order")]
+#[test_case(smallvec![3, 1, 0, 2]; "permuted")]
+#[test_case(smallvec![2, 2, 0]; "repeating a lane")]
+#[test_case(smallvec![1]; "narrower than the source")]
+fn a_shuffle_is_the_stack_of_its_lanes(mask: smallvec::SmallVec<[u32; 8]>) {
+    let vector = UOp::vconst((1..=4).map(|lane| ConstValue::Int(10 * lane)).collect(), DType::Int32);
+    let lane =
+        |at: u32| UOp::index().buffer(vector.clone()).indices(vec![UOp::index_const(i64::from(at))]).call().unwrap();
+    let stacked = UOp::stack(mask.iter().map(|at| lane(*at)).collect());
+    let shuffled = UOp::shuffle(vector.clone(), mask.clone());
+
+    let want: Vec<ConstValue> = mask.iter().map(|at| ConstValue::Int(10 * (at + 1) as i64)).collect();
+    let values = |op: &Arc<UOp>| -> Option<ConstValue> {
+        let Op::Index(ops::Index { buffer, indices }) = op.op() else { return None };
+        let [at] = indices.as_slice() else { return None };
+        let Op::Const(at) = at.op() else { return None };
+        let Op::VConst(ops::VConst { values }) = buffer.op() else { return None };
+        let at = usize::try_from(at.0.try_int()?).ok()?;
+        (Arc::ptr_eq(buffer, &vector)).then(|| values[at])
+    };
+    let stacked: Vec<ConstValue> =
+        sources(&stacked).iter().map(values).collect::<Option<_>>().expect("the stacked lanes extract the vector");
+    assert_eq!(stacked, want);
+    assert_eq!(shuffled.dtype(), DType::Int32.vec(mask.len()).unwrap());
+    let Op::VConst(ops::VConst { values: shuffled }) = shuffled.op() else { panic!("SHUFFLE gathers over constants") };
+    assert_eq!(shuffled, &want);
+}

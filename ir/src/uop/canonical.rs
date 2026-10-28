@@ -654,6 +654,9 @@ fn canonical_arg(node: &Arc<UOp>, ids: &FxHashMap<u64, usize>, verbose: bool) ->
         Op::VConst(ops::VConst { values }) => {
             CanonicalArg::Constants { values: values.iter().copied().map(canonical_const).collect() }
         }
+        Op::Shuffle(ops::Shuffle { mask, .. }) => CanonicalArg::Constants {
+            values: mask.iter().map(|lane| canonical_const(ConstValue::Int(i64::from(*lane)))).collect(),
+        },
         Op::DefineVar(ops::DefineVar { name, min_val, max_val }) => {
             CanonicalArg::DefineVar { name: name.clone(), min: *min_val, max: *max_val }
         }
@@ -785,6 +788,7 @@ fn canonical_op_name(op: &Op) -> String {
             Op::Copy(..) => "COPY",
             Op::MStack(..) => "MSTACK",
             Op::Stack(..) => "STACK",
+            Op::Shuffle(..) => "SHUFFLE",
             Op::Reshape(..) => "RESHAPE",
             Op::Permute(..) => "PERMUTE",
             Op::Expand(..) => "EXPAND",

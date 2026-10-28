@@ -13,6 +13,7 @@ use crate::atoms::{Core, Costs, Device, Target};
 use crate::build::*;
 use crate::ir::*;
 use crate::kernels::Batch;
+use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
 use crate::kernels::rows::{Norm, NormCfg, NormSpec, norm};
 use crate::lower::Lowering;
 use crate::lower::emit::minimum;
@@ -459,5 +460,40 @@ fn the_text_claims_exactly_the_aliasing_tk_knows(target: Target) {
     for line in text.lines().filter(|l| l.contains("load ") || l.contains("store ")) {
         let claim = ["align", "!alias", "dereferenceable"].iter().filter(|meta| line.contains(*meta)).count();
         assert_eq!(claim, 0, "an access claims metadata nowhere justified: {line}");
+    }
+}
+
+/// The wide-load fold at a product's operands: where one wide load fills the
+/// registers an operand stacks — a whole fragment a lane, as RDNA's WMMA
+/// fragments gather — the operand is one shuffle of that load, never the
+/// load's elements torn into the register buffer and read back out a lane at
+/// a time. On sm_86 the fills are pairs (`ldmatrix` words, two-element
+/// runs): several loads a fragment, the closed pattern of one load feeding
+/// one stack does not hold, and the scalar loads stack exactly as they did —
+/// SLP remains the backstop under them.
+#[test_case(amd(AmdArch::Gfx1201, 64); "gfx1201 folds the fragment to its load")]
+#[test_case(crate::atoms::sm86(); "sm_86 keeps its pairs")]
+fn a_products_operand_is_the_load_that_filled_it(target: Target) {
+    let cfg = GemmCfg { tile: [64, 64, 32], stages: 2, warps: [2, 2], unroll: false, core: Core::Warp, crews: 1 };
+    let spec = GemmSpec { m: 128, n: 128, k: 128, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg };
+    let lowered =
+        crate::lower::standalone(gemm::<BF16>(&spec), &Lowering::new(&super::declared(target.clone()))).unwrap();
+    let Op::Program(ops::Program { linear: Some(linear), .. }) = lowered.program.op() else {
+        unreachable!("a lowering emits a linear program")
+    };
+    let (mut folded, mut stacked) = (0, 0);
+    for u in linear.op().sources() {
+        let Op::Wmma(ops::Wmma { a, b, .. }) = u.op() else { continue };
+        for operand in [a, b] {
+            folded += matches!(operand.op(), Op::Shuffle(..)) as usize;
+            stacked += matches!(operand.op(), Op::Stack(..)) as usize;
+        }
+    }
+    let expect = matches!(target.arch, svod_dtype::GpuArch::Amd(_));
+    assert_eq!(folded > 0, expect, "shuffles {folded}, stacks {stacked} on {:?}", target.arch);
+    if !expect {
+        assert!(stacked > 0, "the scalar loads still stack");
+    } else {
+        assert_eq!(stacked, 0, "no operand is stacked out of the register buffer");
     }
 }

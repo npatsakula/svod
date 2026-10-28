@@ -195,8 +195,8 @@ impl Emit<'_> {
                 let cblock = i * rn + j;
                 let mut c = self.reg_load_vec(acc, cblock * rc, rc);
                 for kk in 0..rk {
-                    let xa = UOp::stack(self.reg_loads(a, block_a(i, kk) * ra, ra).into_iter().collect());
-                    let xb = UOp::stack(self.reg_loads(b, block_b(j, kk) * rb, rb).into_iter().collect());
+                    let xa = self.stacked(a, block_a(i, kk) * ra, ra);
+                    let xb = self.stacked(b, block_b(j, kk) * rb, rb);
                     let (x, y) = if swapped { (xb, xa) } else { (xa, xb) };
                     c = UOp::wmma(x, y, c, atom.meta.clone());
                 }
