@@ -1877,6 +1877,12 @@ fn knn_probe() {
                         let [ns] = super::measure([tk::nearest::programs(&planner, DType::Float16, &spec)])[..] else {
                             unreachable!("one candidate")
                         };
+                        // What it timed must also be right: the pick's own
+                        // lists on drawn data, a few rows against a host
+                        // brute force.
+                        if ns.is_some() {
+                            assert_covered(pick, n, m, d, k, metric);
+                        }
                         let rate = ns.map(|ns| (n * m) as f64 / ns as f64);
                         least = least.or(rate.filter(|_| k == 1));
                         let share = rate.zip(least).map_or("-".into(), |(r, l)| format!("{:5.1} %", 100.0 * r / l));
@@ -2745,4 +2751,124 @@ fn a_long_dispatch_stamps_its_duration() {
             "run {run}: the stamps span {span:?} of a {wall:?} dispatch — a stamp landed off the compute"
         );
     }
+}
+
+/// The rows a correctness check walks: the drawn data they score over and
+/// the metric, with the `k` a row keeps and how many rows it checks.
+struct Rows<'a> {
+    d: usize,
+    k: usize,
+    rows: usize,
+    metric: Metric,
+    xs: &'a [f32],
+    cs: &'a [f32],
+}
+
+/// The probe's own assertion: `rows` rows of the pick's lists against a host
+/// brute force over the same drawn data, in parallel. Everything the
+/// reference ranks below the row's returned `k`-th by more than the tie
+/// window must be in the row's list (the f16 kernel's rounding against the
+/// reference's f64 reorders only inside it), every entry the list holds must
+/// score at least as well as its `k`-th, and the list must be sorted. The
+/// rows that failed.
+fn uncovered(rows: Rows<'_>, score: &[f64], index: &[f64]) -> Vec<usize> {
+    use rayon::prelude::*;
+    let (d, k, checked) = (rows.d, rows.k, rows.rows);
+    let (xs, cs, metric) = (rows.xs, rows.cs, rows.metric);
+    let (m, depth) = (cs.len() / d, d);
+    let sq = |v: &[f32]| v.iter().map(|&a| f64::from(a) * f64::from(a)).sum::<f64>();
+    let pair = |i: usize, j: usize| {
+        let (a, b) = (&xs[i * depth..][..depth], &cs[j * depth..][..depth]);
+        let dot: f64 = a.iter().zip(b).map(|(&a, &b)| f64::from(a) * f64::from(b)).sum();
+        match metric {
+            Metric::NegDot => -dot,
+            Metric::ShiftedL2 => sq(b) - 2.0 * dot,
+            Metric::SquaredL2 | Metric::L2 => sq(a) + sq(b) - 2.0 * dot,
+        }
+    };
+    // The f16 kernel's scores sit within this of the reference's own f64 over
+    // the rows as drawn: a pair closer than it at the `k`-th trades places.
+    let tol = 4.0e-3 * depth as f64;
+    (0..checked)
+        .into_par_iter()
+        .filter_map(|i| {
+            let (got, at) = (&index[i * k..][..k], &score[i * k..][..k]);
+            if !at.is_sorted() || at.iter().any(|&s| !s.is_finite()) {
+                return Some(i);
+            }
+            if got.iter().any(|&j| j < 0.0 || j >= m as f64) {
+                return Some(i);
+            }
+            let kth = at[k - 1];
+            let mut row: Vec<(f64, usize)> = (0..m).map(|j| (pair(i, j), j)).collect();
+            row.select_nth_unstable_by(k - 1, |a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            let missing = row[..k].iter().any(|&(s, j)| s < kth - tol && !got.contains(&(j as f64)));
+            let wrong = got.iter().any(|&j| pair(i, j as usize) > kth + tol);
+            (missing || wrong).then_some(i)
+        })
+        .collect()
+}
+
+/// The pick's own lists, asserted: [`uncovered`] of rows of its output
+/// against a host brute force over data drawn as the probe runs it, the
+/// rows a few seconds of host work check.
+fn assert_covered(pick: NearestCfg, n: usize, m: usize, d: usize, k: usize, metric: Metric) {
+    let mut seed = 31;
+    let mut draw = |rows: usize| (0..rows * d).map(|_| super::lcg(&mut seed) as f32).collect::<Vec<_>>();
+    let (xs, cs) = (draw(n), draw(m));
+    let mk =
+        |v: &[f32], rows: usize| Tensor::from_slice(v).try_reshape([rows as isize, d as isize]).unwrap().contiguous();
+    let (x, c) = (mk(&xs, n), mk(&cs, m));
+    let (x, c) = (x.cast(DType::Float16).contiguous(), c.cast(DType::Float16).contiguous());
+    let opts = Nearest { metric, ..Nearest::default() };
+    let (score, index) =
+        crate::ops::nearest::picked(&x, &c, k, opts, None, |_, _, spec| NearestSpec { cfg: pick, ..spec })
+            .expect("the pick runs");
+    let (score, index) = (host(&score), host(&index));
+    let checked = n.min(256).min((1usize << 33) / (m * d).max(1)).max(1);
+    let missed = uncovered(Rows { d, k, rows: checked, metric, xs: &xs, cs: &cs }, &score, &index);
+    assert!(
+        missed.is_empty(),
+        "knn {n}x{m} d{d} {metric:?} k{k}: rows {missed:?} of the pick {pick:?} miss their least"
+    );
+}
+
+/// [`uncovered`] bites: a row's list with one entry traded for a candidate
+/// scoring past the row's `k`-th fails, and an exact one does not.
+#[test]
+fn the_probe_correctness_check_bites() {
+    let (n, m, d, k) = (4usize, 512, 8, 4);
+    let mut seed = 5;
+    let mut draw = |rows: usize| (0..rows * d).map(|_| super::lcg(&mut seed) as f32).collect::<Vec<_>>();
+    let (xs, cs) = (draw(n), draw(m));
+    let metric = Metric::NegDot;
+    let reference = |i: usize| -> Vec<(f64, usize)> {
+        let mut row: Vec<(f64, usize)> = (0..m)
+            .map(|j| {
+                let (a, b) = (&xs[i * d..][..d], &cs[j * d..][..d]);
+                (-a.iter().zip(b).map(|(&a, &b)| f64::from(a) * f64::from(b)).sum::<f64>(), j)
+            })
+            .collect();
+        row.select_nth_unstable_by(k - 1, |a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        row.truncate(k);
+        row.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        row
+    };
+    let (mut score, mut index) = (vec![], vec![]);
+    for i in 0..n {
+        let row = reference(i);
+        score.extend(row.iter().map(|&(s, _)| s));
+        index.extend(row.iter().map(|&(_, j)| j as f64));
+    }
+    assert!(
+        uncovered(Rows { d, k, rows: n, metric, xs: &xs, cs: &cs }, &score, &index).is_empty(),
+        "an exact list passes"
+    );
+    let mut broken = index.clone();
+    broken[0] = (m - 1) as f64;
+    assert_eq!(
+        uncovered(Rows { d, k, rows: n, metric, xs: &xs, cs: &cs }, &score, &broken),
+        vec![0],
+        "a traded entry fails its row"
+    );
 }
