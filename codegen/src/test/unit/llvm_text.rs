@@ -39,6 +39,61 @@ fn llvm_signature_uses_canonical_mixed_param_slot_order() {
     );
 }
 
+/// The alias contract the text claims, and nothing beyond it: every buffer
+/// parameter is `ptr noalias align 32` — each a distinct buffer of the
+/// launch — while the one runtime scalar carries nothing, and no access
+/// carries `align`, `!alias.scope`/`!noalias` or `dereferenceable`. A rolled
+/// loop's accesses are runtime-offset windows of one object, where a static
+/// scope would be unsound across iterations, and per-access `align`
+/// measured byte-identical objects on clang 22 and 23, nvptx and amdgcn
+/// alike (gemm, attention d64/d128, nearest k1/k16/k64, norm; 2026-10-28),
+/// so none is claimed. The buffers of a real program, one line each, are
+/// pinned where the programs are built (`tk`'s `emit` tests).
+#[test]
+fn the_text_claims_exactly_the_aliasing_it_knows() {
+    let buffer = |slot| UOp::param(slot, 1, DType::Float32, None);
+    let at = |slot| UOp::index().buffer(buffer(slot)).indices(vec![slotted_var("row", 3)]).call().unwrap();
+    let add = UOp::new(
+        Op::Binary(BinaryOp::Add, UOp::load().index(at(0)).call(), UOp::load().index(at(2)).call()),
+        DType::Float32,
+    );
+    let sink = UOp::sink(vec![at(1).store(add)]);
+    let linear = UOp::linear(svod_schedule::linearize_with_cfg(sink).into());
+    for (name, rendered) in [
+        ("cpu", render(&linear, Some("cpu_alias")).expect("CPU render")),
+        ("amdgcn", LlvmTextRenderer::amd(AmdArch::Gfx1201).render(&linear, Some("amd_alias")).expect("AMD render")),
+        (
+            "nvptx",
+            LlvmTextRenderer::nvptx(svod_dtype::CudaArch { major: 8, minor: 6 })
+                .render(&linear, Some("nvptx_alias"))
+                .expect("NVPTX render"),
+        ),
+    ] {
+        let define = rendered
+            .code
+            .lines()
+            .find(|l| l.starts_with("define "))
+            .unwrap_or_else(|| panic!("{name}:\n{}", rendered.code));
+        let params = define.split('(').nth(1).and_then(|p| p.split(')').next()).expect("parameters");
+        let mut buffers = 0;
+        for param in params.split(", ") {
+            if param.starts_with("ptr noalias align 32 %data") {
+                buffers += 1;
+            } else {
+                assert_eq!(param, "i32 %data3", "{name}'s runtime scalar alone is bare: {define}");
+            }
+        }
+        assert_eq!(buffers, 3, "{name}: {define}");
+        let accesses: Vec<&str> =
+            rendered.code.lines().filter(|l| l.contains("load ") || l.contains("store ")).collect();
+        assert!(accesses.len() >= 3, "{name} holds no accesses to check:\n{}", rendered.code);
+        for line in accesses {
+            let claimed = ["align", "!alias", "dereferenceable"].iter().filter(|meta| line.contains(*meta)).count();
+            assert_eq!(claimed, 0, "{name} claims metadata nowhere justified: {line}");
+        }
+    }
+}
+
 #[test]
 fn test_simple_add() {
     let idx = UOp::const_(DType::Int32, ConstValue::Int(0));

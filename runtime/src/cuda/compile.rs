@@ -40,7 +40,8 @@ pub(crate) fn compile_ir_to_ptx_with(toolchain: &ClangToolchain, ir: &str, arch:
 
 /// Check PTX text before it reaches the driver JIT, on cached and fresh bytes
 /// alike: a `.version` directive, a `.target` matching `arch`, an `.entry`
-/// named `kernel_name`, and no `.extern .func`. The last one is an LLVM/// intrinsic the NVPTX backend did not recognize (a misspelt `llvm.nvvm.*`
+/// named `kernel_name`, and no `.extern .func`. The last one is an LLVM
+/// intrinsic the NVPTX backend did not recognize (a misspelt `llvm.nvvm.*`
 /// name is silently emitted as an external call) and would only surface as a
 /// `cuModuleLoadDataEx` failure.
 pub(crate) fn validate_ptx(bytes: &[u8], arch: CudaArch, kernel_name: &str) -> crate::Result<()> {

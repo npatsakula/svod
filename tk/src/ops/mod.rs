@@ -190,10 +190,6 @@ pub(crate) fn planner(device: &DeviceSpec) -> Option<Arc<Planner>> {
 /// off (`SVOD_TK_TUNE=0`) nothing is timed: the ranked list's
 /// [`Self::first_clean`] config runs (its verdict kept as a `first` line), and
 /// the device's cost probes still measure once ([`planner`]).
-/// A candidate's least honest ns ([`config::Planner::floor_of`]): the
-/// closure a [`Tuner`] refuses a measurement under.
-type Floor<'a, C> = Option<Box<dyn Fn(&C) -> Option<f64> + 'a>>;
-
 pub(crate) struct Tuner<'a, C, B> {
     store: &'a TuneStore,
     target: &'a Target,
@@ -206,7 +202,7 @@ pub(crate) struct Tuner<'a, C, B> {
     /// The least ns each candidate can honestly take
     /// ([`Planner::floor_of`]): a measurement under it is refused, never a
     /// pick. `None` where the family's problem carries no claim.
-    floor: Floor<'a, C>,
+    floor: Option<Box<tune::Floor<'a, C>>>,
 }
 
 impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> {
@@ -314,7 +310,7 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
         }
         let key = self.keyed(op, if pass == Pass::Screen { " screened" } else { "" }, candidates);
         let bench = &mut self.bench;
-        let floor = self.floor.as_ref().map(|f| &**f as &dyn Fn(&C) -> Option<f64>);
+        let floor = self.floor.as_deref();
         let Some(timed) = self.store.choose(&key, candidates, &self.build, bench, pass, floor) else {
             return untimed();
         };

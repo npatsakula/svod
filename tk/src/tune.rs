@@ -699,7 +699,7 @@ impl TuneStore {
         build: impl Fn(C) -> Candidate,
         bench: &mut Bench<C>,
         pass: Pass,
-        floor: Floor<'_, C>,
+        floor: Option<&Floor<'_, C>>,
     ) -> Option<Arc<[(usize, u64)]>> {
         let keep = bench.lowered.clone();
         let programs = || {
@@ -767,9 +767,10 @@ pub(crate) fn ordered(ns: Vec<Option<u64>>) -> Option<Arc<[(usize, u64)]>> {
     (!ran.is_empty()).then(|| ran.into_iter().map(|(ns, i)| (i, ns)).collect())
 }
 
-/// A candidate's least honest ns: what [`crate::ops::Tuner`] passes
-/// [`TuneStore::choose`] to refuse a measurement under.
-pub(crate) type Floor<'a, C> = Option<&'a dyn Fn(&C) -> Option<f64>>;
+/// A candidate's least honest ns ([`Planner::floor_of`] of its own claim):
+/// the closure a measurement under is refused. [`crate::ops::Tuner`] holds
+/// one boxed, [`TuneStore::choose`] and [`floored`] take it borrowed.
+pub(crate) type Floor<'a, C> = dyn Fn(&C) -> Option<f64> + 'a;
 
 /// [`ordered`]'s pairs less those under their floor: a candidate measuring
 /// below what its own bytes can stream at is a measurement that lied (a stamp
@@ -780,7 +781,7 @@ pub(crate) type Floor<'a, C> = Option<&'a dyn Fn(&C) -> Option<f64>>;
 fn floored<C: std::fmt::Debug>(
     timed: &Arc<[(usize, String, u64)]>,
     candidates: &[C],
-    floor: Floor<'_, C>,
+    floor: Option<&Floor<'_, C>>,
 ) -> Vec<(usize, u64)> {
     let pairs = |kept: &[&(usize, String, u64)]| kept.iter().map(|&&(i, _, ns)| (i, ns)).collect();
     let Some(floor) = floor else { return pairs(&timed.iter().collect::<Vec<_>>()) };

@@ -568,30 +568,6 @@ fn a_floor_above_every_score_picks_the_first_candidate() {
     assert!(score.iter().all(|s| *s == 100.0) && index.iter().all(|i| *i == 0.0), "{score:?} {index:?}");
 }
 
-/// Split into shares, each row's least and first index are the unsplit
-/// ones, bit for bit: exact ties run across every share boundary (each
-/// candidate repeats one of the first three), the last candidate tile is
-/// ragged, under every metric, floors and groups, the rows resident or
-/// streamed, a share per candidate tile at most.
-#[test_case(Metric::SquaredL2, NONE, None; "squared l2")]
-#[test_case(Metric::ShiftedL2, NONE, Some(3); "assignment groups")]
-#[test_case(Metric::L2, BOTH, Some(2); "l2 floors groups")]
-#[test_case(Metric::NegDot, Floors { row: false, col: true }, None; "neg dot col floor")]
-#[test_case(Metric::NegDot, Floors { row: true, col: false }, Some(4); "neg dot row floor groups")]
-fn shares_merge_to_the_unsplit_answer(metric: Metric, floors: Floors, groups: Option<i32>) {
-    let case = Case::draw(70, 230, 24, draw(metric, floors, groups, true, true), 9);
-    for base in [NearestCfg::new(32, 16, 2), NearestCfg::streamed(32, 32, 16, 1)] {
-        let unsplit = case.listed(base, 1);
-        case.check_list("unsplit", 1, &unsplit.0, &unsplit.1, 1e-4, true);
-        for splits in [2, 3, 5, case.m.div_ceil(base.bkv)] {
-            let cfg = NearestCfg { splits, ..base };
-            let split = case.listed(cfg, 1);
-            case.check_list(&format!("{cfg:?}"), 1, &split.0, &split.1, 1e-4, true);
-            assert_eq!(split, unsplit, "{cfg:?}");
-        }
-    }
-}
-
 /// A share whose candidates are all skipped leaves `+∞` at −1, which the
 /// merge passes over: every row's group holds the first `skipped`
 /// candidates, so the first shares hold none of a row's; with every one
@@ -682,11 +658,11 @@ proptest! {
 }
 
 /// Every regime keeps the reference's lists, the shares' bit for bit the
-/// unsplit ones: resident and streamed, split two and five ways and a share
-/// per candidate tile, for every `k` of [`KS`] in bf16 and f16, under every
-/// metric, floors and groups, with exact ties across every trip and share
-/// boundary (each candidate repeats one of the first three, so a list of
-/// more than three holds repeats, in the order of their indices).
+/// unsplit ones: resident and streamed, split two, three and five ways and
+/// a share per candidate tile, for every `k` of [`KS`] in bf16 and f16,
+/// under every metric, floors and groups, with exact ties across every trip
+/// and share boundary (each candidate repeats one of the first three, so a
+/// list of more than three holds repeats, in the order of their indices).
 #[test_case(Metric::SquaredL2, NONE, None; "squared l2")]
 #[test_case(Metric::ShiftedL2, NONE, Some(3); "assignment groups")]
 #[test_case(Metric::L2, BOTH, Some(2); "l2 floors groups")]
@@ -699,7 +675,7 @@ fn lists_match_in_every_regime(metric: Metric, floors: Floors, groups: Option<i3
             for base in [NearestCfg::new(32, 16, 2), NearestCfg::streamed(32, 32, 16, 1)] {
                 let unsplit = case.listed(base, k);
                 case.check_list(&format!("{base:?} k{k}"), k, &unsplit.0, &unsplit.1, 1e-4, true);
-                for splits in [2, 5, case.m.div_ceil(base.bkv)] {
+                for splits in [2, 3, 5, case.m.div_ceil(base.bkv)] {
                     let cfg = NearestCfg { splits, ..base };
                     let split = case.listed(cfg, k);
                     case.check_list(&format!("{cfg:?} k{k}"), k, &split.0, &split.1, 1e-4, true);
@@ -1234,18 +1210,21 @@ fn the_trips_that_lower_a_row_list_its_least(order: Order) {
     }
 }
 
-/// Every lane queue width and depth lists exactly where every candidate
+/// The lane queue's sharing boundaries list exactly where every candidate
 /// lowers its row's `k`-th (falling scores: every score is pushed, queues
 /// fill and passes stop many times a trip), where every candidate ties
 /// (the vote's index decides), and on random scores with groups: in
-/// registers and queued into the outputs, in rounds and in passes.
+/// registers and queued into the outputs, in rounds and in passes. The
+/// widths and depths that bracket the sharing are {2, 8}; a queue's
+/// register arithmetic is pinned analytically by ops_plan's
+/// `a_list_costs_its_registers_and_merges`.
 #[test_case(Order::Falling; "every candidate lower")]
 #[test_case(Order::Flat; "every candidate alike")]
 fn every_lane_queue_lists_its_least(order: Order) {
     let falling = ordered(40, 230, 16, order);
     let random = Case::draw(40, 230, 16, draw(Metric::SquaredL2, NONE, Some(3), true, true), 11);
-    for width in [2, 4, 8, 16] {
-        for (depth, passes) in [1, 2, 4, 8].into_iter().flat_map(|d| [(d, false), (d, true)]) {
+    for width in [2, 8] {
+        for (depth, passes) in [2, 8].into_iter().flat_map(|d| [(d, false), (d, true)]) {
             let lanes = Some(LaneQueue { width, depth, passes });
             let cfgs = [(NearestCfg::new(32, 16, 2), [3, 16, 64]), (NearestCfg::new(16, 64, 1), [1, 5, 33])];
             for (cfg, ks) in cfgs.into_iter().filter(|(c, _)| c.bkv.is_multiple_of(width)) {

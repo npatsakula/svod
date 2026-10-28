@@ -1000,15 +1000,41 @@ fn a_stream_runs_width_jobs_at_once_in_order() {
     assert!(panicked.is_err(), "the job's panic reached the caller");
 }
 
+/// The rates the vendored floor store prices a floor at: gfx1151's cache
+/// ladder and DRAM byte as the Strix Halo's store measured them on
+/// 2026-10-27 (fs a streamed byte at each footprint), every field
+/// [`Planner::floor`] reads.
+const VENDORED_RATES: [(&str, u64); 9] = [
+    ("cached_1m", 10542),
+    ("cached_2m", 12782),
+    ("cached_4m", 21853),
+    ("cached_8m", 30412),
+    ("cached_16m", 35640),
+    ("cached_32m", 38814),
+    ("cached_64m", 144723),
+    ("cached_128m", 166732),
+    ("global_byte", 187054),
+];
+
+/// The choice lines of the vendored floor store, synthesized in the store's
+/// format-6 grammar: gfx1151's k-nearest tuning of 2026-10-28, the one shape
+/// whose readings are known to lie — a 270 ms scores pass whose end stamp
+/// landed off the compute, timed 1.3 ms — three candidates under their
+/// floor beside the honest sample of the same lines.
+const VENDORED_CHOICES: [&str; 2] = [
+    "choice|nearest|gfx1151-40sm|Float16|256x1048576x768x64|0000000000000001|0000000000000001|0000000000000001 0:128,128,2,0,16,32,1,~,4,2,1,~,~,~ 1297360 1:128,128,2,1,16,32,1,~,4,2,1,~,~,~ 1305240 2:128,128,1,0,16,32,1,~,4,2,1,~,~,~ 296351560",
+    "choice|nearest|gfx1151-40sm|Float16|256x1048576x768x64|0000000000000002|0000000000000001|0000000000000002 1:128,128,2,0,16,32,1,~,4,2,1,~,~,~ 1325040 32:64,32,2,0,16,32,128,~,~,~,~,4,4,1 25261320",
+];
+
 /// Every timed candidate of the stores' choice lines clears its physical
 /// floor ([`Planner::floor_of`] of its own claim): the least ns a kernel can
 /// honestly measure, the bytes it must move at the card's measured rate for
-/// them. The one known reading under it is gfx1151's k-nearest pick of
-/// 2026-10-28 — the 270 ms scores kernel whose end stamp landed off the
-/// compute, its chain timed 1.3 ms — on both lines the shape tuned; every
-/// other candidate of every family and card clears it, the least by half.
-/// The stores are the three cards' probes' and the local one; the test
-/// passes vacuously where none of them is on disk.
+/// them. The store scanned is the vendored one (`VENDORED_RATES` and
+/// `VENDORED_CHOICES`, written to a scratch store as `probe::stored` reads
+/// it), so the check runs anywhere and fails the day the floor stops
+/// flagging the three lied readings; `TK_FLOOR_STORES` (`:`-separated) adds
+/// real stores on machines that hold them, where nothing under its floor may
+/// be anything but the same lie — an honest candidate never refused.
 #[test]
 fn timed_candidates_clear_their_physical_floor() {
     fn dtype_of(name: &str) -> Option<ScalarDType> {
@@ -1115,23 +1141,12 @@ fn timed_candidates_clear_their_physical_floor() {
             _ => None,
         }
     }
-    let home = std::env::var("HOME").unwrap_or_default();
-    let dirs = [
-        format!("{home}/projects/tk-nearest-work/pr2-store-strix"),
-        format!("{home}/projects/tk-nearest-work/pr2-store-rx"),
-        format!("{home}/projects/tk-nearest-work/pr2-store-sm86"),
-        format!("{home}/.cache/svod/tk_tune"),
-    ];
-    let dirs: Vec<String> =
-        std::env::var("TK_FLOOR_STORES").map_or(dirs.to_vec(), |list| list.split(':').map(str::to_string).collect());
-    let mut worst: Vec<(f64, String)> = vec![];
-    for dir in dirs {
-        let path = std::path::PathBuf::from(&dir);
-        let Ok(files) = std::fs::read_dir(&path) else {
-            println!("-- {dir}: absent");
-            continue;
-        };
-        println!("-- {dir}");
+
+    /// Every timed candidate of the choice lines under `dir`, as its ns over
+    /// its floor, fastest liars first.
+    fn scan(dir: &std::path::Path) -> Vec<(f64, String)> {
+        let mut worst: Vec<(f64, String)> = vec![];
+        let Ok(files) = std::fs::read_dir(dir) else { return worst };
         let mut planners: std::collections::HashMap<String, Option<crate::ops::config::Planner>> = Default::default();
         for file in files.flatten() {
             let text = std::fs::read_to_string(file.path()).unwrap_or_default();
@@ -1148,7 +1163,7 @@ fn timed_candidates_clear_their_physical_floor() {
                 };
                 let planner = planners.entry(fields[2].to_string()).or_insert_with(|| {
                     let t = target(fields[2])?;
-                    crate::probe::stored(&path, &t).and_then(|m| crate::ops::config::Planner::measured(t, m))
+                    crate::probe::stored(dir, &t).and_then(|m| crate::ops::config::Planner::measured(t, m))
                 });
                 let Some(planner) = planner else { continue };
                 let Some(pairs) = fields[7].split_once(' ').map(|(_, p)| p) else { continue };
@@ -1163,28 +1178,50 @@ fn timed_candidates_clear_their_physical_floor() {
                 }
             }
         }
+        worst.sort_by(|a, b| a.0.total_cmp(&b.0));
+        worst
     }
-    worst.sort_by(|a, b| a.0.total_cmp(&b.0));
-    println!("candidates: {}", worst.len());
-    if worst.is_empty() {
-        return;
-    }
-    for (ratio, what) in worst.iter().take(24) {
+    let lie = |what: &str| what.contains("gfx1151") && what.contains("nearest [256, 1048576, 768, 64] 128,128,2,");
+
+    let dir = Scratch::new("floor-store");
+    let file = TuneStore::at(Some(dir.to_path_buf())).file("gfx1151-40sm").expect("a rooted store");
+    let lines: Vec<String> = VENDORED_RATES
+        .iter()
+        .map(|&(op, fs)| {
+            format!("value|probe:{op}|gfx1151-40sm|Int32||00000000000000c0|00000000000000aa|00000000000000bb {fs}")
+        })
+        .chain(VENDORED_CHOICES.iter().map(|line| (*line).to_string()))
+        .collect();
+    std::fs::write(file, format!("format {FORMAT}\n{}\n", lines.join("\n"))).expect("a store file");
+
+    let vendored = scan(&dir);
+    println!("vendored candidates: {}", vendored.len());
+    for (ratio, what) in vendored.iter().take(8) {
         println!("{ratio:8.3} {what}");
     }
-
-    let under: Vec<&String> = worst.iter().filter(|&&(ratio, _)| ratio < 1.0).map(|(_, what)| what).collect();
+    assert!(vendored.len() > 3, "the vendored store carries its honest sample: {vendored:?}");
+    let under: Vec<&String> = vendored.iter().filter(|&&(ratio, _)| ratio < 1.0).map(|(_, what)| what).collect();
     assert_eq!(
         under.len(),
         3,
         "under the floor: {under:?}\nthe least above it: {:?}",
-        worst.iter().find(|&&(ratio, _)| ratio >= 1.0)
+        vendored.iter().find(|&&(ratio, _)| ratio >= 1.0)
     );
     for what in under {
-        assert!(
-            what.contains("gfx1151") && what.contains("nearest [256, 1048576, 768, 64] 128,128,2,"),
-            "an honest candidate refused: {what}"
-        );
+        assert!(lie(what), "an honest candidate refused: {what}");
+    }
+
+    if let Ok(list) = std::env::var("TK_FLOOR_STORES") {
+        for store in list.split(':').filter(|s| !s.is_empty()) {
+            let worst = scan(std::path::Path::new(store));
+            println!("-- {store}: {} candidates", worst.len());
+            for (ratio, what) in worst.iter().take(8) {
+                println!("{ratio:8.3} {what}");
+            }
+            for (_, what) in worst.iter().filter(|&&(ratio, _)| ratio < 1.0) {
+                assert!(lie(what), "an honest candidate refused: {what}");
+            }
+        }
     }
 }
 

@@ -422,16 +422,13 @@ fn a_fill_goes_in_whole_chunks_per_thread(rows: usize, cols: usize, fills: bool)
     }
 }
 
-/// The alias contract the LLVM text claims, and nothing beyond it: every
-/// buffer parameter is `ptr noalias align 32` — each `ParamArg` a distinct
-/// buffer of the launch, a view an offset inside its own — while the one
-/// runtime scalar (a bound batch's count) carries nothing, and no access
-/// carries `align` or scoped `!alias.scope`/`!noalias` metadata. The
-/// accesses of a ring's slots are runtime-offset windows of one shared
-/// object, where a static scope would be unsound across a loop's
-/// iterations; per-access `align` measured byte-identical objects on clang
-/// 22 and 23, nvptx and amdgcn alike (gemm, attention d64/d128, nearest
-/// k1/k16/k64, norm; 2026-10-28), so none is claimed.
+/// The alias contract the LLVM text claims on a real program's buffers:
+/// every buffer parameter is `ptr noalias align 32` — each `ParamArg` a
+/// distinct buffer of the launch, a view an offset inside its own — while
+/// the one runtime scalar (a bound batch's count) carries nothing. What no
+/// access may carry beyond that (`align`, `!alias.scope`,
+/// `dereferenceable`) is the renderer's own pin, in codegen's
+/// `the_text_claims_exactly_the_aliasing_it_knows`.
 #[test_case(crate::atoms::sm86(); "sm_86")]
 #[test_case(amd(AmdArch::Gfx1201, 64); "gfx1201")]
 fn the_text_claims_exactly_the_aliasing_tk_knows(target: Target) {
@@ -457,10 +454,6 @@ fn the_text_claims_exactly_the_aliasing_tk_knows(target: Target) {
         }
     }
     assert_eq!(buffers, 6, "x, residual, w, b, out, sum: {define}");
-    for line in text.lines().filter(|l| l.contains("load ") || l.contains("store ")) {
-        let claim = ["align", "!alias", "dereferenceable"].iter().filter(|meta| line.contains(*meta)).count();
-        assert_eq!(claim, 0, "an access claims metadata nowhere justified: {line}");
-    }
 }
 
 /// The wide-load fold at a product's operands: where one wide load fills the
