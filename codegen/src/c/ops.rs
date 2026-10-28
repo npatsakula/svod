@@ -517,6 +517,16 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             Some(())
         }
 
+        Op::Shuffle(ops::Shuffle { src, mask }) => {
+            let s = ctx.get(src).to_string();
+            let lanes: Vec<String> = mask.iter().map(|lane| format!("{s}[{lane}]")).collect();
+            let packed_dtype = uop.dtype().scalar_dtype().vec(mask.len()).expect("a SHUFFLE takes a vector");
+            let out_dtype = c_dtype(&packed_dtype, ctx.dialect);
+            let expr = vector_literal(&out_dtype, &lanes.join(", "), ctx.dialect);
+            ctx.emit_expr_dtype(uop, expr, "shuf", kernel, &packed_dtype, true);
+            Some(())
+        }
+
         Op::CustomI(ops::CustomI { deps, code }) => {
             let args: Vec<String> = deps.iter().map(|dep| ctx.get(dep).to_string()).collect();
             let expr = match format_custom_template_strict(code, &args) {

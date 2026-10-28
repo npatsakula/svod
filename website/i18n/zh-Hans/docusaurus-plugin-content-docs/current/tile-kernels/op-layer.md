@@ -38,15 +38,17 @@ pub fn supported(device: &DeviceSpec) -> bool;
 | `Fallback` | 何时出现 |
 |---|---|
 | `Target` | 张量不在默认设备上，设备没有 tk 内核（`config::has_kernels`：sm_80 以下的 CUDA、Metal、CPU），或其目标未报告 SM 数量 |
-| `Dtype` | 任一操作数为 f32，或操作数没有共享同一种带矩阵核心的 16 位类型。`conv2d`：输出类型既不是输入类型也不是 f32，或残差不是该类型 |
+| `Dtype` | 任一操作数为 f32，或操作数没有共享同一种带矩阵核心的 16 位类型（`nearest` 和 `k_nearest` 也接受 i8 行，每行缩放系数为 1）。`conv2d`：输出类型既不是输入类型也不是 f32，或残差不是该类型 |
 | `Symbolic` | 除绑定的首维之外还有符号维度（对 `linear` 而言，符号化的 `N` 也算） |
 | `Shape` | `linear`：`N` 不是 8 的倍数或没有行。`conv2d`：`groups > 1`、`Cin` 不是 16 的倍数、`Cout` 不是 8 的倍数或输出为空。`attention`：没有适合 `D` 的配置（在 sm_86 上，32、48、64、128 和 256 能规划，40 不能）或存在空维度。`heads`：`D` 不是 16..=256 范围内的 2 的幂。归一化：`D` 不是 256..=2048 范围内的 2 的幂 |
 | `Config` | 没有合适的 tile 配置。对 `linear` 而言，`K` 不是 16 的倍数 |
 
 当追加行比所有配置的键块都宽时，`attention` 也会走计算图。
 
+`ops::chosen()` 以值的形式返回本线程最后一个算子的决策：`Chosen::Kernel { op, family, cfg }` ——内核名（`family`）与其所选配置的 Debug 文本（`cfg`，其中也标明 nearest 选择的路径：得分矩阵、队列、拆分），或 `Chosen::Graph { op, why }`。`k_nearest_reranked` 的记录是关于其搜索的：获胜行的 dtype 及其配置。
+
 :::note[为什么 f32 保留计算图]
-内核只接受 16 位操作数。把 f32 模型向下转换会用大约三位十进制精度换取速度，因此算子层把这个选择留给模型的数据类型。
+内核接受 16 位操作数（最近邻搜索还接受 8 位整数）。把 f32 模型向下转换会用大约三位十进制精度换取速度，因此算子层把这个选择留给模型的数据类型。`k_nearest_reranked` 是保留 f32 数值的例外：它以 8 位或 f16 搜索各行（`Quantized`，携带其 `QuantScheme::Row` 缩放方案；`Rerank`），为每行保留最小的 `k + margin` 个（默认 16），再按原样给出的行以 f32 重新评分。`Rerank::search` 指明搜索所用的行（`Search::Int8`、`Search::Half(f16)`，或 `Search::Auto` 取两者中更快的——谁胜出记录在该算子的 `chosen()` 里）。被搜索排在 `k + margin` 之后的近邻会被遗漏。
 :::
 
 ## 批次变量 {#batch-variables}

@@ -167,6 +167,18 @@ pub mod attribute {
     pub const COMPUTE_CAPABILITY_MINOR: i32 = 76;
     pub const MANAGED_MEMORY: i32 = 83;
     pub const CONCURRENT_MANAGED_ACCESS: i32 = 89;
+    pub const MAX_REGISTERS_PER_BLOCK: i32 = 12;
+    pub const CLOCK_RATE: i32 = 13;
+    pub const MEMORY_CLOCK_RATE: i32 = 36;
+    pub const GLOBAL_MEMORY_BUS_WIDTH: i32 = 37;
+    pub const L2_CACHE_SIZE: i32 = 38;
+    pub const ASYNC_ENGINE_COUNT: i32 = 40;
+    pub const SINGLE_TO_DOUBLE_PRECISION_PERF_RATIO: i32 = 87;
+    pub const MAX_PERSISTING_L2_CACHE_SIZE: i32 = 108;
+    pub const RESERVED_SHARED_MEMORY_PER_BLOCK: i32 = 111;
+    pub const CLUSTER_LAUNCH: i32 = 120;
+    pub const TENSOR_MAP_ACCESS_SUPPORTED: i32 = 127;
+    pub const MULTICAST_SUPPORTED: i32 = 132;
 }
 
 /// `CUfunction_attribute` ids.

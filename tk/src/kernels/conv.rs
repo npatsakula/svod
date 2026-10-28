@@ -3,7 +3,7 @@
 //! and `K = kh·kw·cin` walked tap-major, one pipeline over every tap.
 
 use super::Batch;
-use super::gemm::{Epilogue, GemmCfg, GemmSpec, MergeSpec, mainloop_gemm, split_merge};
+use super::gemm::{Epilogue, GemmCfg, GemmSpec, SplitMergeSpec, mainloop_gemm, split_merge};
 use crate::atoms::Device;
 use crate::build::*;
 use crate::ir::*;
@@ -81,18 +81,18 @@ impl ConvSpec {
     }
 
     /// The merge of a split convolution.
-    pub fn merge(&self) -> MergeSpec {
+    pub fn merge(&self) -> SplitMergeSpec {
         let gemm = self.gemm();
-        MergeSpec { m: gemm.m, n: gemm.n, split: self.split, epilogue: self.epilogue, tile: MERGE_TILE }
+        SplitMergeSpec { m: gemm.m, n: gemm.n, split: self.split, epilogue: self.epilogue, tile: MERGE_TILE }
     }
 
     /// The programs to launch in order with their lowerings: the convolution,
     /// or its partials and their merge.
-    pub fn programs<T: Elem>(&self, device: &Device) -> Vec<(Program, Lowering)> {
+    pub fn programs<T: Half>(&self, device: &Device) -> Vec<(Program, Lowering)> {
         let mut out = vec![(conv::<T>(self), self.cfg.lowering(device))];
         if self.split > 1 {
             let merge = self.merge();
-            out.push((split_merge::<T>(&merge), merge.lowering(device)));
+            out.push((split_merge::<T>(&merge), Lowering::new(device)));
         }
         out
     }
@@ -103,14 +103,14 @@ impl ConvSpec {
 /// `y [batch, ho, wo, cout]`; split, only `x`, `w` and the f32 partials
 /// `[split, batch·ho·wo, cout]`. `cin` must be a multiple of `bk`, so a K
 /// step never straddles two taps.
-pub fn conv<T: Elem>(spec: &ConvSpec) -> Program {
+pub fn conv<T: Half>(spec: &ConvSpec) -> Program {
     let g = spec.geom;
     let gemm = spec.gemm();
     let bk = spec.cfg.tile[2];
     assert!(g.cin.is_multiple_of(bk), "cin is a multiple of bk");
     let images = match spec.batch {
         Batch::Static(n) => n,
-        Batch::Var { .. } => 1,
+        Batch::Var(_) => 1,
     };
     mainloop_gemm::<T, _>("conv", &gemm, images * g.h * g.w * g.cin, spec.split, |_k, x, bb, row0| {
         let base = bb.clone().map_or(Sc::from(0), |b| b * (g.h * g.w * g.cin));

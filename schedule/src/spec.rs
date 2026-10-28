@@ -331,6 +331,20 @@ fn rule_alu() -> SpecRule {
     })
 }
 
+/// A SHUFFLE is a vector of one value's lanes: its source carries the same
+/// element dtype and the result's lane count is the mask's. A memory source
+/// is element-typed in the IR (its access carries the width), so the mask's
+/// range is not checked against the dtype's count.
+fn rule_shuffle() -> SpecRule {
+    Box::new(|u| match u.op() {
+        Op::Shuffle(ops::Shuffle { src, mask }) => Some(ok_if(
+            src.dtype().base() == u.dtype().base() && u.dtype().vcount() == mask.len(),
+            "SHUFFLE must reorder one value's lanes into its own lane count",
+        )),
+        _ => None,
+    })
+}
+
 /// `spec.py:59-62` — STACK is empty/void or a shaped collection of
 /// same-shaped values matching the promoted scalar result dtype.
 fn rule_stack() -> SpecRule {
@@ -545,6 +559,7 @@ fn spec_shared() -> Vec<SpecRule> {
         rule_shared_structural(),
         rule_const(),
         rule_stack(),
+        rule_shuffle(),
         rule_alu(),
         rule_range(),
         rule_index_integer(),

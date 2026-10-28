@@ -7,7 +7,7 @@ use svod_ir::{AxisId, RendererDevice, WmmaMetadata, WmmaUpcastAxes};
 use svod_schedule::optimizer::{Renderer, TensorCore};
 
 use crate::ir::Orient;
-use crate::layout::{self as frag, Dim, Layout};
+use crate::layout::{self as frag, Layout};
 use crate::layouts::{Issue, WarpGrid};
 
 /// Which matrix instruction a config's products issue on.
@@ -40,20 +40,29 @@ pub struct MmaAtom {
 }
 
 impl MmaAtom {
-    pub fn regs(&self, operand: Dim) -> u32 {
-        match operand {
-            Dim::Row => self.a.in_size(Dim::Reg),
-            Dim::Col => self.b.in_size(Dim::Reg),
-            _ => self.c.in_size(Dim::Reg),
-        }
-    }
-}
-
-impl MmaAtom {
     /// Whether the atom can issue [`crate::ir::Orient::Swapped`]: a square
     /// atom, whose `m` and `n` extents are interchangeable.
     pub fn swappable(&self) -> bool {
         self.m == self.n
+    }
+
+    /// The `[m, n]` product over `grid` ([`Self::issue`]) issued the way
+    /// round that spreads a row of its result over the fewest lanes (its
+    /// rows fold across the fewest masks,
+    /// [`crate::layouts::TileLayout::row_fold_masks`]): where a row
+    /// reduction folds cheapest, and where a deal of its rows
+    /// ([`crate::ir::TileOp::Deal`]) into as many columns a lane renames
+    /// registers ([`crate::layouts::TileLayout::dealt`]). Direct unless
+    /// swapped spreads narrower: RDNA and CDNA hold a row in a lane
+    /// swapped and over 16 lanes direct; CUDA's `m16n8k16` cannot swap.
+    pub fn narrow(&self, grid: WarpGrid, m: usize, n: usize, k: usize) -> crate::layouts::Result<(Orient, Issue)> {
+        let direct = self.issue(Orient::Direct, grid, m, n, k)?;
+        if !self.swappable() {
+            return Ok((Orient::Direct, direct));
+        }
+        let swapped = self.issue(Orient::Swapped, grid, m, n, k)?;
+        let sharing = |issue: &Issue| issue.c.row_fold_masks().len();
+        Ok(if sharing(&swapped) < sharing(&direct) { (Orient::Swapped, swapped) } else { (Orient::Direct, direct) })
     }
 }
 
@@ -144,7 +153,7 @@ impl Occupancy {
 }
 
 /// What a target offers the lowering.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Target {
     pub arch: GpuArch,
     pub wave: u32,
@@ -166,6 +175,9 @@ pub struct Target {
     pub smem_bytes: usize,
     /// Streaming multiprocessors (compute units), when the device reports them.
     pub sms: Option<u32>,
+    /// Bytes of device memory, when the device reports them: the share a
+    /// planner's scratch may take scales with it.
+    pub memory_bytes: Option<u64>,
     /// Crews a block's warps may split into, one stream of clusters offset by
     /// a cluster so one crew's products overlap the other's loads: two where
     /// the matrix core runs beside the vector units and a lane's file holds
@@ -209,6 +221,12 @@ impl Fill {
             Fill::Staged => stages.clamp(1, 2),
         }
     }
+
+    /// Whether this fill runs a ring `stages` deep as asked: what a config
+    /// asks of its ring is what the template builds ([`Self::stages`]).
+    pub fn runs(self, stages: usize) -> bool {
+        self.stages(stages) == stages
+    }
 }
 
 /// The semantic syncs ([`crate::ir::Sync`]) that are an instruction on a
@@ -219,10 +237,11 @@ pub struct SyncCaps {
     /// independently, where an AMD wave issues its LDS accesses in order and
     /// waits on their counters.
     pub warp_barrier: bool,
-    /// The machine scheduler hoists a pipeline trip's shared-memory commit
-    /// above its products unless fenced (`Sync::Fence` → `sched_barrier`),
-    /// leaving the block waiting on global memory with no product in
-    /// flight: RDNA4.
+    /// The machine scheduler moves a pipeline trip's global loads below its
+    /// products, or its shared-memory commit above them, unless fenced
+    /// (`Sync::Fence` → `sched_barrier`), leaving the block waiting on global
+    /// memory with no product in flight: RDNA (gfx1151 sank a two-slot
+    /// 128×128×64 GEMM trip's loads to its commit; gfx1201 hoisted a commit).
     pub commit_fence: bool,
     /// A wave's issue priority is settable (`Sync::Prio` → `s_setprio`): AMD.
     pub priority: bool,
@@ -241,6 +260,18 @@ pub enum LaneMove {
     /// `permlanex16` between the two rows of a wave32 (RDNA); a mask past 31
     /// takes [`LaneMove::Permute`].
     Dpp,
+}
+
+impl LaneMove {
+    /// The instructions moving a register from lane `lane ^ mask`: on RDNA a
+    /// DPP `row_xmask` for the bits within a row of 16 and a `permlanex16`
+    /// for the bit across them, one instruction elsewhere.
+    pub fn issues(self, mask: u32) -> u32 {
+        match self {
+            LaneMove::Dpp if mask < 32 => u32::from(mask & 15 != 0) + u32::from(mask & 16 != 0),
+            _ => 1,
+        }
+    }
 }
 
 /// What a device's primitives cost, measured on it by [`crate::probe::costs`]
@@ -266,9 +297,18 @@ pub struct Costs {
     /// The same step issued as part of a warpgroup product
     /// ([`GroupMmaAtom`]), 0 where the target has none.
     pub step_group: f64,
+    /// The same step's 16×16×16 products over 8-bit integers into i32
+    /// ([`Target::geometry_of`]), the SM full of waves; 0 where the target
+    /// has no such core.
+    pub step_i8: f64,
     /// The same step of a wave alone on its SIMD: a dependent chain's
     /// latency, which `step_lone / step` waves a SIMD hide.
     pub step_lone: f64,
+    /// The 8-bit step's chain alone on its SIMD: the waves an 8-bit
+    /// product's chain hides with are `step_lone_i8 / step_i8`, not the
+    /// 16-bit ratio (the chain's latency does not scale with its step's
+    /// throughput). 0 where unmeasured: the 16-bit ratio then stands.
+    pub step_lone_i8: f64,
     /// One score element's softmax vector work (scale, max, exp2, sum).
     pub score: f64,
     /// One pipeline trip's fixed overhead (barrier, ring bubble), unrolled,
@@ -307,25 +347,38 @@ pub struct Costs {
     /// trip ahead as two do ([`Self::latency`]).
     pub latency_one: f64,
     /// One byte streamed into a block from the cache in front of DRAM (L2),
-    /// as `global_byte` from a footprint that stays in it.
+    /// as `global_byte` from a footprint that stays in it: the ladder's
+    /// smallest-footprint rate.
     pub l2_byte: f64,
-    /// That cache's bytes: operands that fit in it come from DRAM once and
-    /// are re-read from it. 0 where unmeasured: every fill byte is then
+    /// That cache's bytes: the most any footprint shows it answering
+    /// ([`crate::probe::held`]). 0 where unmeasured: every fill byte is then
     /// priced at `global_byte`.
     pub l2_bytes: f64,
+    /// The cache ladder itself: `(footprint bytes, ns a streamed byte)` at
+    /// each footprint measured, smallest first, the rungs a probe could not
+    /// measure left out and the rest zero. What a stream over a working set
+    /// of any size costs is read from it ([`Self::rate`]); the two fields
+    /// above are its reduced views.
+    pub ladder: [(usize, f64); LADDER],
 }
+
+/// The footprints a device's cache ladder holds at most
+/// ([`crate::probe`]'s grid).
+pub const LADDER: usize = 9;
 
 impl Costs {
     /// Every field a pair of programs measures, by name, in declaration
     /// order: all but the cache's, which a series of footprints measures.
-    pub fn fields(&mut self) -> [(&'static str, &mut f64); 16] {
+    pub fn fields(&mut self) -> [(&'static str, &mut f64); 18] {
         let Costs {
             smem_byte,
             global_byte,
             scatter,
             step,
             step_group,
+            step_i8,
             step_lone,
+            step_lone_i8,
             score,
             trip,
             trip_rolled,
@@ -338,6 +391,7 @@ impl Costs {
             latency_one,
             l2_byte: _,
             l2_bytes: _,
+            ladder: _,
         } = self;
         [
             ("smem_byte", smem_byte),
@@ -345,7 +399,9 @@ impl Costs {
             ("scatter", scatter),
             ("step", step),
             ("step_group", step_group),
+            ("step_i8", step_i8),
             ("step_lone", step_lone),
+            ("step_lone_i8", step_lone_i8),
             ("score", score),
             ("trip", trip),
             ("trip_rolled", trip_rolled),
@@ -358,9 +414,67 @@ impl Costs {
             ("latency_one", latency_one),
         ]
     }
+
+    /// What a byte of a stream over `unique` distinct bytes costs: the
+    /// ladder's rate at that working set, interpolated on the log of both
+    /// axes between the footprints that bracket it, held at the smallest
+    /// footprint's rate below them all and past the last one decaying with
+    /// the working set — the last rung's answered share of its own footprint
+    /// holds as its bytes' worth of any larger set, nothing new measured
+    /// there. DRAM's rate where no ladder was measured.
+    pub fn rate(&self, unique: f64) -> f64 {
+        let (mut below, mut above) = ((0, 0.0), (0, 0.0));
+        for &(footprint, rate) in &self.ladder {
+            if footprint == 0 || rate <= 0.0 {
+                continue;
+            }
+            if footprint as f64 <= unique {
+                if footprint >= below.0 {
+                    below = (footprint, rate);
+                }
+            } else if above.0 == 0 || footprint < above.0 {
+                above = (footprint, rate);
+            }
+        }
+        let answered = |share: f64| share * self.l2_byte + (1.0 - share) * self.global_byte;
+        let rate = match (below.0, above.0) {
+            (0, 0) => self.global_byte,
+            (0, _) => above.1,
+            (_, 0) => {
+                let span = self.global_byte - self.l2_byte;
+                let share =
+                    if span <= 0.0 { 0.0 } else { (self.global_byte - below.1) / span * below.0 as f64 / unique };
+                answered(share.min(1.0))
+            }
+            _ => {
+                let t = (unique / below.0 as f64).ln() / (above.0 as f64 / below.0 as f64).ln();
+                below.1 * (above.1 / below.1).powf(t)
+            }
+        };
+        rate.clamp(self.l2_byte.min(self.global_byte), self.global_byte)
+    }
 }
 
 impl Target {
+    /// The most instructions a lowered program may emit for this target;
+    /// past it the lowering refuses the program
+    /// ([`crate::lower::Error::TooLarge`]) and the tuner rejects the config
+    /// as one that fails to compile, before the backend's compiler is
+    /// handed it. The largest kernels the planner ranks (nearest lists at
+    /// depth 128, `k` 64–80, 16384² rows) emit 270k on sm_86 (a register
+    /// list of 64 over 8-bit rows, a three-slot ring unrolled; the NVPTX
+    /// backend folds a 211k one to 25k lines of PTX, 236 registers, no
+    /// spill) and 176k on gfx1201 (a queued list of 80 over 8-bit rows,
+    /// unrolled: 4 s of clang), where a queued list whose product the
+    /// inference issued the wide way round emitted 400k, which took clang
+    /// 100 s and 700 MB a config and a pool of them the RX 9070 XT's 60 GB.
+    pub fn most_instructions(&self) -> usize {
+        match self.arch {
+            GpuArch::Amd(_) => 1 << 18,
+            GpuArch::Cuda(_) | GpuArch::Metal(_) => 1 << 19,
+        }
+    }
+
     pub fn for_arch(arch: GpuArch) -> Self {
         match arch {
             GpuArch::Cuda(c) => cuda(c),
@@ -407,6 +521,7 @@ impl Target {
                         target.occupancy.waves = node.max_waves_per_simd;
                     }
                     target.xcds = node.num_xcc.max(1);
+                    target.memory_bytes = (node.memory_bytes > 0).then_some(node.memory_bytes);
                 }
                 return Some(target);
             }
@@ -414,6 +529,9 @@ impl Target {
             DeviceSpec::Cpu | DeviceSpec::WebGpu | DeviceSpec::Disk { .. } => return None,
         };
         let mut target = Self::for_arch(arch);
+        if let DeviceSpec::Cuda { device_id } = spec {
+            target.memory_bytes = reg::resolve_cuda_memory(*device_id).ok().map(|b| b as u64);
+        }
         if let Some(limits) = limits {
             target.smem_bytes = limits.shared_per_block_optin as usize;
             target.sms = Some(limits.sm_count);
@@ -441,12 +559,20 @@ impl Target {
         self.mma.iter().find(|a| a.dtype_in == dtype_in && a.dtype_out == dtype_out)
     }
 
-    /// The warp-level matrix core's geometry: its `m × n × k` and operand
-    /// layouts, which every input dtype's atom shares (16-bit operands only,
-    /// `test::unit::atoms::every_atom_of_a_target_shares_its_geometry`). The
-    /// planner prices it; the lowering issues the dtype's own ([`Self::mma`]).
+    /// The warp-level matrix core's geometry over 16-bit operands: its
+    /// `m × n × k` and operand layouts, which every 16-bit input's atom
+    /// shares (`test::unit::atoms::every_atom_of_a_target_shares_its_geometry`).
+    /// The planner prices it; the lowering issues the dtype's own
+    /// ([`Self::mma`]).
     pub fn geometry(&self) -> Option<&MmaAtom> {
-        self.mma.first()
+        self.mma.iter().find(|a| a.dtype_in.bytes() == 2)
+    }
+
+    /// The warp-level matrix core over `dtype_in` into its accumulator (f32
+    /// for a 16-bit float, i32 for an 8-bit integer): an 8-bit atom is as
+    /// deep as its bytes allow (`k` 32 on NVIDIA and CDNA, 16 on RDNA).
+    pub fn geometry_of(&self, dtype_in: ScalarDType) -> Option<&MmaAtom> {
+        self.mma.iter().find(|a| a.dtype_in == dtype_in)
     }
 
     /// The `[m, n] += [m, k] · [k, n]` product over `grid` on `core`'s
@@ -472,7 +598,9 @@ impl Target {
 fn cuda(c: CudaArch) -> Target {
     let renderer = Renderer::for_cuda_arch(c);
     let waves = if (c.major == 8 && c.minor >= 6) || c.major == 12 { 12 } else { 16 };
-    let mma = mma_atoms(&renderer, (8, 16, 16), [frag::mma_sync_a(), frag::mma_sync_b(), frag::mma_sync_c()]);
+    let mut mma = mma_atoms(&renderer, (8, 16, 16), [frag::mma_sync_a(), frag::mma_sync_b(), frag::mma_sync_c()]);
+    let bytes = [frag::mma_sync_a8(), frag::mma_sync_b8(), frag::mma_sync_c()];
+    mma.extend(int8_atom(renderer.tensor_cores.iter(), renderer.device, (8, 16, 32), bytes));
     Target {
         arch: GpuArch::Cuda(c),
         wave: c.wave_size(),
@@ -484,6 +612,7 @@ fn cuda(c: CudaArch) -> Target {
         dot2_bf16: false,
         smem_bytes: c.max_shared_per_block_optin(),
         sms: None,
+        memory_bytes: None,
         crews: 1,
         xcds: 1,
         occupancy: Occupancy { simds: 4, file: 512, waves, registers: 255, acc_file: 0 },
@@ -509,7 +638,20 @@ fn amd(a: AmdArch) -> Target {
     } else {
         (frag::wmma_gfx11_input(), frag::wmma_gfx11_acc())
     };
-    let layouts = [operand.clone(), operand.transpose(), accumulator];
+    let layouts = [operand.clone(), operand.transpose(), accumulator.clone()];
+    let renderer = Renderer::for_amd_arch(a);
+    let mut mma = mma_atoms(&renderer, (16, 16, 16), layouts.clone());
+    // CDNA's 8-bit core takes eight bytes a lane, twice the 16-bit depth (the
+    // scheduler's table lists it only as fp8, so it is built here); RDNA's
+    // `iu8` takes its 16-bit operands' layouts packed into fewer registers.
+    let int8 = if cdna {
+        let tc = svod_schedule::optimizer::renderer::AMD_CDNA_161632.build(DType::Int8, DType::Int32);
+        let operand = frag::mfma_16x16x32_i8();
+        int8_atom([tc].iter(), renderer.device, (16, 16, 32), [operand.clone(), operand.transpose(), accumulator])
+    } else {
+        int8_atom(renderer.tensor_cores.iter(), renderer.device, (16, 16, 16), layouts)
+    };
+    mma.extend(int8);
     let occupancy = if cdna {
         Occupancy { simds: 4, file: 512, waves: 8, registers: 256, acc_file: 256 }
     } else {
@@ -518,7 +660,7 @@ fn amd(a: AmdArch) -> Target {
     Target {
         arch: GpuArch::Amd(a),
         wave: a.wave_size(),
-        mma: mma_atoms(&Renderer::for_amd_arch(a), (16, 16, 16), layouts),
+        mma,
         group_mma: vec![],
         fill: Fill::Staged,
         ldmatrix: false,
@@ -526,10 +668,11 @@ fn amd(a: AmdArch) -> Target {
         dot2_bf16: !cdna || a == AmdArch::Gfx950,
         smem_bytes: if a == AmdArch::Gfx950 { 160 << 10 } else { 64 << 10 },
         sms: None,
+        memory_bytes: None,
         crews: if cdna { 2 } else { 1 },
         xcds: 1,
         occupancy,
-        sync: SyncCaps { warp_barrier: false, commit_fence: a.is_rdna4(), priority: true },
+        sync: SyncCaps { warp_barrier: false, commit_fence: !cdna, priority: true },
         lane_move: if cdna { LaneMove::Permute } else { LaneMove::Dpp },
         hardware_exp2: true,
     }
@@ -549,6 +692,7 @@ fn metal(f: MetalFamily) -> Target {
         dot2_bf16: false,
         smem_bytes: 32 << 10,
         sms: None,
+        memory_bytes: None,
         crews: 1,
         xcds: 1,
         occupancy: Occupancy { simds: 4, file: 1024, waves: 8, registers: 128, acc_file: 0 },
@@ -598,23 +742,41 @@ fn metadata(tc: &TensorCore, device: RendererDevice) -> WmmaMetadata {
 /// The renderer's 16-bit-in, f32-out tensor cores of shape `dims` (the
 /// scheduler table's `(N, M, K)`), each with the operand layouts `[a, b, c]`
 /// of that shape.
-fn mma_atoms(renderer: &Renderer, dims: (usize, usize, usize), [a, b, c]: [Layout; 3]) -> Vec<MmaAtom> {
+fn mma_atoms(renderer: &Renderer, dims: (usize, usize, usize), layouts: [Layout; 3]) -> Vec<MmaAtom> {
     renderer
         .tensor_cores
         .iter()
         .filter(|tc| tc.dims == dims && is_half(&tc.dtype_in) && tc.dtype_out == DType::Float32)
-        .map(|tc| MmaAtom {
-            m: dims.1 as u32,
-            n: dims.0 as u32,
-            k: dims.2 as u32,
-            a: a.clone(),
-            b: b.clone(),
-            c: c.clone(),
-            dtype_in: tc.dtype_in.scalar().expect("a scalar operand dtype"),
-            dtype_out: ScalarDType::Float32,
-            meta: metadata(tc, renderer.device),
-        })
+        .map(|tc| atom(tc, renderer.device, layouts.clone()))
         .collect()
+}
+
+/// The 8-bit integer core into i32 of shape `dims` among `cores`, if any,
+/// with the operand layouts `[a, b, c]` of its bytes.
+fn int8_atom<'a>(
+    mut cores: impl Iterator<Item = &'a TensorCore>,
+    device: RendererDevice,
+    dims: (usize, usize, usize),
+    layouts: [Layout; 3],
+) -> Option<MmaAtom> {
+    let tc = cores.find(|tc| tc.dims == dims && tc.dtype_in == DType::Int8 && tc.dtype_out == DType::Int32)?;
+    Some(atom(tc, device, layouts))
+}
+
+/// The atom of the tensor core `tc` with the operand layouts `[a, b, c]`.
+fn atom(tc: &TensorCore, device: RendererDevice, [a, b, c]: [Layout; 3]) -> MmaAtom {
+    let scalar = |d: &DType| d.scalar().expect("a scalar operand dtype");
+    MmaAtom {
+        m: tc.dims.1 as u32,
+        n: tc.dims.0 as u32,
+        k: tc.dims.2 as u32,
+        a,
+        b,
+        c,
+        dtype_in: scalar(&tc.dtype_in),
+        dtype_out: scalar(&tc.dtype_out),
+        meta: metadata(tc, device),
+    }
 }
 
 fn is_half(dtype: &DType) -> bool {
@@ -629,7 +791,24 @@ pub struct Device {
     pub costs: Costs,
 }
 
+impl Device {
+    /// Whether a relayout across lanes takes the lane exchange whatever the
+    /// costs: on a target whose matrix atom for `dtype` cannot feed a
+    /// product from its accumulator (RDNA3's probabilities), so that the
+    /// shared memory a kernel declares is its config's alone
+    /// ([`crate::kernels::attention::FaCfg::smem_bytes`]).
+    pub fn pins_exchanges(&self, dtype: ScalarDType) -> bool {
+        self.target.geometry_of(dtype).is_some_and(|atom| !atom.accumulator_feeds(self.target.wave))
+    }
+}
+
 impl Costs {
+    /// The waves a SIMD needs to hide a dependent chain of 16-bit steps,
+    /// one at least; one where nothing measured their lone latency.
+    pub fn hide(&self) -> f64 {
+        if self.step > 0.0 && self.step_lone > 0.0 { (self.step_lone / self.step).max(1.0) } else { 1.0 }
+    }
+
     /// One pipeline trip's fixed overhead over a ring `stages` deep that
     /// `fill` fills, `unroll`ed or not: a ring of one slot pays its barrier
     /// pair, a rolled register-staged ring of two recomputes its slot
@@ -661,7 +840,7 @@ impl Costs {
 /// (about the square) and gfx1201 65, 27, 17, 11 (about the blocks); the
 /// square ranks both cards' configs closer to their measured order than
 /// either card's own exponent.
-pub const TRIP_HIDING: i32 = 2;
+pub(crate) const TRIP_HIDING: i32 = 2;
 
 const fn sm(major: u8, minor: u8) -> GpuArch {
     GpuArch::Cuda(CudaArch { major, minor })

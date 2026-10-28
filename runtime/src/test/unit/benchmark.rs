@@ -148,8 +148,8 @@ fn warm_clock_runs_until_the_time_plateaus_or_the_budget_ends() {
         Some(Duration::from_micros(if runs <= 32 { 300 - 8 * runs } else { 40 }))
     });
     let elapsed = start.elapsed();
-    assert!(elapsed >= Duration::from_millis(50) && elapsed < Duration::from_millis(500), "{elapsed:?}");
-    assert!(runs >= 48, "at least the floor's runs and two flat windows: {runs}");
+    assert!(elapsed >= Duration::from_millis(400) && elapsed < Duration::from_millis(800), "{elapsed:?}");
+    assert!(runs >= 48, "past the cold runs and two flat windows: {runs}");
 
     // Warm from the start: the floor, then out.
     let mut runs = 0;
@@ -160,7 +160,7 @@ fn warm_clock_runs_until_the_time_plateaus_or_the_budget_ends() {
         Some(Duration::from_micros(40))
     });
     let elapsed = start.elapsed();
-    assert!(elapsed >= Duration::from_millis(50) && elapsed < Duration::from_millis(300), "{elapsed:?}");
+    assert!(elapsed >= Duration::from_millis(400) && elapsed < Duration::from_millis(800), "{elapsed:?}");
 }
 
 /// Candidates are timed in turn, round after round, each keeping its minimum;

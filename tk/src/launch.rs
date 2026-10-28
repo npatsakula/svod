@@ -1,5 +1,5 @@
 //! Running a tile program as a lazy graph kernel: placeholders sized at
-//! capacity, the lowered PROGRAM as the call body. The first `Out`/`InOut`
+//! capacity, the lowered PROGRAM as the call body. The first `Out`
 //! parameter is the call's output and every other parameter an input;
 //! results return in `prog.params` order.
 
@@ -47,7 +47,7 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Launch `prog` over `tensors`, one per declared parameter in order; the
-/// first `Out`/`InOut` parameter's tensor is returned as the lazy result.
+/// first `Out` parameter's tensor is returned as the lazy result.
 pub fn graph_launch(prog: Program, lowering: &Lowering, tensors: &[&Tensor]) -> Result<Tensor> {
     let out_at = first_output(&prog);
     Ok(launch_all(prog, lowering, tensors, true)?.swap_remove(out_at))
@@ -61,11 +61,48 @@ pub(crate) fn graph_launch_once(prog: Program, lowering: &Lowering, tensors: &[&
     Ok(launch_all(prog, lowering, tensors, false)?.swap_remove(out_at))
 }
 
-fn first_output(prog: &Program) -> usize {
-    prog.params
-        .iter()
-        .position(|p| matches!(p.kind, ParamKind::Out | ParamKind::InOut))
-        .expect("a program writes something")
+/// [`graph_launch_all`] of `body`, `prog` lowered already for its target
+/// alone ([`lower::standalone`]), kept in no memo: its parameters are
+/// positional in `prog.params` order, so the call binds `tensors` in that
+/// order. Where this device or the tensors' placeholders are not the ones it
+/// was lowered over, `prog` is lowered again for them.
+pub(crate) fn graph_launch_lowered(
+    prog: &Program,
+    lowering: &Lowering,
+    body: Arc<UOp>,
+    tensors: &[&Tensor],
+) -> Result<Vec<Tensor>> {
+    let name = prog.name.clone();
+    snafu::ensure!(
+        tensors.len() == prog.params.len(),
+        AritySnafu { name: name.clone(), want: prog.params.len(), got: tensors.len() }
+    );
+    let standalone = match lowering.device.target.arch {
+        svod_dtype::GpuArch::Cuda(_) => DeviceSpec::Cuda { device_id: 0 },
+        svod_dtype::GpuArch::Amd(_) => DeviceSpec::Amd { device_id: 0 },
+        svod_dtype::GpuArch::Metal(_) => DeviceSpec::Metal { device_id: 0 },
+    };
+    if default_device() != standalone || tensors.is_empty() {
+        return launch_all(prog.clone(), lowering, tensors, false);
+    }
+    let origin = svod_ir::origin::current();
+    let info =
+        CallInfo { name: Some(name.clone()), origin, origins: origin.into_iter().collect(), ..CallInfo::default() };
+    let mut fits = true;
+    let outs = tensors[0].custom_kernel_with(&tensors[1..], info, |ph| {
+        let param =
+            |(i, p): (usize, &crate::ir::Param)| UOp::param(i, p.elems, svod_dtype::DType::Scalar(p.dtype), None);
+        fits = ph.iter().zip(prog.params.iter().enumerate().map(param)).all(|(ph, param)| ph.base() == param);
+        if fits { body.without_origins() } else { UOp::noop() }
+    });
+    if !fits {
+        return launch_all(prog.clone(), lowering, tensors, false);
+    }
+    outs.context(GraphSnafu { name })
+}
+
+pub(crate) fn first_output(prog: &Program) -> usize {
+    prog.params.iter().position(|p| p.kind == ParamKind::Out).expect("a program writes something")
 }
 
 /// [`graph_launch`] returning every parameter's tensor as it is after the

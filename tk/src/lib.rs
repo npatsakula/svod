@@ -16,7 +16,7 @@
 
 pub mod atoms;
 pub mod build;
-pub mod index;
+pub(crate) mod index;
 pub mod interp;
 pub mod ir;
 pub mod isa;
@@ -26,7 +26,9 @@ pub mod layout;
 pub mod layouts;
 pub mod lower;
 pub mod ops;
+pub mod oracle;
 pub mod probe;
+pub mod rank;
 pub mod schedule;
 #[doc(hidden)]
 pub mod sweep;

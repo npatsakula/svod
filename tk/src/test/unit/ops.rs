@@ -10,7 +10,7 @@ use crate::ops::{self as tk, Act, Attn, Cache, Chunk, Conv, KeyMask, Linear, Qkv
 
 /// `test` on a device with tk tables, with tuning off on its thread so it
 /// does not measure every shape it touches (the untuned pick runs).
-fn untuned(test: impl FnOnce()) {
+pub(super) fn untuned(test: impl FnOnce()) {
     if super::device_planner().is_some() {
         crate::tune::scoped(false, test);
     }
@@ -60,7 +60,7 @@ fn rebound(t: &Tensor, batch: usize, row: usize) -> Vec<f32> {
 }
 
 /// The graph kernel named `name` is in `t`'s graph.
-fn assert_kernel(t: &Tensor, name: &str) {
+pub(super) fn assert_kernel(t: &Tensor, name: &str) {
     let calls: Vec<String> = t
         .uop()
         .toposort()
@@ -156,6 +156,24 @@ fn gated_linear_matches_the_graph(act: Act, bias: bool) {
         assert_eq!(y.shape().unwrap().to_vec(), [SInt::Const(m), SInt::Const(n)]);
         assert_kernel(&y, "gemm");
         assert_tensors_close("gated linear", &y, &linear_reference(&x, &w, opts), 2e-2);
+    });
+}
+
+/// An op records what it ran as a value ([`tk::chosen`]): the kernel
+/// family with the pick's config, or why the graph ran instead.
+#[test]
+fn an_op_records_what_it_ran() {
+    untuned(|| {
+        let (x, w) = (rand(&[37, 64], 1, 1.0, DType::BFloat16), rand(&[96, 64], 2, 0.5, DType::BFloat16));
+        tk::linear(&x, &w, Linear::default()).unwrap();
+        let Some(tk::Chosen::Kernel { op, family, cfg }) = tk::chosen() else { panic!("no record") };
+        assert_eq!((op, family), ("linear", "gemm"));
+        assert!(cfg.starts_with("GemmCfg { tile: ["), "the pick's text: {cfg}");
+
+        // f32 keeps the graph, and the record says why.
+        let (x, w) = (rand(&[37, 64], 1, 1.0, DType::Float32), rand(&[96, 64], 2, 0.5, DType::Float32));
+        tk::linear(&x, &w, Linear::default()).unwrap();
+        assert_eq!(tk::chosen(), Some(tk::Chosen::Graph { op: "linear", why: tk::shape::Fallback::Dtype }));
     });
 }
 

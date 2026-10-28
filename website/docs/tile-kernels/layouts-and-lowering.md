@@ -5,11 +5,12 @@ sidebar_label: Layouts and Lowering
 # Layouts and Lowering
 
 `lower::lower(program, &lowering, params, device)` turns a tile program into a Svod program
-whose instruction list is already in order. A `Lowering` holds everything the author did not
-decide: the `Device` (the target and its costs), the `Schedule`, the `WarpGrid` over the block
-tile, whether shared rows are swizzled (`swizzle`), and which matrix instruction the products
-issue on (`core`). Each kernel config builds its own (`GemmCfg::lowering`, `FaCfg::lowering`,
-`NormCfg::lowering`). `lower::standalone(program, &lowering)` lowers for a target with no device
+whose instruction list is already in order. A `Lowering` holds what the program does not say:
+the `Device` (the target and its costs) and which matrix instruction the products issue on
+(`core`): `Lowering::new(&device)` for the warp-level core, `GemmCfg::lowering` and
+`FaCfg::lowering` for their config's. The `WarpGrid` over the block tile (`Kernel::warps`) and
+each ring's schedule (`pipeline`'s `Ring`) are the program's own; shared rows are always
+XOR-swizzled. `lower::standalone(program, &lowering)` lowers for a target with no device
 attached, and `lower::render` returns the LLVM text the backend's compiler would be handed.
 
 | Step | Module | Effect |
@@ -65,6 +66,12 @@ inference reads the operand layouts from the atom that consumes the values.
 | AMD RDNA3 / RDNA4 | WMMA 16×16×16 | `wmma_gfx11_input`, `wmma_gfx11_acc` / `wmma_gfx12` |
 | Apple | simdgroup 8×8×8 (atom only; no kernels) | `simdgroup_8x8` |
 
+Each target with kernels also has an 8-bit integer atom into i32 (`Target::geometry_of(Int8)`):
+`mma.sync` m16n8k32 s8 and CDNA's MFMA 16×16×32 i8 hold the 16-bit fragments' bytes, twice as
+deep (`mma_sync_a8`, `mma_sync_b8`, `mfma_16x16x32_i8`); RDNA's `iu8` WMMA keeps the 16-bit
+layouts at depth 16. Its `m` and `n` are the 16-bit atom's. The planner prices the 16-bit
+geometry (`Target::geometry`) except for a problem over 8-bit rows.
+
 An `atoms::GroupMmaAtom` is a warpgroup instruction: four consecutive warps issue a 64 × n
 product together over operands read from shared memory through descriptors (`B` always, `A`
 unless it is a register tile), the accumulator spread over the group with each warp holding
@@ -80,7 +87,10 @@ attention configs both offer this core on sm_90.
    `WarpGrid` (`MmaAtom::issue`), issued whichever way round (`ir::Orient`) leaves the program
    the least relayout cost under the lowering's `Costs`: `Cᵀ = Bᵀ·Aᵀ` is the same instruction
    with its slots exchanged, so on a square atom an accumulator can be held as the next
-   product's operand at no cost. An author may pin the orientation (`Kernel::mma_oriented`).
+   product's operand at no cost. A product whose result is dealt (`TileOp::Deal`, a list's lane
+   queues) is issued the way round that spreads a row over the fewest lanes (`MmaAtom::narrow`),
+   where a deal renames registers, as the op layer prices it. An author may pin the orientation
+   (`Kernel::mma_oriented`).
 2. **Elementwise ops unify.** Operands and the result of `binary`, `cast`, `where_`, `mul_add`
    and the carried values of a loop share one layout.
 3. **Unconstrained tiles take a natural layout.** At a fixed point, a tile nothing constrains
@@ -98,18 +108,18 @@ attention configs both offer this core on sm_90.
 
 ## Schedule templates
 
-`schedule::Schedule::Uniform { fill, unroll, async_products }`: every warp loads and computes.
-`Schedule::PingPong { crew }`: two crews of `crew` warps over one register-staged slot (CDNA
-GEMM, `GemmCfg::crews == 2`).
+`schedule::expand` runs each `Pipeline` by its `Ring { stages, unroll, crews }` and the
+target's `Fill`. One crew: every warp loads and computes. Two crews: the block's warps as two
+crews a cluster apart over one register-staged slot (CDNA GEMM, `GemmCfg::crews == 2`).
 
-| Fill | Expansion of `pipeline(extent, stages, …)` |
+| Fill | Expansion of `pipeline(extent, ring, …)` |
 |---|---|
 | `Fill::CpAsync`, `stages ≥ 2` | One loop of `extent + stages − 1` iterations. Each iteration waits until at most `stages − 2` copy groups are pending, then barriers and consumes step `i − (stages − 1)`. It then issues step `i`'s `cp.async` copies into the slot freed one iteration earlier and commits them as one group (an empty group past the end keeps the count uniform). |
-| `Fill::CpAsync`, `stages ≥ 3`, `async_products` | The same, with the consume's `wgmma` chains left in flight over the next fill: the slot consumed two trips ago is refilled, and after each consume every thread waits for all but its youngest chain (`Sync::WaitProducts`). |
+| `Fill::CpAsync`, `stages ≥ 3`, warpgroup core, a consume whose products only feed products | The same, with the consume's `wgmma` chains left in flight over the next fill: the slot consumed two trips ago is refilled, and after each consume every thread waits for all but its youngest chain (`Sync::WaitProducts`). |
 | `Fill::CpAsync`, `stages = 1` | Copy, wait, consume, and a barrier before the slot is refilled. |
-| `Fill::Staged`, 2 stages | Three loops over one induction variable: the first trip loads step 0 into registers and stores it to its slot; a steady trip loads step `i` into registers, consumes step `i − 1`, fences, and stores the registers to step `i`'s slot, with no branch in its body; the last trip only consumes. |
+| `Fill::Staged`, 2 stages | Three loops over one induction variable: the first trip loads step 0 into registers and stores it to its slot; a steady trip loads step `i` into registers, fences, consumes step `i − 1`, fences, and stores the registers to step `i`'s slot, with no branch in its body (the fences keep the loads ahead of the products and the commit behind them on RDNA); the last trip only consumes. |
 | `Fill::Staged`, 1 stage | The same three loops over one slot: the store waits behind a barrier for every warp to finish the slot, then barriers again, so a tile twice as deep fits the same shared memory. |
-| `PingPong` | A trip is cut at its products into load clusters and product clusters, a block barrier after each, so one crew's products run from registers at raised issue priority while the other crew loads. |
+| two crews | A trip is cut at its products into load clusters and product clusters, a block barrier after each, so one crew's products run from registers at raised issue priority while the other crew loads. |
 
 `unroll` copies the loop body once per ring slot so slot arithmetic folds to constants; the
 tuner measures both. Async and staged copies belong to the template, which fences them. The
@@ -122,7 +132,7 @@ The emitter lists every statement's instructions in program order inside a pre-l
 program, so Svod's linearizer toposort never runs on a tk kernel. Global accesses past a view's
 bounds are gated: loads read zero and stores are dropped. Shared rows are XOR-swizzled in
 16-byte chunks where the row's chunk count is a power of two (`layouts::Swizzle`). Shared to register loads of 16-bit tiles use `ldmatrix.x4` where the layout
-allows; on RDNA4 global to register loads use `global_load_tr_b128` where the layout is what it
+allows, and of 8-bit ones its untransposed form over 16×32 bytes; on RDNA4 global to register loads use `global_load_tr_b128` where the layout is what it
 leaves. A `Warps` statement runs its body on each warp alone, with its own copies and barriers.
 On AMD an f32 `exp2` is the hardware `v_exp_f32`, which flushes results below 2⁻¹²⁶ to zero.
 Shared memory above 48 KB is one dynamic array on CUDA; candidates are filtered against
@@ -131,7 +141,8 @@ Shared memory above 48 KB is one dynamic array on CUDA; candidates are filtered 
 :::note[Invariants kept by the emitter, not the author]
 Pure values are listed at the loop level their inputs require. Register accesses are scalar.
 Shared and global accesses are `SHRINK` vector accesses. Gated stores sit inside an `If`.
-Carried values move into their `phi` at the end of the block that defines them.
+Carried values move into their `phi` at the end of the block that defines them. A loop whose
+extent may fall below zero runs no trip (the range's end is floored).
 :::
 
 `TK_DUMP_LIST=1` prints the emitted list (see [Testing and Debugging](./testing-and-debugging)).

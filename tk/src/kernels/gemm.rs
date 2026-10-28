@@ -8,9 +8,7 @@ use super::{Act, Batch, batch_offset, bound, konst, load_f32};
 use crate::atoms::{Core, Device};
 use crate::build::*;
 use crate::ir::*;
-use crate::layouts::WarpGrid;
 use crate::lower::Lowering;
-use crate::schedule::Schedule;
 
 /// What runs on the accumulator before the single rounding at the store.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -78,8 +76,6 @@ pub struct GemmCfg {
     pub stages: usize,
     /// `[rows, cols]` of the warp grid over the output tile.
     pub warps: [u32; 2],
-    /// Tile rows walked together so resident blocks share B in L2 (0 = row-major).
-    pub group_m: usize,
     pub unroll: bool,
     pub core: Core,
     /// Crews the warp rows form: 1, every warp loading and computing
@@ -91,12 +87,13 @@ pub struct GemmCfg {
 
 /// The tune store keys by this text: a config on the warp-level core and
 /// one crew prints as it did before the fields existed, so its stored
-/// choices still apply.
+/// choices still apply, and every config walks [`GROUP_ROWS`] as when it
+/// was a field (`group_m`).
 impl fmt::Debug for GemmCfg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut s = f.debug_struct("GemmCfg");
         s.field("tile", &self.tile).field("stages", &self.stages).field("warps", &self.warps);
-        s.field("group_m", &self.group_m).field("unroll", &self.unroll);
+        s.field("group_m", &GROUP_ROWS).field("unroll", &self.unroll);
         if self.core != Core::Warp {
             s.field("core", &self.core);
         }
@@ -107,6 +104,11 @@ impl fmt::Debug for GemmCfg {
     }
 }
 
+/// Search bound: the tile rows the blocks in flight walk together, so
+/// resident blocks share the other operand's lines in L2 (a GEMM's B, a
+/// split nearest kernel's candidate shares); one pick no lattice searches.
+pub(crate) const GROUP_ROWS: usize = 8;
+
 /// The depth of an operand's k-slices under two crews: one matrix-core step,
 /// the k of every atom two crews run on (the planner admits none other), so
 /// a cluster's reads are one product's fragments.
@@ -114,14 +116,12 @@ pub const KSLICE: usize = 16;
 
 impl GemmCfg {
     pub fn lowering(&self, device: &Device) -> Lowering {
-        let grid = WarpGrid { rows: self.warps[0], cols: self.warps[1] };
-        if self.crews == 2 {
-            let schedule = Schedule::PingPong { crew: self.warps[1] };
-            return Lowering { schedule, ..Lowering::uniform(device, false, grid) };
-        }
-        let async_products = self.core == Core::Group && self.stages >= 3;
-        let schedule = Schedule::Uniform { fill: device.target.fill, unroll: self.unroll, async_products };
-        Lowering { core: self.core, schedule, ..Lowering::uniform(device, self.unroll, grid) }
+        Lowering { core: self.core, ..Lowering::new(device) }
+    }
+
+    /// The pipeline's ring.
+    pub fn ring(&self) -> Ring {
+        Ring { stages: self.stages, unroll: self.unroll, crews: self.crews }
     }
 
     /// The k-slices each operand of a slot is held as, one after another:
@@ -132,10 +132,12 @@ impl GemmCfg {
         if self.crews == 2 { self.tile[2] / KSLICE } else { 1 }
     }
 
-    /// Static shared memory of the operand ring, in bytes of a 16-bit type.
-    pub fn smem_bytes(&self, gated: bool) -> usize {
+    /// Static shared memory of the operand ring over elements of `bytes`
+    /// bytes: what [`mainloop`] allocates, a slot of the A tile and of
+    /// each B tile (two gated) per stage.
+    pub fn smem_bytes(&self, gated: bool, bytes: usize) -> usize {
         let [bm, bn, bk] = self.tile;
-        self.stages * (bm + bn * if gated { 2 } else { 1 }) * bk * 2
+        self.stages * (bm + bn * if gated { 2 } else { 1 }) * bk * bytes
     }
 }
 
@@ -153,8 +155,10 @@ pub struct GemmSpec {
 /// Parameters in order: `a [batch·m, k]`, `b [n, k]` (`[2n, k]` gated),
 /// `bias` if any, `residual [batch·m, n]` if any, `c [batch·m, n]`. Rows past
 /// `m` and weight rows past `n` are clamped reads whose results are never
-/// stored; `k` must be a multiple of `bk`.
-pub fn gemm<T: Elem>(spec: &GemmSpec) -> Program {
+/// stored; `k` must be a multiple of `bk`. Over 8-bit integers the i32
+/// accumulator is widened to f32 for the epilogue, which stores f32
+/// (`out_f32`): exact while the sums stay below 2^24.
+pub fn gemm<T: MmaIn>(spec: &GemmSpec) -> Program {
     let GemmSpec { m, k: kk, cfg, .. } = *spec;
     let [bm, _, bk] = cfg.tile;
     mainloop_gemm::<T, _>("gemm", spec, m * kk, 1, |k, a, bb, row0| {
@@ -172,13 +176,14 @@ pub fn gemm<T: Elem>(spec: &GemmSpec) -> Program {
 /// With `split > 1` (a single static batch) grid z splits the reduction:
 /// split `z` walks steps `z·trips/split..`, and the kernel writes its raw f32
 /// accumulator to `c [split, m, n]` for [`split_merge`] to finish.
-pub(crate) fn mainloop_gemm<T: Elem, S: Fn(&mut Kernel, Sc, Sc) -> Gmem<T>>(
+pub(crate) fn mainloop_gemm<T: MmaIn, S: Fn(&mut Kernel, Sc, Sc) -> Gmem<T>>(
     name: &str,
     spec: &GemmSpec,
     a_elems: usize,
     split: usize,
     a: impl FnOnce(&mut Kernel, ParamRef<T>, &Option<Sc>, Sc) -> S,
 ) -> Program {
+    assert!(T::DTYPE.bytes() == 2 || spec.epilogue.out_f32 || split > 1, "an 8-bit product stores f32");
     if split > 1 {
         build::<T, F32, S>(name, spec, a_elems, split, a)
     } else if spec.epilogue.out_f32 {
@@ -188,7 +193,7 @@ pub(crate) fn mainloop_gemm<T: Elem, S: Fn(&mut Kernel, Sc, Sc) -> Gmem<T>>(
     }
 }
 
-fn build<T: Elem, U: Elem, S: Fn(&mut Kernel, Sc, Sc) -> Gmem<T>>(
+fn build<T: MmaIn, U: Elem, S: Fn(&mut Kernel, Sc, Sc) -> Gmem<T>>(
     name: &str,
     spec: &GemmSpec,
     a_elems: usize,
@@ -214,9 +219,9 @@ fn build<T: Elem, U: Elem, S: Fn(&mut Kernel, Sc, Sc) -> Gmem<T>>(
     let (gm, gn) = (m.div_ceil(bm), n.div_ceil(bn));
     let (gz, bb) = if partial { (Sc::from(split), Some(k.block(2))) } else { batch.axis(&mut k) };
     k.grid([Sc::from(gm), Sc::from(gn), gz]);
-    k.warps(cfg.warps[0] * cfg.warps[1]);
+    k.warps(WarpGrid { rows: cfg.warps[0], cols: cfg.warps[1] });
 
-    let (bx, by) = tile_order(&mut k, gm, gn, cfg.group_m);
+    let (bx, by) = tile_order(&mut k, gm, gn);
     let (row0, col0) = (bx * bm, by * bn);
     let n_bound = bound(n, bn);
     let a_tile = a_source(&mut k, a, if partial { &None } else { &bb }, row0.clone());
@@ -224,16 +229,17 @@ fn build<T: Elem, U: Elem, S: Fn(&mut Kernel, Sc, Sc) -> Gmem<T>>(
         let v = k.view(b, half * n * kk, [kk, 1], Shape::new(bn, bk), [n_bound.clone(), None]);
         k.at(v, col0.clone(), 0)
     };
-    let stages = cfg.stages;
+    let ring = cfg.ring();
     let first_step = partial.then(|| bb.clone().expect("the split index") * (trips / split));
     let sa = Shape::new(bm, bk);
     let accs = if epi.gated {
         let halves = [b_view(&mut k, 0), b_view(&mut k, 1)];
-        mainloop(&mut k, sa, &a_tile, halves, trips / split, stages, bk, first_step, cfg.slices()).to_vec()
+        mainloop(&mut k, sa, &a_tile, halves, trips / split, ring, bk, first_step, cfg.slices()).to_vec()
     } else {
         let whole = [b_view(&mut k, 0)];
-        mainloop(&mut k, sa, &a_tile, whole, trips / split, stages, bk, first_step, cfg.slices()).to_vec()
+        mainloop(&mut k, sa, &a_tile, whole, trips / split, ring, bk, first_step, cfg.slices()).to_vec()
     };
+    let accs = accs.into_iter().map(|acc| T::widened(&mut k, acc)).collect();
     let tile = Tile2 { m, n, bm, bn, row0, col0 };
     finish::<T, U>(&mut k, accs, epi, bias, residual, c, &bb, &tile);
     k.finish()
@@ -299,7 +305,7 @@ fn finish<T: Elem, U: Elem>(
 /// The second program of a split reduction: `c = epilogue(Σ_z partial[z])`
 /// over `partial [split, m, n]` f32, `bm × bn` tiles per block.
 #[derive(Clone, Debug, PartialEq)]
-pub struct MergeSpec {
+pub struct SplitMergeSpec {
     pub m: usize,
     pub n: usize,
     pub split: usize,
@@ -308,29 +314,14 @@ pub struct MergeSpec {
     pub tile: [usize; 2],
 }
 
-impl MergeSpec {
-    pub fn lowering(&self, device: &Device) -> Lowering {
-        GemmCfg {
-            tile: [self.tile[0], self.tile[1], 16],
-            stages: 1,
-            warps: [4, 1],
-            group_m: 0,
-            unroll: false,
-            core: Core::Warp,
-            crews: 1,
-        }
-        .lowering(device)
-    }
-}
-
 /// Parameters in order: `partial [split, m, n]` f32, `bias [n]` if any,
 /// `residual [m, n]` if any, `c [m, n]` (f32 when `out_f32`).
-pub fn split_merge<T: Elem>(spec: &MergeSpec) -> Program {
+pub fn split_merge<T: Elem>(spec: &SplitMergeSpec) -> Program {
     if spec.epilogue.out_f32 { merge::<T, F32>(spec) } else { merge::<T, T>(spec) }
 }
 
-fn merge<T: Elem, U: Elem>(spec: &MergeSpec) -> Program {
-    let MergeSpec { m, n, split, epilogue: epi, tile: [bm, bn] } = *spec;
+fn merge<T: Elem, U: Elem>(spec: &SplitMergeSpec) -> Program {
+    let SplitMergeSpec { m, n, split, epilogue: epi, tile: [bm, bn] } = *spec;
     assert!(!epi.gated, "a gated weight is not split");
     let mut k = Kernel::new("split_merge");
     let partial = k.param::<F32>("partial", ParamKind::In, split * m * n);
@@ -352,42 +343,41 @@ fn merge<T: Elem, U: Elem>(spec: &MergeSpec) -> Program {
     k.finish()
 }
 
-/// The `(row, col)` tile of this block, walking groups of `group_m` tile rows.
-fn tile_order(k: &mut Kernel, gm: usize, gn: usize, group_m: usize) -> (Sc, Sc) {
-    if group_m == 0 {
-        return (k.block(0), k.block(1));
-    }
-    let id = k.block(0) + k.block(1) * gm;
-    let first_m = id.clone() / (group_m * gn) * group_m;
-    let rows = (Sc::from(gm) - first_m.clone()).min(group_m);
-    let within = id % (group_m * gn);
+/// The `(row, col)` tile of this block, walking groups of [`GROUP_ROWS`] tile rows.
+pub(super) fn tile_order(k: &mut Kernel, gm: impl Into<Sc>, gn: usize) -> (Sc, Sc) {
+    let gm = gm.into();
+    let id = k.block(0) + k.block(1) * gm.clone();
+    let first_m = id.clone() / (GROUP_ROWS * gn) * GROUP_ROWS;
+    let rows = (gm - first_m.clone()).min(GROUP_ROWS);
+    let within = id % (GROUP_ROWS * gn);
     (first_m + within.clone() % rows.clone(), within / rows)
 }
 
 /// The K-streaming pipeline: the `sa`-shaped A tile `a(step, step·bk)` and
 /// `N` B tiles per step into a `stages`-deep shared ring, each operand of a
-/// slot held as `slices` k-slices ([`GemmCfg::slices`]), one f32
-/// accumulator per B.
+/// slot held as `slices` k-slices ([`GemmCfg::slices`]), one accumulator
+/// per B ([`MmaIn::Acc`]).
 #[allow(clippy::too_many_arguments)]
-fn mainloop<T: Elem, const N: usize>(
+pub(super) fn mainloop<T: MmaIn, const N: usize>(
     k: &mut Kernel,
     sa: Shape,
     a: &impl Fn(&mut Kernel, Sc, Sc) -> Gmem<T>,
     bs: [Gmem<T>; N],
     trips: usize,
-    stages: usize,
+    ring: Ring,
     bk: usize,
     first_step: Option<Sc>,
     slices: usize,
-) -> [Regs<F32>; N] {
+) -> [Regs<T::Acc>; N] {
     let sb = k.shape(bs[0]);
     let (sa_s, sb_s) = (Shape::new(sa.rows, bk / slices), Shape::new(sb.rows, bk / slices));
+    let stages = ring.stages;
     let a_s = k.smem::<T>("a_s", stages * sa.elems());
     let b_s = [(); N].map(|()| k.smem::<T>("b_s", stages * sb.elems()));
-    let init = [(); N].map(|()| k.zeros::<F32>(Shape::new(sa.rows, sb.rows)));
+    let init = [(); N].map(|()| k.zeros::<T::Acc>(Shape::new(sa.rows, sb.rows)));
     k.pipeline(
         trips,
-        stages,
+        ring,
         init,
         |k, step, slot| {
             let step = first_step.map_or(step.clone(), |s| s + step);

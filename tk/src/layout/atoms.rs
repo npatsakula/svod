@@ -28,6 +28,26 @@ pub fn mma_sync_b() -> Layout {
     )
 }
 
+/// A 16-bit fragment read as bytes: each element two 8-bit ones side by side
+/// along `dim`, the low bit a register's. An 8-bit operand whose lanes hold
+/// the bytes of the 16-bit one's registers is the 16-bit layout so, twice as
+/// deep (NVIDIA's `m16n8k32` s8 and CDNA's `16x16x32` i8 fragments).
+pub fn bytes(l: &Layout, dim: super::Dim) -> Layout {
+    Layout::identity(Reg, 2, dim).product(l)
+}
+
+/// PTX `mma.m16n8k32` s8 A fragment (16×32, M×K): [`mma_sync_a`] in bytes,
+/// `row = g + 8·((j/4)%2), col = 4t + j%4 + 16·(j/8)`.
+pub fn mma_sync_a8() -> Layout {
+    bytes(&mma_sync_a(), Col)
+}
+
+/// PTX `mma.m16n8k32` s8 B fragment (32×8, K×N): [`mma_sync_b`] in bytes,
+/// `k = 4t + b%4 + 16·(b/4), n = g`.
+pub fn mma_sync_b8() -> Layout {
+    bytes(&mma_sync_b(), Row)
+}
+
 /// PTX `mma.m16n8k16` C/D fragment (16×8, M×N): `row = g + 8·(c/2), col = 2t + c%2`.
 pub fn mma_sync_c() -> Layout {
     Layout::from_bases(
@@ -64,9 +84,18 @@ pub fn ldmatrix_x4(trans: bool) -> Layout {
     m8.product(&Layout::from_bases([(Row, 2), (Col, 2)], &[(Reg, words)]))
 }
 
+/// The bytes one plain `ldmatrix.x4` fills over a 16×32 tile of 8-bit
+/// elements: [`ldmatrix_x4`]`(false)` in bytes, each lane's 32-bit register
+/// four consecutive bytes of a row (the hardware moves 16-bit pairs; the
+/// transposing form has no 8-bit counterpart before sm_100).
+pub fn ldmatrix_x4_bytes() -> Layout {
+    bytes(&ldmatrix_x4(false), Col)
+}
+
 /// The `ldmatrix.x4` addressing: lane `L` supplies the 16-byte row `L % 16` at column
 /// `8·(L/16)`, so lanes `8m..8m+8` address matrix `m` = TL, BL, TR, BR.
-pub fn ldmatrix_x4_rows() -> Layout {
+#[cfg(test)]
+pub(crate) fn ldmatrix_x4_rows() -> Layout {
     Layout::from_bases([(Row, 16), (Col, 16)], &[(Lane, &[[1, 0], [2, 0], [4, 0], [8, 0], [0, 8]])])
 }
 
@@ -104,6 +133,13 @@ pub fn strided(stride: u32, lanes: u32) -> Layout {
 /// [`Layout::transpose`].
 pub fn mfma_16x16x16() -> Layout {
     strided(4, 64)
+}
+
+/// CDNA `v_mfma_i32_16x16x32_i8` A operand (16×32, M×K): [`mfma_16x16x16`]
+/// in bytes, `row = L % 16, k = 8·(L/16) + j`; B is its transpose, the
+/// accumulator [`mfma_16x16x16`]'s.
+pub fn mfma_16x16x32_i8() -> Layout {
+    bytes(&mfma_16x16x16(), Col)
 }
 
 /// CDNA `v_mfma_f32_32x32x8_bf16` A operand (32×8, M×K): `row = L % 32, k = 4·(L/32) + j`;

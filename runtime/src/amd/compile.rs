@@ -187,6 +187,36 @@ pub fn has_amdgpu_target() -> bool {
     path_clang_has_target("amdgcn")
 }
 
+/// Assemble hand-written AMDGCN text for `arch`: the assembler's own
+/// accept/reject of an instruction, which is how instruction availability is
+/// probed per target ("instruction not supported on this GPU" names the mcpu
+/// it refuses it for). No kernel is built or run.
+///
+/// # Errors
+///
+/// - [`crate::Error::JitCompilation`] when `clang` is missing or too old (as
+///   [`compile_ir_to_amd_object`]) or the assembler rejects the text for
+///   `arch`.
+pub fn assemble_gcn(asm: &str, arch: AmdArch) -> crate::Result<Vec<u8>> {
+    let toolchain = amd_toolchain(None)?;
+    if !toolchain.has_target("amdgcn") {
+        return Err(crate::Error::JitCompilation {
+            reason: "AMD GPU support requires clang built with the AMDGPU target.".to_string(),
+        });
+    }
+    let flags = [
+        "-x".to_string(),
+        "assembler".to_string(),
+        "-c".to_string(),
+        "--target=amdgcn-amd-amdhsa".to_string(),
+        format!("-mcpu={}", arch.mcpu()),
+        "-o".to_string(),
+        "-".to_string(),
+        "-".to_string(),
+    ];
+    toolchain.compile_ir(&flags, asm, &format!("amdgcn assembly (mcpu={})", arch.mcpu()))
+}
+
 #[cfg(test)]
 #[path = "../test/unit/amd_compile.rs"]
 mod tests;

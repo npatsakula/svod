@@ -58,4 +58,5 @@ A forked kernel program for one vendor is allowed only as a bounded exception.
 | Two-crew ping-pong off CDNA | `Target::crews` is 2 only where the matrix core runs beside the vector units and a lane's file holds two crews' accumulators (CDNA) |
 | Apple | Atoms only; no kernels |
 | Convolution image-staged form, depthwise, grouped | Graph |
-| fp8/int8, attention backward | Not started |
+| int8 | Atoms on every target with kernels (`m16n8k32` s8, RDNA `iu8`, CDNA `16x16x32` i8, into i32); the nearest-neighbour kernel and `k_nearest_reranked` use them, GEMM and attention ops do not |
+| fp8, attention backward | Not started |

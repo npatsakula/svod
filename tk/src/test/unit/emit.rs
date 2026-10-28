@@ -9,10 +9,12 @@ use svod_ir::uop::eval::{eval_binary_op, eval_unary_op};
 use svod_ir::{ConstValue, Op, UOp, ops};
 use test_case::test_case;
 
-use crate::atoms::{Core, Costs, Device};
+use crate::atoms::{Core, Costs, Device, Target};
 use crate::build::*;
 use crate::ir::*;
-use crate::layouts::WarpGrid;
+use crate::kernels::Batch;
+use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
+use crate::kernels::rows::{Norm, NormCfg, NormSpec, norm};
 use crate::lower::Lowering;
 use crate::lower::emit::minimum;
 
@@ -89,7 +91,7 @@ fn a_lowered_float_minimum_adds_nothing(reduced: bool) {
     let out = k.view(y, 0, [out_shape.cols, 1], out_shape, [None, None]);
     k.store(out, m);
     let device = Device { target: crate::atoms::sm86(), costs: Costs::default() };
-    let lowering = Lowering::uniform(&device, false, WarpGrid { rows: 1, cols: 1 });
+    let lowering = Lowering::new(&device);
     let nodes = linear(k.finish(), &lowering).toposort();
     let float = |u: &Arc<UOp>| u.dtype().is_float();
     let sums = nodes
@@ -171,7 +173,7 @@ fn a_guarded_scalar_read_stays_under_its_guard(max: i64, div: i64, guarded: bool
     let out = at(&mut k, 1);
     k.store(out, v);
     let device = Device { target: crate::atoms::sm86(), costs: Costs::default() };
-    let lowering = Lowering::uniform(&device, false, WarpGrid { rows: 1, cols: 1 });
+    let lowering = Lowering::new(&device);
     let linear = linear(k.finish(), &lowering);
     let Op::Linear(ops::Linear { ops: list }) = linear.op() else { panic!("a linear list") };
     let at = |f: &dyn Fn(&Arc<UOp>) -> bool| (0..list.len()).filter(|&i| f(&list[i])).collect::<Vec<_>>();
@@ -188,16 +190,89 @@ fn a_guarded_scalar_read_stays_under_its_guard(max: i64, div: i64, guarded: bool
     }
 }
 
+/// A loop whose extent may fall below zero runs no trip, as the interpreter
+/// runs none: the backend compares a range's counter unsigned, so a negative
+/// end would run billions of trips (a listing's share of steps starting
+/// past the last read 8 GB before its scores on sm_86), and the emitter
+/// floors an extent the bounds let below zero. One the bounds keep at or
+/// above zero is listed as it is: a share's count less one where it is
+/// positive (a register-staged ring's steady trips, `x − [0 < x]`) is
+/// bounded as such, not a step under the count's own low.
+#[test_case(4, false, true; "a share past the last steps")]
+#[test_case(9, false, false; "every share within the steps")]
+#[test_case(9, true, false; "a share's steady trips")]
+fn a_loop_extent_below_zero_runs_no_trip(steps: i64, steady: bool, floored: bool) {
+    let tile = Shape::new(16, 32);
+    let mut k = Kernel::new("shares");
+    k.warps(1);
+    let y = k.param::<F32>("y", ParamKind::Out, 4 * tile.elems());
+    k.grid([Sc::from(4), Sc::from(1), Sc::from(1)]);
+    // A share of three steps each: the fourth starts at nine.
+    let count = (Sc::from(steps) - k.block(0) * 3).min(3);
+    let mut count = Sc::Id(k.intern(count));
+    if steady {
+        count = count.clone() - Sc::from(0).lt(count);
+    }
+    let zero = k.zeros::<F32>(tile);
+    let one = k.fill::<F32>(tile, Const::Float(1.0));
+    let [sum] = k.loop_(count, [zero], |k, _, [sum]| [k.binary(sum, one, BinaryOp::Add)]);
+    let at = k.block(0) * tile.elems();
+    let out = k.view(y, at, [tile.cols, 1], tile, [None, None]);
+    k.store(out, sum);
+    let device = Device { target: crate::atoms::sm86(), costs: Costs::default() };
+    let linear = linear(k.finish(), &Lowering::new(&device));
+    let Op::Linear(ops::Linear { ops: list }) = linear.op() else { panic!("a linear list") };
+    let ends: Vec<&Arc<UOp>> =
+        list.iter().filter_map(|u| if let Op::Range(r) = u.op() { Some(&r.end) } else { None }).collect();
+    let [end] = ends[..] else { panic!("one loop, {} ranges", ends.len()) };
+    let zero = |u: &Arc<UOp>| matches!(u.op(), Op::Const(c) if c.0 == ConstValue::Int(0));
+    let max0 = |u: &Arc<UOp>| matches!(u.op(), Op::Binary(svod_ir::BinaryOp::Max, _, c) if zero(c));
+    let end = if let Op::Cast(..) = end.op() { end.op().sources()[0].clone() } else { end.clone() };
+    assert_eq!(max0(&end), floored, "range end {:?}", end.op().as_ref());
+}
+
 /// A tile re-held through the relayout scratch lowers in a program that
 /// interns no zero: the scratch is addressed from its start, not at an
 /// offset scalar of the program.
+/// A program emitting more instructions than a kernel may on its target
+/// ([`crate::atoms::Target::most_instructions`]: the CUDA bound above the
+/// AMD one) is refused by the lowering, before any compiler sees it,
+/// naming its count and the bound: given up at the statement passing the
+/// bound (the count named is under twice it, where the whole program emits
+/// four times it), not emitted whole and then refused.
+#[test]
+fn a_program_past_the_instruction_bound_is_refused() {
+    use crate::lower::Error;
+    let target = amd(AmdArch::Gfx1201, 64);
+    let (most, shape) = (target.most_instructions(), Shape::new(64, 64));
+    assert!(most < crate::atoms::sm86().most_instructions());
+    let regs = shape.elems() / (4 * target.wave as usize);
+    let mut k = Kernel::new("huge");
+    k.warps(4);
+    let out = k.param::<F32>("o", ParamKind::Out, shape.elems());
+    let one = k.fill::<F32>(shape, Const::Float(1.0));
+    let mut x = k.zeros::<F32>(shape);
+    // Each add lists its loads, adds and stores: four instructions a register.
+    for _ in 0..most / regs + 1 {
+        x = k.binary(x, one, BinaryOp::Add);
+    }
+    let v = k.view(out, 0, [shape.cols, 1], shape, [None, None]);
+    k.store(v, x);
+    let lowering = crate::lower::Lowering::new(&super::declared(target));
+    let err = crate::lower::standalone(k.finish(), &lowering).err().expect("refused");
+    let Error::TooLarge { name, instructions, most: bound } = &err else { panic!("{err}") };
+    assert_eq!((name.as_str(), *bound), ("huge", most));
+    assert!(*instructions > most && *instructions < 2 * most, "{instructions} of {most}");
+    assert_eq!(err.to_string(), format!("huge emits {instructions} instructions, past the {most} a kernel may"));
+}
+
 #[test]
 fn a_relayout_through_shared_memory_needs_no_zero_of_the_program() {
     use crate::layouts::{Relayout, chunked};
     let (tile, lanes) = (Shape::new(16, 32), 32);
     let [from, to] = [Axis::Col, Axis::Row].map(|walk| chunked(tile, 4, 1, lanes, walk).expect("a chunked layout"));
     let costs = super::lane_moves_dear();
-    assert_eq!(from.relayout(&to, 1, lanes, &costs), Relayout::ViaSmem);
+    assert_eq!(from.relayout(&to, 1, lanes, &costs, false), Relayout::ViaSmem);
     let mut k = Kernel::new("relayout");
     k.warps(1);
     let x = k.param::<F32>("x", ParamKind::In, 2 * tile.elems());
@@ -212,7 +287,7 @@ fn a_relayout_through_shared_memory_needs_no_zero_of_the_program() {
     let prog = k.finish();
     assert!(!prog.scalars.contains(&Scalar::Const(0)), "the program interns a zero");
     let device = Device { target: crate::atoms::sm86(), costs };
-    let lowering = Lowering::uniform(&device, false, WarpGrid { rows: 1, cols: 1 });
+    let lowering = Lowering::new(&device);
     let nodes = linear(prog, &lowering).toposort();
     assert!(nodes.iter().any(|u| matches!(u.op(), Op::Barrier { .. })), "no round trip through shared memory");
 }
@@ -241,7 +316,7 @@ fn a_register_transpose_lowers(tile: Shape, warps: u32, pinned: bool) {
     let dst = k.view(y, 0, [out.cols, 1], out, [None, None]);
     k.store(dst, t);
     let device = Device { target: crate::atoms::sm86(), costs: super::costs() };
-    let lowering = Lowering::uniform(&device, false, WarpGrid { rows: warps, cols: 1 });
+    let lowering = Lowering::new(&device);
     linear(k.finish(), &lowering);
 }
 
@@ -260,7 +335,7 @@ fn the_segment_bounds_are_read_ahead_of_the_key_loop(group: bool) {
         (crate::atoms::sm86(), FaCfg::new(64, 64, 3))
     };
     let spec = AttnSpec {
-        batch: Batch::Var { name: "b".into(), min: 1, max: 4 },
+        batch: Batch::var("b", 1, 4),
         t: 100,
         tk: 100,
         heads: 4,
@@ -312,4 +387,106 @@ fn a_scalars_bounds_are_its_operations(f: fn(&mut Kernel, Sc) -> Sc, want: Optio
     let v = f(&mut k, n);
     let id = k.intern(v);
     assert_eq!(k.finish().bounds(id, &|_| None), want);
+}
+
+/// A `cp.async` fill goes in whole 16-byte chunks, the same count per
+/// thread ([`crate::layouts::fills_in_chunks`]); the emitter refuses any
+/// other, naming the fill, as the rankings' `fits` predicts.
+#[test_case(16, 32, true; "64 chunks over 32 threads")]
+#[test_case(16, 24, false; "48 chunks over 32 threads")]
+#[test_case(16, 20, false; "a row of two chunks and a half")]
+fn a_fill_goes_in_whole_chunks_per_thread(rows: usize, cols: usize, fills: bool) {
+    let shape = Shape::new(rows, cols);
+    assert_eq!(crate::layouts::fills_in_chunks(shape, 2, 32), fills);
+    let mut k = Kernel::new("fill");
+    k.warps(1);
+    let x = k.param::<F16>("x", ParamKind::In, shape.elems());
+    let y = k.param::<F16>("y", ParamKind::Out, shape.elems());
+    let s = k.smem::<F16>("s", shape.elems());
+    let src = k.view(x, 0, [cols, 1], shape, [None, None]);
+    let t = k.smem_view::<F16>(s, 0, shape);
+    k.stage(t, src, CopyMode::Async);
+    let held = Shape::new(rows, 16);
+    let v = k.smem_view::<F16>(s, 0, held);
+    let r = k.load(v);
+    let out = k.view(y, 0, [cols, 1], held, [None, None]);
+    k.store(out, r);
+    let lowering = Lowering::new(&super::declared(crate::atoms::sm86()));
+    match crate::lower::standalone(k.finish(), &lowering) {
+        Ok(_) => assert!(fills, "a {rows}×{cols} fill lowered"),
+        Err(crate::lower::Error::Unsupported { what }) => {
+            assert!(!fills, "{what}");
+            assert_eq!(what, format!("a {rows}×{cols} fill by 32 threads"));
+        }
+        Err(e) => panic!("{e}"),
+    }
+}
+
+/// The alias contract the LLVM text claims on a real program's buffers:
+/// every buffer parameter is `ptr noalias align 32` — each `ParamArg` a
+/// distinct buffer of the launch, a view an offset inside its own — while
+/// the one runtime scalar (a bound batch's count) carries nothing. What no
+/// access may carry beyond that (`align`, `!alias.scope`,
+/// `dereferenceable`) is the renderer's own pin, in codegen's
+/// `the_text_claims_exactly_the_aliasing_it_knows`.
+#[test_case(crate::atoms::sm86(); "sm_86")]
+#[test_case(amd(AmdArch::Gfx1201, 64); "gfx1201")]
+fn the_text_claims_exactly_the_aliasing_tk_knows(target: Target) {
+    let spec = NormSpec {
+        norm: Norm::Layer,
+        rows: 64,
+        d: 256,
+        batch: Batch::var("n", 1, 4),
+        eps: 1e-5,
+        residual: true,
+        bias: true,
+        cfg: NormCfg { br: 4 },
+    };
+    let text = crate::lower::render(norm::<BF16>(&spec), &Lowering::new(&super::declared(target))).unwrap();
+    let define = text.lines().find(|l| l.starts_with("define ")).expect("a define line");
+    let params = define.split('(').nth(1).expect("parameters").trim_end_matches(") #0 {");
+    let mut buffers = 0;
+    for param in params.split(", ") {
+        if param.starts_with("ptr noalias align 32 %data") {
+            buffers += 1;
+        } else {
+            assert_eq!(param, "i32 %data6", "the batch count alone is bare: {define}");
+        }
+    }
+    assert_eq!(buffers, 6, "x, residual, w, b, out, sum: {define}");
+}
+
+/// The wide-load fold at a product's operands: where one wide load fills the
+/// registers an operand stacks — a whole fragment a lane, as RDNA's WMMA
+/// fragments gather — the operand is one shuffle of that load, never the
+/// load's elements torn into the register buffer and read back out a lane at
+/// a time. On sm_86 the fills are pairs (`ldmatrix` words, two-element
+/// runs): several loads a fragment, the closed pattern of one load feeding
+/// one stack does not hold, and the scalar loads stack exactly as they did —
+/// SLP remains the backstop under them.
+#[test_case(amd(AmdArch::Gfx1201, 64); "gfx1201 folds the fragment to its load")]
+#[test_case(crate::atoms::sm86(); "sm_86 keeps its pairs")]
+fn a_products_operand_is_the_load_that_filled_it(target: Target) {
+    let cfg = GemmCfg { tile: [64, 64, 32], stages: 2, warps: [2, 2], unroll: false, core: Core::Warp, crews: 1 };
+    let spec = GemmSpec { m: 128, n: 128, k: 128, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg };
+    let lowered =
+        crate::lower::standalone(gemm::<BF16>(&spec), &Lowering::new(&super::declared(target.clone()))).unwrap();
+    let Op::Program(ops::Program { linear: Some(linear), .. }) = lowered.program.op() else {
+        unreachable!("a lowering emits a linear program")
+    };
+    let (mut folded, mut stacked) = (0, 0);
+    for u in linear.op().sources() {
+        let Op::Wmma(ops::Wmma { a, b, .. }) = u.op() else { continue };
+        for operand in [a, b] {
+            folded += matches!(operand.op(), Op::Shuffle(..)) as usize;
+            stacked += matches!(operand.op(), Op::Stack(..)) as usize;
+        }
+    }
+    let expect = matches!(target.arch, svod_dtype::GpuArch::Amd(_));
+    assert_eq!(folded > 0, expect, "shuffles {folded}, stacks {stacked} on {:?}", target.arch);
+    if !expect {
+        assert!(stacked > 0, "the scalar loads still stack");
+    } else {
+        assert_eq!(stacked, 0, "no operand is stacked out of the register buffer");
+    }
 }

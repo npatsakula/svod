@@ -39,6 +39,61 @@ fn llvm_signature_uses_canonical_mixed_param_slot_order() {
     );
 }
 
+/// The alias contract the text claims, and nothing beyond it: every buffer
+/// parameter is `ptr noalias align 32` — each a distinct buffer of the
+/// launch — while the one runtime scalar carries nothing, and no access
+/// carries `align`, `!alias.scope`/`!noalias` or `dereferenceable`. A rolled
+/// loop's accesses are runtime-offset windows of one object, where a static
+/// scope would be unsound across iterations, and per-access `align`
+/// measured byte-identical objects on clang 22 and 23, nvptx and amdgcn
+/// alike (gemm, attention d64/d128, nearest k1/k16/k64, norm; 2026-10-28),
+/// so none is claimed. The buffers of a real program, one line each, are
+/// pinned where the programs are built (`tk`'s `emit` tests).
+#[test]
+fn the_text_claims_exactly_the_aliasing_it_knows() {
+    let buffer = |slot| UOp::param(slot, 1, DType::Float32, None);
+    let at = |slot| UOp::index().buffer(buffer(slot)).indices(vec![slotted_var("row", 3)]).call().unwrap();
+    let add = UOp::new(
+        Op::Binary(BinaryOp::Add, UOp::load().index(at(0)).call(), UOp::load().index(at(2)).call()),
+        DType::Float32,
+    );
+    let sink = UOp::sink(vec![at(1).store(add)]);
+    let linear = UOp::linear(svod_schedule::linearize_with_cfg(sink).into());
+    for (name, rendered) in [
+        ("cpu", render(&linear, Some("cpu_alias")).expect("CPU render")),
+        ("amdgcn", LlvmTextRenderer::amd(AmdArch::Gfx1201).render(&linear, Some("amd_alias")).expect("AMD render")),
+        (
+            "nvptx",
+            LlvmTextRenderer::nvptx(svod_dtype::CudaArch { major: 8, minor: 6 })
+                .render(&linear, Some("nvptx_alias"))
+                .expect("NVPTX render"),
+        ),
+    ] {
+        let define = rendered
+            .code
+            .lines()
+            .find(|l| l.starts_with("define "))
+            .unwrap_or_else(|| panic!("{name}:\n{}", rendered.code));
+        let params = define.split('(').nth(1).and_then(|p| p.split(')').next()).expect("parameters");
+        let mut buffers = 0;
+        for param in params.split(", ") {
+            if param.starts_with("ptr noalias align 32 %data") {
+                buffers += 1;
+            } else {
+                assert_eq!(param, "i32 %data3", "{name}'s runtime scalar alone is bare: {define}");
+            }
+        }
+        assert_eq!(buffers, 3, "{name}: {define}");
+        let accesses: Vec<&str> =
+            rendered.code.lines().filter(|l| l.contains("load ") || l.contains("store ")).collect();
+        assert!(accesses.len() >= 3, "{name} holds no accesses to check:\n{}", rendered.code);
+        for line in accesses {
+            let claimed = ["align", "!alias", "dereferenceable"].iter().filter(|meta| line.contains(*meta)).count();
+            assert_eq!(claimed, 0, "{name} claims metadata nowhere justified: {line}");
+        }
+    }
+}
+
 #[test]
 fn test_simple_add() {
     let idx = UOp::const_(DType::Int32, ConstValue::Int(0));
@@ -151,6 +206,48 @@ fn amd_loop_back_edges_carry_the_unroll_hint() {
 
     let cpu = render(&linear, Some("cpu_loops")).expect("CPU render").code;
     assert!(!cpu.contains("!llvm.loop"), "CPU loops carry no unroll hint:\n{cpu}");
+}
+
+/// A loop issuing a matrix-core product, and every loop around it, stays
+/// rolled (`llvm.loop.unroll.disable`, the second hint node); a loop beside
+/// them without a product keeps the unroll hint.
+#[test]
+fn amd_loops_over_products_stay_rolled() {
+    let bound = UOp::const_(DType::Int32, ConstValue::Int(24));
+    let range = |n| UOp::range_axis_dtype(bound.clone(), AxisId::Renumbered(n), AxisType::Loop, DType::Int32);
+    let (outer, inner, beside) = (range(0), range(1), range(2));
+    // The accumulator is read at both counters: a product both loops carry.
+    let load = |slot, dt: DType, lanes, at: &std::sync::Arc<UOp>| {
+        let idx = UOp::index().buffer(UOp::param(slot, 48, dt, None)).indices(vec![at.clone()]).call().unwrap();
+        UOp::load().index(idx).call().broadcast(lanes)
+    };
+    let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
+    let (a, b) = (load(0, DType::Float16, 8, &zero), load(1, DType::Float16, 8, &zero));
+    let c = load(2, DType::Float32, 8, &inner.try_add(&outer).unwrap());
+    let product = UOp::wmma(a, b, c, amd_wmma_meta(16, DType::Float16, DType::Float32, 8));
+    let products = product.end(smallvec::smallvec![inner]).end(smallvec::smallvec![outer]);
+    let out =
+        UOp::index().buffer(UOp::param(3, 24, DType::Float32, None)).indices(vec![beside.clone()]).call().unwrap();
+    let plain = out.store(UOp::const_(DType::Float32, ConstValue::Float(1.0))).end(smallvec::smallvec![beside]);
+    let linear = UOp::linear(svod_schedule::linearize_with_cfg(UOp::sink(vec![products, plain])).into());
+
+    let amd = LlvmTextRenderer::amd(AmdArch::Gfx1201).render(&linear, Some("amd_products")).expect("AMD render").code;
+    let lines: Vec<&str> = amd.lines().collect();
+    let back_edge = |id: &str| {
+        let footer = lines.iter().position(|line| *line == format!("loop_footer_{id}:")).expect("footer");
+        lines[footer + 1]
+    };
+    let loop_of = |id: &str| back_edge(id).split_once(", !llvm.loop ").unwrap_or_else(|| panic!("{amd}")).1;
+    let node = |name: &str| *lines.iter().find(|line| line.starts_with(&format!("{name} = "))).expect("node");
+    assert_eq!(node("!0"), "!0 = !{!\"amdgpu.loop.unroll.threshold\", i32 300}", "{amd}");
+    assert_eq!(node("!1"), "!1 = !{!\"llvm.loop.unroll.disable\"}", "{amd}");
+    for id in ["0", "1"] {
+        let n = loop_of(id);
+        assert_eq!(node(n), format!("{n} = distinct !{{{n}, !1}}"), "loop {id} rolled:\n{amd}");
+    }
+    let n = loop_of("2");
+    assert_eq!(node(n), format!("{n} = distinct !{{{n}, !0}}"), "loop 2 hinted:\n{amd}");
+    assert_amd_ir_compiles(&amd, "gfx1201");
 }
 
 /// A loop whose counter indexes a register array keeps LLVM's private-memory
@@ -406,6 +503,9 @@ fn wmma_ssa_sink(
 #[test_case::test_case(AmdArch::Gfx950, 32, DType::FP8E4M3, 8, DType::Float32, 4, 4,
     &["bitcast <8 x i8>", " to i64", "(i64, i64, <4 x float>, i32, i32, i32)"],
     &[]; "cdna4 fp8 packs eight lanes into one i64")]
+#[test_case::test_case(AmdArch::Gfx942, 32, DType::Int8, 8, DType::Int32, 4, 4,
+    &["bitcast <8 x i8>", " to i64", "@llvm.amdgcn.mfma.i32.16x16x32.i8(i64", "(i64, i64, <4 x i32>, i32, i32, i32)"],
+    &["i1 true"]; "cdna3 int8 packs eight lanes into one i64")]
 // `llc -mcpu=gfx950` accepts `<8 x bfloat>` and rejects `<8 x i16>` for the K=32
 // double-rate MFMA, so unlike the K=16 `bf16.1k` form this must not bitcast.
 #[test_case::test_case(AmdArch::Gfx950, 32, DType::BFloat16, 8, DType::Float32, 4, 4,

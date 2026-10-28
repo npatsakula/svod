@@ -11,7 +11,7 @@ use svod_tensor::Tensor;
 use test_case::test_case;
 
 use super::declared;
-use crate::atoms::{Core, Fill, Target, sm86};
+use crate::atoms::{Fill, Target, sm86};
 use crate::build::*;
 use crate::interp::run;
 use crate::ir::*;
@@ -20,7 +20,6 @@ use crate::kernels::conv::{ConvSpec, conv};
 use crate::launch::graph_launch;
 use crate::layouts::WarpGrid;
 use crate::lower::Lowering;
-use crate::schedule::Schedule;
 
 fn data(n: usize, seed: &mut u64) -> Vec<f64> {
     super::rounded(ScalarDType::BFloat16, n, seed, |x| x)
@@ -111,7 +110,7 @@ fn gathered_gemm(m: usize, n: usize, kk: usize, tile: [usize; 3], stages: usize,
     let b = k.param::<BF16>("b", ParamKind::In, n * kk);
     let c = k.param::<F32>("c", ParamKind::Out, m * n);
     k.grid([Sc::from(m / bm), Sc::from(n / bn), Sc::from(1)]);
-    k.warps(warps[0] * warps[1]);
+    k.warps(WarpGrid { rows: warps[0], cols: warps[1] });
     let (row0, col0) = (k.block(0) * bm, k.block(1) * bn);
     let i = row0.clone() + k.row();
     let start = i.clone() * 7 % m * kk;
@@ -123,7 +122,7 @@ fn gathered_gemm(m: usize, n: usize, kk: usize, tile: [usize; 3], stages: usize,
     let init = k.zeros::<F32>(Shape::new(bm, bn));
     let [acc] = k.pipeline(
         kk / bk,
-        stages,
+        Ring { stages, unroll: true, crews: 1 },
         [init],
         |k, step, slot| {
             let a_g = k.gather(a, step.clone() * bk, start.clone(), Some(valid.clone()), Shape::new(bm, bk), None);
@@ -168,19 +167,14 @@ fn gathered_gemm_matches_the_reference_in_the_interpreter() {
     }
 }
 
-fn lowering(target: Target, fill: Fill, warps: [u32; 2]) -> Lowering {
-    Lowering {
-        core: Core::Warp,
-        device: declared(target),
-        schedule: Schedule::Uniform { fill, unroll: true, async_products: false },
-        grid: WarpGrid { rows: warps[0], cols: warps[1] },
-        swizzle: true,
-    }
+/// `target` filling as `fill` does.
+fn lowering(target: Target, fill: Fill) -> Lowering {
+    Lowering::new(&declared(Target { fill, ..target }))
 }
 
 /// The emitted instruction list of `prog` on sm_86.
-fn emitted(prog: Program, fill: Fill, warps: [u32; 2]) -> Vec<Arc<UOp>> {
-    let linear = super::targets::linear(prog, &lowering(sm86(), fill, warps));
+fn emitted(prog: Program, fill: Fill) -> Vec<Arc<UOp>> {
+    let linear = super::targets::linear(prog, &lowering(sm86(), fill));
     let Op::Linear(ops::Linear { ops }) = linear.op() else { panic!("a linear list") };
     ops.to_vec()
 }
@@ -226,7 +220,7 @@ fn the_row_decode_is_hoisted_and_padding_rows_zero_fill(
     prog: Program,
     (tile, stages, warps): ([usize; 3], usize, [u32; 2]),
 ) {
-    let list = emitted(prog, Fill::CpAsync, warps);
+    let list = emitted(prog, Fill::CpAsync);
     let body = loop_body(&list);
     let threads = (warps[0] * warps[1] * 32) as usize;
     let copies = |suffix: &str| {
@@ -247,7 +241,7 @@ fn the_row_decode_is_hoisted_and_padding_rows_zero_fill(
 #[test]
 fn a_staged_gathered_run_is_one_select() {
     let (tile, _, warps) = PIN;
-    let list = emitted(gathered_gemm(128, 64, 224, tile, 2, warps), Fill::Staged, warps);
+    let list = emitted(gathered_gemm(128, 64, 224, tile, 2, warps), Fill::Staged);
     let body = loop_body(&list);
     let reads_a = |u: &Arc<UOp>| {
         u.toposort().iter().any(|s| matches!(s.op(), Op::Param(ops::Param { arg, .. }) if arg.slot == 0))
@@ -279,7 +273,7 @@ fn gathered_gemm_matches_the_interpreter_on_the_gpu(fill: Fill) {
     let want = run(&prog, vec![a.clone(), b.clone(), vec![0.0; m * n]], &[]).unwrap();
     let tensor = |v: &[f64]| Tensor::from_slice(v.iter().map(|&x| x as f32).collect::<Vec<_>>()).cast(DType::BFloat16);
     let (a_t, b_t, c_t) = (tensor(&a), tensor(&b), Tensor::empty(&[m * n], DType::Float32));
-    let got = graph_launch(prog, &lowering(target, fill, warps), &[&a_t, &b_t, &c_t]).unwrap();
+    let got = graph_launch(prog, &lowering(target, fill), &[&a_t, &b_t, &c_t]).unwrap();
     let got = got.to_vec::<f32>().unwrap();
     for (i, (g, w)) in got.iter().zip(&want[2]).enumerate() {
         assert!((*g as f64 - w).abs() <= 1e-3 * w.abs().max(1.0), "c[{}, {}] = {g}, want {w}", i / n, i % n);

@@ -108,12 +108,14 @@ fn gemm_nt(m: usize, n: usize, kk: usize, [bm, bn, bk]: [usize; 3], stages: usiz
 निकलता है, इसलिए कोई भी `m` और `n` बिना copy के चलते हैं। सिर्फ़ `k` का `bk` का गुणज होना ज़रूरी है।
 
 **Pipeline.** `pipeline(extent, stages, init, produce, consume)` `stages` shared slots की ring पर
+(`Ring { stages, unroll, crews }` loop को हर slot पर एक बार copy भी कर सकता है या दो crews चला सकता है)
 एक producer और एक consumer घोषित करता है, और `init` (यहाँ accumulator) को consumer के ज़रिए आगे
 ले जाता है। लेखक बताता है कि slot में क्या copy करना है और उससे क्या गणना करनी है।
 [Schedule template](./layouts-and-lowering#schedule-templates) तय करता है कि copies कितना आगे चलें,
 और हर wait और barrier को जगह देता है।
 
-**गुणनफल.** `mma(acc, a, a_t, b, b_t)` f32 accumulators पर `acc + A·B` है, यहाँ `B` transposed
+**गुणनफल.** `mma(acc, a, a_t, b, b_t)` f32 accumulators (8-bit integers पर i32, `MmaIn::Acc`) पर `acc + A·B` है,
+यहाँ `B` transposed
 पढ़ा जाता है। यह कभी किसी instruction का नाम नहीं लेता: lowering target का matrix-core atom चुनती है
 और `a`, `b` और `acc` को उसके layouts देती है। नतीजा एक ही बार round होता है, store से पहले के cast
 पर।
@@ -137,7 +139,7 @@ let (m, n, k) = (1000, 512, 256);
 let target = Target::for_device(&default_device()).expect("a GPU target");
 let device = Device { costs: svod_tk::probe::costs(&target)?.costs, target };
 let cfg =
-    GemmCfg { tile: [64, 64, 32], stages: 2, warps: [2, 2], group_m: 8, unroll: true, core: Core::Warp, crews: 1 };
+    GemmCfg { tile: [64, 64, 32], stages: 2, warps: [2, 2], unroll: true, core: Core::Warp, crews: 1 };
 let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg };
 let a = Tensor::empty(&[m * k], DType::BFloat16);
 let b = Tensor::empty(&[n * k], DType::BFloat16);
@@ -153,9 +155,9 @@ c.realize()?;
 
 | समूह | कॉल्स |
 |---|---|
-| घोषणाएँ | `param`, `var` (launch variable जो नाम से bind होता है), `grid`, `warps`, `smem` |
+| घोषणाएँ | `param`, `var` (launch variable जो नाम से bind होता है), `grid`, `warps` (एक गिनती, warps का एक column, या `WarpGrid` जिस पर register tiles फैलती हैं), `smem` |
 | Scalars | `block(axis)`, `warp()`, `row()` (gather map के भीतर), `load_scalar(param, index)`, `Sc` operators और `min`/`max`/`lt`/`le`/`eq`/`and`/`or` |
 | Views | `view`, `gather` (row-mapped view), `at`, `narrow`, `smem_view`, `smem_view_as`, `smem_slot` |
-| Tile ops | `fill`, `zeros`, `splat`, `coord`, `unary`, `binary` (row या column vector broadcast होता है), `scale`, `compare` (`CmpOp`), `cast`, `cast_toward_zero`, `where_`, `mul_add` (एक ही rounding), `reduce`, `reduce_f32`, `transpose`, `mma`, `mma_oriented`, `pin` |
+| Tile ops | `fill`, `zeros`, `splat`, `coord`, `unary`, `binary` (row या column vector broadcast होता है), `scale`, `compare` (`CmpOp`), `cast`, `cast_toward_zero`, `where_`, `mul_add` (एक ही rounding), `reduce`, `reduce_f32`, `transpose`, `shift` (axis के साथ एक step आगे, पहले स्थान पर fill), `flip` (हर element axis के साथ mask के bits पार अपने partner से बदलता है: sorting network का एक step), `mma`, `mma_oriented`, `pin` |
 | Movement | `stage` (global → shared, `CopyMode::Async` या `Sync`), `load`, `load_as_fill`, `store` |
-| Control | `loop_` (carried register tiles), `pipeline`, `if_`, `select_if` (tiles बनाने वाली branches), `each_warp` (एक `Warps` statement), `barrier` |
+| Control | `loop_` (carried register tiles), `pipeline`, `if_`, `select_if` (tiles बनाने वाली branches), `where_any` (एक `where_` जिसका चुना हुआ पक्ष केवल वे warps गणना करते हैं जिनके पास predicate का कोई set element है), `each_warp` (एक `Warps` statement), `barrier` |

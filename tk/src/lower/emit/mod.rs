@@ -15,9 +15,9 @@ use svod_ir::{AxisId, AxisType, BarrierFence, KernelInfo, Op, UOp};
 use crate::atoms::{Core, Fill};
 use crate::index::*;
 use crate::ir::*;
-use crate::layouts::{Laid, TileLayout};
-use crate::lower::{Lowering, ProgramSnafu, Result, UnsupportedSnafu};
-use snafu::ResultExt;
+use crate::layouts::{Laid, Moves, TileLayout};
+use crate::lower::{Lowering, ProgramSnafu, Result, TooLargeSnafu, UnsupportedSnafu};
+use snafu::{ResultExt, ensure};
 
 mod address;
 mod amdgpu;
@@ -25,19 +25,99 @@ mod compute;
 mod copy;
 mod nvptx;
 
+thread_local! {
+    /// The rolled ranges of the program [`emit`] is emitting, handed to
+    /// [`lower`](super::lower) — a thread-local, as `emit` returns the
+    /// program alone.
+    pub(super) static ROLLED: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(vec![]) };
+}
+
 pub fn emit(laid: &Laid, low: &Lowering, params: Vec<Arc<UOp>>, device: DeviceSpec) -> Result<Arc<UOp>> {
     let (prog, lay) = (&laid.prog, laid.layouts.as_slice());
+    // Parameters and buffers committed up front: the assembly rebuilds none
+    // of the ops reading them to commit their shapes.
+    let params = params.iter().map(UOp::committed_shape).collect();
     let mut e = Emit::new(prog, lay, low, params);
     e.prologue()?;
     e.block(&prog.body)?;
+    e.list.within(&prog.name)?;
+    let list = e.list.listed();
     if std::env::var_os("TK_DUMP_LIST").is_some() {
-        for (i, u) in e.list.iter().enumerate() {
+        for (i, u) in list.iter().enumerate() {
             let srcs: Vec<u64> = u.op().sources().iter().map(|s| s.id).collect();
             eprintln!("[{i:4}] id={} {:?} {:?} <- {srcs:?}", u.id, u.op().as_ref(), u.dtype());
         }
     }
     let info = KernelInfo { name: Some(prog.name.clone()), ..Default::default() };
-    UOp::linear_program(info, e.list, device).context(ProgramSnafu)
+    ROLLED.with(|cell| cell.borrow_mut().extend(e.rolled));
+    UOp::linear_program(info, list, device).context(ProgramSnafu)
+}
+
+/// The instruction list cut at the insertion point of every nesting level
+/// (the kernel's, then every open loop's body and branch of an `If`): a
+/// value hoisted to a level appends to its segment, a statement to the
+/// last one, the innermost level's body. It holds `most` instructions at
+/// most ([`crate::atoms::Target::most_instructions`]): a statement listing
+/// one past that refuses the program ([`Self::within`]), so a program far
+/// past the bound is given up at the statement passing it rather than
+/// emitted whole and then refused.
+struct Listing {
+    levels: Vec<Vec<Arc<UOp>>>,
+    len: usize,
+    most: usize,
+}
+
+impl Listing {
+    fn new(most: usize) -> Self {
+        Self { levels: vec![vec![], vec![]], len: 0, most }
+    }
+
+    /// The innermost open level.
+    fn level(&self) -> usize {
+        self.levels.len() - 2
+    }
+
+    fn push(&mut self, u: Arc<UOp>) {
+        self.levels.last_mut().expect("a body").push(u);
+        self.len += 1;
+    }
+
+    fn hoist(&mut self, level: usize, u: Arc<UOp>) {
+        self.levels[level].push(u);
+        self.len += 1;
+    }
+
+    /// A level opens here: what follows is its body.
+    fn open(&mut self) {
+        self.levels.push(vec![]);
+    }
+
+    /// The innermost level closes: its body joins the level around it.
+    fn close(&mut self) {
+        let body = self.levels.pop().expect("an open level");
+        self.levels.last_mut().expect("a body").extend(body);
+    }
+
+    /// Whether the instructions listed so far are within the bound. The one
+    /// bound that refuses a program by its own size fires a log line when it
+    /// does (the plan log's debug level gates it; no modeled cost reaches
+    /// the emitter, so the line carries the counts alone).
+    fn within(&self, name: &str) -> Result<()> {
+        if self.len > self.most {
+            tracing::debug!(
+                target: crate::ops::PLAN,
+                "bound most_instructions dropped {name} at {} instructions (the target holds {})",
+                self.len,
+                self.most
+            );
+        }
+        ensure!(self.len <= self.most, TooLargeSnafu { name, instructions: self.len, most: self.most });
+        Ok(())
+    }
+
+    fn listed(self) -> Vec<Arc<UOp>> {
+        self.levels.concat()
+    }
 }
 
 struct Emit<'a> {
@@ -46,10 +126,7 @@ struct Emit<'a> {
     low: &'a Lowering,
     params: Vec<Arc<UOp>>,
     vars: HashMap<String, Arc<UOp>>,
-    list: Vec<Arc<UOp>>,
-    /// Insertion point of values computed at each nesting level: the
-    /// kernel's, then every open loop's body and branch of an `If`.
-    headers: Vec<usize>,
+    list: Listing,
     /// The levels of the open branches, innermost last.
     guards: Vec<usize>,
     /// Open branches on the warp of the block's scope: some warps skip them.
@@ -73,6 +150,12 @@ struct Emit<'a> {
     /// A shared allocation's buffer read under another type, per pair.
     typed: HashMap<(usize, ScalarDType), Arc<UOp>>,
     scratch: HashMap<ScalarDType, (Arc<UOp>, usize)>,
+    /// The lane moves of every shift, flip and deal, by their layouts.
+    moves: Moves,
+    /// The value every register slot last held, and the nesting depth it was
+    /// stored at: the fold's window. A region closing drops the slots filled
+    /// inside it, so a value is folded only where its store still reaches.
+    slots: HashMap<(u64, u32), Stored>,
     lane: Arc<UOp>,
     warp: Arc<UOp>,
     tid: Arc<UOp>,
@@ -84,6 +167,11 @@ struct Emit<'a> {
     /// The block being emitted holds a [`Sync::WaitProducts`]: its warpgroup
     /// products issue without waiting, that statement is their wait.
     async_products: bool,
+    /// Whether the loop being emitted holds a product, innermost last: the
+    /// ranges opened over one that does are the schedule's own decision to
+    /// stay rolled, carried to the renderer ([`Lowered::rolled`]).
+    rolling: Vec<bool>,
+    rolled: Vec<u64>,
     range_id: usize,
     reg_slot: usize,
     local_slot: usize,
@@ -102,6 +190,13 @@ struct View {
     /// Added to a shared view's offset: a warp's region of the relayout
     /// scratch inside a [`Stmt::Warps`].
     region: Option<Arc<UOp>>,
+}
+
+/// What a register slot last held: the stored value, and the listing depth
+/// (open regions) at which the store listed it.
+struct Stored {
+    value: Arc<UOp>,
+    depth: usize,
 }
 
 /// A register's coordinate in its tile: the part the lane and warp decide,
@@ -132,16 +227,24 @@ impl<'a> Emit<'a> {
         let wave = c32(low.device.target.wave as i64);
         let lane = tid.try_cmod(&wave).expect("lane");
         let warp = tid.try_cdiv(&wave).expect("warp");
+        // `init` starts in place; `next` is moved into `phi` at the end of
+        // every iteration (a body may read `phi` after computing `next`). A
+        // value that starts several loops starts none in place: each copies
+        // it in ([`Self::loop_`]).
+        let carried = |stmt: &Stmt| match stmt {
+            Stmt::Loop(l) => l.carried.clone(),
+            Stmt::Pipeline(p) => p.carried.clone(),
+            _ => vec![],
+        };
+        let mut starts: HashMap<ValId, usize> = HashMap::new();
+        for (_, stmt) in prog.walk() {
+            for c in carried(stmt) {
+                *starts.entry(c.init).or_default() += 1;
+            }
+        }
         let mut alias = HashMap::new();
         for (_, stmt) in prog.walk() {
-            let carried = match stmt {
-                Stmt::Loop(l) => &l.carried,
-                Stmt::Pipeline(p) => &p.carried,
-                _ => continue,
-            };
-            // `init` starts in place; `next` is moved into `phi` at the end of
-            // every iteration (a body may read `phi` after computing `next`).
-            for c in carried {
+            for c in carried(stmt).into_iter().filter(|c| starts[&c.init] == 1) {
                 alias.insert(c.init, c.phi);
             }
         }
@@ -155,8 +258,7 @@ impl<'a> Emit<'a> {
             low,
             params,
             vars: HashMap::new(),
-            list: vec![],
-            headers: vec![0],
+            list: Listing::new(low.device.target.most_instructions()),
             guards: vec![],
             divergent: 0,
             levels: HashMap::new(),
@@ -171,6 +273,8 @@ impl<'a> Emit<'a> {
             smem: vec![],
             typed: HashMap::new(),
             scratch: HashMap::new(),
+            moves: Moves::new(prog.warp_grid.count(), low.device.target.wave),
+            slots: HashMap::new(),
             last: tid.clone(),
             lane,
             warp,
@@ -178,6 +282,8 @@ impl<'a> Emit<'a> {
             blocks: [None, None, None],
             scope: Scope::Block,
             async_products: false,
+            rolling: vec![],
+            rolled: vec![],
             range_id: 0,
             reg_slot: 0,
             local_slot: 0,
@@ -233,17 +339,13 @@ impl<'a> Emit<'a> {
             }
             level = level.max(self.level_of(&src));
         }
-        let at = self.headers[level];
-        self.list.insert(at, u.clone());
-        for h in &mut self.headers[level..] {
-            *h += 1;
-        }
+        self.list.hoist(level, u.clone());
         self.levels.insert(u.id, level);
         u
     }
 
     fn level(&self) -> usize {
-        self.headers.len() - 1
+        self.list.level()
     }
 
     fn next_tag(&mut self) -> u64 {
@@ -262,7 +364,7 @@ impl<'a> Emit<'a> {
         self.hoist(self.lane.clone());
         self.hoist(self.warp.clone());
         for (i, alloc) in self.prog.smem.iter().enumerate() {
-            let buf = UOp::buffer(i, alloc.elems, DType::Scalar(alloc.dtype), AddrSpace::Local, None);
+            let buf = UOp::committed_buffer(i, alloc.elems, DType::Scalar(alloc.dtype), AddrSpace::Local);
             let buf = self.hoist(buf);
             self.smem.push(buf);
         }
@@ -302,6 +404,7 @@ impl<'a> Emit<'a> {
             Scalar::Special(Special::Block(axis)) => (0, self.block_index(*axis as usize)),
             Scalar::Special(Special::Warp) => (0, self.warp.clone()),
             Scalar::Induction => return self.inductions[&id].clone(),
+            Scalar::Any(_) => unreachable!("a branch reads an any as its predicate, nothing else does"),
             Scalar::Bin(op, a, b) => {
                 let ((la, a), (lb, b)) = (self.scalar_at(*a, row), self.scalar_at(*b, row));
                 let u = match op {
@@ -437,7 +540,7 @@ impl<'a> Emit<'a> {
         }
         let regs = self.layout(root).regs() as usize;
         let dtype = DType::Scalar(self.value(root).dtype);
-        let buf = UOp::buffer(self.reg_slot, regs, dtype, AddrSpace::Reg, None);
+        let buf = UOp::committed_buffer(self.reg_slot, regs, dtype, AddrSpace::Reg);
         self.reg_slot += 1;
         let buf = self.hoist(buf);
         self.regs.insert(root, buf.clone());
@@ -477,14 +580,60 @@ impl<'a> Emit<'a> {
         }
         let buf = self.reg_buf(v);
         let idx = self.access(&buf, &c32(j as i64), w);
-        self.push(idx.store(val));
+        self.push(idx.store(val.clone()));
+        self.filled(&buf, j, (0..w as usize).map(|e| elem(&val, e, w as usize)));
     }
 
     fn reg_store(&mut self, v: ValId, j: u32, vals: Vec<Arc<UOp>>) {
         let buf = self.reg_buf(v);
+        let depth = self.list.levels.len();
         for (e, val) in vals.into_iter().enumerate() {
             let idx = self.access(&buf, &c32(j as i64 + e as i64), 1);
-            self.push(store_at(&idx, vec![val]));
+            self.push(store_at(&idx, vec![val.clone()]));
+            self.slots.insert((buf.id, j + e as u32), Stored { value: val, depth });
+        }
+    }
+
+    /// Registers `j..j + w` of `v` as one `w`-wide value, where the slots were
+    /// all filled from one visible wide value — the value itself where its
+    /// lanes land in order, else one shuffle of it — else the scalar loads
+    /// stacked. This is the whole of the wide-load fold: an extract chain
+    /// (`elem(load, k)`) stored to the slots and consumed right here folds
+    /// back to the load, so the register buffer is written and never read for
+    /// this consumer; a slot filled any other way (a lane move, a select, a
+    /// re-store) keeps the loads, and SLP stays the backstop under them.
+    fn stacked(&mut self, v: ValId, j: u32, w: u32) -> Arc<UOp> {
+        if w == 1 {
+            return self.reg_load(v, j);
+        }
+        /// The lane each slot of a fold reads: one shared source and its index.
+        type Lanes = Vec<(Arc<UOp>, u32)>;
+        let buf = self.reg_buf(v);
+        let lanes: Option<Lanes> = (0..w)
+            .map(|e| {
+                let stored = self.slots.get(&(buf.id, j + e))?;
+                let (src, lane) = lane_of(&stored.value)?;
+                Some((src.clone(), lane))
+            })
+            .collect();
+        if let Some(lanes) = lanes
+            && w > 1
+            && lanes.iter().all(|(src, _)| Arc::ptr_eq(src, &lanes[0].0))
+        {
+            let mask: smallvec::SmallVec<[u32; 8]> = lanes.iter().map(|(_, lane)| *lane).collect();
+            // One shuffle a use: the tag keeps two stacks over one source in
+            // sibling regions two nodes, each listed where it is used.
+            let tag = self.next_tag();
+            return UOp::shuffle(lanes[0].0.clone(), mask).rtag(Some(smallvec![tag as usize]));
+        }
+        UOp::stack(self.reg_loads(v, j, w).into_iter().collect())
+    }
+
+    /// Record registers `j..j + w` of `v` as holding `vals`.
+    fn filled(&mut self, buf: &Arc<UOp>, j: u32, vals: impl Iterator<Item = Arc<UOp>>) {
+        let depth = self.list.levels.len();
+        for (e, val) in vals.enumerate() {
+            self.slots.insert((buf.id, j + e as u32), Stored { value: val, depth });
         }
     }
 
@@ -494,6 +643,7 @@ impl<'a> Emit<'a> {
         let outer = std::mem::replace(&mut self.async_products, waited);
         for stmt in &block.0 {
             self.stmt(stmt)?;
+            self.list.within(&self.prog.name)?;
         }
         self.async_products = outer;
         // A carried tile moves a fragment at a time, as the products read
@@ -528,26 +678,47 @@ impl<'a> Emit<'a> {
                 self.scope = outer;
                 out
             }
-            Stmt::If { pred, then, otherwise } => {
+            Stmt::If { pred, then, otherwise, results } => {
                 let divergent = usize::from(self.scope == Scope::Block && self.prog.varies_by_warp(*pred));
-                let pred = self.sc(*pred);
-                // Listed like any scalar: a compare left to its first user
-                // would land inside whichever branch meets it first and not
-                // reach a later `if` on the same predicate outside it.
-                let cond = self.hoist(pred.try_cmpne(&c32(0)).expect("predicate"));
-                let not = self.hoist(cond.not());
+                let (cond, not) = if let Scalar::Any(v) = *self.prog.scalar(*pred) {
+                    // Listed here, after the tile it reads, never hoisted.
+                    let cond = self.vote_any(v);
+                    (cond.clone(), self.push(cond.not()))
+                } else {
+                    let pred = self.sc(*pred);
+                    // Listed like any scalar: a compare left to its first user
+                    // would land inside whichever branch meets it first and not
+                    // reach a later `if` on the same predicate outside it.
+                    let cond = self.hoist(pred.try_cmpne(&c32(0)).expect("predicate"));
+                    (cond.clone(), self.hoist(cond.not()))
+                };
                 self.divergent += divergent;
-                for (branch, cond) in [(then, cond), (otherwise, not)] {
-                    if branch.0.is_empty() {
+                // A branch ends in its merges: the moves of the results whose
+                // source it computed, the last thing it does.
+                let merge = |e: &mut Self, srcs: Vec<Option<ValId>>| -> Result<()> {
+                    for (&(dst, ..), src) in results.iter().zip(srcs) {
+                        let Some(src) = src else { continue };
+                        e.let_(dst, &TileOp::Move { src })?;
+                        e.advance(dst);
+                    }
+                    Ok(())
+                };
+                let then_srcs: Vec<Option<ValId>> = results.iter().map(|&(_, t, ..)| Some(t)).collect();
+                let else_srcs: Vec<Option<ValId>> = results.iter().map(|&(.., e)| e).collect();
+                for (branch, cond, merges) in [(then, cond, then_srcs), (otherwise, not, else_srcs)] {
+                    if branch.0.is_empty() && merges.iter().all(Option::is_none) {
                         continue;
                     }
                     let tag = self.next_tag();
                     let if_ = self.push(UOp::if_(cond, smallvec![]).rtag(Some(smallvec![tag as usize])));
-                    self.headers.push(self.list.len());
+                    self.list.open();
                     self.guards.push(self.level());
                     self.block(branch)?;
+                    merge(self, merges)?;
                     let level = self.guards.pop().expect("the branch just opened");
-                    self.headers.pop();
+                    self.list.close();
+                    let open = self.list.levels.len();
+                    self.slots.retain(|_, s| s.depth <= open);
                     // What was listed under the branch is out of reach past it.
                     self.scalars.retain(|_, (l, _)| *l < level);
                     self.row_scalars.retain(|_, (l, _)| *l < level);
@@ -562,8 +733,39 @@ impl<'a> Emit<'a> {
 
     /// A rolled loop, or `unroll` copies of the body per iteration followed by
     /// a rolled remainder (skipped when a constant extent divides evenly).
+    /// Whether any statement of `block`, at any depth, is a product.
+    fn holds_product(block: &Block) -> bool {
+        block.walk().any(|(_, s)| matches!(s, Stmt::Let { op: TileOp::Mma { .. }, .. }))
+    }
+
     fn loop_(&mut self, l: &Loop) -> Result<()> {
-        let (start, extent) = (self.sc(l.start), self.sc(l.extent));
+        self.rolling.push(Self::holds_product(&l.body));
+        let out = self.loop_inner(l);
+        self.rolling.pop();
+        out
+    }
+
+    fn loop_inner(&mut self, l: &Loop) -> Result<()> {
+        let copied: Vec<Carried> =
+            l.carried.iter().filter(|c| self.root(c.init) != self.root(c.phi)).copied().collect();
+        for c in copied {
+            let (regs, w) = (self.layout(c.phi).regs(), self.layout(c.phi).frag_regs().max(1));
+            for j in (0..regs).step_by(w as usize) {
+                let x = self.reg_load_vec(c.init, j, w);
+                self.reg_store_vec(c.phi, j, w, x);
+            }
+        }
+        let (start, mut extent) = (self.sc(l.start), self.sc(l.extent));
+        // An extent below zero runs no trip, as the interpreter runs none: a
+        // range's end is unsigned to the backend, so where the bounds say it
+        // may fall below zero (a share of steps past the last) it is floored.
+        let bound = |iv| {
+            let (_, u) = self.inductions.get(&iv)?;
+            Some((u.vmin().try_int()?, u.vmax().try_int()?))
+        };
+        if self.prog.bounds(l.extent, &bound).is_some_and(|(lo, _)| lo < 0) {
+            extent = self.hoist(extent.try_max(&c32(0)).expect("a floored extent"));
+        }
         let u = l.unroll.max(1) as i64;
         let constant = self.constant(l.extent);
         if u == 1 {
@@ -584,15 +786,20 @@ impl<'a> Emit<'a> {
     fn open_range(&mut self, end: Arc<UOp>) -> Arc<UOp> {
         let range = UOp::range_axis_dtype(end, AxisId::Renumbered(self.range_id), AxisType::Loop, DType::Int32);
         self.range_id += 1;
+        if self.rolling.last() == Some(&true) {
+            self.rolled.push(range.id);
+        }
         let range = self.push(range);
-        self.headers.push(self.list.len());
+        self.list.open();
         // The induction variable belongs to the level it opens.
         self.levels.insert(range.id, self.level());
         range
     }
 
     fn close_range(&mut self, range: Arc<UOp>) {
-        self.headers.pop();
+        self.list.close();
+        let open = self.list.levels.len();
+        self.slots.retain(|_, s| s.depth <= open);
         let end = self.last.clone().end(smallvec![range]);
         self.push(end);
     }
@@ -685,7 +892,8 @@ impl<'a> Emit<'a> {
 /// `dies` dies, each taking every `dies`th block of a dispatch: the dies'
 /// shares laid end to end (the first `total % dies` dies hold a block more),
 /// so a die runs a contiguous range of the kernel's block order.
-pub fn die_order(linear: u64, total: u64, dies: u64) -> u64 {
+#[cfg(test)]
+pub(crate) fn die_order(linear: u64, total: u64, dies: u64) -> u64 {
     let (base, tall) = (total / dies, total % dies);
     let (die, local) = (linear % dies, linear / dies);
     die * base + die.min(tall) + local
@@ -700,6 +908,15 @@ pub fn die_order(linear: u64, total: u64, dies: u64) -> u64 {
 /// coordinate or a variable in its range.
 pub(crate) fn minimum(x: &Arc<UOp>, y: &Arc<UOp>) -> svod_ir::Result<Arc<UOp>> {
     Ok(x.neg().try_max(&y.neg())?.neg())
+}
+
+/// The lane `u` reads of one vector value, where `u` is an extract of one
+/// (`elem`): the value and the lane's index.
+fn lane_of(u: &Arc<UOp>) -> Option<(&Arc<UOp>, u32)> {
+    let Op::Index(svod_ir::ops::Index { buffer, indices }) = u.op() else { return None };
+    let [index] = indices.as_slice() else { return None };
+    let Op::Const(value) = index.op() else { return None };
+    Some((buffer, u32::try_from(value.0.try_int()?).ok()?))
 }
 
 /// Whether scalar `id` is a multiple of `m` whatever its inputs.
@@ -723,7 +940,7 @@ fn reads_row(prog: &Program, id: ScalarId, memo: &mut Vec<Option<bool>>) -> bool
         Scalar::Row => true,
         Scalar::Bin(_, a, b) => reads_row(prog, *a, memo) | reads_row(prog, *b, memo),
         Scalar::Load { index, .. } => reads_row(prog, *index, memo),
-        Scalar::Const(_) | Scalar::Var(_) | Scalar::Special(_) | Scalar::Induction => false,
+        Scalar::Const(_) | Scalar::Var(_) | Scalar::Special(_) | Scalar::Induction | Scalar::Any(_) => false,
     };
     memo[id.index()] = Some(dep);
     dep

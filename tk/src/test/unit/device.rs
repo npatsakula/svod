@@ -14,7 +14,7 @@ use crate::ir::Program;
 use crate::kernels::Batch;
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
 use crate::launch::graph_launch;
-use crate::ops::config::Planner;
+use crate::ops::config::{Planner, gemm_cfg};
 
 fn plain_gemm(m: usize, n: usize, k: usize, cfg: GemmCfg) -> Program {
     gemm::<BF16>(&GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg })
@@ -27,8 +27,13 @@ pub(super) fn device_gemms(planner: &Planner, spec: &GemmSpec) -> (Vec<GemmCfg>,
     let ranked = planner.gemm_ranked(1, m, n, k, epilogue.gated);
     let build = |cfg: GemmCfg| vec![(gemm::<BF16>(&GemmSpec { cfg, ..spec.clone() }), cfg.lowering(&planner.device))];
     let shape = [spec.batch.capacity(), m, n, k];
-    let (admitted, pick) =
-        super::tuned_on_device(planner, ("gemm", DType::BFloat16, &shape), &ranked, <[_]>::to_vec, build);
+    let (admitted, pick) = super::tuned_on_device(
+        planner,
+        ("gemm", DType::BFloat16, &shape, crate::ops::DEVICE_TEST),
+        &ranked,
+        <[_]>::to_vec,
+        build,
+    );
     (admitted, pick.expect("a GEMM the planner runs"))
 }
 
@@ -57,8 +62,7 @@ fn gemm_matches_the_interpreter(
 ) {
     let Some(target) = super::device_target() else { return };
     let stages = target.fill.stages(stages);
-    let cfg =
-        GemmCfg { core: Core::Warp, tile: [bm, bn, bk], stages, warps: [wr, wc], group_m: 0, unroll: true, crews: 1 };
+    let cfg = gemm_cfg([bm, bn, bk], stages, [wr, wc], true);
     check_gemm(&declared(target), m, n, k, cfg);
 }
 
@@ -94,15 +98,8 @@ fn warpgroup_gemm_matches_the_warp_core(tile: [usize; 3], group: [u32; 2], warp:
     let device = declared(target);
     // Rows stay 16-byte aligned for the chunk fills: `n` a multiple of eight.
     let (m, n, k) = (tile[0] * 2 - 5, tile[1] + 8, tile[2] * 5);
-    let cfgs = [(Core::Group, group), (Core::Warp, warp)].map(|(core, warps)| GemmCfg {
-        tile,
-        stages,
-        warps,
-        group_m: 8,
-        unroll: false,
-        core,
-        crews: 1,
-    });
+    let cfgs = [(Core::Group, group), (Core::Warp, warp)]
+        .map(|(core, warps)| GemmCfg { core, ..gemm_cfg(tile, stages, warps, false) });
     let outs: Vec<Vec<f32>> = cfgs.iter().map(|cfg| check_gemm(&device, m, n, k, *cfg)).collect();
     let (same, worst) = outs[0].iter().zip(&outs[1]).fold((0usize, 0.0f32), |(same, worst), (g, w)| {
         (same + usize::from(g.to_bits() == w.to_bits()), worst.max((g - w).abs() / w.abs().max(1.0)))
@@ -127,7 +124,7 @@ fn two_crews_match_the_interpreter_and_the_uniform_kernel(tile: [usize; 3]) {
         return;
     };
     let device = &planner.device;
-    let crews = GemmCfg { tile, stages: 1, warps: [2, 4], group_m: 8, unroll: false, core: Core::Warp, crews: 2 };
+    let crews = GemmCfg { crews: 2, ..gemm_cfg(tile, 1, [2, 4], false) };
     check_gemm(device, 200, 136, 128, crews);
     check_gemm(device, 520, 300, 256, crews);
     let (m, n, k) = (1024, 768, 512);
@@ -144,8 +141,7 @@ fn two_crews_match_the_interpreter_and_the_uniform_kernel(tile: [usize; 3]) {
 }
 
 /// A config standing in where a spec's own is replaced.
-pub(super) const BIG: GemmCfg =
-    GemmCfg { core: Core::Warp, tile: [128, 128, 32], stages: 2, warps: [2, 4], group_m: 8, unroll: true, crews: 1 };
+pub(super) const BIG: GemmCfg = gemm_cfg([128, 128, 32], 2, [2, 4], true);
 
 /// The device's result, checked against the interpreter's within the
 /// rounding a bf16 store and f32 accumulation allow.
@@ -203,22 +199,14 @@ fn gemm_throughput_probe() {
     let (admitted, pick) = device_gemms(&planner, &spec);
     let mut cfgs: Vec<GemmCfg> = if target.fill == Fill::CpAsync {
         [
-            (128, 64, 32, 2, 2, 2, 8, true),
-            (128, 64, 32, 2, 2, 2, 8, false),
-            (128, 64, 32, 3, 2, 2, 8, false),
-            (128, 128, 32, 3, 2, 4, 8, true),
-            (128, 128, 32, 3, 2, 4, 8, false),
-            (128, 128, 32, 2, 2, 4, 8, false),
+            (128, 64, 32, 2, 2, 2, true),
+            (128, 64, 32, 2, 2, 2, false),
+            (128, 64, 32, 3, 2, 2, false),
+            (128, 128, 32, 3, 2, 4, true),
+            (128, 128, 32, 3, 2, 4, false),
+            (128, 128, 32, 2, 2, 4, false),
         ]
-        .map(|(bm, bn, bk, stages, wr, wc, group_m, unroll)| GemmCfg {
-            core: Core::Warp,
-            tile: [bm, bn, bk],
-            stages,
-            warps: [wr, wc],
-            group_m,
-            unroll,
-            crews: 1,
-        })
+        .map(|(bm, bn, bk, stages, wr, wc, unroll)| gemm_cfg([bm, bn, bk], stages, [wr, wc], unroll))
         .to_vec()
     } else {
         admitted
@@ -231,15 +219,7 @@ fn gemm_throughput_probe() {
                 ([128, 256, 64], [8, 2], 2),
                 ([256, 128, 64], [16, 1], 2),
             ]
-            .map(|(tile, warps, stages)| GemmCfg {
-                tile,
-                stages,
-                warps,
-                group_m: 8,
-                unroll: false,
-                core: Core::Group,
-                crews: 1,
-            }),
+            .map(|(tile, warps, stages)| GemmCfg { core: Core::Group, ..gemm_cfg(tile, stages, warps, false) }),
         );
     }
     // The pick may be a pipeline twin of an admitted tile, or outside the fixed set.
@@ -247,15 +227,13 @@ fn gemm_throughput_probe() {
         cfgs.push(pick);
     }
     for cfg in cfgs {
-        let GemmCfg { tile: [bm, bn, bk], stages, warps: [wr, wc], group_m, unroll, core, crews } = cfg;
+        let GemmCfg { tile: [bm, bn, bk], stages, warps: [wr, wc], unroll, core, crews } = cfg;
         let (prog, lowering) = (plain_gemm(m, n, k, cfg), cfg.lowering(&planner.device));
         let c_t = Tensor::empty(&[m * n], DType::BFloat16);
         let out = graph_launch(prog, &lowering, &[&a_t, &b_t, &c_t]).unwrap();
         let picked = if cfg == pick { " (tuner's pick)" } else { "" };
         plans.push((
-            format!(
-                "tk {bm}x{bn}x{bk} s{stages} {wr}x{wc} group_m={group_m} unroll={unroll} {core:?} crews={crews}{picked}"
-            ),
+            format!("tk {bm}x{bn}x{bk} s{stages} {wr}x{wc} unroll={unroll} {core:?} crews={crews}{picked}"),
             out.prepare().unwrap(),
         ));
     }
@@ -291,8 +269,7 @@ fn gemm_throughput_probe() {
 fn gemm_candidates_probe() {
     use crate::kernels::Act;
     let Some(planner) = super::device_planner() else { return };
-    let ladder =
-        GemmCfg { core: Core::Warp, tile: [128, 64, 32], stages: 2, warps: [2, 2], group_m: 8, unroll: true, crews: 1 };
+    let ladder = gemm_cfg([128, 64, 32], 2, [2, 2], true);
     let plain = Epilogue::default();
     for (m, n, k, epilogue, var) in [
         (704, 1536, 512, plain, true),
@@ -301,7 +278,7 @@ fn gemm_candidates_probe() {
         (704, 512, 2048, Epilogue { residual: true, ..plain }, true),
         (4096, 4096, 4096, plain, false),
     ] {
-        let batch = if var { Batch::Var { name: "b".into(), min: 1, max: 1 } } else { Batch::Static(1) };
+        let batch = if var { Batch::var("b", 1, 1) } else { Batch::Static(1) };
         let (cfgs, pick) = device_gemms(&planner, &GemmSpec { m, n, k, batch: batch.clone(), epilogue, cfg: BIG });
         let build = |cfg| {
             let spec = GemmSpec { m, n, k, batch: batch.clone(), epilogue, cfg };
@@ -351,15 +328,7 @@ fn first_execution_probe() {
     b_t.realize().unwrap();
     let mut plans: Vec<(String, svod_runtime::ExecutionPlan)> = vec![];
     for (bm, bn, stages) in [(128, 128, 3), (64, 64, 2)] {
-        let cfg = GemmCfg {
-            core: Core::Warp,
-            tile: [bm, bn, 32],
-            stages,
-            warps: [2, 2],
-            group_m: 8,
-            unroll: false,
-            crews: 1,
-        };
+        let cfg = gemm_cfg([bm, bn, 32], stages, [2, 2], false);
         let c_t = Tensor::empty(&[m * n], DType::BFloat16);
         let out = graph_launch(plain_gemm(m, n, k, cfg), &cfg.lowering(&device), &[&a_t, &b_t, &c_t]).unwrap();
         plans.push((format!("tk {bm}x{bn} s{stages}"), out.prepare().unwrap()));
@@ -369,8 +338,7 @@ fn first_execution_probe() {
     let graph = a2.matmul(&b2.try_transpose(0, 1).unwrap()).unwrap();
     plans.push(("graph matmul".to_string(), graph.prepare().unwrap()));
     // Host-side cost: building, lowering and scheduling the pre-linearized body.
-    let cfg =
-        GemmCfg { core: Core::Warp, tile: [64, 64, 32], stages: 2, warps: [2, 2], group_m: 8, unroll: false, crews: 1 };
+    let cfg = gemm_cfg([64, 64, 32], 2, [2, 2], false);
     for i in 0..3 {
         let c_t = Tensor::empty(&[m * n], DType::BFloat16);
         let t = std::time::Instant::now();
@@ -440,16 +408,8 @@ fn qwen3_gemm_candidates_probe() {
                 for bk in [16, 32, 64] {
                     for warps in [[2, 2], [2, 4], [4, 2], [4, 4]] {
                         for unroll in [false, true] {
-                            let cfg = GemmCfg {
-                                core: Core::Warp,
-                                tile: [bm, bn, bk],
-                                stages: 2,
-                                warps,
-                                group_m: 8,
-                                unroll,
-                                crews: 1,
-                            };
-                            let fits = cfg.fits(target) && cfg.smem_bytes(epilogue.gated) <= target.smem_bytes;
+                            let cfg = gemm_cfg([bm, bn, bk], 2, warps, unroll);
+                            let fits = cfg.fits(target) && cfg.smem_bytes(epilogue.gated, 2) <= target.smem_bytes;
                             if fits && !shortlist.contains(&cfg) {
                                 lattice.push(cfg);
                             }
@@ -552,5 +512,63 @@ fn transposing_loads_land_as_their_layout() {
             assert_eq!(held[(lane * 8 + j) as usize], r * 16 + c, "lane {lane} register {j}");
         }
         assert_eq!(rows.apply(&[(Lane, lane)]), (lane % 8 + 8 * (lane / 16), 8 * (lane / 8 % 2)));
+    }
+}
+
+/// A product's scores dealt over its lanes on the device: every row's dealt
+/// columns are its columns once, each dealt value the product's at its
+/// dealt column, as the interpreter's are in its own order.
+#[test_case(1; "a lane's columns each deal")]
+#[test_case(2; "two of a lane's columns each deal")]
+fn a_product_deals_its_columns_on_device(per_lane: usize) {
+    use crate::build::{F32, I32, Kernel};
+    use crate::ir::{ParamKind, Shape};
+    let Some(target) = super::device_target() else { return };
+    let device = declared(target);
+    let (rows, cols, depth) = (64usize, 64usize, 32usize);
+    let w = 4 * per_lane;
+    let mut k = Kernel::new("deal");
+    let x = k.param::<BF16>("x", ParamKind::In, rows * depth);
+    let c = k.param::<BF16>("c", ParamKind::In, cols * depth);
+    let y = k.param::<F32>("y", ParamKind::Out, rows * cols);
+    let at = k.param::<I32>("at", ParamKind::Out, rows * cols);
+    k.warps(4);
+    let xv = k.view(x, 0, [depth, 1], Shape::new(rows, depth), [None, None]);
+    let cv = k.view(c, 0, [depth, 1], Shape::new(cols, depth), [None, None]);
+    let (xr, cr) = (k.load(xv), k.load(cv));
+    let zero = k.zeros::<F32>(Shape::new(rows, cols));
+    let s = k.mma(zero, xr, false, cr, true);
+    for j in 0..cols / w {
+        let (v, col) = (k.deal(s, w, j), k.deal_col(s, w, j));
+        let yv = k.view(y, j * w, [cols, 1], Shape::new(rows, w), [None, None]);
+        k.store(yv, v);
+        let av = k.view(at, j * w, [cols, 1], Shape::new(rows, w), [None, None]);
+        k.store(av, col);
+    }
+    let prog = k.finish();
+    let mut seed = 3;
+    let xs = super::rounded(ScalarDType::BFloat16, rows * depth, &mut seed, |v| v);
+    let cs = super::rounded(ScalarDType::BFloat16, cols * depth, &mut seed, |v| v);
+    let product = |r: usize, j: usize| (0..depth).map(|e| xs[r * depth + e] * cs[j * depth + e]).sum::<f64>();
+    let params = vec![xs.clone(), cs.clone(), vec![0.0; rows * cols], vec![0.0; rows * cols]];
+    let interpreted = run(&prog, params.clone(), &[]).unwrap();
+    let lowering = crate::lower::Lowering::new(&device);
+    let outs = super::targets::on_device(prog, &lowering, &params);
+    for (what, y, at) in [
+        ("interpreted", interpreted[2].clone(), interpreted[3].clone()),
+        ("device", outs[2].clone().unwrap(), outs[3].clone().unwrap()),
+    ] {
+        for r in 0..rows {
+            let mut taken: Vec<usize> = at[r * cols..(r + 1) * cols].iter().map(|&c| c as usize).collect();
+            for (i, &j) in taken.iter().enumerate() {
+                let (got, want) = (y[r * cols + i], product(r, j));
+                assert!(
+                    (got - want).abs() <= 1e-3 * want.abs().max(1.0),
+                    "{what}: row {r} slot {i} column {j}: {got} vs {want}"
+                );
+            }
+            taken.sort_unstable();
+            assert_eq!(taken, (0..cols).collect::<Vec<_>>(), "{what}: row {r} takes each column once");
+        }
     }
 }

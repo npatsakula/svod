@@ -25,9 +25,13 @@ fn assert_rounds_once(actual: Tensor, reference: Tensor, legacy: Tensor, epilogu
 
 #[test]
 fn fp16_layernorm_keeps_affine_in_fp32_until_final_cast() {
-    let x = fp16(&[0.1013, -0.2037, 0.3071, 1.913], &[1, 4]);
-    let weight = fp16(&[17.25, -31.5, 47.75, -63.0], &[4]);
-    let bias = fp16(&[0.03125, -0.0625, 0.09375, -0.125], &[4]);
+    // Values whose affine result sits across an FP16 boundary, so rounding
+    // the normalized value and each product (the legacy form) differs from
+    // rounding once at the end: since a Float16 roundtrip rounds instead of
+    // folding away, only such values keep this fixture discriminative.
+    let x = fp16(&[0.15673828, -0.18688965, -2.5175781, -0.5385742], &[1, 4]);
+    let weight = fp16(&[-0.38793945, 0.90625, -12.2421875, -3.8222656], &[4]);
+    let bias = fp16(&[-3.9140625, -3.234375, 4.2421875, -3.2304688], &[4]);
     let layer = LayerNorm::new(weight.clone(), Some(bias.clone()), 1e-5);
     let f32_of = |t: &Tensor| t.cast(DType::Float32);
 

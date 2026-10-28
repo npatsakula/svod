@@ -108,9 +108,9 @@ pub fn render_wmma_amd(
 /// differs from its natural `ldt` type (a bitcast is then required). bf16 lanes
 /// go as `i16` (the `bf16.1k`/RDNA `.bf16` intrinsics), except for the CDNA4
 /// K=32 `.bf16` form which takes native `<N x bfloat>` (`bf16_native`); K=32
-/// fp8 lanes pack into one `iN`, scaled K=128 uses packed i32 vectors, and
-/// RDNA int8 lanes pack four-at-a-time into i32 vectors (RDNA3's 16 lanes give
-/// `<4 x i32>`, RDNA4's 8 give `<2 x i32>`).
+/// fp8 lanes pack into one `iN`, as CDNA's K=32 int8 lanes do, scaled K=128
+/// uses packed i32 vectors, and RDNA int8 lanes pack four-at-a-time into i32
+/// vectors (RDNA3's 16 lanes give `<4 x i32>`, RDNA4's 8 give `<2 x i32>`).
 fn wmma_wire_type(dtype: &DType, bf16_native: bool) -> (String, bool) {
     wmma_wire_type_with_scaled_fp8(dtype, bf16_native, false, false)
 }
@@ -124,6 +124,7 @@ fn wmma_wire_type_with_scaled_fp8(
     match dtype {
         DType::Vector { scalar: ScalarDType::BFloat16, count } if !bf16_native => (format!("<{count} x i16>"), true),
         DType::Vector { scalar: ScalarDType::Int8, count } if rdna_int8 => (format!("<{} x i32>", count / 4), true),
+        DType::Vector { scalar: ScalarDType::Int8, count } => (format!("i{}", count * 8), true),
         DType::Vector { scalar: ScalarDType::FP8E4M3 | ScalarDType::FP8E5M2, count } if scaled_fp8 => {
             (format!("<{} x i32>", count / 4), true)
         }
@@ -192,8 +193,8 @@ fn resolve_intrinsic(
         // Verified with `llc -mcpu=gfx942|gfx950` (ROCm 7.2): the f16/bf16 K=16
         // forms (`f16`/`bf16.1k`) select on both CDNA3 (gfx942) and CDNA4
         // (gfx950); the dotted K=32 double-rate forms (`.f16`/`.bf16`) select on
-        // gfx950 only; fp8/bf8 select at K=32 on both and scaled K=128 on
-        // gfx950; f32 selects only at K=4 (`v_mfma_f32_16x16x4_f32`, scalar
+        // gfx950 only; fp8/bf8 and int8 into i32 select at K=32 on both and
+        // scaled fp8 K=128 on gfx950; f32 selects only at K=4 (`v_mfma_f32_16x16x4_f32`, scalar
         // A/B operands). Anything else has no
         // MFMA intrinsic — return `None` so the caller raises `InvalidGraph`
         // (and the optimizer decomposes it) instead of emitting a name LLVM
@@ -209,6 +210,7 @@ fn resolve_intrinsic(
             (ScalarDType::FP8E4M3 | ScalarDType::FP8E5M2, 128) => return None,
             (ScalarDType::FP8E4M3, 32) => ".fp8.fp8",
             (ScalarDType::FP8E5M2, 32) => ".bf8.bf8",
+            (ScalarDType::Int8, 32) if acc_dt == ScalarDType::Int32 => ".i8",
             _ => return None,
         };
         let acc_suffix = match acc_dt {

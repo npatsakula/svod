@@ -83,6 +83,28 @@ pub fn has_nvptx_target() -> bool {
     path_clang_has_target("nvptx64")
 }
 
+/// Is a `ptxas` usable (present, not disabled with `SVOD_CUDA_PTXAS=0`)?
+/// Cached for the lifetime of the process.
+pub fn has_ptxas() -> bool {
+    static HAS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HAS.get_or_init(|| Ptxas::discover(None).is_some())
+}
+
+/// Assemble hand-written PTX text for `arch`: the vendor assembler's own
+/// accept/reject of an instruction, which is how instruction availability is
+/// probed per target (a `.target` the instruction needs and `arch` lacks is
+/// an error, not a lowered fallback). No kernel is built or run.
+///
+/// # Errors
+///
+/// - [`crate::Error::JitCompilation`] when no `ptxas` is usable or it rejects
+///   the text for `arch` (its stderr names the instruction).
+pub fn assemble_ptx(ptx: &str, arch: CudaArch) -> crate::Result<Vec<u8>> {
+    let ptxas =
+        Ptxas::discover(None).ok_or_else(|| crate::Error::JitCompilation { reason: "no usable ptxas".to_string() })?;
+    ptxas.assemble(ptx.as_bytes(), arch)
+}
+
 /// Toolkit locations searched for `ptxas` after `PATH`.
 const PTXAS_FALLBACK_DIRS: &[&str] = &["/opt/cuda/bin"];
 

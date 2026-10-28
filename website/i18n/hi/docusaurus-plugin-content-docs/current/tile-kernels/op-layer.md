@@ -50,10 +50,16 @@ compile होते हैं (या, अगर हर एक spill करे,
 भेजते)। `Plan::Graph(Fallback)` बताता है कि ग्राफ़ क्यों चलता है, और planner log उसका नाम लेता है
 (`RUST_LOG=svod_tk::plan=debug`)।
 
+`ops::chosen()` उस op का फ़ैसला एक value के रूप में लौटाता है जो इस thread ने आख़िरी चलाया:
+`Chosen::Kernel { op, family, cfg }` — kernel का नाम (`family`) और उसकी pick का Debug text
+(`cfg`, जो एक nearest pick का path बताता है: score matrix, queue, splits) — या
+`Chosen::Graph { op, why }`। `k_nearest_reranked` का record उसकी search का है: जीतने वाली
+rows का dtype उसके config के साथ।
+
 | `Fallback` | कब |
 |---|---|
 | `Target` | Tensor default device पर नहीं है, device के पास कोई tk kernels नहीं हैं (`config::has_kernels`: sm_80 से नीचे का CUDA, Metal, CPU), या उसका target कोई SM count नहीं बताता |
-| `Dtype` | कोई operand f32 है, या सभी operands matrix core वाला एक ही 16-bit type साझा नहीं करते। `conv2d`: input के type या f32 के अलावा कोई output type, या ऐसा residual जो उस type में न हो |
+| `Dtype` | कोई operand f32 है, या सभी operands matrix core वाला एक ही 16-bit type साझा नहीं करते (`nearest` और `k_nearest` i8 rows भी लेते हैं, हर एक 1 से scaled)। `conv2d`: input के type या f32 के अलावा कोई output type, या ऐसा residual जो उस type में न हो |
 | `Symbolic` | Bound leading dim के अलावा कोई dim symbolic है (`linear` के लिए symbolic `N` भी) |
 | `Shape` | `linear`: `N` 8 का गुणज नहीं या कोई rows नहीं। `conv2d`: `groups > 1`, `Cin` 16 का गुणज नहीं, `Cout` 8 का गुणज नहीं, या ख़ाली output। `attention`: कोई config `D` पर फ़िट नहीं होता (sm_86 पर 32, 48, 64, 128 और 256 plan होते हैं और 40 नहीं) या कोई ख़ाली dim। `heads`: `D` 16..=256 में दो की घात नहीं। Norms: `D` 256..=2048 में दो की घात नहीं |
 | `Config` | कोई tile config फ़िट नहीं होता। `linear` के लिए, `K` 16 का गुणज नहीं है |
@@ -61,8 +67,14 @@ compile होते हैं (या, अगर हर एक spill करे,
 जब appended rows हर config के key block से चौड़ी हों, तब भी `attention` ग्राफ़ लेता है।
 
 :::note[f32 ग्राफ़ पर क्यों रहता है]
-कर्नेल सिर्फ़ 16-bit operands लेते हैं। किसी f32 मॉडल को नीचे cast करने से गति के बदले precision के
-लगभग तीन दशमलव अंक चले जाते, इसलिए op layer यह फ़ैसला मॉडल के dtype पर छोड़ती है।
+कर्नेल 16-bit operands लेते हैं (और nearest-neighbour search के लिए 8-bit integers)। किसी f32 मॉडल
+को नीचे cast करने से गति के बदले precision के लगभग तीन दशमलव अंक चले जाते, इसलिए op layer यह फ़ैसला
+मॉडल के dtype पर छोड़ती है। `k_nearest_reranked` वह अपवाद है जो f32 numbers रखता है: यह rows को
+8 bits या f16 में search करता है (`Quantized`, अपनी `QuantScheme::Row` scale के साथ; `Rerank`),
+हर row के `k + margin` सबसे छोटे रखता है (default 16), और उन्हें दी गई rows से f32 में फिर से
+score करता है। `Rerank::search` rows का नाम लेता है (`Search::Int8`, `Search::Half(f16)`, या
+`Search::Auto`, दोनों में तेज़ — कौन जीता, वह op के `chosen()` record में है)। जिस neighbour को
+search `k + margin` के बाद rank करता है, वह छूट जाता है।
 :::
 
 ## Batch variables {#batch-variables}

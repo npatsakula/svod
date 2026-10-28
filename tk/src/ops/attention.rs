@@ -6,12 +6,14 @@ use svod_ir::SInt;
 use svod_ir::origin::OriginScope;
 use svod_tensor::Tensor;
 
-use super::config::Planner;
+use super::config::{AttentionProblem, Planner};
+use super::shape::Fallback;
 use super::shape::{self, extent, shape_of};
 use super::{
     DtypeSnafu, GraphSnafu, HeadsSnafu, LaunchSnafu, Result, ShapeSnafu, Tuner, batch_of, fmt_shape, kernel_buffer,
     output, typed,
 };
+use crate::ir::Var;
 use crate::kernels;
 use crate::kernels::Batch;
 pub use crate::kernels::attention::Chunk;
@@ -20,6 +22,7 @@ use crate::kernels::attention::{
 };
 use crate::kernels::rows::NormCfg;
 use crate::launch;
+use crate::lower::Lowering;
 use crate::tune::TuneStore;
 
 /// Which keys each batch row attends to.
@@ -178,6 +181,7 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
     let cfgs: Vec<FaCfg> = cfgs.iter().copied().filter(|c| c.holds_appended(appended)).collect();
     if cfgs.is_empty() {
         tracing::debug!(target: super::PLAN, op = OP, appended, "graph: no config holds the appended rows");
+        super::ran_graph(OP, Fallback::Config);
         return graph(q, k, v, opts).context(GraphSnafu { op: OP });
     }
     let (q_ext, k_ext, var) = (q_ext.expect("planned"), k_ext.expect("planned"), var.flatten());
@@ -185,7 +189,7 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
     let ([b, t, heads, d], [kv_rows, tk, heads_total, _]) = (dims4(&q_ext.dims), dims4(&k_ext.dims));
     let batch = batch_of(&var, b);
     let kv_heads = opts.cache.map_or(heads_total, |c| c.kv_heads);
-    let cache = opts.cache.map(|c| kernels::attention::Cache {
+    let cache = opts.cache.map(|c| kernels::attention::CacheLayout {
         rows: kv_rows,
         heads_total,
         row_map: c.row_map.is_some(),
@@ -198,6 +202,7 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
     let scale = opts.scale.unwrap_or(1.0 / (d as f32).sqrt());
     let spec = AttnSpec { batch: batch.clone(), t, tk, heads, kv_heads, d, mask, cache, scale, cfg: cfgs[0] };
     let cfg = tuned(TuneStore::global(), &planner, q.dtype(), &cfgs, spec.clone(), opts.splits).cfg;
+    super::ran(OP, "flash_attention", cfg);
     let i32 = |t: &Tensor| if t.dtype() == DType::Int32 { t.clone() } else { t.cast(DType::Int32) };
     let lens = lens.map(i32);
     // Rows padded to the kernel's aligned stride.
@@ -265,7 +270,7 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
     let merge = merge(batch, t, heads, d, cfg.splits);
     let o = output(&q_ext.dims, &var, q.dtype()).context(GraphSnafu { op: OP })?;
     let ins = [&parts[3], &parts[4], &parts[5], &o];
-    launch::graph_launch(typed!(q.dtype(), combine, &merge), &merge.cfg.lowering(&planner.device), &ins)
+    launch::graph_launch(typed!(q.dtype(), combine, &merge), &Lowering::new(&planner.device), &ins)
         .context(LaunchSnafu { op: OP })
 }
 
@@ -309,8 +314,8 @@ pub fn tuned(
     let measured_mask = AttnMask { bias: bias_rows, ..edges };
     let measured = match &spec.batch {
         Batch::Static(n) if *n > TUNE_BATCH => Batch::Static(TUNE_BATCH),
-        Batch::Var { name, min, max } if *max > TUNE_BATCH as i64 => {
-            Batch::Var { name: name.clone(), min: (*min).min(TUNE_BATCH as i64), max: TUNE_BATCH as i64 }
+        Batch::Var(v) if v.max > TUNE_BATCH as i64 => {
+            Batch::Var(Var { min: v.min.min(TUNE_BATCH as i64), max: TUNE_BATCH as i64, ..v.clone() })
         }
         other => other.clone(),
     };
@@ -323,7 +328,7 @@ pub fn tuned(
     let salt = (&measured, measured_mask, cache.map(|c| c.heads_total), rows, mapped, splits);
     let build = |cfg: FaCfg| {
         // Scratch caches hold no appended rows and no garbage: a zero map.
-        let plain = cache.map(|c| kernels::attention::Cache {
+        let plain = cache.map(|c| kernels::attention::CacheLayout {
             rows: rows.expect("a cache"),
             row_map: mapped,
             appended: 0,
@@ -337,11 +342,20 @@ pub fn tuned(
             .collect::<Vec<_>>();
         if cfg.splits > 1 {
             let merge = merge(spec.batch.clone(), t, heads, d, cfg.splits);
-            programs.push((typed!(dtype, combine, &merge), merge.cfg.lowering(&planner.device)));
+            programs.push((typed!(dtype, combine, &merge), Lowering::new(&planner.device)));
         }
         programs
     };
-    let mut tuner = Tuner::new(store, &planner.device, dtype.clone(), &shape, salt, build);
+    let problem = AttentionProblem {
+        tiles: spec.batch.capacity() * heads,
+        t,
+        tk,
+        d,
+        causal: spec.mask.causal,
+        bias: bias_rows.is_some(),
+    };
+    let mut tuner = Tuner::new(store, &planner.device, dtype.clone(), &shape, salt, build)
+        .floored(|cfg| planner.floor_of(&problem, cfg));
     let cfg = tune(&mut tuner, &split, bias_rows.is_some(), expand);
     tracing::debug!(target: super::PLAN, op = OP, ?shape, pick = ?cfg, "attention tuned");
     AttnSpec { cfg, ..spec }

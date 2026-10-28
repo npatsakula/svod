@@ -31,8 +31,21 @@ impl UOp {
         Self::new(Op::Stack(ops::Stack { sources }), dtype)
     }
 
+    /// The lanes of `src` in `mask` order: lane `i` of the result is lane
+    /// `mask[i]` of `src`, a vector of the source's element type with
+    /// `mask.len()` lanes (a scalar source is counted, a vector re-counted).
+    /// A constant source gathers at construction.
+    pub fn shuffle(src: Arc<Self>, mask: SmallVec<[u32; 8]>) -> Arc<Self> {
+        let dtype = crate::dtype_from_op(&Op::Shuffle(ops::Shuffle { src: src.clone(), mask: mask.clone() }))
+            .expect("a SHUFFLE takes a vector");
+        if let Op::VConst(ops::VConst { values }) = src.op() {
+            let lanes = |lane: &u32| values.get(*lane as usize).copied().unwrap_or(values[0]);
+            return Self::new(Op::VConst(ops::VConst { values: mask.iter().map(lanes).collect() }), dtype);
+        }
+        Self::new(Op::Shuffle(ops::Shuffle { src, mask }), dtype)
+    }
+
     /// Reshape tensor to new shape (low-level, UOp-based constructor).
-    ///
     /// Takes a UOp for the shape parameter (used internally by compiler passes).
     /// For the public API with validation, use `try_reshape`.
     pub(crate) fn reshape(src: Arc<Self>, new_shape: Arc<Self>) -> Arc<Self> {

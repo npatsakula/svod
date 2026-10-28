@@ -4,7 +4,7 @@ use test_case::test_case;
 use crate::atoms::{Core, Fill};
 use crate::interp::{round_to, run};
 use crate::ir::*;
-use crate::schedule::{Schedule, expand};
+use crate::schedule::expand;
 
 fn count(prog: &Program, pred: impl Fn(&Stmt) -> bool) -> usize {
     prog.walk().filter(|(_, s)| pred(s)).count()
@@ -29,7 +29,7 @@ fn expansion_preserves_the_result(fill: Fill, stages: usize) {
     let (m, n, k) = (64usize, 32usize, 160usize);
     let mut prog = super::gemm_nt(m, n, k, 32, 32, 32, stages);
     let want = run(&prog, operands(m, n, k), &[("b", 1)]).unwrap();
-    expand(&mut prog, Schedule::Uniform { fill, unroll: true, async_products: false });
+    expand(&mut prog, fill, Core::Warp);
     let got = run(&prog, operands(m, n, k), &[("b", 1)]).unwrap();
     assert_eq!(got[2], want[2]);
     assert_eq!(count(&prog, |s| matches!(s, Stmt::Pipeline(_))), 0);
@@ -67,7 +67,7 @@ fn products_in_flight_preserve_the_result(stages: usize) {
     let (m, n, k) = (64usize, 32usize, 160usize);
     let mut prog = super::gemm_nt(m, n, k, 32, 32, 32, stages);
     let want = run(&prog, operands(m, n, k), &[("b", 1)]).unwrap();
-    expand(&mut prog, Schedule::Uniform { fill: Fill::CpAsync, unroll: true, async_products: true });
+    expand(&mut prog, Fill::CpAsync, Core::Group);
     let got = run(&prog, operands(m, n, k), &[("b", 1)]).unwrap();
     assert_eq!(got[2], want[2]);
     let syncs: Vec<Sync> =
@@ -106,7 +106,7 @@ fn ping_pong_expansion_preserves_the_result(bk: usize, slices: usize) {
     let want = run(&prog, operands(m, n, k), &[("b", 1)]).unwrap();
     // As the lowering: a product's shared operands become explicit reads first.
     crate::lower::materialize_operands(&mut prog, Core::Warp);
-    expand(&mut prog, Schedule::PingPong { crew: 4 });
+    expand(&mut prog, Fill::Staged, Core::Warp);
     let got = run(&prog, operands(m, n, k), &[("b", 1)]).unwrap();
     assert_eq!(got[2], want[2]);
     assert_eq!(count(&prog, |s| matches!(s, Stmt::Pipeline(_))), 0);
@@ -127,7 +127,7 @@ fn ping_pong_expansion_preserves_the_result(bk: usize, slices: usize) {
 fn ping_pong_cuts_a_trip_into_clusters() {
     let mut prog = super::gemm_nt_crews(64, 64, 256, [64, 64, 64]);
     crate::lower::materialize_operands(&mut prog, Core::Warp);
-    expand(&mut prog, Schedule::PingPong { crew: 4 });
+    expand(&mut prog, Fill::Staged, Core::Warp);
     let kind = |s: &Stmt| match s {
         Stmt::Copy { dst, src, mode: CopyMode::Staged, .. } => match (&prog.value(*src).place, prog.value(*dst).tier())
         {
@@ -212,7 +212,7 @@ fn staged_halves_keep_their_copys_scope() {
         cfg,
     };
     let mut prog = attention::<BF16>(&spec);
-    expand(&mut prog, Schedule::Uniform { fill: Fill::Staged, unroll: false, async_products: false });
+    expand(&mut prog, Fill::Staged, Core::Warp);
     fn copies(block: &Block, inside: bool, out: &mut Vec<(bool, Scope, CopyMode)>) {
         for s in &block.0 {
             if let Stmt::Copy { mode, scope, .. } = s {
@@ -239,10 +239,11 @@ fn staged_halves_keep_their_copys_scope() {
 /// consumer and a store after it, and peels the ring into three loops over
 /// one induction variable: the first trip loads and commits step 0, a
 /// steady trip loads, consumes and ends in `tail` with no branch in its
-/// body, and the last trip only consumes what the steady loop left. Two
-/// slots fence the commit and unroll over the slots; one slot commits
-/// between two barriers (the slot is read out before it is overwritten,
-/// then seen), its slot scalars the constant 0 and nothing to unroll.
+/// body, and the last trip only consumes what the steady loop left. A
+/// trip's loads are fenced ahead of its products. Two slots fence the
+/// commit and unroll over the slots; one slot commits between two barriers
+/// (the slot is read out before it is overwritten, then seen), its slot
+/// scalars the constant 0 and nothing to unroll.
 #[test_case(2, ["fence", "commit", "commit", "barrier"], 2; "two slots fence the commit")]
 #[test_case(1, ["barrier", "commit", "commit", "barrier"], 1; "one slot commits between two barriers")]
 fn register_staging_peels_the_ring_into_three_branch_free_loops(stages: usize, tail: [&str; 4], unroll: u32) {
@@ -252,7 +253,7 @@ fn register_staging_peels_the_ring_into_three_branch_free_loops(stages: usize, t
         .filter_map(|(_, s)| if let Stmt::Pipeline(p) = s { Some([p.produce.slot, p.consume.slot]) } else { None })
         .flatten()
         .collect();
-    expand(&mut prog, Schedule::Uniform { fill: Fill::Staged, unroll: true, async_products: false });
+    expand(&mut prog, Fill::Staged, Core::Warp);
     let constant = slots.iter().all(|&s| *prog.scalar(s) == Scalar::Const(0));
     assert!(!slots.is_empty() && constant == (stages == 1), "slot scalars constant: {constant}");
     let loops: Vec<&Loop> =
@@ -273,13 +274,13 @@ fn register_staging_peels_the_ring_into_three_branch_free_loops(stages: usize, t
     let kinds = |l: &Loop| l.body.0.iter().map(kind).collect::<Vec<_>>();
     assert_eq!(kinds(head), ["issue", "issue", "commit", "commit", "barrier"]);
     let k = kinds(steady);
-    let computes = k.len() - 6;
-    assert_eq!(k[..2], ["issue", "issue"]);
-    assert!(computes > 0 && k[2..2 + computes].iter().all(|k| *k == "compute"), "{k:?}");
-    assert_eq!(k[2 + computes..], tail);
+    let computes = k.len() - 7;
+    assert_eq!(k[..3], ["issue", "issue", "fence"]);
+    assert!(computes > 0 && k[3..3 + computes].iter().all(|k| *k == "compute"), "{k:?}");
+    assert_eq!(k[3 + computes..], tail);
     assert_eq!(kinds(drain), vec!["compute"; computes]);
     assert_eq!((head.unroll, steady.unroll, drain.unroll), (1, unroll, 1));
-    assert_eq!(count(&prog, |s| matches!(s, Stmt::Sync(Sync::Fence))), usize::from(stages == 2), "fences");
+    assert_eq!(count(&prog, |s| matches!(s, Stmt::Sync(Sync::Fence))), stages, "fences");
     assert!(head.iv == steady.iv && steady.iv == drain.iv, "one induction variable");
     assert!(head.carried.is_empty());
     assert_eq!(steady.carried.len(), 1);

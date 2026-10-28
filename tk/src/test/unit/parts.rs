@@ -7,31 +7,23 @@ use svod_tensor::Tensor;
 use test_case::test_case;
 
 use super::declared;
-use crate::atoms::{Core, Fill};
 use crate::build::*;
 use crate::interp::run;
 use crate::ir::*;
 use crate::launch::graph_launch;
 use crate::layouts::WarpGrid;
 use crate::lower::Lowering;
-use crate::schedule::Schedule;
 
 fn data(n: usize, seed: &mut u64) -> Vec<f64> {
     super::rounded(ScalarDType::BFloat16, n, seed, |x| x)
 }
 
-fn check(prog: Program, inputs: Vec<Vec<f64>>, out_elems: usize, warps: u32, tol: f64) {
+fn check(prog: Program, inputs: Vec<Vec<f64>>, out_elems: usize, tol: f64) {
     let Some(target) = super::cp_async_target() else { return };
     let mut params = inputs.clone();
     params.push(vec![0.0; out_elems]);
     let want = run(&prog, params, &[]).unwrap();
-    let lowering = Lowering {
-        core: Core::Warp,
-        device: declared(target),
-        schedule: Schedule::Uniform { fill: Fill::CpAsync, unroll: false, async_products: false },
-        grid: WarpGrid { rows: warps, cols: 1 },
-        swizzle: true,
-    };
+    let lowering = Lowering::new(&declared(target));
     let tensors: Vec<Tensor> = inputs
         .iter()
         .map(|v| Tensor::from_slice(v.iter().map(|&x| x as f32).collect::<Vec<_>>()).cast(DType::BFloat16))
@@ -66,7 +58,7 @@ fn qk_from_registers_and_shared(bq: usize, bkv: usize, d: usize) {
     k.store(s_view, s);
     let mut seed = 1;
     let (qd, kd) = (data(bq * d, &mut seed), data(bkv * d, &mut seed));
-    check(k.finish(), vec![qd, kd], bq * bkv, (bq / 16) as u32, 1e-3);
+    check(k.finish(), vec![qd, kd], bq * bkv, 1e-3);
 }
 
 /// `o = p · v` with P from global memory as the A operand and V through
@@ -91,7 +83,7 @@ fn pv_with_a_transposed_gather(bq: usize, bkv: usize, d: usize) {
     k.store(o_view, o);
     let mut seed = 2;
     let (pd, vd) = (data(bq * bkv, &mut seed), data(bkv * d, &mut seed));
-    check(k.finish(), vec![pd, vd], bq * d, (bq / 16) as u32, 1e-3);
+    check(k.finish(), vec![pd, vd], bq * d, 1e-3);
 }
 
 /// Row max and row sum of a `q · kᵀ` tile, and the broadcast of a row vector
@@ -123,7 +115,7 @@ fn row_reductions_and_broadcast() {
     k.store(sum_view, sum);
     let mut seed = 3;
     let (qd, kd) = (data(bq * d, &mut seed), data(bkv * d, &mut seed));
-    check(k.finish(), vec![qd, kd], bq * (bkv + 2), (bq / 16) as u32, 1e-3);
+    check(k.finish(), vec![qd, kd], bq * (bkv + 2), 1e-3);
 }
 
 /// The card's empirical tensor-core ceiling: register-resident `mma.sync`
@@ -138,7 +130,7 @@ fn mma_peak_probe() {
     let b = k.param::<BF16>("b", ParamKind::In, bn * bk);
     let c = k.param::<F32>("c", ParamKind::Out, blocks * bm * bn);
     k.grid([Sc::from(blocks), Sc::from(1), Sc::from(1)]);
-    k.warps(4);
+    k.warps(WarpGrid { rows: 2, cols: 2 });
     let a_g = k.view(a, 0, [bk, 1], Shape::new(bm, bk), [None, None]);
     let b_g = k.view(b, 0, [bk, 1], Shape::new(bn, bk), [None, None]);
     let a_r = k.load(a_g);
@@ -149,13 +141,7 @@ fn mma_peak_probe() {
     let c_view = k.view(c, block * (bm * bn), [bn, 1], Shape::new(bm, bn), [None, None]);
     k.store(c_view, acc);
     let prog = k.finish();
-    let lowering = Lowering {
-        core: Core::Warp,
-        device: declared(target),
-        schedule: Schedule::Uniform { fill: Fill::CpAsync, unroll: false, async_products: false },
-        grid: WarpGrid { rows: 2, cols: 2 },
-        swizzle: true,
-    };
+    let lowering = Lowering::new(&declared(target));
     let a_t = Tensor::from_slice(vec![0.5f32; bm * bk]).cast(DType::BFloat16);
     let b_t = Tensor::from_slice(vec![0.5f32; bn * bk]).cast(DType::BFloat16);
     let out = Tensor::empty(&[blocks * bm * bn], DType::Float32);

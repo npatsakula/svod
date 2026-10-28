@@ -12,6 +12,7 @@ use super::{GraphSnafu, HeadsSnafu, LaunchSnafu, Result, ShapeSnafu, Tuner, batc
 use crate::kernels::heads::{HeadsSpec, Rope, heads as kernel};
 use crate::kernels::rows::NormCfg;
 use crate::launch;
+use crate::lower::Lowering;
 use crate::tune::TuneStore;
 
 #[derive(Clone, Copy, Debug)]
@@ -86,14 +87,14 @@ pub fn heads(qkv: &Tensor, opts: Qkv) -> Result<(Tensor, Tensor, Tensor)> {
         cfg: cfgs[0],
     };
     let spec = tuned(TuneStore::global(), &planner, qkv.dtype(), &cfgs, spec);
+    super::ran(OP, "heads", spec.cfg);
     let q = output(&[b, t, heads, d], &var, qkv.dtype()).context(GraphSnafu { op: OP })?;
     let k = output(&[b, t, kv_heads, d], &var, qkv.dtype()).context(GraphSnafu { op: OP })?;
     let v = output(&[b, t, kv_heads, d], &var, qkv.dtype()).context(GraphSnafu { op: OP })?;
     let ins: Vec<&Tensor> =
         [Some(qkv), q_norm, k_norm, cos, sin, Some(&q), Some(&k), Some(&v)].into_iter().flatten().collect();
-    let mut outs =
-        launch::graph_launch_all(typed!(qkv.dtype(), kernel, &spec), &spec.cfg.lowering(&planner.device), &ins)
-            .context(LaunchSnafu { op: OP })?;
+    let mut outs = launch::graph_launch_all(typed!(qkv.dtype(), kernel, &spec), &Lowering::new(&planner.device), &ins)
+        .context(LaunchSnafu { op: OP })?;
     let v = outs.pop().expect("v");
     let k = outs.pop().expect("k");
     let q = outs.pop().expect("q");
@@ -105,7 +106,7 @@ pub fn heads(qkv: &Tensor, opts: Qkv) -> Result<(Tensor, Tensor, Tensor)> {
 pub fn tuned(store: &TuneStore, planner: &Planner, dtype: DType, ranked: &[NormCfg], spec: HeadsSpec) -> HeadsSpec {
     let shape = [spec.batch.capacity(), spec.t, spec.heads, spec.kv_heads, spec.d];
     let salt = (&spec.batch, spec.q_norm, spec.k_norm, spec.rope);
-    let build = |cfg| vec![(typed!(dtype, kernel, &HeadsSpec { cfg, ..spec.clone() }), cfg.lowering(&planner.device))];
+    let build = |cfg| vec![(typed!(dtype, kernel, &HeadsSpec { cfg, ..spec.clone() }), Lowering::new(&planner.device))];
     let cfg = Tuner::new(store, &planner.device, dtype.clone(), &shape, salt, build).tuned(OP, ranked, <[_]>::to_vec);
     HeadsSpec { cfg, ..spec }
 }

@@ -46,8 +46,6 @@ const TRIES: usize = 3;
 const AGREE: f64 = 0.1;
 /// Measurement: warps of a throughput probe's block.
 const WARPS: u32 = 4;
-/// Measurement: a throughput probe's warp grid: [`WARPS`] rows of warps.
-const ROWS: WarpGrid = WarpGrid { rows: WARPS, cols: 1 };
 
 /// One measurement: `candidates` are `[baseline, probe]`, the probe doing
 /// `units` more of the primitive.
@@ -189,13 +187,23 @@ pub fn costs(target: &Target) -> Result<Measured> {
 fn priced(target: &Target, mut measure: impl FnMut(Probe) -> Result<f64>) -> Result<Measured> {
     let mut measured = assemble(target, probes(target)?, &mut measure);
     let Measured { costs, unmeasured } = &mut measured;
-    // The cache ladder is read against the DRAM rate; without one, or when a
-    // footprint fails, the cache is unmeasured and fills are priced as DRAM.
+    // The cache ladder is read against the DRAM rate; without one the cache
+    // is unmeasured and fills are priced as DRAM.
     let ladder = if unmeasured.contains(&"global_byte") { None } else { cache(target, costs.global_byte, measure)? };
-    (costs.l2_byte, costs.l2_bytes) = ladder.unwrap_or_else(|| {
-        unmeasured.push("l2_bytes");
-        (costs.global_byte, 0.0)
-    });
+    match ladder {
+        Some(rates) => {
+            assert!(rates.len() <= costs.ladder.len(), "a ladder rung a footprint");
+            costs.l2_byte = rates[0].1;
+            costs.l2_bytes = held(&rates, costs.global_byte).1;
+            for (slot, rate) in costs.ladder.iter_mut().zip(rates) {
+                *slot = rate;
+            }
+        }
+        None => {
+            unmeasured.push("l2_bytes");
+            (costs.l2_byte, costs.l2_bytes) = (costs.global_byte, 0.0);
+        }
+    }
     Ok(measured)
 }
 
@@ -244,8 +252,12 @@ pub const GUESSED: Costs = Costs {
     scatter: 8.0,
     step: 5.0,
     step_group: 5.0,
+    // Twice the 16-bit rate, as most cores with an 8-bit one run it.
+    step_i8: 2.5,
     // Three waves a SIMD hide the chain.
     step_lone: 15.0,
+    // Unmeasured: the 16-bit ratio stands.
+    step_lone_i8: 0.0,
     score: 0.5,
     trip: 150.0,
     trip_rolled: 170.0,
@@ -261,6 +273,7 @@ pub const GUESSED: Costs = Costs {
     latency_one: 900.0,
     l2_byte: 0.0,
     l2_bytes: 0.0,
+    ladder: [(0, 0.0); crate::atoms::LADDER],
 };
 
 /// `probes`, in [`Costs::fields`] order, each measured by `measure` into its
@@ -376,30 +389,40 @@ const FOOTPRINTS: [(&str, usize); 9] = [
     ("probe:cached_256m", 256 << 20),
 ];
 
-/// The cache in front of DRAM, as [`climbed`] reads the ladder of
-/// footprints; `None`, with a warning, when a footprint cannot be measured.
-fn cache(target: &Target, global_byte: f64, measure: impl FnMut(Probe) -> Result<f64>) -> Result<Option<(f64, f64)>> {
+/// The cache ladder, as [`climbed`] reads the footprints; `None`, with a
+/// warning, when no footprint can be measured.
+fn cache(
+    target: &Target,
+    global_byte: f64,
+    measure: impl FnMut(Probe) -> Result<f64>,
+) -> Result<Option<Vec<(usize, f64)>>> {
     let ladder = climbed(cache_probes(target)?, global_byte, measure);
     Ok(ladder.map_err(|e| tracing::warn!("{}: {e}; the cache is unmeasured", target.arch.target_name())).ok())
 }
 
 /// The ladder of `probes` (smallest footprint first) measured until it has
-/// [`settled`] past the cache, read by [`held`]: a small cache's ladder
-/// stops after a few footprints, and no run streams a large one for
-/// nothing.
+/// [`settled`] past the cache: a small cache's ladder stops after a few
+/// footprints, and no run streams a large one for nothing. A rung that
+/// cannot be measured is skipped — the ladder keeps the rungs it has, and
+/// fails only when it holds none.
 pub(crate) fn climbed(
     probes: Vec<(usize, Probe)>,
     global_byte: f64,
     mut measure: impl FnMut(Probe) -> Result<f64>,
-) -> Result<(f64, f64)> {
+) -> Result<Vec<(usize, f64)>> {
     let mut rates = Vec::with_capacity(probes.len());
     for (footprint, probe) in probes {
         if settled(&rates, global_byte) {
             break;
         }
-        rates.push((footprint, measure(probe)?));
+        match measure(probe) {
+            Ok(rate) => rates.push((footprint, rate)),
+            Err(e) => tracing::warn!("probe:cached: {e}; the ladder keeps the rungs it has"),
+        }
     }
-    Ok(held(&rates, global_byte))
+    (!rates.is_empty())
+        .then_some(rates)
+        .ok_or_else(|| Error::Unmeasured { probe: "probe:cached", last: "no rung measured".into() })
 }
 
 /// Whether the ladder's last two footprints both read nearer DRAM's rate
@@ -460,7 +483,9 @@ pub(crate) fn probes(target: &Target) -> Result<Vec<Probe>> {
         p.scatter(),
         p.step(),
         p.step_group(),
+        p.step_i8(),
         p.step_lone(),
+        p.step_lone_i8(),
         p.score(),
         p.trips("probe:trip", true, 2),
         p.rolled_trips(),
@@ -514,8 +539,8 @@ impl<'a> Probes<'a> {
         Ok(Self { target, sms, blocks, warps: o.simds })
     }
 
-    fn lowering(&self, grid: WarpGrid, unroll: bool) -> Lowering {
-        Lowering::uniform(&Device { target: self.target.clone(), costs: Costs::default() }, unroll, grid)
+    fn lowering(&self) -> Lowering {
+        Lowering::new(&Device { target: self.target.clone(), costs: Costs::default() })
     }
 
     /// A relayout-class probe's lowering: a block per SM of a warp per SIMD,
@@ -523,7 +548,7 @@ impl<'a> Probes<'a> {
     /// a barrier spans waves, as in a kernel's block), as a relayout between
     /// two products does; its value is that wait per unit of one wave.
     fn chain(&self, costs: Costs) -> Lowering {
-        let mut lowering = self.lowering(WarpGrid { rows: self.warps, cols: 1 }, false);
+        let mut lowering = self.lowering();
         lowering.device.costs = costs;
         lowering
     }
@@ -554,7 +579,7 @@ impl<'a> Probes<'a> {
     fn smem_byte(&self) -> Probe {
         let (op, tile, iters) = ("probe:smem_byte", Shape::new(32, 128), 1024);
         let units = (self.blocks * iters * tile.elems() * 4) as f64;
-        self.make(op, ScalarDType::Float32, units, true, self.lowering(ROWS, false), |on| {
+        self.make(op, ScalarDType::Float32, units, true, self.lowering(), |on| {
             let mut k = kernel(op, self.blocks, WARPS);
             let x = input::<F32>(&mut k, tile);
             let ring = on.then(|| {
@@ -590,7 +615,7 @@ impl<'a> Probes<'a> {
     fn global_byte(&self) -> Probe {
         let (op, tile) = ("probe:global_byte", Shape::new(32, 128));
         let (blocks, iters) = self.stream_grid(tile.elems() * 4);
-        self.make(op, ScalarDType::Int32, STREAM as f64, true, self.lowering(ROWS, false), |on| {
+        self.make(op, ScalarDType::Int32, STREAM as f64, true, self.lowering(), |on| {
             let mut k = kernel(op, blocks, WARPS);
             let src = k.param::<I32>("src", ParamKind::In, STREAM / 4);
             let block = k.block(0);
@@ -622,7 +647,7 @@ impl<'a> Probes<'a> {
         let iters = 4 * STREAM / (tile.elems() * 4) / blocks;
         let region = region_tiles(footprint);
         let units = (blocks * iters * tile.elems() * 4) as f64;
-        self.make(op, ScalarDType::Int32, units, true, self.lowering(ROWS, false), |on| {
+        self.make(op, ScalarDType::Int32, units, true, self.lowering(), |on| {
             let mut k = kernel(op, blocks, WARPS);
             let src = k.param::<I32>("src", ParamKind::In, region * tile.elems());
             let block = k.block(0);
@@ -674,8 +699,19 @@ impl<'a> Probes<'a> {
     /// 16×16×16 matrix-core steps on register operands into four
     /// independent accumulators per warp.
     fn step(&self) -> Probe {
-        let lowering = self.lowering(WarpGrid { rows: 2, cols: 2 }, false);
-        self.steps("probe:step", [64, 64, 16], self.blocks, WARPS, lowering, true)
+        let grid = WarpGrid { rows: 2, cols: 2 };
+        self.steps::<BF16>("probe:step", [64, 64, 16], self.blocks, grid, self.lowering(), true)
+    }
+
+    /// [`Self::step`] over 8-bit integers into i32, two NVIDIA or CDNA atoms
+    /// deep; no candidates where the target has no such core.
+    fn step_i8(&self) -> Probe {
+        let grid = WarpGrid { rows: 2, cols: 2 };
+        let mut probe = self.steps::<I8>("probe:step_i8", [64, 64, 64], self.blocks, grid, self.lowering(), true);
+        if self.target.geometry_of(ScalarDType::Int8).is_none() {
+            probe.candidates.clear();
+        }
+        probe
     }
 
     /// [`Self::trips`] over a rolled ring of two slots, priced apart from an
@@ -697,7 +733,7 @@ impl<'a> Probes<'a> {
         let (op, [bm, bn, bk]) = ("probe:step_group", [64usize, 256, 64]);
         let iters = 1024;
         let units = (self.blocks * iters * bm * bn * bk / 4096) as f64;
-        let mut lowering = self.lowering(ROWS, false);
+        let mut lowering = self.lowering();
         lowering.core = Core::Group;
         let mut probe = self.make(op, ScalarDType::BFloat16, units, true, lowering, |on| {
             let mut k = kernel(op, self.blocks, WARPS);
@@ -727,29 +763,56 @@ impl<'a> Probes<'a> {
     fn step_lone(&self) -> Probe {
         let warps = self.warps;
         let tile = [32 * warps as usize, 32, 16];
-        self.steps("probe:step_lone", tile, self.sms as usize, warps, self.chain(Costs::default()), false)
+        self.steps::<BF16>(
+            "probe:step_lone",
+            tile,
+            self.sms as usize,
+            warps.into(),
+            self.chain(Costs::default()),
+            false,
+        )
+    }
+
+    /// [`Self::step_lone`] over 8-bit integers: the 8-bit chain's own
+    /// latency, whose ratio to [`Self::step_i8`] is the waves a SIMD hides
+    /// an 8-bit product's chain with; no candidates where the target has no
+    /// such core.
+    fn step_lone_i8(&self) -> Probe {
+        let warps = self.warps;
+        let mut probe = self.steps::<I8>(
+            "probe:step_lone_i8",
+            [32 * warps as usize, 32, 32],
+            self.sms as usize,
+            warps.into(),
+            self.chain(Costs::default()),
+            false,
+        );
+        if self.target.geometry_of(ScalarDType::Int8).is_none() {
+            probe.candidates.clear();
+        }
+        probe
     }
 
     /// `blocks` of `warps` each accumulating a `bm × bn` product over `bk`
     /// every iteration, where the baseline holds the zero accumulator; a
     /// unit is a 16×16×16 step of the SM (`per_sm`) or of one wave.
-    fn steps(
+    fn steps<T: MmaIn>(
         &self,
         op: &'static str,
         [bm, bn, bk]: [usize; 3],
         blocks: usize,
-        warps: u32,
+        grid: WarpGrid,
         lowering: Lowering,
         per_sm: bool,
     ) -> Probe {
         let iters = 1024;
         let steps = iters * bm * bn * bk / 4096;
-        let units = if per_sm { blocks * steps } else { steps / warps as usize } as f64;
-        self.make(op, ScalarDType::BFloat16, units, per_sm, lowering, |on| {
-            let mut k = kernel(op, blocks, warps);
-            let a = input::<BF16>(&mut k, Shape::new(bm, bk));
-            let b = input::<BF16>(&mut k, Shape::new(bn, bk));
-            let zero = k.zeros::<F32>(Shape::new(bm, bn));
+        let units = if per_sm { blocks * steps } else { steps / grid.count() as usize } as f64;
+        self.make(op, T::DTYPE, units, per_sm, lowering, |on| {
+            let mut k = kernel(op, blocks, grid);
+            let a = input::<T>(&mut k, Shape::new(bm, bk));
+            let b = input::<T>(&mut k, Shape::new(bn, bk));
+            let zero = k.zeros::<T::Acc>(Shape::new(bm, bn));
             let [acc] = if on {
                 k.loop_(iters, [zero], |k, _, [acc]| [k.mma_oriented(acc, a, false, b, true, Some(Orient::Direct))])
             } else {
@@ -765,7 +828,7 @@ impl<'a> Probes<'a> {
     fn score(&self) -> Probe {
         let (op, tile, iters) = ("probe:score", Shape::new(64, 128), 256);
         let units = (self.blocks * iters * tile.elems()) as f64;
-        self.make(op, ScalarDType::Float32, units, true, self.lowering(ROWS, false), |on| {
+        self.make(op, ScalarDType::Float32, units, true, self.lowering(), |on| {
             let mut k = kernel(op, self.blocks, WARPS);
             let x = input::<F32>(&mut k, tile);
             let zero = k.zeros::<F32>(Shape::new(tile.rows, 1));
@@ -845,7 +908,7 @@ impl<'a> Probes<'a> {
         let units = (blocks * TRIPS) as f64;
         let chunks = chunked(tile, 4, WARPS, self.target.wave, Axis::Col).expect("a chunk layout");
         let sms = self.sms as usize;
-        let probe = self.make(op, ScalarDType::Int32, units, true, self.lowering(ROWS, unroll), |on| {
+        let probe = self.make(op, ScalarDType::Int32, units, true, self.lowering(), |on| {
             // Every trip probe runs these programs, named alike.
             let mut k = kernel("probe:trip", blocks, WARPS);
             let src = k.param::<I32>("src", ParamKind::In, sms * region * tile.elems());
@@ -861,7 +924,7 @@ impl<'a> Probes<'a> {
                 k.view(src, (first.clone() + at) * tile.elems(), [32, 1], tile, [None, None])
             };
             let sum = if on {
-                ring_sum(&mut k, TRIPS, stages, zero, chunk)
+                ring_sum(&mut k, TRIPS, Ring { stages, unroll, crews: 1 }, zero, chunk)
             } else {
                 // The ring's slots, written once and fenced before the loop; a
                 // trip reads the slot `order` names, as the ring's consume
@@ -941,7 +1004,9 @@ impl<'a> Probes<'a> {
         let (warps, lanes) = (self.warps, self.target.wave);
         let work: f64 = helds
             .iter()
-            .flat_map(|h| [plain.relayout(h, warps, lanes, &costs), h.relayout(plain, warps, lanes, &costs)])
+            .flat_map(|h| {
+                [plain.relayout(h, warps, lanes, &costs, false), h.relayout(plain, warps, lanes, &costs, false)]
+            })
             .map(|r| r.work())
             .sum();
         let units = iters as f64 * work * tile.elems() as f64 / warps as f64;
@@ -987,7 +1052,7 @@ impl<'a> Probes<'a> {
         let waves = self.sms as usize;
         let trips = LATENCY_TRIPS.min(STREAM / 4 / tile.elems() / waves);
         let stages = self.target.fill.stages(stages);
-        let lowering = self.lowering(WarpGrid { rows: 1, cols: 1 }, false);
+        let lowering = self.lowering();
         self.make(op, ScalarDType::Int32, (trips - stages) as f64, false, lowering, |on| {
             let mut k = kernel(op, waves, 1);
             let src = k.param::<I32>("src", ParamKind::In, STREAM / 4);
@@ -1002,7 +1067,7 @@ impl<'a> Probes<'a> {
     }
 }
 
-fn kernel(op: &str, blocks: usize, warps: u32) -> Kernel {
+fn kernel(op: &str, blocks: usize, warps: impl Into<WarpGrid>) -> Kernel {
     let mut k = Kernel::new(op.replace(':', "_"));
     k.grid([Sc::from(blocks), Sc::from(1), Sc::from(1)]);
     k.warps(warps);
@@ -1029,23 +1094,23 @@ fn sum_loads<T: Elem>(
 fn ring_sum(
     k: &mut Kernel,
     trips: usize,
-    stages: usize,
+    ring: impl Into<Ring>,
     init: Regs<I32>,
     view: impl FnOnce(&mut Kernel, Sc) -> Gmem<I32>,
 ) -> Regs<I32> {
-    let tile = k.shape(init);
-    let ring = k.smem::<I32>("ring", stages * tile.elems());
+    let (tile, ring) = (k.shape(init), ring.into());
+    let slots = k.smem::<I32>("ring", ring.stages * tile.elems());
     let [sum] = k.pipeline(
         trips,
-        stages,
+        ring,
         [init],
         |k, step, slot| {
             let v = view(k, step);
-            let s = k.smem_slot::<I32>(ring, slot, tile);
+            let s = k.smem_slot::<I32>(slots, slot, tile);
             k.stage(s, v, CopyMode::Async);
         },
         |k, _, slot, [sum]| {
-            let s = k.smem_slot::<I32>(ring, slot, tile);
+            let s = k.smem_slot::<I32>(slots, slot, tile);
             let y = k.load(s);
             [k.binary(sum, y, BinaryOp::Add)]
         },

@@ -5,8 +5,9 @@ use svod_codegen::llvm::nvptx::smem::{cp_async_16, cp_async_16_zfill};
 use svod_ir::ConstValue;
 
 use crate::layout as frag;
-use crate::layouts::Relayout;
+use crate::layouts::{Move, Pick, Relayout};
 use crate::lower::DivergentBarrierSnafu;
+use snafu::OptionExt;
 
 use super::*;
 
@@ -25,7 +26,7 @@ impl Emit<'_> {
     /// The warps a register tile is spread over: the lowering's grid, which
     /// key warps sharing a block's tiles are not part of.
     pub(super) fn grid_warps(&self) -> u32 {
-        self.low.grid.count()
+        self.prog.warp_grid.count()
     }
 
     /// Global → shared, every thread of the copy's scope (the block's, or
@@ -41,7 +42,7 @@ impl Emit<'_> {
         let threads = (warps * self.low.device.target.wave) as i64;
         let chunks = d.shape.rows as i64 * cols / chunk;
         snafu::ensure!(
-            cols % chunk == 0 && chunks % threads == 0,
+            crate::layouts::fills_in_chunks(d.shape, d.dtype.bytes(), threads as usize),
             UnsupportedSnafu { what: format!("a {}×{} fill by {threads} threads", d.shape.rows, cols) }
         );
         snafu::ensure!(self.along(&d).0 == Axis::Col, UnsupportedSnafu { what: "a chunk fill of a column-major tile" });
@@ -101,34 +102,28 @@ impl Emit<'_> {
     }
 
     /// Shared → registers under the destination's layout: `ldmatrix.x4` per
-    /// 16×16 block when the layout is a register permutation of what it
-    /// produces, else vector loads per register run.
+    /// 16×16 block of 16-bit elements (16×32 of 8-bit ones, untransposed)
+    /// when the layout is a register permutation of what it produces, else
+    /// vector loads per register run.
     pub(super) fn gather(&mut self, dst: ValId, src: ValId) -> Result<()> {
         let l = self.layout(dst).clone();
         let s = self.view(src);
         let [sub_r, sub_c] = l.sub_shape();
         // `ldmatrix` reads 16-byte memory rows: a row-major tile only.
         let rows = self.along(&s).0 == Axis::Col;
-        if self.low.device.target.ldmatrix && rows && s.dtype.bytes() == 2 && sub_r % 16 == 0 && sub_c % 16 == 0 {
-            for trans in [false, true] {
-                let produced = TileLayout {
-                    frag: frag::ldmatrix_x4(trans),
-                    reps: [sub_r / 16, sub_c / 16],
-                    warps: l.warps.clone(),
-                };
+        let bytes = s.dtype.bytes() as u32;
+        let cols = 16 * 2 / bytes;
+        if self.low.device.target.ldmatrix && rows && matches!(bytes, 1 | 2) && sub_r % 16 == 0 && sub_c % cols == 0 {
+            let forms: &[bool] = if bytes == 2 { &[false, true] } else { &[false] };
+            for &trans in forms {
+                let frag = if bytes == 2 { frag::ldmatrix_x4(trans) } else { frag::ldmatrix_x4_bytes() };
+                let produced = TileLayout { frag, reps: [sub_r / 16, sub_c / cols], warps: l.warps.clone() };
                 if let Some(perm) = l.as_permutation_of(&produced, self.grid_warps(), self.low.device.target.wave) {
                     return self.ldmatrix_gather(dst, &s, &l, trans, &perm);
                 }
             }
         }
-        for (j, w) in self.runs(&l, &s) {
-            let c = self.coord(&l, j);
-            let (off, _) = self.address(&s, &c);
-            let v = self.mem_load(&s.buf, &off, w, None);
-            let vals = (0..w as usize).map(|e| elem(&v, e, w as usize)).collect();
-            self.reg_store(dst, j, vals);
-        }
-        Ok(())
+        self.gather_view(dst, &s)
     }
 
     /// Global → registers: past a plain bound the load is gated; a gathered
@@ -145,7 +140,7 @@ impl Emit<'_> {
             return self.tr_load_regs(dst, &s, &l, &perm);
         }
         let gathered = matches!(s.place, Some(Place::Global { rows: Some(_), .. }));
-        let l2_only = mode == CopyMode::Staged && self.low.schedule.fill() == Fill::CpAsync;
+        let l2_only = mode == CopyMode::Staged && self.low.device.target.fill == Fill::CpAsync;
         for (j, w) in self.runs(&l, &s) {
             let c = self.coord(&l, j);
             let (off, gate) = self.address(&s, &c);
@@ -184,21 +179,36 @@ impl Emit<'_> {
         l.as_permutation_of(&produced, self.grid_warps(), self.low.device.target.wave)
     }
 
+    /// Registers → memory in the runs [`Self::runs`] gives, gated by the
+    /// view's bounds; a run that a column bound may end inside (one not
+    /// known to be a multiple of its width) is stored element by element,
+    /// each gated, so nothing past the bound is written.
     pub(super) fn store_regs(&mut self, dst: ValId, src: ValId) -> Result<()> {
         let l = self.layout(src).clone();
         let d = self.view(dst);
-        for (j, w) in self.runs(&l, &d) {
+        let ragged = |w: u32| match &d.place {
+            Some(Place::Global { bounds: [_, Some(b)], .. }) => {
+                self.along(&d).0 == Axis::Col && !multiple_of(self.prog, *b, i64::from(w))
+            }
+            _ => false,
+        };
+        let runs: Vec<(u32, u32)> = self
+            .runs(&l, &d)
+            .into_iter()
+            .flat_map(|(j, w)| if w > 1 && ragged(w) { (j..j + w).map(|e| (e, 1)).collect() } else { vec![(j, w)] })
+            .collect();
+        for (j, w) in runs {
             let c = self.coord(&l, j);
             let (off, gate) = self.address(&d, &c);
-            let vals = self.reg_loads(src, j, w);
+            let val = self.stacked(src, j, w);
             match gate {
                 Some(gate) => {
                     let tag = self.next_tag();
                     let if_ = self.push(UOp::if_(gate, smallvec![]).rtag(Some(smallvec![tag as usize])));
-                    self.mem_store(&d.buf, &off, vals);
+                    self.mem_store_wide(&d.buf, &off, w, val);
                     self.push(UOp::endif(if_));
                 }
-                None => self.mem_store(&d.buf, &off, vals),
+                None => self.mem_store_wide(&d.buf, &off, w, val),
             }
         }
         Ok(())
@@ -206,7 +216,11 @@ impl Emit<'_> {
 
     pub(super) fn relayout(&mut self, dst: ValId, src: ValId) -> Result<()> {
         let (ls, ld) = (self.layout(src).clone(), self.layout(dst).clone());
-        match ls.relayout(&ld, self.grid_warps(), self.low.device.target.wave, &self.low.device.costs) {
+        // A layout the program pins is its author's call (a probe's forced
+        // pair); the inference's relayouts alone are pinned.
+        let pinned = self.prog.pins.iter().any(|(p, _)| p == &src);
+        let pin = !pinned && self.low.device.pins_exchanges(self.value(src).dtype);
+        match ls.relayout(&ld, self.grid_warps(), self.low.device.target.wave, &self.low.device.costs, pin) {
             Relayout::Identity => {
                 let buf = self.reg_buf(src);
                 let root = self.root(dst);
@@ -220,33 +234,106 @@ impl Emit<'_> {
                 }
                 Ok(())
             }
+            // Every lane has a source: a shift's moves with nothing to fill.
             Relayout::Exchange(picks) => {
-                // A (mask, register) move is made once and shared by every
-                // destination register that selects it.
-                let mut moved: HashMap<(u32, u32), Arc<UOp>> = HashMap::new();
-                for (jd, picks) in picks.into_iter().enumerate() {
-                    let mut out: Option<Arc<UOp>> = None;
-                    for p in picks.into_iter().rev() {
-                        let v = moved
-                            .entry((p.mask, p.reg))
-                            .or_insert_with(|| {
-                                let x = self.reg_load(src, p.reg);
-                                if p.mask == 0 { x } else { self.shuffle_xor(&x, p.mask) }
-                            })
-                            .clone();
-                        out = Some(match out {
-                            None => v,
-                            Some(rest) => {
-                                let mine = self.hoist(self.lane_in(p.lanes));
-                                UOp::try_where(mine, v, rest).expect("exchange select")
-                            }
-                        });
-                    }
-                    self.reg_store(dst, jd as u32, vec![out.expect("a move per register")]);
-                }
+                let moves = picks.into_iter().map(|p| (p, 0)).collect();
+                self.moved(dst, moves, None, false, |e, reg| e.reg_load(src, reg));
                 Ok(())
             }
             Relayout::ViaSmem => self.relayout_via_smem(dst, src),
+        }
+    }
+
+    /// `dst = src` one step on along `axis`, `fill` first: in-lane where a
+    /// lane holds the predecessor, else the lane moves of
+    /// [`TileLayout::shift`], selected by lane as an exchange's.
+    pub(super) fn shift(&mut self, dst: ValId, src: ValId, axis: Axis, fill: Const) -> Result<()> {
+        let moves = self
+            .moves_of(dst, src, Move::Shift(axis))
+            .context(UnsupportedSnafu { what: "a shift whose predecessors are in another warp" })?;
+        let dtype = DType::Scalar(self.value(dst).dtype);
+        let fill = match fill {
+            Const::Int(i) => UOp::const_(dtype, ConstValue::Int(i)),
+            Const::Float(f) => UOp::const_(dtype, ConstValue::Float(f)),
+        };
+        self.moved(dst, moves, Some(fill), false, |e, reg| e.reg_load(src, reg));
+        Ok(())
+    }
+
+    /// `dst = src` exchanged across the bits of `mask` along `axis`: a
+    /// register renaming where a lane holds the partner, else the lane moves
+    /// of [`TileLayout::flip`].
+    pub(super) fn flip(&mut self, dst: ValId, src: ValId, axis: Axis, mask: u32) -> Result<()> {
+        let moves = self
+            .moves_of(dst, src, Move::Flip(axis, mask))
+            .context(UnsupportedSnafu { what: "a flip whose partners are in another warp" })?;
+        self.moved(dst, moves, None, false, |e, reg| e.reg_load(src, reg));
+        Ok(())
+    }
+
+    /// `dst` the `j`th of the columns each lane holds of `src`'s rows (with
+    /// `col`, their columns): a renaming where the lane holds it, else the
+    /// lane moves of [`TileLayout::deal`].
+    pub(super) fn deal(&mut self, dst: ValId, src: ValId, j: u32, col: bool) -> Result<()> {
+        let ls = self.layout(src).clone();
+        let moves = self
+            .moves_of(dst, src, Move::Deal(j))
+            .context(UnsupportedSnafu { what: "a deal of columns another warp holds" })?;
+        match col {
+            false => self.moved(dst, moves, None, false, |e, reg| e.reg_load(src, reg)),
+            true => self.moved(dst, moves, None, true, |e, reg| {
+                let (_, c) = e.coord(&ls, reg).full();
+                e.hoist(c)
+            }),
+        }
+        Ok(())
+    }
+
+    /// The moves of `how` from `src`'s layout into `dst`'s.
+    fn moves_of(&mut self, dst: ValId, src: ValId, how: Move) -> Option<Vec<(Vec<Pick>, u64)>> {
+        let lay = self.lay;
+        let at = |v: ValId| lay[v.index()].as_ref().expect("every register value has a layout");
+        self.moves.get(at(src), at(dst), how).cloned()
+    }
+
+    /// Each register of `dst` from the `moves` of the source registers
+    /// `load` reads per lane, `fill` in the lanes without one. A `pure`
+    /// source (what `load` reads is listed nowhere: a lane's coordinate) is
+    /// moved by values hoisted as it is, which every branch reaching it may
+    /// share.
+    fn moved(
+        &mut self,
+        dst: ValId,
+        moves: Vec<(Vec<Pick>, u64)>,
+        fill: Option<Arc<UOp>>,
+        pure: bool,
+        load: impl Fn(&mut Self, u32) -> Arc<UOp>,
+    ) {
+        let place = |e: &mut Self, u: Arc<UOp>| if pure { e.hoist(u) } else { u };
+        let mut moved: HashMap<(u32, u32), Arc<UOp>> = HashMap::new();
+        for (jd, (picks, first)) in moves.into_iter().enumerate() {
+            let mut out = (first != 0).then(|| fill.clone().expect("a fill where a lane has no source"));
+            for p in picks.into_iter().rev() {
+                let v = moved
+                    .entry((p.mask, p.reg))
+                    .or_insert_with(|| {
+                        let x = load(self, p.reg);
+                        if p.mask == 0 {
+                            return x;
+                        }
+                        let moved = self.shuffle_xor(&x, p.mask);
+                        place(self, moved)
+                    })
+                    .clone();
+                out = Some(match out {
+                    None => v,
+                    Some(rest) => {
+                        let mine = self.hoist(self.lane_in(p.lanes));
+                        place(self, UOp::try_where(mine, v, rest).expect("shift select"))
+                    }
+                });
+            }
+            self.reg_store(dst, jd as u32, vec![out.expect("a source per register")]);
         }
     }
 
@@ -271,7 +358,8 @@ impl Emit<'_> {
         let scratch = match self.scratch.get(&dtype) {
             Some((buf, size)) if *size >= elems * regions => buf.clone(),
             _ => {
-                let buf = UOp::buffer(self.local_slot, elems * regions, DType::Scalar(dtype), AddrSpace::Local, None);
+                let buf =
+                    UOp::committed_buffer(self.local_slot, elems * regions, DType::Scalar(dtype), AddrSpace::Local);
                 self.local_slot += 1;
                 let buf = self.hoist(buf);
                 self.scratch.insert(dtype, (buf.clone(), elems * regions));
@@ -295,17 +383,20 @@ impl Emit<'_> {
         self.gather_view(dst, &view)
     }
 
+    /// Registers → a view without bounds (a shared tile, the scratch), in
+    /// the runs [`Self::runs`] gives.
     pub(super) fn store_view(&mut self, d: &View, src: ValId) -> Result<()> {
         let l = self.layout(src).clone();
         for (j, w) in self.runs(&l, d) {
             let c = self.coord(&l, j);
             let (off, _) = self.address(d, &c);
-            let vals = self.reg_loads(src, j, w);
-            self.mem_store(&d.buf, &off, vals);
+            let val = self.stacked(src, j, w);
+            self.mem_store_wide(&d.buf, &off, w, val);
         }
         Ok(())
     }
 
+    /// A view without bounds → registers, in the runs [`Self::runs`] gives.
     pub(super) fn gather_view(&mut self, dst: ValId, s: &View) -> Result<()> {
         let l = self.layout(dst).clone();
         for (j, w) in self.runs(&l, s) {

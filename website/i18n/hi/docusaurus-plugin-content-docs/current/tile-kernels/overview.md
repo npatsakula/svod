@@ -69,8 +69,8 @@ Nemotron-3-Diarization (bf16, चार steps) 1064 dispatches में 45.82 m
 
 :::note[इस रिलीज़ में नहीं]
 Hopper TMA और mbarrier producers (sm_90 `cp.async` से भरे जाने वाले `wgmma` चलाता है), Blackwell
-`tcgen05`, 32×32 MFMA, Apple kernels, fp8/int8, attention backward, और convolution का image-staged
-रूप। देखें [पोर्टेबिलिटी](./portability#not-in-this-release)।
+`tcgen05`, 32×32 MFMA, Apple kernels, fp8, nearest-neighbour search के अलावा int8, attention
+backward, और convolution का image-staged रूप। देखें [पोर्टेबिलिटी](./portability#not-in-this-release)।
 :::
 
 ## पढ़ने का क्रम {#reading-order}

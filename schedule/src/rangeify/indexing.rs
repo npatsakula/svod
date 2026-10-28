@@ -986,6 +986,9 @@ fn apply_movement_op_uncached(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> 
                     };
                     if expanding { UOp::index_const(0) } else { Arc::clone(rng) }
                 })
+                // The leading axes an EXPAND adds to a lower-rank source index
+                // nothing in it (Tinygrad `indexing.py`: `rngs[len(arg):]`).
+                .skip(new_shape_vals.len().saturating_sub(in_shape.len()))
                 .collect()
         }
 

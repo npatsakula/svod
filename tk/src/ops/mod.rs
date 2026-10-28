@@ -10,9 +10,11 @@ pub mod config;
 pub(crate) mod conv;
 pub(crate) mod heads;
 pub(crate) mod linear;
+pub(crate) mod nearest;
 pub(crate) mod norm;
 pub mod shape;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -28,13 +30,16 @@ pub use self::attention::{Attn, Cache, Chunk, KeyMask, attention};
 pub use self::conv::{Conv, conv2d};
 pub use self::heads::{Qkv, heads};
 pub use self::linear::{Linear, linear};
+pub use self::nearest::{
+    MARGIN, Metric, Nearest, QuantScheme, Quantized, Rerank, Search, k_nearest, k_nearest_reranked, nearest,
+};
 pub use self::norm::{add_layer_norm, add_rms_norm, layer_norm, rms_norm};
 use crate::atoms::{Device, Target};
 pub use crate::kernels::Act;
 use crate::kernels::Batch;
-use crate::tune::{self, Bench, TuneKey, TuneStore};
+use crate::tune::{self, Bench, Pass, TuneKey, TuneStore};
 use config::Planner;
-use shape::{BatchVar, Plan};
+use shape::{Fallback, Plan};
 
 /// The salt of the tunings the device tests and GEMM probes run, keyed by
 /// the kernel's name (`gemm`) rather than an op's: [`tuned::gemm_probe`]
@@ -51,6 +56,7 @@ pub mod tuned {
     pub use super::conv::tuned as conv;
     pub use super::heads::tuned as heads;
     pub use super::linear::{probed as gemm_probe, tuned as linear};
+    pub use super::nearest::tuned as nearest;
     pub use super::norm::tuned as norm;
 }
 
@@ -60,12 +66,50 @@ pub mod tuned {
 /// showed (its verdict, registers and spilled bytes), and the tuned pick.
 pub const PLAN: &str = "svod_tk::plan";
 
+/// What an op ran, asked of the last one this thread ran ([`chosen`]): the
+/// kernel family (the kernel's name, `gemm` say) under the op's name, with
+/// the config its tuning picked — the pick's Debug text, a tile, or a
+/// reranked search's rows' dtype beside its config — or why the graph ran
+/// instead. A reranked op's record is its search's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Chosen {
+    /// The kernel `family` `op` launched under `cfg`: a nearest pick's text
+    /// names its path (its score matrix, queue, splits), an attention one
+    /// its split count.
+    Kernel { op: &'static str, family: &'static str, cfg: String },
+    /// The graph, and why.
+    Graph { op: &'static str, why: Fallback },
+}
+
+thread_local! {
+    /// The last op this thread ran's [`Chosen`], set where the op decides.
+    static CHOSEN: RefCell<Option<Chosen>> = const { RefCell::new(None) };
+}
+
+/// The last op this thread ran's [`Chosen`]: the same facts the planner log
+/// holds, as a value a caller (or a test) reads beside the tensors the op
+/// returned. `None` before an op ran on this thread.
+pub fn chosen() -> Option<Chosen> {
+    CHOSEN.with(|c| c.borrow().clone())
+}
+
+/// `op`'s kernel `family` under `cfg`, its pick.
+pub(crate) fn ran(op: &'static str, family: &'static str, cfg: impl Debug) {
+    CHOSEN.with(|c| *c.borrow_mut() = Some(Chosen::Kernel { op, family, cfg: format!("{cfg:?}") }));
+}
+
+/// `op` took the graph for `why`.
+pub(crate) fn ran_graph(op: &'static str, why: Fallback) {
+    CHOSEN.with(|c| *c.borrow_mut() = Some(Chosen::Graph { op, why }));
+}
+
 /// `plan`'s ranked configs, or `None` with why `op` takes the graph logged.
 fn kernel<C>(op: &'static str, plan: Plan<C>) -> Option<Arc<[C]>> {
     match plan {
         Plan::Kernel(cfgs) => Some(cfgs),
         Plan::Graph(why) => {
             tracing::debug!(target: PLAN, op, ?why, "graph");
+            ran_graph(op, why);
             None
         }
     }
@@ -80,6 +124,10 @@ pub enum Error {
     Dtype { op: &'static str, operand: &'static str, got: DType, want: DType },
     #[snafu(display("{op}: {heads} query heads are not a multiple of {kv_heads} key/value heads"))]
     Heads { op: &'static str, heads: usize, kv_heads: usize },
+    #[snafu(display("{op}: a row keeps no score (k = 0)"))]
+    NoScores { op: &'static str },
+    #[snafu(display("{op}: k is {got}, neither a count nor a bound variable"))]
+    Unbound { op: &'static str, got: String },
     #[snafu(display("{op}: {source}"))]
     Graph {
         op: &'static str,
@@ -113,12 +161,18 @@ pub(crate) fn planner(device: &DeviceSpec) -> Option<Arc<Planner>> {
     planners
         .entry(device.clone())
         .or_insert_with(|| {
-            let target = Target::for_device(device).filter(config::has_kernels)?;
+            // The compile-probe oracle gates the target's capabilities first:
+            // its verdicts are asked of the device's own toolchain and cached
+            // beside the probes, the tables the fallback and the cross-check.
+            let target = crate::oracle::gate(Target::for_device(device).filter(config::has_kernels)?);
             // A device no probe can scale to (no SM count) has no planner; a
             // probe that fails leaves its field at zero and the planner ranks on.
             let measured = crate::probe::costs(&target)
                 .inspect_err(|e| tracing::warn!("{}: no tk planner: {e}", target.arch.target_name()))
                 .ok()?;
+            // Its layer-0 facts are queried at the same time; no hand value
+            // reads them yet (capture-and-expose, phase B).
+            config::facts_of(device);
             Planner::measured(target, measured).map(Arc::new)
         })
         .clone()
@@ -145,6 +199,10 @@ pub(crate) struct Tuner<'a, C, B> {
     salt: String,
     build: B,
     bench: Bench<C>,
+    /// The least ns each candidate can honestly take
+    /// ([`Planner::floor_of`]): a measurement under it is refused, never a
+    /// pick. `None` where the family's problem carries no claim.
+    floor: Option<Box<tune::Floor<'a, C>>>,
 }
 
 impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> {
@@ -169,13 +227,24 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
             salt: format!("{salt:?}"),
             build,
             bench: Bench::default(),
+            floor: None,
         }
+    }
+
+    /// [`Self::new`] refusing measurements under their candidate's floor
+    /// (`floor`, of [`Planner::floor_of`] of the problem's claim): a
+    /// wrong-but-fast reading — a stamp that landed off its kernel — never
+    /// becomes the pick.
+    pub(crate) fn floored(mut self, floor: impl Fn(&C) -> Option<f64> + 'a) -> Self {
+        self.floor = Some(Box::new(floor));
+        self
     }
 
     /// The fingerprint of the programs `build` makes of `list`, what an
     /// admission's store line carries: a lowering change re-judges.
-    fn programs(store: &TuneStore, build: &B, list: &[C]) -> u64 {
-        store.fingerprint(&list.iter().map(|&c| build(c)).collect::<Vec<_>>())
+    /// The programs lowered for it are kept in `keep` for their compile.
+    fn programs(store: &TuneStore, build: &B, list: &[C], keep: &tune::Lowerings) -> u64 {
+        store.fingerprint_keeping(&list.iter().map(|&c| build(c)).collect::<Vec<_>>(), Some(keep)).0
     }
 
     fn key(&self, op: &'static str, list: &[C]) -> TuneKey {
@@ -199,16 +268,17 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
         let ranked = &config::representatives(ranked);
         let key = self.key(op, ranked);
         let (store, bench, build) = (self.store, &mut self.bench, &self.build);
-        let programs = || Self::programs(store, build, &ranked[..ranked.len().min(config::FIRST)]);
-        let find = || config::first_clean(ranked, |batch| bench.admit(batch, build));
-        let at = store.first(&key, programs, find);
+        let keep = bench.lowered.clone();
+        let programs = || Self::programs(store, build, &ranked[..ranked.len().min(config::FIRST)], &keep);
+        let find = || config::first_clean(ranked, |batch| bench.admit(batch, build, store));
+        let at = store.first(&key, ranked, programs, find);
         let cfg = ranked.get(at.unwrap_or(0)).copied();
         tracing::debug!(target: PLAN, op, shape = ?self.shape, ?cfg, stored = at.is_some(), "first");
         cfg
     }
 
     /// The configs of `ranked` (best guess first) the tuner chooses among
-    /// ([`config::shortlist`]), compiled in ranked batches on a store miss
+    /// ([`config::shortlist`]), compiled in parallel on a store miss
     /// and kept in the store under the shortlist's programs; with tuning
     /// off, the [`Self::first_clean`] alone.
     pub(crate) fn admitted(&mut self, op: &'static str, ranked: &[C]) -> Vec<C> {
@@ -217,9 +287,10 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
         }
         let key = self.key(op, ranked);
         let (store, bench, build) = (self.store, &mut self.bench, &self.build);
-        let programs = || Self::programs(store, build, &ranked[..ranked.len().min(config::SHORTLIST)]);
-        let admit = || config::shortlist(ranked, |batch| bench.admit(batch, build));
-        let found = store.admitted(&key, programs, admit);
+        let keep = bench.lowered.clone();
+        let programs = || Self::programs(store, build, &ranked[..ranked.len().min(config::SHORTLIST)], &keep);
+        let admit = || bench.shortlist(ranked, build, store);
+        let found = store.admitted(&key, ranked, programs, admit);
         let configs: Vec<C> = match &found {
             Some(at) => at.iter().map(|&i| ranked[i]).collect(),
             None => config::distinct(ranked).take(config::SHORTLIST).collect(),
@@ -229,15 +300,20 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
     }
 
     /// `candidates` in the order they ran by the global store under `op`,
-    /// fastest first, each with its device ns, timed on a miss; as given
-    /// and untimed when tuning is off, alone or nothing ran.
-    pub(crate) fn ordered(&mut self, op: &'static str, candidates: &[C]) -> Vec<(C, Option<u64>)> {
+    /// fastest first, each with its device ns, timed through `pass` on a
+    /// miss (a screen's order kept under its own key); as given and untimed
+    /// when tuning is off, alone or nothing ran.
+    pub(crate) fn ordered(&mut self, op: &'static str, candidates: &[C], pass: Pass) -> Vec<(C, Option<u64>)> {
         let untimed = || candidates.iter().map(|&c| (c, None)).collect();
         if !tune::enabled() || candidates.len() == 1 {
             return untimed();
         }
-        let key = self.key(op, candidates);
-        let Some(timed) = self.store.choose(&key, candidates, &self.build, &mut self.bench) else { return untimed() };
+        let key = self.keyed(op, if pass == Pass::Screen { " screened" } else { "" }, candidates);
+        let bench = &mut self.bench;
+        let floor = self.floor.as_deref();
+        let Some(timed) = self.store.choose(&key, candidates, &self.build, bench, pass, floor) else {
+            return untimed();
+        };
         let timed: Vec<(C, u64)> = timed.iter().map(|&(i, ns)| (candidates[i], ns)).collect();
         tracing::debug!(target: PLAN, op, shape = ?self.shape, ?timed, "choice");
         timed.into_iter().map(|(c, ns)| (c, Some(ns))).collect()
@@ -245,20 +321,31 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
 
     /// The fastest of `candidates` ([`Self::ordered`]).
     pub(crate) fn fastest(&mut self, op: &'static str, candidates: &[C]) -> C {
-        self.ordered(op, candidates)[0].0
+        self.ordered(op, candidates, Pass::Whole)[0].0
     }
 
     /// The candidate to launch: `expand` makes the admitted configs of
     /// `ranked`'s tile [representatives](config::Tiled::represents) the
     /// candidates (adding variants, such as key splits, the
-    /// plain one first), they are timed, and the fastest pipeline of the
-    /// leading tiles ([`Self::pipelined`]) is the choice.
+    /// plain one first), they are screened ([`Pass::Screen`]), and the
+    /// fastest pipeline of the leading tiles ([`Self::pipelined`], which
+    /// times them again) is the choice.
     pub(crate) fn tuned(&mut self, op: &'static str, ranked: &[C], expand: impl Fn(&[C]) -> Vec<C>) -> C {
+        self.tuned_timed(op, ranked, expand).0
+    }
+
+    /// [`Self::tuned`] with the pick's device ns as last timed, where it was.
+    pub(crate) fn tuned_timed(
+        &mut self,
+        op: &'static str,
+        ranked: &[C],
+        expand: impl Fn(&[C]) -> Vec<C>,
+    ) -> (C, Option<u64>) {
         let candidates = expand(&self.admitted(op, &config::representatives(ranked)));
-        let ordered = self.ordered(op, &candidates);
-        let pick = self.pipelined(op, &ordered, ranked);
-        tracing::debug!(target: PLAN, op, shape = ?self.shape, ?pick, "tuned");
-        pick
+        let ordered = self.ordered(op, &candidates, Pass::Screen);
+        let (pick, ns) = self.pipelined_timed(op, &ordered, ranked);
+        tracing::debug!(target: PLAN, op, shape = ?self.shape, ?pick, ns, "tuned");
+        (pick, ns)
     }
 
     /// The fastest pipeline of the leading tiles of `ordered` (fastest
@@ -269,7 +356,13 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
     /// shortlist held one pipeline per tile, the model's first clean one,
     /// and a tile's place in it is that pipeline's). The leader itself with
     /// tuning off, alone, or where no other twin compiles to be judged.
+    #[cfg(test)]
     pub(crate) fn pipelined(&mut self, op: &'static str, ordered: &[(C, Option<u64>)], ranked: &[C]) -> C {
+        self.pipelined_timed(op, ordered, ranked).0
+    }
+
+    /// [`Self::pipelined`] with the pick's device ns as last timed.
+    fn pipelined_timed(&mut self, op: &'static str, ordered: &[(C, Option<u64>)], ranked: &[C]) -> (C, Option<u64>) {
         let (winner, lead) = ordered[0];
         let near: Vec<C> = ordered
             .iter()
@@ -280,15 +373,16 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
         let twins: Vec<C> = config::distinct_configs(&leaders.iter().flat_map(|l| l.twins(ranked)).collect::<Vec<_>>());
         tracing::debug!(?leaders, twins = twins.len(), "tuner's twins");
         if !tune::enabled() || twins.len() < 2 {
-            return winner;
+            return (winner, lead);
         }
         let key = self.keyed(op, " compiled", &twins);
         let (store, bench, build) = (self.store, &mut self.bench, &self.build);
-        let admit = || config::compiled(&twins, |batch| bench.admit(batch, build));
-        let judged = store.admitted(&key, || Self::programs(store, build, &twins), admit);
+        let keep = bench.lowered.clone();
+        let admit = || config::compiled(&twins, |batch| bench.admit(batch, build, store));
+        let judged = store.admitted(&key, &twins, || Self::programs(store, build, &twins, &keep), admit);
         let compiled: Vec<C> = judged.iter().flat_map(|at| at.iter().map(|&i| twins[i])).collect();
         tracing::debug!(target: PLAN, op, shape = ?self.shape, ?compiled, "twins admitted");
-        if compiled.len() > 1 { self.fastest(op, &compiled) } else { winner }
+        if compiled.len() > 1 { self.ordered(op, &compiled, Pass::Whole)[0] } else { (winner, lead) }
     }
 }
 
@@ -297,20 +391,21 @@ fn fmt_shape(shape: &[SInt]) -> String {
     format!("[{}]", dims.join(", "))
 }
 
-/// The kernel batch axis of an operand whose leading dims hold `lead` rows.
-fn batch_of(var: &Option<BatchVar>, static_batches: usize) -> Batch {
-    match var {
-        Some(v) => Batch::Var { name: v.name.clone(), min: v.min, max: v.max },
+/// The kernel batch axis of an operand whose leading dim is `var` where a
+/// variable binds it.
+fn batch_of(var: &Option<SInt>, static_batches: usize) -> Batch {
+    match var.as_ref().and_then(shape::bound_var) {
+        Some(v) => Batch::Var(v),
         None => Batch::Static(static_batches),
     }
 }
 
 /// A kernel output: allocated at capacity, shaped with the live batch in dim 0
 /// so a consumer kernel binds the realized buffer itself rather than a copy.
-fn output(dims: &[usize], var: &Option<BatchVar>, dtype: DType) -> svod_tensor::error::Result<Tensor> {
+fn output(dims: &[usize], var: &Option<SInt>, dtype: DType) -> svod_tensor::error::Result<Tensor> {
     let mut shape: Vec<SInt> = dims.iter().map(|&d| SInt::Const(d)).collect();
     if let Some(var) = var {
-        shape[0] = var.dim.clone();
+        shape[0] = var.clone();
     }
     kernel_buffer(&shape, dtype)
 }
@@ -323,8 +418,15 @@ fn kernel_buffer(shape: &[SInt], dtype: DType) -> svod_tensor::error::Result<Ten
     Tensor::empty_dynamic_spec(shape, dtype, BufferSpec { cpu_access: !local, ..BufferSpec::default() })
 }
 
-/// `f::<T>(spec)` for the 16-bit element type `dtype`.
+/// `f::<T>(spec)` for the 16-bit element type `dtype`; with `int8`, an
+/// 8-bit integer one too.
 macro_rules! typed {
+    ($dtype:expr, $f:ident, $spec:expr, int8) => {
+        match $dtype.scalar() {
+            Some(svod_dtype::ScalarDType::Int8) => $f::<crate::build::I8>($spec),
+            _ => typed!($dtype, $f, $spec),
+        }
+    };
     ($dtype:expr, $f:ident, $spec:expr) => {
         match $dtype.scalar() {
             Some(svod_dtype::ScalarDType::BFloat16) => $f::<crate::build::BF16>($spec),

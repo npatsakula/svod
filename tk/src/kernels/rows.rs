@@ -2,11 +2,8 @@
 //! LayerNorm and RMSNorm, optionally after a residual add.
 
 use super::{Batch, affine, batch_offset, bound, load_f32};
-use crate::atoms::Device;
 use crate::build::*;
 use crate::ir::*;
-use crate::layouts::WarpGrid;
-use crate::lower::Lowering;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Norm {
@@ -20,14 +17,6 @@ pub enum Norm {
 pub struct NormCfg {
     /// Rows (and warps) per block.
     pub br: usize,
-}
-
-impl NormCfg {
-    /// No matrix core: the warp grid only has to cover the warps, one per
-    /// row, which tile layouts span.
-    pub fn lowering(&self, device: &Device) -> Lowering {
-        Lowering::uniform(device, false, WarpGrid { rows: self.br as u32, cols: 1 })
-    }
 }
 
 /// `rows` rows of `d` per batch; the batch, when there is one, walks grid z.

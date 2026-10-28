@@ -5,8 +5,10 @@ sidebar_label: कर्नेल लाइब्रेरी
 # कर्नेल लाइब्रेरी {#kernel-library}
 
 `svod_tk::kernels` का हर कर्नेल एक function `fn k<T: Elem>(spec: &Spec) -> Program` है, जो 16-bit
-element type (`BF16` या `F16`) पर generic है। हर spec में एक `batch: Batch` होता है:
-`Batch::Static(n)` `n` batches launch करता है, और `Batch::Var { name, min, max }` नाम से bind हुए
+element type (`BF16` या `F16`) पर generic है; `gemm` और `nearest` 8-bit integers (`I8`) भी लेते हैं,
+जो i32 में exact रूप से accumulate होते हैं: `gemm` f32 store करता है, और `nearest` हर row के
+products को rows के `x_scale` और `c_scale` से scale करता है। हर spec में एक `batch: Batch` होता है:
+`Batch::Static(n)` `n` batches launch करता है, और `Batch::var(name, min, max)` (an `ir::Var`) नाम से bind हुए
 runtime variable की live गिनती launch करता है, buffers `max` के आकार के होते हैं। हर config type में
 एक `lowering(&device)` है (एक `atoms::Device`: target और उसकी costs)। मॉडल इन कर्नेलों तक
 [op layer](./op-layer) के ज़रिए पहुँचते हैं, जो config चुनती है।
@@ -34,10 +36,11 @@ runtime variable की live गिनती launch करता है, buffers
 | `residual` | `[batch·m, n]`, सबसे आख़िर में जोड़ा जाता है |
 | `out_f32` | f32 output और residual; accumulator बिना round किए store होता है |
 
-`GemmCfg { tile: [bm, bn, bk], stages, warps: [rows, cols], group_m, unroll, core, crews }`। `m` से
+`GemmCfg { tile: [bm, bn, bk], stages, warps: [rows, cols], unroll, core, crews }`। `m` से
 आगे की rows और `n` से आगे के columns bounded views हैं, इसलिए `m` और `n` मुक्त हैं। `k` का `bk` का
 गुणज होना ज़रूरी है। `core: Core::Group` products को `wgmma` (sm_90) पर issue करता है; `crews: 2` दोनों
-warp rows को एक slot पर ping-pong में चलाता है (CDNA)।
+warp rows को एक slot पर ping-pong में चलाता है (CDNA)। Blocks output tiles पर 8 tile rows
+(`gemm::GROUP_ROWS`) के समूहों में चलते हैं, ताकि एक साथ resident blocks वही B tiles पढ़ें।
 
 कोई tile table नहीं है। `config::Planner::gemm_ranked` tiles, `bk`, warp grids, ring depths और
 unrolling गिनता है, वही रखता है जिसे lowering target पर चलाती है (atoms warp grid को tile करते हैं,

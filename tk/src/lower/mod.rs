@@ -12,8 +12,8 @@ use svod_ir::{Op, UOp, ops};
 
 use crate::atoms::{Core, Device, Target};
 use crate::ir::*;
-use crate::layouts::{self, Laid, TileLayout, WarpGrid};
-use crate::schedule::{self, Schedule};
+use crate::layouts::{self, Laid, TileLayout};
+use crate::schedule;
 
 pub mod emit;
 pub mod sync;
@@ -36,33 +36,31 @@ pub enum Error {
     },
     #[snafu(display("{what} is a block barrier under a branch on the warp, which some warps skip"))]
     DivergentBarrier { what: &'static str },
+    #[snafu(display("{name} emits {instructions} instructions, past the {most} a kernel may"))]
+    TooLarge { name: String, instructions: usize, most: usize },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Everything the lowering decides that the author did not.
+/// What the lowering is given beside the program: the target and its
+/// costs, and the matrix instruction products issue on. The warp grid and
+/// each ring's schedule are the program's own ([`Program::warp_grid`],
+/// [`Pipeline`]).
 #[derive(Clone, Debug)]
 pub struct Lowering {
     /// The target and what its primitives cost: the costs decide each
     /// product's orientation and how a tile is re-held.
     pub device: Device,
-    pub schedule: Schedule,
-    pub grid: WarpGrid,
-    /// XOR-swizzle 16-byte chunks of shared rows against the row index.
-    pub swizzle: bool,
-    /// The matrix instruction products issue on; on the warpgroup atom
-    /// ([`crate::atoms::GroupMmaAtom`]) the grid's rows are warpgroups of
-    /// four warps, shared operands are read through descriptors (over the
-    /// swizzled rows, so `swizzle` holds) and never loaded into registers.
+    /// On the warpgroup atom ([`crate::atoms::GroupMmaAtom`]) the grid's
+    /// rows are warpgroups of four warps, shared operands are read through
+    /// descriptors (over the swizzled rows) and never loaded into registers.
     pub core: Core,
 }
 
 impl Lowering {
-    /// `device`'s uniform pipeline over `grid`, its ring `unroll`ed or not,
-    /// shared rows swizzled.
-    pub fn uniform(device: &Device, unroll: bool, grid: WarpGrid) -> Self {
-        let schedule = Schedule::Uniform { fill: device.target.fill, unroll, async_products: false };
-        Self { device: device.clone(), schedule, grid, swizzle: true, core: Core::Warp }
+    /// `device`'s warp-level core.
+    pub fn new(device: &Device) -> Self {
+        Self { device: device.clone(), core: Core::Warp }
     }
 }
 
@@ -70,22 +68,28 @@ pub struct Lowered {
     pub program: Arc<UOp>,
     pub tile: Program,
     pub layouts: Vec<Option<TileLayout>>,
+    /// The ranges the program's own schedule kept rolled (a loop whose body
+    /// holds a product), which [`Lowered::text`] hints every target against
+    /// unrolling further.
+    pub rolled: Vec<u64>,
 }
 
 /// `params` are the flat buffer UOps in `prog.params` order (placeholders on
 /// the graph path, `UOp::param`s on the direct one).
 pub fn lower(mut prog: Program, lowering: &Lowering, params: Vec<Arc<UOp>>, device: DeviceSpec) -> Result<Lowered> {
-    let grid = lowering.grid.count();
+    let grid = prog.warp_grid.count();
     let lone = prog.walk().any(|(_, s)| matches!(s, Stmt::Warps { .. }));
     ensure!(prog.warps.is_multiple_of(grid) && (prog.warps == grid || lone), GridSnafu { warps: prog.warps, grid });
     materialize_operands(&mut prog, lowering.core);
     sync::insert_barriers(&mut prog)?;
-    schedule::expand(&mut prog, lowering.schedule);
-    let mut laid = layouts::infer(prog, &lowering.device, lowering.grid, lowering.core).context(LayoutSnafu)?;
+    schedule::expand(&mut prog, lowering.device.target.fill, lowering.core);
+    let mut laid = layouts::infer(prog, &lowering.device, lowering.core).context(LayoutSnafu)?;
     orient_shared(&mut laid, &lowering.device.target);
+    emit::ROLLED.with(|cell| cell.borrow_mut().clear());
     let program = emit::emit(&laid, lowering, params, device)?;
+    let rolled = emit::ROLLED.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
     let Laid { prog, layouts } = laid;
-    Ok(Lowered { program, tile: prog, layouts })
+    Ok(Lowered { program, tile: prog, layouts, rolled })
 }
 
 /// `prog` lowered for its lowering's target alone, its parameters declared
@@ -108,6 +112,15 @@ pub fn render(prog: Program, lowering: &Lowering) -> Result<String> {
 }
 
 impl Lowered {
+    /// The instructions the program emitted (within
+    /// [`Target::most_instructions`]).
+    pub fn instructions(&self) -> usize {
+        let Op::Program(ops::Program { linear: Some(linear), .. }) = self.program.op() else {
+            unreachable!("a lowering emits a linear program")
+        };
+        linear.op().sources().len()
+    }
+
     /// The LLVM text of the program for `target`: what the backend's
     /// compiler is handed. Metal renders C, which has no text here.
     pub fn text(&self, target: &Target) -> Result<String> {
@@ -115,7 +128,8 @@ impl Lowered {
             GpuArch::Cuda(arch) => LlvmTextRenderer::nvptx(arch),
             GpuArch::Amd(arch) => LlvmTextRenderer::amd(arch),
             GpuArch::Metal(_) => return UnsupportedSnafu { what: "Metal's LLVM text" }.fail(),
-        };
+        }
+        .rolled(self.rolled.iter().copied());
         let Op::Program(ops::Program { linear: Some(linear), .. }) = self.program.op() else {
             unreachable!("a lowering emits a linear program")
         };

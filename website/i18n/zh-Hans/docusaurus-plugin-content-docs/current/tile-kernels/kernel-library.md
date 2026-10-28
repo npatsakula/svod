@@ -4,7 +4,7 @@ sidebar_label: 内核库
 
 # 内核库 {#kernel-library}
 
-`svod_tk::kernels` 中的每个内核都是一个函数 `fn k<T: Elem>(spec: &Spec) -> Program`，对 16 位元素类型（`BF16` 或 `F16`）泛型。每个 spec 都有一个 `batch: Batch`：`Batch::Static(n)` 启动 `n` 个批次，`Batch::Var { name, min, max }` 按名称绑定的运行时变量的实际值启动批次，缓冲区按 `max` 分配。每种配置类型都有一个 `lowering(&device)`（一个 `atoms::Device`：目标及其代价）。模型通过[算子层](./op-layer)使用这些内核，由算子层选择配置。
+`svod_tk::kernels` 中的每个内核都是一个函数 `fn k<T: Elem>(spec: &Spec) -> Program`，对 16 位元素类型（`BF16` 或 `F16`）泛型；`gemm` 和 `nearest` 也接受 8 位整数（`I8`，在 i32 中精确累加：`gemm` 存储 f32，`nearest` 用各行的 `x_scale` 和 `c_scale` 缩放每行的乘积）。每个 spec 都有一个 `batch: Batch`：`Batch::Static(n)` 启动 `n` 个批次，`Batch::var(name, min, max)` (an `ir::Var`) 按名称绑定的运行时变量的实际值启动批次，缓冲区按 `max` 分配。每种配置类型都有一个 `lowering(&device)`（一个 `atoms::Device`：目标及其代价）。模型通过[算子层](./op-layer)使用这些内核，由算子层选择配置。
 
 | 内核 | Spec → 程序 | 内核名称 | 算子 |
 |---|---|---|---|
@@ -28,7 +28,7 @@ sidebar_label: 内核库
 | `residual` | 最后加上的 `[batch·m, n]` |
 | `out_f32` | f32 输出与残差，累加器不经舍入直接存储 |
 
-`GemmCfg { tile: [bm, bn, bk], stages, warps: [rows, cols], group_m, unroll, core, crews }`。超出 `m` 的行和超出 `n` 的列是带边界的视图，因此 `m` 和 `n` 不受限制。`k` 必须是 `bk` 的倍数。`core: Core::Group` 在 `wgmma` 上发出乘积（sm_90）；`crews: 2` 让两行 warp 在同一个槽上以乒乓方式运行（CDNA）。
+`GemmCfg { tile: [bm, bn, bk], stages, warps: [rows, cols], unroll, core, crews }`。超出 `m` 的行和超出 `n` 的列是带边界的视图，因此 `m` 和 `n` 不受限制。`k` 必须是 `bk` 的倍数。`core: Core::Group` 在 `wgmma` 上发出乘积（sm_90）；`crews: 2` 让两行 warp 在同一个槽上以乒乓方式运行（CDNA）。各块按每组 8 个 tile 行（`gemm::GROUP_ROWS`）遍历输出 tile，使同时驻留的块读取相同的 B tile。
 
 不存在 tile 表。`config::Planner::gemm_ranked` 枚举 tile、`bk`、warp 网格、环形缓冲深度和展开方式，保留降级能在目标上运行的配置（原子能铺满 warp 网格，填充能按每线程整 16 字节块拆分，环形缓冲放得进共享内存），再依据设备测得的 `Costs`，以 SM 时间的纳秒数为其余配置排序。排序所用的每一项设备输入都是测得的；其少数几个模型常数（`ops::config` 中的 `BAND`、`CACHE_SHARE`、`CACHE_SPILL`、`OVERLAP_WAVES`）旨在对所有设备成立。排序只负责排列顺序，调优器测量编译后不溢出的前 64 个 tile（[调优](./tuning)）。
 

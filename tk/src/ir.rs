@@ -128,6 +128,14 @@ pub enum Scalar {
     },
     /// The row coordinate inside the view whose [`RowMap`] reads it.
     Row,
+    /// Whether some element of a boolean register tile is set among those
+    /// the warp evaluating it holds: one for the whole block in the
+    /// interpreter, whose block is one thread. Only a branch reads it, and
+    /// only one whose results agree with the other branch's wherever the
+    /// tile is clear ([`crate::build::Kernel::where_any`] selects so,
+    /// [`crate::build::Kernel::if_any`] leaves it to its author), so how the
+    /// lowering spreads the tile over warps cannot change them.
+    Any(ValId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -262,16 +270,77 @@ pub enum TileOp {
     Transpose {
         src: ValId,
     },
+    /// Every element one step on along `axis` (`out[r][c] = src[r][c − 1]`
+    /// along `Col`), the first row or column `fill`.
+    Shift {
+        src: ValId,
+        axis: Axis,
+        fill: Const,
+    },
+    /// Every element exchanged with the one whose coordinate along `axis`
+    /// differs by the bits of `mask` (`out[r][c] = src[r][c ^ mask]` along
+    /// `Col`): a butterfly, a step of a sorting or merging network. The
+    /// axis is a multiple of the power of two past `mask` long.
+    Flip {
+        src: ValId,
+        axis: Axis,
+        mask: u32,
+    },
+    /// The `j`th of the columns each lane holds of its rows: `src` is
+    /// `[rows, w·n]`, the result `[rows, w]` (`w` its columns, `j < n`), each
+    /// element one of the same row of `src`, or with `col` that element's
+    /// column (`i32`). Over `j < n` a row's results take each of its columns
+    /// once, in the order the lowering holds them: column `c` of the result
+    /// is held by the lanes holding `src`'s columns it takes, so dealing is
+    /// a renaming of registers wherever the layouts allow, else the
+    /// interpreter's order, column `c·n + j`. What a program computes from
+    /// a deal must not depend on that order but through `col`.
+    Deal {
+        src: ValId,
+        j: u32,
+        col: bool,
+        /// The source column each element takes, per row of the result, as
+        /// the layouts the inference assigned hold them
+        /// ([`crate::layouts::TileLayout::dealt`]): the device's order,
+        /// recorded once laid so the interpreter replays it. `None` until
+        /// then (and in a program never lowered): the fallback order,
+        /// column `c·n + j`.
+        order: Option<Vec<Vec<u32>>>,
+    },
     /// The same elements held under the layout its consumer needs; inserted
     /// by the layout inference, never by an author (who pins layouts instead).
     Relayout {
         src: ValId,
     },
     /// A copy into a value that mutually exclusive branches each define once
-    /// (the merge of an `if`).
+    /// (the merge of an `if`), or that is defined before an `if` and again
+    /// in its branch, which replaces it ([`crate::build::Kernel::if_any`]).
     Move {
         src: ValId,
     },
+}
+
+impl TileOp {
+    /// The register values the op reads.
+    pub fn srcs(&self) -> impl Iterator<Item = ValId> {
+        let [a, b, c] = match *self {
+            TileOp::Fill(_) | TileOp::Splat(_) | TileOp::Coord(_) => [None; 3],
+            TileOp::Unary { src, .. }
+            | TileOp::Cast { src, .. }
+            | TileOp::Reduce { src, .. }
+            | TileOp::Transpose { src }
+            | TileOp::Shift { src, .. }
+            | TileOp::Flip { src, .. }
+            | TileOp::Deal { src, .. }
+            | TileOp::Relayout { src }
+            | TileOp::Move { src } => [Some(src), None, None],
+            TileOp::Binary { a, b, .. } => [Some(a), Some(b), None],
+            TileOp::Mma { acc, a, b, .. } => [Some(acc), Some(a), Some(b)],
+            TileOp::Where { pred, a, b } => [Some(pred), Some(a), Some(b)],
+            TileOp::MulAdd { a, b, c } => [Some(a), Some(b), Some(c)],
+        };
+        [a, b, c].into_iter().flatten()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -297,8 +366,9 @@ pub struct Carried {
     pub next: ValId,
 }
 
-/// `iv` runs over `start..start + extent`; several loops may share an `iv`
-/// (and the scalars defined from it) over consecutive ranges.
+/// `iv` runs over `start..start + extent` (no trip at all below an extent
+/// of one); several loops may share an `iv` (and the scalars defined from
+/// it) over consecutive ranges.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Loop {
     pub iv: ScalarId,
@@ -328,6 +398,12 @@ pub struct Stage {
 pub struct Pipeline {
     pub extent: ScalarId,
     pub stages: usize,
+    /// The loop copied once per ring slot, so slot addressing folds to
+    /// constants.
+    pub unroll: bool,
+    /// 1: every warp loads and computes; 2: the block's warps as two crews
+    /// a cluster apart over one slot ([`crate::schedule`]'s ping-pong).
+    pub crews: u32,
     pub carried: Vec<Carried>,
     pub produce: Stage,
     pub consume: Stage,
@@ -355,9 +431,10 @@ pub enum Sync {
     /// Block until at most `pending` of this thread's committed groups are in
     /// flight.
     WaitAsync { pending: u32 },
-    /// No instruction moves across this point: a pipeline trip's commit stays
-    /// after its products, where a machine scheduler would otherwise hoist
-    /// it above them. Nothing to a target that keeps program order.
+    /// No instruction moves across this point: a pipeline trip's loads stay
+    /// before its products and its commit after them, where a machine
+    /// scheduler would otherwise move either past them. Nothing to a target
+    /// that keeps program order.
     Fence,
     /// Block until at most `pending` of this thread's warpgroup product
     /// chains are in flight (`wgmma.wait_group`): the products of the block
@@ -398,6 +475,15 @@ pub enum Stmt {
         pred: ScalarId,
         then: Block,
         otherwise: Block,
+        /// The branch's merge: past the statement each `dst` holds its
+        /// branch's source (`None`: what `dst` held before it, which `then`
+        /// replaces). Both sources keep their identity — every value stays
+        /// defined once, by the branch that computes it or before — and the
+        /// moves into `dst` are the branch's last, so a `dst` a loop carries
+        /// moves into its `phi` at the end of the body holding the `if`,
+        /// never inside the branch ([`crate::build::Kernel::select_if_vec`],
+        /// [`crate::build::Kernel::if_any`]).
+        results: Vec<(ValId, ValId, Option<ValId>)>,
     },
     Sync(Sync),
 }
@@ -409,7 +495,6 @@ pub struct Block(pub Vec<Stmt>);
 pub enum ParamKind {
     In,
     Out,
-    InOut,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -434,7 +519,7 @@ pub struct SmemAlloc {
 }
 
 /// A bound symbolic variable of the launch, with the range it may take.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Var {
     pub name: String,
     pub min: i64,
@@ -470,6 +555,10 @@ pub struct Program {
     pub vars: Vec<Var>,
     pub grid: [ScalarId; 3],
     pub warps: u32,
+    /// How the warps spread a block-wide register tile: every warp, or a
+    /// whole grid of them where the others run only inside
+    /// [`Stmt::Warps`].
+    pub warp_grid: crate::layouts::WarpGrid,
     pub smem: Vec<SmemAlloc>,
     pub scalars: Vec<Scalar>,
     pub values: Vec<Value>,
@@ -486,14 +575,11 @@ impl Program {
     pub fn scalar(&self, id: ScalarId) -> &Scalar {
         &self.scalars[id.index()]
     }
-    pub fn param(&self, id: ParamId) -> &Param {
-        &self.params[id.index()]
-    }
     /// Whether scalar `id` reads [`Special::Warp`]: the warps of a block may
     /// see it differ.
     pub fn varies_by_warp(&self, id: ScalarId) -> bool {
         match self.scalar(id) {
-            Scalar::Special(Special::Warp) => true,
+            Scalar::Special(Special::Warp) | Scalar::Any(_) => true,
             Scalar::Bin(_, a, b) => self.varies_by_warp(*a) || self.varies_by_warp(*b),
             Scalar::Load { index, .. } => self.varies_by_warp(*index),
             _ => false,
@@ -519,6 +605,7 @@ impl Program {
                 Some((0, self.bounds(self.grid[*axis as usize], induction)?.1 - 1))
             }
             Scalar::Special(Special::Warp) => Some((0, i64::from(self.warps) - 1)),
+            Scalar::Any(_) => Some((0, 1)),
             Scalar::Induction => induction(id),
             Scalar::Bin(op, a, b) => {
                 let ((a0, a1), (b0, b1)) = (self.bounds(*a, induction)?, self.bounds(*b, induction)?);
@@ -526,9 +613,23 @@ impl Program {
                     let v = [f(a0, b0)?, f(a0, b1)?, f(a1, b0)?, f(a1, b1)?];
                     Some((v.into_iter().min()?, v.into_iter().max()?))
                 };
+                // `x − [c < x]` (a count less one where it passes `c`: a
+                // register-staged ring's steady trips) stays at `x` up to
+                // `c` and a step under it past, never a step under `x`'s
+                // own low.
+                let less_one_past = |b: ScalarId| match self.scalar(b) {
+                    Scalar::Bin(BinOp::Lt, c, x) if *x == *a => match self.scalar(*c) {
+                        Scalar::Const(c) => Some(*c),
+                        _ => None,
+                    },
+                    _ => None,
+                };
                 match op {
                     BinOp::Add => Some((a0.checked_add(b0)?, a1.checked_add(b1)?)),
-                    BinOp::Sub => Some((a0.checked_sub(b1)?, a1.checked_sub(b0)?)),
+                    BinOp::Sub => match less_one_past(*b) {
+                        Some(c) => Some((if a0 > c { a0 - 1 } else { a0 }, if a1 > c { a1 - 1 } else { a1 })),
+                        None => Some((a0.checked_sub(b1)?, a1.checked_sub(b0)?)),
+                    },
                     BinOp::Mul => corners(i64::checked_mul),
                     BinOp::Div if b0 > 0 || b1 < 0 => corners(i64::checked_div),
                     BinOp::Rem if b0 > 0 || b1 < 0 => {

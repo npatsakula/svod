@@ -263,12 +263,44 @@ impl UOp {
         Ok(Self::program(sink, program_info, Some(Self::linear(list.into())), None, None))
     }
 
-    fn commit_shape(
-        shape: &Arc<Self>,
-        commit_const: &impl Fn(&Arc<Self>) -> Option<(crate::UOpKey, Arc<Self>)>,
-    ) -> Arc<Self> {
-        let consts: std::collections::HashMap<_, _> = shape.toposort().iter().filter_map(commit_const).collect();
-        shape.substitute(&consts)
+    /// The dtype a program commits a weak integer constant of a shape to:
+    /// `i32`, or `i64` past its range.
+    pub(crate) fn committed_int(value: crate::ConstValue) -> DType {
+        match value.try_int() {
+            Some(v) if i32::try_from(v).is_err() => DType::Int64,
+            _ => DType::Int32,
+        }
+    }
+
+    /// This PARAM or BUFFER with the weak constants of its shape committed,
+    /// as [`Self::linear_program`] commits them (itself when none are weak,
+    /// or when it is neither): parameters committed before a program is
+    /// built on them spare its assembly rebuilding every op reading them.
+    pub fn committed_shape(self: &Arc<Self>) -> Arc<Self> {
+        let commit = |shape: &Arc<Self>| {
+            let consts: std::collections::HashMap<_, _> = shape
+                .toposort()
+                .into_iter()
+                .filter_map(|node| match node.op() {
+                    Op::Const(value) if node.dtype() == DType::WeakInt => {
+                        let committed = Self::const_(Self::committed_int(value.0), value.0);
+                        Some((crate::UOpKey(node.clone()), committed))
+                    }
+                    _ => None,
+                })
+                .collect();
+            shape.substitute(&consts)
+        };
+        let committed = match self.op() {
+            Op::Param(ops::Param { shape, arg }) => {
+                Self::new(Op::Param(ops::Param { shape: commit(shape), arg: arg.clone() }), self.dtype())
+            }
+            Op::Buffer(ops::Buffer { shape, arg }) => {
+                Self::new(Op::Buffer(ops::Buffer { shape: commit(shape), arg: arg.clone() }), self.dtype())
+            }
+            _ => return self.clone(),
+        };
+        if Arc::ptr_eq(&committed, self) { committed } else { committed.rtag(self.tag().clone()) }
     }
 
     /// PARAM and BUFFER shapes are metadata a program never renders, but
@@ -281,32 +313,12 @@ impl UOp {
         use crate::UOpKey;
 
         let root = Self::sink(ops.clone());
-        let commit_const = |node: &Arc<Self>| match node.op() {
-            Op::Const(value) if node.dtype() == DType::WeakInt => {
-                let dtype = match value.0.try_int() {
-                    Some(v) if i32::try_from(v).is_err() => DType::Int64,
-                    _ => DType::Int32,
-                };
-                Some((UOpKey(node.clone()), Self::const_(dtype, value.0)))
-            }
-            _ => None,
-        };
         let params: HashMap<UOpKey, Arc<Self>> = root
             .toposort()
             .into_iter()
             .filter_map(|node| {
-                let committed = match node.op() {
-                    Op::Param(ops::Param { shape, arg }) => {
-                        let shape = Self::commit_shape(shape, &commit_const);
-                        Self::new(Op::Param(ops::Param { shape, arg: arg.clone() }), node.dtype())
-                    }
-                    Op::Buffer(ops::Buffer { shape, arg }) => {
-                        let shape = Self::commit_shape(shape, &commit_const);
-                        Self::new(Op::Buffer(ops::Buffer { shape, arg: arg.clone() }), node.dtype())
-                    }
-                    _ => return None,
-                };
-                (!Arc::ptr_eq(&committed, &node)).then(|| (UOpKey(node.clone()), committed.rtag(node.tag().clone())))
+                let committed = node.committed_shape();
+                (!Arc::ptr_eq(&committed, &node)).then(|| (UOpKey(node), committed))
             })
             .collect();
         if params.is_empty() {

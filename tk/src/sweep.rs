@@ -8,24 +8,23 @@
 //! and digests of it compared across builds ([`digest`], [`diff`]).
 //! Fixtures, not an API: hidden from the docs.
 
-use std::sync::Arc;
-
-use svod_codegen::Renderer;
-use svod_codegen::llvm::LlvmTextRenderer;
-use svod_dtype::{AmdArch, CudaArch, DType, DeviceSpec, GpuArch};
-use svod_ir::{Op, UOp, ops};
+use svod_dtype::{AmdArch, CudaArch, GpuArch, ScalarDType};
 
 use crate::atoms::{Core, Costs, Device, Target};
-use crate::build::{BF16, F16};
-use crate::ir::Program;
-use crate::kernels::attention::{AttnMask, AttnSpec, Bias, Cache, Chunk, CombineSpec, FaCfg, attention, combine};
+use crate::build::{BF16, F16, I8};
+use crate::ir::{Program, Var};
+use crate::kernels::attention::{AttnMask, AttnSpec, Bias, CacheLayout, Chunk, CombineSpec, FaCfg, attention, combine};
 use crate::kernels::conv::{ConvCfg, ConvGeom, ConvSpec};
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Scale, gemm};
 use crate::kernels::heads::{HeadsSpec, Rope, heads};
+use crate::kernels::nearest::{
+    Floors, Live, Metric, NearestCfg, NearestMergeSpec, NearestSpec, RescoreSpec, SelectCfg, SelectSpec, nearest,
+    nearest_merge, nearest_rescore, nearest_select,
+};
 use crate::kernels::rows::{Norm, NormCfg, NormSpec, norm};
 use crate::kernels::{Act, Batch};
-use crate::lower::{Lowering, lower};
-use crate::ops::config::{self, Planner};
+use crate::lower::Lowering;
+use crate::ops::config::{self, NearestProblem, Planner};
 
 /// Costs a test declares where it needs a ranking or an orientation: the
 /// guessed sm_86-class fixture, the warpgroup step free.
@@ -59,7 +58,7 @@ pub(crate) fn conv_first_eight(planner: &Planner, batches: usize, m: usize, g: &
 pub type Launch = (String, Program, Lowering);
 
 /// The first candidate the op layer plans for each kernel family on `target`.
-pub fn families(target: &Target) -> Vec<Launch> {
+pub(crate) fn families(target: &Target) -> Vec<Launch> {
     let mut out: Vec<Launch> = vec![];
     let mut push = |name: &str, prog: Program, lowering: Lowering| out.push((name.to_string(), prog, lowering));
     let planner = planner(target.clone());
@@ -89,10 +88,20 @@ pub fn families(target: &Target) -> Vec<Launch> {
     let half_step =
         GemmSpec { cfg: planner.gemm_ranked(1, 300, 512, 256, false)[0], ..gemm_spec(100, 96, 256, half_step) };
     push("gemm gelu scale residual", gemm::<BF16>(&half_step), half_step.cfg.lowering(&planner.device));
+    // The 8-bit integer core where the target has one: its products exact
+    // into f32, over a whole tile two atoms deep and over a lone warp row.
+    if target.geometry_of(ScalarDType::Int8).is_some() {
+        let out_f32 = Epilogue { out_f32: true, ..Epilogue::DEFAULT };
+        for cfg in [config::gemm_cfg([64, 64, 64], 2, [2, 2], true), config::gemm_cfg([32, 64, 64], 1, [1, 2], false)] {
+            let spec = GemmSpec { m: 130, n: 192, k: 256, batch: Batch::Static(1), epilogue: out_f32, cfg };
+            let name = format!("gemm int8 {:?}x{}", cfg.tile, cfg.stages);
+            push(&name, gemm::<I8>(&spec), cfg.lowering(&planner.device));
+        }
+    }
 
     // The planner's lead for the shape; a head size it plans no kernel for
     // has no family.
-    let fa = |t, tk, d, mask: AttnMask, cache: Option<Cache>, batch| {
+    let fa = |t, tk, d, mask: AttnMask, cache: Option<CacheLayout>, batch| {
         let cfg = *planner.attention_ranked(8, t, tk, d, mask.causal, mask.bias.is_some()).first()?;
         let splits = if cache.is_some() { 2 } else { 1 };
         let cfg = crate::kernels::attention::FaCfg { splits, ..cfg };
@@ -108,16 +117,16 @@ pub fn families(target: &Target) -> Vec<Launch> {
         }
     }
     let masked = AttnMask { key_lens: true, key_mask: true, ..AttnMask::default() };
-    let spec = fa(37, 75, 64, masked, None, Batch::Var { name: "b".into(), min: 1, max: 2 }).expect("d 64 plans");
+    let spec = fa(37, 75, 64, masked, None, Batch::var("b", 1, 2)).expect("d 64 plans");
     push("attention d64 key masks", attention::<F16>(&spec), spec.cfg.lowering(&planner.device));
     // The bias streams through its own ring slot; its 75 keys end inside a
     // key block, so the ring's fill meets the column bound.
     let biased = AttnMask { key_lens: true, bias: Some(Bias::PerBatch), ..AttnMask::default() };
     let spec = fa(37, 75, 64, biased, None, Batch::Static(2)).expect("d 64 plans with a bias");
     push("attention d64 bias", attention::<F16>(&spec), spec.cfg.lowering(&planner.device));
-    let cache = Cache { rows: 6, heads_total: 6, row_map: true, appended: 1, app_lens: false };
+    let cache = CacheLayout { rows: 6, heads_total: 6, row_map: true, appended: 1, app_lens: false };
     let lens = AttnMask { key_lens: true, ..AttnMask::default() };
-    let spec = fa(1, 150, 64, lens, Some(cache), Batch::Var { name: "b".into(), min: 1, max: 3 }).expect("d 64 plans");
+    let spec = fa(1, 150, 64, lens, Some(cache), Batch::var("b", 1, 3)).expect("d 64 plans");
     push("attention d64 cache", attention::<F16>(&spec), spec.cfg.lowering(&planner.device));
     let cfg = crate::kernels::attention::FaCfg {
         key_warps: 4,
@@ -131,14 +140,14 @@ pub fn families(target: &Target) -> Vec<Launch> {
     let spec = AttnSpec { mask: AttnMask { bias: Some(Bias::PerBatch), ..lens }, ..spec };
     push("attention d64 cache key warps bias", attention::<F16>(&spec), spec.cfg.lowering(&planner.device));
     let merge = CombineSpec { batch: spec.batch.clone(), t: 1, heads: 4, d: 64, splits: 2, cfg: NormCfg { br: 4 } };
-    push("attention combine", combine::<F16>(&merge), merge.cfg.lowering(&planner.device));
+    push("attention combine", combine::<F16>(&merge), Lowering::new(&planner.device));
 
     for (name, kind, d, residual, bias) in
         [("layer norm", Norm::Layer, 1024, true, true), ("rms norm", Norm::Rms, 512, false, false)]
     {
         let cfg = config::norm_candidates(d)[0];
         let spec = NormSpec { norm: kind, rows: 37, d, batch: Batch::Static(1), eps: 1e-5, residual, bias, cfg };
-        push(name, norm::<BF16>(&spec), cfg.lowering(&planner.device));
+        push(name, norm::<BF16>(&spec), Lowering::new(&planner.device));
     }
 
     for d in [64, 128] {
@@ -155,8 +164,164 @@ pub fn families(target: &Target) -> Vec<Launch> {
             rope: Some(Rope { per_batch: false }),
             cfg,
         };
-        push(&format!("heads d{d}"), heads::<BF16>(&spec), cfg.lowering(&planner.device));
+        push(&format!("heads d{d}"), heads::<BF16>(&spec), Lowering::new(&planner.device));
     }
+
+    // The tiles planned for a large self-join, over a ragged small one; a
+    // row's least alone, and lists of its least scores.
+    let both = Floors { row: true, col: true };
+    for (name, d, metric, floors, groups, k) in [
+        ("nearest squared l2", 64, Metric::SquaredL2, Floors::default(), false, 1),
+        ("nearest l2 floors", 16, Metric::L2, both, false, 1),
+        ("nearest groups", 32, Metric::ShiftedL2, Floors::default(), true, 1),
+        ("nearest neg dot col floor", 64, Metric::NegDot, Floors { row: false, col: true }, false, 1),
+        ("nearest streamed neg dot", 800, Metric::NegDot, Floors::default(), false, 1),
+        ("nearest streamed l2 floors groups", 512, Metric::L2, both, true, 1),
+        ("nearest 4 squared l2", 64, Metric::SquaredL2, Floors::default(), false, 4),
+        ("nearest 16 l2 floors groups", 32, Metric::L2, both, true, 16),
+        ("nearest 8 streamed neg dot", 768, Metric::NegDot, Floors::default(), false, 8),
+        ("nearest 32 streamed shifted l2 groups", 512, Metric::ShiftedL2, Floors::default(), true, 32),
+        ("nearest 64 queued squared l2", 64, Metric::SquaredL2, Floors::default(), false, 64),
+        ("nearest 100 queued l2 floors groups", 32, Metric::L2, both, true, 100),
+        ("nearest 256 queued streamed neg dot", 256, Metric::NegDot, Floors::default(), false, 256),
+        ("nearest 48 registers l2 floors", 64, Metric::L2, both, false, 48),
+    ] {
+        let p = NearestProblem { n: 1 << 16, m: 1 << 16, d, dtype: ScalarDType::Float16, metric, floors, groups, k };
+        // A named way's first config, else the ranking's first.
+        let way = |c: &&NearestCfg| match name {
+            _ if name.contains("queued") => c.queue.is_some(),
+            _ if name.contains("registers") => c.queue.is_none() && c.select.is_none(),
+            _ => true,
+        };
+        let Some(&cfg) = planner.nearest_ranked(p).iter().find(way) else { continue };
+        let spec = NearestSpec { n: 100, m: 150, d, metric, floors, groups, k, cfg, live: Live::default() };
+        push(name, nearest::<BF16>(&spec), Lowering::new(&planner.device));
+    }
+    // Over 8-bit rows scaled per row, where the target has the core: the
+    // planner's first config of each way, and a split.
+    let int8 = [
+        ("nearest int8 squared l2", 128, Metric::SquaredL2, Floors::default(), false, 1),
+        ("nearest int8 streamed neg dot", 800, Metric::NegDot, Floors::default(), false, 1),
+        ("nearest int8 16 l2 floors groups", 64, Metric::L2, both, true, 16),
+        ("nearest int8 8 streamed neg dot", 768, Metric::NegDot, Floors::default(), false, 8),
+        ("nearest int8 64 queued squared l2", 64, Metric::SquaredL2, Floors::default(), false, 64),
+    ];
+    for (name, d, metric, floors, groups, k) in
+        int8.into_iter().filter(|_| target.geometry_of(ScalarDType::Int8).is_some())
+    {
+        let d = planner.nearest_depth(d, ScalarDType::Int8).expect("an 8-bit core");
+        let dtype = ScalarDType::Int8;
+        let p = NearestProblem { n: 1 << 16, m: 1 << 16, d, dtype, metric, floors, groups, k };
+        let way = |c: &&NearestCfg| !name.contains("queued") || c.queue.is_some();
+        let streamed = |c: &&NearestCfg| name.contains("streamed") == c.bk.is_some();
+        let ranked = planner.nearest_ranked(p);
+        let Some(&cfg) = ranked.iter().filter(way).find(streamed).or(ranked.iter().find(way)) else { continue };
+        let spec = NearestSpec { n: 100, m: 150, d, metric, floors, groups, k, cfg, live: Live::default() };
+        push(name, nearest::<I8>(&spec), Lowering::new(&planner.device));
+    }
+    // A reranked search's exact pass: a ragged depth, floors, rows bound at launch.
+    let n_var = Var { name: "n".into(), min: 1, max: 100 };
+    for (name, metric, floors, live) in [
+        ("nearest rescore l2 floors", Metric::L2, Floors { row: true, col: true }, Live::default()),
+        (
+            "nearest rescore live neg dot",
+            Metric::NegDot,
+            Floors::default(),
+            Live { rows: Some((n_var.clone(), 0)), k: None },
+        ),
+    ] {
+        let spec = RescoreSpec { n: 100, m: 150, d: 100, cols: 20, metric, floors, live };
+        push(name, nearest_rescore(&spec), Lowering::new(&planner.device));
+    }
+    if target.geometry_of(ScalarDType::Int8).is_some() {
+        let cfg = NearestCfg { splits: 2, ..NearestCfg::streamed(32, 32, 64, 2) };
+        let (metric, floors, live) = (Metric::SquaredL2, Floors::default(), Live::default());
+        let spec = NearestSpec { n: 100, m: 90, d: 128, metric, floors, groups: true, k: 8, cfg, live };
+        push("nearest int8 8 split", nearest::<I8>(&spec), Lowering::new(&planner.device));
+    }
+    // Split over the candidates (shares of one tile and of two), and a merge
+    // of shares, of a least alone and of lists: in registers, the longest
+    // there, and queued.
+    for (k, queue, name) in [(1, None, ""), (8, None, " 8"), (64, None, " 64"), (256, Some(32), " 256 queued")] {
+        let cfg = NearestCfg { splits: 2, queue, ..NearestCfg::streamed(32, 32, 32, 2) };
+        let (metric, floors, live) = (Metric::L2, Floors::default(), Live::default());
+        let spec = NearestSpec { n: 100, m: 90, d: 64, metric, floors, groups: true, k, cfg, live };
+        push(&format!("nearest{name} split"), nearest::<BF16>(&spec), Lowering::new(&planner.device));
+        let merge = NearestMergeSpec { n: 300, splits: 3, metric: Metric::L2, k, live: Live::default() };
+        push(&format!("nearest{name} merge"), nearest_merge(&merge), Lowering::new(&planner.device));
+    }
+
+    // A score matrix, and its listing into empty lists of 100 and of 1024
+    // (carried lists hold an order the scratch inputs would not).
+    let select = SelectCfg { warps: 4, queue: 2, filter: false };
+    let cfg = NearestCfg { select: Some(select), ..NearestCfg::new(64, 32, 2) };
+    let (metric, live) = (Metric::L2, Live::default());
+    let spec = NearestSpec { n: 100, m: 150, d: 64, metric, floors: both, groups: true, k: 100, cfg, live };
+    push("nearest matrix", nearest::<BF16>(&spec), Lowering::new(&planner.device));
+    for (k, queue, name) in [(100, 2, "100"), (100, 4, "100 queue 4"), (1024, 8, "1024")] {
+        let select = SelectCfg { queue, ..select };
+        let b = SelectSpec {
+            n: 100,
+            cols: 150,
+            k,
+            metric: Metric::L2,
+            first: true,
+            cfg: select,
+            live: Live::default(),
+            wide: select.wide(planner.device.target.wave),
+            filter: None,
+            shares: 1,
+        };
+        push(&format!("nearest select {name}"), nearest_select(&b), Lowering::new(&planner.device));
+    }
+    // Rows and lists bound at launch: a register list and a queued one, a
+    // split and its merge, a score matrix's panel past its first row and its
+    // listing into empty lists (carried lists hold an order the scratch
+    // inputs would not).
+    let var = |name: &str, max: i64| Var { name: name.into(), min: 1, max };
+    let live = |from: usize, k: i64| Live { rows: Some((var("n", 100), from)), k: Some(var("k", k)) };
+    for (name, d, k, queued) in [("nearest live 16", 64, 16, false), ("nearest live queued 256", 256, 256, true)] {
+        let p = NearestProblem {
+            n: 1 << 16,
+            m: 1 << 16,
+            d,
+            dtype: ScalarDType::Float16,
+            metric: Metric::SquaredL2,
+            floors: both,
+            groups: true,
+            k,
+        };
+        let way = |c: &&NearestCfg| c.queue.is_some() == queued && c.select.is_none();
+        let Some(&cfg) = planner.nearest_ranked(p).iter().find(way) else { continue };
+        let (metric, floors, live) = (Metric::SquaredL2, both, live(0, k as i64));
+        let spec = NearestSpec { n: 100, m: 150, d, metric, floors, groups: true, k, cfg, live };
+        push(name, nearest::<F16>(&spec), Lowering::new(&planner.device));
+    }
+    let cfg = NearestCfg { splits: 2, ..NearestCfg::streamed(32, 32, 32, 2) };
+    let (metric, floors) = (Metric::NegDot, Floors::default());
+    let spec = NearestSpec { n: 100, m: 90, d: 64, metric, floors, groups: false, k: 8, cfg, live: live(0, 8) };
+    push("nearest live split", nearest::<BF16>(&spec), Lowering::new(&planner.device));
+    let merge = NearestMergeSpec { n: 100, splits: 3, metric, k: 8, live: live(0, 8) };
+    push("nearest live merge", nearest_merge(&merge), Lowering::new(&planner.device));
+    let cfg = NearestCfg { select: Some(select), ..NearestCfg::new(64, 32, 2) };
+    let (metric, live) = (Metric::L2, live(30, 100));
+    let spec =
+        NearestSpec { n: 64, m: 150, d: 64, metric, floors: both, groups: true, k: 100, cfg, live: live.clone() };
+    push("nearest live matrix panel", nearest::<BF16>(&spec), Lowering::new(&planner.device));
+    let wide = select.wide(planner.device.target.wave);
+    let b =
+        SelectSpec { n: 64, cols: 150, k: 100, metric, first: true, cfg: select, live, wide, filter: None, shares: 1 };
+    push("nearest live select", nearest_select(&b), Lowering::new(&planner.device));
+    // Filtered: the trips' leasts stored beside the scores, a listing bound
+    // by them, in shares and merged.
+    let filtered = SelectCfg { queue: 1, filter: true, ..select };
+    let cfg = NearestCfg { select: Some(filtered), splits: 2, ..NearestCfg::new(64, 32, 2) };
+    let (metric, live) = (Metric::NegDot, Live::default());
+    let spec = NearestSpec { n: 100, m: 300, d: 64, metric, floors: both, groups: true, k: 2, cfg, live: live.clone() };
+    push("nearest matrix filtered", nearest::<F16>(&spec), Lowering::new(&planner.device));
+    let (wide, filter) = (filtered.wide(planner.device.target.wave), Some(32));
+    let b = SelectSpec { n: 100, cols: 300, k: 2, metric, first: true, cfg: filtered, live, wide, filter, shares: 3 };
+    push("nearest select filtered shares", nearest_select(&b), Lowering::new(&planner.device));
 
     let silu_bias = Epilogue { bias: true, act: Act::Silu, ..Epilogue::DEFAULT };
     for (name, g, images) in [
@@ -175,7 +340,7 @@ pub fn families(target: &Target) -> Vec<Launch> {
 }
 
 /// An H100 SXM: sm_90 with 132 SMs.
-pub fn hopper() -> Target {
+pub(crate) fn hopper() -> Target {
     Target { sms: Some(132), ..Target::for_arch(GpuArch::Cuda(CudaArch { major: 9, minor: 0 })) }
 }
 
@@ -183,7 +348,7 @@ pub fn hopper() -> Target {
 /// rows, one or two across, every swizzle span (16-, 32- and 64-deep rings
 /// are 32-, 64- and 128-byte rows), a 96-wide tile of three `n32` and a
 /// `k` of several trips. Shapes stay small for the interpreter.
-pub fn group_families(target: &Target) -> Vec<Launch> {
+pub(crate) fn group_families(target: &Target) -> Vec<Launch> {
     let planner = planner(target.clone());
     let tiles: [([usize; 3], [u32; 2], usize); 7] = [
         ([128, 128, 64], [8, 1], 3),
@@ -197,7 +362,7 @@ pub fn group_families(target: &Target) -> Vec<Launch> {
     tiles
         .into_iter()
         .map(|(tile, warps, stages)| {
-            let cfg = GemmCfg { tile, stages, warps, group_m: 8, unroll: false, core: Core::Group, crews: 1 };
+            let cfg = GemmCfg { tile, stages, warps, unroll: false, core: Core::Group, crews: 1 };
             assert!(cfg.fits(target), "{cfg:?} fits the warpgroup core");
             let (m, n, k) = (tile[0] + 2, tile[1] - 3, 3 * tile[2]);
             let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg };
@@ -208,20 +373,20 @@ pub fn group_families(target: &Target) -> Vec<Launch> {
 
 /// An AMD GPU with `cus` compute units and 64 KB of LDS per workgroup; a
 /// CDNA3 one is an MI300X of eight dies.
-pub fn amd(arch: AmdArch, cus: u32) -> Target {
+pub(crate) fn amd(arch: AmdArch, cus: u32) -> Target {
     let xcds = if arch.is_cdna() { 8 } else { 1 };
     Target { sms: Some(cus), xcds, ..Target::for_arch(GpuArch::Amd(arch)) }
 }
 
 /// A square-kernel convolution of `cin` to `cout` channels over `hw`, its
 /// stride, padding and dilation the same along both axes.
-pub fn geom(hw: [usize; 2], cin: usize, cout: usize, k: usize, s: usize, p: usize, d: usize) -> ConvGeom {
+pub(crate) fn geom(hw: [usize; 2], cin: usize, cout: usize, k: usize, s: usize, p: usize, d: usize) -> ConvGeom {
     ConvGeom { h: hw[0], w: hw[1], cin, cout, kernel: [k, k], stride: [s, s], pad: [p, p], dilation: [d, d] }
 }
 
 /// `(cin, cout, k, [h, w], stride)` of the YOLO26x dense 3×3 classes at
 /// 640² (the memo's census), padded `k / 2`.
-pub const YOLO: [(usize, usize, usize, [usize; 2], usize); 9] = [
+pub(crate) const YOLO: [(usize, usize, usize, [usize; 2], usize); 9] = [
     (192, 192, 3, [40, 40], 1),
     (96, 96, 3, [80, 80], 1),
     (384, 384, 3, [160, 160], 2),
@@ -233,45 +398,50 @@ pub const YOLO: [(usize, usize, usize, [usize; 2], usize); 9] = [
     (768, 96, 3, [20, 20], 1),
 ];
 
-pub fn yolo_geom((cin, cout, k, hw, s): (usize, usize, usize, [usize; 2], usize)) -> ConvGeom {
+pub(crate) fn yolo_geom((cin, cout, k, hw, s): (usize, usize, usize, [usize; 2], usize)) -> ConvGeom {
     geom(hw, cin, cout, k, s, k / 2, 1)
 }
 
-pub(crate) fn device(target: &Target) -> DeviceSpec {
+#[cfg(test)]
+pub(crate) fn device(target: &Target) -> svod_dtype::DeviceSpec {
     match target.arch {
-        GpuArch::Cuda(_) => DeviceSpec::Cuda { device_id: 0 },
-        GpuArch::Amd(_) => DeviceSpec::Amd { device_id: 0 },
-        GpuArch::Metal(_) => DeviceSpec::Metal { device_id: 0 },
+        GpuArch::Cuda(_) => svod_dtype::DeviceSpec::Cuda { device_id: 0 },
+        GpuArch::Amd(_) => svod_dtype::DeviceSpec::Amd { device_id: 0 },
+        GpuArch::Metal(_) => svod_dtype::DeviceSpec::Metal { device_id: 0 },
     }
 }
 
 /// The lowered instruction list of `prog`.
-pub fn linear(prog: Program, lowering: &Lowering) -> Arc<UOp> {
-    let params =
-        prog.params.iter().enumerate().map(|(i, p)| UOp::param(i, p.elems, DType::Scalar(p.dtype), None)).collect();
+#[cfg(test)]
+pub(crate) fn linear(prog: Program, lowering: &Lowering) -> std::sync::Arc<svod_ir::UOp> {
+    let params = prog
+        .params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| svod_ir::UOp::param(i, p.elems, svod_dtype::DType::Scalar(p.dtype), None))
+        .collect();
     let name = prog.name.clone();
-    let lowered =
-        lower(prog, lowering, params, device(&lowering.device.target)).unwrap_or_else(|e| panic!("{name}: {e}"));
-    let Op::Program(ops::Program { linear: Some(linear), .. }) = lowered.program.op() else { panic!("a program") };
+    let lowered = crate::lower::lower(prog, lowering, params, device(&lowering.device.target))
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
+    let svod_ir::Op::Program(svod_ir::ops::Program { linear: Some(linear), .. }) = lowered.program.op() else {
+        panic!("a program")
+    };
     linear.clone()
 }
 
 /// LLVM text of `prog` for its lowering's target.
-pub fn render(prog: Program, lowering: &Lowering) -> String {
+#[cfg(test)]
+pub(crate) fn render(prog: Program, lowering: &Lowering) -> String {
     let name = prog.name.clone();
     try_render(prog, lowering).unwrap_or_else(|e| panic!("{name}: {e}"))
 }
 
-/// [`render`], a renderer's error returned.
+/// [`render`], a renderer's error returned. Through [`lower::render`], so
+/// the program's own rolled loops carry their hint.
 pub fn try_render(prog: Program, lowering: &Lowering) -> Result<String, svod_codegen::Error> {
     let name = prog.name.clone();
-    let renderer = match lowering.device.target.arch {
-        GpuArch::Cuda(arch) => LlvmTextRenderer::nvptx(arch),
-        GpuArch::Amd(arch) => LlvmTextRenderer::amd(arch),
-        GpuArch::Metal(_) => unreachable!("Metal renders C"),
-    };
-    let linear = linear(prog, lowering);
-    Ok(renderer.render(&linear, Some(&name))?.code)
+    crate::lower::render(prog, lowering)
+        .map_err(|e| svod_codegen::Error::InvalidGraph { reason: format!("{name}: {e}") })
 }
 
 /// The targets of the refactor sweep, by the names the gate files them
@@ -297,8 +467,8 @@ pub fn targets() -> Vec<(&'static str, Target)> {
 /// over a cache with and without a row map and appended rows. Each is
 /// `(name, t, tk, d, mask, cache, batch)`.
 #[allow(clippy::type_complexity)]
-fn attention_variants() -> Vec<(String, usize, usize, usize, AttnMask, Option<Cache>, Batch)> {
-    let var = |max| Batch::Var { name: "b".into(), min: 1, max };
+fn attention_variants() -> Vec<(String, usize, usize, usize, AttnMask, Option<CacheLayout>, Batch)> {
+    let var = |max| Batch::var("b", 1, max);
     let m = AttnMask::default();
     let lens = AttnMask { key_lens: true, ..m };
     let chunk = AttnMask { chunk: Some(Chunk { size: 32, left: Some(1), right: 0 }), ..lens };
@@ -315,7 +485,7 @@ fn attention_variants() -> Vec<(String, usize, usize, usize, AttnMask, Option<Ca
     ];
     for row_map in [false, true] {
         for (appended, app_lens) in [(0, false), (4, true)] {
-            let cache = Cache { rows: 6, heads_total: 6, row_map, appended, app_lens };
+            let cache = CacheLayout { rows: 6, heads_total: 6, row_map, appended, app_lens };
             let tag = format!("rm{}_app{appended}", row_map as u8);
             cases.push((format!("decode_{tag}"), 1, 150, 64, lens, Some(cache), var(3)));
             cases.push((format!("prefill_{tag}"), 8, 150, 64, lens, Some(cache), var(3)));
@@ -419,7 +589,7 @@ pub fn digested(target: &Target) -> Vec<Launch> {
                 bias: false,
                 cfg,
             };
-            out.push((format!("rms d{d} {cfg:?}"), norm::<BF16>(&spec), cfg.lowering(&device)));
+            out.push((format!("rms d{d} {cfg:?}"), norm::<BF16>(&spec), Lowering::new(&device)));
         }
     }
     for d in [64, 128] {
@@ -436,7 +606,7 @@ pub fn digested(target: &Target) -> Vec<Launch> {
                 rope: Some(Rope { per_batch: false }),
                 cfg,
             };
-            out.push((format!("heads d{d} {cfg:?}"), heads::<BF16>(&spec), cfg.lowering(&device)));
+            out.push((format!("heads d{d} {cfg:?}"), heads::<BF16>(&spec), Lowering::new(&device)));
         }
     }
     let probes = crate::probe::probes(target).expect("the probes build");
@@ -452,7 +622,7 @@ pub fn digested(target: &Target) -> Vec<Launch> {
 }
 
 /// `launches` with every repeated name numbered (`name #2`, …) after its first.
-pub fn unique(launches: Vec<Launch>) -> Vec<Launch> {
+pub(crate) fn unique(launches: Vec<Launch>) -> Vec<Launch> {
     let mut seen = std::collections::HashMap::<String, usize>::new();
     launches
         .into_iter()
@@ -468,8 +638,9 @@ pub fn unique(launches: Vec<Launch>) -> Vec<Launch> {
 /// The rankings the planner makes on `target` for the shapes [`digested`]
 /// draws from and a few more: GEMMs plain and gated, attention per head
 /// size, query and key count with and without a causal mask or a bias, the
-/// YOLO convolutions and their splits. A ranking change moves no kernel's
-/// text but what the tuner chooses among.
+/// YOLO convolutions and their splits, nearest self-joins resident and
+/// streamed. A ranking change moves no kernel's text but what the tuner
+/// chooses among.
 pub fn rankings(target: &Target) -> String {
     let planner = planner(target.clone());
     let mut s = String::new();
@@ -492,6 +663,25 @@ pub fn rankings(target: &Target) -> String {
         let ranked = planner.conv_ranked(1, ho * wo, &g);
         s += &format!("conv {g:?}: {:?}\n", &*ranked);
         s += &format!("splits: {:?}\n", planner.conv_splits(1, ho * wo, &g, &ranked[..ranked.len().min(8)]));
+    }
+    let self_join = |d, metric, k| {
+        let dtype = ScalarDType::Float16;
+        NearestProblem { n: 1 << 16, m: 1 << 16, d, dtype, metric, floors: Floors::default(), groups: false, k }
+    };
+    for d in [16, 64, 256, 512, 1024] {
+        for metric in [Metric::SquaredL2, Metric::NegDot] {
+            let p = self_join(d, metric, 1);
+            let ranked = planner.nearest_ranked(p);
+            s += &format!("nearest d{d} {metric:?}: {:?}\n", &*ranked);
+            let split = planner.nearest_splits(&p, &first_eight(&ranked));
+            s += &format!("splits: {split:?}\n");
+        }
+    }
+    for (d, k) in [(128, 4), (256, 16), (768, 8), (768, 32)] {
+        let p = self_join(d, Metric::SquaredL2, k);
+        let ranked = planner.nearest_ranked(p);
+        s += &format!("nearest d{d} k{k}: {:?}\n", &*ranked);
+        s += &format!("splits: {:?}\n", planner.nearest_splits(&p, &first_eight(&ranked)));
     }
     s
 }

@@ -158,8 +158,20 @@ pub fn resolve_metal_family(device_id: usize) -> Result<svod_dtype::MetalFamily>
     Ok(crate::metal::MetalDevice::open(device_id)?.family())
 }
 
+/// The bytes of memory CUDA device `device_id` holds in all, read from the
+/// opened (cached) device.
+pub fn resolve_cuda_memory(device_id: usize) -> Result<usize> {
+    Ok(crate::cuda::CudaDevice::open(device_id)?.memory_info()?.1)
+}
+
 /// The static limits of CUDA device `device_id`, read from the opened
 /// (cached) device.
 pub fn resolve_cuda_limits(device_id: usize) -> Result<crate::cuda::CudaLimits> {
     Ok(*crate::cuda::CudaDevice::open(device_id)?.limits())
+}
+
+/// The driver's name for CUDA device `device_id`, read from the opened
+/// (cached) device.
+pub fn resolve_cuda_name(device_id: usize) -> Result<String> {
+    Ok(crate::cuda::CudaDevice::open(device_id)?.name().to_string())
 }

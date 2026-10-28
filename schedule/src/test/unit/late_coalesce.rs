@@ -460,17 +460,16 @@ fn a_gated_load_is_skipped_rather_than_aborting_the_pass() {
     assert_same!(folded[0], gated);
 }
 
-/// `pm_simplify_add_image` removes a Float16 roundtrip and widens a Float16 STORE
-/// value to the address dtype, but an F16-addressed LOAD cannot be built —
-/// `svod_ir` pins LOAD dtype to the address — so that shape is left alone.
+/// `pm_simplify_add_image` keeps a float's Float16 roundtrip, which rounds, and
+/// widens a Float16 STORE value to the address dtype, but an F16-addressed LOAD
+/// cannot be built — `svod_ir` pins LOAD dtype to the address — so that shape is
+/// left alone.
 #[test]
 fn image_float_accesses_adapt_to_the_address_dtype() {
-    let value = UOp::native_const(1.0f32);
+    let value = load(index_of(param(0, 16, DType::Float32), UOp::index_const(0)));
+    let roundtrip = value.cast(DType::Float16).cast(DType::Float32);
     let mut ctx: AddImageContext = (HashMap::new(), Renderer::cpu());
-    assert_same!(
-        graph_rewrite(&pm_simplify_add_image(), value.cast(DType::Float16).cast(DType::Float32), &mut ctx),
-        value
-    );
+    assert_same!(graph_rewrite(&pm_simplify_add_image(), roundtrip.clone(), &mut ctx), roundtrip);
 
     let half = load(index_of(param(0, 16, DType::Float16), UOp::index_const(0)));
     let mut ctx: AddImageContext = (HashMap::new(), Renderer::cpu());

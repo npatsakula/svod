@@ -31,7 +31,33 @@ impl Emit<'_> {
 
     pub(super) fn mem_store(&mut self, buf: &Arc<UOp>, off: &Arc<UOp>, vals: Vec<Arc<UOp>>) {
         let idx = self.access(buf, off, vals.len() as u32);
-        self.push(store_at(&idx, vals));
+        let value = self.packed(vals);
+        self.push(idx.store(value));
+    }
+
+    /// One `w`-wide `val` stored whole at `off`.
+    pub(super) fn mem_store_wide(&mut self, buf: &Arc<UOp>, off: &Arc<UOp>, w: u32, val: Arc<UOp>) {
+        let idx = self.access(buf, off, w);
+        self.push(idx.store(val));
+    }
+
+    /// The `w` values as one stored value: the wide value they were all
+    /// extracted from, reordered by one shuffle, where every element is an
+    /// extract (`elem`) of one source — the [`fill`](Self::fill) path, which
+    /// loads a chunk wide and must not tear it into per-element stores. Any
+    /// other elements keep the stack: a gated or selected element is not an
+    /// extract chain and stays scalar.
+    fn packed(&mut self, vals: Vec<Arc<UOp>>) -> Arc<UOp> {
+        let lanes: Option<Vec<(&Arc<UOp>, u32)>> = vals.iter().map(|val| lane_of(val)).collect();
+        if let Some(lanes) = lanes
+            && lanes.len() > 1
+            && lanes.iter().all(|(src, _)| Arc::ptr_eq(src, lanes[0].0))
+        {
+            let mask: smallvec::SmallVec<[u32; 8]> = lanes.iter().map(|(_, lane)| *lane).collect();
+            let tag = self.next_tag();
+            return UOp::shuffle(lanes[0].0.clone(), mask).rtag(Some(smallvec![tag as usize]));
+        }
+        store_at_value(vals)
     }
 
     pub(super) fn view(&mut self, v: ValId) -> View {
@@ -128,7 +154,7 @@ impl Emit<'_> {
                     None => (None, cols),
                 };
                 let chunk = 16 / bytes as i64;
-                let swizzle = if self.low.swizzle { Swizzle::of_row(cols as usize, bytes) } else { Swizzle::None };
+                let swizzle = Swizzle::of_row(cols as usize, bytes);
                 let col = if swizzle != Swizzle::None {
                     let (c, within) = (shr(&col, chunk.trailing_zeros()), and(&col, &c32(chunk - 1)));
                     let (shift, mask) = (3 - swizzle.bits(), c32((1 << swizzle.bits()) - 1));
@@ -233,15 +259,23 @@ impl Emit<'_> {
     /// reaches every row; `None` keeps the row whole.
     pub(super) fn panel_cols(&self, cols: usize, bytes: usize) -> Option<usize> {
         let (row, span) = (cols * bytes, Swizzle::B128.span());
-        (self.low.core == Core::Group && self.low.swizzle && row > span && row.is_multiple_of(span))
-            .then_some(span / bytes)
+        (self.low.core == Core::Group && row > span && row.is_multiple_of(span)).then_some(span / bytes)
     }
 
     /// The register runs of `l` a view is accessed by: 16-byte vectors along
     /// the view's axis where it is contiguous, else single elements.
+    /// A row-major global view whose rows are a constant stride apart that
+    /// is no multiple of the vector's elements is accessed element by
+    /// element: its rows start off the vector alignment.
     pub(super) fn runs(&self, l: &TileLayout, view: &View) -> Vec<(u32, u32)> {
         let (along, contiguous) = self.along(view);
         let width = if contiguous { 16 / view.dtype.bytes() as u32 } else { 1 };
-        l.runs(self.low.device.target.wave, width, along)
+        let misaligned = match &view.place {
+            Some(Place::Global { stride, rows: None, .. }) if along == Axis::Col && view.shape.rows > 1 => {
+                matches!(self.prog.scalar(stride[0]), Scalar::Const(s) if s % i64::from(width) != 0)
+            }
+            _ => false,
+        };
+        l.runs(self.low.device.target.wave, if misaligned { 1 } else { width }, along)
     }
 }

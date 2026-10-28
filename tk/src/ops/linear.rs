@@ -8,7 +8,7 @@ use svod_dtype::DType;
 use svod_ir::SInt;
 use svod_tensor::Tensor;
 
-use super::config::Planner;
+use super::config::{GemmProblem, Planner};
 use super::shape::{self, Plan, extent, shape_of};
 use super::{
     Act, DEVICE_TEST, DtypeSnafu, GraphSnafu, LaunchSnafu, Result, ShapeSnafu, Tuner, batch_of, fmt_shape, output,
@@ -83,6 +83,7 @@ pub fn linear(x: &Tensor, w: &Tensor, opts: Linear) -> Result<Tensor> {
     };
     let spec = GemmSpec { m, n, k, batch: batch_of(&var, 1), epilogue, cfg: cfgs[0] };
     let spec = tuned(TuneStore::global(), &planner, x.dtype(), &cfgs, spec);
+    super::ran(OP, "gemm", spec.cfg);
     let y = output(&[lead, &[n]].concat(), &var, x.dtype()).context(GraphSnafu { op: OP })?;
     let ins: Vec<&Tensor> = [Some(x), Some(w), opts.bias, opts.residual, Some(&y)].into_iter().flatten().collect();
     launch::graph_launch(typed!(x.dtype(), gemm, &spec), &spec.cfg.lowering(&planner.device), &ins)
@@ -112,7 +113,16 @@ fn tune(
 ) -> GemmSpec {
     let shape = [spec.batch.capacity(), spec.m, spec.n, spec.k];
     let build = |cfg| vec![(typed!(dtype, gemm, &GemmSpec { cfg, ..spec.clone() }), cfg.lowering(&planner.device))];
-    let cfg = Tuner::new(store, &planner.device, dtype.clone(), &shape, salt, build).tuned(op, ranked, <[_]>::to_vec);
+    let problem = GemmProblem {
+        batches: spec.batch.capacity().max(1),
+        m: spec.m,
+        n: spec.n,
+        k: spec.k,
+        halves: usize::from(spec.epilogue.gated) + 1,
+    };
+    let cfg = Tuner::new(store, &planner.device, dtype.clone(), &shape, salt, build)
+        .floored(|cfg| planner.floor_of(&problem, cfg))
+        .tuned(op, ranked, <[_]>::to_vec);
     GemmSpec { cfg, ..spec }
 }
 

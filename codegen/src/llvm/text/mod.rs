@@ -35,27 +35,39 @@ use svod_ir::ops;
 /// emitter (`ptx_kernel` ABI, addrspace(3) shared memory, nvvm intrinsics).
 pub struct LlvmTextRenderer {
     target: LlvmTarget,
+    /// RANGE ids a tile program's own schedule kept rolled, whose loops
+    /// carry the rolled hint whatever a pattern match over the nodes would
+    /// find ([`Self::rolled`]).
+    rolled: std::collections::HashSet<u64>,
 }
 
 impl LlvmTextRenderer {
     /// Renderer for the host CPU target (default for backwards compatibility).
     pub fn new() -> Self {
-        Self { target: LlvmTarget::Cpu }
+        Self { target: LlvmTarget::Cpu, rolled: Default::default() }
     }
 
     /// Renderer for an AMD GPU at the named `gfx{family}` target.
     pub fn amd(arch: AmdArch) -> Self {
-        Self { target: LlvmTarget::Amd(arch) }
+        Self { target: LlvmTarget::Amd(arch), rolled: Default::default() }
     }
 
     /// Renderer for an NVIDIA GPU at the named `sm_XY` compute capability.
     pub fn nvptx(arch: CudaArch) -> Self {
-        Self { target: LlvmTarget::Nvptx(arch) }
+        Self { target: LlvmTarget::Nvptx(arch), rolled: Default::default() }
+    }
+
+    /// The loops whose ranges `ids` name, kept rolled by the schedule that
+    /// emitted them: they carry the rolled hint on every target, in place
+    /// of the pattern match that recovers the fact from the nodes.
+    pub fn rolled(mut self, ids: impl IntoIterator<Item = u64>) -> Self {
+        self.rolled = ids.into_iter().collect();
+        self
     }
 
     /// Construct with an explicit target.
     pub fn with_target(target: LlvmTarget) -> Self {
-        Self { target }
+        Self { target, rolled: Default::default() }
     }
 
     pub fn target(&self) -> LlvmTarget {
@@ -94,7 +106,17 @@ impl Renderer for LlvmTextRenderer {
 
         let mut ctx = RenderContext::new();
         if self.target.is_amd() {
-            ctx.set_loop_hint(amd::LOOP_HINT, amd::register_indexing_ranges(&nodes));
+            ctx.set_loop_hint(
+                amd::LOOP_HINT,
+                amd::ROLLED_HINT,
+                amd::register_indexing_ranges(&nodes),
+                self.rolled.iter().copied().chain(amd::product_ranges(&nodes)).collect(),
+            );
+        } else if !self.rolled.is_empty() {
+            // A tile program's rolled loops stay rolled wherever they run;
+            // nothing else carries a hint (NVPTX has no threshold boost to
+            // keep, so its loops run bare unless the schedule says rolled).
+            ctx.set_rolled_hint(amd::ROLLED_HINT, self.rolled.clone());
         }
         let mut kernel: Vec<String> = Vec::new();
         let mut operations = Vec::new();

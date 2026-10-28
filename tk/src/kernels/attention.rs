@@ -5,10 +5,9 @@ use std::fmt;
 
 use super::rows::NormCfg;
 use super::{Batch, batch_offset, bound, load_f32};
-use crate::atoms::{Core, Device, Target};
+use crate::atoms::{Core, Device};
 use crate::build::*;
 use crate::ir::*;
-use crate::layouts::WarpGrid;
 use crate::lower::Lowering;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -96,9 +95,37 @@ pub struct Forms {
 /// row's scores and its reductions stay within the warp. A warp may own a
 /// multiple ([`FaCfg::warp_rows`]); the planner refuses a core whose atom
 /// differs ([`FaCfg::fits`](FaCfg::fits)).
-pub const WARP_ROWS: usize = 16;
+pub(crate) const WARP_ROWS: usize = 16;
+
+/// Why [`attention`] refuses a config, whatever the target: what its
+/// ranking leaves out as one that does not lower
+/// ([`crate::ops::config::Rejected::Lowers`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, snafu::Snafu)]
+pub enum Invalid {
+    #[snafu(display("{key_warps} key warps share a block of one row warp, not {bq} rows"))]
+    KeyWarps { key_warps: usize, bq: usize },
+    #[snafu(display("{stages} stages of {bkv} keys hold no key warp's output"))]
+    KeyWarpOutput { stages: usize, bkv: usize },
+}
 
 impl FaCfg {
+    /// Whether [`attention`] runs the config's key warps: several share a
+    /// block of one row warp, and a warp's merged output takes `16·d` f32
+    /// of its 16-bit K ring.
+    pub fn shares_keys(&self) -> Result<(), Invalid> {
+        let Self { bq, bkv, stages, key_warps, .. } = *self;
+        if key_warps == 1 {
+            return Ok(());
+        }
+        if bq != WARP_ROWS {
+            return Err(Invalid::KeyWarps { key_warps, bq });
+        }
+        if stages * bkv < 2 * WARP_ROWS {
+            return Err(Invalid::KeyWarpOutput { stages, bkv });
+        }
+        Ok(())
+    }
+
     pub const fn new(bq: usize, bkv: usize, stages: usize) -> Self {
         Self {
             bq,
@@ -131,8 +158,7 @@ impl FaCfg {
     }
 
     pub fn lowering(&self, device: &Device) -> Lowering {
-        let grid = WarpGrid { rows: self.row_warps(), cols: 1 };
-        Lowering { core: self.core, ..Lowering::uniform(device, self.unroll, grid) }
+        Lowering { core: self.core, ..Lowering::new(device) }
     }
 
     /// Whether the config holds `appended` rows: they ride one key block,
@@ -150,20 +176,17 @@ impl FaCfg {
 
     /// Static shared memory in bytes: the K and V rings of a 16-bit type (and
     /// the bias ring, [`bias_ring`](Self::bias_ring)), one set per key warp
-    /// (the states key warps merge through reuse their rings).
+    /// (the states key warps merge through reuse their rings) — all of it:
+    /// where the core's accumulator cannot feed the P·V product (RDNA3), the
+    /// probabilities' relayout is pinned to the lane exchange
+    /// ([`crate::layouts::TileLayout::relayout`]), so a kernel of the config
+    /// declares no scratch for them. (A shared crossing, which the costs
+    /// could choose before, the card may refuse: the Strix Halo's "local
+    /// memory (73728) exceeds limit (65536)", a 32×128 block of head size 64
+    /// whose rings alone are its whole 64 KB.)
     pub fn smem_bytes(&self, d: usize, bias: bool) -> usize {
         let slot = 2 * self.bkv * d + usize::from(self.bias_ring(bias)) * self.bq * self.bkv;
         self.key_warps * self.stages * slot * 2
-    }
-
-    /// The shared scratch the f32 score tile crosses to become the P·V
-    /// operand where the core's accumulator cannot feed a product as it
-    /// stands (RDNA3); nothing where it can.
-    pub fn scratch_bytes(&self, target: &Target) -> usize {
-        match target.geometry() {
-            Some(atom) if !atom.accumulator_feeds(target.wave) => self.bq * self.bkv * 4,
-            _ => 0,
-        }
     }
 }
 
@@ -219,7 +242,7 @@ pub enum Bias {
 /// `kv_heads` heads from a `[1]` i32 `head_start` parameter on: a layer's
 /// slice is a runtime value, so every layer runs the one program.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Cache {
+pub struct CacheLayout {
     pub rows: usize,
     pub heads_total: usize,
     /// A `[batch]` i32 parameter: the cache row each batch reads.
@@ -235,7 +258,7 @@ pub struct Cache {
 
 /// The row stride of the `key_mask` and `bias` parameters: 8-element runs
 /// stay aligned.
-pub fn key_mask_stride(tk: usize) -> usize {
+pub(crate) fn key_mask_stride(tk: usize) -> usize {
     tk.next_multiple_of(8)
 }
 
@@ -250,7 +273,7 @@ pub struct AttnSpec {
     pub kv_heads: usize,
     pub d: usize,
     pub mask: AttnMask,
-    pub cache: Option<Cache>,
+    pub cache: Option<CacheLayout>,
     pub scale: f32,
     pub cfg: FaCfg,
 }
@@ -260,7 +283,7 @@ impl AttnSpec {
     pub fn extra_params(&self) -> Vec<&'static str> {
         let AttnMask { key_lens, key_mask, seg_start, .. } = self.mask;
         let cache =
-            self.cache.unwrap_or(Cache { rows: 0, heads_total: 0, row_map: false, appended: 0, app_lens: false });
+            self.cache.unwrap_or(CacheLayout { rows: 0, heads_total: 0, row_map: false, appended: 0, app_lens: false });
         [
             (key_lens, "key_lens"),
             (key_mask, "key_mask"),
@@ -330,7 +353,7 @@ impl<T> Step<'_, T> {
 /// what keeps that sum finite for any value magnitude.
 const RESCALE_ABOVE: f64 = 8.0;
 
-fn step<T: Elem, PK: TierMark, PV: TierMark>(
+fn step<T: Half, PK: TierMark, PV: TierMark>(
     k: &mut Kernel,
     st: &Step<'_, T>,
     k_t: Tile<PK, T>,
@@ -407,7 +430,7 @@ fn step<T: Elem, PK: TierMark, PV: TierMark>(
 /// skipped through the first block and the trip count, the rest shared
 /// evenly by the splits; only blocks a mask edge crosses pay for the mask,
 /// except under a key mask or a bias, which every block reads.
-pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
+pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
     let AttnSpec { ref batch, t, tk, heads, kv_heads, d, mask, cache, scale, cfg } = *spec;
     let AttnMask { causal, window, chunk, key_lens, key_mask, seg_start, bias } = mask;
     let FaCfg { bq, bkv, stages, splits, .. } = cfg;
@@ -447,10 +470,11 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
     let (gz, bb) = batch.axis(&mut k);
     k.grid([Sc::from(t.div_ceil(bq) * splits), Sc::from(heads), gz]);
     let kw = cfg.key_warps;
-    assert!(kw == 1 || bq == WARP_ROWS, "{kw} key warps share a block of one row warp, not {bq} rows");
-    // A warp's merged output takes 16·d f32 of its 16-bit K ring.
-    assert!(kw == 1 || stages * bkv >= 2 * WARP_ROWS, "{stages} stages of {bkv} keys hold no key warp's output");
-    k.warps(cfg.warps());
+    if let Err(e) = cfg.shares_keys() {
+        panic!("{e}");
+    }
+    k.warps(cfg.row_warps());
+    k.lone_warps(cfg.warps());
     let k_s = k.smem::<T>("k_s", kw * stages * bkv * d);
     let v_s = k.smem::<T>("v_s", kw * stages * bkv * d);
     // The bias streams through a ring of its own beside K and V, unless the
@@ -702,7 +726,7 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
         };
         let [m, l, acc] = k.pipeline(
             w_blocks,
-            stages,
+            Ring { stages, unroll: cfg.unroll, crews: 1 },
             [m0, l0, o0],
             |k, step, slot| {
                 let (kv_off, slot) = ((w_first.clone() + step) * bkv, slot0.clone() + slot);

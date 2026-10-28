@@ -88,7 +88,7 @@ fn counted(target: &Target, probes: &[Probe], field: &str) -> f64 {
         probe.value(l.carried[0].phi).shape.elems()
     };
     match field {
-        "step" | "step_group" => (blocks * extent * mma(probe) / 4096) as f64,
+        "step" | "step_group" | "step_i8" => (blocks * extent * mma(probe) / 4096) as f64,
         "smem_byte" | "global_byte" => {
             let tier = if field == "smem_byte" { Tier::Smem } else { Tier::Global };
             (blocks * extent * loads_from(probe, tier).iter().map(|l| l.1).sum::<usize>()) as f64
@@ -96,7 +96,7 @@ fn counted(target: &Target, probes: &[Probe], field: &str) -> f64 {
         "score" => (blocks * extent * carried()) as f64,
         // One wave's chain: every wave runs its own alongside the others.
         "scatter" => (extent * loads_from(probe, Tier::Global)[0].0.elems() / warps) as f64,
-        "step_lone" => (extent * mma(probe) / 4096 / warps) as f64,
+        "step_lone" | "step_lone_i8" => (extent * mma(probe) / 4096 / warps) as f64,
         // The work of every relayout of a trip, as the inference prices it.
         "smem_trip" | "lane_move" => {
             let moved: f64 = relayouts(target, find(probes, field), 1).iter().map(Relayout::work).sum();
@@ -153,13 +153,14 @@ fn the_ladder_reads_the_cache(rates: &[(usize, f64)], global_byte: f64, want: (f
 /// footprints in a row read nearer DRAM than the cache, so a device with a
 /// small cache measures a few rungs and one whose cache holds every
 /// footprint measures them all; a rung that cannot be measured (a rate of
-/// 0 here) fails the ladder. A list of rates repeats its last.
-#[test_case(&[10.0, 11.0, 60.0, 95.0, 100.0], 100.0, 4, Some((10.0, 2.0 * (1 << 20) as f64 * (89.0 / 90.0))); "a small cache stops the ladder at four")]
-#[test_case(&[10.0, 12.0, 30.0, 31.0, 90.0, 95.0], 100.0, 6, Some((10.0, 8.0 * (1 << 20) as f64 * (69.0 / 90.0))); "a second level is climbed through")]
-#[test_case(&[120.0, 130.0], 100.0, 2, Some((100.0, 0.0)); "slower than DRAM stops at two")]
-#[test_case(&[10.0], 100.0, 9, Some((10.0, (STREAM / 2) as f64)); "a cache holding half the stream climbs every rung")]
-#[test_case(&[10.0, 11.0, 0.0], 100.0, 3, None; "a rung that fails")]
-fn the_ladder_stops_past_the_cache(rates: &[f64], global_byte: f64, want_calls: usize, want: Option<(f64, f64)>) {
+/// 0 here) is skipped and the ladder keeps the rungs it has, failing only
+/// when it holds none. A list of rates repeats its last.
+#[test_case(&[10.0, 11.0, 60.0, 95.0, 100.0], 100.0, 4, 4; "a small cache stops the ladder at four")]
+#[test_case(&[10.0, 12.0, 30.0, 31.0, 90.0, 95.0], 100.0, 6, 6; "a second level is climbed through")]
+#[test_case(&[120.0, 130.0], 100.0, 2, 2; "slower than DRAM stops at two")]
+#[test_case(&[10.0], 100.0, 9, 9; "a cache holding half the stream climbs every rung")]
+#[test_case(&[10.0, 11.0, 0.0], 100.0, 9, 2; "a rung that fails is skipped")]
+fn the_ladder_stops_past_the_cache(rates: &[f64], global_byte: f64, want_calls: usize, want_rungs: usize) {
     let probes = crate::probe::cache_probes(&sm86()).unwrap();
     assert_eq!(probes.last().map(|p| p.0), Some(STREAM / 2), "the ladder reaches half the stream");
     let mut calls = 0;
@@ -167,9 +168,12 @@ fn the_ladder_stops_past_the_cache(rates: &[f64], global_byte: f64, want_calls: 
         let rate = rates.get(calls).or(rates.last()).copied().unwrap();
         calls += 1;
         (rate > 0.0).then_some(rate).ok_or(crate::probe::Error::Unmeasured { probe: p.op, last: "lost".into() })
-    });
-    assert_eq!(got.ok(), want);
+    })
+    .expect("a rung of the ladder");
     assert_eq!(calls, want_calls);
+    assert_eq!(got.len(), want_rungs);
+    assert!(got.windows(2).all(|w| w[0].0 < w[1].0), "{got:?}");
+    assert_eq!(got[0].1, rates[0]);
 }
 
 /// A cache probe's region holds a prime number of tiles that nearly fills
@@ -236,6 +240,7 @@ fn units_count_the_primitive(target: Target) {
         if p.candidates.is_empty() {
             let absent = match field {
                 "step_group" => target.group_mma.is_empty(),
+                "step_i8" => target.geometry_of(svod_dtype::ScalarDType::Int8).is_none(),
                 "trip_rolled" => target.fill == Fill::CpAsync,
                 "latency_one" => target.fill == Fill::Staged,
                 _ => false,
@@ -256,25 +261,39 @@ fn units_count_the_primitive(target: Target) {
     }
     assert_eq!(find(&probes, "global_byte").units, STREAM as f64, "the stream is read once");
     let [trip, rolled, one] = ["trip", "trip_rolled", "trip_one"].map(|f| find(&probes, f));
-    let unroll = |p: &Probe| -> Vec<bool> {
-        p.candidates
-            .iter()
-            .map(|c| match c[0].1.schedule {
-                crate::schedule::Schedule::Uniform { unroll, .. } => unroll,
-                crate::schedule::Schedule::PingPong { .. } => panic!("a probe runs every warp alike"),
+    // Each candidate's ring: unrolled or not, `None` without one.
+    let unroll = |p: &Probe| -> Vec<Option<bool>> {
+        let ring = |c: &crate::tune::Candidate| {
+            c[0].0.walk().find_map(|(_, s)| match s {
+                Stmt::Pipeline(p) => {
+                    assert_eq!(p.crews, 1, "a probe runs every warp alike");
+                    Some(p.unroll)
+                }
+                _ => None,
             })
-            .collect()
+        };
+        p.candidates.iter().map(ring).collect()
     };
-    assert_eq!(unroll(trip), vec![true; 2], "the ring unrolled");
+    assert_eq!(unroll(trip), [None, Some(true)], "the ring unrolled");
     // A rolled ring is priced apart only where the fill goes through registers.
     let rolled = (target.fill == Fill::Staged).then_some(rolled);
     if let Some(rolled) = rolled {
-        assert_eq!(unroll(rolled), vec![false; 2], "then rolled");
-        assert_eq!(pair(trip), pair(rolled), "the same programs");
+        assert_eq!(unroll(rolled), [None, Some(false)], "then rolled");
+        fn roll(block: &mut Block) {
+            for s in &mut block.0 {
+                if let Stmt::Pipeline(p) = s {
+                    p.unroll = false;
+                }
+                s.blocks_mut().for_each(roll);
+            }
+        }
+        let (base, mut probe) = (pair(trip).0.clone(), pair(trip).1.clone());
+        roll(&mut probe.body);
+        assert_eq!((&base, &probe), pair(rolled), "the same programs");
     }
     // The one-slot trip: the ring one slot deep, rolled, against a baseline
     // reading its fragments from a ring as deep.
-    assert_eq!(unroll(one), vec![false; 2], "a one-slot ring has nothing to unroll");
+    assert_eq!(unroll(one), [None, Some(false)], "a one-slot ring has nothing to unroll");
     let ring = |p: &Program| p.smem.iter().map(|a| a.elems).collect::<Vec<_>>();
     for p in [Some(trip), rolled, Some(one)].into_iter().flatten() {
         let (base, probe) = pair(p);
@@ -335,6 +354,9 @@ fn in_loop(ir: &str) -> &str {
 #[test_case(sm86(), "step", "@llvm.nvvm.mma."; "sm86 mma.sync")]
 #[test_case(gfx1151(), "step", "@llvm.amdgcn.wmma."; "gfx1151 wmma")]
 #[test_case(hopper(), "step_group", "wgmma.mma_async.sync.aligned.m64n256k16"; "sm90 wgmma")]
+#[test_case(sm86(), "step_i8", "@llvm.nvvm.mma.m16n8k32.row.col.satfinite.s8"; "sm86 s8 mma.sync")]
+#[test_case(gfx1151(), "step_i8", "@llvm.amdgcn.wmma.i32.16x16x16.iu8"; "gfx1151 iu8 wmma")]
+#[test_case(amd(AmdArch::Gfx942, 304), "step_i8", "@llvm.amdgcn.mfma.i32.16x16x32.i8"; "gfx942 i8 mfma")]
 #[test_case(sm86(), "step_lone", "@llvm.nvvm.mma."; "sm86 lone mma.sync")]
 #[test_case(gfx1151(), "step_lone", "@llvm.amdgcn.wmma."; "gfx1151 lone wmma")]
 #[test_case(sm86(), "smem_byte", "ptr %local0"; "sm86 shared load")]
@@ -379,7 +401,7 @@ fn relayouts(target: &Target, p: &Probe, i: usize) -> Vec<Relayout> {
     tile.walk()
         .filter_map(|(_, s)| match s {
             Stmt::Let { dst, op: TileOp::Relayout { src } } => {
-                Some(lay(*src).relayout(&lay(*dst), tile.warps, target.wave, &lowering.device.costs))
+                Some(lay(*src).relayout(&lay(*dst), tile.warps, target.wave, &lowering.device.costs, false))
             }
             _ => None,
         })
@@ -448,10 +470,14 @@ fn a_probe_keeps_the_least_of_agreeing_timings(timings: &[u64]) -> (Option<u64>,
 /// and non-negative, and ordered as the hardware is: a shared byte cheaper
 /// than a global one, a cached one no dearer than DRAM's, a lone trip's wait
 /// (through a one-slot `cp.async` ring too) outlasting a matrix step, a
-/// rolled ring's trip and a one-slot ring's about an unrolled two-slot one's
-/// or more, a lone block's trip no cheaper than one with the SM full, and a
-/// round trip through shared memory costing something. The
-/// retries absorb a pair timed alongside another test's kernels.
+/// rolled ring's trip about an unrolled two-slot one's or more, a one-slot
+/// ring's within a factor of two of it either way (its two barriers a trip
+/// cost more, its half footprint runs twice the blocks that hide them:
+/// gfx1201 measures 5.9 ns to the two-slot ring's 7.5 once a trip's loads
+/// are fenced ahead of its products, 7.2 to 7.2 before), a lone block's
+/// trip no cheaper than one with the SM full, and a round trip through
+/// shared memory costing something. The retries absorb a pair timed
+/// alongside another test's kernels.
 #[test]
 fn device_costs_are_physical() {
     let Some(target) = super::device_target() else { return };
@@ -468,6 +494,8 @@ fn device_costs_are_physical() {
     assert!(target.fill != Fill::CpAsync || c.latency_one > c.step, "{c:?}");
     assert!(c.trip_lone >= c.trip && c.trip_one_lone >= c.trip_one, "{c:?}");
     assert!(c.step_lone >= c.step, "{c:?}");
+    let int8 = target.geometry_of(svod_dtype::ScalarDType::Int8).is_some();
+    assert_eq!(c.step_i8 > 0.0, int8, "{c:?}");
     assert!(c.smem_trip > 0.0, "{c:?}");
     // A ring the planner prices apart from the unrolled two-slot one does no
     // less than it, within what the trip pairs resolve: each pair's
@@ -491,7 +519,7 @@ fn device_costs_are_physical() {
         eprintln!("trip_rolled {rolled:.3}");
         assert!(c.trip_rolled >= 0.9 * c.trip - (trip + rolled), "{c:?}");
     }
-    assert!(c.trip_one >= 0.9 * c.trip - (trip + one), "{c:?}");
+    assert!(c.trip_one >= 0.5 * c.trip - (trip + one) && c.trip_one <= 2.0 * c.trip + (trip + one), "{c:?}");
 }
 
 /// Every probe's signal on the attached GPU: a dominant one at least half

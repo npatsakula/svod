@@ -5,36 +5,110 @@
 //! memo, a fingerprint keyed by what the candidates emit and remembered
 //! by what they are made of, and on the device a real GEMM tuning.
 
+use super::Scratch;
+use crate::ops::config::{Tiled, gemm_cfg};
 use std::cell::Cell;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use svod_dtype::ScalarDType;
 use svod_runtime::KernelResources;
 use test_case::test_case;
 
-use crate::atoms::{Core, Device, sm86};
+use crate::atoms::{Device, sm86};
 use crate::build::BF16;
 use crate::kernels::Batch;
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
-use crate::tune::{self, Bench, Entry, FORMAT, Kind, ScratchPool, TuneKey, TuneStore, fingerprint};
+use crate::tune::{self, Bench, Entry, FORMAT, Kind, Pass, ScratchPool, TuneKey, TuneStore, fingerprint};
 
 /// A host key: no device, so no compiler digest.
 fn key(shape: &[usize], candidates: &[usize]) -> TuneKey {
     TuneKey::new("gemm", &sm86(), 0, ScalarDType::BFloat16, shape, &candidates)
 }
 
+/// `n` distinct GEMM configs a store line's indices point into.
+fn cfgs(n: usize) -> Vec<crate::kernels::gemm::GemmCfg> {
+    let tiles = [[64, 64, 32], [128, 64, 32], [64, 128, 32], [128, 128, 32], [256, 64, 16], [64, 256, 64]];
+    (0..n)
+        .map(|i| {
+            let t = tiles[i % tiles.len()];
+            gemm_cfg(t, 2, [2, 2], i % 2 == 0)
+        })
+        .chain(std::iter::repeat(gemm_cfg(tiles[0], 2, [2, 2], false)))
+        .take(n)
+        .collect()
+}
+
+/// Every family's config code holds the config whole and nothing else: the
+/// lattices the rankings walk — warp and warpgroup cores, a two-crew
+/// cluster, conv splits, nearest lists, lane queues and score matrices —
+/// round-trip through their code, and a code that is not the family's form
+/// holds no config.
+#[test]
+fn every_familys_config_code_round_trips() {
+    use crate::atoms::Core;
+    use crate::kernels::attention::FaCfg;
+    use crate::kernels::conv::ConvCfg;
+    use crate::kernels::nearest::{LaneQueue, Metric, NearestCfg, SelectCfg};
+    use crate::kernels::rows::NormCfg;
+    use crate::ops::config::{Tiled, gemm_lattice};
+    fn round<C: Tiled + std::fmt::Debug>(cs: &[C]) {
+        for c in cs {
+            let code = c.code();
+            assert_eq!(C::of_code(&code).as_ref(), Some(c), "{c:?} does not round-trip as {code}");
+        }
+    }
+    let target = sm86();
+    let planner = super::planner(target.clone());
+    let mut gemm = gemm_lattice(&target);
+    gemm.push(GemmCfg { core: Core::Group, ..gemm_cfg([128, 256, 32], 4, [4, 4], false) });
+    round(&gemm);
+    let mut conv: Vec<ConvCfg> = gemm.iter().map(|g| ConvCfg { gemm: *g, split: 4 }).collect();
+    conv.push(ConvCfg { gemm: gemm[0], split: 1 });
+    round(&conv);
+    round(&[NormCfg { br: 4 }, NormCfg { br: 32 }]);
+    let mut forms = planner.attention_ranked(8, 100, 100, 64, true, false).to_vec();
+    forms.push(FaCfg { core: Core::Group, splits: 2, key_warps: 4, ..forms[0] });
+    forms.push(FaCfg {
+        forms: crate::kernels::attention::Forms {
+            truncate_p: true,
+            sum_after: true,
+            skip_rescale: true,
+            raw_max: true,
+            bias_direct: true,
+        },
+        ..forms[0]
+    });
+    round(&forms);
+    let problem = crate::ops::config::NearestProblem {
+        n: 1 << 14,
+        m: 1 << 14,
+        d: 128,
+        dtype: ScalarDType::Float16,
+        metric: Metric::SquaredL2,
+        floors: Default::default(),
+        groups: false,
+        k: 64,
+    };
+    let mut nearest = planner.nearest_ranked(problem).to_vec();
+    nearest.push(NearestCfg { lanes: Some(LaneQueue { width: 4, depth: 32, passes: true }), ..nearest[0] });
+    nearest.push(NearestCfg {
+        select: Some(SelectCfg { warps: 2, queue: 16, filter: true }),
+        lanes: None,
+        ..nearest[0]
+    });
+    round(&nearest);
+    // A code that is not the family's form holds no config.
+    for bad in ["", "x", "w,1", "w,a,b,c,d,e,f,g,h", "64,64,2,0", "w,1,2,3,4,5,6,7,8,9,10"] {
+        assert!(GemmCfg::of_code(bad).is_none());
+        assert!(FaCfg::of_code(bad).is_none());
+        assert!(NearestCfg::of_code(bad).is_none());
+    }
+}
+
 /// The store file of [`key`]'s device under `dir`.
 fn store_file(dir: &std::path::Path) -> String {
     let path = dir.join(format!("sm_86_28sm-v{}.txt", env!("CARGO_PKG_VERSION")));
     std::fs::read_to_string(path).expect("the store file")
-}
-
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("svod-tk-tune-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-    dir
 }
 
 /// A choice made the way [`TuneStore::choose`] makes one, from a closure of
@@ -61,8 +135,12 @@ impl Select for TuneStore {
         programs: impl FnOnce() -> u64,
         measure: impl FnOnce() -> Vec<Option<u64>>,
     ) -> Option<usize> {
-        let within = |entry: &Entry| matches!(entry, Entry::Choice(timed) if timed.iter().all(|&(i, _)| i < count));
-        let timed = |()| tune::ordered(measure()).map(Entry::Choice);
+        let within = |entry: &Entry| matches!(entry, Entry::Choice(timed) if timed.iter().all(|&(i, _, _)| i < count));
+        let timed = |()| {
+            tune::ordered(measure()).map(|timed| {
+                Entry::Choice(timed.iter().map(|&(i, ns)| (i, i.to_string(), ns)).collect::<Vec<_>>().into())
+            })
+        };
         match self.remember(Kind::Choice, key, within, || (programs(), ()), timed)? {
             Entry::Choice(timed) => Some(timed[0].0),
             _ => None,
@@ -85,23 +163,22 @@ fn timed<'a>(ns: &'a [Option<u64>], ran: &'a Cell<bool>) -> impl FnOnce() -> Vec
 /// fingerprint) re-measures.
 #[test]
 fn a_winner_round_trips_through_the_store() {
-    let dir = scratch("round-trip");
+    let dir = Scratch::new("tune-round-trip");
     let k = key(&[1, 704, 512, 512], &[1, 2, 3]);
     let ran = Cell::new(false);
-    let chosen = TuneStore::at(Some(dir.clone())).select(&k, 3, || 7, timed(&[Some(300), None, Some(100)], &ran));
+    let chosen = TuneStore::at(Some(dir.to_path_buf())).select(&k, 3, || 7, timed(&[Some(300), None, Some(100)], &ran));
     assert_eq!((chosen, ran.get()), (Some(2), true));
-    assert_eq!(store_file(&dir), format!("format {FORMAT}\n{} 2 100 0 300\n", k.line(Kind::Choice, 7)));
+    assert_eq!(store_file(&dir), format!("format {FORMAT}\n{} 2:2 100 0:0 300\n", k.line(Kind::Choice, 7)));
 
-    let again = TuneStore::at(Some(dir.clone()));
+    let again = TuneStore::at(Some(dir.to_path_buf()));
     let ran = Cell::new(false);
     assert_eq!((again.select(&k, 3, || 7, timed(&[None; 3], &ran)), ran.get()), (Some(2), false));
 
-    let changed = TuneStore::at(Some(dir.clone()));
+    let changed = TuneStore::at(Some(dir.to_path_buf()));
     let ran = Cell::new(false);
     assert_eq!(changed.select(&k, 3, || 8, timed(&[Some(5), Some(9), Some(9)], &ran)), Some(0));
     assert!(ran.get(), "another kernel fingerprint is a miss");
     assert_eq!(changed.entries(&k).len(), 2, "both lines are kept");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// A warm memo neither fingerprints nor measures.
@@ -123,12 +200,11 @@ fn the_memo_answers_without_building() {
 /// Nothing measured: no choice, and no line on disk.
 #[test]
 fn nothing_measured_is_never_stored() {
-    let dir = scratch("unmeasured");
-    let store = TuneStore::at(Some(dir.clone()));
+    let dir = Scratch::new("tune-unmeasured");
+    let store = TuneStore::at(Some(dir.to_path_buf()));
     let k = key(&[64, 64, 64], &[0, 1]);
     assert_eq!(store.select(&k, 2, || 1, || vec![None, None]), None);
     assert!(store.entries(&k).is_empty());
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Two threads asking for one key at once measure it once: the second
@@ -164,8 +240,8 @@ fn a_key_in_flight_is_measured_once() {
 #[test]
 fn concurrent_writers_of_one_file_lose_no_line() {
     let (threads, keys) = (8, 8);
-    let dir = scratch("concurrent");
-    let store = TuneStore::at(Some(dir.clone()));
+    let dir = Scratch::new("tune-concurrent");
+    let store = TuneStore::at(Some(dir.to_path_buf()));
     let start = std::sync::Barrier::new(threads);
     std::thread::scope(|s| {
         for t in 0..threads {
@@ -179,7 +255,7 @@ fn concurrent_writers_of_one_file_lose_no_line() {
             });
         }
     });
-    let again = TuneStore::at(Some(dir.clone()));
+    let again = TuneStore::at(Some(dir.to_path_buf()));
     assert_eq!(again.entries(&key(&[], &[0])).len(), threads * keys);
     for t in 0..threads {
         for i in 0..keys {
@@ -189,12 +265,10 @@ fn concurrent_writers_of_one_file_lose_no_line() {
     }
     let leftovers = std::fs::read_dir(&dir).unwrap().count();
     assert_eq!(leftovers, 1, "a temporary file left behind");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
-/// A plain bf16 GEMM's programs at `tile` on sm_86.
-fn gemm_programs(tile: [usize; 3]) -> tune::Candidate {
-    let cfg = GemmCfg { core: Core::Warp, tile, stages: 2, warps: [2, 2], group_m: 8, unroll: true, crews: 1 };
+/// A plain bf16 GEMM's programs under `cfg` on sm_86.
+fn gemm_programs(cfg: crate::kernels::gemm::GemmCfg) -> tune::Candidate {
     let spec = GemmSpec { m: 128, n: 128, k: 128, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg };
     vec![(gemm::<BF16>(&spec), cfg.lowering(&Device { target: sm86(), costs: super::costs() }))]
 }
@@ -205,40 +279,38 @@ fn gemm_programs(tile: [usize; 3]) -> tune::Candidate {
 /// the programs to fingerprint them and compiles nothing.
 #[test]
 fn a_store_hit_compiles_nothing() {
-    let dir = scratch("hit");
+    let dir = Scratch::new("tune-hit");
     let k = key(&[128, 128, 128], &[0, 1]);
-    let tiles = [[64, 64, 32], [128, 64, 32]];
+    let cfgs = [gemm_cfg([64, 64, 32], 2, [2, 2], true), gemm_cfg([128, 64, 32], 2, [2, 2], true)];
     let builds = Cell::new(0);
-    let build = |i: usize| {
+    let build = |c: crate::kernels::gemm::GemmCfg| {
         builds.set(builds.get() + 1);
-        gemm_programs(tiles[i])
+        gemm_programs(c)
     };
-    let programs = fingerprint(&[gemm_programs(tiles[0]), gemm_programs(tiles[1])]);
+    let programs = fingerprint(&[gemm_programs(cfgs[0]), gemm_programs(cfgs[1])]);
     let mut bench = Bench::default();
-    let missed = TuneStore::at(Some(dir.clone())).choose(&k, &[0, 1], build, &mut bench);
+    let missed = TuneStore::at(Some(dir.to_path_buf())).choose(&k, &cfgs, build, &mut bench, Pass::Whole, None);
     assert_eq!((builds.get(), bench.built.len()), (2, 2), "a miss builds and compiles each once");
     // Without a device that timed them, what it would have measured, stored
     // as a timing would; with one, its choice is already stored.
-    let stored = TuneStore::at(Some(dir.clone())).select(&k, 2, || programs, || vec![Some(9), Some(4)]);
+    let stored = TuneStore::at(Some(dir.to_path_buf())).select(&k, 2, || programs, || vec![Some(9), Some(4)]);
     let missed = missed.map(|timed| timed[0].0);
     assert_eq!(stored, missed.or(Some(1)), "the device's choice, else the stored timing's");
     builds.set(0);
     let mut bench = Bench::default();
-    let hit = TuneStore::at(Some(dir.clone())).choose(&k, &[0, 1], build, &mut bench);
+    let hit = TuneStore::at(Some(dir.to_path_buf())).choose(&k, &cfgs, build, &mut bench, Pass::Whole, None);
     assert_eq!((hit.map(|timed| timed[0].0), builds.get(), bench.built.len()), (stored, 2, 0));
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// A stored index past the candidate count is a miss.
 #[test]
 fn a_stale_index_is_a_miss() {
-    let dir = scratch("stale");
+    let dir = Scratch::new("tune-stale");
     let k = key(&[8, 8, 8], &[0, 1, 2]);
-    TuneStore::at(Some(dir.clone())).select(&k, 3, || 1, || vec![None, None, Some(1)]);
+    TuneStore::at(Some(dir.to_path_buf())).select(&k, 3, || 1, || vec![None, None, Some(1)]);
     let ran = Cell::new(false);
-    assert_eq!(TuneStore::at(Some(dir.clone())).select(&k, 2, || 1, timed(&[Some(1), None], &ran)), Some(0));
+    assert_eq!(TuneStore::at(Some(dir.to_path_buf())).select(&k, 2, || 1, timed(&[Some(1), None], &ran)), Some(0));
     assert!(ran.get());
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// A warm memo answers a value without fingerprinting or measuring; an
@@ -246,13 +318,12 @@ fn a_stale_index_is_a_miss() {
 #[test_case(Some(5); "measured")]
 #[test_case(None; "unmeasured")]
 fn the_memo_answers_a_value(measured: Option<u64>) {
-    let dir = scratch(&format!("value-memo-{measured:?}"));
-    let store = TuneStore::at(Some(dir.clone()));
+    let dir = Scratch::new(&format!("tune-value-memo-{measured:?}"));
+    let store = TuneStore::at(Some(dir.to_path_buf()));
     let k = key(&[1], &[0]);
     assert_eq!(store.value(&k, || 1, || measured), measured);
     assert_eq!(store.entries(&k).len(), usize::from(measured.is_some()));
     assert_eq!(store.value(&k, || unreachable!("fingerprinted"), || unreachable!("measured")), measured);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Choices and values of one device share its file, a value as a `value`
@@ -260,17 +331,17 @@ fn the_memo_answers_a_value(measured: Option<u64>) {
 /// on the directory reads both back without measuring.
 #[test]
 fn choices_and_values_share_a_file() {
-    let dir = scratch("shared");
+    let dir = Scratch::new("tune-shared");
     let (choice, value) = (key(&[64, 64, 64], &[0, 1]), TuneKey { op: "probe:step", ..key(&[], &[2]) });
-    TuneStore::at(Some(dir.clone())).select(&choice, 2, || 1, || vec![Some(9), Some(4)]);
-    assert_eq!(TuneStore::at(Some(dir.clone())).value(&value, || 2, || Some(1234)), Some(1234));
-    let lines = [format!("{} 1 4 0 9", choice.line(Kind::Choice, 1)), format!("{} 1234", value.line(Kind::Value, 2))];
+    TuneStore::at(Some(dir.to_path_buf())).select(&choice, 2, || 1, || vec![Some(9), Some(4)]);
+    assert_eq!(TuneStore::at(Some(dir.to_path_buf())).value(&value, || 2, || Some(1234)), Some(1234));
+    let lines =
+        [format!("{} 1:1 4 0:0 9", choice.line(Kind::Choice, 1)), format!("{} 1234", value.line(Kind::Value, 2))];
     assert_eq!(store_file(&dir), format!("format {FORMAT}\n{}\n", lines.join("\n")));
-    let again = TuneStore::at(Some(dir.clone()));
+    let again = TuneStore::at(Some(dir.to_path_buf()));
     assert_eq!(again.entries(&choice).len(), 2);
     assert_eq!(again.select(&choice, 2, || 1, || panic!("measured twice")), Some(1));
     assert_eq!(again.value(&value, || 2, || panic!("measured twice")), Some(1234));
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// A line the store cannot read (an older format, a stray edit) is a miss
@@ -278,17 +349,16 @@ fn choices_and_values_share_a_file() {
 /// key is kept, each kind leading its own line.
 #[test]
 fn an_unreadable_line_is_dropped_at_the_next_write() {
-    let dir = scratch("unreadable");
+    let dir = Scratch::new("tune-unreadable");
     let k = key(&[3, 3, 3], &[0, 1]);
     let path = dir.join(format!("sm_86_28sm-v{}.txt", env!("CARGO_PKG_VERSION")));
     let kept = format!("{} 42", k.line(Kind::Value, 1));
     let lines = format!("format {FORMAT}\ngemm|sm_86-28sm|BFloat16|3x3x3|0|0|0 1 100\n{kept}\nnonsense\n");
     std::fs::write(&path, lines).unwrap();
-    let store = TuneStore::at(Some(dir.clone()));
+    let store = TuneStore::at(Some(dir.to_path_buf()));
     assert_eq!(store.entries(&k).len(), 1);
     assert_eq!(store.select(&k, 2, || 1, || vec![Some(9), Some(4)]), Some(1));
-    assert_eq!(store_file(&dir), format!("format {FORMAT}\n{} 1 4 0 9\n{kept}\n", k.line(Kind::Choice, 1)));
-    let _ = std::fs::remove_dir_all(dir);
+    assert_eq!(store_file(&dir), format!("format {FORMAT}\n{} 1:1 4 0:0 9\n{kept}\n", k.line(Kind::Choice, 1)));
 }
 
 /// A run's time sums its kernels (a candidate is a kernel and its merge);
@@ -330,7 +400,7 @@ fn candidates_share_scratch_buffers_without_aliasing_a_program() {
         k: 256,
         batch: Batch::Static(1),
         epilogue: Epilogue::default(),
-        cfg: GemmCfg { core: Core::Warp, tile, stages: 2, warps: [2, 2], group_m: 8, unroll: true, crews: 1 },
+        cfg: gemm_cfg(tile, 2, [2, 2], true),
     };
     let (first, second) = (gemm::<BF16>(&spec([64, 64, 32])), gemm::<BF16>(&spec([128, 64, 32])));
     let pool = ScratchPool::default();
@@ -389,10 +459,10 @@ fn a_scoped_setting_holds_on_its_thread_alone(on: bool) {
 #[test_case(None; "nothing built")]
 fn admission_is_memoized(found: Option<Vec<usize>>) {
     let store = TuneStore::at(None);
-    let k = key(&[1, 2, 3], &[0, 1, 2]);
+    let (k, list) = (key(&[1, 2, 3], &[0, 1, 2]), cfgs(3));
     let want = found.clone().map(Into::into);
-    assert_eq!(store.admitted(&k, || 7, || found), want);
-    assert_eq!(store.admitted(&k, || 7, || unreachable!("compiled twice")), want);
+    assert_eq!(store.admitted(&k, &list, || 7, || found), want);
+    assert_eq!(store.admitted(&k, &list, || 7, || unreachable!("compiled twice")), want);
 }
 
 /// An admission round-trips through the store as an `admitted` line of its
@@ -401,19 +471,23 @@ fn admission_is_memoized(found: Option<Vec<usize>>) {
 /// is never stored.
 #[test]
 fn an_admission_round_trips_through_the_store() {
-    let dir = scratch("admission");
+    let dir = Scratch::new("tune-admission");
     let k = key(&[1, 2, 3], &[0, 1, 2]);
-    let store = TuneStore::at(Some(dir.clone()));
-    assert_eq!(store.admitted(&key(&[9], &[0]), || 7, || None), None);
+    let store = TuneStore::at(Some(dir.to_path_buf()));
+    let list = cfgs(6);
+    assert_eq!(store.admitted(&key(&[9], &[0]), &list, || 7, || None), None);
     assert!(store.entries(&k).is_empty());
-    assert_eq!(store.admitted(&k, || 7, || Some(vec![3, 0, 5])).as_deref(), Some(&[3, 0, 5][..]));
-    assert_eq!(store_file(&dir), format!("format {FORMAT}\n{} 3 0 5\n", k.line(Kind::Admitted, 7)));
-    let again = TuneStore::at(Some(dir.clone()));
-    assert_eq!(again.admitted(&k, || 7, || unreachable!("judged twice")).as_deref(), Some(&[3, 0, 5][..]));
-    let relowered = TuneStore::at(Some(dir.clone()));
-    assert_eq!(relowered.admitted(&k, || 8, || Some(vec![1])).as_deref(), Some(&[1][..]));
+    assert_eq!(store.admitted(&k, &list, || 7, || Some(vec![3, 0, 5])).as_deref(), Some(&[3, 0, 5][..]));
+    let coded = |at: usize| format!("{at}:{}", list[at].code());
+    assert_eq!(
+        store_file(&dir),
+        format!("format {FORMAT}\n{} {} {} {}\n", k.line(Kind::Admitted, 7), coded(3), coded(0), coded(5))
+    );
+    let again = TuneStore::at(Some(dir.to_path_buf()));
+    assert_eq!(again.admitted(&k, &list, || 7, || unreachable!("judged twice")).as_deref(), Some(&[3, 0, 5][..]));
+    let relowered = TuneStore::at(Some(dir.to_path_buf()));
+    assert_eq!(relowered.admitted(&k, &list, || 8, || Some(vec![1])).as_deref(), Some(&[1][..]));
     assert_eq!(store_file(&dir).lines().count(), 3);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// A first clean config round-trips through the store as a `first` line
@@ -422,18 +496,26 @@ fn an_admission_round_trips_through_the_store() {
 /// stored.
 #[test]
 fn a_first_clean_config_round_trips_through_the_store() {
-    let dir = scratch("first");
+    let dir = Scratch::new("tune-first");
     let k = key(&[1, 2, 3], &[0, 1, 2]);
-    let store = TuneStore::at(Some(dir.clone()));
-    assert_eq!(store.first(&key(&[9], &[0]), || 7, || None), None);
+    let store = TuneStore::at(Some(dir.to_path_buf()));
+    let list = cfgs(6);
+    assert_eq!(store.first(&key(&[9], &[0]), &list, || 7, || None), None);
     assert!(store.entries(&k).is_empty());
-    assert_eq!(store.first(&k, || 7, || Some(2)), Some(2));
-    assert_eq!(store.admitted(&k, || 7, || Some(vec![2, 0, 5])).as_deref(), Some(&[2, 0, 5][..]));
-    let lines = format!("format {FORMAT}\n{} 2 0 5\n{} 2\n", k.line(Kind::Admitted, 7), k.line(Kind::First, 7));
+    assert_eq!(store.first(&k, &list, || 7, || Some(2)), Some(2));
+    assert_eq!(store.admitted(&k, &list, || 7, || Some(vec![2, 0, 5])).as_deref(), Some(&[2, 0, 5][..]));
+    let lines = format!(
+        "format {FORMAT}\n{} 2:{} 0:{} 5:{}\n{} 2:{}\n",
+        k.line(Kind::Admitted, 7),
+        list[2].code(),
+        list[0].code(),
+        list[5].code(),
+        k.line(Kind::First, 7),
+        list[2].code()
+    );
     assert_eq!(store_file(&dir), lines);
-    let again = TuneStore::at(Some(dir.clone()));
-    assert_eq!(again.first(&k, || 7, || unreachable!("searched twice")), Some(2));
-    let _ = std::fs::remove_dir_all(dir);
+    let again = TuneStore::at(Some(dir.to_path_buf()));
+    assert_eq!(again.first(&k, &list, || 7, || unreachable!("searched twice")), Some(2));
 }
 
 /// A file of another line format, or without a format line (the first
@@ -443,13 +525,13 @@ fn a_first_clean_config_round_trips_through_the_store() {
 #[test_case(Some(FORMAT), true; "this format")]
 #[test_case(None, false; "no format line")]
 fn a_file_of_another_format_is_dropped(written: Option<u32>, kept: bool) {
-    let dir = scratch(&format!("format-{written:?}"));
+    let dir = Scratch::new(&format!("tune-format-{written:?}"));
     let k = key(&[2, 2, 2], &[0, 1]);
     let path = dir.join(format!("sm_86_28sm-v{}.txt", env!("CARGO_PKG_VERSION")));
-    let line = format!("{} 1 100 0 300", k.line(Kind::Choice, 7));
+    let line = format!("{} 1:1 100 0:0 300", k.line(Kind::Choice, 7));
     let header = written.map_or(String::new(), |n| format!("format {n}\n"));
     std::fs::write(&path, format!("{header}{line}\n")).unwrap();
-    let store = TuneStore::at(Some(dir.clone()));
+    let store = TuneStore::at(Some(dir.to_path_buf()));
     assert_eq!(store.entries(&k).len(), usize::from(kept));
     let measured = Cell::new(false);
     assert_eq!(store.select(&k, 2, || 7, timed(&[Some(9), Some(4)], &measured)), Some(1));
@@ -457,10 +539,9 @@ fn a_file_of_another_format_is_dropped(written: Option<u32>, kept: bool) {
     let want = if kept {
         format!("{header}{line}\n")
     } else {
-        format!("format {FORMAT}\n{} 1 4 0 9\n", k.line(Kind::Choice, 7))
+        format!("format {FORMAT}\n{} 1:1 4 0:0 9\n", k.line(Kind::Choice, 7))
     };
     assert_eq!(store_file(&dir), want);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Tunes a Nemotron GEMM on the device into a scratch directory; a second
@@ -472,21 +553,21 @@ fn a_gemm_tunes_on_the_device() {
     let device = &planner.device;
     let (m, n, k) = (704, 512, 512);
     let cfgs = super::first_eight(&planner.gemm_ranked(1, m, n, k, false));
-    let batch = Batch::Var { name: "b".into(), min: 1, max: 1 };
+    let batch = Batch::var("b", 1, 1);
     let build = |cfg: GemmCfg| {
         let spec = GemmSpec { m, n, k, batch: batch.clone(), epilogue: Epilogue::default(), cfg };
         vec![(gemm::<BF16>(&spec), cfg.lowering(device))]
     };
     let key = TuneKey::new("gemm", &device.target, tune::compiler(&spec), ScalarDType::BFloat16, &[1, m, n, k], &cfgs);
-    let dir = scratch("device");
+    let dir = Scratch::new("tune-device");
     let start = std::time::Instant::now();
-    let chosen = TuneStore::at(Some(dir.clone())).choose(&key, &cfgs, build, &mut Bench::default());
+    let chosen =
+        TuneStore::at(Some(dir.to_path_buf())).choose(&key, &cfgs, build, &mut Bench::default(), Pass::Whole, None);
     let chosen = cfgs[chosen.expect("measured")[0].0];
     eprintln!("tuned {} candidates in {:.1} s: {chosen:?}", cfgs.len(), start.elapsed().as_secs_f64());
     let programs = || fingerprint(&cfgs.iter().map(|&c| build(c)).collect::<Vec<_>>());
-    let hit = TuneStore::at(Some(dir.clone())).select(&key, cfgs.len(), programs, || panic!("measured twice"));
+    let hit = TuneStore::at(Some(dir.to_path_buf())).select(&key, cfgs.len(), programs, || panic!("measured twice"));
     assert_eq!(hit.map(|i| cfgs[i]), Some(chosen));
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// A candidate's time is its fastest timed run: a run the device did not
@@ -517,15 +598,19 @@ fn workers_see_the_callers_device() {
 
 /// The timed rounds: every candidate runs once, then only those within
 /// [`CONTENDER`](tune::CONTENDER) of the first round's best run the rest
-/// ([`ROUNDS`] in all), or every candidate when there are fewer than
-/// [`CUT_FROM`](tune::CUT_FROM) (`losers` more at 1000 fill a field out);
-/// then, where more than two contenders ran them, the two leaders run
-/// [`ROUNDS`] more.
+/// ([`ROUNDS`] in all), past the second only those within
+/// [`SETTLED`](tune::SETTLED) of the best so far, or every candidate every
+/// round when there are fewer than [`CUT_FROM`](tune::CUT_FROM) (`losers`
+/// more at 1000 fill a field out); then, where more than two contenders ran
+/// them, the two leaders run [`ROUNDS`] more.
 /// A candidate that fails (a run of 0 here, its list run out) is excluded
 /// for good, whichever round it fails in; nothing running leaves every
 /// candidate `None`. A candidate's list repeats its last run.
-#[test_case(&[&[100], &[150], &[110], &[500]], 12, &[4, 1, 4, 1], &[Some(100), Some(150), Some(110), Some(500)]; "in a field losers run once and two contenders are the leaders")]
-#[test_case(&[&[100], &[115], &[110], &[500]], 12, &[8, 4, 8, 1], &[Some(100), Some(115), Some(110), Some(500)]; "in a field the leaders of three contenders run again")]
+#[test_case(&[&[100], &[150], &[110], &[500]], 12, &[4, 1, 2, 1], &[Some(100), Some(150), Some(110), Some(500)]; "in a field losers run once and an unsettled contender twice")]
+#[test_case(&[&[100], &[150], &[110], &[500]], 4, &[4, 1, 2, 1], &[Some(100), Some(150), Some(110), Some(500)]; "eight candidates are a field")]
+#[test_case(&[&[100], &[115], &[110], &[500]], 12, &[8, 2, 6, 1], &[Some(100), Some(115), Some(110), Some(500)]; "in a field the leaders of three contenders run again")]
+#[test_case(&[&[100], &[104], &[107], &[103, 103, 98]], 12, &[8, 3, 2, 8], &[Some(100), Some(104), Some(107), Some(98)]; "past the second round the settled contenders run on")]
+#[test_case(&[&[100], &[110, 104]], 14, &[4, 4], &[Some(100), Some(104)]; "a contender settles by its best after the round")]
 #[test_case(&[&[100], &[150], &[110], &[500]], 0, &[8, 4, 8, 4], &[Some(100), Some(150), Some(110), Some(500)]; "a short list runs every round")]
 #[test_case(&[&[100, 90, 95, 92], &[118, 121]], 14, &[4, 2], &[Some(90), Some(118)]; "past the bound a contender stops, its minimum standing")]
 #[test_case(&[&[100; 4], &[101; 4], &[150]], 0, &[8, 8, 4], &[Some(100), Some(101), Some(150)]; "the two leaders run again")]
@@ -537,10 +622,17 @@ fn workers_see_the_callers_device() {
 #[test_case(&[&[], &[]], 0, &[1, 1], &[None, None]; "nothing runs")]
 #[test_case(&[], 0, &[], &[]; "no candidates")]
 fn contenders_run_the_later_rounds(runs: &[&[u64]], losers: usize, want_calls: &[usize], want: &[Option<u64>]) {
+    scripted_rounds(runs, losers, Pass::Whole, want_calls, want);
+}
+
+/// [`tune::rounds`] under `pass` over candidates whose runs are scripted
+/// (`losers` more at 1000), checked against the times and the calls each
+/// gets, every loser's one.
+fn scripted_rounds(runs: &[&[u64]], losers: usize, pass: Pass, want_calls: &[usize], want: &[Option<u64>]) {
     use std::cell::RefCell;
     let runs: Vec<&[u64]> = runs.iter().copied().chain(std::iter::repeat_n(&[1000][..], losers)).collect();
     let calls = RefCell::new(vec![0usize; runs.len()]);
-    let got = tune::rounds(runs.len(), |i| {
+    let got = tune::rounds(runs.len(), None, pass, |i, _, _| {
         let mut calls = calls.borrow_mut();
         let run = runs[i].get(calls[i]).or(runs[i].last()).copied();
         calls[i] += 1;
@@ -552,6 +644,83 @@ fn contenders_run_the_later_rounds(runs: &[&[u64]], losers: usize, want_calls: &
     let calls = calls.borrow();
     assert_eq!(calls[..want_calls.len()], *want_calls);
     assert!(calls[want_calls.len()..].iter().all(|&c| c == 1), "{calls:?}");
+}
+
+/// The first round runs in the given order and the later ones backwards and
+/// forwards in turn, so each candidate runs after both its neighbours; the
+/// leaders' rounds alternate the two, the only calls told they are a
+/// leaders' round. A screen's second round runs backwards.
+#[test_case(Pass::Whole, &[0, 1, 2, 3, 3, 2, 1, 0, 0, 1, 2, 3, 3, 2, 1, 0], &[0, 1, 0, 1, 0, 1, 0, 1]; "every round")]
+#[test_case(Pass::Screen, &[0, 1, 2, 3, 3, 2, 1, 0], &[]; "a screen")]
+fn later_rounds_alternate_their_order(pass: Pass, want: &[usize], leaders: &[usize]) {
+    let mut order = vec![];
+    tune::rounds(4, None, pass, |i, _, leader| {
+        order.push((i, leader));
+        Some(Duration::from_nanos(100 + i as u64))
+    });
+    let want: Vec<(usize, bool)> = want.iter().map(|&i| (i, false)).chain(leaders.iter().map(|&i| (i, true))).collect();
+    assert_eq!(order, want);
+}
+
+/// A screen runs the first round and one more of its contenders, and no
+/// leaders' rounds: a later pass times its leaders again. A short list's
+/// screen runs every candidate twice.
+#[test_case(&[&[100], &[150], &[110], &[500]], 12, &[2, 1, 2, 1], &[Some(100), Some(150), Some(110), Some(500)]; "a field")]
+#[test_case(&[&[100], &[103, 101], &[104], &[500]], 12, &[2, 2, 2, 1], &[Some(100), Some(101), Some(104), Some(500)]; "a field of settled contenders")]
+#[test_case(&[&[100], &[150], &[110], &[500]], 0, &[2, 2, 2, 2], &[Some(100), Some(150), Some(110), Some(500)]; "a short list")]
+#[test_case(&[&[100], &[105, 0]], 0, &[2, 2], &[Some(100), None]; "a failure in the second round")]
+fn a_screen_runs_two_rounds(runs: &[&[u64]], losers: usize, want_calls: &[usize], want: &[Option<u64>]) {
+    scripted_rounds(runs, losers, Pass::Screen, want_calls, want);
+}
+
+/// Under a hopeless factor of 2, a candidate's first run past twice the
+/// best time so far is its time (its settled runs skipped, `aborted`), and
+/// a short list's later rounds leave out what sits past twice the first
+/// round's best: candidates are `(first run, settled)`, the first
+/// candidate is never cut short (there is no time before it), the bar is
+/// the best so far, not the first candidate's, and a run at the bar runs on.
+#[test_case(&[(100, 100), (300, 250), (110, 105)], &[4, 1, 4], &[false, true, false], &[100, 300, 105]; "a slow first run stops")]
+#[test_case(&[(500, 500), (100, 100)], &[1, 4], &[false, false], &[500, 100]; "the first candidate runs whole")]
+#[test_case(&[(100, 100), (150, 90), (190, 190)], &[4, 4, 1], &[false, false, true], &[100, 90, 190]; "the bar is the best so far")]
+#[test_case(&[(100, 100), (200, 199)], &[4, 4], &[false, false], &[100, 199]; "a run at the bar runs on")]
+#[test_case(&[(100, 100), (150, 250)], &[4, 1], &[false, false], &[100, 250]; "a settled time past the bar runs no later round")]
+fn hopeless_candidates_stop_at_their_first_run(
+    runs: &[(u64, u64)],
+    want_calls: &[usize],
+    want_aborted: &[bool],
+    want: &[u64],
+) {
+    use std::cell::RefCell;
+    let (calls, aborted) = (RefCell::new(vec![0usize; runs.len()]), RefCell::new(vec![false; runs.len()]));
+    let got = tune::rounds(runs.len(), Some(2.0), Pass::Whole, |i, bar, _| {
+        let (first, settled) = runs[i];
+        let mut calls = calls.borrow_mut();
+        calls[i] += 1;
+        if calls[i] == 1 && bar.is_some_and(|bar| Duration::from_nanos(first) > bar) {
+            aborted.borrow_mut()[i] = true;
+            return Some(Duration::from_nanos(first));
+        }
+        Some(Duration::from_nanos(settled))
+    });
+    let got: Vec<u64> = got.iter().map(|t| t.expect("a time").as_nanos() as u64).collect();
+    assert_eq!(got, want);
+    assert_eq!(*calls.borrow(), want_calls);
+    assert_eq!(*aborted.borrow(), want_aborted);
+}
+
+/// Without a hopeless factor nothing is cut short and a short list runs
+/// every round, however far behind (the probes' pairs, a probe at least
+/// twice its baseline, are timed so).
+#[test]
+fn without_a_hopeless_factor_every_candidate_runs_whole() {
+    let mut calls = vec![0; 2];
+    let got = tune::rounds(2, None, Pass::Whole, |i, bar, _| {
+        assert_eq!(bar, None);
+        calls[i] += 1;
+        Some(Duration::from_nanos([100, 1000][i]))
+    });
+    assert_eq!(got, [Some(Duration::from_nanos(100)), Some(Duration::from_nanos(1000))]);
+    assert_eq!(calls, [4, 4]);
 }
 
 /// A candidate's plan is prepared for its measurement alone: two scratch
@@ -689,7 +858,7 @@ fn made_of(candidate: &tune::Candidate) -> u64 {
 /// line it cannot read is passed over.
 #[test]
 fn what_a_program_emits_is_remembered_by_its_build() {
-    let dir = scratch("emitted");
+    let dir = Scratch::new("tune-emitted");
     let candidate = gemm_candidate(sm86(), super::costs());
     let fresh = built(&dir, 1).fingerprint(std::slice::from_ref(&candidate));
     assert_eq!(fresh, TuneStore::at(None).fingerprint(std::slice::from_ref(&candidate)));
@@ -701,7 +870,6 @@ fn what_a_program_emits_is_remembered_by_its_build() {
     std::hash::Hash::hash(&vec![vec![42u64]], &mut hasher);
     let read = built(&dir, 1).fingerprint(std::slice::from_ref(&candidate));
     assert_eq!(read, std::hash::Hasher::finish(&hasher), "read from the file, not lowered");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Another build consults none of a build's memo: it lowers again, and where
@@ -709,7 +877,7 @@ fn what_a_program_emits_is_remembered_by_its_build() {
 /// store's entries still answer.
 #[test]
 fn another_build_lowers_again_and_matches_where_the_code_is_the_same() {
-    let dir = scratch("rebuilt");
+    let dir = Scratch::new("tune-rebuilt");
     let candidate = gemm_candidate(sm86(), super::costs());
     let first = built(&dir, 1).fingerprint(std::slice::from_ref(&candidate));
     let stale = dir.join("emitted").join(format!("{:016x}.txt", 1));
@@ -721,14 +889,13 @@ fn another_build_lowers_again_and_matches_where_the_code_is_the_same() {
         .collect();
     files.sort();
     assert_eq!(files, [format!("{:016x}.txt", 1), format!("{:016x}.txt", 2)]);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Opening the memo removes the files of builds unused for longer than a
 /// build's file is kept, and keeps the recent ones.
 #[test]
 fn a_build_unused_for_long_loses_its_memo() {
-    let dir = scratch("pruned");
+    let dir = Scratch::new("tune-pruned");
     let emitted = dir.join("emitted");
     std::fs::create_dir_all(&emitted).expect("the memo dir");
     let (old, recent) = (emitted.join("old.txt"), emitted.join("recent.txt"));
@@ -739,5 +906,355 @@ fn a_build_unused_for_long_loses_its_memo() {
     std::fs::File::options().write(true).open(&old).unwrap().set_modified(month).unwrap();
     built(&dir, 3).fingerprint(&[gemm_candidate(sm86(), super::costs())]);
     assert!(!old.exists() && recent.exists());
-    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A program is lowered once per tuning: what a fingerprint lowers is kept
+/// for the compile and handed over once, the program its target lowers to
+/// alone; one the compile lowers first is remembered, so the fingerprint
+/// after it finds what it emits without lowering, the same as lowering it.
+#[test]
+fn a_tuning_lowers_each_program_once() {
+    let candidate = gemm_candidate(sm86(), super::costs());
+    let [(prog, lowering)] = &candidate[..] else { unreachable!("one program") };
+    let alone = crate::lower::standalone(prog.clone(), lowering).expect("lowers").program;
+    let (store, keep) = (TuneStore::at(None), tune::Lowerings::default());
+    let fingerprinted = store.fingerprint_keeping(std::slice::from_ref(&candidate), Some(&keep));
+    let lowered = |store: &TuneStore, keep: &tune::Lowerings| store.lowered(prog, lowering, keep).map(|(_, p)| p);
+    assert_eq!(lowered(&store, &keep), Some(alone.clone()), "kept by the fingerprint");
+    assert_eq!(lowered(&store, &keep), Some(alone.clone()), "lowered again once taken");
+    let (fresh, keep) = (TuneStore::at(None), tune::Lowerings::default());
+    assert_eq!(lowered(&fresh, &keep), Some(alone));
+    assert_eq!(fresh.fingerprint_keeping(std::slice::from_ref(&candidate), Some(&keep)), fingerprinted);
+    assert!(keep.0.lock().unwrap().is_empty(), "nothing lowered: the compile remembered what it emits");
+}
+
+/// A program the fingerprint finds does not lower is kept as such, a
+/// verdict that stays: its compile is refused without lowering it again,
+/// and the bench records the candidate failed.
+#[test]
+fn a_program_that_does_not_lower_is_lowered_once() {
+    let candidate = gemm_candidate(sm86(), super::costs());
+    let [(prog, lowering)] = &candidate[..] else { unreachable!("one program") };
+    // Half the warps of the grid: the lowering refuses it.
+    let prog = &crate::ir::Program { warp_grid: crate::layouts::WarpGrid { rows: 1, cols: 4 }, ..prog.clone() };
+    assert!(matches!(crate::lower::standalone(prog.clone(), lowering), Err(crate::lower::Error::Grid { .. })));
+    let candidate = vec![(prog.clone(), lowering.clone())];
+    let (store, keep) = (TuneStore::at(None), tune::Lowerings::default());
+    store.fingerprint_keeping(std::slice::from_ref(&candidate), Some(&keep));
+    let m = tune::made_of(prog, lowering);
+    assert_eq!(keep.0.lock().unwrap().get(&m), Some(&None), "kept as one that does not lower");
+    assert_eq!(store.lowered(prog, lowering, &keep), None);
+    assert_eq!(keep.0.lock().unwrap().get(&m), Some(&None), "the verdict stays");
+    let mut bench = Bench::default();
+    bench.lowered = std::sync::Arc::new(keep);
+    assert_eq!(bench.admit(&[0u8], |_| candidate.clone(), &store), vec![tune::Compiled::Failed]);
+}
+
+/// A tuner's round gives a candidate the runs 20 ms of device time holds,
+/// two to five: a short kernel the five a probe's round gives.
+#[test_case(1_000, 5; "a short kernel")]
+#[test_case(4_000, 5; "five fit")]
+#[test_case(5_000, 4; "four fit")]
+#[test_case(8_000, 3; "three fit")]
+#[test_case(10_000, 2; "two fit")]
+#[test_case(70_000, 2; "a long kernel still runs twice")]
+fn a_round_gives_the_runs_its_budget_holds(us: u64, want: usize) {
+    assert_eq!(tune::runs(Duration::from_micros(us)), want);
+}
+
+/// A stream runs its jobs on the pool at most `width` at once, starting
+/// them in the order queued, every result back once; a job's panic resumes
+/// on the caller's thread.
+#[test]
+fn a_stream_runs_width_jobs_at_once_in_order() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (running, most) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    let started = std::sync::Mutex::new(vec![]);
+    let run = |job: usize| {
+        started.lock().unwrap().push(job);
+        let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+        most.fetch_max(now, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(5));
+        running.fetch_sub(1, Ordering::SeqCst);
+        job * 2
+    };
+    let mut got = tune::streamed(2, run, |stream| {
+        (0..12).for_each(|job| stream.push(job));
+        std::iter::from_fn(|| stream.next()).collect::<Vec<_>>()
+    });
+    got.sort_unstable();
+    assert_eq!(got, (0..12).map(|j| j * 2).collect::<Vec<_>>());
+    assert!(most.load(Ordering::SeqCst) <= 2, "at most two at once");
+    let started = started.into_inner().unwrap();
+    assert!(started.iter().enumerate().all(|(i, &j)| i.abs_diff(j) < 2), "started in queue order: {started:?}");
+    let panicked = std::panic::catch_unwind(|| {
+        tune::streamed(
+            2,
+            |job: usize| assert!(job != 3, "job 3 fails"),
+            |stream| {
+                (0..6).for_each(|job| stream.push(job));
+                while stream.next().is_some() {}
+            },
+        )
+    });
+    assert!(panicked.is_err(), "the job's panic reached the caller");
+}
+
+/// The rates the vendored floor store prices a floor at: gfx1151's cache
+/// ladder and DRAM byte as the Strix Halo's store measured them on
+/// 2026-10-27 (fs a streamed byte at each footprint), every field
+/// [`Planner::floor`] reads.
+const VENDORED_RATES: [(&str, u64); 9] = [
+    ("cached_1m", 10542),
+    ("cached_2m", 12782),
+    ("cached_4m", 21853),
+    ("cached_8m", 30412),
+    ("cached_16m", 35640),
+    ("cached_32m", 38814),
+    ("cached_64m", 144723),
+    ("cached_128m", 166732),
+    ("global_byte", 187054),
+];
+
+/// The choice lines of the vendored floor store, synthesized in the store's
+/// format-6 grammar: gfx1151's k-nearest tuning of 2026-10-28, the one shape
+/// whose readings are known to lie — a 270 ms scores pass whose end stamp
+/// landed off the compute, timed 1.3 ms — three candidates under their
+/// floor beside the honest sample of the same lines.
+const VENDORED_CHOICES: [&str; 2] = [
+    "choice|nearest|gfx1151-40sm|Float16|256x1048576x768x64|0000000000000001|0000000000000001|0000000000000001 0:128,128,2,0,16,32,1,~,4,2,1,~,~,~ 1297360 1:128,128,2,1,16,32,1,~,4,2,1,~,~,~ 1305240 2:128,128,1,0,16,32,1,~,4,2,1,~,~,~ 296351560",
+    "choice|nearest|gfx1151-40sm|Float16|256x1048576x768x64|0000000000000002|0000000000000001|0000000000000002 1:128,128,2,0,16,32,1,~,4,2,1,~,~,~ 1325040 32:64,32,2,0,16,32,128,~,~,~,~,4,4,1 25261320",
+];
+
+/// Every timed candidate of the stores' choice lines clears its physical
+/// floor ([`Planner::floor_of`] of its own claim): the least ns a kernel can
+/// honestly measure, the bytes it must move at the card's measured rate for
+/// them. The store scanned is the vendored one (`VENDORED_RATES` and
+/// `VENDORED_CHOICES`, written to a scratch store as `probe::stored` reads
+/// it), so the check runs anywhere and fails the day the floor stops
+/// flagging the three lied readings; `TK_FLOOR_STORES` (`:`-separated) adds
+/// real stores on machines that hold them, where nothing under its floor may
+/// be anything but the same lie — an honest candidate never refused.
+#[test]
+fn timed_candidates_clear_their_physical_floor() {
+    fn dtype_of(name: &str) -> Option<ScalarDType> {
+        match name {
+            "Float16" => Some(ScalarDType::Float16),
+            "BFloat16" => Some(ScalarDType::BFloat16),
+            "Int8" => Some(ScalarDType::Int8),
+            _ => None,
+        }
+    }
+    fn target(device: &str) -> Option<crate::atoms::Target> {
+        use svod_dtype::{AmdArch, CudaArch, GpuArch};
+        let (arch, sms) = device.rsplit_once('-')?;
+        let sms = sms.strip_suffix("sm")?.parse().ok()?;
+        let arch = match AmdArch::parse(arch) {
+            Some(a) => GpuArch::Amd(a),
+            None => GpuArch::Cuda(arch.trim_end_matches('a').parse::<CudaArch>().ok()?),
+        };
+        let xcds = crate::atoms::CARDS.iter().find(|c| c.1 == arch).map_or(
+            match arch {
+                GpuArch::Amd(a) if a.is_cdna() => 8,
+                _ => 1,
+            },
+            |c| c.3,
+        );
+        Some(crate::atoms::Target::offline(arch, sms, xcds))
+    }
+    fn floor(
+        planner: &crate::ops::config::Planner,
+        op: &str,
+        dtype: ScalarDType,
+        shape: &[usize],
+        code: &str,
+    ) -> Option<f64> {
+        use crate::kernels::nearest::{Floors, Metric};
+        use crate::ops::config::{AttentionProblem, ConvProblem, GemmProblem, NearestProblem, Tiled};
+        match op {
+            "nearest" => {
+                let (n, m, d, k) = match shape[..] {
+                    [n, m, d] => (n, m, d, 1),
+                    [n, m, d, k] => (n, m, d, k),
+                    _ => return None,
+                };
+                let p = NearestProblem {
+                    n,
+                    m,
+                    d,
+                    dtype,
+                    metric: Metric::SquaredL2,
+                    floors: Floors::default(),
+                    groups: false,
+                    k,
+                };
+                planner.floor_of(&p, &Tiled::of_code(code)?)
+            }
+            "gemm" | "linear" => {
+                let &[cap, m, n, k] = shape else { return None };
+                let p = GemmProblem { batches: cap.max(1), m, n, k, halves: 1 };
+                planner.floor_of(&p, &Tiled::of_code(code)?)
+            }
+            "attention" => {
+                let &[cap, t, tk, heads, _kv, d] = shape else { return None };
+                let p = AttentionProblem { tiles: cap * heads, t, tk, d, causal: false, bias: false };
+                planner.floor_of(&p, &Tiled::of_code(code)?)
+            }
+            "conv2d" => {
+                let (g, images) = match shape[..] {
+                    [cin, cout, h, w, stride] => (
+                        crate::kernels::conv::ConvGeom {
+                            h,
+                            w,
+                            cin,
+                            cout,
+                            kernel: [3, 3],
+                            stride: [stride, stride],
+                            pad: [1, 1],
+                            dilation: [1, 1],
+                        },
+                        1,
+                    ),
+                    [images, h, w, cin, cout, k0, k1, s0, s1, p0, p1, d0, d1] => (
+                        crate::kernels::conv::ConvGeom {
+                            h,
+                            w,
+                            cin,
+                            cout,
+                            kernel: [k0, k1],
+                            stride: [s0, s1],
+                            pad: [p0, p1],
+                            dilation: [d0, d1],
+                        },
+                        images,
+                    ),
+                    _ => return None,
+                };
+                let [ho, wo] = g.out_hw();
+                let p = ConvProblem {
+                    gemm: GemmProblem { batches: 1, m: images * ho * wo, n: g.cout, k: g.k(), halves: 1 },
+                    geom: g,
+                };
+                let c: crate::kernels::conv::ConvCfg = Tiled::of_code(code)?;
+                p.claim(planner, &c.gemm).ok().map(|claim| planner.floor(&claim))
+            }
+            _ => None,
+        }
+    }
+
+    /// Every timed candidate of the choice lines under `dir`, as its ns over
+    /// its floor, fastest liars first.
+    fn scan(dir: &std::path::Path) -> Vec<(f64, String)> {
+        let mut worst: Vec<(f64, String)> = vec![];
+        let Ok(files) = std::fs::read_dir(dir) else { return worst };
+        let mut planners: std::collections::HashMap<String, Option<crate::ops::config::Planner>> = Default::default();
+        for file in files.flatten() {
+            let text = std::fs::read_to_string(file.path()).unwrap_or_default();
+            let name = file.path().file_stem().unwrap().to_string_lossy().to_string();
+            for line in text.lines() {
+                let fields: Vec<&str> = line.split('|').collect();
+                if fields.first() != Some(&"choice") || fields.len() != 8 {
+                    continue;
+                }
+                let (op, dtype, shape) = (fields[1], fields[3], fields[4]);
+                let Some(dtype) = dtype_of(dtype) else { continue };
+                let Ok(shape) = shape.split('x').map(|n| n.parse::<usize>()).collect::<Result<Vec<_>, _>>() else {
+                    continue;
+                };
+                let planner = planners.entry(fields[2].to_string()).or_insert_with(|| {
+                    let t = target(fields[2])?;
+                    crate::probe::stored(dir, &t).and_then(|m| crate::ops::config::Planner::measured(t, m))
+                });
+                let Some(planner) = planner else { continue };
+                let Some(pairs) = fields[7].split_once(' ').map(|(_, p)| p) else { continue };
+                for pair in pairs.split(' ').collect::<Vec<_>>().chunks(2) {
+                    let [f, ns] = pair else { continue };
+                    let Some(code) = f.split_once(':').map(|(_, c)| c) else { continue };
+                    let Some(ns) = ns.parse::<u64>().ok() else { continue };
+                    let Some(f) = floor(planner, op, dtype, &shape, code) else { continue };
+                    if f > 0.0 {
+                        worst.push((ns as f64 / f, format!("{name} {op} {shape:?} {code}")));
+                    }
+                }
+            }
+        }
+        worst.sort_by(|a, b| a.0.total_cmp(&b.0));
+        worst
+    }
+    let lie = |what: &str| what.contains("gfx1151") && what.contains("nearest [256, 1048576, 768, 64] 128,128,2,");
+
+    let dir = Scratch::new("floor-store");
+    let file = TuneStore::at(Some(dir.to_path_buf())).file("gfx1151-40sm").expect("a rooted store");
+    let lines: Vec<String> = VENDORED_RATES
+        .iter()
+        .map(|&(op, fs)| {
+            format!("value|probe:{op}|gfx1151-40sm|Int32||00000000000000c0|00000000000000aa|00000000000000bb {fs}")
+        })
+        .chain(VENDORED_CHOICES.iter().map(|line| (*line).to_string()))
+        .collect();
+    std::fs::write(file, format!("format {FORMAT}\n{}\n", lines.join("\n"))).expect("a store file");
+
+    let vendored = scan(&dir);
+    println!("vendored candidates: {}", vendored.len());
+    for (ratio, what) in vendored.iter().take(8) {
+        println!("{ratio:8.3} {what}");
+    }
+    assert!(vendored.len() > 3, "the vendored store carries its honest sample: {vendored:?}");
+    let under: Vec<&String> = vendored.iter().filter(|&&(ratio, _)| ratio < 1.0).map(|(_, what)| what).collect();
+    assert_eq!(
+        under.len(),
+        3,
+        "under the floor: {under:?}\nthe least above it: {:?}",
+        vendored.iter().find(|&&(ratio, _)| ratio >= 1.0)
+    );
+    for what in under {
+        assert!(lie(what), "an honest candidate refused: {what}");
+    }
+
+    if let Ok(list) = std::env::var("TK_FLOOR_STORES") {
+        for store in list.split(':').filter(|s| !s.is_empty()) {
+            let worst = scan(std::path::Path::new(store));
+            println!("-- {store}: {} candidates", worst.len());
+            for (ratio, what) in worst.iter().take(8) {
+                println!("{ratio:8.3} {what}");
+            }
+            for (_, what) in worst.iter().filter(|&&(ratio, _)| ratio < 1.0) {
+                assert!(lie(what), "an honest candidate refused: {what}");
+            }
+        }
+    }
+}
+
+/// A candidate measuring under its floor never becomes the pick — not
+/// measured, not read back from a store that holds the number: the choice is
+/// the next candidate's. One that refuses everything leaves the order as it
+/// ran: a floor that refuses every candidate is itself what is wrong.
+#[test]
+fn an_underfloor_measurement_is_never_the_pick() {
+    let dir = Scratch::new("tune-floor");
+    let k = key(&[128, 128, 128], &[0, 1]);
+    let cfgs = [gemm_cfg([64, 64, 32], 2, [2, 2], true), gemm_cfg([128, 64, 32], 2, [2, 2], true)];
+    let programs = || fingerprint(&[gemm_programs(cfgs[0]), gemm_programs(cfgs[1])]);
+    TuneStore::at(Some(dir.to_path_buf())).select(&k, 2, programs, || vec![Some(1), Some(4)]);
+    let build = |c: crate::kernels::gemm::GemmCfg| gemm_programs(c);
+    let floor = |c: &crate::kernels::gemm::GemmCfg| (c == &cfgs[0]).then_some(3.0);
+    let chosen = TuneStore::at(Some(dir.to_path_buf())).choose(
+        &k,
+        &cfgs,
+        build,
+        &mut Bench::default(),
+        Pass::Whole,
+        Some(&floor),
+    );
+    assert_eq!(chosen.map(|timed| timed[0].0), Some(1), "the under-floor candidate is refused");
+    let every = |_: &crate::kernels::gemm::GemmCfg| Some(9.0);
+    let kept = TuneStore::at(Some(dir.to_path_buf())).choose(
+        &k,
+        &cfgs,
+        build,
+        &mut Bench::default(),
+        Pass::Whole,
+        Some(&every),
+    );
+    assert_eq!(kept.map(|timed| timed[0].0), Some(0), "a floor refusing everything is ignored");
 }

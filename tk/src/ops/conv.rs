@@ -5,7 +5,7 @@ use svod_dtype::{DType, ScalarDType};
 use svod_ir::SInt;
 use svod_tensor::Tensor;
 
-use super::config::Planner;
+use super::config::{ConvProblem, GemmProblem, Planner};
 use super::shape::{self, extent, shape_of};
 use super::{
     Act, DtypeSnafu, GraphSnafu, LaunchSnafu, Linear, Result, ShapeSnafu, Tuner, batch_of, fmt_shape, kernel_buffer,
@@ -129,6 +129,7 @@ pub fn conv2d(x: &Tensor, w: &Tensor, opts: Conv) -> Result<Tensor> {
     };
     let spec = ConvSpec { batch, geom, epilogue, cfg: cfgs[0].gemm, split: cfgs[0].split };
     let spec = tuned(TuneStore::global(), &planner, x.dtype(), &cfgs, spec);
+    super::ran(OP, "conv", ConvCfg { gemm: spec.cfg, split: spec.split });
     let mut programs = programs(&spec, &x.dtype(), &planner).into_iter();
     let y = output(&[images, ho, wo, geom.cout], &var, out_dtype).context(GraphSnafu { op: OP })?;
     let (prog, lowering) = programs.next().expect("the convolution");
@@ -173,7 +174,7 @@ pub fn tuned(store: &TuneStore, planner: &Planner, dtype: DType, ranked: &[ConvC
         g.dilation[0],
         g.dilation[1],
     ];
-    let bound = matches!(spec.batch, Batch::Var { .. });
+    let bound = matches!(spec.batch, Batch::Var(_));
     let (batches, m) = shape::conv_grid(&shape::Extent { dims: vec![images], var: bound }, &g);
     let expand = |admitted: &[ConvCfg]| {
         let mut list = planner.conv_splits(batches, m, &g, admitted);
@@ -182,7 +183,9 @@ pub fn tuned(store: &TuneStore, planner: &Planner, dtype: DType, ranked: &[ConvC
         list
     };
     let build = |c: ConvCfg| programs(&ConvSpec { cfg: c.gemm, split: c.split, ..spec.clone() }, &dtype, planner);
+    let problem = ConvProblem { gemm: GemmProblem { batches, m, n: g.cout, k: g.k(), halves: 1 }, geom: g };
     let cfg = Tuner::new(store, &planner.device, dtype.clone(), &key, (&spec.batch, spec.epilogue), build)
+        .floored(|c| problem.claim(planner, &c.gemm).ok().map(|claim| planner.floor(&claim)))
         .tuned(OP, ranked, expand);
     ConvSpec { cfg: cfg.gemm, split: cfg.split, ..spec }
 }

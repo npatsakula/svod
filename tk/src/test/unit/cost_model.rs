@@ -13,24 +13,30 @@ use crate::build::BF16;
 use crate::kernels::attention::{AttnMask, AttnSpec, FaCfg, attention};
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
 use crate::kernels::{Act, Batch};
-use crate::ops::config::{Attention, DIAGONAL, Planner, Problem, gemm_cfg};
-use crate::tune::{Bench, Candidate, Compiled};
+use crate::ops::config::{AttentionProblem, DIAGONAL, GemmProblem, Planner, gemm_cfg};
+use crate::tune::{Bench, Candidate, Compiled, Pass, TuneStore};
 
 /// Each of `ranked` compiled (in ranked batches, as the tuner admits), then
 /// every one that compiled timed twice, its lesser time kept: the verdicts
 /// and ns in `ranked`'s order, and the extra candidates' ns after them.
-fn timed<C: Copy + PartialEq + std::fmt::Debug>(
+fn timed<C: Copy + PartialEq + Eq + std::hash::Hash + std::fmt::Debug + Send>(
     ranked: &[C],
     extra: &[C],
     build: impl Fn(C) -> Candidate,
 ) -> (Vec<Compiled>, Vec<Option<u64>>) {
+    let store = TuneStore::global();
     let mut bench: Bench<C> = Bench::default();
-    let verdicts: Vec<Compiled> = ranked.chunks(64).flat_map(|chunk| bench.admit(chunk, &build)).collect();
+    let verdicts: Vec<Compiled> = ranked.chunks(64).flat_map(|chunk| bench.admit(chunk, &build, store)).collect();
     let mut runs: Vec<C> =
         ranked.iter().zip(&verdicts).filter(|(_, v)| **v != Compiled::Failed).map(|(c, _)| *c).collect();
     runs.extend(extra.iter().filter(|c| !runs.contains(c)).copied().collect::<Vec<_>>());
-    let passes: Vec<Vec<Option<u64>>> =
-        (0..2).map(|_| bench.time(&runs, runs.iter().map(|&c| build(c)).collect())).collect();
+    // What each run's programs emit, where the compiles learned it, an
+    // index of its own where not: twins time once, the rest apart.
+    let keys: Vec<u64> =
+        runs.iter().enumerate().map(|(i, &c)| store.emitted_key(&build(c)).unwrap_or(i as u64 + 1)).collect();
+    let passes: Vec<Vec<Option<u64>>> = (0..2)
+        .map(|_| bench.time(&runs, runs.iter().map(|&c| build(c)).collect(), &keys, Pass::Whole, store))
+        .collect();
     let ns = |c: &C| -> Option<u64> {
         let at = runs.iter().position(|r| r == c)?;
         passes.iter().filter_map(|p| p[at]).min()
@@ -98,7 +104,7 @@ fn rankings(planner: &Planner) -> (Vec<Ranking<GemmCfg>>, Vec<Ranking<FaCfg>>) {
         .into_iter()
         .filter(|s| wanted(s.0))
         .map(|(label, m, n, k, epilogue)| {
-            let p = Problem { batches: 1, m, n, k, halves: if epilogue.gated { 2 } else { 1 } };
+            let p = GemmProblem { batches: 1, m, n, k, halves: if epilogue.gated { 2 } else { 1 } };
             let ranked: Vec<GemmCfg> = planner.gemm_ranked(1, m, n, k, epilogue.gated).to_vec();
             let ns = ranked.iter().map(|c| p.admit(planner, c).expect("ranked").0).collect();
             (label, ranked, ns)
@@ -108,7 +114,7 @@ fn rankings(planner: &Planner) -> (Vec<Ranking<GemmCfg>>, Vec<Ranking<FaCfg>>) {
         .into_iter()
         .filter(|s| wanted(s.0))
         .map(|(label, batch, heads, t, d, causal)| {
-            let p = Attention { tiles: batch * heads, t, tk: t, d, causal, bias: false };
+            let p = AttentionProblem { tiles: batch * heads, t, tk: t, d, causal, bias: false };
             let ranked: Vec<FaCfg> = planner.attention_ranked(batch * heads, t, t, d, causal, false).to_vec();
             let ns = ranked.iter().map(|c| p.admit(planner, c).expect("ranked").0).collect();
             (label, ranked, ns)
@@ -185,7 +191,7 @@ fn cost_model_replay() {
         let row = |c: &GemmCfg| {
             let blocks = m.div_ceil(c.tile[0]) * n.div_ceil(c.tile[1]);
             let regs = c.registers(target, halves).expect("ranked");
-            (format!("{c:?}"), at_once(blocks, c.smem_bytes(epilogue.gated), regs, c.warps[0] * c.warps[1]))
+            (format!("{c:?}"), at_once(blocks, c.smem_bytes(epilogue.gated, 2), regs, c.warps[0] * c.warps[1]))
         };
         print(label, ranked.iter().map(row).collect(), ns);
     }
@@ -193,8 +199,7 @@ fn cost_model_replay() {
         attentions.into_iter().zip(ATTENTION_SHAPES.into_iter().filter(|s| wanted(s.0)))
     {
         let row = |c: &FaCfg| {
-            let (smem, regs) =
-                (c.smem_bytes(d, false) + c.scratch_bytes(target), c.registers(target, d, false).expect("ranked"));
+            let (smem, regs) = (c.smem_bytes(d, false), c.registers(target, d, false).expect("ranked"));
             (format!("{c:?}"), at_once(batch * heads * t.div_ceil(c.bq), smem, regs, c.warps()))
         };
         print(label, ranked.iter().map(row).collect(), ns);
@@ -255,7 +260,7 @@ proptest! {
         bq in prop::sample::select(vec![16usize, 32, 64, 128]),
         bkv in prop::sample::select(vec![16usize, 32, 64, 128]),
     ) {
-        let p = Attention { tiles: 1, t, tk, d: 64, causal: true, bias: false };
+        let p = AttentionProblem { tiles: 1, t, tk, d: 64, causal: true, bias: false };
         let model = p.causal_trips(bq, bkv) as f64;
         let diagonal = (DIAGONAL * bq.div_ceil(bkv)) as f64;
         let kernel = kernel_trips(t, tk, bq, bkv);
@@ -270,7 +275,7 @@ proptest! {
 #[test_case::test_case(1500, 128, 32; "whisper")]
 #[test_case::test_case(384, 16, 128; "qwen3")]
 fn causal_trips_of_one_sequence_are_half_the_keys(t: usize, bq: usize, bkv: usize) {
-    let p = Attention { tiles: 1, t, tk: t, d: 64, causal: true, bias: false };
+    let p = AttentionProblem { tiles: 1, t, tk: t, d: 64, causal: true, bias: false };
     assert_eq!(p.causal_trips(bq, bkv), t.div_ceil(2 * bkv) + DIAGONAL * bq.div_ceil(bkv));
 }
 
@@ -299,7 +304,7 @@ fn a_block_alone_ranks_behind_the_measured_faster_tile(
 ) {
     let target = Target::card(card).expect("a listed card");
     let planner = Planner::new(Device { target, costs }).expect("an SM count");
-    let p = Problem { batches: 1, m, n, k, halves };
+    let p = GemmProblem { batches: 1, m, n, k, halves };
     let cost = |c: &GemmCfg| p.admit(&planner, c).expect("admitted").0;
     assert!(cost(&fast) < cost(&slow), "{} against {}", cost(&fast), cost(&slow));
 }

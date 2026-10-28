@@ -18,8 +18,12 @@ pub const CLOCK_WARMUP: Duration = Duration::from_millis(1500);
 /// Dispatches per plateau check in [`warm_clock`].
 const WARM_WINDOW: usize = 8;
 /// The least a warm-up runs, so a plateau seen in the first window of a cold
-/// device (the clock has not started lifting yet) does not end it.
-const WARM_FLOOR: Duration = Duration::from_millis(50);
+/// device (the clock has not started lifting yet) does not end it: an idle
+/// clock is flat too, and a device that idled through a compile gap needs
+/// this much load before its lift begins to show (the RTX 3060 lifts within
+/// about a second; at 50 ms a flat idle clock passed as warm and the next
+/// measurement read it, 3–7× a warm read).
+const WARM_FLOOR: Duration = Duration::from_millis(400);
 
 /// Run `dispatch` back to back until the kernel's time stops falling — a cold
 /// device's clock lifts under load — or `budget` of wall time has elapsed, or a

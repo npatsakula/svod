@@ -485,6 +485,7 @@ pub fn try_get_kernel_graph(root: Arc<UOp>) -> Result<(Arc<UOp>, RangeifyBufferC
     let t_stage = std::time::Instant::now();
     let after_split = split_all_stores(&pre_cut);
     tracing::debug!(elapsed_ms = t_stage.elapsed().as_millis() as u64, "kernel split: split_all_stores complete");
+    let after_split = remove_views(after_split);
 
     validate_normal_kernel_devices(&after_split).context(IrSnafu)?;
 
@@ -587,6 +588,26 @@ fn split_all_stores(root: &Arc<UOp>) -> Arc<UOp> {
 
     let mut ctx = Vec::new();
     graph_rewrite_bottom_up(&matcher, root.clone(), &mut ctx)
+}
+
+/// Tinygrad `pm_no_views`: the kernel graph is what gets executed, so a RESHAPE or
+/// SHRINK over storage is dropped and the storage stands for the value. A STAGE
+/// over a symbolic range is flattened to its concrete extents and shrunk back
+/// (`flatten_bufferize`), which leaves such a SHRINK on every realized output.
+fn remove_views(root: Arc<UOp>) -> Arc<UOp> {
+    use std::sync::LazyLock;
+    use svod_ir::rewrite::graph_rewrite_preserve_calls;
+
+    fn is_storage(src: &Arc<UOp>) -> bool {
+        matches!(src.op(), Op::After(..) | Op::Param(..) | Op::MStack(..) | Op::Buffer(..))
+    }
+    static PM: LazyLock<crate::TypedPatternMatcher> = LazyLock::new(|| {
+        crate::patterns! {
+            Reshape { src, .. } if is_storage(src) => Some(src.clone()),
+            Shrink { src, .. } if is_storage(src) => Some(src.clone()),
+        }
+    });
+    graph_rewrite_preserve_calls(&*PM, root, &mut ())
 }
 
 // ============================================================================

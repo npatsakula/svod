@@ -27,6 +27,26 @@ fn gemm_matches_a_naive_reference(m: usize, n: usize, k: usize, bm: usize, bn: u
     }
 }
 
+/// An 8-bit product accumulates in i32 exactly: a sum past 2^24 that f32
+/// would round to an even neighbour (`127² · 1057` is odd) stays itself.
+#[test]
+fn an_8_bit_product_accumulates_exactly_in_i32() {
+    let (rows, depth) = (16, 1057);
+    let mut k = Kernel::new("int8");
+    let a = k.param::<I8>("a", ParamKind::In, rows * depth);
+    let c = k.param::<I32>("c", ParamKind::Out, rows * rows);
+    let view = k.view(a, 0, [depth, 1], Shape::new(rows, depth), [None, None]);
+    let x = k.load(view);
+    let zero = k.zeros::<I32>(Shape::new(rows, rows));
+    let acc = k.mma(zero, x, false, x, true);
+    let out = k.view(c, 0, [rows, 1], Shape::new(rows, rows), [None, None]);
+    k.store(out, acc);
+    let out = run(&k.finish(), vec![vec![127.0; rows * depth], vec![0.0; rows * rows]], &[]).unwrap();
+    let want = (127 * 127 * depth) as f64;
+    assert_ne!(f64::from(want as f32), want, "f32 rounds the sum");
+    assert!(out[1].iter().all(|&v| v == want), "{} vs {want}", out[1][0]);
+}
+
 /// A loop-carried register holds its last update after the loop, and the
 /// induction variable drives the addressing: a row-wise prefix sum.
 #[test]
@@ -51,6 +71,28 @@ fn loop_carries_registers_and_bounds_gate_the_tail() {
         let want: f64 = (0..valid as usize).map(|c| x[r * cols + c]).sum();
         assert_eq!(out[1][r], want, "row {r}: columns past the bound read as zero");
     }
+}
+
+/// Two carried registers sharing one `next` both take it at the end of a
+/// trip, as the emitter moves them: the nexts are read before any `phi` is
+/// written, not taken one carried value at a time.
+#[test]
+fn carried_registers_sharing_a_next_both_take_it() {
+    let shape = Shape::new(4, 32);
+    let mut k = Kernel::new("shared_next");
+    let y = k.param::<F32>("y", ParamKind::Out, 2 * shape.elems());
+    let zero = k.zeros::<F32>(shape);
+    let one = k.fill::<F32>(shape, Const::Float(1.0));
+    let [a, b] = k.loop_(3, [zero, zero], |k, _, [a, _]| {
+        let next = k.binary(a, one, BinaryOp::Add);
+        [next, next]
+    });
+    for (at, v) in [(0, a), (shape.elems(), b)] {
+        let out = k.view(y, at, [32, 1], shape, [None, None]);
+        k.store(out, v);
+    }
+    let out = run(&k.finish(), vec![vec![0.0; 2 * shape.elems()]], &[]).unwrap();
+    assert!(out[0].iter().all(|&v| v == 3.0), "{:?}", &out[0][..]);
 }
 
 /// Online softmax as a monoid over `(max, sum)` carried through a loop of
@@ -239,4 +281,159 @@ fn an_access_past_the_capacity_is_an_error(access: Access, at: i64) -> Result<()
     let dst = k.view(y, write_at, [tile.cols, 1], tile, [None, None]);
     k.store(dst, v);
     run(&k.finish(), vec![vec![1.0; 16], vec![0.0; 16]], &[]).map(drop).map_err(|e| e.to_string())
+}
+
+/// A shift moves every element one step on along its axis and fills the
+/// first column (or row).
+#[test_case(Axis::Col; "along the columns")]
+#[test_case(Axis::Row; "down the rows")]
+fn a_shift_moves_every_element_one_step(axis: Axis) {
+    let (rows, cols) = (3usize, 5usize);
+    let mut k = Kernel::new("shift");
+    let x = k.param::<F32>("x", ParamKind::In, rows * cols);
+    let y = k.param::<F32>("y", ParamKind::Out, rows * cols);
+    let xv = k.view(x, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
+    let xr = k.load(xv);
+    let out = k.shift(xr, axis, Const::Float(-9.0));
+    let yv = k.view(y, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
+    k.store(yv, out);
+    let xs: Vec<f64> = (0..rows * cols).map(|i| i as f64).collect();
+    let got = run(&k.finish(), vec![xs, vec![0.0; rows * cols]], &[]).unwrap();
+    let want: Vec<f64> = (0..rows * cols)
+        .map(|i| match axis {
+            Axis::Col if i % cols == 0 => -9.0,
+            Axis::Row if i < cols => -9.0,
+            Axis::Col => (i - 1) as f64,
+            Axis::Row => (i - cols) as f64,
+        })
+        .collect();
+    assert_eq!(got[1], want);
+}
+
+/// A flip exchanges every element with the one whose coordinate along its
+/// axis differs by the mask's bits.
+#[test_case(Axis::Col, 1; "neighbouring columns")]
+#[test_case(Axis::Col, 3; "a run of four reversed")]
+#[test_case(Axis::Col, 6; "pairs two and four apart")]
+#[test_case(Axis::Row, 1; "neighbouring rows")]
+fn a_flip_exchanges_across_its_mask(axis: Axis, mask: u32) {
+    let (rows, cols) = (4usize, 8usize);
+    let mut k = Kernel::new("flip");
+    let x = k.param::<F32>("x", ParamKind::In, rows * cols);
+    let y = k.param::<F32>("y", ParamKind::Out, rows * cols);
+    let xv = k.view(x, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
+    let xr = k.load(xv);
+    let out = k.flip(xr, axis, mask);
+    let yv = k.view(y, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
+    k.store(yv, out);
+    let xs: Vec<f64> = (0..rows * cols).map(|i| i as f64).collect();
+    let got = run(&k.finish(), vec![xs, vec![0.0; rows * cols]], &[]).unwrap();
+    let m = mask as usize;
+    let want: Vec<f64> = (0..rows * cols)
+        .map(|i| match axis {
+            Axis::Col => (i / cols * cols + ((i % cols) ^ m)) as f64,
+            Axis::Row => (((i / cols) ^ m) * cols + i % cols) as f64,
+        })
+        .collect();
+    assert_eq!(got[1], want);
+}
+
+/// A flip spans whole runs of its mask's power of two along its axis.
+#[test]
+#[should_panic(expected = "a flip across")]
+fn a_flip_spans_whole_runs() {
+    let mut k = Kernel::new("flip");
+    let v = k.fill::<F32>(Shape::new(4, 6), Const::Float(0.0));
+    k.flip(v, Axis::Col, 3);
+}
+
+/// A deal takes the `j`th of each row's runs of its columns, column `c·n +
+/// j` in the interpreter, and with `col` that column's index.
+#[test_case(2; "two columns a row")]
+#[test_case(4; "four columns a row")]
+#[test_case(8; "every column")]
+fn a_deal_takes_a_column_of_each_run(w: usize) {
+    let (rows, cols) = (3usize, 8usize);
+    let n = cols / w;
+    let mut k = Kernel::new("deal");
+    let x = k.param::<F32>("x", ParamKind::In, rows * cols);
+    let (y, at) = (k.param::<F32>("y", ParamKind::Out, rows * cols), k.param::<I32>("at", ParamKind::Out, rows * cols));
+    let xv = k.view(x, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
+    let xr = k.load(xv);
+    for j in 0..n {
+        let (v, c) = (k.deal(xr, w, j), k.deal_col(xr, w, j));
+        let yv = k.view(y, j * w, [cols, 1], Shape::new(rows, w), [None, None]);
+        k.store(yv, v);
+        let av = k.view(at, j * w, [cols, 1], Shape::new(rows, w), [None, None]);
+        k.store(av, c);
+    }
+    let xs: Vec<f64> = (0..rows * cols).map(|i| (i * 7 % 11) as f64).collect();
+    let got = run(&k.finish(), vec![xs.clone(), vec![0.0; rows * cols], vec![0.0; rows * cols]], &[]).unwrap();
+    for (i, (&v, &c)) in got[1].iter().zip(&got[2]).enumerate() {
+        let (r, j, c_) = (i / cols, i % cols / w, i % w);
+        assert_eq!(c, (c_ * n + j) as f64, "element {i}");
+        assert_eq!(v, xs[r * cols + c as usize], "element {i}");
+    }
+}
+
+/// A lowered deal carries the order the device's layouts rename registers
+/// by ([`TileOp::Deal`]'s `order`): every row a permutation of the source's
+/// columns, and the interpreter replaying it keeps each dealt value the one
+/// at its recorded column, `col` its index — the pair the device holds,
+/// whatever order that is.
+#[test]
+fn a_lowered_deal_replays_the_devices_order() {
+    use crate::atoms::sm86;
+    use crate::lower::Lowering;
+    let (rows, cols, depth, w) = (64usize, 64usize, 32usize, 8usize);
+    let n = cols / w;
+    let mut k = Kernel::new("dealt");
+    let x = k.param::<BF16>("x", ParamKind::In, rows * depth);
+    let c = k.param::<BF16>("c", ParamKind::In, cols * depth);
+    let (y, at) = (k.param::<F32>("y", ParamKind::Out, rows * cols), k.param::<I32>("at", ParamKind::Out, rows * cols));
+    k.warps(4);
+    let xv = k.view(x, 0, [depth, 1], Shape::new(rows, depth), [None, None]);
+    let cv = k.view(c, 0, [depth, 1], Shape::new(cols, depth), [None, None]);
+    let (xr, cr) = (k.load(xv), k.load(cv));
+    let zero = k.zeros::<F32>(Shape::new(rows, cols));
+    let s = k.mma(zero, xr, false, cr, true);
+    for j in 0..n {
+        let (v, col) = (k.deal(s, w, j), k.deal_col(s, w, j));
+        let yv = k.view(y, j * w, [cols, 1], Shape::new(rows, w), [None, None]);
+        k.store(yv, v);
+        let av = k.view(at, j * w, [cols, 1], Shape::new(rows, w), [None, None]);
+        k.store(av, col);
+    }
+    let lowered = crate::lower::standalone(k.finish(), &Lowering::new(&super::declared(sm86()))).unwrap();
+    let mut orders = 0;
+    for (_, stmt) in lowered.tile.walk() {
+        let Stmt::Let { op: TileOp::Deal { src, order, .. }, .. } = stmt else { continue };
+        let Some(order) = order else { continue };
+        orders += 1;
+        let cols = lowered.tile.value(*src).shape.cols;
+        for row in order {
+            let mut sorted = row.clone();
+            sorted.sort_unstable();
+            assert_eq!(sorted, (0..cols as u32).collect::<Vec<_>>(), "a row's columns once");
+        }
+    }
+    assert!(orders > 0, "the device's renaming order was recorded");
+    let mut seed = 5;
+    let xs = super::rounded(ScalarDType::BFloat16, rows * depth, &mut seed, |v| v);
+    let cs = super::rounded(ScalarDType::BFloat16, cols * depth, &mut seed, |v| v);
+    let params = vec![xs.clone(), cs.clone(), vec![0.0; rows * cols], vec![0.0; rows * cols]];
+    let got = run(&lowered.tile, params, &[]).unwrap();
+    for (i, (&v, &col)) in got[2].iter().zip(&got[3]).enumerate() {
+        let want = (0..depth).map(|e| xs[i / cols * depth + e] * cs[col as usize * depth + e]).sum::<f64>();
+        assert!((v - want).abs() <= 1e-3 * want.abs().max(1.0), "element {i} = {v} at column {col}");
+    }
+}
+
+/// A deal's width divides its source's columns.
+#[test]
+#[should_panic(expected = "deal")]
+fn a_deal_divides_its_columns() {
+    let mut k = Kernel::new("deal");
+    let v = k.fill::<F32>(Shape::new(4, 6), Const::Float(0.0));
+    k.deal(v, 4, 0);
 }

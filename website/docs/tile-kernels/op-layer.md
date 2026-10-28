@@ -53,16 +53,28 @@ holds the ranked configs; the [tuner](./tuning) measures the first that compile 
 | `Fallback` | When |
 |---|---|
 | `Target` | The tensor is not on the default device, the device has no tk kernels (`config::has_kernels`: CUDA below sm_80, Metal, the CPU), or its target reports no SM count |
-| `Dtype` | Any operand is f32, or the operands do not all share one 16-bit type with a matrix core. `conv2d`: an output type other than the input's or f32, or a residual not in it |
+| `Dtype` | Any operand is f32, or the operands do not all share one 16-bit type with a matrix core (`nearest` and `k_nearest` also take i8 rows, each scaled by 1). `conv2d`: an output type other than the input's or f32, or a residual not in it |
 | `Symbolic` | A dim other than a bound leading one is symbolic (for `linear`, also a symbolic `N`) |
 | `Shape` | `linear`: `N` not a multiple of 8 or no rows. `conv2d`: `groups > 1`, `Cin` not a multiple of 16, `Cout` not a multiple of 8, or an empty output. `attention`: no config fits `D` (on sm_86, 32, 48, 64, 128 and 256 plan and 40 does not) or an empty dim. `heads`: `D` not a power of two in 16..=256. Norms: `D` not a power of two in 256..=2048 |
 | `Config` | No tile config fits. For `linear`, `K` is not a multiple of 16 |
 
 `attention` also takes the graph when appended rows are wider than every config's key block.
 
+`ops::chosen()` returns what the last op this thread ran chose, as a value beside the tensors it
+returned: `Chosen::Kernel { op, family, cfg }` — the kernel's name (`family`) and its pick's Debug
+text (`cfg`), which names a nearest pick's path (score matrix, queue, splits) — or
+`Chosen::Graph { op, why }`. `k_nearest_reranked`'s record is its search's: the winning rows'
+dtype beside its config.
+
 :::note[Why f32 keeps the graph]
-The kernels take 16-bit operands only. Casting an f32 model down would trade about three
-decimal digits of precision for speed, so the op layer leaves that choice to the model's dtype.
+The kernels take 16-bit operands (and, for the nearest-neighbour search, 8-bit integers).
+Casting an f32 model down would trade about three decimal digits of precision for speed, so the
+op layer leaves that choice to the model's dtype. `k_nearest_reranked` is the exception that
+keeps f32 numbers: it searches the rows in 8 bits or f16 (`Quantized` with its
+`QuantScheme::Row` scale, `Rerank`), keeps each row's `k + margin` least (16 by default), and
+scores those again in f32 from the rows as given. `Rerank::search` names the rows
+(`Search::Int8`, `Search::Half(f16)`, or `Search::Auto`, the faster of the two — which one won
+is the op's `chosen()` record). A neighbour the search ranks past `k + margin` is missed.
 :::
 
 ## Batch variables

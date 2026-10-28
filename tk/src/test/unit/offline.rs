@@ -2,7 +2,7 @@
 //! targets from the card table, their costs from a tune store copied from
 //! them.
 
-use std::path::PathBuf;
+use super::Scratch;
 
 use svod_dtype::DType;
 use test_case::test_case;
@@ -71,11 +71,9 @@ fn line(device: &str, op: &str, programs: &str, fs: u64) -> String {
 }
 
 /// A scratch directory holding `lines` as the store file of `target`'s device.
-fn store(name: &str, target: &Target, lines: &[String]) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("svod-tk-offline-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-    let file = TuneStore::at(Some(dir.clone())).file(&tune::device(target)).expect("a rooted store");
+fn store(name: &str, target: &Target, lines: &[String]) -> Scratch {
+    let dir = Scratch::new(&format!("offline-{name}"));
+    let file = TuneStore::at(Some(dir.to_path_buf())).file(&tune::device(target)).expect("a rooted store");
     std::fs::write(file, format!("format 4\n{}\n", lines.join("\n"))).expect("a store file");
     dir
 }
@@ -96,10 +94,10 @@ fn costs_read_from_a_copied_store() {
     let before: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| std::fs::read(e.unwrap().path()).unwrap()).collect();
     let Measured { costs, unmeasured } = probe::stored(&dir, &target).expect("the device's file");
     // Probes added since the store was copied are unmeasured.
-    assert_eq!(unmeasured, ["trip_lone", "trip_one_lone", "latency_one"]);
+    assert_eq!(unmeasured, ["step_i8", "step_lone_i8", "trip_lone", "trip_one_lone", "latency_one"]);
     // A rolled ring is not probed where fills are `cp.async`: its line is passed over.
     let want = |op: &str| match op {
-        "trip_rolled" | "trip_lone" | "trip_one_lone" | "latency_one" => 0.0,
+        "step_i8" | "step_lone_i8" | "trip_rolled" | "trip_lone" | "trip_one_lone" | "latency_one" => 0.0,
         _ => H100.iter().find(|f| f.0 == op).expect("a probe").1 as f64 * 1e-6,
     };
     let mut costs = costs;
@@ -112,12 +110,11 @@ fn costs_read_from_a_copied_store() {
     let after: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| std::fs::read(e.unwrap().path()).unwrap()).collect();
     assert_eq!(before, after, "the store is read, never written");
     assert_eq!(probe::stored(&dir, &Target::card("h100-sxm").unwrap()), None, "no file for 132 SMs");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Of a probe's several lines the one this build's programs measured
 /// counts; several of none of them leave the field unmeasured, as does a
-/// missing one, and a ladder with a missing rung leaves the cache so.
+/// missing one, and a ladder missing a rung keeps the rungs it has.
 #[test]
 fn a_probe_of_several_lines_takes_this_builds() {
     let target = Target::card("h100-pcie").expect("a listed card");
@@ -137,9 +134,13 @@ fn a_probe_of_several_lines_takes_this_builds() {
     let dir = store("several", &target, &lines);
     let Measured { costs, unmeasured } = probe::stored(&dir, &target).expect("the device's file");
     assert_eq!(costs.step, 2.0);
-    assert_eq!((costs.trip, costs.latency, costs.l2_bytes), (0.0, 0.0, 0.0));
-    assert_eq!(unmeasured, ["trip", "trip_lone", "trip_one_lone", "latency", "latency_one", "l2_bytes"]);
-    let _ = std::fs::remove_dir_all(dir);
+    assert_eq!((costs.trip, costs.latency), (0.0, 0.0));
+    // The ladder's missing rung (`cached_2m`) is bridged, not fatal: the
+    // rest are measured until two past the knee (H100's 50 MB L2 settles
+    // only past 128 MB).
+    assert!(costs.l2_bytes > 0.0, "{}", costs.l2_bytes);
+    assert_eq!(costs.ladder.iter().filter(|&&(f, _)| f > 0).count(), 7);
+    assert_eq!(unmeasured, ["step_i8", "step_lone_i8", "trip", "trip_lone", "trip_one_lone", "latency", "latency_one"]);
 }
 
 /// A planner needs no device: a card's target under its stored costs
@@ -153,7 +154,6 @@ fn a_planner_plans_for_a_card_without_it() {
     let dir = store("planner", &target, &lines);
     let planner = Planner::measured(target, probe::stored(&dir, &Target::card("h100-pcie").unwrap()).unwrap())
         .expect("an H100 has SMs");
-    let _ = std::fs::remove_dir_all(dir);
     let bf16 = [DType::BFloat16; 2];
     let x = Extent { dims: vec![4096, 4096], var: false };
     let Plan::Kernel(gemm) = shape::linear(Some(&planner), &bf16, Some(&x), 4096, false) else { panic!("no GEMM") };

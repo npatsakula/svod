@@ -149,6 +149,7 @@ impl Frame<'_> {
                 let (store, index) = (&self.globals[param.index()], self.scalar_at(*index, row)?);
                 store[slot(&self.prog.params[param.index()].name, store, index)?] as i64
             }
+            Scalar::Any(v) => i64::from(self.read(*v)?.iter().any(|&b| b != 0.0)),
         })
     }
 
@@ -200,9 +201,17 @@ impl Frame<'_> {
                 }
                 self.warp = saved;
             }
-            Stmt::If { pred, then, otherwise } => {
-                let branch = if self.scalar(*pred)? != 0 { then } else { otherwise };
-                self.block_run(branch)?;
+            Stmt::If { pred, then, otherwise, results } => {
+                let taken = self.scalar(*pred)? != 0;
+                self.block_run(if taken { then } else { otherwise })?;
+                // The merge, as the moves the branches end in: the taken
+                // branch's source, else what `dst` held before the `if`.
+                for (dst, then_src, else_src) in results {
+                    if let Some(src) = if taken { Some(*then_src) } else { *else_src } {
+                        let out = self.tile_op(*dst, &TileOp::Move { src })?;
+                        self.regs.insert(*dst, out);
+                    }
+                }
             }
             Stmt::Sync(_) => {}
         }
@@ -217,13 +226,16 @@ impl Frame<'_> {
     }
 
     /// Carried registers take their `next` where the iteration computed one
-    /// (a guarded body may skip it, leaving the register as it was).
+    /// (a guarded body may skip it, leaving the register as it was), all at
+    /// once: every `next` is read before any `phi` is written, so two
+    /// carried values sharing a `next` both take it.
     fn advance(&mut self, carried: &[Carried]) {
+        let taken: Vec<(ValId, Vec<f64>)> =
+            carried.iter().filter_map(|c| self.regs.get(&c.next).map(|next| (c.phi, next.clone()))).collect();
         for c in carried {
-            if let Some(next) = self.regs.remove(&c.next) {
-                self.regs.insert(c.phi, next);
-            }
+            self.regs.remove(&c.next);
         }
+        self.regs.extend(taken);
     }
 
     /// Element coordinates → flat index of a view, or `None` past its bounds.
@@ -375,6 +387,9 @@ impl Frame<'_> {
                 let k = if *a_t { sa.rows } else { sa.cols };
                 let at = |m: usize, kk: usize| if *a_t { va[kk * sa.cols + m] } else { va[m * sa.cols + kk] };
                 let bt = |kk: usize, n: usize| if *b_t { vb[n * sb.cols + kk] } else { vb[kk * sb.cols + n] };
+                // An integer accumulator adds exactly (8-bit products sum
+                // well inside an f64's integers); a float one in f32.
+                let exact = !out.dtype.is_float();
                 let mut out = self.read(*acc)?;
                 for m in 0..rows {
                     for n in 0..cols {
@@ -382,7 +397,8 @@ impl Frame<'_> {
                         for kk in 0..k {
                             sum += at(m, kk) * bt(kk, n);
                         }
-                        out[m * cols + n] = (out[m * cols + n] as f32 + sum as f32) as f64;
+                        let held = out[m * cols + n];
+                        out[m * cols + n] = if exact { held + sum } else { (held as f32 + sum as f32) as f64 };
                     }
                 }
                 out
@@ -420,6 +436,42 @@ impl Frame<'_> {
             TileOp::Transpose { src } => {
                 let v = self.read(*src)?;
                 (0..rows * cols).map(|i| v[(i % cols) * rows + i / cols]).collect()
+            }
+            TileOp::Shift { src, axis, fill } => {
+                let v = self.read(*src)?;
+                let fill = match fill {
+                    Const::Int(i) => *i as f64,
+                    Const::Float(f) => *f,
+                };
+                let step = if *axis == Axis::Col { 1 } else { cols };
+                (0..rows * cols)
+                    .map(|i| {
+                        let first = if *axis == Axis::Col { i % cols == 0 } else { i < cols };
+                        if first { fill } else { v[i - step] }
+                    })
+                    .collect()
+            }
+            TileOp::Deal { src, j, col, order } => {
+                let s = self.prog.value(*src).shape;
+                let n = s.cols / cols;
+                let v = if *col { vec![] } else { self.read(*src)? };
+                (0..rows * cols)
+                    .map(|i| {
+                        let (r, c) = (i / cols, i % cols);
+                        let at = order.as_ref().map_or(c * n + *j as usize, |o| o[r][c * n + *j as usize] as usize);
+                        if *col { at as f64 } else { v[r * s.cols + at] }
+                    })
+                    .collect()
+            }
+            TileOp::Flip { src, axis, mask } => {
+                let v = self.read(*src)?;
+                let m = *mask as usize;
+                (0..rows * cols)
+                    .map(|i| match axis {
+                        Axis::Col => v[i / cols * cols + ((i % cols) ^ m)],
+                        Axis::Row => v[((i / cols) ^ m) * cols + i % cols],
+                    })
+                    .collect()
             }
         };
         Ok(data.into_iter().map(|x| round_to(out.dtype, x)).collect())

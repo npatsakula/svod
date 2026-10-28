@@ -1583,16 +1583,42 @@ impl AmdComputeQueue {
 
         let mut finalized = crate::hcq::Submission::new(submission.queue);
         finalized.push(crate::hcq::Command::Wait { signal_address: counter_addr, value: prev });
+        // The stamp waits below are gfx11's, measured there (gfx1151, 2026-10-28):
+        // they hold both stamps to the compute they bracket. On gfx12 (gfx1201)
+        // the wait on a stamp wedges the queue, and on both a store fence in its
+        // place leaves probes unmeasured — its stamps are left as they were, the
+        // tuner's physical floor the guard on what they read.
+        let fenced = self.core.arch.gfx_major() == 11 && ts_addrs.is_some();
         for command in &submission.commands {
             if matches!(command, crate::hcq::Command::Compute(_))
                 && let Some((start_addr, _)) = ts_addrs
             {
                 finalized.push(crate::hcq::Command::Timestamp { dst: start_addr });
+                // A bare end-of-pipe clock write retires with the CP's event
+                // queue, not with the packets around it: dispatched behind
+                // other events its landing drags past a following compute
+                // (a 270 ms dispatch's start stamp landed 4 ms before its
+                // end, gfx1151), and left to complete on its own it lands
+                // before one (the same dispatch stamped 1-3 us). Both stamps
+                // are therefore waited to land where the dispatch needs them:
+                // the start one (zeroed by `reset`) before the compute is
+                // forwarded, the end one behind the timeline-class store that
+                // provably follows the dispatch's retirement.
+                // The stamp's high half: zeroed by `reset`, never zero once
+                // the GPU clock lands in it.
+                if fenced {
+                    finalized.push(crate::hcq::Command::Wait { signal_address: start_addr + 4, value: 1 });
+                }
             }
             finalized.push(command.clone());
             if matches!(command, crate::hcq::Command::Compute(_))
                 && let Some((_, end_addr)) = ts_addrs
             {
+                let gate = timestamps.as_ref().expect("a stamp pair holds its signal").value_addr();
+                if fenced {
+                    finalized.push(crate::hcq::Command::Store { dst: gate, value: 1 });
+                    finalized.push(crate::hcq::Command::Wait { signal_address: gate, value: 1 });
+                }
                 finalized.push(crate::hcq::Command::Timestamp { dst: end_addr });
             }
         }

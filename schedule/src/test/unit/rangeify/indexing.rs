@@ -10,6 +10,7 @@ use crate::rangeify::{
     indexing::{broadcast_ranges, data_sources},
 };
 use crate::test::support::prelude::*;
+use test_case::test_case;
 
 fn var() -> Arc<UOp> {
     UOp::var("x", DType::Float32, 0, i64::MAX)
@@ -149,4 +150,29 @@ fn equal_movement_inputs_reuse_the_cached_index_chain() {
 
     assert_eq!(first.len(), in_shape.len(), "one index per input axis");
     assert!(first.iter().zip(&second).all(|(a, b)| Arc::ptr_eq(a, b)), "a hit returns the cached nodes");
+}
+
+/// EXPAND aligns its source with the trailing output axes, so the source is
+/// indexed by one index per source axis: an output axis the EXPAND adds on the
+/// left (a rank-0 constant broadcast by `const_like`) maps to nothing, and a
+/// broadcast singleton maps to CONST 0. `Some(i)` is the consumer's range `i`.
+#[test_case(&[], &[5, 1], &[] ; "rank 0 to rank 2 drops both axes")]
+#[test_case(&[], &[5], &[] ; "rank 0 to rank 1 drops the axis")]
+#[test_case(&[1], &[5, 1], &[Some(1)] ; "rank 1 keeps the trailing range")]
+#[test_case(&[1], &[3, 5], &[None] ; "rank 1 zeroes its broadcast singleton")]
+#[test_case(&[1, 1], &[5, 1], &[None, Some(1)] ; "equal rank zeroes only the broadcast axis")]
+#[test_case(&[5, 1], &[5, 4], &[Some(0), None] ; "equal rank keeps the unexpanded axis")]
+fn expand_indexes_the_source_once_per_source_axis(in_dims: &[usize], out_dims: &[usize], expected: &[Option<usize>]) {
+    let rngs: Vec<_> = out_dims.iter().enumerate().map(|(id, &extent)| global_range(extent as i64, id)).collect();
+    let in_shape: Vec<SInt> = in_dims.iter().map(|&d| SInt::Const(d)).collect();
+    let new_shape = svod_ir::shape::shape_to_uop(&out_dims.iter().map(|&d| SInt::Const(d)).collect());
+    let expand = UOp::new(Op::Expand(ops::Expand { src: UOp::index_const(0), new_shape }), DType::Float32);
+
+    let indices = crate::rangeify::apply_movement_op(expand.op(), &in_shape, &rngs);
+
+    assert_eq!(indices.len(), expected.len(), "one index per source axis");
+    for (index, expected) in indices.iter().zip(expected) {
+        let want = expected.map_or_else(|| UOp::index_const(0), |i| rngs[i].clone());
+        assert!(Arc::ptr_eq(index, &want), "got {index:?}, want {want:?}");
+    }
 }

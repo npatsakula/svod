@@ -6,11 +6,11 @@ shape; the excerpts below are verbatim (trimmed) at 2e9d5edb.
 
 ## 1. The kernel (`tk/src/kernels/x.rs`, `pub mod x;` in `kernels/mod.rs`)
 
-- `XCfg` (`Clone + Copy + Debug + PartialEq + Eq + Hash`): the knobs the tuner picks, with
-  `fn lowering(&self, device: &Device) -> Lowering`. A row kernel:
-  `Lowering::uniform(device, false, WarpGrid { rows: self.br as u32, cols: 1 })`. A mainloop kernel reuses
-  `GemmCfg::lowering` (ring depth via `Fill::stages`, unroll, `crews` → `Schedule::PingPong`, `core: Core::Group` →
-  the warpgroup atom).
+- `XCfg` (`Clone + Copy + Debug + PartialEq + Eq + Hash`): the knobs the tuner picks. The program states its warp
+  grid (`k.warps(br as u32)`, a column; `k.warps(WarpGrid { rows, cols })`) and each ring
+  (`k.pipeline(extent, Ring { stages, unroll, crews }, …)`, or a slot count); the launch takes
+  `Lowering::new(&device)`, or the config's `lowering` where it picks the core (`GemmCfg`, `FaCfg`: `Core::Group` →
+  the warpgroup atom). A mainloop kernel reuses `gemm::mainloop` with `GemmCfg::ring()`.
 - `XSpec`: shapes, `batch: Batch`, options, `cfg: XCfg`. Size every param at `batch.capacity()`.
 - `pub fn x<T: Elem>(spec: &XSpec) -> Program`. The `Kernel::new` name is what profiles, `assert_kernel`, the IR dump
   files and `.kd` descriptors show. Param order is the launch order (inputs, then outputs).
