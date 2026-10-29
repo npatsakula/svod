@@ -1,11 +1,11 @@
 //! The refactor sweep's own logic: its digest, the comparison of two runs,
 //! the numbering of repeated names, and that its kernel set holds every
-//! family under unique names on every target it lists.
+//! family under unique names and renders whole on every target it lists.
 
 use test_case::test_case;
 
 use crate::ops::config::has_kernels;
-use crate::sweep::{Diff, diff, digest, digested, families, targets, unique};
+use crate::sweep::{Diff, diff, digest, digested, families, targets, try_render, unique};
 
 /// FNV-1a 64's published vectors: a digest stable across builds.
 #[test_case(b"" => 0xcbf2_9ce4_8422_2325; "empty")]
@@ -54,4 +54,23 @@ fn every_target_digests_its_families_under_unique_names() {
             assert!(set.contains(&family), "{name}: {family} is not digested");
         }
     }
+}
+
+/// Every kernel the sweep digests renders on its target: a config the
+/// sweep admits but its lowering refuses — the warpgroup attention tiles
+/// over rows appended to a cache, which only gmem can feed — fails here,
+/// not as a FAILED line the digest gate prints.
+#[test]
+fn every_target_renders_what_it_digests() {
+    std::thread::scope(|s| {
+        for (name, target) in targets() {
+            s.spawn(move || {
+                for (kname, prog, lowering) in digested(&target) {
+                    if let Err(e) = try_render(prog, &lowering) {
+                        panic!("{name} {kname}: {e}");
+                    }
+                }
+            });
+        }
+    });
 }

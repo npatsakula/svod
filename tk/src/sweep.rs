@@ -543,8 +543,9 @@ pub fn digested(target: &Target) -> Vec<Launch> {
     }
     for (name, t, tk, d, mask, cache, batch) in attention_variants() {
         let ranked = planner.attention_ranked(8, t, tk, d, mask.causal, mask.bias.is_some());
+        let appended = cache.map_or(0, |c| c.appended);
         let mut cfgs: Vec<FaCfg> = vec![];
-        for cfg in first_eight(&ranked).into_iter().take(4) {
+        for cfg in first_eight(&ranked).into_iter().filter(|c| c.holds_appended(appended)).take(4) {
             for splits in if cache.is_some() { vec![1, 2] } else { vec![1] } {
                 cfgs.push(FaCfg { splits, ..cfg });
             }
@@ -555,7 +556,7 @@ pub fn digested(target: &Target) -> Vec<Launch> {
         if group {
             for (bq, bkv) in [(64, 64), (128, 64), (64, 128)] {
                 let cfg = FaCfg { core: Core::Group, ..FaCfg::new(bq, bkv, 2) };
-                if cfg.fits(target, d, mask.bias.is_some()) && cache.is_none_or(|c| c.appended == 0) {
+                if cfg.fits(target, d, mask.bias.is_some()) && cfg.holds_appended(appended) {
                     cfgs.push(cfg);
                 }
             }
