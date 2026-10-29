@@ -336,7 +336,8 @@ impl Kernel {
         let offset = self.intern(offset);
         let stride = stride.map(|s| self.intern(s));
         let bounds = bounds.map(|b| b.map(|s| self.intern(s)));
-        Tile::new(self.value(T::DTYPE, shape, Place::Global { param: param.0, offset, stride, bounds, rows: None }))
+        let place = Place::Global { param: param.0, offset, stride, bounds, rows: None, period: None };
+        Tile::new(self.value(T::DTYPE, shape, place))
     }
 
     /// A `shape` window of contiguous columns whose row `r` starts at
@@ -359,8 +360,23 @@ impl Kernel {
         Tile::new(self.value(
             T::DTYPE,
             shape,
-            Place::Global { param: param.0, offset, stride, bounds, rows: Some(rows) },
+            Place::Global { param: param.0, offset, stride, bounds, rows: Some(rows), period: None },
         ))
+    }
+
+    /// `view` with its columns repeating every `period`: column `c` reads
+    /// column `c % period`, a table every block of `period` columns shares.
+    /// Its contiguous columns hold the period, and it is read into
+    /// registers only.
+    pub fn periodic<T: Elem>(&mut self, view: Gmem<T>, period: usize) -> Gmem<T> {
+        let Value { dtype, shape, place } = self.prog.value(view.0).clone();
+        let Place::Global { param, offset, stride, bounds, rows, period: None } = place else {
+            unreachable!("a global view of one period")
+        };
+        let unit = matches!(self.prog.scalar(stride[1]), Scalar::Const(1));
+        assert!(period > 0 && unit && bounds[1].is_none(), "a periodic view has unbounded contiguous columns");
+        let place = Place::Global { param, offset, stride, bounds, rows, period: Some(period) };
+        Tile::new(self.value(dtype, shape, place))
     }
 
     /// The row coordinate a [`Self::gather`] map is evaluated at.
@@ -373,12 +389,15 @@ impl Kernel {
     pub fn at<T: Elem>(&mut self, view: Gmem<T>, rows: impl Into<Sc>, cols: impl Into<Sc>) -> Gmem<T> {
         let (rows, cols) = (rows.into(), cols.into());
         let Value { dtype, shape, place } = self.prog.value(view.0).clone();
-        let Place::Global { param, offset, stride, bounds, rows: map } = place else { unreachable!("global tier") };
+        let Place::Global { param, offset, stride, bounds, rows: map, period } = place else {
+            unreachable!("global tier")
+        };
         assert!(map.is_none() || rows == Sc::Const(0), "a gathered view moves along its columns only");
+        assert!(period.is_none() || cols == Sc::Const(0), "a periodic view moves along its rows only");
         let moved = Sc::Id(offset) + rows.clone() * Sc::Id(stride[0]) + cols.clone() * Sc::Id(stride[1]);
         let offset = self.intern(moved);
         let bounds = [(bounds[0], rows), (bounds[1], cols)].map(|(b, by)| b.map(|b| self.intern(Sc::Id(b) - by)));
-        Tile::new(self.value(dtype, shape, Place::Global { param, offset, stride, bounds, rows: map }))
+        Tile::new(self.value(dtype, shape, Place::Global { param, offset, stride, bounds, rows: map, period }))
     }
 
     /// The first `shape` rows and columns of `view`.
@@ -608,8 +627,12 @@ impl Kernel {
         let (d, s) = (self.prog.value(dst), self.prog.value(src));
         assert_eq!(d.shape, s.shape, "copy shapes");
         assert_eq!(d.dtype, s.dtype, "copy dtypes");
-        if let Place::Global { param, .. } = d.place {
+        if let Place::Global { param, period, .. } = d.place {
             assert_ne!(self.prog.params[param.index()].kind, ParamKind::In, "a store into an input");
+            assert!(period.is_none(), "a store into a periodic view");
+        }
+        if let Place::Global { period: Some(_), .. } = s.place {
+            assert_eq!(d.place, Place::Reg, "a periodic view is read into registers only");
         }
         self.push(Stmt::Copy { dst, src, mode, scope: self.scope });
     }

@@ -95,6 +95,7 @@ fn a_key_warps_state_over_its_ring_is_fenced_by_the_warp_then_the_block() {
         d: 64,
         mask,
         cache: None,
+        packed: false,
         scale: 0.125,
         cfg,
     };
@@ -403,6 +404,7 @@ fn a_consume_body_fences_its_own_tiles() {
     t: 4, tk: 200, heads: 4, kv_heads: 2, d: 64,
     mask: AttnMask { causal: true, key_lens: true, key_mask: true, ..AttnMask::default() },
     cache: Some(CacheLayout { rows: 3, heads_total: 6, row_map: true, appended: 4, app_lens: true }),
+    packed: false,
     scale: 0.125,
     cfg: FaCfg { splits: 2, ..FaCfg::new(16, 64, 3) },
 }); "attention with every mask, a cache and splits")]

@@ -220,7 +220,7 @@ impl Steps {
 }
 
 /// A ring's fill: where the bytes a trip streams in come from.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Stream {
     /// The bytes a trip fills into its ring.
     pub bytes: f64,
@@ -277,6 +277,23 @@ pub(crate) struct Claim {
     pub ops: Ops,
     /// A trip's ring fill.
     pub fill: Stream,
+    /// The epilogue's own global reads, beside the run's trips: the tables,
+    /// biases, norms and scales a block reads straight from global memory
+    /// alongside the vector work they feed — a side read, never ring-staged,
+    /// so no trip waits on it (its loads are many, small and independent:
+    /// latency-tolerant), and cache-resident at the working set `unique`
+    /// names, the blocks in flight re-reading a `shared` share of one
+    /// another's lines. Stated per trip like the fill — a read a block makes
+    /// once (`bytes` over its `trips`, a whole-block table a share a trip) —
+    /// and priced at the same ladder by its own working set, but through the
+    /// epilogue's pipe, not the fill's: the loads issue alongside the
+    /// epilogue's operations and overlap with the ring's fill and the steps
+    /// as that pipe does, a pipe of their own they are not. Its distinct
+    /// bytes are bytes the kernel moves: they count toward the run's floor
+    /// ([`Self::distinct`]). A stream of none prices at nothing; the rotary
+    /// tables a fused projection's epilogue turns its columns by are the
+    /// one stated.
+    pub side: Stream,
     /// The bytes a trip writes straight to DRAM (a score matrix's stores),
     /// priced at the global rate whatever the cache holds.
     pub stores: f64,
@@ -302,11 +319,12 @@ pub(crate) const FLOOR: f64 = 2.0;
 
 impl Claim {
     /// The bytes the kernel must move at least once: every distinct byte of
-    /// its streams, its straight-to-DRAM stores and its whole-problem
-    /// sections' — the work no config of the problem can skip, whatever it
-    /// caches or overlaps.
+    /// its streams — the ring's and the side's alike — its straight-to-DRAM
+    /// stores and its whole-problem sections' — the work no config of the
+    /// problem can skip, whatever it caches or overlaps.
     pub(crate) fn distinct(&self) -> f64 {
         self.fill.unique
+            + self.side.unique
             + self.stores * self.trips as f64 * self.blocks as f64
             + self.sections.iter().map(|s| s.bytes * s.rows).sum::<f64>()
     }
@@ -402,9 +420,10 @@ impl Planner {
     /// The SM time of `claim`'s run — the only place a claim becomes time:
     /// the steps at their core's probe with the chain ratio that hides
     /// them, the fragment reads at the shared rate, the ops at [`pair_op`]'s
-    /// unit by kind, the fill through the cache ladder, the trip at its
-    /// ring's probe — pipelined over the waves a SIMD holds — and the waits
-    /// and the sections beside the run's trips.
+    /// unit by kind, the fill through the cache ladder, the side's reads at
+    /// that ladder of their own working set alongside the epilogue, the trip
+    /// at its ring's probe — pipelined over the waves a SIMD holds — and the
+    /// waits and the sections beside the run's trips.
     ///
     /// The pipelining: the busiest SM issues the work of `⌈blocks / sms⌉`
     /// blocks, each taken up as another ends (measured on sm_86: a 64×64
@@ -453,6 +472,14 @@ impl Planner {
                 claim.fill.shared,
             )
             + claim.stores * costs.global_byte;
+        // A side read's bytes at the ladder of the working set they name,
+        // through the epilogue's pipe: see [`Claim::side`].
+        let side = claim.side.bytes
+            * self.fill_byte(
+                claim.side.unique,
+                (claim.blocks * claim.trips) as f64 * claim.side.bytes,
+                claim.side.shared,
+            );
         let trip = costs.trip(target.fill, claim.ring, claim.unroll);
         // The run the claim describes: `blocks` blocks of `waves` waves,
         // `trips` trips through a ring `stages` deep, a trip's issue down
@@ -471,7 +498,7 @@ impl Planner {
         // `alone`: one block's pipes, its fill after the rest where serial.
         let body = |waves: usize, alone: bool| {
             let fill = if alone && serial { (0.0, fill) } else { (fill, 0.0) };
-            let pipes = [reads, work * lone(waves) + epilogue, fill.0];
+            let pipes = [reads, work * lone(waves) + epilogue + side, fill.0];
             let longest = pipes.into_iter().fold(0.0, f64::max);
             longest + (pipes.iter().sum::<f64>() - longest) / per_simd(waves).min(OVERLAP_WAVES) + fill.1
         };

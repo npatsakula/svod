@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::atoms::{Core, Fill, Target};
 use crate::ir::{Axis, Shape};
-use crate::kernels::gemm::{GROUP_ROWS, GemmCfg, KSLICE};
+use crate::kernels::gemm::{GROUP_ROWS, GemmCfg, KSLICE, Rope};
 use crate::layouts::{Issue, Swizzle, WarpGrid, chunked, fills_in_chunks};
 
 use super::cost::{Claim, ELEM, Family, Kind, Ops, Planner, STEP, Spread, Steps, Stream, cached};
@@ -114,6 +114,13 @@ pub(crate) const fn gemm_cfg(tile: [usize; 3], stages: usize, warps: [u32; 2], u
 /// the same whatever the tile.
 pub(crate) const EPILOGUE_OPS: f64 = 40.0;
 
+/// Model: a rotary turn's tile operations a turned output element — the two
+/// tables' casts, the sign's multiply, the element's own multiply feeding
+/// the fused add and the mul_add itself; the sign tile's column arithmetic
+/// (the divides, compare and select over a `[1, bn]` tile) is shared over
+/// the tile's rows.
+pub(crate) const ROPE_OPS: f64 = 5.0;
+
 /// Search bound: the output tile's rows, the first of the knobs a GEMM-shaped
 /// kernel is enumerated over.
 const ROWS: [usize; 4] = [32, 64, 128, 256];
@@ -170,14 +177,17 @@ pub fn gemm_lattice(target: &Target) -> Vec<GemmCfg> {
 
 /// A GEMM-shaped problem: `batches` products of `m × k` by `k × n·halves`
 /// (two halves: a gated weight, whose block stages a `2·bn`-wide B tile
-/// and holds two accumulators).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// and holds two accumulators). With `rope`, the output's first heads turn
+/// in the kernel's store: only tiles that hold whole heads lower, and the
+/// turn's operations and table reads are claimed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct GemmProblem {
     pub batches: usize,
     pub m: usize,
     pub n: usize,
     pub k: usize,
     pub halves: usize,
+    pub rope: Option<Rope>,
 }
 
 impl GemmProblem {
@@ -222,6 +232,12 @@ impl GemmProblem {
         let target = &planner.device.target;
         let ([bm, bn, bk], [wr, wc]) = (cfg.tile, cfg.warps.map(|w| w as usize));
         let gated = self.halves == 2;
+        // A turn moves each element's partner half a head along: a tile whose
+        // block or warps do not hold whole heads has partners another lane or
+        // warp holds, which the flip the kernel issues cannot reach.
+        if self.rope.is_some_and(|rope| !cfg.turns(rope.head_dim)) {
+            return Err(Rejected::Lowers);
+        }
         let atom = target.geometry().ok_or(Rejected::Lowers)?;
         // A step is at least two matrix-core depths, unless the reduction dim
         // allows nothing deeper.
@@ -270,8 +286,26 @@ impl GemmProblem {
         // lane's element each, paid over the trips that fold into one
         // output: their whole is m·n·[`EPILOGUE_OPS`] of lane operations
         // whatever the tile, so what the term orders is a trip's balance of
-        // steps against epilogue.
+        // steps against epilogue. A rope's turn covers the `turned` share of
+        // the columns (the last block straddling them half-turned on
+        // average), and every block whose window reaches them reads, once,
+        // its rows' positions of both tables — `half` distinct elements a
+        // row each — the side stream: priced at the ladder of its own
+        // working set through the epilogue's pipe, not folded into the
+        // ring's fill, its distinct bytes in the run's floor.
         let epilogue = EPILOGUE_OPS * (bm * bn) as f64 / trips as f64;
+        let (mut ops, mut side) = (epilogue, Stream::default());
+        if let Some(rope) = self.rope {
+            let (half, turned) = (rope.head_dim / 2, rope.heads * rope.head_dim);
+            let share = turned as f64 / self.n as f64;
+            ops += ROPE_OPS * (bm * bn) as f64 * share / trips as f64;
+            let reading = turned.div_ceil(bn) as f64 / self.n.div_ceil(bn).max(1) as f64;
+            side = Stream {
+                bytes: 2.0 * (bm * half) as f64 * ELEM as f64 * reading / trips as f64,
+                unique: (2 * rope.seq * half * ELEM) as f64,
+                shared,
+            };
+        }
         Ok(Claim {
             blocks,
             smem,
@@ -284,8 +318,9 @@ impl GemmProblem {
             },
             trips,
             reads: fragments as f64,
-            ops: Ops::of(Kind::Epilogue, epilogue),
+            ops: Ops::of(Kind::Epilogue, ops),
             fill: Stream { bytes: fill as f64, unique, shared },
+            side,
             stores: 0.0,
             ring: stages,
             unroll: cfg.unroll,
@@ -331,9 +366,24 @@ impl Planner {
     /// Every GEMM config for `batches` GEMMs of `m` rows, `n` columns and
     /// reduction dim `k`, the cheapest of the lattice first.
     pub fn gemm_ranked(&self, batches: usize, m: usize, n: usize, k: usize, gated: bool) -> Arc<[GemmCfg]> {
+        self.gemm_ranked_rope(batches, m, n, k, gated, None)
+    }
+
+    /// [`Planner::gemm_ranked`] for a problem whose output `rope` turns in
+    /// the kernel's store: only tiles that hold whole heads of its head
+    /// width lower, their turn priced.
+    pub fn gemm_ranked_rope(
+        &self,
+        batches: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+        gated: bool,
+        rope: Option<Rope>,
+    ) -> Arc<[GemmCfg]> {
         if batches * m * n * k == 0 {
             return Arc::new([]);
         }
-        self.ranked(GemmProblem { batches, m, n, k, halves: if gated { 2 } else { 1 } })
+        self.ranked(GemmProblem { batches, m, n, k, halves: if gated { 2 } else { 1 }, rope })
     }
 }

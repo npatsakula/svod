@@ -3,7 +3,7 @@ use crate::hcq::{
     ClikeKernargLayout, Command, CommandBufferCache, CommandField, CopyLeg, CpuQueueExecutor, DeviceQueue,
     LaneSubmission, LaneWait, LinkPatchValues, LoweredCommandBuffer, NullHcq, PatchEncoding, PatchSite, PatchSource,
     PatchTable, PlaceholderKind, PlaceholderPacking, PlaceholderRequest, QueueKind, QueueMergeLimits,
-    RuntimePatchValues, SemanticLinkedPlan, SemanticLinkedSubmission, Submission, SubmissionExecutionError,
+    RuntimePatchValues, SemanticLinkedPlan, SemanticLinkedSubmission, StoreScope, Submission, SubmissionExecutionError,
     SystemField, SystemPatchValues, TopologyOperation, TopologyOperationKind, TopologyResource, schedule_device_lanes,
 };
 use svod_dtype::{AddrSpace, DType, DeviceSpec};
@@ -136,7 +136,7 @@ fn null_hcq_enforces_timeline_dependencies_and_order() {
         .push(Command::Wait { signal_address: signal, value: 1 })
         .push(Command::MemoryBarrier)
         .push(Command::Compute(compute.clone()))
-        .push(Command::Store { dst: signal, value: 2 });
+        .push(Command::Store { dst: signal, value: 2, scope: StoreScope::System });
     null.submit(&submit).unwrap();
 
     assert_eq!(
@@ -155,7 +155,7 @@ fn null_hcq_timestamps_use_deterministic_queue_clock() {
         .push(Command::Timestamp { dst: 0x40 })
         .push(Command::Execute { operation: 0 })
         .push(Command::Timestamp { dst: 0x48 })
-        .push(Command::Store { dst: 0x20, value: 1 });
+        .push(Command::Store { dst: 0x20, value: 1, scope: StoreScope::System });
     let mut copy = Submission::new(QueueKind::Copy(0));
     copy.push(Command::Wait { signal_address: 0x20, value: 1 })
         .push(Command::Timestamp { dst: 0x50 })
@@ -183,7 +183,7 @@ fn cpu_hcq_mixed_compute_copy_waits_and_finalizers_are_ordered() {
         .push(Command::Execute { operation: 7 })
         .push(Command::Copy { dst: intermediate.as_mut_ptr() as u64, src: source.as_ptr() as u64, bytes: source.len() })
         .push(Command::Timestamp { dst: 0x30 })
-        .push(Command::Store { dst: 0x20, value: 1 });
+        .push(Command::Store { dst: 0x20, value: 1, scope: StoreScope::System });
     let mut copy = Submission::new(QueueKind::Copy(0));
     copy.push(Command::Wait { signal_address: 0x20, value: 1 })
         .push(Command::Copy {
@@ -192,7 +192,7 @@ fn cpu_hcq_mixed_compute_copy_waits_and_finalizers_are_ordered() {
             bytes: intermediate.len(),
         })
         .push(Command::Timestamp { dst: 0x38 })
-        .push(Command::Store { dst: 0x28, value: 2 });
+        .push(Command::Store { dst: 0x28, value: 2, scope: StoreScope::System });
 
     let mut operations = Vec::new();
     unsafe {
@@ -214,7 +214,11 @@ fn cpu_hcq_mixed_compute_copy_waits_and_finalizers_are_ordered() {
 #[test]
 fn cpu_and_null_compute_errors_do_not_publish_finalizers() {
     let mut submission = Submission::new(QueueKind::Compute(0));
-    submission.push(Command::Execute { operation: 9 }).push(Command::Store { dst: 0x20, value: 1 });
+    submission.push(Command::Execute { operation: 9 }).push(Command::Store {
+        dst: 0x20,
+        value: 1,
+        scope: StoreScope::System,
+    });
 
     let mut cpu = CpuQueueExecutor::default();
     let error = unsafe { cpu.submit(&submission, |_| Err("CPU failure")) }.unwrap_err();
@@ -579,9 +583,48 @@ fn native_adapter_preserves_single_device_submission_shape() {
             Command::MemoryBarrier,
             Command::Wait { .. },
             Command::Wait { .. },
+            Command::MemoryBarrier,
             Command::Execute { operation: 1 },
             Command::Store { .. }
         ]
     ));
     assert!(matches!(native[2].static_submission().commands.as_slice(), [Command::Wait { .. }, Command::Store { .. }]));
+}
+
+/// A store publishes its lane's writes only where another lane waits on it,
+/// the finalizer included; any other store marks progress for work its own
+/// queue runs behind it anyway. A lane that waits on another acquires after.
+#[test]
+fn native_stores_publish_only_where_another_lane_waits() {
+    use Command::{Execute, MemoryBarrier, Store, Wait};
+    use StoreScope::{Queue, System};
+
+    let compute = lane(0, QueueKind::Compute(0));
+    let (copied, landed) = (resource(80, 0), resource(81, 0));
+    let operations = [
+        execute(0, compute.clone(), vec![], vec![copied.clone()]),
+        execute(1, compute.clone(), vec![], vec![]),
+        copy_op(2, copied, landed.clone()),
+        execute(3, compute.clone(), vec![landed], vec![]),
+        execute(4, compute, vec![], vec![]),
+    ];
+    let lanes = schedule_local(&operations, QueueMergeLimits::NO_MERGE);
+    assert_eq!(null_order(lanes.clone()), [0, 1, 2, 3, 4]);
+    let plan = SemanticLinkedPlan::from_lane_submissions(lanes, lane_signals).unwrap();
+    let native = plan.native_submissions().unwrap();
+    let commands = |index: usize| native[index].static_submission().commands.as_slice();
+
+    assert_eq!(native.len(), 6);
+    // The copy reads operation 0's output.
+    assert!(matches!(commands(0), [MemoryBarrier, Wait { .. }, Execute { operation: 0 }, Store { scope: System, .. }]));
+    assert!(matches!(commands(1), [Execute { operation: 1 }, Store { scope: Queue, .. }]));
+    // Operation 3 reads the copy's, and the finalizer waits on the copy lane.
+    assert!(matches!(
+        commands(2),
+        [MemoryBarrier, Wait { .. }, Wait { .. }, MemoryBarrier, Execute { operation: 2 }, Store { scope: System, .. }]
+    ));
+    assert!(matches!(commands(3), [Wait { .. }, MemoryBarrier, Execute { operation: 3 }, Store { scope: Queue, .. }]));
+    // The finalizer runs on the same queue: it publishes for the host.
+    assert!(matches!(commands(4), [Execute { operation: 4 }, Store { scope: Queue, .. }]));
+    assert!(matches!(commands(5), [Wait { .. }, Store { scope: System, .. }]));
 }

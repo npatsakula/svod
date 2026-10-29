@@ -109,7 +109,7 @@ impl Planner {
         if batches * m * g.cout * g.k() == 0 {
             return Arc::new([]);
         }
-        let p = ConvProblem { gemm: GemmProblem { batches, m, n: g.cout, k: g.k(), halves: 1 }, geom: *g };
+        let p = ConvProblem { gemm: GemmProblem { batches, m, n: g.cout, k: g.k(), halves: 1, rope: None }, geom: *g };
         cached(&self.conv, p, || p.ranked(self))
     }
 
@@ -121,7 +121,7 @@ impl Planner {
     /// dividing the steps that keep at most 16 blocks per SM.
     pub(crate) fn conv_splits(&self, batches: usize, m: usize, g: &ConvGeom, admitted: &[ConvCfg]) -> Vec<ConvCfg> {
         let Some(&ConvCfg { gemm: base, .. }) = admitted.first() else { return vec![] };
-        let (p, k) = (GemmProblem { batches, m, n: g.cout, k: g.k(), halves: 1 }, g.k());
+        let (p, k) = (GemmProblem { batches, m, n: g.cout, k: g.k(), halves: 1, rope: None }, g.k());
         let mut out = admitted.to_vec();
         let sms = self.sms();
         let blocks = |c: &GemmCfg| p.blocks(c);

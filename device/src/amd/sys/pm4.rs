@@ -434,11 +434,11 @@ pub fn acquire_mem_gfx9() -> [u32; 7] {
 /// K-cache, vector TCL1) but **skip the L2 (TC) invalidate + write-back** —
 /// the per-exec `acquire_mem(gli=0, gl2=0)` form.
 ///
-/// Safe as a per-dispatch prologue because the previous dispatch's
-/// `release_mem(cache_flush=true)` already flushed+invalidated L2 at end-of-pipe
-/// (`CACHE_FLUSH_AND_INV_TS`), so L2 is clean at the next dispatch's start — the
-/// full L2 invalidate here would be pure redundant stall. (The HDP flush still
-/// runs separately, so host writes remain visible.)
+/// Safe as a per-dispatch prologue because a PM4 queue has one XCC, whose L2
+/// every dispatch on the device reads through; memory written behind L2's back
+/// (host, SDMA) is acquired by a full `MemoryBarrier` (HDP flush, L2 invalidate)
+/// before the dispatch that reads it — the full L2 invalidate here would be
+/// pure redundant stall.
 pub fn acquire_mem_gfx9_narrow() -> [u32; 7] {
     let cp_coher_cntl = COHER_SH_ICACHE_ACTION_ENA | COHER_SH_KCACHE_ACTION_ENA | COHER_TCL1_ACTION_ENA;
     [packet3(PACKET3_ACQUIRE_MEM, 5), cp_coher_cntl, 0xFFFF_FFFF, 0xFFFF_FFFF, 0, 0, 0x0000_000A]

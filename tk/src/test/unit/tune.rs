@@ -161,6 +161,15 @@ fn timed<'a>(ns: &'a [Option<u64>], ran: &'a Cell<bool>) -> impl FnOnce() -> Vec
 /// knows the leaders and how close they ran; a second store on the directory
 /// reads it back without measuring; a kernel change (another program
 /// fingerprint) re-measures.
+/// A store line is its key, a space and the entry, the key's fields split
+/// at bars: an op name with either would never be read back.
+#[test_case("packed attention"; "a space")]
+#[test_case("attention|packed"; "a bar")]
+#[should_panic(expected = "a store line is split at spaces and bars")]
+fn an_op_name_splits_no_store_line(op: &'static str) {
+    TuneKey::new(op, &sm86(), 0, ScalarDType::BFloat16, &[1], &[0usize]);
+}
+
 #[test]
 fn a_winner_round_trips_through_the_store() {
     let dir = Scratch::new("tune-round-trip");
@@ -1092,7 +1101,7 @@ fn timed_candidates_clear_their_physical_floor() {
             }
             "gemm" | "linear" => {
                 let &[cap, m, n, k] = shape else { return None };
-                let p = GemmProblem { batches: cap.max(1), m, n, k, halves: 1 };
+                let p = GemmProblem { batches: cap.max(1), m, n, k, halves: 1, rope: None };
                 planner.floor_of(&p, &Tiled::of_code(code)?)
             }
             "attention" => {
@@ -1132,7 +1141,7 @@ fn timed_candidates_clear_their_physical_floor() {
                 };
                 let [ho, wo] = g.out_hw();
                 let p = ConvProblem {
-                    gemm: GemmProblem { batches: 1, m: images * ho * wo, n: g.cout, k: g.k(), halves: 1 },
+                    gemm: GemmProblem { batches: 1, m: images * ho * wo, n: g.cout, k: g.k(), halves: 1, rope: None },
                     geom: g,
                 };
                 let c: crate::kernels::conv::ConvCfg = Tiled::of_code(code)?;

@@ -104,7 +104,10 @@ attention configs both offer this core on sm_90.
    partners) or `ViaSmem`. An `Exchange` is kept only while its work costs less than a round
    trip through shared memory (`Relayout::work × Costs::lane_move < Costs::smem_trip`). The
    emitter lowers an `Exchange` with the target's `atoms::LaneMove` (`shfl.sync` on CUDA, DPP
-   and `permlanex16` on RDNA, `ds_bpermute` on CDNA).
+   and `permlanex16` on RDNA, `ds_bpermute` on CDNA). A `flip` moves by the same classes:
+   in each lane where it holds both exchanged elements (a register renaming), else by the
+   lane moves of `TileLayout::flip`; partners another warp holds are unsupported, and a
+   turning GEMM's ranking admits only tiles whose warps hold whole heads.
 
 ## Schedule templates
 

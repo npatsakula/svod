@@ -242,6 +242,7 @@ impl AttentionProblem {
             reads: fragments as f64,
             ops: Ops::of(Kind::Pair, (kw * bq * bkv) as f64 * PAIR_OPS),
             fill: Stream { bytes: fill as f64, unique, shared },
+            side: Stream::default(),
             stores: parts,
             ring: stages,
             unroll: cfg.unroll,
