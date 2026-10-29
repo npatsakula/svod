@@ -248,8 +248,9 @@ impl Frame<'_> {
                     + (if self.prog.smem[alloc.index()].along == Axis::Row { c * rows + r } else { r * cols + c })
                         as i64,
             ),
-            Place::Global { offset, stride, bounds, rows, .. } => {
+            Place::Global { offset, stride, bounds, rows, period, .. } => {
                 let inside = |b: Option<ScalarId>, i: usize| b.map_or(Ok(true), |b| Ok((i as i64) < self.scalar(b)?));
+                let c = period.map_or(c, |p| c % p);
                 let at = |id: ScalarId| self.scalar_at(id, Some(r as i64));
                 let (row_ok, row_off) = match rows {
                     Some(map) => (map.valid.map_or(Ok(true), |v| Ok(at(v)? != 0))?, at(map.offset)?),

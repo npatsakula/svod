@@ -168,7 +168,7 @@ impl Emit<'_> {
     /// and a column bound ends a 16-byte run, which such a load reads whole.
     pub(super) fn transposing(&self, l: &TileLayout, view: &View) -> Option<Vec<u32>> {
         let [sub_r, sub_c] = l.sub_shape();
-        let Some(Place::Global { bounds, .. }) = view.place else { return None };
+        let Some(Place::Global { bounds, period: None, .. }) = view.place else { return None };
         let runs = bounds[1].is_none_or(|b| multiple_of(self.prog, b, 16 / view.dtype.bytes() as i64));
         let global = self.along(view) == (Axis::Col, true) && runs;
         if !self.low.device.target.tr_load || !global || view.dtype.bytes() != 2 || sub_r % 16 != 0 || sub_c % 16 != 0 {
@@ -349,8 +349,9 @@ impl Emit<'_> {
         bit.try_cmpne(&c(0)).expect("lane predicate")
     }
 
-    /// A tile re-held through a scratch of shared memory; inside a
-    /// [`Stmt::Warps`] every warp takes its own region of it.
+    /// A tile re-held through a scratch of shared memory, its columns read
+    /// back xor `flip`; inside a [`Stmt::Warps`] every warp takes its own
+    /// region of it.
     pub(super) fn relayout_via_smem(&mut self, dst: ValId, src: ValId) -> Result<()> {
         let Value { dtype, shape, .. } = self.value(src).clone();
         let elems = shape.elems();

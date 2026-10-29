@@ -8,12 +8,14 @@ use test_case::test_case;
 
 use super::declared;
 use crate::atoms::{Core, Device, Fill};
-use crate::build::BF16;
+use crate::build::*;
 use crate::interp::{round_to, run};
-use crate::ir::Program;
+use crate::ir::*;
 use crate::kernels::Batch;
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
 use crate::launch::graph_launch;
+use crate::layouts::WarpGrid;
+use crate::lower::Lowering;
 use crate::ops::config::{Planner, gemm_cfg};
 
 fn plain_gemm(m: usize, n: usize, k: usize, cfg: GemmCfg) -> Program {
@@ -571,4 +573,68 @@ fn a_product_deals_its_columns_on_device(per_lane: usize) {
             assert_eq!(taken, (0..cols).collect::<Vec<_>>(), "{what}: row {r} takes each column once");
         }
     }
+}
+
+/// A flip of a tile held as the matrix core's accumulator stores what the
+/// interpreter stores, held in each lane or traded between lanes (as a
+/// rotary half lies on sm_86: 64 columns a warp, halves within an atom);
+/// a flip whose partners another warp holds is unsupported, so a turning
+/// GEMM admits only tiles whose warps hold whole heads.
+#[test_case([2, 2], 32; "64 columns a warp")]
+#[test_case([2, 2], 4; "halves within an atom")]
+fn a_flip_of_the_accumulator_matches_the_interpreter(grid: [u32; 2], half: usize) {
+    let Some(target) = super::device_target() else { return };
+    let (rows, cols) = (64usize, 128usize);
+    let warps = WarpGrid { rows: grid[0], cols: grid[1] };
+    let atom = target.mma(ScalarDType::BFloat16, ScalarDType::Float32).expect("a bf16 matrix core");
+    let held = atom.issue(Orient::Direct, warps, rows, cols, 16).unwrap().c;
+    let mut k = Kernel::new("flip");
+    let x = k.param::<F32>("x", ParamKind::In, rows * cols);
+    let y = k.param::<F32>("y", ParamKind::Out, rows * cols);
+    k.warps(warps.count());
+    let src = k.view(x, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
+    let v = k.load(src);
+    k.pin(v, held);
+    let flipped = k.flip(v, Axis::Col, half as u32);
+    let dst = k.view(y, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
+    k.store(dst, flipped);
+    let prog = k.finish();
+    let xs: Vec<f64> = (0..rows * cols).map(|i| i as f64).collect();
+    let want = run(&prog, vec![xs.clone(), vec![0.0; rows * cols]], &[]).unwrap();
+    let x_t = Tensor::from_slice(xs.iter().map(|&v| v as f32).collect::<Vec<_>>());
+    let y_t = Tensor::empty(&[rows * cols], DType::Float32);
+    let got = graph_launch(prog, &Lowering::new(&declared(target)), &[&x_t, &y_t]).unwrap();
+    let got: Vec<f64> = got.to_vec::<f32>().unwrap().into_iter().map(f64::from).collect();
+    assert_eq!(got, want[1]);
+}
+
+/// A periodic view of a bf16 table with gathered rows reads into registers
+/// what the interpreter reads: 16-byte runs within a period of 32, 8-element
+/// runs within one of 24, pairs within one of 6.
+#[test_case(32; "a period of 32")]
+#[test_case(24; "a period of 24")]
+#[test_case(6; "a period of 6")]
+fn a_periodic_table_matches_the_interpreter(period: usize) {
+    let Some(target) = super::device_target() else { return };
+    let (rows, cols, table_rows) = (64usize, 96usize, 37usize);
+    let mut k = Kernel::new("periodic");
+    let x = k.param::<BF16>("x", ParamKind::In, table_rows * period);
+    let y = k.param::<F32>("y", ParamKind::Out, rows * cols);
+    k.warps(4);
+    let r = k.row();
+    let g = k.gather(x, 0, (r * 5 + 3) % table_rows * period, None, Shape::new(rows, cols), None);
+    let g = k.periodic(g, period);
+    let v = k.load(g);
+    let v = k.cast::<BF16, F32>(v);
+    let dst = k.view(y, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
+    k.store(dst, v);
+    let prog = k.finish();
+    let mut seed = 3;
+    let xs = super::rounded(ScalarDType::BFloat16, table_rows * period, &mut seed, |x| x);
+    let want = run(&prog, vec![xs.clone(), vec![0.0; rows * cols]], &[]).unwrap();
+    let x_t = Tensor::from_slice(xs.iter().map(|&v| v as f32).collect::<Vec<_>>()).cast(DType::BFloat16);
+    let y_t = Tensor::empty(&[rows * cols], DType::Float32);
+    let got = graph_launch(prog, &Lowering::new(&declared(target)), &[&x_t, &y_t]).unwrap();
+    let got: Vec<f64> = got.to_vec::<f32>().unwrap().into_iter().map(f64::from).collect();
+    assert_eq!(got, want[1]);
 }

@@ -1629,7 +1629,11 @@ impl AmdComputeQueue {
             {
                 let gate = timestamps.as_ref().expect("a stamp pair holds its signal").value_addr();
                 if fenced {
-                    finalized.push(crate::hcq::Command::Store { dst: gate, value: 1 });
+                    finalized.push(crate::hcq::Command::Store {
+                        dst: gate,
+                        value: 1,
+                        scope: crate::hcq::StoreScope::Queue,
+                    });
                     finalized.push(crate::hcq::Command::Wait { signal_address: gate, value: 1 });
                 }
                 finalized.push(crate::hcq::Command::Timestamp { dst: end_addr });

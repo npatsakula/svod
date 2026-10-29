@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use test_case::test_case;
 
-use svod_dtype::{AmdArch, GpuArch};
+use svod_dtype::{AmdArch, GpuArch, ScalarDType};
 
 use super::{costs, declared, lane_moves_dear};
 use crate::atoms::{Core, Costs, Device, Target, sm86};
@@ -442,6 +442,25 @@ fn a_half_swap_moves_and_selects_once_per_register(lane: u32, mask: u32) {
     let masks: HashSet<u32> = p.iter().flatten().map(|p| p.mask).collect();
     assert_eq!(masks, HashSet::from([0, mask]));
     assert_eq!(exchange.work(), 2.0);
+}
+
+/// A flip of a GEMM accumulator stays in each lane where a warp's columns
+/// hold both halves of the exchange, and trades lanes where the halves share
+/// an atom's columns; different warps holding them is unsupported, so a
+/// turning GEMM admits only tiles whose warps hold whole heads.
+#[test_case(sm86(), [2, 2], 32 => "in lane"; "sm_86, 64 columns a warp")]
+#[test_case(sm86(), [2, 2], 4 => "across lanes"; "sm_86, halves within an atom")]
+#[test_case(sm86(), [2, 4], 32 => "unsupported"; "sm_86, 32 columns a warp")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1201, 64), [2, 2], 32 => "in lane"; "gfx1201, 64 columns a warp")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1201, 64), [2, 4], 32 => "unsupported"; "gfx1201, 32 columns a warp")]
+fn an_accumulator_flips_as_near_as_the_halves_lie(target: Target, grid: [u32; 2], half: u32) -> &'static str {
+    let atom = target.mma(ScalarDType::BFloat16, ScalarDType::Float32).expect("a bf16 matrix core");
+    let c = atom.issue(Orient::Direct, WarpGrid { rows: grid[0], cols: grid[1] }, 128, 128, 16).unwrap().c;
+    match c.flip(Axis::Col, half, grid[0] * grid[1], target.wave) {
+        None => "unsupported",
+        Some(moves) if moves.iter().all(|(picks, _)| picks.iter().all(|p| p.mask == 0)) => "in lane",
+        Some(_) => "across lanes",
+    }
 }
 
 /// The per-element cost of each way to re-hold a tile is its work in the
