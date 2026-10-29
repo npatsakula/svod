@@ -1090,7 +1090,8 @@ pub fn counted(program: &svod_ir::UOp) -> Option<Counted> {
         }
         spaces.insert(u.id, space);
     }
-    // The buffer a load reads (a view chain), for the space it loads from.
+    // The buffer an access reads (a view chain), for the space it loads
+    // from, and the elements it spans: an INDEX one, a SHRINK its size.
     let space_of = |u: &std::sync::Arc<svod_ir::UOp>| -> Option<AddrSpace> {
         let mut at = u;
         for _ in 0..8 {
@@ -1104,18 +1105,39 @@ pub fn counted(program: &svod_ir::UOp) -> Option<Counted> {
         }
         None
     };
+    let width_of = |index: &std::sync::Arc<svod_ir::UOp>| match index.op() {
+        Op::Shrink(ops::Shrink { sizes, .. }) => match sizes.op() {
+            Op::Const(elems) => match elems.0 {
+                svod_ir::ConstValue::Int(w) => w.max(1) as usize,
+                _ => 1,
+            },
+            _ => 1,
+        },
+        _ => 1,
+    };
     let mut out = Counted { instructions: list.len(), smem, steps: 0, valu: 0, fill: 0 };
+    // The loops the statement at hand sits in: the bytes a trip moves are
+    // what a loop body loads — a block's once-over reads (its resident rows)
+    // sit outside them, priced as the working set they join, not a trip's.
+    let mut loops = 0usize;
     for u in &list {
         match u.op() {
             Op::Wmma(..) => out.steps += 1,
             Op::Unary(..) | Op::Binary(..) | Op::Ternary(..) | Op::Cast(..) | Op::BitCast(..) => out.valu += 1,
+            Op::Range(..) => loops += 1,
+            Op::End(ops::End { ranges, .. }) => loops = loops.saturating_sub(ranges.len()),
             // A `cp.async` copy moves its width's bytes from global memory
             // without a load the list would hold; the commit and wait groups
             // a ring lands them with move nothing.
             Op::Custom(ops::Custom { code, .. }) if code.contains("cp.async") && code.contains("shared.global") => {
                 out.fill += 16;
             }
-            Op::Load(..) if space_of(u) == Some(AddrSpace::Global) => out.fill += u.dtype().bytes(),
+            // A plain load inside a loop body moves its access's width of
+            // elements — the fill's own on a staged target, a side read's
+            // beside it.
+            Op::Load(ops::Load { index, .. }) if loops > 0 && space_of(index) == Some(AddrSpace::Global) => {
+                out.fill += u.dtype().bytes() * width_of(index);
+            }
             _ => {}
         }
     }
@@ -1133,7 +1155,9 @@ pub struct Claim {
     pub steps: f64,
     /// VALU operations a trip.
     pub ops: f64,
-    /// The bytes a trip fills from global memory.
+    /// The bytes a trip reads from global memory: its ring's fill and its
+    /// side reads alike, the loads the program's list counts by address
+    /// space.
     pub fill: usize,
     /// The shared memory the config declares.
     pub smem: usize,
@@ -1189,7 +1213,7 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
             let predicted = Claim {
                 steps: claim.steps.count() * config::STEP as f64 / atom_step,
                 ops: valu,
-                fill: claim.fill.bytes as usize,
+                fill: (claim.fill.bytes + claim.side.bytes) as usize,
                 smem: claim.smem,
                 regs: claim.regs,
             };

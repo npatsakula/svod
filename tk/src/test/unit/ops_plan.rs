@@ -228,6 +228,7 @@ impl Planner {
             reads: reads / costs.smem_byte,
             ops: config::Ops::of(config::Kind::Epilogue, epilogue / unit),
             fill: config::Stream { bytes: fill / costs.global_byte, unique: 0.0, shared: 0.0 },
+            side: config::Stream::default(),
             stores: 0.0,
             ring: g.stages,
             unroll: false,

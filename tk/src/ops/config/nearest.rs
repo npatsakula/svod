@@ -470,6 +470,7 @@ impl NearestProblem {
             reads: (read * depth * elem) as f64,
             ops,
             fill: Stream { bytes: tile as f64, unique, shared },
+            side: Stream::default(),
             stores,
             ring: stages,
             unroll: cfg.unroll,

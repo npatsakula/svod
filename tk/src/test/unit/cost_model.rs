@@ -308,3 +308,31 @@ fn a_block_alone_ranks_behind_the_measured_faster_tile(
     let cost = |c: &GemmCfg| p.admit(&planner, c).expect("admitted").0;
     assert!(cost(&fast) < cost(&slow), "{} against {}", cost(&fast), cost(&slow));
 }
+
+/// The side stream's contract: bytes of none price at nothing (a zero
+/// stream leaves the run's price and floor exactly what they were, whatever
+/// share it claims), side bytes price above none at the ladder of the
+/// working set they name (a stream cache-resident at its working set
+/// cheaper than one that spills past the ladder's last rung), and the
+/// stream's distinct bytes are bytes the kernel moves: they count toward
+/// the run's floor.
+#[test]
+fn a_side_stream_prices_alongside_the_epilogue() {
+    use crate::ops::config::Stream;
+    let target = Target::card("rtx3060").expect("a listed card");
+    let planner = Planner::new(Device { target, costs: crate::test::unit::sm86_costs() }).expect("an SM count");
+    let p = GemmProblem { batches: 1, m: 4096, n: 4096, k: 1024, halves: 1 };
+    let cfg = planner.gemm_ranked(1, 4096, 4096, 1024, false)[0];
+    let mut claim = p.claim(&planner, &cfg).expect("ranked");
+    let (plain, floor) = (planner.price(&claim), planner.floor(&claim));
+    assert_eq!((claim.side.bytes, claim.side.unique), (0.0, 0.0));
+    claim.side = Stream { bytes: 0.0, unique: 0.0, shared: 1.0 };
+    assert_eq!((planner.price(&claim), planner.floor(&claim)), (plain, floor));
+    claim.side = Stream { bytes: (1 << 20) as f64, unique: (1 << 20) as f64, shared: 0.0 };
+    let resident = (planner.price(&claim), planner.floor(&claim));
+    assert!(resident.0 > plain, "{} against {plain}", resident.0);
+    assert!(resident.1 > floor, "{} against {floor}", resident.1);
+    claim.side.unique = 1e12;
+    let spilled = planner.price(&claim);
+    assert!(spilled > resident.0, "a working set past the ladder priced dearer: {spilled} against {}", resident.0);
+}

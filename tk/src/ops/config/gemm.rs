@@ -286,6 +286,7 @@ impl GemmProblem {
             reads: fragments as f64,
             ops: Ops::of(Kind::Epilogue, epilogue),
             fill: Stream { bytes: fill as f64, unique, shared },
+            side: Stream::default(),
             stores: 0.0,
             ring: stages,
             unroll: cfg.unroll,
