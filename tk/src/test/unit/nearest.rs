@@ -2287,7 +2287,7 @@ fn tuning_probe() {
                 GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg: super::device::BIG };
             let build =
                 |cfg: GemmCfg| vec![(gemm::<BF16>(&GemmSpec { cfg, ..spec.clone() }), cfg.lowering(&planner.device))];
-            let p = GemmProblem { batches: 1, m, n, k, halves: 1 };
+            let p = GemmProblem { batches: 1, m, n, k, halves: 1, rope: None };
             let work = 2.0 * (m * n * k) as f64;
             let key = ("gemm", &[1, m, n, k][..], crate::ops::DEVICE_TEST);
             report(

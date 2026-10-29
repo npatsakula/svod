@@ -104,7 +104,7 @@ fn rankings(planner: &Planner) -> (Vec<Ranking<GemmCfg>>, Vec<Ranking<FaCfg>>) {
         .into_iter()
         .filter(|s| wanted(s.0))
         .map(|(label, m, n, k, epilogue)| {
-            let p = GemmProblem { batches: 1, m, n, k, halves: if epilogue.gated { 2 } else { 1 } };
+            let p = GemmProblem { batches: 1, m, n, k, halves: if epilogue.gated { 2 } else { 1 }, rope: None };
             let ranked: Vec<GemmCfg> = planner.gemm_ranked(1, m, n, k, epilogue.gated).to_vec();
             let ns = ranked.iter().map(|c| p.admit(planner, c).expect("ranked").0).collect();
             (label, ranked, ns)
@@ -304,7 +304,7 @@ fn a_block_alone_ranks_behind_the_measured_faster_tile(
 ) {
     let target = Target::card(card).expect("a listed card");
     let planner = Planner::new(Device { target, costs }).expect("an SM count");
-    let p = GemmProblem { batches: 1, m, n, k, halves };
+    let p = GemmProblem { batches: 1, m, n, k, halves, rope: None };
     let cost = |c: &GemmCfg| p.admit(&planner, c).expect("admitted").0;
     assert!(cost(&fast) < cost(&slow), "{} against {}", cost(&fast), cost(&slow));
 }

@@ -98,6 +98,16 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
             push(&name, gemm::<I8>(&spec), cfg.lowering(&planner.device));
         }
     }
+    // A fused projection's queries and keys turned in its store, on the
+    // planner's lead tile for ModernBERT's that turns heads of 64: six heads
+    // of nine, positions wrapping every 50 rows.
+    let turning = planner.gemm_ranked(1, 4096, 2304, 768, false).iter().copied().find(|c| c.turns(64));
+    if let Some(cfg) = turning {
+        let rope = crate::kernels::gemm::Rope { heads: 6, head_dim: 64, seq: 50 };
+        let epilogue = Epilogue { rope: Some(rope), ..Epilogue::DEFAULT };
+        let spec = GemmSpec { m: 130, n: 576, k: 128, batch: Batch::Static(1), epilogue, cfg };
+        push("gemm rope", gemm::<BF16>(&spec), cfg.lowering(&planner.device));
+    }
 
     // The planner's lead for the shape; a head size it plans no kernel for
     // has no family.
@@ -105,7 +115,7 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
         let cfg = *planner.attention_ranked(8, t, tk, d, mask.causal, mask.bias.is_some()).first()?;
         let splits = if cache.is_some() { 2 } else { 1 };
         let cfg = crate::kernels::attention::FaCfg { splits, ..cfg };
-        Some(AttnSpec { batch, t, tk, heads: 4, kv_heads: 2, d, mask, cache, scale: 0.125, cfg })
+        Some(AttnSpec { batch, t, tk, heads: 4, kv_heads: 2, d, mask, cache, packed: false, scale: 0.125, cfg })
     };
     let causal = AttnMask { causal: true, ..AttnMask::default() };
     for d in [64, 128] {
@@ -119,6 +129,12 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
     let masked = AttnMask { key_lens: true, key_mask: true, ..AttnMask::default() };
     let spec = fa(37, 75, 64, masked, None, Batch::var("b", 1, 2)).expect("d 64 plans");
     push("attention d64 key masks", attention::<F16>(&spec), spec.cfg.lowering(&planner.device));
+    // ModernBERT's: a packed projection under a key mask and a band.
+    let banded = AttnMask { key_mask: true, window: Some((32, 32)), ..AttnMask::default() };
+    let spec =
+        fa(100, 100, 64, banded, None, Batch::Var(Var { name: "b".into(), min: 1, max: 2 })).expect("d 64 plans");
+    let spec = AttnSpec { packed: true, ..spec };
+    push("attention d64 packed", attention::<BF16>(&spec), spec.cfg.lowering(&planner.device));
     // The bias streams through its own ring slot; its 75 keys end inside a
     // key block, so the ring's fill meets the column bound.
     let biased = AttnMask { key_lens: true, bias: Some(Bias::PerBatch), ..AttnMask::default() };
@@ -536,6 +552,7 @@ pub fn digested(target: &Target) -> Vec<Launch> {
                     d,
                     mask,
                     cache: None,
+                    packed: false,
                     scale: 0.125,
                     cfg,
                 };
@@ -563,8 +580,19 @@ pub fn digested(target: &Target) -> Vec<Launch> {
             }
         }
         for cfg in cfgs {
-            let spec =
-                AttnSpec { batch: batch.clone(), t, tk, heads: 4, kv_heads: 2, d, mask, cache, scale: 0.125, cfg };
+            let spec = AttnSpec {
+                batch: batch.clone(),
+                t,
+                tk,
+                heads: 4,
+                kv_heads: 2,
+                d,
+                mask,
+                cache,
+                packed: false,
+                scale: 0.125,
+                cfg,
+            };
             out.push((format!("fa {name} {cfg:?}"), attention::<F16>(&spec), cfg.lowering(&device)));
         }
     }

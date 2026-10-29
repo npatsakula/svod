@@ -102,7 +102,8 @@ pub fn conv2d(x: &Tensor, w: &Tensor, opts: Conv) -> Result<Tensor> {
     let pointwise = geom.kernel == [1, 1] && geom.stride == [1, 1] && geom.pad == [0, 0] && groups == 1;
     if pointwise && out_dtype == x.dtype() {
         let w2 = w.try_reshape([geom.cout as isize, cin as isize]).context(GraphSnafu { op: OP })?;
-        let lin = Linear { bias: opts.bias, act: opts.act, gated: false, residual: opts.residual, scale: opts.scale };
+        let lin =
+            Linear { bias: opts.bias, act: opts.act, residual: opts.residual, scale: opts.scale, ..Linear::default() };
         return super::linear(x, &w2, lin);
     }
 
@@ -126,6 +127,7 @@ pub fn conv2d(x: &Tensor, w: &Tensor, opts: Conv) -> Result<Tensor> {
         residual: opts.residual.is_some(),
         scale: opts.scale.map(Scale::new),
         out_f32: out_dtype != x.dtype(),
+        rope: None,
     };
     let spec = ConvSpec { batch, geom, epilogue, cfg: cfgs[0].gemm, split: cfgs[0].split };
     let spec = tuned(TuneStore::global(), &planner, x.dtype(), &cfgs, spec);
@@ -183,7 +185,7 @@ pub fn tuned(store: &TuneStore, planner: &Planner, dtype: DType, ranked: &[ConvC
         list
     };
     let build = |c: ConvCfg| programs(&ConvSpec { cfg: c.gemm, split: c.split, ..spec.clone() }, &dtype, planner);
-    let problem = ConvProblem { gemm: GemmProblem { batches, m, n: g.cout, k: g.k(), halves: 1 }, geom: g };
+    let problem = ConvProblem { gemm: GemmProblem { batches, m, n: g.cout, k: g.k(), halves: 1, rope: None }, geom: g };
     let cfg = Tuner::new(store, &planner.device, dtype.clone(), &key, (&spec.batch, spec.epilogue), build)
         .floored(|c| problem.claim(planner, &c.gemm).ok().map(|claim| planner.floor(&claim)))
         .tuned(OP, ranked, expand);

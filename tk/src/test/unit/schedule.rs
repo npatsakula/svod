@@ -208,6 +208,7 @@ fn staged_halves_keep_their_copys_scope() {
         d: 64,
         mask,
         cache: None,
+        packed: false,
         scale: 0.125,
         cfg,
     };

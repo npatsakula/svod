@@ -70,7 +70,7 @@ fn store(dir: &std::path::Path, ns: impl Fn(usize) -> u64) -> Planner {
 /// the ns the model says they cost.
 fn predicted(planner: &Planner) -> Vec<f64> {
     let ranked = planner.gemm_ranked(1, 512, 512, 512, false);
-    let p = GemmProblem { batches: 1, m: 512, n: 512, k: 512, halves: 1 };
+    let p = GemmProblem { batches: 1, m: 512, n: 512, k: 512, halves: 1, rope: None };
     representatives(&ranked).iter().take(4).map(|&c| p.admit(planner, &c).expect("ranked").0).collect()
 }
 

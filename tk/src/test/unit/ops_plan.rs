@@ -178,7 +178,7 @@ fn a_gated_gemm_is_a_double_width_problem() {
     let gated = planner(target.clone()).gemm_ranked(1, 4096, 3072, 1024, true);
     assert_valid(&gated, &target, 1024, true);
     assert!(gated.iter().all(|c| c.tile[2] >= 32), "{gated:?}");
-    let p = config::GemmProblem { batches: 1, m: 4096, n: 3072, k: 1024, halves: 2 };
+    let p = config::GemmProblem { batches: 1, m: 4096, n: 3072, k: 1024, halves: 2, rope: None };
     assert!(deep.smem_bytes(true, 2) > target.smem_bytes && p.admit(&planner(target), &deep).is_err());
 }
 
@@ -280,7 +280,7 @@ fn an_sm_issues_its_share_of_blocks() {
 #[test_case(sm86(), 32, false; "sm86 three slots against one")]
 #[test_case(rdna3(), 32, true; "rdna3 two slots against one")]
 fn a_one_slot_ring_is_charged_its_own_trip(target: Target, bk: usize, cheap_wins: bool) {
-    let problem = config::GemmProblem { batches: 1, m: 4096, n: 4096, k: 4096, halves: 1 };
+    let problem = config::GemmProblem { batches: 1, m: 4096, n: 4096, k: 4096, halves: 1, rope: None };
     // A small tile: its residency is bound by shared memory, not registers.
     let two = gemm_cfg([64, 64, bk], target.fill.stages(3), [2, 2], false);
     let one = GemmCfg { stages: 1, ..two };
@@ -454,7 +454,7 @@ fn a_round_pays_the_latency_its_ring_leaves() {
 #[test]
 fn a_one_warp_tile_yields_to_four_at_one_wave_per_scheduler() {
     let cfg = |warps| gemm_cfg([64, 64, 32], 3, warps, false);
-    let p = config::GemmProblem { batches: 1, m: 64 * 28, n: 64 * 28, k: 4096, halves: 1 };
+    let p = config::GemmProblem { batches: 1, m: 64 * 28, n: 64 * 28, k: 4096, halves: 1, rope: None };
     let ratio = |step_lone| {
         let planner = planned(Device { target: sm86(), costs: Costs { step_lone, ..costs() } });
         let cost = |c| p.admit(&planner, &c).expect("admitted").0;
@@ -536,7 +536,7 @@ fn blocks_in_flight_share_their_lines_past_the_cache() {
     assert!((planner.fill_byte(100.0 * mb, 1e4 * mb, 0.75) - (0.75 * 0.01 + 0.25 * stream)).abs() < 1e-12);
     assert!((planner.fill_byte(100.0 * mb, 1e4 * mb, 0.0) - stream).abs() < 1e-12);
     assert!(planner.fill_byte(mb, 100.0 * mb, 0.5) < planner.fill_byte(mb, 100.0 * mb, 0.0));
-    let p = config::GemmProblem { batches: 1, m: 4096, n: 4096, k: 4096, halves: 1 };
+    let p = config::GemmProblem { batches: 1, m: 4096, n: 4096, k: 4096, halves: 1, rope: None };
     let cfg = gemm_cfg([128, 128, 32], 3, [2, 4], false);
     let dram = planned(Device { target: sm86(), costs: Costs { l2_bytes: 0.0, ..c } });
     let (cached, at_dram) = (p.admit(&planner, &cfg).unwrap().0, p.admit(&dram, &cfg).unwrap().0);
@@ -624,7 +624,7 @@ proptest::proptest! {
 #[test]
 fn under_latency_resident_blocks_halve_the_cost() {
     let slow = Costs { latency: 1e9, ..costs() };
-    let p = config::GemmProblem { batches: 112, m: 128, n: 128, k: 4096, halves: 1 };
+    let p = config::GemmProblem { batches: 112, m: 128, n: 128, k: 4096, halves: 1, rope: None };
     let cfg = gemm_cfg([128, 128, 32], 3, [2, 4], false);
     let full = sm86();
     let starved = Target { occupancy: crate::atoms::Occupancy { waves: 2, ..full.occupancy }, ..sm86() };
@@ -1157,7 +1157,7 @@ fn a_planner_over_a_zero_field_still_ranks() {
     let measured = crate::probe::Measured { costs: Costs { step: 0.0, ..costs() }, unmeasured: vec!["step"] };
     let planner = Planner::measured(sm86(), measured).expect("an SM count");
     assert_eq!(planner.unmeasured, ["step"]);
-    let p = config::GemmProblem { batches: 1, m: 704, n: 1536, k: 512, halves: 1 };
+    let p = config::GemmProblem { batches: 1, m: 704, n: 1536, k: 512, halves: 1, rope: None };
     let ranked = p.ranked(&planner);
     assert!(!ranked.is_empty());
     assert!(ranked.iter().all(|c| p.admit(&planner, c).is_ok_and(|(cost, _)| cost.is_finite() && cost > 0.0)));
@@ -1169,7 +1169,7 @@ fn a_planner_over_a_zero_field_still_ranks() {
 #[test]
 fn a_ranking_at_zero_costs_is_finite() {
     let planner = planned(Device { target: sm86(), costs: Costs::default() });
-    let p = config::GemmProblem { batches: 1, m: 4096, n: 4096, k: 4096, halves: 1 };
+    let p = config::GemmProblem { batches: 1, m: 4096, n: 4096, k: 4096, halves: 1, rope: None };
     let ranked = p.ranked(&planner);
     assert!(!ranked.is_empty());
     assert!(ranked.iter().all(|c| p.admit(&planner, c).is_ok_and(|(cost, _)| cost == 0.0)));
@@ -1253,7 +1253,7 @@ fn the_graph_scales_before_the_residual(act: Act, gated: bool) {
     let (m, n, k) = (5, 6, 4);
     let rows = if gated { 2 * n } else { n };
     let (x, w, b, r) = (f(&[m, k], 1), f(&[rows, k], 2), f(&[rows], 3), f(&[m, n], 4));
-    let opts = Linear { bias: Some(&b), act, gated, residual: Some(&r), scale: Some(-0.75) };
+    let opts = Linear { bias: Some(&b), act, gated, residual: Some(&r), scale: Some(-0.75), rope: None };
     let got = tk::linear(&x, &w, opts).unwrap().to_vec::<f32>().unwrap();
     let unscaled = Linear { residual: None, scale: None, ..opts };
     let y = tk::linear(&x, &w, unscaled).unwrap().to_vec::<f32>().unwrap();

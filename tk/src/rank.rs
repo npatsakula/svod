@@ -804,7 +804,7 @@ fn gemm(lines: &mut Lines, planner: &Planner, op: &'static str, dtype: ScalarDTy
     let mut problems: Vec<GemmProblem> = vec![];
     for (salt, gated, bound) in salts {
         let keying = Keying::new(op, planner, dtype, shape, salt);
-        let p = GemmProblem { batches: batches(bound), m, n, k, halves: if gated { 2 } else { 1 } };
+        let p = GemmProblem { batches: batches(bound), m, n, k, halves: if gated { 2 } else { 1 }, rope: None };
         let ranked = planner.gemm_ranked(p.batches, m, n, k, gated);
         let configs = |list: Vec<GemmCfg>| Configs::Gemm { problem: p, list };
         out.extend(stages(lines, &keying, &ranked, <[_]>::to_vec, configs).into_iter().flatten());
@@ -848,6 +848,7 @@ fn epilogues() -> Vec<Epilogue> {
                         residual,
                         scale: None,
                         out_f32: false,
+                        rope: None,
                     })
                 })
             })
@@ -1017,7 +1018,8 @@ fn conv(lines: &mut Lines, planner: &Planner, dtype: ScalarDType, shape: &[usize
                 true => (images, ho * wo),
             };
             let ranked = planner.conv_ranked(batches, m, &g);
-            let p = ConvProblem { gemm: GemmProblem { batches, m, n: g.cout, k: g.k(), halves: 1 }, geom: g };
+            let p =
+                ConvProblem { gemm: GemmProblem { batches, m, n: g.cout, k: g.k(), halves: 1, rope: None }, geom: g };
             if !problems.contains(&p) {
                 problems.push(p);
             }
@@ -1240,7 +1242,7 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
     // epilogue on the accumulator — the claim's own epilogue term, un-
     // amortized over the trips and in the static-code units a program's
     // instruction mix counts (the lane operations over a wave).
-    let p = GemmProblem { batches: 1, m: 4096, n: 4096, k: 4096, halves: 1 };
+    let p = GemmProblem { batches: 1, m: 4096, n: 4096, k: 4096, halves: 1, rope: None };
     for cfg in config::distinct(&planner.gemm_ranked(1, 4096, 4096, 4096, false)).take(3) {
         let claim = p.claim(&planner, &cfg).expect("ranked");
         let valu = claim.ops.epilogue * (4096 / cfg.tile[2]) as f64 / target.wave as f64;
@@ -1274,6 +1276,7 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
             d: 64,
             mask: AttnMask { causal: true, ..AttnMask::default() },
             cache: None,
+            packed: false,
             scale: 0.125,
             cfg,
         };
