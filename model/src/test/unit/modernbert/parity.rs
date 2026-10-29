@@ -187,3 +187,110 @@ fn mlm_logits_match_pytorch() {
     eprintln!("MLM real-token max |delta| = {real_max:.3e}");
     assert!(real_max < 1e-2, "MLM logits drifted from PyTorch golden: real-token max |delta| = {real_max}");
 }
+
+/// Per-row real-token drift of `got` from the f32 golden `want`: each row's
+/// mean |Δ| and the 95th percentile of its tokens' own mean |Δ|, over the
+/// positions `mask` marks real.
+fn row_drift(got: &[f32], want: &[f32], mask: &[i64], l: usize, d: usize) -> Vec<(f32, f32)> {
+    let rows = mask.len() / l;
+    (0..rows)
+        .map(|row| {
+            let mut tokens: Vec<f32> = (row * l..(row + 1) * l)
+                .filter(|&t| mask[t] == 1)
+                .map(|t| {
+                    let deltas =
+                        got[t * d..(t + 1) * d].iter().zip(&want[t * d..(t + 1) * d]).map(|(a, e)| (a - e).abs());
+                    deltas.sum::<f32>() / d as f32
+                })
+                .collect();
+            let mean = tokens.iter().sum::<f32>() / tokens.len() as f32;
+            tokens.sort_by(f32::total_cmp);
+            (mean, tokens[(tokens.len() - 1) * 95 / 100])
+        })
+        .collect()
+}
+
+/// The 16-bit backbone against the f32 golden, bounded by PyTorch's own bf16
+/// drift on the same rows (`convert_modernbert.py --long --long-length L`: a
+/// full row and a 27-token one right-padded to `L`; 500 pads the attention to its
+/// tile and leaves the GEMMs off theirs, 512 is on both). Four paths: the eager
+/// forward and the JIT with its batch pinned (flash attention, the local layers
+/// banded, tk's GEMMs where the rows tile), the JIT with its batch free (SDPA,
+/// the generic GEMMs), and the full row alone with no mask (the attention masks
+/// its own tile padding, if any). Each row's mean drift stays within 1.5×
+/// PyTorch's, and so does its 95th-percentile token. Not the single worst token:
+/// a few tokens amplify bf16 rounding chaotically, in PyTorch's run as in ours
+/// (0.8 mean |Δ| on one of the 512), and which ones blow up differs by path.
+/// The control — the same forward ignoring the padding — must break the short
+/// row's bound, or the bound proves nothing.
+#[test_case::test_case(500; "ragged")]
+#[test_case::test_case(512; "tile aligned")]
+#[ignore = "heavy: real ModernBERT-base weights + the long PyTorch golden, on a bf16 GPU"]
+fn bf16_drift_tracks_pytorch_bf16(length: usize) {
+    use crate::jit::InputSpec;
+    use crate::modernbert::ModernBertJit;
+
+    let dtype = crate::default_compute_dtype();
+    if dtype != DType::BFloat16 {
+        eprintln!("skip bf16_drift_tracks_pytorch_bf16: the default device computes in {dtype:?}");
+        return;
+    }
+    let golden =
+        crate::state::load_safetensors(&real_file(&format!("golden_long_{length}.safetensors"))).expect("golden_long");
+    let (ids, mask): (Vec<i64>, Vec<i64>) =
+        (load_golden_vec(&golden, "input_ids"), load_golden_vec(&golden, "attention_mask"));
+    let (want, pytorch): (Vec<f32>, Vec<f32>) =
+        (load_golden_vec(&golden, "last_hidden_state"), load_golden_vec(&golden, "last_hidden_state_bf16"));
+    let (b, l) = (2usize, ids.len() / 2);
+    let d = want.len() / ids.len();
+
+    let mut cfg = ModernBertConfig::from_json(&real_file("config.json")).expect("parse config.json");
+    (cfg.dtype, cfg.max_batch_size) = (dtype, b);
+    let model = ModernBert::from_safetensors(&real_file("model.safetensors"), cfg).expect("load weights");
+
+    let ids_t = Tensor::from_slice(ids.clone()).try_reshape([b as isize, l as isize]).unwrap();
+    let eager = |mask: &[i64]| -> Vec<f32> {
+        let mask_t = Tensor::from_slice(mask).try_reshape([b as isize, l as isize]).unwrap();
+        let out = model.forward(&ids_t, Some(&mask_t)).expect("forward").cast(DType::Float32);
+        out.realize().expect("realize");
+        out.as_vec::<f32>().expect("read")
+    };
+    let jit = |pinned: bool| -> Vec<f32> {
+        let mut jit = ModernBertJit::new(model.clone());
+        if pinned {
+            jit = jit.with_b_fixed(b);
+        }
+        jit.prepare(InputSpec::i64(&[b, l]), InputSpec::i64(&[b, l])).expect("prepare");
+        jit.input_ids_mut().unwrap().copyin(bytemuck::cast_slice(&ids)).unwrap();
+        jit.attention_mask_mut().unwrap().copyin(bytemuck::cast_slice(&mask)).unwrap();
+        jit.execute_bound(b as i64).expect("execute");
+        // bf16 is the top half of an f32.
+        let mut raw = vec![0u8; want.len() * 2];
+        jit.hidden().expect("hidden").copyout_prefix(&mut raw).expect("read");
+        raw.as_chunks::<2>().0.iter().map(|&h| f32::from_bits(u32::from(u16::from_le_bytes(h)) << 16)).collect()
+    };
+
+    let bound = row_drift(&pytorch, &want, &mask, l, d);
+    eprintln!("pytorch bf16 per row (mean, p95 token) |Δ|: {bound:.3?}");
+    let within = |drift: &[(f32, f32)]| drift.iter().zip(&bound).all(|(r, p)| r.0 <= 1.5 * p.0 && r.1 <= 1.5 * p.1);
+    let mut paths: Vec<(&str, Vec<(f32, f32)>)> = Vec::new();
+    for (name, got) in [("eager", eager(&mask)), ("jit pinned", jit(true)), ("jit free batch", jit(false))] {
+        assert!(got.iter().all(|x| x.is_finite()), "{name}: non-finite output");
+        paths.push((name, row_drift(&got, &want, &mask, l, d)));
+    }
+    // The full row alone and unmasked: the attention masks its own tile padding.
+    let row = Tensor::from_slice(&ids[..l]).try_reshape([1, l as isize]).unwrap();
+    let alone = model.forward(&row, None).expect("forward").cast(DType::Float32);
+    alone.realize().expect("realize");
+    let alone = row_drift(&alone.as_vec::<f32>().expect("read"), &want[..l * d], &mask[..l], l, d);
+    paths.push(("eager, row 0 alone, no mask", [alone[0], bound[1]].to_vec()));
+    for (name, drift) in &paths {
+        eprintln!("svod {name} per row (mean, p95 token) |Δ|: {drift:.3?}");
+    }
+    for (name, drift) in &paths {
+        assert!(within(drift), "svod {name} drifts past PyTorch's bf16: {drift:?} against {bound:?}");
+    }
+    let unmasked = row_drift(&eager(&vec![1; b * l]), &want, &mask, l, d);
+    eprintln!("control, padding ignored, per row (mean, p95 token) |Δ|: {unmasked:.3?}");
+    assert!(!within(&unmasked), "ignoring the padding stays within the bound: it cannot catch a mask bug");
+}
