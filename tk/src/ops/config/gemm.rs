@@ -290,16 +290,21 @@ impl GemmProblem {
         // the columns (the last block straddling them half-turned on
         // average), and every block whose window reaches them reads, once,
         // its rows' positions of both tables — `half` distinct elements a
-        // row each, a stream beside the ring's own.
+        // row each — the side stream: priced at the ladder of its own
+        // working set through the epilogue's pipe, not folded into the
+        // ring's fill, its distinct bytes in the run's floor.
         let epilogue = EPILOGUE_OPS * (bm * bn) as f64 / trips as f64;
-        let (mut ops, mut fill, mut unique) = (epilogue, fill as f64, unique);
+        let (mut ops, mut side) = (epilogue, Stream::default());
         if let Some(rope) = self.rope {
             let (half, turned) = (rope.head_dim / 2, rope.heads * rope.head_dim);
             let share = turned as f64 / self.n as f64;
             ops += ROPE_OPS * (bm * bn) as f64 * share / trips as f64;
             let reading = turned.div_ceil(bn) as f64 / self.n.div_ceil(bn).max(1) as f64;
-            fill += 2.0 * (bm * half) as f64 * ELEM as f64 * reading / trips as f64;
-            unique += (2 * rope.seq * half * ELEM) as f64;
+            side = Stream {
+                bytes: 2.0 * (bm * half) as f64 * ELEM as f64 * reading / trips as f64,
+                unique: (2 * rope.seq * half * ELEM) as f64,
+                shared,
+            };
         }
         Ok(Claim {
             blocks,
@@ -314,8 +319,8 @@ impl GemmProblem {
             trips,
             reads: fragments as f64,
             ops: Ops::of(Kind::Epilogue, ops),
-            fill: Stream { bytes: fill, unique, shared },
-            side: Stream::default(),
+            fill: Stream { bytes: fill as f64, unique, shared },
+            side,
             stores: 0.0,
             ring: stages,
             unroll: cfg.unroll,

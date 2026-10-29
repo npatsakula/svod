@@ -290,9 +290,9 @@ pub(crate) struct Claim {
     /// epilogue's operations and overlap with the ring's fill and the steps
     /// as that pipe does, a pipe of their own they are not. Its distinct
     /// bytes are bytes the kernel moves: they count toward the run's floor
-    /// ([`Self::distinct`]). A stream of none prices at nothing; no in-crate
-    /// family states one yet, the rotary tables a fused projection's
-    /// epilogue turns its columns by the first meant.
+    /// ([`Self::distinct`]). A stream of none prices at nothing; the rotary
+    /// tables a fused projection's epilogue turns its columns by are the
+    /// one stated.
     pub side: Stream,
     /// The bytes a trip writes straight to DRAM (a score matrix's stores),
     /// priced at the global rate whatever the cache holds.
