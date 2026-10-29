@@ -1811,7 +1811,8 @@ fn the_nearest_cost_charges_every_pair(target: Target) {
 
 #[test_case(1024, Ok(vec![4, 8, 16]); "1024")]
 #[test_case(256, Ok(vec![4, 8, 16]); "256")]
-#[test_case(768, Err(Fallback::Shape); "not a power of two")]
+#[test_case(768, Ok(vec![4, 8, 16]); "768, three spans of 256")]
+#[test_case(384, Err(Fallback::Shape); "not a multiple of 256")]
 #[test_case(128, Err(Fallback::Shape); "narrower than a warp's loads")]
 #[test_case(4096, Err(Fallback::Shape); "wider than the measured range")]
 fn norm_plans(d: usize, want: Result<Vec<usize>, Fallback>) {

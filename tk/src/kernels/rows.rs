@@ -36,8 +36,8 @@ pub struct NormSpec {
 
 /// Parameters in order: `x`, `residual` if fused, `w [d]`, `b [d]` (a
 /// LayerNorm with a bias), `out`, and `sum` (`x + residual` rounded to the
-/// element type, which is what gets normalized) if fused. `d` is a power
-/// of two.
+/// element type, which is what gets normalized) if fused. `d` is a multiple
+/// of 256 (`norm_candidates`).
 pub fn norm<T: Elem>(spec: &NormSpec) -> Program {
     let NormSpec { norm, rows, d, ref batch, eps, residual, bias, cfg: NormCfg { br } } = *spec;
     let elems = batch.capacity() * rows * d;
