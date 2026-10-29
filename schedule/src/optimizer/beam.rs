@@ -1068,7 +1068,7 @@ impl CacheKey {
         let seed = hasher.finish();
 
         Self {
-            schema: 15,
+            schema: 16, // 16: minimums settle before the rounds end (round_robin_min_steady)
             ast_hash,
             beam_width: config.beam_width,
             device: scheduler.ren.device,

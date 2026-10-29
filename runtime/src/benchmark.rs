@@ -52,30 +52,70 @@ pub fn warm_clock(budget: Duration, mut dispatch: impl FnMut() -> Option<Duratio
     }
 }
 
-/// Each candidate's minimum over `rounds` rounds of timing every candidate in
-/// turn, so none is judged at a clock the others were not (timing them one after
-/// another lets the first lift the clock for the rest). `time(i)` is one timed
-/// run of candidate `i`; `None` excludes it for good. A candidate whose minimum
-/// is already past `early_stop` is not run again — it cannot win, and a search
-/// sets the bound at a multiple of its incumbent to spend the rounds on the
-/// ones that can — but the minimum it reached stands.
+/// Each candidate's minimum over a fixed `rounds` rounds of timing every
+/// candidate in turn ([`round_robin_min_steady`] with no stability check: a
+/// search that wants its cost bounded whatever the device is doing).
 pub fn round_robin_min(
     count: usize,
     rounds: usize,
+    early_stop: Option<Duration>,
+    time: impl FnMut(usize) -> Option<Duration>,
+) -> Vec<Option<Duration>> {
+    round_robin_min_steady(count, rounds, rounds, 0, early_stop, time)
+}
+
+/// A run at or above this fraction of a candidate's minimum so far holds it
+/// stable; a lower one beats it by more than a run's drift and resets the
+/// count — a minimum still falling is not settled, however many runs sit
+/// above it. A clock still lifting under a batch shows a falling minimum run
+/// to run (a 3060 read a nearest search at 4.8 ms against its warm 0.87); a
+/// warm kernel's runs sit within a few percent of its minimum.
+const STEADY: f64 = 0.97;
+
+/// Whether any candidate still live is short of `settle` stable rounds.
+fn unsettled(live: &[bool], stable: &[usize], settle: usize) -> bool {
+    live.iter().zip(stable).any(|(&live, &stable)| live && stable < settle)
+}
+
+/// Each candidate's minimum over rounds of timing every candidate in turn,
+/// so none is judged at a clock the others were not (timing them one after
+/// another lets the first lift the clock for the rest), the rounds only as
+/// many as the minimums take to settle: `min_rounds` always run, then one
+/// more at a time until every live candidate's minimum has held — `settle`
+/// rounds in a row without a run under [`STEADY`] of it (the first run only
+/// sets the minimum) — or `max_rounds` have run. A minimum still falling (a
+/// clock lifting under it, a first read of a sagged one) is timed further;
+/// a warm batch settles within a round past its floor and pays barely more
+/// than the fixed rounds alone. `time(i)` is one timed run of candidate `i`;
+/// `None` excludes it for good. A candidate whose minimum is already past
+/// `early_stop` is not run again — it cannot win, and a search sets the bound
+/// at a multiple of its incumbent to spend the rounds on the ones that can —
+/// but the minimum it reached stands, and a retired or failed candidate no
+/// longer holds the rounds open.
+pub fn round_robin_min_steady(
+    count: usize,
+    min_rounds: usize,
+    max_rounds: usize,
+    settle: usize,
     early_stop: Option<Duration>,
     mut time: impl FnMut(usize) -> Option<Duration>,
 ) -> Vec<Option<Duration>> {
     let mut best: Vec<Option<Duration>> = vec![None; count];
     let mut live = vec![true; count];
-    for _ in 0..rounds {
+    let mut stable = vec![0usize; count];
+    let mut round = 0;
+    while round < min_rounds || round < max_rounds && unsettled(&live, &stable, settle) {
+        round += 1;
         for i in 0..count {
             if !live[i] {
                 continue;
             }
             match time(i) {
                 Some(t) => {
+                    let held = best[i].is_some_and(|b| t >= b.mul_f64(STEADY));
                     let t = best[i].map_or(t, |b| b.min(t));
                     best[i] = Some(t);
+                    stable[i] = if held { stable[i] + 1 } else { 0 };
                     live[i] = early_stop.is_none_or(|bound| t <= bound);
                 }
                 None => (live[i], best[i]) = (false, None),

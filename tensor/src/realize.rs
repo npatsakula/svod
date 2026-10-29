@@ -2109,7 +2109,21 @@ fn beam_search_optimize(
         if lifts_clock && let Some(first) = (0..batch.len()).find(|&i| loaded[i].is_some()) {
             svod_runtime::benchmark::warm_clock(svod_runtime::benchmark::CLOCK_WARMUP, || run(first));
         }
-        let timings = svod_runtime::benchmark::round_robin_min(batch.len(), beam_config.num_runs, early_stop, run);
+        // The rounds run until every live minimum holds, not a fixed count: a
+        // clock that sagged through a compile wave and lifts under the batch
+        // shows a falling minimum round over round, and a fixed count reads
+        // the clock, not the kernels. The floor is the rounds the search
+        // always ran, the cap a small multiple of it, and three stable rounds
+        // settle a minimum (tk's tuner's discipline, lifted here for every
+        // consumer).
+        let timings = svod_runtime::benchmark::round_robin_min_steady(
+            batch.len(),
+            beam_config.num_runs,
+            beam_config.num_runs * 3,
+            3,
+            early_stop,
+            run,
+        );
         if beam_debug > 1 {
             for ((candidate, timing), loaded) in batch.iter().zip(&timings).zip(&loaded) {
                 let Some(Loaded { program, grid, factor }) = loaded else { continue };

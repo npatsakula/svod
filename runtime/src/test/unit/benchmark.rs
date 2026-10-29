@@ -211,3 +211,57 @@ fn round_robin_keeps_timing_a_candidate_at_the_bound() {
     assert_eq!(runs, 3);
     assert_eq!(best, vec![Some(Duration::from_micros(10))]);
 }
+
+/// A warm batch settles a round past the floor: the first run only sets each
+/// minimum, `settle` rounds holding it settle the batch, and the rounds stop
+/// there however high the cap.
+#[test]
+fn steady_times_a_warm_batch_a_round_past_its_floor() {
+    let mut calls = Vec::new();
+    let best = round_robin_min_steady(2, 2, 10, 3, None, |i| {
+        calls.push(i);
+        Some(Duration::from_micros(if i == 0 { 10 } else { 20 }))
+    });
+    assert_eq!(calls, vec![0, 1, 0, 1, 0, 1, 0, 1], "four rounds: the floor of two, then one per stable run");
+    assert_eq!(best, vec![Some(Duration::from_micros(10)), Some(Duration::from_micros(20))]);
+}
+
+/// A minimum that keeps falling — a clock still lifting under it — resets its
+/// stable count run after run and holds the rounds open to the cap, taking
+/// every live candidate with it (its rivals' minimums rode the same clock).
+#[test]
+fn steady_runs_to_the_cap_while_any_minimum_falls() {
+    let mut calls = Vec::new();
+    let best = round_robin_min_steady(2, 1, 4, 2, None, |i| {
+        calls.push(i);
+        match i {
+            // Falling 10% a run, past the 3% a warm run drifts within.
+            0 => Some(Duration::from_secs_f64(
+                0.0001 * 0.9f64.powi(calls.iter().filter(|&i| *i == 0).count() as i32 - 1),
+            )),
+            _ => Some(Duration::from_micros(20)),
+        }
+    });
+    assert_eq!(calls, vec![0, 1, 0, 1, 0, 1, 0, 1], "the cap of four rounds runs both candidates");
+    let falling = best[0].expect("its minimum stands");
+    assert_eq!(falling, Duration::from_secs_f64(0.0001 * 0.9f64.powi(3)), "the last run is the minimum");
+    assert_eq!(best[1], Some(Duration::from_micros(20)));
+}
+
+/// A candidate past the early-stop bound and one that fails outright keep
+/// their fixed-form fate — the minimum reached stands, nothing runs again —
+/// and neither holds the rounds open: only live candidates settle the batch.
+#[test]
+fn steady_settles_without_its_retired_candidates() {
+    let mut calls = Vec::new();
+    let best = round_robin_min_steady(3, 1, 10, 2, Some(Duration::from_micros(10)), |i| {
+        calls.push(i);
+        match i {
+            0 => None,
+            1 => Some(Duration::from_micros(8)),
+            _ => Some(Duration::from_micros(30)),
+        }
+    });
+    assert_eq!(calls, vec![0, 1, 2, 1, 1], "candidate 2 retires at the bound, candidate 0 at its failure");
+    assert_eq!(best, vec![None, Some(Duration::from_micros(8)), Some(Duration::from_micros(30))]);
+}
