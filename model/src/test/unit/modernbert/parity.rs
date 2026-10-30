@@ -1,41 +1,55 @@
-//! Parity against the PyTorch reference (`answerdotai/ModernBERT-base`).
-//! Heavy: loads the real checkpoint + a golden `last_hidden_state` produced by
-//! HuggingFace `transformers` (`uv run scripts/convert_modernbert.py`).
+//! Parity against the PyTorch reference (`answerdotai/ModernBERT-base` and its
+//! SST-2 / CoNLL-2003 fine-tunes). Heavy: each tier loads the real checkpoint
+//! (fetched from HF Hub on first run) plus a golden produced by HuggingFace
+//! `transformers`.
+//!
+//! # Goldens are not committed
+//!
+//! The `golden*.safetensors` fixtures are generated locally and are **not** on
+//! HF Hub — only the model weights / configs are. Generate them before running
+//! the `--ignored` tier (output lands in `data/modernbert/`, overridable via
+//! `SVOD_MODERNBERT`):
+//!
+//! ```text
+//! uv run model/scripts/generate_modernbert_golden.py            // backbone + MLM + embedder
+//! uv run model/scripts/generate_modernbert_classifier_golden.py // SST-2 classifier
+//! uv run model/scripts/generate_modernbert_token_golden.py      // CoNLL-2003 NER
+//! ```
 //!
 //! Runs in **f32** (config dtype overridden) so it works on CPU backends
 //! without GPU bf16 transcendentals. bf16 numerical parity is implied by the
 //! framework's f32-accumulator guarantees in layernorm/matmul/attention.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+
+use svod_arch::pipelines::text::{Classify, ClassifyTokens, EncoderHead, Encoding};
 
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
-use crate::modernbert::{ModernBert, ModernBertConfig, ModernBertForMaskedLm};
+use crate::encoder_head::{HeadOptions, Pooling};
+use crate::modernbert::{
+    ModernBert, ModernBertClassifier, ModernBertConfig, ModernBertEmbedder, ModernBertForMaskedLm,
+    ModernBertTokenClassifier,
+};
 use crate::state::StateDict;
+use crate::test::unit::encoder_head::{assert_tracks_pytorch_bf16, golden_encodings};
+use crate::test::unit::{load_golden_vec, max_abs_delta, nan_max};
 
-const HUB_REPO: &str = "answerdotai/ModernBERT-base";
+/// `answerdotai/ModernBERT-base`, at the revision the goldens were generated
+/// from (each repo's pin is also its generate script's `--revision` default).
+const BASE_REPO: (&str, &str) = ("answerdotai/ModernBERT-base", "8949b909ec900327062f0ebf497f51aef5e6f0c8");
 
-/// Resolve `model.safetensors` / `golden.safetensors` for the real-checkpoint
-/// tests: `SVOD_MODERNBERT` dir override → local `data/modernbert/` (output of
-/// `scripts/convert_modernbert.py`) → HF Hub download.
-fn real_file(name: &str) -> PathBuf {
-    let dir = std::env::var_os("SVOD_MODERNBERT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/modernbert"));
-    let local = dir.join(name);
-    if local.exists() {
-        local
-    } else {
-        let repo = crate::hub::HubRepo::open(HUB_REPO, "main").expect("HF Hub API");
-        repo.get(name).unwrap_or_else(|_| panic!("download {name} from HF Hub"))
-    }
+/// [`encoder_head::local_or_hub`](crate::test::unit::encoder_head::local_or_hub)
+/// over `SVOD_MODERNBERT` / `data/modernbert/`.
+fn local_or_hub(repo: (&str, &str), name: &str) -> PathBuf {
+    crate::test::unit::encoder_head::local_or_hub("SVOD_MODERNBERT", "modernbert", repo, name)
 }
 
-fn load_golden_vec<T: svod_dtype::ext::HasDType + Default + Clone>(sd: &StateDict, key: &str) -> Vec<T> {
-    let t = sd.get(key).unwrap_or_else(|| panic!("golden key {key}")).clone();
-    t.realize().expect("realize golden");
-    t.as_vec::<T>().expect("golden readout")
+/// [`local_or_hub`] for `answerdotai/ModernBERT-base` (`golden.safetensors` is
+/// the output of `model/scripts/generate_modernbert_golden.py`).
+fn real_file(name: &str) -> PathBuf {
+    local_or_hub(BASE_REPO, name)
 }
 
 /// Load the model + golden fixture once, returning (model, ids, mask, want).
@@ -87,8 +101,8 @@ fn real_token_max_delta(got: &[f32], want: &[f32], mask: &[i64], d: usize) -> f3
         .zip(want.chunks_exact(d))
         .zip(mask.iter())
         .filter(|&(_, m)| *m == 1)
-        .flat_map(|((g, w), _)| g.iter().zip(w.iter()).map(|(a, e)| (a - e).abs()))
-        .fold(0.0f32, f32::max)
+        .map(|((g, w), _)| max_abs_delta(g, w))
+        .fold(0.0, nan_max)
 }
 
 /// `last_hidden_state` parity: our backbone (f32) vs the PyTorch reference.
@@ -211,8 +225,8 @@ fn row_drift(got: &[f32], want: &[f32], mask: &[i64], l: usize, d: usize) -> Vec
 }
 
 /// The 16-bit backbone against the f32 golden, bounded by PyTorch's own bf16
-/// drift on the same rows (`convert_modernbert.py --long --long-length L`: a
-/// full row and a 27-token one right-padded to `L`; 500 leaves the attention and
+/// drift on the same rows (`generate_modernbert_golden.py --long --long-length L`:
+/// a full row and a 27-token one right-padded to `L`; 500 leaves the attention and
 /// the GEMMs a partial tile, 512 none). Four paths, all on tk's op layer (flash
 /// attention with the local layers banded and the padding as its key mask, tk's
 /// GEMMs): the eager forward, the JIT with its batch pinned, the JIT with its
@@ -251,7 +265,7 @@ fn bf16_drift_tracks_pytorch_bf16(length: usize) {
     pytorch.sort();
     assert!(
         !pytorch.is_empty(),
-        "golden_long_{length} predates PyTorch's bf16 paths: rerun convert_modernbert.py --long"
+        "golden_long_{length} predates PyTorch's bf16 paths: rerun generate_modernbert_golden.py --long"
     );
 
     let mut cfg = ModernBertConfig::from_json(&real_file("config.json")).expect("parse config.json");
@@ -310,4 +324,236 @@ fn bf16_drift_tracks_pytorch_bf16(length: usize) {
     let unmasked = row_drift(&eager(&vec![1; b * l]), &want, &mask, l, d);
     eprintln!("control, padding ignored, per row (mean, p95 token) |Δ|: {unmasked:.3?}");
     assert!(!within(&unmasked), "ignoring the padding stays within the bound: it cannot catch a mask bug");
+}
+
+/// The embedder at `dtype` over the golden's one row, and the golden.
+fn load_embed_fixture(dtype: DType) -> (ModernBertEmbedder, Encoding, StateDict) {
+    let golden = crate::state::load_safetensors(&real_file("golden.safetensors")).expect("golden");
+    let enc = golden_encodings(&golden).pop().expect("one row");
+    let opts = HeadOptions { max_seq: Some(enc.len()), dtype: Some(dtype), ..HeadOptions::default() };
+    let (config, weights) = (real_file("config.json"), real_file("model.safetensors"));
+    let embedder = ModernBertEmbedder::from_files(&config, &weights, Pooling::default(), &opts).expect("embedder");
+    (embedder, enc, golden)
+}
+
+/// Embedding-pipeline parity: Svod's fused backbone+masked-mean-pool+L2-norm JIT
+/// (`ModernBertEmbedder`) vs the PyTorch reference (`expected_embedding` from the
+/// golden, produced by `transformers` + the same pooling recipe). Validates the
+/// full embed path — not just the backbone forward — against an independent
+/// reference. The 1e-12 denominator/norm EPS Svod adds is negligible here.
+#[test]
+#[ignore = "heavy: real ModernBERT-base weights + PyTorch golden (local or HF Hub download)"]
+fn embeddings_match_pytorch() {
+    let (mut embedder, enc, golden) = load_embed_fixture(DType::Float32);
+    let want: Vec<f32> = load_golden_vec(&golden, "expected_embedding");
+    let (got, _prof) = embedder.run_batch(&[&enc], false).expect("embed");
+    let got = &got[0].values;
+    assert_eq!(got.len(), want.len(), "embedding dim mismatch");
+
+    let max_delta = max_abs_delta(got, &want);
+    eprintln!("embedding max |delta| = {max_delta:.3e}");
+    assert!(max_delta < 1e-3, "embedding drifted from PyTorch golden: max |delta| = {max_delta}");
+}
+
+// ── classifier parity (SST-2 fine-tuned checkpoint) ─────────────────────────
+//
+// Tests the fused backbone + classification head (pool → dense → GELU → norm →
+// classifier) against `AutoModelForSequenceClassification` from `transformers`.
+// The SST-2 model uses mean pooling and `classifier_bias = false` — exercising
+// the masked-mean path and the optional-bias code.
+
+const CLASSIFIER_REPO: (&str, &str) =
+    ("AnkitAI/Sensible-ModernBERT-Sentiment-Analysis", "df8a40e2ea5911d7c8d52cced4ad60048ae63490");
+
+/// [`local_or_hub`] for the SST-2 fine-tuned repo.
+fn classifier_file(name: &str) -> PathBuf {
+    local_or_hub(CLASSIFIER_REPO, name)
+}
+
+/// A head sized to the golden's padded rows, computing in `dtype`.
+fn fixture_options(encodings: &[Encoding], dtype: DType) -> HeadOptions {
+    HeadOptions {
+        max_batch: encodings.len(),
+        max_seq: Some(encodings[0].len()),
+        dtype: Some(dtype),
+        ..HeadOptions::default()
+    }
+}
+
+/// The classifier at `dtype` over the golden's rows, and the golden. The plan
+/// matches the golden's padding (batch and length from its `input_ids`).
+fn load_classifier_fixture(dtype: DType) -> (ModernBertClassifier, Vec<Encoding>, StateDict) {
+    let golden = crate::state::load_safetensors(&classifier_file("golden_classifier.safetensors")).expect("golden");
+    let encodings = golden_encodings(&golden);
+    let opts = fixture_options(&encodings, dtype);
+    let classifier =
+        ModernBertClassifier::from_files(&classifier_file("config.json"), &classifier_file("model.safetensors"), &opts)
+            .expect("build classifier");
+    (classifier, encodings, golden)
+}
+
+/// Classification parity: Svod's fused backbone+head JIT (`ModernBertClassifier`)
+/// vs the PyTorch reference (`expected_logits` from the golden, produced by
+/// `transformers` `AutoModelForSequenceClassification`). The SST-2 model uses
+/// mean pooling with `classifier_bias = false`.
+#[test]
+#[ignore = "heavy: real SST-2 ModernBERT-base classifier weights + PyTorch golden (local or HF Hub download)"]
+fn classify_logits_match_pytorch() {
+    let (mut classifier, encodings, golden) = load_classifier_fixture(DType::Float32);
+    let want: Vec<f32> = load_golden_vec(&golden, "expected_logits");
+    let num_labels = classifier.num_labels();
+
+    let refs: Vec<&Encoding> = encodings.iter().collect();
+    let (classifications, _prof) = classifier.run_batch(&refs, false).expect("classify");
+
+    assert_eq!(classifications.len(), encodings.len(), "batch size mismatch");
+    for (i, c) in classifications.iter().enumerate() {
+        let expected = &want[i * num_labels..(i + 1) * num_labels];
+        let max_delta = max_abs_delta(&c.logits, expected);
+        eprintln!("[{i}] logits max |delta| = {max_delta:.3e}  got={:.4?}  want={:.4?}", c.logits, expected);
+        assert!(max_delta < 1e-3, "classification logits [{i}] drifted from PyTorch golden: max |delta| = {max_delta}");
+    }
+}
+
+/// Negative control: an all-ones mask (ignoring padding) must DIVERGE from the
+/// golden — both attention and mean-pooling are contaminated by pad tokens. If
+/// this passes, the golden isn't exercising the mask.
+#[test]
+#[ignore = "heavy: real SST-2 ModernBERT-base classifier weights + PyTorch golden (local or HF Hub download)"]
+fn ignoring_padding_diverges_in_classification() {
+    let (mut classifier, encodings, golden) = load_classifier_fixture(DType::Float32);
+    let want: Vec<f32> = load_golden_vec(&golden, "expected_logits");
+    let num_labels = classifier.num_labels();
+
+    let unmasked: Vec<Encoding> = encodings
+        .iter()
+        .map(|e| {
+            let mut e = e.clone();
+            e.attention_mask.fill(1);
+            e
+        })
+        .collect();
+
+    let refs: Vec<&Encoding> = unmasked.iter().collect();
+    let (classifications, _prof) = classifier.run_batch(&refs, false).expect("classify unmasked");
+
+    for (i, c) in classifications.iter().enumerate() {
+        let expected = &want[i * num_labels..(i + 1) * num_labels];
+        let max_delta = max_abs_delta(&c.logits, expected);
+        assert!(
+            max_delta > 1e-2,
+            "ignoring padding did NOT diverge from the golden [{i}] (max |delta| = {max_delta:.3e})"
+        );
+        eprintln!("[{i}] unmasked logits max |delta| = {max_delta:.3e} (diverges as expected)");
+    }
+}
+
+// ─── token classification parity ───────────────────────────────────────────
+//
+// Tests the fused backbone + token head (`ClassifierHead::forward` over the full
+// `(B, L, D)` state, no pooling) against `AutoModelForTokenClassification` from
+// `transformers`. The CoNLL-2003 NER fine-tune has no pooling; `classifier_bias`
+// is exercised by the always-present `classifier.bias`.
+
+const TOKEN_REPO: (&str, &str) =
+    ("sanketrai/modernbert-base-conll2003-english-ner", "6e6500c22245f5f17a2dd3a427577715625c3d9d");
+
+/// [`local_or_hub`] for the CoNLL-2003 NER fine-tuned repo.
+fn token_file(name: &str) -> PathBuf {
+    local_or_hub(TOKEN_REPO, name)
+}
+
+/// The token classifier at `dtype` over the golden's rows, and the golden.
+/// The plan matches the golden's padding (batch and length from its
+/// `input_ids`).
+fn load_token_fixture(dtype: DType) -> (ModernBertTokenClassifier, Vec<Encoding>, StateDict) {
+    let golden = crate::state::load_safetensors(&token_file("golden_token.safetensors")).expect("golden");
+    let encodings = golden_encodings(&golden);
+    let opts = fixture_options(&encodings, dtype);
+    let classifier =
+        ModernBertTokenClassifier::from_files(&token_file("config.json"), &token_file("model.safetensors"), &opts)
+            .expect("build token classifier");
+    (classifier, encodings, golden)
+}
+
+/// Token-classification parity: Svod's fused backbone + per-token head JIT
+/// (`ModernBertTokenClassifier`) vs the PyTorch reference (`expected_logits`
+/// from the golden, produced by `transformers`
+/// `AutoModelForTokenClassification`). Compares real-token positions only (mask
+/// = 1); pad positions are a don't-care.
+#[test]
+#[ignore = "heavy: real CoNLL-2003 ModernBERT-base NER weights + PyTorch golden (local or HF Hub download)"]
+fn token_logits_match_pytorch() {
+    let (mut recognizer, encodings, golden) = load_token_fixture(DType::Float32);
+    let want: Vec<f32> = load_golden_vec(&golden, "expected_logits");
+    let (num_labels, seq_len) = (recognizer.num_labels(), encodings[0].len());
+
+    let refs: Vec<&Encoding> = encodings.iter().collect();
+    let (classifications, _prof) = recognizer.run_batch(&refs, false).expect("recognize");
+
+    assert_eq!(classifications.len(), encodings.len(), "batch size mismatch");
+    let mut worst = 0.0f32;
+    for (i, c) in classifications.iter().enumerate() {
+        assert_eq!((c.logits.len(), c.num_labels), (seq_len * num_labels, num_labels), "per-chunk grid shape");
+        // Compare only real-token rows: pad rows are a don't-care and may drift.
+        for t in 0..seq_len {
+            if encodings[i].attention_mask[t] == 0 {
+                continue;
+            }
+            let got = &c.logits[t * num_labels..(t + 1) * num_labels];
+            let want_off = (i * seq_len + t) * num_labels;
+            let expected = &want[want_off..want_off + num_labels];
+            let max_delta = max_abs_delta(got, expected);
+            worst = worst.max(max_delta);
+            assert!(max_delta < 1e-3, "token logits [{i}][{t}] drifted from PyTorch golden: max |delta| = {max_delta}");
+        }
+    }
+    eprintln!("token logits real-position max |delta| = {worst:.3e}");
+}
+
+// ─── bf16 heads ─────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug)]
+enum Head {
+    Embed,
+    Classify,
+    ClassifyTokens,
+}
+
+/// The heads in bf16 — where they run on tk's flash attention, GEMMs and layer
+/// norm, which the f32 parity tests above never reach — against the f32
+/// goldens, bounded by PyTorch's own bf16 drift ([`assert_tracks_pytorch_bf16`]).
+/// The token head is compared at real tokens only.
+#[test_case::test_case(Head::Embed; "embed")]
+#[test_case::test_case(Head::Classify; "classify")]
+#[test_case::test_case(Head::ClassifyTokens; "classify tokens")]
+#[ignore = "heavy: real ModernBERT checkpoints + PyTorch goldens, on a bf16 device"]
+fn bf16_heads_track_pytorch_bf16(head: Head) {
+    let dtype = crate::default_compute_dtype();
+    if dtype != DType::BFloat16 {
+        eprintln!("skip bf16_heads_track_pytorch_bf16: the default device computes in {dtype:?}");
+        return;
+    }
+    let (got, golden, key, real) = match head {
+        Head::Embed => {
+            let (mut embedder, enc, golden) = load_embed_fixture(dtype);
+            let got = embedder.run_batch(&[&enc], false).expect("embed").0.remove(0).values;
+            (got, golden, "expected_embedding", None)
+        }
+        Head::Classify => {
+            let (mut classifier, encodings, golden) = load_classifier_fixture(dtype);
+            let refs: Vec<&Encoding> = encodings.iter().collect();
+            let got = classifier.run_batch(&refs, false).expect("classify").0.into_iter().flat_map(|c| c.logits);
+            (got.collect(), golden, "expected_logits", None)
+        }
+        Head::ClassifyTokens => {
+            let (mut classifier, encodings, golden) = load_token_fixture(dtype);
+            let refs: Vec<&Encoding> = encodings.iter().collect();
+            let got = classifier.run_batch(&refs, false).expect("classify tokens").0.into_iter().flat_map(|c| c.logits);
+            let mask: Vec<i64> = load_golden_vec(&golden, "attention_mask");
+            (got.collect(), golden, "expected_logits", Some((mask, classifier.num_labels())))
+        }
+    };
+    let real = real.as_ref().map(|(mask, width)| (mask.as_slice(), *width));
+    assert_tracks_pytorch_bf16(&format!("{head:?}"), got, &golden, key, real);
 }

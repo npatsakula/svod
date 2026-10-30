@@ -31,4 +31,10 @@ pub enum Error {
     Config { message: String },
     #[snafu(display("model has no {head} head"))]
     MissingHead { head: &'static str },
+    #[snafu(display("loading tokenizer failed: {source}"))]
+    Tokenizer { source: svod_arch::pipelines::text::HfTokenizerError },
+    #[snafu(display("building encoder head failed: {source}"))]
+    Head { source: crate::encoder_head::HeadError },
+    #[snafu(display("reading the embedding pooling failed: {source}"), context(false))]
+    Pooling { source: crate::encoder_head::PoolingError },
 }

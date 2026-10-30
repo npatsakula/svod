@@ -1,7 +1,8 @@
-//! Host-side speech building blocks for Svod: CTC and RNN-T decoders, VAD-driven
+//! Host-side building blocks for Svod: CTC and RNN-T decoders, VAD-driven
 //! chunking, the long-form ASR pipeline ([`pipelines::audio`]) that chains a
-//! splitter and a transcriber, and speaker-diarization state and
-//! post-processing ([`diarization`]).
+//! splitter and a transcriber, the encoder text pipeline ([`pipelines::text`])
+//! for embeddings, reranking and classification, and speaker-diarization state
+//! and post-processing ([`diarization`]).
 
 pub mod ctc;
 pub mod diarization;

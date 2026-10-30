@@ -63,7 +63,7 @@ impl ModernBert {
         // dtype / max_batch_size (those aren't in the on-disk config).
         let cfg_path = repo.get("config.json")?;
         let parsed = ModernBertConfig::from_json(&cfg_path)?;
-        config.merge_structural_from(&parsed);
+        config.apply_checkpoint(&parsed);
 
         let weights_path = repo.get("model.safetensors")?;
         Self::from_safetensors(&weights_path, config.clone())

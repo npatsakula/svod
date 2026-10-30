@@ -52,13 +52,15 @@ Svod 自带语音、文本和视觉模型，均已对照各自的 PyTorch 参考
 | 语音活动检测 | FireRedVAD、Silero VAD |
 | 语音增强 | GTCRN |
 | 说话人分析 | Nemotron-3-Diarization、DiariZen、WeSpeaker |
-| 文本嵌入与重排序 | BGE-M3、Qwen3-Embedding、ModernBERT |
+| 文本嵌入与重排序 | BGE-M3、BGE-reranker-v2-m3、Qwen3-Embedding、Qwen3-Reranker、ModernBERT |
+| 文本分类 | ModernBERT、XLM-RoBERTa（均支持整段文本与逐 token 分类） |
+| 断句 | SaT |
 | 视觉 | YOLO26、ResNet |
 | 其他一切 | [ONNX 导入器](https://github.com/npatsakula/svod/tree/main/onnx/)（[算子覆盖](https://github.com/npatsakula/svod/tree/main/onnx/PARITY.md)） |
 
 权重直接来自 Hugging Face Hub，输出与参考实现逐一比对。
 [`model/`](https://github.com/npatsakula/svod/tree/main/model/) 列出了各个变体、上游链接和可运行示例；
-[`arch`](https://github.com/npatsakula/svod/tree/main/arch/) 包含解码器和长音频流水线。
+[`arch`](https://github.com/npatsakula/svod/tree/main/arch/) 包含 CTC 与 RNN-T 解码器、长音频流水线和文本流水线。文本流水线把长文本切成窗口，分批送入编码器，再合并各窗口的结果，使嵌入、分数或标注覆盖整段文本。
 
 ## 引擎
 
@@ -167,7 +169,7 @@ Morok 是 Svod 之前的名字。
 | [`tensor`](https://github.com/npatsakula/svod/tree/main/tensor/) | 惰性张量 API、`nn` 模块和内存规划器 |
 | [`tk`](https://github.com/npatsakula/svod/tree/main/tk/) | 算子层背后的 tile 语言、内核库、规划器和调优器 |
 | [`onnx`](https://github.com/npatsakula/svod/tree/main/onnx/) | ONNX 导入器 |
-| [`arch`](https://github.com/npatsakula/svod/tree/main/arch/) | 宿主端解码器、VAD 分段和音频流水线 |
+| [`arch`](https://github.com/npatsakula/svod/tree/main/arch/) | 宿主端解码器、VAD 分段、音频与文本流水线 |
 | [`model`](https://github.com/npatsakula/svod/tree/main/model/) | 预训练模型与示例 |
 
 ## 使用这个库

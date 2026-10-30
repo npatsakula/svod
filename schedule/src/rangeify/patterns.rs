@@ -14,12 +14,14 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use smallvec::SmallVec;
+use smallvec::{SmallVec, smallvec};
 use svod_device::DeviceSpec;
 use svod_dtype::{AddrSpace, DType};
 use svod_ir::uop::cached_property::CachedProperty;
 use svod_ir::uop::properties::{RangesProperty, SoundVminVmaxProperty};
-use svod_ir::{AxisId, AxisType, BinaryOp, BufferizeOpts, ConstValue, Op, ReduceOp, UOp, UOpKey, UnaryOp};
+use svod_ir::{
+    AxisId, AxisType, BinaryOp, BufferizeOpts, ConstValue, Op, ReduceOp, SInt, TernaryOp, UOp, UOpKey, UnaryOp,
+};
 
 use crate::TypedPatternMatcher;
 use crate::rangeify::transforms::{cast_to_dtype, get_range_size, partition_reduce_ranges};
@@ -1318,11 +1320,57 @@ fn gated_collapse_core(idx: &Arc<UOp>, range: &Arc<UOp>, end: &Arc<UOp>, expr: &
     let idx_casted = idx.cast(range.dtype());
     let zero = UOp::index_const(0);
     let in_bounds = idx_casted.try_cmpge(&zero).ok()?.try_and_op(&idx_casted.try_cmplt(end).ok()?).ok()?;
-    let valid_idx = idx_casted.valid(in_bounds.clone());
-    let subs: std::collections::HashMap<UOpKey, Arc<UOp>> = [(UOpKey(range.clone()), valid_idx)].into_iter().collect();
-    let substituted = expr.substitute(&subs);
+    pick_step(&idx_casted, in_bounds, range, expr)
+}
+
+/// `where(in_bounds, expr[r := step.valid(in_bounds)], 0)`: the one step of the
+/// reduction that `in_bounds` admits and `step` names.
+fn pick_step(step: &Arc<UOp>, in_bounds: Arc<UOp>, range: &Arc<UOp>, expr: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let subs = [(UOpKey(range.clone()), step.valid(in_bounds.clone()))].into_iter().collect();
     let zero_like = UOp::const_(expr.dtype(), ConstValue::zero(expr.dtype().base()));
-    UOp::try_where(in_bounds, substituted, zero_like).ok()
+    UOp::try_where(in_bounds, expr.substitute(&subs), zero_like).ok()
+}
+
+/// The gated collapse where [`solve_for_range`] cannot move `cmp` onto `idx`: a
+/// full-range i64 index against `i64(r + chunk * R)`, which is how `split_reduceop`
+/// leaves a lookup, has no wider dtype to subtract in, and one against `i64(i32(r))`
+/// cannot be read at 32 bits.
+///
+/// `cmp` is `r + C`, so the values it takes are exactly `cmp[r := 0] ..= cmp[r :=
+/// end - 1]`, two values the reduction itself computes. The gate compares `idx`
+/// against them as the comparison did, with no arithmetic on it. The step is
+/// `idx - cmp[r := 0]` taken on `idx` clamped into that span, so it stays in
+/// `[0, end)` on every lane, inside the gate or out of it. It subtracts in i64,
+/// which has to hold the span and `-cmp[r := 0]` (which `try_sub` adds), so no
+/// lane computes a value that wraps; a u64 step would lower into a float index.
+fn collapse_onto_span(
+    idx: &Arc<UOp>,
+    cmp: &Arc<UOp>,
+    range: &Arc<UOp>,
+    end: &Arc<UOp>,
+    expr: &Arc<UOp>,
+) -> Option<Arc<UOp>> {
+    let nonempty = sound_int_bounds(end).is_some_and(|(lo, _)| lo >= 1);
+    (nonempty && offsets_range(cmp, range)).then_some(())?;
+    let at = |step: Arc<UOp>| cmp.substitute(&[(UOpKey(range.clone()), step)].into_iter().collect());
+    let (first, last) = (at(range.const_like(0)), at(end.try_sub(&end.const_like(1)).ok()?));
+    let ((lo, hi), (_, last_hi)) = (sound_int_bounds(&first)?, sound_int_bounds(&last)?);
+    (holds(&DType::Int64, (lo, last_hi)) && holds(&DType::Int64, (-hi, -lo))).then_some(())?;
+    let in_span = idx.try_cmpge(&first).ok()?.try_and_op(&idx.try_cmple(&last).ok()?).ok()?;
+    let clamped = UOp::try_where(in_span.clone(), idx.clone(), first.clone()).ok()?.cast(DType::Int64);
+    pick_step(&clamped.try_sub(&first.cast(DType::Int64)).ok()?.cast(range.dtype()), in_span, range, expr)
+}
+
+/// Whether `cmp` is `range` plus a range-invariant term: casts that keep their
+/// values and additions of terms that do not reach `range`.
+fn offsets_range(cmp: &Arc<UOp>, range: &Arc<UOp>) -> bool {
+    match cmp.op() {
+        _ if Arc::ptr_eq(cmp, range) => true,
+        Op::Cast(ops::Cast { src, .. }) => cast_is_injective(src, &cmp.dtype()) && offsets_range(src, range),
+        Op::Binary(BinaryOp::Add, x, y) if !reaches(y, range) => offsets_range(x, range),
+        Op::Binary(BinaryOp::Add, x, y) if !reaches(x, range) => offsets_range(y, range),
+        _ => false,
+    }
 }
 
 /// Whether `node` depends on `range` — the question the reduce-collapse family
@@ -1341,9 +1389,8 @@ fn reaches(node: &Arc<UOp>, range: &Arc<UOp>) -> bool {
 /// node provably takes. A cast that merged two values would let several steps
 /// of the reduction satisfy the equality, and keeping one would drop the rest.
 pub(crate) fn cast_is_injective(value: &Arc<UOp>, dtype: &DType) -> bool {
-    let (Some((lo, hi)), Some(format)) = (int_limits(dtype), int_limits(&value.dtype())) else { return false };
-    let fits = |(min, max): (i128, i128)| lo <= min && max <= hi;
-    fits(format) || sound_int_bounds(value).is_some_and(fits)
+    let fits = |values| holds(dtype, values);
+    int_limits(&value.dtype()).is_some_and(fits) || sound_int_bounds(value).is_some_and(fits)
 }
 
 fn int_value(value: &ConstValue) -> Option<i128> {
@@ -1370,13 +1417,18 @@ fn sound_int_bounds(node: &Arc<UOp>) -> Option<(i128, i128)> {
 /// `idx`'s own where the operands' bounds keep the result inside it, else i64
 /// where they keep it there. `idx == arange(2, 7)` does no arithmetic on `idx`, so
 /// the `idx - 2` read off it must not wrap an i32 index near its minimum past the
-/// bounds check [`gated_collapse_core`] puts on it.
+/// bounds check [`gated_collapse_core`] puts on it. `try_sub` adds `-by`, which
+/// must not wrap either: `i32::MIN` negates onto itself.
 fn wrap_free_dtype(idx: &Arc<UOp>, by: &Arc<UOp>, negate: bool) -> Option<DType> {
     let bounds = |node: &Arc<UOp>| sound_int_bounds(node).or_else(|| int_limits(&node.dtype()));
     let ((lo, hi), (by_lo, by_hi)) = (bounds(idx)?, bounds(by)?);
-    let (lo, hi) = if negate { (lo - by_hi, hi - by_lo) } else { (lo + by_lo, hi + by_hi) };
-    let holds = |dtype: &DType| int_limits(dtype).is_some_and(|(min, max)| min <= lo && hi <= max);
-    [idx.dtype(), DType::Int64].into_iter().find(holds)
+    let by = if negate { (-by_hi, -by_lo) } else { (by_lo, by_hi) };
+    [idx.dtype(), DType::Int64].into_iter().find(|dtype| holds(dtype, by) && holds(dtype, (lo + by.0, hi + by.1)))
+}
+
+/// Whether `dtype` holds every value in `lo..=hi`.
+fn holds(dtype: &DType, (lo, hi): (i128, i128)) -> bool {
+    int_limits(dtype).is_some_and(|(min, max)| min <= lo && hi <= max)
 }
 
 /// `idx + by`, or `idx - by` when `negate`, in [`wrap_free_dtype`].
@@ -1522,10 +1574,14 @@ fn try_reduce_collapse(
     // index reaches the output ranges by construction — it is a different index
     // per output element — so neither side is range-free, both tests fail and
     // the arm gives up on the very shape it was written for. `solve_for_range`
-    // then moves whatever wraps the range over onto the index.
+    // then moves whatever wraps the range over onto the index, and where it
+    // cannot without wrapping or narrowing the index, `collapse_onto_span` gates
+    // the raw index instead.
     //
     // A shape that is not NE/EQ over this range must FALL THROUGH to Pattern 4:
     // an `And` condition is exactly what the two-sided rule below is written for.
+    // [`is_one_hot_select`] below mirrors this arm on the pre-synthesis graph,
+    // for the kernel splitter's guard; keep the two in sync.
     if let Some((lhs, rhs, expr)) = match cond.op() {
         Op::Binary(BinaryOp::Ne, lhs, rhs) if is_const_zero(true_val) => Some((lhs, rhs, false_val)),
         Op::Binary(BinaryOp::Eq, lhs, rhs) if is_const_zero(false_val) => Some((lhs, rhs, true_val)),
@@ -1540,9 +1596,11 @@ fn try_reduce_collapse(
             _ => None,
         };
         if let Some((idx, cmp)) = oriented
-            && let Some(idx) = solve_for_range(idx, cmp, range)
+            && let Some(collapsed) = solve_for_range(idx, cmp, range)
+                .and_then(|solved| gated_collapse_core(&solved, range, end, expr))
+                .or_else(|| collapse_onto_span(idx, cmp, range, end, expr))
         {
-            return gated_collapse_core(&idx, range, end, expr);
+            return Some(collapsed);
         }
     }
 
@@ -1578,6 +1636,80 @@ fn try_reduce_collapse(
     }
 
     None
+}
+
+/// Follows `node` down through movement ops, and through the casts whose source
+/// `pass` accepts, to the first other op, carrying `indices` (what each axis of
+/// `node` is read at) onto that op's axes. `None` past a cast `pass` refuses.
+fn through_views(
+    mut node: &Arc<UOp>,
+    mut indices: Vec<Arc<UOp>>,
+    pass: impl Fn(&Arc<UOp>) -> bool,
+) -> Option<(&Arc<UOp>, Vec<Arc<UOp>>)> {
+    loop {
+        match node.op() {
+            Op::Cast(ops::Cast { src, .. }) => node = pass(src).then_some(src)?,
+            op if op.is_movement() => {
+                let src = op.children()[0];
+                indices = super::indexing::apply_movement_op(op, src.shape().ok()??, &indices);
+                node = src;
+            }
+            _ => return Some((node, indices)),
+        }
+    }
+}
+
+/// Whether `reduce` is the one-hot lookup `Tensor::embedding` and `gather`
+/// build, in a form reduce simplification folds into one indexed load: a sum
+/// of `where(idx == arange, x, 0)`, `where(idx != arange, 0, x)` or
+/// `x * (idx == arange)`, where `idx` is constant along the reduced axes and
+/// `arange` varies along all of them without reading a buffer, through casts
+/// that keep every value of `idx`. Split, the first stage still folds, gated on
+/// `idx` landing in its chunk, but the lookup pays for a second kernel and an
+/// intermediate of one value per chunk.
+///
+/// This is patterns 3/3b of [`try_reduce_collapse`] above, read off the
+/// pre-synthesis graph: what that arm folds once reduce simplification has
+/// synthesized its per-range reduce, this recognizes before, from the whole
+/// reduce and its input shape. [`super::kernel::split_reduceop`] skips what it
+/// answers, so the two must stay in sync.
+pub(crate) fn is_one_hot_select(reduce: &Arc<UOp>, input_shape: &[SInt]) -> bool {
+    let Op::Reduce(ops::Reduce { src, reduce_op: ReduceOp::Add, num_axes, .. }) = reduce.op() else {
+        return false;
+    };
+    // A cast between the reduce and the select keeps it from folding.
+    let Some((select, at)) = through_views(src, super::kernel::axis_ranges(input_shape), |_| false) else {
+        return false;
+    };
+    let is_zero = |uop: &Arc<UOp>| matches!(uop.base().op(), Op::Const(value) if value.0.is_zero());
+    let (gates, compare): (SmallVec<[&Arc<UOp>; 2]>, _) = match select.op() {
+        Op::Ternary(TernaryOp::Where, gate, _, otherwise) if is_zero(otherwise) => (smallvec![gate], BinaryOp::Eq),
+        Op::Ternary(TernaryOp::Where, gate, picked, _) if is_zero(picked) => (smallvec![gate], BinaryOp::Ne),
+        Op::Binary(BinaryOp::Mul, lhs, rhs) => (smallvec![lhs, rhs], BinaryOp::Eq),
+        _ => return false,
+    };
+
+    let reduced: HashSet<usize> =
+        (0..*num_axes).filter(|&axis| input_shape[axis].as_const().is_some_and(|n| n > 1)).collect();
+    // The reduced axes `side` varies along, and the op it reads them from.
+    let along_reduced = |side: &Arc<UOp>, at: &[Arc<UOp>], pass: &dyn Fn(&Arc<UOp>) -> bool| {
+        let (base, at) = through_views(side, at.to_vec(), pass)?;
+        let axes: HashSet<usize> =
+            at.iter().flat_map(super::kernel::collect_range_ids).filter(|axis| reduced.contains(axis)).collect();
+        Some((base.clone(), axes))
+    };
+    let selects = |idx: &Arc<UOp>, arange: &Arc<UOp>, at: &[Arc<UOp>]| {
+        let keeps_idx = |src: &Arc<UOp>| svod_dtype::DType::can_safe_cast(idx.dtype(), src.dtype());
+        along_reduced(idx, at, &|_| true).is_some_and(|(_, axes)| axes.is_empty())
+            && along_reduced(arange, at, &keeps_idx)
+                .is_some_and(|(base, axes)| axes == reduced && !base.any_in_subtree(|node| node.has_buffer_identity()))
+    };
+    gates.into_iter().any(|gate| {
+        through_views(gate, at.clone(), |_| true).is_some_and(|(cmp, at)| match cmp.op() {
+            Op::Binary(op, lhs, rhs) if *op == compare => selects(lhs, rhs, &at) || selects(rhs, lhs, &at),
+            _ => false,
+        })
+    })
 }
 
 /// Extract lower bound from (r >= lower) condition.
@@ -1747,7 +1879,9 @@ pub(crate) fn try_lift_arithmetic_from_eq(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
 
 /// `c - y` (`c + y` unless `negate`), the side an EQ or NE lift moves `y` onto,
 /// only where it cannot wrap in `c`'s dtype. Elsewhere the comparison stays as it
-/// is, and the gated collapse solves it in i64 ([`solve_for_range`]).
+/// is, and the gated collapse solves it in i64 ([`solve_for_range`]) or, with no
+/// dtype wide enough, gates `c` on the span the other side takes
+/// ([`collapse_onto_span`]).
 fn lifted(c: &Arc<UOp>, y: &Arc<UOp>, negate: bool) -> Option<Arc<UOp>> {
     (wrap_free_dtype(c, y, negate)? == c.dtype()).then(|| if negate { c.try_sub(y) } else { c.try_add(y) }.ok())?
 }

@@ -20,7 +20,7 @@ CTC / RN-T decoders, VAD chunking and the long-form audio pipeline.
 | Speaker diarization | DiariZen (WavLM + Conformer) | `diarizen` | `BUT-FIT/diarizen-wavlm-large-s80-md-v2` |
 | Speaker diarization | Nemotron-3-Diarization (offline, streaming; up to 8 speakers) | `nemotron_diar` | `nvidia/Nemotron-3-Diarization` |
 | Speaker embedding | WeSpeaker ResNet34 | `wespeaker` | `pyannote/wespeaker-voxceleb-resnet34-LM` |
-| Text embeddings | BGE-M3 (dense, sparse, ColBERT), BGE-reranker-v2-m3 | `bgem3` | `BAAI/bge-m3`, `BAAI/bge-reranker-v2-m3` |
+| Text embeddings | BGE-M3 (dense, sparse, ColBERT), BGE-reranker-v2-m3 | `bgem3`, `xlm_roberta` | `BAAI/bge-m3`, `BAAI/bge-reranker-v2-m3` |
 | Text embeddings | Qwen3-Embedding-0.6B, Qwen3-Reranker-0.6B | `qwen3` | `Qwen/Qwen3-Embedding-0.6B` |
 | Text embeddings, fill-mask | ModernBERT base / large | `modernbert` | `answerdotai/ModernBERT-base` |
 | Vision | ResNet 18 / 34 / 50 / 101 / 152 | `resnet` | `timm/resnet*.a1_in1k` |
@@ -331,10 +331,18 @@ let rows: Vec<Vec<u32>> = texts.iter().map(|t| tokenize(t)).collect();
 let embeddings: Vec<Vec<f32>> = embedder.embed(&rows)?; // L2-normalized, one row per text
 ```
 
-`BgeM3Embedder` (`encode_dense`, `encode_colbert`, `encode` with sparse
-weights), the BGE and Qwen3 rerankers and `ModernBert` follow the same
-`from_hub(model_id, config)` convention; `svod_model::default_compute_dtype()`
-picks bf16 where the device has bf16 tensor cores and f32 otherwise.
+`BgeM3` (`encode_dense`, `encode_colbert`, `encode` with sparse weights), the
+Qwen3 reranker and `ModernBert` follow the same `from_hub(model_id, config)`
+convention; `svod_model::default_compute_dtype()` picks bf16 where the device
+has bf16 tensor cores and f32 otherwise.
+
+The encoder heads that run in `svod_arch::pipelines::text` come with their
+tokenizer instead: the module functions `modernbert::from_hub*` and
+`xlm_roberta::from_hub*` take a model id and `HubOptions` and return the
+tokenizer and the head. One of these heads gives BGE-M3's dense vector alone
+(`xlm_roberta::from_hub`); only `BgeM3` gives the sparse weights and ColBERT
+vectors. Another is the BGE reranker (`xlm_roberta::from_hub_classifier`),
+which scores query–passage pairs.
 
 ---
 

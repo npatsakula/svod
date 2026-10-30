@@ -31,6 +31,23 @@ fn same_provenance_shares_immutable_storage() {
     assert_ne!(again.storage_id(), old);
 }
 
+/// A weight's storage goes back to the device when its last owner drops, not
+/// into the allocator's reuse pool: there, a model cast to f16 would keep every
+/// f32 checkpoint weight until some allocation failed.
+#[test]
+fn a_dropped_weight_is_not_pooled_for_reuse() {
+    // A size no other test allocates, so only the weight can fill its pool slot.
+    let bytes = [5u8; 4_099];
+    let key = WeightKey { dtype: DType::UInt8, shape: vec![bytes.len()], ..key("w_unpooled") };
+    drop(shared_weight_buffer(key, &bytes));
+
+    let allocator = svod_device::registry::cpu().unwrap();
+    let next = Buffer::new(allocator, DType::UInt8, vec![bytes.len()], Default::default());
+    let mut out = [0u8; 4_099];
+    next.copyout(&mut out).unwrap();
+    assert_eq!(out, [0u8; 4_099], "a pooled weight is handed out again, contents and all");
+}
+
 #[test]
 fn shared_weight_refuses_host_writes() {
     let bytes = [2u8; 16];

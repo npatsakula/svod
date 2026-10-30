@@ -4,22 +4,18 @@
 //! Run with:
 //!   SVOD_BGEM3=$PWD/data/bgem3 cargo test -p svod-model --lib bgem3::parity -- --ignored
 
-use crate::bgem3::{BgeM3, BgeRerankerV2M3, EncodeOpts};
+use crate::bgem3::{BgeM3, EncodeOpts};
 use crate::state::{self, StateDict};
+use crate::test::unit::{load_golden_vec, max_abs_delta};
 use crate::xlm_roberta::XlmRobertaConfig;
 use std::path::PathBuf;
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
 const HUB_REPO: &str = "BAAI/bge-m3";
-const RERANKER_HUB: &str = "BAAI/bge-reranker-v2-m3";
 
 fn real_file(name: &str) -> PathBuf {
     resolve_file(name, HUB_REPO)
-}
-
-fn real_file_reranker(name: &str) -> PathBuf {
-    resolve_file(name, RERANKER_HUB)
 }
 
 fn resolve_file(name: &str, hub_repo: &str) -> PathBuf {
@@ -56,17 +52,6 @@ fn load_fixture() -> (BgeM3, StateDict) {
         None
     };
     (BgeM3 { model: backbone, sparse_head: sparse, colbert_head: colbert, normalize_dense: true }, golden)
-}
-
-fn load_golden_vec<T: Clone + Default + svod_dtype::ext::HasDType>(sd: &StateDict, key: &str) -> Vec<T> {
-    let t = sd.get(key).unwrap_or_else(|| panic!("missing golden key: {key}")).clone();
-    t.realize().unwrap();
-    t.as_vec::<T>().unwrap()
-}
-
-fn max_abs_delta(got: &[f32], want: &[f32]) -> f32 {
-    assert_eq!(got.len(), want.len());
-    got.iter().zip(want.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max)
 }
 
 fn prep_inputs(golden: &StateDict) -> (Tensor, Tensor) {
@@ -148,25 +133,4 @@ fn ignoring_padding_diverges_from_golden() {
     out.realize().unwrap();
     let delta = max_abs_delta(&out.as_vec::<f32>().unwrap(), &load_golden_vec(&golden, "last_hidden_state"));
     assert!(delta > 1e-2, "all-ones mask did NOT diverge (delta={delta:.6})");
-}
-
-// --- Reranker ---
-
-fn load_reranker_fixture() -> (BgeRerankerV2M3, StateDict) {
-    let golden = state::load_safetensors(&real_file("golden_reranker.safetensors")).expect("golden");
-    let mut cfg = XlmRobertaConfig::from_json(&real_file_reranker("config.json")).expect("config");
-    cfg.dtype = DType::Float32;
-    let model = BgeRerankerV2M3::from_safetensors(&real_file_reranker("model.safetensors"), cfg).unwrap();
-    (model, golden)
-}
-
-#[test]
-#[ignore = "heavy: real BGE-reranker-v2-m3 weights + PyTorch golden"]
-fn reranker_logits_match_pytorch() {
-    let (model, golden) = load_reranker_fixture();
-    let (ids, mask) = prep_inputs(&golden);
-    let out = model.forward(&ids, Some(&mask)).unwrap();
-    out.realize().unwrap();
-    let delta = max_abs_delta(&out.as_vec::<f32>().unwrap(), &load_golden_vec(&golden, "logits"));
-    assert!(delta < 1e-3, "reranker logits max |delta| = {delta:.6}");
 }

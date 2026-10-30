@@ -10,6 +10,7 @@ pub mod audio;
 pub mod bgem3;
 pub mod blocks;
 pub mod diarizen;
+pub mod encoder_head;
 pub mod firered_vad;
 pub mod gigaam;
 pub mod gtcrn;
@@ -31,13 +32,18 @@ pub mod xlm_roberta;
 pub mod yolo;
 
 /// Default compute dtype of the transformer configs (`modernbert`, `qwen3`,
-/// `xlm_roberta`): bf16, except on a CUDA device without bf16 tensor cores
-/// (pre-Ampere), whose profile stores no bf16 at all, or one that cannot be
-/// opened to tell. Callers wanting CPU parity against an f32 reference set
-/// `dtype` explicitly.
+/// `xlm_roberta`): [`compute_dtype_for`] the thread's default device. Callers
+/// wanting CPU parity against an f32 reference set `dtype` explicitly.
 pub fn default_compute_dtype() -> svod_dtype::DType {
-    match svod_dtype::default_device::default_device() {
-        svod_dtype::DeviceSpec::Cuda { device_id } => match svod_device::registry::resolve_cuda_arch(device_id) {
+    compute_dtype_for(&svod_dtype::default_device::default_device())
+}
+
+/// The dtype a transformer computes in on `device`: bf16, except on a CUDA
+/// device without bf16 tensor cores (pre-Ampere), whose profile stores no bf16
+/// at all, or one that cannot be opened to tell.
+pub fn compute_dtype_for(device: &svod_dtype::DeviceSpec) -> svod_dtype::DType {
+    match device {
+        svod_dtype::DeviceSpec::Cuda { device_id } => match svod_device::registry::resolve_cuda_arch(*device_id) {
             Ok(arch) if arch.has_bf16_mma() => svod_dtype::DType::BFloat16,
             _ => svod_dtype::DType::Float32,
         },

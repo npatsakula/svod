@@ -637,8 +637,9 @@ struct SplitCandidate {
     output_size: usize,
 }
 
-fn detect_expanded_dimensions(source: &Arc<UOp>, input_shape: &[SInt]) -> Vec<bool> {
-    let ranges: Vec<Arc<UOp>> = input_shape
+/// One RANGE per axis of `shape`, numbered by position; a unit axis reads at 0.
+pub(crate) fn axis_ranges(shape: &[SInt]) -> Vec<Arc<UOp>> {
+    shape
         .iter()
         .enumerate()
         .map(|(axis_id, dim)| match dim {
@@ -648,9 +649,11 @@ fn detect_expanded_dimensions(source: &Arc<UOp>, input_shape: &[SInt]) -> Vec<bo
             }
             _ => UOp::index_const(0),
         })
-        .collect();
+        .collect()
+}
 
-    let indexed = match UOp::index().buffer(Arc::clone(source)).indices(ranges).call() {
+fn detect_expanded_dimensions(source: &Arc<UOp>, input_shape: &[SInt]) -> Vec<bool> {
+    let indexed = match UOp::index().buffer(Arc::clone(source)).indices(axis_ranges(input_shape)).call() {
         Ok(idx) => idx,
         Err(_) => return vec![false; input_shape.len()],
     };
@@ -797,7 +800,7 @@ pub fn split_reduceop(reduce: &Arc<UOp>, config: &SplitReduceOpConfig) -> Option
     }
 
     let ratio = input_size / output_size;
-    if ratio < config.split_threshold {
+    if ratio < config.split_threshold || super::patterns::is_one_hot_select(reduce, input_shape) {
         return None;
     }
 
