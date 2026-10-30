@@ -162,7 +162,7 @@ fn sat_window_scores_match_wtpsplit(weighting: WindowWeighting, key: &str) {
     let chunker = SlidingWindowChunker::new(classifier.capacity().1, stride).with_full_last_window();
     let mut pipeline = EncoderPipeline::new(tokenizer, chunker, classifier).expect("pipeline");
     let chunks = pipeline.classify_tokens(&text, ()).expect("classify tokens").chunks;
-    let scores = token_scores_document(&chunks, weighting);
+    let scores = token_scores_document(&chunks, weighting).expect("windows agree on labels");
 
     let spans: Vec<(usize, usize)> = scores.iter().map(|t| (t.start, t.end)).collect();
     assert!(spans.windows(2).any(|pair| pair[0] == pair[1]), "no two tokens share a byte span");

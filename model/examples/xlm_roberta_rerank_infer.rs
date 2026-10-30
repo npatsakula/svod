@@ -115,7 +115,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .enumerate()
         .map(|(i, r)| {
-            let logits = classification_document(&r.chunks, DocumentPooling::Max).unwrap_or_default();
+            let logits = classification_document(&r.chunks, DocumentPooling::Max).ok().flatten().unwrap_or_default();
             (i, r.chunks.len(), logits.first().copied().unwrap_or(f32::NEG_INFINITY))
         })
         .collect();

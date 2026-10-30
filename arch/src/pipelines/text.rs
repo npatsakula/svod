@@ -1459,6 +1459,23 @@ impl<T: Tokenizer, C: Chunker, M: ClassifyTokens> EncoderPipeline<T, C, M> {
 
 /// How [`embedding_document`] and [`classification_document`] fold a text's
 /// chunks into one result.
+/// The document free-fns ([`embedding_document`], [`classification_document`],
+/// [`token_scores_document`]) refusing chunks a head answered inconsistently:
+/// every chunk of a text at the same width, every window scoring the same
+/// labels. A head that breaks that has a bug of its own; these say which
+/// chunk broke it instead of panicking in the pipeline.
+#[derive(Debug, Snafu)]
+pub enum DocumentError {
+    #[snafu(display(
+        "chunk {chunk} of a text has {width} values, but its first chunk has {first}: every chunk of a text has the same width"
+    ))]
+    RaggedWidth { chunk: usize, width: usize, first: usize },
+    #[snafu(display(
+        "window {window} of a text scores {labels} labels, but its first window scores {first}: every window of a text scores the same labels"
+    ))]
+    RaggedLabels { window: usize, labels: usize, first: usize },
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DocumentPooling {
     /// Each chunk weighted by its content tokens, so a short last window
@@ -1470,14 +1487,18 @@ pub enum DocumentPooling {
 }
 
 impl DocumentPooling {
-    /// Fold `rows` (all of one length), each with its weight; `None` for no
-    /// rows.
-    fn pool<'a>(self, rows: impl Iterator<Item = (&'a [f32], usize)> + Clone) -> Option<Vec<f32>> {
-        let width = rows.clone().next()?.0.len();
+    /// Fold `rows` (all of one length), each with its weight; `Ok(None)` for
+    /// no rows, [`DocumentError`] for ragged ones.
+    fn pool<'a>(
+        self,
+        rows: impl Iterator<Item = (&'a [f32], usize)> + Clone,
+    ) -> Result<Option<Vec<f32>>, DocumentError> {
+        let Some((first, _)) = rows.clone().next() else { return Ok(None) };
+        let width = first.len();
         let mut out = vec![if self == Self::Max { f32::NEG_INFINITY } else { 0.0 }; width];
         let mut total = 0.0;
-        for (row, weight) in rows {
-            assert_eq!(row.len(), width, "every chunk of a text has the same width");
+        for (chunk, (row, weight)) in rows.enumerate() {
+            ensure!(row.len() == width, RaggedWidthSnafu { chunk, width: row.len(), first: width });
             let weight = weight.max(1) as f32;
             total += weight;
             for (acc, &x) in out.iter_mut().zip(row) {
@@ -1490,29 +1511,40 @@ impl DocumentPooling {
         if self == Self::Mean {
             out.iter_mut().for_each(|x| *x /= total);
         }
-        Some(out)
+        Ok(Some(out))
     }
 }
 
 /// One embedding for a text from its chunks' (one per window under
-/// [`SlidingWindowChunker`]), or `None` for no chunks. With `normalize` the
+/// [`SlidingWindowChunker`]), or `Ok(None)` for no chunks; chunks a head
+/// answered at different widths are [`DocumentError`]. With `normalize` the
 /// result is scaled back to unit length, which a mean of unit vectors loses:
 /// pass the head's [`Embed::normalized`].
-pub fn embedding_document(chunks: &[ChunkEmbedding], pooling: DocumentPooling, normalize: bool) -> Option<Vec<f32>> {
-    let mut out = pooling.pool(chunks.iter().map(|c| (c.values.as_slice(), c.tokens)))?;
+pub fn embedding_document(
+    chunks: &[ChunkEmbedding],
+    pooling: DocumentPooling,
+    normalize: bool,
+) -> Result<Option<Vec<f32>>, DocumentError> {
+    let Some(mut out) = pooling.pool(chunks.iter().map(|c| (c.values.as_slice(), c.tokens)))? else {
+        return Ok(None);
+    };
     if normalize {
         let norm = out.iter().map(|x| x * x).sum::<f32>().sqrt();
         if norm > 0.0 {
             out.iter_mut().for_each(|x| *x /= norm);
         }
     }
-    Some(out)
+    Ok(Some(out))
 }
 
-/// One row of logits for a text (or a pair) from its chunks', or `None` for no
-/// chunks. Logits are pooled before any softmax or sigmoid, as
+/// One row of logits for a text (or a pair) from its chunks', or `Ok(None)`
+/// for no chunks; chunks a head answered at different widths are
+/// [`DocumentError`]. Logits are pooled before any softmax or sigmoid, as
 /// [`token_scores_document`] does.
-pub fn classification_document(chunks: &[ChunkClassification], pooling: DocumentPooling) -> Option<Vec<f32>> {
+pub fn classification_document(
+    chunks: &[ChunkClassification],
+    pooling: DocumentPooling,
+) -> Result<Option<Vec<f32>>, DocumentError> {
     pooling.pool(chunks.iter().map(|c| (c.logits.as_slice(), c.tokens)))
 }
 
@@ -1781,10 +1813,14 @@ impl TokenScores {
 /// Windows meet on [`TokenScore::token_index`], not byte spans. Over one chunk,
 /// or windows that do not overlap, every weighting gives each token the
 /// sigmoid of its own logits. `chunks` hold one text's windows, all with the
-/// same `num_labels`.
-pub fn token_scores_document(chunks: &[ChunkTokenClassification], weighting: WindowWeighting) -> TokenScores {
+/// same `num_labels` — or the mismatch is [`DocumentError`]; no windows score
+/// nothing.
+pub fn token_scores_document(
+    chunks: &[ChunkTokenClassification],
+    weighting: WindowWeighting,
+) -> Result<TokenScores, DocumentError> {
     let Some(num_labels) = chunks.first().map(|c| c.num_labels).filter(|&nl| nl > 0) else {
-        return TokenScores::default();
+        return Ok(TokenScores::default());
     };
     let lo = chunks.iter().map(|c| c.first_token).min().unwrap_or(0);
     let hi = chunks.iter().map(|c| c.first_token + c.content_range().len()).max().unwrap_or(0);
@@ -1793,8 +1829,11 @@ pub fn token_scores_document(chunks: &[ChunkTokenClassification], weighting: Win
     let mut sums = vec![0.0f32; (hi - lo) * num_labels];
     let mut weights = vec![0.0f32; hi - lo];
     let mut spans = vec![(0, 0); hi - lo];
-    for chunk in chunks {
-        assert_eq!(chunk.num_labels, num_labels, "every window of a text scores the same labels");
+    for (window, chunk) in chunks.iter().enumerate() {
+        ensure!(
+            chunk.num_labels == num_labels,
+            RaggedLabelsSnafu { window, labels: chunk.num_labels, first: num_labels }
+        );
         let content = chunk.content_range();
         let rows = chunk.logits.chunks_exact(num_labels).zip(&chunk.special_tokens_mask).zip(&chunk.token_offsets);
         for (t, ((row, &special), &span)) in rows.enumerate() {
@@ -1816,7 +1855,7 @@ pub fn token_scores_document(chunks: &[ChunkTokenClassification], weighting: Win
         scores.tokens.push((lo + i, spans[i]));
         scores.probs.extend(sums[i * num_labels..][..num_labels].iter().map(|&sum| sigmoid(sum / w)));
     }
-    scores
+    Ok(scores)
 }
 
 /// Tag prefix decoded by [`parse_tag`].

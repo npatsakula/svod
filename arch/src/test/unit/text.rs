@@ -8,11 +8,11 @@ use test_case::test_case;
 use crate::pipelines::text::HfTokenizer;
 use crate::pipelines::text::{
     ChunkClassification, ChunkEmbedding, ChunkTokenClassification, Chunker, Classification, Classify, ClassifyTokens,
-    DocumentPooling, Embed, Embedding, EncoderHead, EncoderPipeline, EncoderPipelineBuildError, EncoderPipelineError,
-    Encoding, PairTokenizer, PairTruncation, RunOptions, RunProfile, Scheme, SlidingWindowChunker,
-    SlidingWindowChunkerError, TextChunk, TokenClassification, TokenLabel, TokenScores, Tokenizer, TruncatingChunker,
-    TruncatingChunkerError, WindowWeighting, argmax, classification_document, embedding_document, group_spans,
-    group_spans_document, labels_for_tokens, sigmoid, softmax, token_scores_document,
+    DocumentError, DocumentPooling, Embed, Embedding, EncoderHead, EncoderPipeline, EncoderPipelineBuildError,
+    EncoderPipelineError, Encoding, PairTokenizer, PairTruncation, RunOptions, RunProfile, Scheme,
+    SlidingWindowChunker, SlidingWindowChunkerError, TextChunk, TokenClassification, TokenLabel, TokenScores,
+    Tokenizer, TruncatingChunker, TruncatingChunkerError, WindowWeighting, argmax, classification_document,
+    embedding_document, group_spans, group_spans_document, labels_for_tokens, sigmoid, softmax, token_scores_document,
 };
 
 fn enc(ids: &[u32]) -> Encoding {
@@ -1086,20 +1086,24 @@ fn classified(tokens: usize, logits: &[f32]) -> ChunkClassification {
 #[test_case(DocumentPooling::Mean => vec![0.25, 0.75]; "mean")]
 #[test_case(DocumentPooling::Max => vec![1.0, 1.0]; "max")]
 fn embedding_document_pools_chunks(pooling: DocumentPooling) -> Vec<f32> {
-    embedding_document(&[embedded(1, &[1.0, 0.0]), embedded(3, &[0.0, 1.0])], pooling, false).unwrap()
+    embedding_document(&[embedded(1, &[1.0, 0.0]), embedded(3, &[0.0, 1.0])], pooling, false)
+        .unwrap()
+        .expect("two chunks")
 }
 
 #[test]
 fn embedding_document_restores_unit_length() {
-    let pooled =
-        embedding_document(&[embedded(1, &[1.0, 0.0]), embedded(3, &[0.0, 1.0])], DocumentPooling::Mean, true).unwrap();
+    let pooled = embedding_document(&[embedded(1, &[1.0, 0.0]), embedded(3, &[0.0, 1.0])], DocumentPooling::Mean, true)
+        .unwrap()
+        .expect("two chunks");
     let expected = [0.25 / 0.625f32.sqrt(), 0.75 / 0.625f32.sqrt()];
     assert!(pooled.iter().zip(expected).all(|(a, b)| (a - b).abs() < 1e-6), "{pooled:?}");
 }
 
 #[test]
 fn a_chunk_without_content_weighs_one() {
-    let pooled = classification_document(&[classified(0, &[2.0]), classified(1, &[0.0])], DocumentPooling::Mean);
+    let pooled =
+        classification_document(&[classified(0, &[2.0]), classified(1, &[0.0])], DocumentPooling::Mean).unwrap();
     assert_eq!(pooled, Some(vec![1.0]));
 }
 
@@ -1107,13 +1111,21 @@ fn a_chunk_without_content_weighs_one() {
 #[test]
 fn classification_document_max_is_the_best_window() {
     let windows = [classified(4, &[-1.0, 0.0]), classified(4, &[3.0, -2.0]), classified(1, &[0.5, 1.0])];
-    assert_eq!(classification_document(&windows, DocumentPooling::Max), Some(vec![3.0, 1.0]));
+    assert_eq!(classification_document(&windows, DocumentPooling::Max).unwrap(), Some(vec![3.0, 1.0]));
 }
 
 #[test]
 fn no_chunks_pool_to_nothing() {
-    assert_eq!(embedding_document(&[], DocumentPooling::Mean, true), None);
-    assert_eq!(classification_document(&[], DocumentPooling::Max), None);
+    assert_eq!(embedding_document(&[], DocumentPooling::Mean, true).unwrap(), None);
+    assert_eq!(classification_document(&[], DocumentPooling::Max).unwrap(), None);
+}
+
+/// A head answering one chunk at two values and the next at one is a bug the
+/// caller reads out of the error, not a panic.
+#[test]
+fn ragged_chunks_pool_to_an_error() {
+    let ragged = embedding_document(&[embedded(1, &[1.0, 0.0]), embedded(3, &[0.0])], DocumentPooling::Mean, false);
+    assert!(matches!(ragged, Err(DocumentError::RaggedWidth { chunk: 1, width: 1, first: 2 })));
 }
 
 // ─── warm_up ────────────────────────────────────────────────────────────────
@@ -1591,6 +1603,7 @@ fn decoders_number_only_a_pairs_second_text() {
         out.chunks.iter().map(|c| labels_for_tokens(c, |_| "x").iter().map(|t| t.token_index).collect()).collect();
     assert_eq!(indices, [[0], [1], [2]]);
     let scores: Vec<(usize, f32)> = token_scores_document(&out.chunks, WindowWeighting::Uniform)
+        .unwrap()
         .iter()
         .map(|t| (t.token_index, t.probs[0]))
         .collect();
@@ -1604,7 +1617,7 @@ fn score_rows(scores: &TokenScores) -> Vec<(usize, (usize, usize), Vec<f32>)> {
 
 #[test]
 fn token_scores_take_a_sigmoid_per_content_token() {
-    let scores = token_scores_document(&[scored_chunk(0, &[&[2.0], &[-1.0]])], WindowWeighting::Uniform);
+    let scores = token_scores_document(&[scored_chunk(0, &[&[2.0], &[-1.0]])], WindowWeighting::Uniform).unwrap();
     assert_eq!(scores.num_labels(), 1);
     assert_eq!(score_rows(&scores), [(0, (0, 1), vec![sigmoid(2.0)]), (1, (1, 2), vec![sigmoid(-1.0)])]);
 }
@@ -1612,7 +1625,7 @@ fn token_scores_take_a_sigmoid_per_content_token() {
 /// Labels score independently: two labels may both be likely.
 #[test]
 fn token_scores_score_each_label_on_its_own() {
-    let scores = token_scores_document(&[scored_chunk(0, &[&[1.0, 1.0]])], WindowWeighting::Uniform);
+    let scores = token_scores_document(&[scored_chunk(0, &[&[1.0, 1.0]])], WindowWeighting::Uniform).unwrap();
     assert_eq!(score_rows(&scores), [(0, (0, 1), vec![sigmoid(1.0); 2])]);
 }
 
@@ -1622,7 +1635,7 @@ fn token_scores_score_each_label_on_its_own() {
 #[test]
 fn token_scores_average_logits_across_windows() {
     let windows = [scored_chunk(0, &[&[0.5], &[2.0]]), scored_chunk(1, &[&[-4.0], &[1.5]])];
-    let scores = token_scores_document(&windows, WindowWeighting::Uniform);
+    let scores = token_scores_document(&windows, WindowWeighting::Uniform).unwrap();
     let want = [(0, (0, 1), vec![sigmoid(0.5)]), (1, (1, 2), vec![sigmoid(-1.0)]), (2, (2, 3), vec![sigmoid(1.5)])];
     assert_eq!(score_rows(&scores), want);
 }
@@ -1634,7 +1647,7 @@ fn token_scores_average_logits_across_windows() {
 #[test_case(WindowWeighting::Hat => 1.0; "hat")]
 fn token_scores_weigh_window_edges(weighting: WindowWeighting) -> f32 {
     let windows = [scored_chunk(0, &[&[0.0], &[2.0], &[0.0]]), scored_chunk(1, &[&[-2.0], &[0.0], &[0.0]])];
-    let p = token_scores_document(&windows, weighting).iter().nth(1).expect("token 1").probs[0];
+    let p = token_scores_document(&windows, weighting).unwrap().iter().nth(1).expect("token 1").probs[0];
     // Back to the averaged logit, rounded past the f32 noise of the weights.
     ((p / (1.0 - p)).ln() * 1e4).round() / 1e4
 }
@@ -1644,20 +1657,23 @@ fn token_scores_weigh_window_edges(weighting: WindowWeighting) -> f32 {
 fn token_scores_keep_tokens_that_share_a_span() {
     let (mut a, mut b) = (scored_chunk(0, &[&[1.0], &[2.0]]), scored_chunk(1, &[&[2.0], &[3.0]]));
     (a.token_offsets[1], a.token_offsets[2], b.token_offsets[1]) = ((0, 4), (0, 4), (0, 4));
-    let rows = score_rows(&token_scores_document(&[a, b], WindowWeighting::Uniform));
+    let rows = score_rows(&token_scores_document(&[a, b], WindowWeighting::Uniform).unwrap());
     let want = [(0, (0, 4), vec![sigmoid(1.0)]), (1, (0, 4), vec![sigmoid(2.0)]), (2, (2, 3), vec![sigmoid(3.0)])];
     assert_eq!(rows, want);
 }
 
 #[test]
 fn token_scores_of_no_windows_are_empty() {
-    assert!(token_scores_document(&[], WindowWeighting::Hat).is_empty());
+    assert!(token_scores_document(&[], WindowWeighting::Hat).unwrap().is_empty());
 }
 
+/// A head scoring one label in a window and two in the next is a bug the
+/// caller reads out of the error, not a panic.
 #[test]
-#[should_panic(expected = "every window of a text scores the same labels")]
 fn token_scores_refuse_windows_with_different_labels() {
-    token_scores_document(&[scored_chunk(0, &[&[1.0]]), scored_chunk(1, &[&[1.0, 2.0]])], WindowWeighting::Uniform);
+    let scored =
+        token_scores_document(&[scored_chunk(0, &[&[1.0]]), scored_chunk(1, &[&[1.0, 2.0]])], WindowWeighting::Uniform);
+    assert!(matches!(scored, Err(DocumentError::RaggedLabels { window: 1, labels: 2, first: 1 })));
 }
 
 proptest! {
