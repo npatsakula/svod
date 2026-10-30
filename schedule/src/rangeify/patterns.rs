@@ -14,12 +14,14 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use smallvec::SmallVec;
+use smallvec::{SmallVec, smallvec};
 use svod_device::DeviceSpec;
 use svod_dtype::{AddrSpace, DType};
 use svod_ir::uop::cached_property::CachedProperty;
 use svod_ir::uop::properties::{RangesProperty, SoundVminVmaxProperty};
-use svod_ir::{AxisId, AxisType, BinaryOp, BufferizeOpts, ConstValue, Op, ReduceOp, UOp, UOpKey, UnaryOp};
+use svod_ir::{
+    AxisId, AxisType, BinaryOp, BufferizeOpts, ConstValue, Op, ReduceOp, SInt, TernaryOp, UOp, UOpKey, UnaryOp,
+};
 
 use crate::TypedPatternMatcher;
 use crate::rangeify::transforms::{cast_to_dtype, get_range_size, partition_reduce_ranges};
@@ -1578,6 +1580,8 @@ fn try_reduce_collapse(
     //
     // A shape that is not NE/EQ over this range must FALL THROUGH to Pattern 4:
     // an `And` condition is exactly what the two-sided rule below is written for.
+    // [`is_one_hot_select`] below mirrors this arm on the pre-synthesis graph,
+    // for the kernel splitter's guard; keep the two in sync.
     if let Some((lhs, rhs, expr)) = match cond.op() {
         Op::Binary(BinaryOp::Ne, lhs, rhs) if is_const_zero(true_val) => Some((lhs, rhs, false_val)),
         Op::Binary(BinaryOp::Eq, lhs, rhs) if is_const_zero(false_val) => Some((lhs, rhs, true_val)),
@@ -1632,6 +1636,80 @@ fn try_reduce_collapse(
     }
 
     None
+}
+
+/// Follows `node` down through movement ops, and through the casts whose source
+/// `pass` accepts, to the first other op, carrying `indices` (what each axis of
+/// `node` is read at) onto that op's axes. `None` past a cast `pass` refuses.
+fn through_views(
+    mut node: &Arc<UOp>,
+    mut indices: Vec<Arc<UOp>>,
+    pass: impl Fn(&Arc<UOp>) -> bool,
+) -> Option<(&Arc<UOp>, Vec<Arc<UOp>>)> {
+    loop {
+        match node.op() {
+            Op::Cast(ops::Cast { src, .. }) => node = pass(src).then_some(src)?,
+            op if op.is_movement() => {
+                let src = op.children()[0];
+                indices = super::indexing::apply_movement_op(op, src.shape().ok()??, &indices);
+                node = src;
+            }
+            _ => return Some((node, indices)),
+        }
+    }
+}
+
+/// Whether `reduce` is the one-hot lookup `Tensor::embedding` and `gather`
+/// build, in a form reduce simplification folds into one indexed load: a sum
+/// of `where(idx == arange, x, 0)`, `where(idx != arange, 0, x)` or
+/// `x * (idx == arange)`, where `idx` is constant along the reduced axes and
+/// `arange` varies along all of them without reading a buffer, through casts
+/// that keep every value of `idx`. Split, the first stage still folds, gated on
+/// `idx` landing in its chunk, but the lookup pays for a second kernel and an
+/// intermediate of one value per chunk.
+///
+/// This is patterns 3/3b of [`try_reduce_collapse`] above, read off the
+/// pre-synthesis graph: what that arm folds once reduce simplification has
+/// synthesized its per-range reduce, this recognizes before, from the whole
+/// reduce and its input shape. [`super::kernel::split_reduceop`] skips what it
+/// answers, so the two must stay in sync.
+pub(crate) fn is_one_hot_select(reduce: &Arc<UOp>, input_shape: &[SInt]) -> bool {
+    let Op::Reduce(ops::Reduce { src, reduce_op: ReduceOp::Add, num_axes, .. }) = reduce.op() else {
+        return false;
+    };
+    // A cast between the reduce and the select keeps it from folding.
+    let Some((select, at)) = through_views(src, super::kernel::axis_ranges(input_shape), |_| false) else {
+        return false;
+    };
+    let is_zero = |uop: &Arc<UOp>| matches!(uop.base().op(), Op::Const(value) if value.0.is_zero());
+    let (gates, compare): (SmallVec<[&Arc<UOp>; 2]>, _) = match select.op() {
+        Op::Ternary(TernaryOp::Where, gate, _, otherwise) if is_zero(otherwise) => (smallvec![gate], BinaryOp::Eq),
+        Op::Ternary(TernaryOp::Where, gate, picked, _) if is_zero(picked) => (smallvec![gate], BinaryOp::Ne),
+        Op::Binary(BinaryOp::Mul, lhs, rhs) => (smallvec![lhs, rhs], BinaryOp::Eq),
+        _ => return false,
+    };
+
+    let reduced: HashSet<usize> =
+        (0..*num_axes).filter(|&axis| input_shape[axis].as_const().is_some_and(|n| n > 1)).collect();
+    // The reduced axes `side` varies along, and the op it reads them from.
+    let along_reduced = |side: &Arc<UOp>, at: &[Arc<UOp>], pass: &dyn Fn(&Arc<UOp>) -> bool| {
+        let (base, at) = through_views(side, at.to_vec(), pass)?;
+        let axes: HashSet<usize> =
+            at.iter().flat_map(super::kernel::collect_range_ids).filter(|axis| reduced.contains(axis)).collect();
+        Some((base.clone(), axes))
+    };
+    let selects = |idx: &Arc<UOp>, arange: &Arc<UOp>, at: &[Arc<UOp>]| {
+        let keeps_idx = |src: &Arc<UOp>| svod_dtype::DType::can_safe_cast(idx.dtype(), src.dtype());
+        along_reduced(idx, at, &|_| true).is_some_and(|(_, axes)| axes.is_empty())
+            && along_reduced(arange, at, &keeps_idx)
+                .is_some_and(|(base, axes)| axes == reduced && !base.any_in_subtree(|node| node.has_buffer_identity()))
+    };
+    gates.into_iter().any(|gate| {
+        through_views(gate, at.clone(), |_| true).is_some_and(|(cmp, at)| match cmp.op() {
+            Op::Binary(op, lhs, rhs) if *op == compare => selects(lhs, rhs, &at) || selects(rhs, lhs, &at),
+            _ => false,
+        })
+    })
 }
 
 /// Extract lower bound from (r >= lower) condition.
