@@ -123,6 +123,9 @@ fn free_batch_jit_takes_flash_attention_with_the_mask() {
         max_batch_size: rows,
         ..tiny_cfg()
     };
+    // One deterministic draw: the bound below is measured against it, not
+    // against a distribution over draws.
+    svod_tensor::rand::manual_seed(42);
     let reference = XlmRobertaModel::empty(cfg.clone());
     let weights = reference.state_dict("");
     weights.values().for_each(|w| w.realize().expect("realize weight"));
@@ -167,8 +170,8 @@ fn free_batch_jit_takes_flash_attention_with_the_mask() {
     unmasked[..live * len].fill(1);
     let control = max_abs_delta(&real_rows(&run(&unmasked), live_mask, d), &want);
     eprintln!("bf16 free-batch jit max |Δ| from f32: {drift:.3e}; padding ignored: {control:.3e}");
-    // The weights are unseeded: over five runs on the RTX 3060, bf16 rounding
-    // lands at 0.036-0.044 and attending the padding at 0.50-0.84.
+    // The weights are seeded (above): on the RTX 3060, bf16 rounding lands at
+    // 5.3e-2 and attending the padding at 7.4e-1.
     let bound = 0.2;
     assert!(drift < bound, "the free-batch plan drifts from the f32 forward: {drift:.3e}");
     assert!(control > bound, "ignoring the padding stays within the bound ({control:.3e}): it cannot catch a mask bug");
