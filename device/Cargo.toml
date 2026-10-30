@@ -16,13 +16,13 @@ svod-ir = { path = "../ir", version = "=0.3.0" }
 ndarray.workspace = true
 
 snafu = "0.9"
-parking_lot = "0.12"
+parking_lot = "0.13"
 smallvec = { workspace = true }
 tracing = "0.1"
 sha2 = "0.11"
 serde = { version = "1", features = ["derive"] }
 
-proptest-derive = { version = "0.8", optional = true }
+proptest-derive = { version = "0.9", optional = true }
 proptest = { version = "1.9", optional = true }
 memmap2 = "0.9"
 object = { version = "0.40", default-features = false, features = ["elf", "read"] }
