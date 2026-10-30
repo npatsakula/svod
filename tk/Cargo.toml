@@ -8,15 +8,15 @@ repository.workspace = true
 description = "Tiled Language v3: structured tile programs over F2 linear layouts, lowered per GPU target, with a measured planner and an always-a-Tensor op layer"
 
 [dependencies]
-svod-dtype = { path = "../dtype", version = "=0.2.0" }
-svod-ir = { path = "../ir", version = "=0.2.0" }
+svod-dtype = { path = "../dtype", version = "=0.3.0" }
+svod-ir = { path = "../ir", version = "=0.3.0" }
 smallvec = { workspace = true }
 snafu = "0.9"
-svod-schedule = { path = "../schedule", version = "=0.2.0" }
-svod-codegen = { path = "../codegen", version = "=0.2.0" }
-svod-tensor = { path = "../tensor", version = "=0.2.0" }
-svod-device = { path = "../device", version = "=0.2.0" }
-svod-runtime = { path = "../runtime", version = "=0.2.0" }
+svod-schedule = { path = "../schedule", version = "=0.3.0" }
+svod-codegen = { path = "../codegen", version = "=0.3.0" }
+svod-tensor = { path = "../tensor", version = "=0.3.0" }
+svod-device = { path = "../device", version = "=0.3.0" }
+svod-runtime = { path = "../runtime", version = "=0.3.0" }
 papaya = "0.2.3"
 rayon = "1.12.0"
 tracing = "0.1"

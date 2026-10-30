@@ -11,8 +11,8 @@ description = "Host-side pipelines for Svod: CTC and RNN-T decoders, VAD-driven 
 [dependencies]
 serde = { version = "1.0", features = ["derive"], optional = true }
 snafu = "0.9"
-svod-ir = { path = "../ir", version = "=0.2.0" }
-svod-runtime = { path = "../runtime", version = "=0.2.0" }
+svod-ir = { path = "../ir", version = "=0.3.0" }
+svod-runtime = { path = "../runtime", version = "=0.3.0" }
 tokenizers = { version = "0.23", default-features = false, features = ["onig"], optional = true }
 
 [dev-dependencies]
