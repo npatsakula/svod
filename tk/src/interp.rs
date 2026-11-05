@@ -166,9 +166,18 @@ impl Frame<'_> {
                 let out = self.tile_op(*dst, op)?;
                 self.regs.insert(*dst, out);
             }
-            Stmt::Copy { dst, src, .. } => {
+            Stmt::Copy { dst, src, mode, .. } => {
                 let data = self.read(*src)?;
-                self.write(*dst, &data)?;
+                match mode {
+                    CopyMode::AtomicAdd => {
+                        let dtype = self.prog.value(*dst).dtype;
+                        self.write_with(*dst, &data, |old, x| match dtype {
+                            ScalarDType::Int32 => (old as i32).wrapping_add(x as i32) as f64,
+                            _ => round_to(dtype, old + x),
+                        })?
+                    }
+                    _ => self.write(*dst, &data)?,
+                }
             }
             Stmt::Loop(l) => {
                 let (start, extent) = (self.scalar(l.start)?, self.scalar(l.extent)?);
@@ -294,6 +303,12 @@ impl Frame<'_> {
     }
 
     fn write(&mut self, id: ValId, data: &[f64]) -> Result<()> {
+        self.write_with(id, data, |_, x| x)
+    }
+
+    /// Each element of `id` as `f` of what it held and its element of `data`,
+    /// in row-major order.
+    fn write_with(&mut self, id: ValId, data: &[f64], f: impl Fn(f64, f64) -> f64) -> Result<()> {
         let v = self.prog.value(id).clone();
         let Shape { rows, cols } = v.shape;
         let rounded: Vec<f64> = data.iter().map(|&x| round_to(v.dtype, x)).collect();
@@ -317,7 +332,7 @@ impl Frame<'_> {
                     Place::Reg => unreachable!(),
                 };
                 for (i, x) in writes {
-                    store[i] = x;
+                    store[i] = f(store[i], x);
                 }
             }
         }

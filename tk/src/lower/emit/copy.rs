@@ -1,7 +1,9 @@
 //! Copies between the tiers: fills of shared memory, register loads from
 //! shared and global memory, stores, and relayouts between register layouts.
 
+use svod_codegen::llvm::common::ldt;
 use svod_codegen::llvm::nvptx::smem::{cp_async_16, cp_async_16_zfill};
+use svod_dtype::GpuArch;
 use svod_ir::ConstValue;
 
 use crate::layout as frag;
@@ -13,6 +15,9 @@ use super::*;
 
 impl Emit<'_> {
     pub(super) fn copy(&mut self, dst: ValId, src: ValId, mode: CopyMode, scope: Scope) -> Result<()> {
+        if mode == CopyMode::AtomicAdd {
+            return self.atomic_add_regs(dst, src, scope);
+        }
         match (self.value(dst).tier(), self.value(src).tier()) {
             (Tier::Smem, Tier::Global) => self.fill(dst, src, mode, scope),
             (Tier::Reg, Tier::Smem) => self.gather(dst, src),
@@ -212,6 +217,57 @@ impl Emit<'_> {
             }
         }
         Ok(())
+    }
+
+    /// Registers added into an accumulator one element at a time (a vector
+    /// add would be a compare-and-swap loop), each under its row's gate. Every
+    /// element of the tile must be one lane's alone, every warp's to add: a
+    /// layout replicating an element, or a warp skipping its share, would add
+    /// a different sum than the program says.
+    fn atomic_add_regs(&mut self, dst: ValId, src: ValId, scope: Scope) -> Result<()> {
+        let l = self.layout(src).clone();
+        let d = self.view(dst);
+        let wave = self.low.device.target.wave;
+        snafu::ensure!(
+            scope == Scope::Block && self.divergent == 0 && self.prog.warps == self.grid_warps(),
+            UnsupportedSnafu { what: "an atomic add some of the block's warps skip" }
+        );
+        snafu::ensure!(
+            (l.regs() * wave * self.grid_warps()) as usize == d.shape.elems(),
+            UnsupportedSnafu {
+                what: format!("an atomic add of a {}×{} tile a layout replicates", d.shape.rows, d.shape.cols)
+            }
+        );
+        for j in 0..l.regs() {
+            let c = self.coord(&l, j);
+            let (off, gate) = self.address(&d, &c);
+            let gate = gate.expect("an atomic add's row gate");
+            let val = self.reg_load(src, j);
+            let at = self.access(&d.buf, &off, 1);
+            let add = self.atomic_add(at, val);
+            let tag = self.next_tag();
+            let if_ = self.push(UOp::if_(gate, smallvec![]).rtag(Some(smallvec![tag as usize])));
+            self.push(add);
+            self.push(UOp::endif(if_));
+        }
+        Ok(())
+    }
+
+    /// `*at += val`, its result unused, ordered by the dispatch alone. At AMD's
+    /// agent scope `monotonic` is a plain `global_atomic`, on every die of a
+    /// part; the metadata states the memory is the device's own, which is what
+    /// lets the backend issue the instruction rather than a compare-and-swap
+    /// loop.
+    fn atomic_add(&self, at: Arc<UOp>, val: Arc<UOp>) -> Arc<UOp> {
+        let ordering = match self.low.device.target.arch {
+            GpuArch::Cuda(_) => "syncscope(\"device\") monotonic",
+            GpuArch::Amd(_) => "syncscope(\"agent\") monotonic, !amdgpu.no.fine.grained.memory !{{}}",
+            GpuArch::Metal(_) => unreachable!("gated before emission"),
+        };
+        let dtype = val.dtype();
+        let op = if dtype == DType::Float32 { "fadd" } else { "add" };
+        let code = format!("atomicrmw {op} ptr {{0}}, {} {{1}} {ordering}", ldt(&dtype));
+        UOp::custom(smallvec![at, val], code, DType::Void)
     }
 
     pub(super) fn relayout(&mut self, dst: ValId, src: ValId) -> Result<()> {

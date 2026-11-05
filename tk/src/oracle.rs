@@ -45,6 +45,8 @@ fn op(name: &str) -> &'static str {
         "wmma16" => "oracle:wmma16",
         "tr_load" => "oracle:tr_load",
         "dot2_bf16" => "oracle:dot2_bf16",
+        "atomic_add_i32" => "oracle:atomic_add_i32",
+        "atomic_add_f32" => "oracle:atomic_add_f32",
         other => unreachable!("no oracle op for {other}"),
     }
 }
@@ -86,7 +88,15 @@ fn cuda(target: &Target, c: CudaArch) -> Vec<Capability> {
         "{shared}\n.visible .entry oracle() {{\n  .reg .b64 %rd<3>;\n  mov.u64 %rd1, smem;\n  mov.u64 %rd2, 0;\n  \
          cp.async.cg.shared.global [%rd1], [%rd2], 16;\n  cp.async.commit_group;\n  ret;\n}}"
     ));
+    let atom = |kind: &str, ty: &str| {
+        module(&format!(
+            "\n.visible .entry oracle() {{\n  .reg .{kind} %r<3>;\n  .reg .b64 %rd1;\n  mov.u64 %rd1, 0;\n  \
+             atom.global.add.{ty} %r1, [%rd1], %r2;\n  ret;\n}}"
+        ))
+    };
     vec![
+        Capability { name: "atomic_add_i32", module: atom("b32", "u32"), table: target.atomic_add.i32 },
+        Capability { name: "atomic_add_f32", module: atom("f32", "f32"), table: target.atomic_add.f32 },
         Capability { name: "wgmma", module: wgmma, table: !target.group_mma.is_empty() },
         Capability { name: "ldmatrix", module: ldmatrix, table: target.ldmatrix },
         Capability { name: "mma_i8", module: mma_i8, table: target.geometry_of(ScalarDType::Int8).is_some() },
@@ -113,6 +123,20 @@ fn amd(target: &Target, a: AmdArch) -> Vec<Capability> {
         (false, false) => module("v_wmma_i32_16x16x16_iu8 v[0:7], v[8:11], v[12:15], v[16:23]"),
     };
     vec![
+        Capability {
+            name: "atomic_add_i32",
+            module: module(if cdna {
+                "global_atomic_add v0, v1, s[0:1]"
+            } else {
+                "global_atomic_add_u32 v0, v1, s[0:1]"
+            }),
+            table: target.atomic_add.i32,
+        },
+        Capability {
+            name: "atomic_add_f32",
+            module: module("global_atomic_add_f32 v0, v1, s[0:1]"),
+            table: target.atomic_add.f32,
+        },
         Capability { name: "wmma16", module: wmma16, table: target.geometry().is_some() },
         Capability { name: "mma_i8", module: mma_i8, table: target.geometry_of(ScalarDType::Int8).is_some() },
         Capability {
@@ -228,6 +252,8 @@ pub(crate) fn flipped(target: &Target, verdicts: &[(&'static str, Option<bool>)]
             "wmma16" if !v => gated.mma.retain(|a| a.dtype_in.bytes() != 2),
             "tr_load" => gated.tr_load = v,
             "dot2_bf16" => gated.dot2_bf16 = v,
+            "atomic_add_i32" => gated.atomic_add.i32 = v,
+            "atomic_add_f32" => gated.atomic_add.f32 = v,
             _ => {}
         }
     }

@@ -823,6 +823,12 @@ impl ProgramInfo {
                         ins.push(slot);
                     }
                 }
+                Op::Custom(..) => {
+                    for slot in u.read_modify_writes().filter_map(param_slot) {
+                        outs.push(slot);
+                        ins.push(slot);
+                    }
+                }
                 Op::Special(ops::Special { end, name }) => {
                     let Some(axis) = name.chars().last().and_then(|c| c.to_digit(10)).map(|axis| axis as usize) else {
                         continue;

@@ -60,6 +60,11 @@ impl MmaIn for I8 {
     }
 }
 
+/// An element an atomic add takes ([`Kernel::atomic_add`]).
+pub trait Accumulable: Elem {}
+impl Accumulable for I32 {}
+impl Accumulable for F32 {}
+
 pub trait TierMark: Copy {}
 macro_rules! tier {
     ($($name:ident),*) => {$(
@@ -94,6 +99,12 @@ impl<P, T> Tile<P, T> {
         Self(id, PhantomData)
     }
 }
+
+/// Elements of an [`ParamKind::Accum`] parameter: only
+/// [`Kernel::atomic_add`] takes one, so it is no [`TierMark`] and nothing
+/// reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Accum;
 
 pub type Gmem<T> = Tile<Global, T>;
 pub type Shared<T> = Tile<Smem, T>;
@@ -333,6 +344,7 @@ impl Kernel {
         shape: Shape,
         bounds: [Option<Sc>; 2],
     ) -> Gmem<T> {
+        self.refuse_accum(param.0);
         let offset = self.intern(offset);
         let stride = stride.map(|s| self.intern(s));
         let bounds = bounds.map(|b| b.map(|s| self.intern(s)));
@@ -353,15 +365,48 @@ impl Kernel {
         shape: Shape,
         col_bound: Option<Sc>,
     ) -> Gmem<T> {
+        self.refuse_accum(param.0);
+        Tile::new(self.gathered(param.0, T::DTYPE, offset, rows, valid, shape, col_bound))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gathered(
+        &mut self,
+        param: ParamId,
+        dtype: ScalarDType,
+        offset: impl Into<Sc>,
+        rows: Sc,
+        valid: Option<Sc>,
+        shape: Shape,
+        col_bound: Option<Sc>,
+    ) -> ValId {
         let offset = self.intern(offset);
         let rows = RowMap { offset: self.intern(rows), valid: valid.map(|v| self.intern(v)) };
         let stride = [self.intern(0), self.intern(1)];
         let bounds = [None, col_bound.map(|b| self.intern(b))];
-        Tile::new(self.value(
-            T::DTYPE,
-            shape,
-            Place::Global { param: param.0, offset, stride, bounds, rows: Some(rows), period: None },
-        ))
+        self.value(dtype, shape, Place::Global { param, offset, stride, bounds, rows: Some(rows), period: None })
+    }
+
+    fn refuse_accum(&self, param: ParamId) {
+        assert_ne!(self.prog.params[param.index()].kind, ParamKind::Accum, "an accumulator is only added to");
+    }
+
+    /// The elements of an accumulator [`Kernel::atomic_add`] adds to, as
+    /// [`Self::gather`] picks them: row `r`, column `c` is
+    /// `offset + rows[Row := r] + c`, and a row where `valid[Row := r]` is
+    /// zero drops its update. `valid` is required: the author says where a row
+    /// is inside the parameter, and that no two rows of the tile are one
+    /// update (a padded tile's clamped row, say).
+    pub fn gather_accum<T: Accumulable>(
+        &mut self,
+        param: ParamRef<T>,
+        offset: impl Into<Sc>,
+        rows: Sc,
+        valid: Sc,
+        shape: Shape,
+    ) -> Tile<Accum, T> {
+        assert_eq!(self.prog.params[param.0.index()].kind, ParamKind::Accum, "an accumulator's elements");
+        Tile::new(self.gathered(param.0, T::DTYPE, offset, rows, Some(valid), shape, None))
     }
 
     /// `view` with its columns repeating every `period`: column `c` reads
@@ -634,6 +679,9 @@ impl Kernel {
         if let Place::Global { period: Some(_), .. } = s.place {
             assert_eq!(d.place, Place::Reg, "a periodic view is read into registers only");
         }
+        if let Err(what) = self.prog.check_accum_copy(dst, src, mode) {
+            panic!("{what}");
+        }
         self.push(Stmt::Copy { dst, src, mode, scope: self.scope });
     }
 
@@ -663,6 +711,14 @@ impl Kernel {
     /// Registers → shared or global.
     pub fn store<T: Elem, P: TierMark>(&mut self, dst: Tile<P, T>, src: Regs<T>) {
         self.copy(dst.0, src.0, CopyMode::Sync);
+    }
+
+    /// `dst += src`, element by element: every thread adds what it holds and
+    /// no thread sees another's add before the dispatch ends. The sum is
+    /// exact for `i32`, which wraps; for `f32` its rounding depends on the
+    /// order the threads land in.
+    pub fn atomic_add<T: Accumulable>(&mut self, dst: Tile<Accum, T>, src: Regs<T>) {
+        self.copy(dst.0, src.0, CopyMode::AtomicAdd);
     }
 
     // ---- control ---------------------------------------------------------

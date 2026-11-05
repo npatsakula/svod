@@ -1,3 +1,4 @@
+mod atomics;
 mod atoms;
 mod attention;
 mod build;

@@ -360,6 +360,10 @@ pub enum CopyMode {
     /// where they are register-staged), so a register load in this mode
     /// moves bytes exactly as a fill would.
     Staged,
+    /// Registers added into an [`ParamKind::Accum`] view, element by element
+    /// and in no order among threads; what a block adds lands by the end of
+    /// the dispatch, never before the block's next statement.
+    AtomicAdd,
 }
 
 /// A loop-carried register: `phi` holds `init` on entry, is assigned `next`
@@ -500,6 +504,9 @@ pub struct Block(pub Vec<Stmt>);
 pub enum ParamKind {
     In,
     Out,
+    /// Added to and nothing else: its contents are the launch's own, a kernel
+    /// never reads them, and it may share no byte with another parameter.
+    Accum,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -576,6 +583,28 @@ pub struct Program {
 impl Program {
     pub fn value(&self, id: ValId) -> &Value {
         &self.values[id.index()]
+    }
+    /// Whether a value is a view of an accumulator.
+    pub fn is_accum(&self, id: ValId) -> bool {
+        matches!(self.value(id).place, Place::Global { param, .. } if self.params[param.index()].kind == ParamKind::Accum)
+    }
+    /// How a copy may touch an accumulator: only an atomic add writes one,
+    /// nothing reads one, and an atomic add moves registers into one gated
+    /// gather.
+    pub fn check_accum_copy(&self, dst: ValId, src: ValId, mode: CopyMode) -> Result<(), &'static str> {
+        if self.is_accum(src) {
+            return Err("an accumulator is read");
+        }
+        if mode != CopyMode::AtomicAdd {
+            return if self.is_accum(dst) { Err("an accumulator takes atomic adds only") } else { Ok(()) };
+        }
+        let gated = matches!(self.value(dst).place, Place::Global { rows: Some(RowMap { valid: Some(_), .. }), .. });
+        match () {
+            () if !self.is_accum(dst) => Err("an atomic add into other than an accumulator"),
+            () if !gated => Err("an atomic add without a row gate"),
+            () if self.value(src).tier() != Tier::Reg => Err("an atomic add from other than registers"),
+            () => Ok(()),
+        }
     }
     pub fn scalar(&self, id: ScalarId) -> &Scalar {
         &self.scalars[id.index()]
