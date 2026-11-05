@@ -37,6 +37,16 @@ pub(super) use crate::sweep::{Launch, amd, families, group_families, hopper, lin
 /// integer of the full range.
 fn inputs(name: &str, prog: &Program) -> Vec<Vec<f64>> {
     let mut seed = name.len() as u64;
+    // Indices over the rows and past them, colliding, for a scatter to drop
+    // and to sum; integers, whose sums are exact in either type, so no order
+    // of landing shows.
+    if name.starts_with("scatter_add") {
+        let [target, index, values] = prog.params.as_slice() else { panic!("target, index, values") };
+        let rows = (target.elems * index.elems / values.elems) as i64;
+        let ramp = |n: usize, by: i64| (0..n as i64).map(|i| (i * by) as f64).collect();
+        let at = (0..index.elems as i64).map(|i| (i * 7 % (rows + 4) - 2) as f64).collect();
+        return vec![ramp(target.elems, 11), at, ramp(values.elems, 1)];
+    }
     let params = prog.params.iter().map(|p| match p.dtype {
         ScalarDType::Int32 => vec![1.0; p.elems],
         ScalarDType::Int8 => super::rounded(ScalarDType::Int8, p.elems, &mut seed, |x| (127.0 * x).round()),

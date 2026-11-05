@@ -42,6 +42,10 @@ pub enum Error {
     Graph { name: String, source: svod_tensor::error::Error },
     #[snafu(display("{name} declares {want} parameters, {got} tensors were given"))]
     Arity { name: String, want: usize, got: usize },
+    #[snafu(display("{name}'s accumulator {param} shares its buffer with another parameter"))]
+    AccumAlias { name: String, param: String },
+    #[snafu(display("{name}'s accumulator {param} is not a realized buffer"))]
+    AccumTarget { name: String, param: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -77,6 +81,7 @@ pub(crate) fn graph_launch_lowered(
         tensors.len() == prog.params.len(),
         AritySnafu { name: name.clone(), want: prog.params.len(), got: tensors.len() }
     );
+    check_accums(prog, tensors)?;
     let standalone = match lowering.device.target.arch {
         svod_dtype::GpuArch::Cuda(_) => DeviceSpec::Cuda { device_id: 0 },
         svod_dtype::GpuArch::Amd(_) => DeviceSpec::Amd { device_id: 0 },
@@ -101,8 +106,31 @@ pub(crate) fn graph_launch_lowered(
     outs.context(GraphSnafu { name })
 }
 
+/// Every accumulator is a buffer of its own: realized (a lazy value would be
+/// hash-consed onto one buffer with any equal one), and sharing no byte with
+/// another parameter of the launch, which holds `noalias` and may be read.
+pub(crate) fn check_accums(prog: &Program, tensors: &[&Tensor]) -> Result<()> {
+    let buffer = |t: &Tensor| t.uop().base().buf_uop().id;
+    let storage = |t: &Tensor| t.buffer().map(|b| b.storage_id());
+    for (i, p) in prog.params.iter().enumerate().filter(|(_, p)| p.kind == ParamKind::Accum) {
+        let (name, param) = (&prog.name, &p.name);
+        let uop = tensors[i].uop();
+        snafu::ensure!(
+            uop.has_buffer_identity() || UOp::realized_base(&uop).is_some(),
+            AccumTargetSnafu { name, param }
+        );
+        let shared = |(j, other): (usize, &&Tensor)| {
+            j != i
+                && (buffer(other) == buffer(tensors[i])
+                    || storage(other).is_some_and(|s| Some(s) == storage(tensors[i])))
+        };
+        snafu::ensure!(!tensors.iter().enumerate().any(shared), AccumAliasSnafu { name, param });
+    }
+    Ok(())
+}
+
 pub(crate) fn first_output(prog: &Program) -> usize {
-    prog.params.iter().position(|p| p.kind == ParamKind::Out).expect("a program writes something")
+    prog.params.iter().position(|p| p.kind != ParamKind::In).expect("a program writes something")
 }
 
 /// [`graph_launch`] returning every parameter's tensor as it is after the
@@ -117,6 +145,7 @@ fn launch_all(prog: Program, lowering: &Lowering, tensors: &[&Tensor], memo: boo
         tensors.len() == prog.params.len(),
         AritySnafu { name: name.clone(), want: prog.params.len(), got: tensors.len() }
     );
+    check_accums(&prog, tensors)?;
     let out_at = first_output(&prog);
     // `custom_kernel` hands placeholders in `[out, ins...]` order.
     let ins: Vec<&Tensor> = tensors.iter().enumerate().filter(|(i, _)| *i != out_at).map(|(_, t)| *t).collect();

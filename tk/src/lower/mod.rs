@@ -42,6 +42,39 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// [`Program::check_accum_copy`] over a whole program, whose fields are public,
+/// with every accumulator refused as a scalar load or a product's operand, and
+/// every add one the target has.
+fn check_atomics(prog: &Program, target: &Target) -> Result<()> {
+    let refused = |what: &str| UnsupportedSnafu { what: what.to_string() }.fail();
+    if prog
+        .scalars
+        .iter()
+        .any(|s| matches!(s, Scalar::Load { param, .. } if prog.params[param.index()].kind == ParamKind::Accum))
+    {
+        return refused("a scalar load of an accumulator");
+    }
+    for (_, stmt) in prog.walk() {
+        match stmt {
+            Stmt::Copy { dst, src, mode, .. } => {
+                if let Err(what) = prog.check_accum_copy(*dst, *src, *mode) {
+                    return refused(what);
+                }
+                let dtype = prog.value(*dst).dtype;
+                ensure!(
+                    *mode != CopyMode::AtomicAdd || target.atomic_add.holds(dtype),
+                    UnsupportedSnafu { what: format!("an atomic add of {dtype:?} on {}", target.arch.target_name()) }
+                );
+            }
+            Stmt::Let { op: TileOp::Mma { a, b, .. }, .. } if prog.is_accum(*a) || prog.is_accum(*b) => {
+                return refused("a product over an accumulator");
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// What the lowering is given beside the program: the target and its
 /// costs, and the matrix instruction products issue on. The warp grid and
 /// each ring's schedule are the program's own ([`Program::warp_grid`],
@@ -77,6 +110,7 @@ pub struct Lowered {
 /// `params` are the flat buffer UOps in `prog.params` order (placeholders on
 /// the graph path, `UOp::param`s on the direct one).
 pub fn lower(mut prog: Program, lowering: &Lowering, params: Vec<Arc<UOp>>, device: DeviceSpec) -> Result<Lowered> {
+    check_atomics(&prog, &lowering.device.target)?;
     let grid = prog.warp_grid.count();
     let lone = prog.walk().any(|(_, s)| matches!(s, Stmt::Warps { .. }));
     ensure!(prog.warps.is_multiple_of(grid) && (prog.warps == grid || lone), GridSnafu { warps: prog.warps, grid });

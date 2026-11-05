@@ -17,7 +17,7 @@ use svod_dtype::{AmdArch, CudaArch};
 use svod_ir::pattern::TypedPatternMatcher;
 use svod_ir::{Op, prelude::*};
 
-use crate::common::{collect_abi_params, is_output_buffer};
+use crate::common::{collect_abi_params, is_modified_in_place, is_output_buffer};
 use crate::llvm::amd;
 use crate::llvm::common::gpu::local_bounds;
 use crate::llvm::common::{LlvmTarget, RenderContext, ldt};
@@ -161,7 +161,8 @@ impl Renderer for LlvmTextRenderer {
             };
             let source_name = format!("%data{}", arg.slot);
             if arg.addrspace.is_some() {
-                inner_params.push(format!("ptr noalias align 32 {source_name}"));
+                let noalias = if is_modified_in_place(param, &nodes) { "" } else { "noalias " };
+                inner_params.push(format!("ptr {noalias}align 32 {source_name}"));
             } else {
                 inner_params.push(format!("{} {source_name}", ldt(&param.dtype())));
             }

@@ -833,3 +833,52 @@ fn an_unsigned_gep_index_is_zero_extended(index_dtype: DType, widened: Option<&s
         None => assert!(!code.contains("zext"), "{code}"),
     }
 }
+
+/// A void custom statement whose dep is directly a parameter's INDEX reads and
+/// writes that parameter: the program's `outs` and `ins` hold it, it counts as
+/// an output, and it alone goes without `noalias`.
+#[test]
+fn a_custom_statement_on_an_index_writes_its_parameter() {
+    let buffer = |slot| UOp::param(slot, 4, DType::Int32, None);
+    let at = |slot| UOp::index().buffer(buffer(slot)).indices(vec![slotted_var("row", 3)]).call().unwrap();
+    let read = UOp::load().index(at(1)).call();
+    let add = UOp::custom(
+        smallvec::smallvec![at(0), read],
+        "atomicrmw add ptr {0}, i32 {1} monotonic".to_string(),
+        DType::Void,
+    );
+    let sink = UOp::sink(vec![add.clone()]);
+    let info = svod_ir::ProgramInfo::from_sink(&sink, svod_dtype::DeviceSpec::Cpu);
+    assert_eq!(info.outs, vec![0]);
+    assert_eq!(info.ins, vec![0, 1]);
+    let nodes = sink.toposort();
+    assert!(crate::common::is_output_buffer(&buffer(0), &nodes));
+    assert!(!crate::common::is_output_buffer(&buffer(1), &nodes));
+    let linear = UOp::linear(svod_schedule::linearize_with_cfg(sink).into());
+    let rendered = LlvmTextRenderer::amd(AmdArch::Gfx1201).render(&linear, Some("adds")).unwrap();
+    assert!(rendered.code.contains("(ptr align 32 %data0, ptr noalias align 32 %data1"), "{}", rendered.code);
+}
+
+/// No other custom statement names memory: an address behind `specific_ptr`'s
+/// cast (every one `cp.async` and its kin take), or a statement ordering
+/// itself after a load or a store.
+#[test]
+fn a_custom_statement_elsewhere_writes_nothing() {
+    use crate::llvm::nvptx::smem::cp_async_16;
+    let param = |slot| UOp::param(slot, 16, DType::Int32, None);
+    let at = |buf: std::sync::Arc<UOp>| UOp::index().buffer(buf).indices(vec![slotted_var("row", 3)]).call().unwrap();
+    let local = UOp::committed_buffer(0, 16, DType::Int32, AddrSpace::Local);
+    let copy = cp_async_16(&at(local), &at(param(0)));
+    let sink = UOp::sink(vec![copy]);
+    let info = svod_ir::ProgramInfo::from_sink(&sink, svod_dtype::DeviceSpec::Cpu);
+    assert!(info.outs.is_empty(), "a copy's source is no output: {:?}", info.outs);
+
+    let load = UOp::load().index(at(param(0))).call();
+    let ordered = UOp::custom(smallvec::smallvec![load], "call void @after()".to_string(), DType::Void);
+    let info = svod_ir::ProgramInfo::from_sink(&UOp::sink(vec![ordered]), svod_dtype::DeviceSpec::Cpu);
+    assert!(info.outs.is_empty(), "a statement after a load: {:?}", info.outs);
+
+    let valued = UOp::custom(smallvec::smallvec![at(param(0))], "load i32, ptr {0}".to_string(), DType::Int32);
+    let info = svod_ir::ProgramInfo::from_sink(&UOp::sink(vec![valued]), svod_dtype::DeviceSpec::Cpu);
+    assert!(info.outs.is_empty(), "a value is no statement: {:?}", info.outs);
+}

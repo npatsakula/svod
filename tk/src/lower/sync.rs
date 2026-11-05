@@ -124,7 +124,7 @@ fn walk(prog: &Program, block: Block, mut state: State, scope: Scope, divergent:
                 if let Some(a) = wr {
                     match mode {
                         CopyMode::Async => state.pending.insert(a),
-                        CopyMode::Sync | CopyMode::Staged => state.dirty.insert(a),
+                        CopyMode::Sync | CopyMode::Staged | CopyMode::AtomicAdd => state.dirty.insert(a),
                     };
                 }
                 state.read.extend(rd);

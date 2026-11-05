@@ -7,6 +7,7 @@ pub mod gemm;
 pub mod heads;
 pub mod nearest;
 pub mod rows;
+pub mod scatter;
 
 use std::f64::consts::{FRAC_1_SQRT_2, LOG2_E};
 use std::fmt;

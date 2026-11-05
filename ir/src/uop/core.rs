@@ -302,6 +302,18 @@ impl UOp {
         rebuilt.remove(&self.id).expect("toposort ends at the root")
     }
 
+    /// The memory a custom statement reads and writes in place: the deps of a
+    /// void `Op::Custom` that are directly an INDEX. A statement that only
+    /// orders itself after another, or takes an address through a cast of
+    /// its own, names none.
+    pub fn read_modify_writes(&self) -> impl Iterator<Item = &Arc<Self>> {
+        let deps = match &self.op {
+            Op::Custom(ops::Custom { deps, .. }) if self.dtype == DType::Void => deps.as_slice(),
+            _ => &[],
+        };
+        deps.iter().filter(|dep| matches!(dep.op(), Op::Index(..)))
+    }
+
     /// Check if this UOp has a concrete buffer identity in the graph.
     ///
     /// Returns true for buffer-like identities or RESHAPE/MULTI chains leading to them.
