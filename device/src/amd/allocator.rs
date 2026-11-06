@@ -18,7 +18,7 @@ use tracing::debug;
 
 use crate::allocator::{Allocator, AmdBufferGuard, BufferSpec, RawBuffer};
 use crate::amd::device::AmdDevice;
-use crate::amd::iface::AllocKind;
+use crate::amd::iface::{AllocKind, HUGE_PAGE};
 use crate::amd::va_registry::AllocTag;
 use crate::error::{Result, UnsupportedSnafu};
 
@@ -104,7 +104,7 @@ impl Allocator for AmdAllocator {
         let seam_zero = zero && cpu_access;
         let buf = AmdBufferGuard::new(do_alloc(
             &self.dev,
-            size,
+            whole_huge_pages(size),
             AllocKind::DeviceVram { executable: true },
             cpu_access,
             seam_zero,
@@ -272,6 +272,14 @@ fn do_alloc(
         AllocKind::UncachedGtt => AllocTag::Gtt,
     };
     do_alloc_tagged(dev, size, kind, tag, cpu_accessible, zero_init)
+}
+
+/// A data buffer's bytes: a huge page or more takes whole huge pages. A partial
+/// last one costs the whole buffer's translation, and more the larger the tail
+/// (gfx942 GEMM over 4256×4096×4096 by 224×256×64 tiles, 208 against 587 TF;
+/// VA alignment alone leaves that, 2026-11-06).
+fn whole_huge_pages(size: usize) -> usize {
+    if size >= HUGE_PAGE { size.next_multiple_of(HUGE_PAGE) } else { size }
 }
 
 fn do_alloc_tagged(
