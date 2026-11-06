@@ -385,6 +385,7 @@ fn with(cfg: FaCfg, spec: AttnSpec) -> AttnSpec {
 #[test_case(with(RAW_MAX, spec(128, 128, 128, 0, 0, true, true)), &[128, 64]; "d 128, the RDNA prefill forms")]
 #[test_case(with(FaCfg::new(128, 64, 3), spec(256, 192, 64, 0, 0, true, true)), &[192, 70]; "bq 128, three stages")]
 #[test_case(with(FaCfg::new(128, 32, 2), spec(200, 130, 128, 0, 0, false, true)), &[130, 99]; "d 128, bq 128, ragged")]
+#[test_case(with(rows32(256, 32), spec(600, 420, 128, 0, 0, false, true)), &[420, 299]; "d 128, bq 256, ragged")]
 #[test_case(masked(100, 100, 64, 64, 64, KEY_MASK), &[100, 100]; "key mask, ragged")]
 #[test_case(masked(128, 128, 128, 64, 32, EVERY), &[128, 100]; "every mask, d 128")]
 #[test_case(with(FaCfg::new(64, 64, 3), masked(200, 200, 48, 0, 0, SEGMENTS)), &[200, 200]; "d 48, three stages")]

@@ -14,7 +14,7 @@ use super::{costs, first_eight, planner, self_join};
 use crate::atoms::{Core, Costs, Device, Fill, Target, sm86};
 use crate::build::BF16 as BF16T;
 use crate::kernels::Batch;
-use crate::kernels::attention::{FaCfg, Forms, WARP_ROWS};
+use crate::kernels::attention::{FaCfg, Forms, WARP_ROWS, narrowest_warp_rows};
 use crate::kernels::conv::ConvCfg;
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Scale, gemm};
 use crate::kernels::rows::NormCfg;
@@ -2080,13 +2080,13 @@ fn rdna_plans_register_staged_kernels() {
 /// config follows its one-row twin, from blocks of 64 queries, so the
 /// twins stage times it beside the contender tiles. On gfx942 the d128
 /// pick's tile carries its two-row pipelines as twins.
-#[test_case(gfx1151_planner(), &[(128, 64), (128, 32), (64, 32), (64, 16), (64, 64), (32, 16), (32, 32), (32, 64), (16, 16), (16, 32), (16, 64)]; "gfx1151")]
-#[test_case(planner(gfx1201()), &[(128, 64), (128, 32), (64, 32), (64, 64), (64, 16), (32, 32), (32, 16), (32, 64), (16, 32), (16, 16), (16, 64)]; "gfx1201")]
+#[test_case(gfx1151_planner(), &[(256, 32), (128, 64), (128, 32), (64, 32), (64, 16), (64, 64), (32, 16), (32, 32), (32, 64), (16, 16), (16, 32), (16, 64)]; "gfx1151")]
+#[test_case(planner(gfx1201()), &[(256, 32), (128, 64), (128, 32), (64, 32), (64, 64), (64, 16), (32, 32), (32, 16), (32, 64), (16, 32), (16, 16), (16, 64)]; "gfx1201")]
 fn two_atom_rows_are_a_variant_not_a_tile(target: Planner, tiles: &[(usize, usize)]) {
     use crate::ops::config::{representatives, shortlist};
     let ranked = target.attention_ranked(32, 2048, 2048, 64, false, true);
     let reps = representatives(&ranked);
-    assert!(reps.iter().all(|c| c.warp_rows == WARP_ROWS), "{reps:?}");
+    assert!(reps.iter().all(|c| c.warp_rows == narrowest_warp_rows(c.core, c.bq)), "{reps:?}");
     let clean = vec![Compiled::Clean; reps.len()];
     let mut compiles = Verdicts { verdicts: &clean, order: [0].iter().cycle(), room: 0, flight: vec![], asked: vec![] };
     let at = shortlist(&reps, &mut compiles).expect("a shortlist");
@@ -2100,6 +2100,17 @@ fn two_atom_rows_are_a_variant_not_a_tile(target: Planner, tiles: &[(usize, usiz
     let ranked = gfx942.attention_ranked(32, 2048, 2048, 128, false, false);
     let pick = FaCfg::new(128, 32, 2);
     assert!(pick.twins(&ranked).iter().any(|c| c.warp_rows == 2 * WARP_ROWS), "{ranked:?}");
+}
+
+/// A warp-level block past eight row warps holds them at the rows that keep it
+/// to eight, as the tile it represents.
+#[test]
+fn a_wide_block_keeps_to_eight_row_warps() {
+    let ranked = planner(super::targets::amd(AmdArch::Gfx942, 304)).attention_ranked(32, 2048, 2048, 128, false, false);
+    assert!(ranked.iter().filter(|c| c.core == Core::Warp).all(|c| c.row_warps() <= 8), "{ranked:?}");
+    let wide = ranked.iter().find(|c| c.bq == 256).expect("a block of 256 queries ranked");
+    assert_eq!(wide.warp_rows, 2 * WARP_ROWS);
+    assert!(wide.represents(), "{wide:?}");
 }
 
 /// On a target with the warpgroup core the attention lattice spans both
@@ -2119,7 +2130,10 @@ fn the_warpgroup_core_is_a_tile_of_its_own() {
         assert!(c.represents() && c.tile() != FaCfg { core: Core::Warp, ..**c }.tile());
         assert!(c.twins(&ranked).iter().all(|t| t.core == Core::Group), "{c:?} twins a warp-level config");
     }
-    assert_eq!(representatives(&ranked).len(), ranked.iter().filter(|c| c.warp_rows == WARP_ROWS).count());
+    assert_eq!(
+        representatives(&ranked).len(),
+        ranked.iter().filter(|c| c.warp_rows == narrowest_warp_rows(c.core, c.bq)).count()
+    );
     let plain = format!("{:?}", FaCfg::new(64, 32, 2));
     assert!(!plain.contains("core") && !plain.contains("warp_rows"), "{plain}");
 }

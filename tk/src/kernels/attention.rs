@@ -97,6 +97,19 @@ pub struct Forms {
 /// differs ([`FaCfg::fits`](FaCfg::fits)).
 pub(crate) const WARP_ROWS: usize = 16;
 
+/// Search bound: the row warps a block of the warp-level core spreads over.
+const MOST_ROW_WARPS: usize = 8;
+
+/// The fewest rows a warp of a `bq`-row block owns on `core`: one atom row
+/// (a warpgroup's rows are the instruction's), or on the warp-level core as
+/// many as hold the block in [`MOST_ROW_WARPS`].
+pub(crate) fn narrowest_warp_rows(core: Core, bq: usize) -> usize {
+    match core {
+        Core::Warp => WARP_ROWS * (bq / (MOST_ROW_WARPS * WARP_ROWS)).max(1),
+        Core::Group => WARP_ROWS,
+    }
+}
+
 /// Why [`attention`] refuses a config, whatever the target: what its
 /// ranking leaves out as one that does not lower
 /// ([`crate::ops::config::Rejected::Lowers`]).
