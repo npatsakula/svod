@@ -60,25 +60,26 @@ impl Emit<'_> {
 /// cache-swizzled descriptor stride each, or flat as they are. A line must take
 /// one mapping across a dispatch ([`Target::cache_swizzle`]) and no lowering
 /// can tell which of its parameters alias, so every parameter takes the one
-/// stride; it only steers the cache, so the widest row an input is read by
-/// serves them all. Rows under 256 bytes already spread over the L1 sets, rows
-/// past 8192 are unmeasured, and a byte offset must fit 31 bits.
+/// stride. The stride only steers the cache, and only a power of two spreads
+/// rows: the largest within the row, whose loads gain most, of the widest input
+/// row or else output row that gains. A byte offset must fit 31 bits.
 pub(super) fn swizzled(params: Vec<Arc<UOp>>, prog: &Program, target: &Target) -> Vec<Arc<UOp>> {
     let fits = |p: &Param| p.elems.saturating_mul(p.dtype.bytes()) <= i32::MAX as usize;
-    if !target.cache_swizzle || !prog.params.iter().all(fits) {
-        return params;
-    }
-    let rows = prog.values.iter().filter_map(|v| match &v.place {
-        Place::Global { param, stride, .. } if prog.params[param.index()].kind == ParamKind::In => {
-            match prog.scalar(stride[0]) {
-                Scalar::Const(row) => Some(*row as usize * v.dtype.bytes()),
-                _ => None,
+    let Some(swizzle) = target.cache_swizzle.filter(|_| prog.params.iter().all(fits)) else { return params };
+    let widest = |input: bool| {
+        let rows = prog.values.iter().filter_map(|v| match &v.place {
+            Place::Global { param, stride, .. } if (prog.params[param.index()].kind == ParamKind::In) == input => {
+                match prog.scalar(stride[0]) {
+                    Scalar::Const(row) => Some(*row as usize * v.dtype.bytes()),
+                    _ => None,
+                }
             }
-        }
-        _ => None,
-    });
-    let Some(row_bytes) = rows.max().filter(|row| (256..=8192).contains(row)) else { return params };
-    let space = AddrSpace::Swizzled { row_bytes: row_bytes as u16 };
+            _ => None,
+        });
+        rows.filter(|row| (swizzle.min_row..=swizzle.max_row).contains(row)).max()
+    };
+    let Some(row) = widest(true).or_else(|| widest(false)) else { return params };
+    let space = AddrSpace::Swizzled { stride: (1 << row.ilog2()).min(swizzle.max_stride) as u16 };
     params.iter().map(|p| p.with_addrspace(space)).collect()
 }
 

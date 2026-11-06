@@ -95,17 +95,19 @@ pub struct GemmCfg {
     pub warps: [u32; 2],
     pub unroll: bool,
     pub core: Core,
-    /// Crews the warp rows form: 1, every warp loading and computing
-    /// together, or 2, the two rows of warps a cluster apart over one slot
-    /// ([`Schedule::PingPong`]), the operands held as k-slices of
-    /// [`KSLICE`] so a product's fragments are read a cluster ahead.
-    pub crews: u32,
+    /// `None`: every warp loads and computes together. `Some(k)`: the warp
+    /// rows form two crews a cluster apart over one slot
+    /// ([`Schedule::PingPong`]), the operands held as k-slices `k` deep, the k
+    /// of the target's atom, so a slice is one product's fragments and they
+    /// are read a cluster ahead.
+    pub kslice: Option<usize>,
 }
 
 /// The tune store keys by this text: a config on the warp-level core and
 /// one crew prints as it did before the fields existed, so its stored
 /// choices still apply, and every config walks [`GROUP_ROWS`] as when it
-/// was a field (`group_m`).
+/// was a field (`group_m`). A store is one target's, whose atom fixes the
+/// k-slices, so two crews print as just that.
 impl fmt::Debug for GemmCfg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut s = f.debug_struct("GemmCfg");
@@ -114,8 +116,8 @@ impl fmt::Debug for GemmCfg {
         if self.core != Core::Warp {
             s.field("core", &self.core);
         }
-        if self.crews != 1 {
-            s.field("crews", &self.crews);
+        if self.crews() != 1 {
+            s.field("crews", &self.crews());
         }
         s.finish()
     }
@@ -126,11 +128,6 @@ impl fmt::Debug for GemmCfg {
 /// split nearest kernel's candidate shares); one pick no lattice searches.
 pub(crate) const GROUP_ROWS: usize = 8;
 
-/// The depth of an operand's k-slices under two crews: one matrix-core step,
-/// the k of every atom two crews run on (the planner admits none other), so
-/// a cluster's reads are one product's fragments.
-pub const KSLICE: usize = 16;
-
 impl GemmCfg {
     pub fn lowering(&self, device: &Device) -> Lowering {
         Lowering { core: self.core, ..Lowering::new(device) }
@@ -138,15 +135,18 @@ impl GemmCfg {
 
     /// The pipeline's ring.
     pub fn ring(&self) -> Ring {
-        Ring { stages: self.stages, unroll: self.unroll, crews: self.crews }
+        Ring { stages: self.stages, unroll: self.unroll, crews: self.crews() }
+    }
+
+    pub fn crews(&self) -> u32 {
+        if self.kslice.is_some() { 2 } else { 1 }
     }
 
     /// The k-slices each operand of a slot is held as, one after another:
-    /// under two crews one matrix-core step deep ([`KSLICE`]), so a slice is
-    /// a plain view and a product's fragments are one cluster's reads; else
-    /// the slot whole.
+    /// under two crews one matrix-core step deep, so a slice is a plain view
+    /// and a product's fragments are one cluster's reads; else the slot whole.
     pub fn slices(&self) -> usize {
-        if self.crews == 2 { self.tile[2] / KSLICE } else { 1 }
+        self.kslice.map_or(1, |k| self.tile[2] / k)
     }
 
     /// Whether the tile carries an [`Epilogue::rope`] of `head_dim` heads:

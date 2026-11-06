@@ -643,7 +643,7 @@ fn two_crews_are_ranked_only_where_the_target_interleaves_them(arch: AmdArch, so
     let target = crate::test::unit::targets::amd(arch, 64);
     assert_eq!(target.crews >= 2, some);
     let ranked = planner(target.clone()).gemm_ranked(1, 4096, 4096, 4096, false);
-    let crews: Vec<&GemmCfg> = ranked.iter().filter(|c| c.crews == 2).collect();
+    let crews: Vec<&GemmCfg> = ranked.iter().filter(|c| c.crews() == 2).collect();
     assert_eq!(!crews.is_empty(), some, "{ranked:?}");
     assert!(crews.iter().all(|c| c.core == Core::Warp
         && c.stages == 1

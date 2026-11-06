@@ -510,7 +510,7 @@ fn address_space_name(address_space: AddrSpace) -> String {
         AddrSpace::Global => "global".to_string(),
         AddrSpace::Local => "local".to_string(),
         AddrSpace::Reg => "register".to_string(),
-        AddrSpace::Swizzled { row_bytes } => format!("swizzled:{row_bytes}"),
+        AddrSpace::Swizzled { stride } => format!("swizzled:{stride}"),
     }
 }
 

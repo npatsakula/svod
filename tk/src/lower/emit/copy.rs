@@ -96,7 +96,7 @@ impl Emit<'_> {
                     None => v,
                 };
                 let vals: Vec<_> = (0..chunk as usize).map(|e| elem(&v, e, chunk as usize)).collect();
-                if self.halves(&d) {
+                if self.halves(&d).is_some() {
                     let half = chunk as usize / 2;
                     let (hi_off, _) = self.address(&d, &Coord::plain(hi_row, add(&hi_col, &c32(half as i64))));
                     self.mem_store(&d.buf, &dst_off, vals[..half].to_vec());

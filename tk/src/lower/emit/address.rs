@@ -167,16 +167,15 @@ impl Emit<'_> {
                 let chunk = 16 / bytes as i64;
                 let swizzle = Swizzle::of_row(cols as usize, bytes);
                 let halves = self.halves(view);
-                let col = if swizzle != Swizzle::None || halves {
+                let col = if swizzle != Swizzle::None || halves.is_some() {
                     let (mut c, mut within) = (shr(&col, chunk.trailing_zeros()), and(&col, &c32(chunk - 1)));
                     if swizzle != Swizzle::None {
                         let (shift, mask) = (3 - swizzle.bits(), c32((1 << swizzle.bits()) - 1));
                         let sw = if shift == 0 { and(&row, &mask) } else { and(&shr(&row, shift), &mask) };
                         c = xor(&c, &sw);
                     }
-                    if halves {
-                        let bit = crate::layouts::HALVES_ROW_BIT as u32;
-                        within = xor(&within, &mul(&and(&shr(&row, bit), &c32(1)), &c32(8 / bytes as i64)));
+                    if let Some(bit) = halves {
+                        within = xor(&within, &mul(&and(&shr(&row, bit), &c32(1)), &c32(chunk / 2)));
                     }
                     add(&mul(&c, &c32(chunk)), &within)
                 } else {
@@ -271,10 +270,13 @@ impl Emit<'_> {
         }
     }
 
-    /// Whether a view's allocation exchanges its chunks' halves
+    /// The row bit a view's allocation exchanges its chunks' halves on
     /// ([`crate::layouts::shared_element`]): its accesses stay within a half.
-    pub(super) fn halves(&self, view: &View) -> bool {
-        matches!(&view.place, Some(Place::Smem { alloc, .. }) if self.prog.smem[alloc.index()].halves)
+    pub(super) fn halves(&self, view: &View) -> Option<u32> {
+        match &view.place {
+            Some(Place::Smem { alloc, .. }) => self.prog.smem[alloc.index()].halves,
+            _ => None,
+        }
     }
 
     /// The width in elements of the column panels a shared row of `cols`
@@ -295,8 +297,8 @@ impl Emit<'_> {
     pub(super) fn runs(&self, l: &TileLayout, view: &View) -> Vec<(u32, u32)> {
         let (along, contiguous) = self.along(view);
         let mut width = if contiguous { 16 / view.dtype.bytes() as u32 } else { 1 };
-        if self.halves(view) {
-            width = width.min(8 / view.dtype.bytes() as u32);
+        if self.halves(view).is_some() {
+            width = width.min(16 / view.dtype.bytes() as u32 / 2);
         }
         // An aligned run no wider than the power of two dividing a period stays within one.
         if let Some(Place::Global { period: Some(p), .. }) = &view.place {

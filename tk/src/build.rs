@@ -268,7 +268,7 @@ impl Kernel {
     }
 
     pub fn smem<T: Elem>(&mut self, name: impl Into<String>, elems: usize) -> SmemRef<T> {
-        self.prog.smem.push(SmemAlloc { name: name.into(), dtype: T::DTYPE, elems, halves: false, along: Axis::Col });
+        self.prog.smem.push(SmemAlloc { name: name.into(), dtype: T::DTYPE, elems, halves: None, along: Axis::Col });
         SmemRef(SmemId(self.prog.smem.len() as u32 - 1), PhantomData)
     }
 

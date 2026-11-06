@@ -642,7 +642,7 @@ fn an_operand_read_twice_matches_the_interpreter_on_the_device() {
     let Some(planner) = super::device_planner() else { return };
     let (m, k) = (512, 256);
     let cfg = config::gemm_cfg([256, 256, 64], 1, [2, 4], false);
-    let cfg = crate::kernels::gemm::GemmCfg { crews: planner.device.target.crews.min(2), ..cfg };
+    let cfg = crate::kernels::gemm::GemmCfg { kslice: planner.device.target.kslice(), ..cfg };
     let spec = GemmSpec { m, n: m, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg };
     let prog = gemm::<BF16>(&spec);
     let mut seed = 5;

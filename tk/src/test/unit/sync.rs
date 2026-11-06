@@ -397,7 +397,7 @@ fn a_consume_body_fences_its_own_tiles() {
 /// their templates fence: the pass leaves them as they are.
 #[test_case(gemm::<BF16>(&GemmSpec {
     m: 256, n: 256, k: 256, batch: Batch::Static(1), epilogue: Epilogue::default(),
-    cfg: GemmCfg { core: Core::Warp, tile: [128, 128, 32], stages: 3, warps: [2, 2], unroll: true, crews: 1 },
+    cfg: GemmCfg { core: Core::Warp, tile: [128, 128, 32], stages: 3, warps: [2, 2], unroll: true, kslice: None },
 }); "gemm")]
 #[test_case(attention::<BF16>(&AttnSpec {
     batch: Batch::var("b", 1, 2),

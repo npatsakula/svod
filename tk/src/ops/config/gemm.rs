@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::atoms::{Core, Fill, Target};
 use crate::ir::{Axis, Shape};
-use crate::kernels::gemm::{GROUP_ROWS, GemmCfg, KSLICE, Rope};
+use crate::kernels::gemm::{GROUP_ROWS, GemmCfg, Rope};
 use crate::layouts::{Issue, Swizzle, WarpGrid, chunked, fills_in_chunks};
 
 use super::cost::{Claim, ELEM, Family, Kind, Ops, Planner, STEP, Spread, Steps, Stream, cached};
@@ -30,15 +30,14 @@ impl GemmCfg {
         // Two crews: the two warp rows of the warp-level core, one slot, and
         // k-slices of a product (one atom deep) each with another to
         // overlap, on a target that interleaves crews.
-        let crews = self.crews == 1
-            || (self.crews == 2
-                && self.core == Core::Warp
-                && target.crews >= 2
-                && target.geometry().is_some_and(|atom| atom.k as usize == KSLICE)
+        let crews = self.kslice.is_none_or(|k| {
+            self.core == Core::Warp
+                && target.kslice() == Some(k)
                 && self.stages == 1
                 && self.warps[0] == 2
-                && bk.is_multiple_of(KSLICE)
-                && bk >= 2 * KSLICE);
+                && bk.is_multiple_of(k)
+                && bk >= 2 * k
+        });
         row && crews && self.issue(target, bk).is_some() && target.fill.runs(self.stages)
     }
 
@@ -100,7 +99,7 @@ impl GemmCfg {
 }
 
 pub(crate) const fn gemm_cfg(tile: [usize; 3], stages: usize, warps: [u32; 2], unroll: bool) -> GemmCfg {
-    GemmCfg { core: Core::Warp, tile, stages, warps, unroll, crews: 1 }
+    GemmCfg { core: Core::Warp, tile, stages, warps, unroll, kslice: None }
 }
 
 /// Model: a representative layer epilogue's tile operations an output
@@ -163,8 +162,9 @@ pub fn gemm_lattice(target: &Target) -> Vec<GemmCfg> {
                             );
                             // Two crews: the warp-level core's two warp rows a
                             // cluster apart over the one slot.
-                            if core == Core::Warp && target.crews >= 2 && stages == 1 && warps[0] == 2 {
-                                out.push(GemmCfg { crews: 2, ..gemm_cfg([bm, bn, bk], 1, warps, false) });
+                            let kslice = target.kslice();
+                            if core == Core::Warp && kslice.is_some() && stages == 1 && warps[0] == 2 {
+                                out.push(GemmCfg { kslice, ..gemm_cfg([bm, bn, bk], 1, warps, false) });
                             }
                         }
                     }

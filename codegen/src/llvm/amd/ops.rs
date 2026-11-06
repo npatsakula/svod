@@ -66,9 +66,9 @@ const BUFFER_FLAGS: u32 = 0x11_0000;
 /// descriptor, which the backend's loads and stores through it then use.
 pub fn render_swizzled_params(params: &[Arc<UOp>], ctx: &mut RenderContext, kernel: &mut Vec<String>) {
     for param in params {
-        let Some(AddrSpace::Swizzled { row_bytes }) = param.addrspace() else { continue };
-        assert!(row_bytes < 1 << 14, "the stride field holds 14 bits");
-        let field = row_bytes | CACHE_SWIZZLE;
+        let Some(AddrSpace::Swizzled { stride }) = param.addrspace() else { continue };
+        assert!(stride < 1 << 14, "the stride field holds 14 bits");
+        let field = stride | CACHE_SWIZZLE;
         let make = "llvm.amdgcn.make.buffer.rsrc.p7.p1";
         ctx.push_module_prefix(format!("declare ptr addrspace(7) @{make}(ptr addrspace(1), i16, i32, i32)"));
         let flat = ctx.get(param).to_string();
