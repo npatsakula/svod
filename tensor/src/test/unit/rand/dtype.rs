@@ -141,3 +141,12 @@ fn rand_rejects_integer_dtype() {
     let err = Tensor::rand_with(&[4], DType::Int32, DeviceSpec::Cpu);
     assert!(err.is_err(), "rand on Int32 should error (callers should use randint)");
 }
+
+/// A draw past `i32::MAX` words still counts them all, however many a graph
+/// holds before anything runs.
+#[test]
+fn a_draw_past_i32_words_keeps_its_shape() {
+    let n = 1usize << 33;
+    let t = Tensor::rand_with(&[n], DType::Float32, DeviceSpec::Cpu).expect("a lazy draw");
+    assert_eq!(svod_ir::shape::to_vec_usize(&t.shape().unwrap()).unwrap(), [n]);
+}
