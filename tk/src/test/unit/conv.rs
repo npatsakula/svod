@@ -98,6 +98,14 @@ fn check_interp(g: ConvGeom, batch: Batch, epi: Epilogue, c: GemmCfg) {
     assert_rel_close("y", got.last().unwrap(), &want, tolerance(epi));
 }
 
+/// Two crews hold a slot as k-slices, each its own part of the K step.
+#[test_case(geom([7, 9], 64, 64, 3, 1, 1, 1), [32, 64, 64], [2, 1]; "one tap to a step")]
+#[test_case(geom([6, 5], 64, 96, 3, 2, 1, 1), [64, 96, 32], [2, 2]; "two steps to a tap")]
+fn two_crews_read_each_slice_of_a_step(g: ConvGeom, tile: [usize; 3], warps: [u32; 2]) {
+    let c = GemmCfg { crews: 2, ..gemm_cfg(tile, 1, warps, false) };
+    check_interp(g, Batch::Static(1), SILU_BIAS, c);
+}
+
 pub(super) const SILU_BIAS: Epilogue = Epilogue { bias: true, act: Act::Silu, ..Epilogue::DEFAULT };
 
 /// A bound batch walks grid z instead of folding into the rows.

@@ -115,8 +115,9 @@ pub fn conv<T: Half>(spec: &ConvSpec) -> Program {
     mainloop_gemm::<T, _>("conv", &gemm, images * g.h * g.w * g.cin, spec.split, |_k, x, bb, row0| {
         let base = bb.clone().map_or(Sc::from(0), |b| b * (g.h * g.w * g.cin));
         let shape = Shape::new(spec.cfg.tile[0], bk);
-        move |k: &mut Kernel, step: Sc, _koff: Sc| {
-            im2col_view(k, x, &g, gemm.m, base.clone(), row0.clone(), step, shape)
+        move |k: &mut Kernel, step: Sc, koff: Sc| {
+            let v = im2col_view(k, x, &g, gemm.m, base.clone(), row0.clone(), step.clone(), shape);
+            if spec.cfg.slices() == 1 { v } else { k.at(v, 0, koff - step * bk) }
         }
     })
 }
