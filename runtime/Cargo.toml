@@ -16,7 +16,7 @@ svod-ir = { path = "../ir", version = "=0.3.0" }
 svod-codegen = { path = "../codegen", version = "=0.3.0" }
 svod-schedule = { path = "../schedule", version = "=0.3.0" }
 snafu = "0.9"
-parking_lot = "0.12"
+parking_lot = "0.13"
 libc = "0.2"
 papaya = "0.2.3"
 rayon = "1.11"
