@@ -230,6 +230,18 @@ impl KfdIface {
         }
         let kfd_version = (ver_args.major_version, ver_args.minor_version);
 
+        // Opening the fd queues the root page directory clear on SDMA, and
+        // ACQUIRE_VM's wait for it skips that BOOKKEEP fence (`amdgpu_sync_resv`
+        // stops at READ). The clear then lands over the first PDEs KFD writes
+        // with the CPU, and the walker retries forever until the GPU resets.
+        // `amdgpu_flush` runs on any close and drains the VM's job queues;
+        // nothing exposes the jobs' completion, so a pause covers their execution.
+        let flushed = drm_fd
+            .try_clone()
+            .map_err(|e| Error::AmdIoctl { ioctl: "dup(render node)", errno: e.raw_os_error().unwrap_or(0) })?;
+        drop(flushed);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+
         // ACQUIRE_VM tells KFD to register this DRM fd as the process's VM
         // for this GPU. Required before any alloc/map ioctls.
         let mut args = kfd::kfd_ioctl_acquire_vm_args { drm_fd: drm_fd.as_raw_fd() as u32, gpu_id: node.gpu_id };
