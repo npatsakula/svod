@@ -203,7 +203,12 @@ pub struct Target {
     pub shared_banks: Option<SharedBanks>,
     /// Staged 16-byte global loads go through a buffer descriptor holding the
     /// view's row stride and the cache-swizzle bit, which a flat load has no
-    /// room for (gfx942 4096³ GEMM: 562 against 607 TF, 2026-11-05).
+    /// room for (gfx942 4096³ GEMM: best 579 against 628 TF, the bit's alone,
+    /// 2026-11-06). Off everywhere: on gfx942 the bit returns wrong data to
+    /// a self-join (`nearest_matches_the_graph`, whole tiles) at row strides
+    /// from 128 to 1024 bytes, the stride alone not, for a cause not yet
+    /// known; the same data in two buffers is right, as is GEMM over one
+    /// tensor twice.
     pub swizzled_loads: bool,
     pub occupancy: Occupancy,
     /// What the semantic syncs a template places become.
@@ -691,7 +696,7 @@ fn amd(a: AmdArch) -> Target {
         crews: if cdna { 2 } else { 1 },
         xcds: 1,
         shared_banks: (a == AmdArch::Gfx942).then_some(SharedBanks { count: 16, bytes: 8 }),
-        swizzled_loads: a == AmdArch::Gfx942,
+        swizzled_loads: false,
         occupancy,
         sync: SyncCaps { warp_barrier: false, commit_fence: !cdna, priority: true },
         lane_move: if cdna { LaneMove::Permute } else { LaneMove::Dpp },

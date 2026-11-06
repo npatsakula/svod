@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use svod_dtype::AmdArch;
 use test_case::test_case;
 
-use crate::atoms::SharedBanks;
+use crate::atoms::{SharedBanks, Target};
 use crate::build::BF16;
 use crate::ir::*;
 use crate::kernels::Batch;
@@ -128,7 +128,7 @@ fn a_store_stays_within_a_half() {
 }
 
 fn gemm_text(arch: AmdArch, k: usize) -> String {
-    let device = declared(amd(arch, 304));
+    let device = declared(Target { swizzled_loads: true, ..amd(arch, 304) });
     let cfg = crate::kernels::gemm::GemmCfg { crews: 2, ..config::gemm_cfg([256, 256, 64], 1, [2, 4], false) };
     let spec = GemmSpec { m: 512, n: 512, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg };
     crate::lower::render(gemm::<BF16>(&spec), &cfg.lowering(&device)).unwrap()
@@ -150,6 +150,7 @@ fn a_stride_past_its_field_loads_flat() {
     assert!(!gemm_text(AmdArch::Gfx942, 8192).contains(BUFFER_LOAD));
 }
 
+#[test_case(AmdArch::Gfx942; "gfx942")]
 #[test_case(AmdArch::Gfx950; "gfx950")]
 #[test_case(AmdArch::Gfx1201; "gfx1201")]
 fn a_target_without_swizzled_loads_loads_flat(arch: AmdArch) {
