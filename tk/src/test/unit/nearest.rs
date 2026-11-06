@@ -1408,6 +1408,7 @@ fn host(t: &Tensor) -> Vec<f64> {
 #[test_case(257, 1000, 37, draw(Metric::SquaredL2, NONE, None, false, false), false, 1; "squared l2 d37")]
 #[test_case(200, 200, 64, draw(Metric::L2, BOTH, None, false, false), true, 1; "l2 floors self-join")]
 #[test_case(300, 300, 16, draw(Metric::L2, BOTH, Some(5), false, false), true, 1; "l2 floors groups self-join")]
+#[test_case(256, 256, 64, draw(Metric::L2, BOTH, None, false, false), true, 1; "l2 floors self-join, whole tiles")]
 #[test_case(100, 130, 128, draw(Metric::NegDot, NONE, Some(3), false, false), false, 1; "neg dot groups d128")]
 #[test_case(500, 700, 768, draw(Metric::NegDot, NONE, None, false, false), false, 1; "streamed neg dot d768")]
 #[test_case(300, 300, 1000, draw(Metric::SquaredL2, BOTH, Some(4), false, false), true, 1; "streamed self-join d1000")]

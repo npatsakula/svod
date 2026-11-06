@@ -635,6 +635,30 @@ fn families_match_the_interpreter_on_the_device() {
     check_on_device(&target);
 }
 
+/// One tensor as both operands: a kernel reading the same memory twice, as a
+/// self-join does, gets the same bytes both times.
+#[test]
+fn an_operand_read_twice_matches_the_interpreter_on_the_device() {
+    let Some(planner) = super::device_planner() else { return };
+    let (m, k) = (512, 256);
+    let cfg = config::gemm_cfg([256, 256, 64], 1, [2, 4], false);
+    let cfg = crate::kernels::gemm::GemmCfg { crews: planner.device.target.crews.min(2), ..cfg };
+    let spec = GemmSpec { m, n: m, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg };
+    let prog = gemm::<BF16>(&spec);
+    let mut seed = 5;
+    let a = super::rounded(ScalarDType::BFloat16, m * k, &mut seed, |x| x);
+    let want = interp::run(&prog, vec![a.clone(), a.clone(), vec![0.0; m * m]], &[]).unwrap().remove(2);
+    let t = Tensor::from_slice(a.iter().map(|&x| x as f32).collect::<Vec<_>>()).cast(DType::BFloat16);
+    let out = Tensor::empty(&[m * m], DType::BFloat16);
+    let out = crate::launch::graph_launch(prog, &cfg.lowering(&planner.device), &[&t, &t, &out]).unwrap();
+    out.prepare().unwrap().execute().unwrap();
+    let mut bytes = vec![0u8; m * m * 2];
+    out.buffer().unwrap().copyout(&mut bytes).unwrap();
+    for (i, (g, w)) in super::decode(ScalarDType::BFloat16, &bytes).iter().zip(&want).enumerate() {
+        assert!((g - w).abs() <= 2e-2 * w.abs().max(1.0), "[{i}] = {g} vs {w}");
+    }
+}
+
 /// Each family lowered for its target alone and launched as that body, as
 /// the tuner launches a candidate it fingerprinted, writes bit for bit what
 /// the same program lowered at its launch writes.
