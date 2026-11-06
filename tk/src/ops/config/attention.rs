@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::atoms::{Core, Fill, GroupMmaAtom, Target};
 use crate::ir::{Axis, Shape};
-use crate::kernels::attention::{FaCfg, WARP_ROWS};
+use crate::kernels::attention::{FaCfg, WARP_ROWS, narrowest_warp_rows};
 use crate::layouts::{Swizzle, WarpGrid, chunked, fills_in_chunks};
 
 use super::cost::{Claim, ELEM, Family, Kind, Ops, PAIR_OPS, Planner, STEP, Spread, Steps, Stream, cached};
@@ -271,17 +271,14 @@ impl AttentionProblem {
         let cores: &[Core] = if target.group_mma.is_empty() { &[Core::Warp] } else { &[Core::Warp, Core::Group] };
         let mut out = vec![];
         for (core, bq) in cores.iter().flat_map(|&c| QUERY_BLOCKS.map(|bq| (c, bq))) {
-            // The warp-level core's blocks stop at eight row warps.
-            if core == Core::Warp && bq > 128 {
-                continue;
-            }
             // A row warp of queries may share its block with key warps.
             let key_warps: &[usize] = if bq == WARP_ROWS && self.t <= WARP_ROWS { &KEY_WARPS } else { &[1] };
             for bkv in KEY_BLOCKS {
                 for &stages in stages {
                     for unroll in [false, true] {
                         for &key_warps in key_warps {
-                            out.push(FaCfg { unroll, key_warps, core, ..FaCfg::new(bq, bkv, stages) });
+                            let warp_rows = narrowest_warp_rows(core, bq);
+                            out.push(FaCfg { unroll, key_warps, core, warp_rows, ..FaCfg::new(bq, bkv, stages) });
                         }
                     }
                 }
@@ -330,6 +327,7 @@ impl AttentionProblem {
             Some(planner.resident(smem, cfg.registers(target, self.d, self.bias)?, cfg.warps() as usize))
         };
         one.core == Core::Warp
+            && one.warp_rows == WARP_ROWS
             && one.bq >= TWO_ROWS_FROM
             && one.key_warps == 1
             && self.admit(planner, wide).is_ok()

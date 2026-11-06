@@ -10,7 +10,7 @@ use svod_dtype::GpuArch;
 
 use crate::atoms::Core;
 use crate::atoms::Target;
-use crate::kernels::attention::{FaCfg, Forms, WARP_ROWS};
+use crate::kernels::attention::{FaCfg, Forms, WARP_ROWS, narrowest_warp_rows};
 use crate::kernels::conv::ConvCfg;
 use crate::kernels::gemm::GemmCfg;
 use crate::kernels::nearest::{LaneQueue, NearestCfg, SelectCfg};
@@ -459,9 +459,9 @@ impl Tiled for FaCfg {
             .collect()
     }
 
-    /// Two atom rows per warp are a variant of the one-row tile.
+    /// Two atom rows per warp are a variant of a tile that holds one.
     fn represents(&self) -> bool {
-        self.warp_rows == WARP_ROWS
+        self.warp_rows == narrowest_warp_rows(self.core, self.bq)
     }
 }
 
