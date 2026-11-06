@@ -2,7 +2,6 @@
 //! product, lane moves on the vector unit and through the LDS crossbar,
 //! the hardware `exp2`, and the scheduling and priority barriers.
 
-use svod_codegen::llvm::amd::buffer::swizzled_load_b128;
 use svod_codegen::llvm::amd::tr::{global_load_tr_b128, global_load_tr_b128_or_zeros};
 
 use crate::layout as frag;
@@ -16,27 +15,6 @@ impl Emit<'_> {
     /// reaches the lanes it scatters to whole, so a lane whose run lies past
     /// the view's bounds, or whose gathered row is outside its map, addresses
     /// a run of zeros instead and every element it supplies reads zero.
-    pub(super) fn swizzled_load(&mut self, s: &View, c: &Coord, w: u32) -> Option<Vec<Arc<UOp>>> {
-        if !self.low.device.target.swizzled_loads || self.inside(s, c).is_some() {
-            return None;
-        }
-        let Some(Place::Global { offset, stride, rows: None, period: None, .. }) = &s.place else { return None };
-        let (offset, stride) = (*offset, *stride);
-        let bytes = s.dtype.bytes();
-        let (Scalar::Const(row), Scalar::Const(1)) = (self.prog.scalar(stride[0]), self.prog.scalar(stride[1])) else {
-            return None;
-        };
-        let row_bytes = u16::try_from(*row as usize * bytes).ok().filter(|&r| r < 1 << 14)?;
-        if !multiple_of(self.prog, offset, i64::from(w)) {
-            return None;
-        }
-        let (base, lane) = self.global_parts(s, c);
-        let base = self.access(&s.buf, &base, 1);
-        let voffset = self.hoist(mul(&lane, &c32(bytes as i64)));
-        let tag = self.next_tag() as usize;
-        Some(swizzled_load_b128(&base, &voffset, row_bytes, s.dtype, w as usize, tag).into_iter().collect())
-    }
-
     pub(super) fn tr_load_regs(&mut self, dst: ValId, s: &View, l: &TileLayout, perm: &[u32]) -> Result<()> {
         let [sub_r, sub_c] = l.sub_shape();
         let rows = TileLayout { frag: frag::global_tr_rows(), reps: [sub_r / 16, sub_c / 16], warps: l.warps.clone() };
@@ -76,6 +54,32 @@ impl Emit<'_> {
             DType::Int32,
         ))
     }
+}
+
+/// `params` as this kernel's global accesses all reach them: through one
+/// cache-swizzled descriptor stride each, or flat as they are. A line must take
+/// one mapping across a dispatch ([`Target::cache_swizzle`]) and no lowering
+/// can tell which of its parameters alias, so every parameter takes the one
+/// stride; it only steers the cache, so the widest row an input is read by
+/// serves them all. Rows under 256 bytes already spread over the L1 sets, rows
+/// past 8192 are unmeasured, and a byte offset must fit 31 bits.
+pub(super) fn swizzled(params: Vec<Arc<UOp>>, prog: &Program, target: &Target) -> Vec<Arc<UOp>> {
+    let fits = |p: &Param| p.elems.saturating_mul(p.dtype.bytes()) <= i32::MAX as usize;
+    if !target.cache_swizzle || !prog.params.iter().all(fits) {
+        return params;
+    }
+    let rows = prog.values.iter().filter_map(|v| match &v.place {
+        Place::Global { param, stride, .. } if prog.params[param.index()].kind == ParamKind::In => {
+            match prog.scalar(stride[0]) {
+                Scalar::Const(row) => Some(*row as usize * v.dtype.bytes()),
+                _ => None,
+            }
+        }
+        _ => None,
+    });
+    let Some(row_bytes) = rows.max().filter(|row| (256..=8192).contains(row)) else { return params };
+    let space = AddrSpace::Swizzled { row_bytes: row_bytes as u16 };
+    params.iter().map(|p| p.with_addrspace(space)).collect()
 }
 
 /// DPP's `row_xmask` control: OR the lane xor-mask within a row of 16.

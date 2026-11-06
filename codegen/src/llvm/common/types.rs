@@ -159,6 +159,7 @@ pub fn addr_space_num(addrspace: AddrSpace) -> u32 {
         AddrSpace::Global => 0,
         AddrSpace::Local => 3,
         AddrSpace::Reg => 5,
+        AddrSpace::Swizzled { .. } => 7,
     }
 }
 

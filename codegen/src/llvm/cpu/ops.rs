@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use svod_dtype::DType;
+use svod_dtype::{AddrSpace, DType};
 use svod_ir::{BinaryOp, Op, TernaryOp, UnaryOp, prelude::*};
 
 use crate::common::{access_dtype, shaped_dtype, value_width};
@@ -92,8 +92,9 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
                 // and at STORE level (IF/ENDIF via line_rewrite_cleanups).
                 let (index_type, index) = gep_index(index, &dst, ctx, kernel);
                 kernel.push(format!(
-                    "  {dst} = getelementptr inbounds {}, ptr {buf}, {index_type} {index}",
-                    ldt(&uop.dtype())
+                    "  {dst} = getelementptr inbounds {}, {} {buf}, {index_type} {index}",
+                    ldt(&uop.dtype()),
+                    ptr_type(buffer)
                 ));
             } else {
                 // `extractelement` reads its index as unsigned already.
@@ -111,8 +112,9 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             let buf = ctx.get(src).to_string();
             let (offset_type, offset) = gep_index(offsets, &dst, ctx, kernel);
             kernel.push(format!(
-                "  {dst} = getelementptr inbounds {}, ptr {buf}, {offset_type} {offset}",
-                ldt(&uop.dtype())
+                "  {dst} = getelementptr inbounds {}, {} {buf}, {offset_type} {offset}",
+                ldt(&uop.dtype()),
+                ptr_type(src)
             ));
             Some(())
         }
@@ -144,7 +146,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             }
             let idx = ctx.get(index);
             let dtype = ldt(&load_dtype);
-            let idx_type = "ptr";
+            let idx_type = ptr_type(index);
             let volatile = if is_volatile_access(index) { "volatile " } else { "" };
 
             let gate_info = match (alt, gate) {
@@ -196,7 +198,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             let idx = ctx.get(index);
             let val = ctx.get(value);
             let val_type = ldt(&access_dtype(index, value));
-            let idx_type = "ptr";
+            let idx_type = ptr_type(index);
             let volatile = if is_volatile_access(index) { "volatile " } else { "" };
 
             kernel.push(format!("  store {volatile}{val_type} {val}, {idx_type} {idx}"));
@@ -869,5 +871,13 @@ fn render_vectorize(dst: &str, elements: &[Arc<UOp>], ctx: &RenderContext, kerne
         let next = if i == count - 1 { dst.to_string() } else { format!("{dst}.v{i}") };
         kernel.push(format!("  {next} = insertelement {vec_type} {prev}, {scalar_type} {val}, i32 {i}"));
         prev = next;
+    }
+}
+
+/// The LLVM type of a pointer into `storage`.
+fn ptr_type(storage: &Arc<UOp>) -> &'static str {
+    match storage.addrspace() {
+        Some(AddrSpace::Swizzled { .. }) => "ptr addrspace(7)",
+        _ => "ptr",
     }
 }

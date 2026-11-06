@@ -201,15 +201,14 @@ pub struct Target {
     /// How shared memory serves a wave, where its reads depend on the address
     /// ([`SharedBanks`]).
     pub shared_banks: Option<SharedBanks>,
-    /// Staged 16-byte global loads go through a buffer descriptor holding the
-    /// view's row stride and the cache-swizzle bit, which a flat load has no
-    /// room for (gfx942 4096³ GEMM: best 579 against 628 TF, the bit's alone,
-    /// 2026-11-06). Off everywhere: on gfx942 the bit returns wrong data to
-    /// a self-join (`nearest_matches_the_graph`, whole tiles) at row strides
-    /// from 128 to 1024 bytes, the stride alone not, for a cause not yet
-    /// known; the same data in two buffers is right, as is GEMM over one
-    /// tensor twice.
-    pub swizzled_loads: bool,
+    /// Global memory goes through buffer descriptors with the cache-swizzle
+    /// bit, which spreads rows a stride would pile into one L1 set (gfx942
+    /// 4096³ GEMM: best 579 against 628 TF, 2026-11-06). The bit changes how
+    /// L1 lays out a line's 32-byte sectors: within one dispatch, a line read
+    /// or stored under two mappings (flat and swizzled, or two strides) reads
+    /// the wrong sector, so a kernel takes one mapping for all of them,
+    /// whichever of its operands alias.
+    pub cache_swizzle: bool,
     pub occupancy: Occupancy,
     /// What the semantic syncs a template places become.
     pub sync: SyncCaps,
@@ -638,7 +637,7 @@ fn cuda(c: CudaArch) -> Target {
         crews: 1,
         xcds: 1,
         shared_banks: None,
-        swizzled_loads: false,
+        cache_swizzle: false,
         occupancy: Occupancy { simds: 4, file: 512, waves, registers: 255, acc_file: 0 },
         sync: SyncCaps { warp_barrier: true, commit_fence: false, priority: false },
         lane_move: LaneMove::Shuffle,
@@ -696,7 +695,7 @@ fn amd(a: AmdArch) -> Target {
         crews: if cdna { 2 } else { 1 },
         xcds: 1,
         shared_banks: (a == AmdArch::Gfx942).then_some(SharedBanks { count: 16, bytes: 8 }),
-        swizzled_loads: false,
+        cache_swizzle: a == AmdArch::Gfx942,
         occupancy,
         sync: SyncCaps { warp_barrier: false, commit_fence: !cdna, priority: true },
         lane_move: if cdna { LaneMove::Permute } else { LaneMove::Dpp },
@@ -722,7 +721,7 @@ fn metal(f: MetalFamily) -> Target {
         crews: 1,
         xcds: 1,
         shared_banks: None,
-        swizzled_loads: false,
+        cache_swizzle: false,
         occupancy: Occupancy { simds: 4, file: 1024, waves: 8, registers: 128, acc_file: 0 },
         sync: SyncCaps { warp_barrier: false, commit_fence: false, priority: false },
         lane_move: LaneMove::SimdShuffle,

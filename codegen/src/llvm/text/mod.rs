@@ -170,6 +170,9 @@ impl Renderer for LlvmTextRenderer {
 
         // -- Build function body --
         kernel.push("".to_string());
+        if self.target.is_amd() {
+            amd::ops::render_swizzled_params(&abi_params, &mut ctx, &mut kernel);
+        }
         if self.target.is_nvptx() {
             nvptx::ops::plan_shared_memory(&nodes, &mut ctx);
         }

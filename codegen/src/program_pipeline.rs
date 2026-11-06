@@ -122,7 +122,7 @@ fn param_class(node: &Arc<UOp>) -> String {
     match arg.addrspace {
         None if arg.name.as_deref() == Some("_device_num") => "device scalar PARAM".to_string(),
         None => format!("scalar PARAM {}", arg.name.as_deref().unwrap_or("<unnamed>")),
-        Some(svod_ir::AddrSpace::Global) => "global storage PARAM".to_string(),
+        Some(svod_ir::AddrSpace::Global | svod_ir::AddrSpace::Swizzled { .. }) => "global storage PARAM".to_string(),
         Some(svod_ir::AddrSpace::Local) => "local storage PARAM".to_string(),
         Some(svod_ir::AddrSpace::Reg) => "register storage PARAM".to_string(),
     }

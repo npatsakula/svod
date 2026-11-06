@@ -127,50 +127,79 @@ fn a_store_stays_within_a_half() {
     assert!(asm.contains("ds_write") && !asm.contains("ds_write_b128"), "{asm}");
 }
 
-fn gemm_text(arch: AmdArch, k: usize) -> String {
-    let device = declared(Target { swizzled_loads: true, ..amd(arch, 304) });
+fn gemm_text_on(target: Target, m: usize, k: usize) -> String {
+    let device = declared(target);
     let cfg = crate::kernels::gemm::GemmCfg { crews: 2, ..config::gemm_cfg([256, 256, 64], 1, [2, 4], false) };
-    let spec = GemmSpec { m: 512, n: 512, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg };
+    let spec = GemmSpec { m, n: 512, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg };
     crate::lower::render(gemm::<BF16>(&spec), &cfg.lowering(&device)).unwrap()
 }
 
-const BUFFER_LOAD: &str = "call <4 x i32> @llvm.amdgcn.raw.ptr.buffer.load";
+fn gemm_text(arch: AmdArch, k: usize) -> String {
+    gemm_text_on(Target { cache_swizzle: true, ..amd(arch, 304) }, 512, k)
+}
+
+const FAT_POINTER: &str = "@llvm.amdgcn.make.buffer.rsrc.p7.p1";
 
 #[test_case(1024, 2048; "a row of 2 KiB")]
 #[test_case(4096, 8192; "a row of 8 KiB")]
-fn a_staged_load_carries_its_row_stride_and_the_swizzle(k: usize, row_bytes: u32) {
+fn a_kernel_carries_its_widest_input_row_and_the_swizzle(k: usize, row_bytes: u32) {
     let text = gemm_text(AmdArch::Gfx942, k);
-    assert!(text.contains(BUFFER_LOAD), "{text}");
+    assert!(text.contains(FAT_POINTER), "{text}");
     let field = format!("i16 {}, i32 -1", row_bytes | 0x4000);
     assert!(text.contains(&field), "{field}:\n{text}");
 }
 
-#[test]
-fn a_stride_past_its_field_loads_flat() {
-    assert!(!gemm_text(AmdArch::Gfx942, 8192).contains(BUFFER_LOAD));
+/// A dispatch reading a line under two mappings reads the wrong sector: every
+/// parameter holds the one stride, and no global access is left flat.
+#[test_case(1024; "a row of 2 KiB")]
+#[test_case(4096; "a row of 8 KiB")]
+fn every_global_access_of_a_kernel_takes_one_mapping(k: usize) {
+    let text = gemm_text(AmdArch::Gfx942, k);
+    let fields: Vec<_> = text
+        .lines()
+        .filter(|l| l.contains("= call ptr addrspace(7)"))
+        .map(|l| l.split("i16 ").nth(1).and_then(|f| f.split(',').next()).expect("a stride field"))
+        .collect();
+    assert_eq!(fields.len(), 3, "A, B and C:\n{text}");
+    assert!(fields.iter().all(|f| *f == fields[0]), "{fields:?}");
+    let Some(asm) = amd_asm(&text, AmdArch::Gfx942) else { return };
+    assert!(asm.contains("buffer_load_dwordx4") && asm.contains("buffer_store"), "{asm}");
+    assert!(!asm.contains("global_load") && !asm.contains("global_store"), "{asm}");
+    assert!(!asm.contains("flat_load") && !asm.contains("flat_store"), "{asm}");
 }
 
-#[test_case(AmdArch::Gfx942; "gfx942")]
+#[test_case(512, 64; "rows already spread over the sets")]
+#[test_case(512, 8192; "a stride past the measured")]
+#[test_case(1 << 19, 4096; "an operand past a 32-bit offset")]
+fn a_kernel_outside_the_swizzle_stays_flat(m: usize, k: usize) {
+    let text = gemm_text_on(amd(AmdArch::Gfx942, 304), m, k);
+    assert!(!text.contains(FAT_POINTER), "{text}");
+}
+
 #[test_case(AmdArch::Gfx950; "gfx950")]
 #[test_case(AmdArch::Gfx1201; "gfx1201")]
-fn a_target_without_swizzled_loads_loads_flat(arch: AmdArch) {
-    assert!(!amd(arch, 304).swizzled_loads);
+fn a_target_without_the_swizzle_stays_flat(arch: AmdArch) {
+    assert!(!amd(arch, 304).cache_swizzle);
     let device = declared(amd(arch, 304));
     let cfg = config::gemm_cfg([64, 64, 32], 1, [2, 2], false);
     let spec = GemmSpec { m: 256, n: 256, k: 512, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg };
-    assert!(!crate::lower::render(gemm::<BF16>(&spec), &cfg.lowering(&device)).unwrap().contains(BUFFER_LOAD));
+    assert!(!crate::lower::render(gemm::<BF16>(&spec), &cfg.lowering(&device)).unwrap().contains(FAT_POINTER))
+}
+
+/// The assembly of `text`; `None` where clang has no AMDGPU target.
+fn amd_asm(text: &str, arch: AmdArch) -> Option<String> {
+    match svod_runtime::amd::compile_ir_to_amd_asm(text, arch) {
+        Ok(asm) => Some(String::from_utf8(asm).unwrap()),
+        Err(e) if e.to_string().contains("AMDGPU target") || e.to_string().contains("too old") => {
+            eprintln!("skipped: clang has no AMDGPU target");
+            None
+        }
+        Err(e) => panic!("{e}"),
+    }
 }
 
 #[test]
-fn a_swizzled_load_needs_no_waterfall() {
-    let text = gemm_text(AmdArch::Gfx942, 4096);
-    let asm = match svod_runtime::amd::compile_ir_to_amd_asm(&text, AmdArch::Gfx942) {
-        Ok(asm) => String::from_utf8(asm).unwrap(),
-        Err(e) if e.to_string().contains("AMDGPU target") || e.to_string().contains("too old") => {
-            eprintln!("skipped: clang has no AMDGPU target");
-            return;
-        }
-        Err(e) => panic!("{e}"),
-    };
+fn a_swizzled_access_needs_no_waterfall() {
+    let Some(asm) = amd_asm(&gemm_text(AmdArch::Gfx942, 4096), AmdArch::Gfx942) else { return };
     assert!(asm.contains("buffer_load_dwordx4") && !asm.contains("s_cbranch_execnz"), "{asm}");
 }

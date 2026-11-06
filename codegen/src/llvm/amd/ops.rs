@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use svod_dtype::{DType, ScalarDType};
+use svod_dtype::{AddrSpace, DType, ScalarDType};
 use svod_ir::{BarrierFence, Op, UnaryOp, prelude::*};
 
 use crate::llvm::amd::wmma;
@@ -53,6 +53,31 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
         Op::Cast(ops::Cast { src, .. }) if is_fp8_cast(uop, src) => render_fp8_cast(uop, src, ctx, kernel),
         // ── Everything else: shared CPU path (ALU, INDEX, LOAD, STORE, …) ─
         _ => cpu::render_uop(uop, ctx, kernel),
+    }
+}
+
+/// Descriptor word 1 bit 30, in the 16 bits the stride field shares with it.
+const CACHE_SWIZZLE: u16 = 0x4000;
+
+/// Descriptor word 3: the `DST_SEL`/format bits a raw 32-bit access goes under.
+const BUFFER_FLAGS: u32 = 0x11_0000;
+
+/// Every parameter under a swizzled address space as the fat pointer of its
+/// descriptor, which the backend's loads and stores through it then use.
+pub fn render_swizzled_params(params: &[Arc<UOp>], ctx: &mut RenderContext, kernel: &mut Vec<String>) {
+    for param in params {
+        let Some(AddrSpace::Swizzled { row_bytes }) = param.addrspace() else { continue };
+        assert!(row_bytes < 1 << 14, "the stride field holds 14 bits");
+        let field = row_bytes | CACHE_SWIZZLE;
+        let make = "llvm.amdgcn.make.buffer.rsrc.p7.p1";
+        ctx.push_module_prefix(format!("declare ptr addrspace(7) @{make}(ptr addrspace(1), i16, i32, i32)"));
+        let flat = ctx.get(param).to_string();
+        let fat = format!("{flat}.fat");
+        kernel.push(format!("  {flat}.p1 = addrspacecast ptr {flat} to ptr addrspace(1)"));
+        kernel.push(format!(
+            "  {fat} = call ptr addrspace(7) @{make}(ptr addrspace(1) {flat}.p1, i16 {field}, i32 -1, i32 {BUFFER_FLAGS})"
+        ));
+        ctx.register(param.id, fat);
     }
 }
 

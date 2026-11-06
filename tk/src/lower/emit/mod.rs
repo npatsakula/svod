@@ -12,7 +12,7 @@ use svod_codegen::llvm::nvptx::wgmma;
 use svod_dtype::{AddrSpace, DType, DeviceSpec, ScalarDType};
 use svod_ir::{AxisId, AxisType, BarrierFence, KernelInfo, Op, UOp};
 
-use crate::atoms::{Core, Fill};
+use crate::atoms::{Core, Fill, Target};
 use crate::index::*;
 use crate::ir::*;
 use crate::layouts::{Laid, Moves, TileLayout};
@@ -37,6 +37,7 @@ pub fn emit(laid: &Laid, low: &Lowering, params: Vec<Arc<UOp>>, device: DeviceSp
     // Parameters and buffers committed up front: the assembly rebuilds none
     // of the ops reading them to commit their shapes.
     let params = params.iter().map(UOp::committed_shape).collect();
+    let params = amdgpu::swizzled(params, prog, &low.device.target);
     let mut e = Emit::new(prog, lay, low, params);
     e.prologue()?;
     e.block(&prog.body)?;
