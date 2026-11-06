@@ -162,6 +162,22 @@ pub struct SharedBanks {
     pub bytes: u32,
 }
 
+/// Global memory through buffer descriptors with the cache-swizzle bit, which
+/// spreads rows a stride would pile into one L1 set (gfx942 4096³ GEMM: best
+/// 579 against 628 TF, 2026-11-06). The bit changes how L1 lays out a line's
+/// 32-byte sectors: within one dispatch, a line read or stored under two
+/// mappings (flat and swizzled, or two strides) reads the wrong sector, so a
+/// kernel takes one mapping for all of them, whichever of its operands alias.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CacheSwizzle {
+    /// Bytes of the narrowest row that gains: narrower ones already spread.
+    pub min_row: usize,
+    /// Bytes of the widest row that gains: wider ones stay piled up.
+    pub max_row: usize,
+    /// The widest stride, in bytes, that spreads rows.
+    pub max_stride: usize,
+}
+
 /// What a target offers the lowering.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Target {
@@ -201,14 +217,9 @@ pub struct Target {
     /// How shared memory serves a wave, where its reads depend on the address
     /// ([`SharedBanks`]).
     pub shared_banks: Option<SharedBanks>,
-    /// Global memory goes through buffer descriptors with the cache-swizzle
-    /// bit, which spreads rows a stride would pile into one L1 set (gfx942
-    /// 4096³ GEMM: best 579 against 628 TF, 2026-11-06). The bit changes how
-    /// L1 lays out a line's 32-byte sectors: within one dispatch, a line read
-    /// or stored under two mappings (flat and swizzled, or two strides) reads
-    /// the wrong sector, so a kernel takes one mapping for all of them,
-    /// whichever of its operands alias.
-    pub cache_swizzle: bool,
+    /// How global memory's rows spread over the L1 sets, where a descriptor
+    /// can steer them ([`CacheSwizzle`]).
+    pub cache_swizzle: Option<CacheSwizzle>,
     pub occupancy: Occupancy,
     /// What the semantic syncs a template places become.
     pub sync: SyncCaps,
@@ -589,6 +600,12 @@ impl Target {
         self.mma.iter().find(|a| a.dtype_in.bytes() == 2)
     }
 
+    /// How deep two crews hold an operand's k-slices, one atom's k so a slice
+    /// is one product's fragments; `None` where crews don't interleave.
+    pub fn kslice(&self) -> Option<usize> {
+        self.geometry().filter(|_| self.crews >= 2).map(|atom| atom.k as usize)
+    }
+
     /// The warp-level matrix core over `dtype_in` into its accumulator (f32
     /// for a 16-bit float, i32 for an 8-bit integer): an 8-bit atom is as
     /// deep as its bytes allow (`k` 32 on NVIDIA and CDNA, 16 on RDNA).
@@ -637,7 +654,7 @@ fn cuda(c: CudaArch) -> Target {
         crews: 1,
         xcds: 1,
         shared_banks: None,
-        cache_swizzle: false,
+        cache_swizzle: None,
         occupancy: Occupancy { simds: 4, file: 512, waves, registers: 255, acc_file: 0 },
         sync: SyncCaps { warp_barrier: true, commit_fence: false, priority: false },
         lane_move: LaneMove::Shuffle,
@@ -695,7 +712,11 @@ fn amd(a: AmdArch) -> Target {
         crews: if cdna { 2 } else { 1 },
         xcds: 1,
         shared_banks: (a == AmdArch::Gfx942).then_some(SharedBanks { count: 16, bytes: 8 }),
-        cache_swizzle: a == AmdArch::Gfx942,
+        cache_swizzle: (a == AmdArch::Gfx942).then_some(CacheSwizzle {
+            min_row: 256,
+            max_row: 16 << 10,
+            max_stride: 8 << 10,
+        }),
         occupancy,
         sync: SyncCaps { warp_barrier: false, commit_fence: !cdna, priority: true },
         lane_move: if cdna { LaneMove::Permute } else { LaneMove::Dpp },
@@ -721,7 +742,7 @@ fn metal(f: MetalFamily) -> Target {
         crews: 1,
         xcds: 1,
         shared_banks: None,
-        cache_swizzle: false,
+        cache_swizzle: None,
         occupancy: Occupancy { simds: 4, file: 1024, waves: 8, registers: 128, acc_file: 0 },
         sync: SyncCaps { warp_barrier: false, commit_fence: false, priority: false },
         lane_move: LaneMove::SimdShuffle,

@@ -183,8 +183,8 @@ pub enum AddrSpace {
     /// Register memory.
     Reg,
     /// Global memory reached through a buffer descriptor whose cache is
-    /// swizzled for rows `row_bytes` apart.
-    Swizzled { row_bytes: u16 },
+    /// swizzled on `stride` bytes.
+    Swizzled { stride: u16 },
 }
 
 /// Image type kind.

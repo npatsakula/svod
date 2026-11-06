@@ -204,8 +204,13 @@ fn orient_shared(laid: &mut Laid, target: &Target) {
 /// Exchange the chunks' halves of each shared allocation whose readers reach
 /// the target's banks only that way. An allocation qualifies when one tile
 /// shape reads it whole (the exchange follows the view's row) and no reader
-/// holds a run across a half.
+/// holds a run across a half. Only banks of half a chunk are met this way, on
+/// the row bit that doubles the banks the lower bits reach.
 fn meet_banks(prog: &mut Program, layouts: &[Option<TileLayout>], banks: SharedBanks, lanes: u32) {
+    if 2 * banks.bytes != 16 {
+        return;
+    }
+    let bit = banks.count.ilog2() - 1;
     for a in 0..prog.smem.len() {
         let (along, dtype) = (prog.smem[a].along, prog.smem[a].dtype);
         let views = prog.values.iter().filter(|v| matches!(v.place, Place::Smem { alloc, .. } if alloc.index() == a));
@@ -230,7 +235,7 @@ fn meet_banks(prog: &mut Program, layouts: &[Option<TileLayout>], banks: SharedB
         let group: Vec<u32> = (0..lanes).collect();
         let width = (16 / bytes) as u32;
         // Whether each `banks.count` consecutive lanes of every read reach as many banks.
-        let meets = |halves| {
+        let meets = |halves: Option<u32>| {
             readers.iter().all(|l| {
                 let bank = |warp, lane, reg| {
                     let (r, c) = l.coord(warp, lane, reg);
@@ -248,8 +253,11 @@ fn meet_banks(prog: &mut Program, layouts: &[Option<TileLayout>], banks: SharedB
                 })
             })
         };
-        let narrow = readers.iter().all(|l| l.runs(lanes, width, along).iter().all(|&(_, w)| w as usize * bytes <= 8));
-        prog.smem[a].halves = !readers.is_empty() && narrow && !meets(false) && meets(true);
+        let narrow = readers
+            .iter()
+            .all(|l| l.runs(lanes, width, along).iter().all(|&(_, w)| w as usize * bytes <= banks.bytes as usize));
+        let exchange = !readers.is_empty() && narrow && !meets(None) && meets(Some(bit));
+        prog.smem[a].halves = exchange.then_some(bit);
     }
 }
 

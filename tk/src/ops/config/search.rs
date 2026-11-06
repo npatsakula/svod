@@ -302,7 +302,7 @@ impl Tiled for GemmCfg {
     }
 
     /// `w|g` (the core), the tile, the ring, the warp grid, unrolling and
-    /// crews: `w,128,256,64,3,2,4,0,1`.
+    /// the k-slices' depth, 1 for one crew: `w,128,256,64,3,2,4,0,1`.
     fn code(&self) -> String {
         format!(
             "{},{}",
@@ -318,7 +318,7 @@ impl Tiled for GemmCfg {
                 Some(self.warps[0] as usize),
                 Some(self.warps[1] as usize),
                 Some(self.unroll as usize),
-                Some(self.crews as usize),
+                Some(self.kslice.unwrap_or(1)),
             ])
         )
     }
@@ -341,7 +341,7 @@ impl Tiled for GemmCfg {
             stages: n(3)?,
             warps: [n(4)? as u32, n(5)? as u32],
             unroll: n(6)? == 1,
-            crews: n(7)? as u32,
+            kslice: Some(n(7)?).filter(|&k| k != 1),
         })
     }
 

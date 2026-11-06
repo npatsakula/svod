@@ -26,14 +26,15 @@ use crate::sweep::{amd, declared};
 #[test_case(32, 64, 1, true; "bytes")]
 #[test_case(32, 16, 4, true; "words")]
 fn a_shared_tile_keeps_each_element_a_place(rows: usize, cols: usize, bytes: usize, halves: bool) {
-    let at: BTreeSet<_> =
-        (0..rows).flat_map(|r| (0..cols).map(move |c| shared_element(r, c, cols, bytes, halves))).collect();
+    let at: BTreeSet<_> = (0..rows)
+        .flat_map(|r| (0..cols).map(move |c| shared_element(r, c, cols, bytes, halves.then_some(3))))
+        .collect();
     assert_eq!(at, (0..rows * cols).collect());
 }
 
 fn gemm_on(arch: AmdArch) -> Lowered {
     let device = declared(amd(arch, 304));
-    let cfg = crate::kernels::gemm::GemmCfg { crews: 2, ..config::gemm_cfg([256, 256, 64], 1, [2, 4], false) };
+    let cfg = crate::kernels::gemm::GemmCfg { kslice: Some(16), ..config::gemm_cfg([256, 256, 64], 1, [2, 4], false) };
     let spec = GemmSpec { m: 512, n: 512, k: 256, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg };
     standalone(gemm::<BF16>(&spec), &cfg.lowering(&device)).unwrap()
 }
@@ -92,7 +93,7 @@ fn missed(low: &Lowered, banks: SharedBanks) -> usize {
 #[test]
 fn gemm_reads_reach_every_bank() {
     let low = gemm_on(AmdArch::Gfx942);
-    assert!(low.tile.smem.iter().all(|a| a.halves), "{:?}", low.tile.smem);
+    assert!(low.tile.smem.iter().all(|a| a.halves.is_some()), "{:?}", low.tile.smem);
     assert_eq!(missed(&low, amd(AmdArch::Gfx942, 304).shared_banks.unwrap()), 0);
 }
 
@@ -100,7 +101,7 @@ fn gemm_reads_reach_every_bank() {
 #[test_case(128; "d128")]
 fn attention_reads_reach_every_bank(d: usize) {
     let low = attention_on(AmdArch::Gfx942, d);
-    assert!(low.tile.smem.iter().all(|a| a.halves), "{:?}", low.tile.smem);
+    assert!(low.tile.smem.iter().all(|a| a.halves.is_some()), "{:?}", low.tile.smem);
     assert_eq!(missed(&low, amd(AmdArch::Gfx942, 304).shared_banks.unwrap()), 0);
 }
 
@@ -109,7 +110,7 @@ fn attention_reads_reach_every_bank(d: usize) {
 fn a_target_without_banks_keeps_its_chunks(arch: AmdArch) {
     assert!(amd(arch, 304).shared_banks.is_none());
     let low = attention_on(arch, 64);
-    assert!(low.tile.smem.iter().all(|a| !a.halves));
+    assert!(low.tile.smem.iter().all(|a| a.halves.is_none()));
 }
 
 #[test]
@@ -127,25 +128,33 @@ fn a_store_stays_within_a_half() {
     assert!(asm.contains("ds_write") && !asm.contains("ds_write_b128"), "{asm}");
 }
 
-fn gemm_text_on(target: Target, m: usize, k: usize) -> String {
+fn gemm_text_on(target: Target, m: usize, n: usize, k: usize) -> String {
     let device = declared(target);
-    let cfg = crate::kernels::gemm::GemmCfg { crews: 2, ..config::gemm_cfg([256, 256, 64], 1, [2, 4], false) };
-    let spec = GemmSpec { m, n: 512, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg };
+    let cfg = crate::kernels::gemm::GemmCfg { kslice: Some(16), ..config::gemm_cfg([256, 256, 64], 1, [2, 4], false) };
+    let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg };
     crate::lower::render(gemm::<BF16>(&spec), &cfg.lowering(&device)).unwrap()
 }
 
 fn gemm_text(arch: AmdArch, k: usize) -> String {
-    gemm_text_on(Target { cache_swizzle: true, ..amd(arch, 304) }, 512, k)
+    gemm_text_on(amd(arch, 304), 512, 512, k)
 }
 
 const FAT_POINTER: &str = "@llvm.amdgcn.make.buffer.rsrc.p7.p1";
 
+/// The stride is the largest power of two within the widest input row, or
+/// else output row, and past 8 KiB the field's largest.
+#[test_case(64, 1024; "only an output row spreads")]
+#[test_case(768, 1024; "a row of 1.5 KiB")]
 #[test_case(1024, 2048; "a row of 2 KiB")]
+#[test_case(1536, 2048; "a row of 3 KiB")]
+#[test_case(3072, 4096; "a row of 6 KiB")]
 #[test_case(4096, 8192; "a row of 8 KiB")]
-fn a_kernel_carries_its_widest_input_row_and_the_swizzle(k: usize, row_bytes: u32) {
+#[test_case(6144, 8192; "a row of 12 KiB")]
+#[test_case(8192, 8192; "a row of 16 KiB")]
+fn a_kernel_takes_the_power_of_two_within_its_widest_row(k: usize, stride: u32) {
     let text = gemm_text(AmdArch::Gfx942, k);
     assert!(text.contains(FAT_POINTER), "{text}");
-    let field = format!("i16 {}, i32 -1", row_bytes | 0x4000);
+    let field = format!("i16 {}, i32 -1", stride | 0x4000);
     assert!(text.contains(&field), "{field}:\n{text}");
 }
 
@@ -168,18 +177,18 @@ fn every_global_access_of_a_kernel_takes_one_mapping(k: usize) {
     assert!(!asm.contains("flat_load") && !asm.contains("flat_store"), "{asm}");
 }
 
-#[test_case(512, 64; "rows already spread over the sets")]
-#[test_case(512, 8192; "a stride past the measured")]
-#[test_case(1 << 19, 4096; "an operand past a 32-bit offset")]
-fn a_kernel_outside_the_swizzle_stays_flat(m: usize, k: usize) {
-    let text = gemm_text_on(amd(AmdArch::Gfx942, 304), m, k);
+#[test_case(512, 64, 64; "rows already spread over the sets")]
+#[test_case(512, 16384, 16384; "rows the stride leaves piled up")]
+#[test_case(1 << 19, 512, 4096; "an operand past a 32-bit offset")]
+fn a_kernel_outside_the_swizzle_stays_flat(m: usize, n: usize, k: usize) {
+    let text = gemm_text_on(amd(AmdArch::Gfx942, 304), m, n, k);
     assert!(!text.contains(FAT_POINTER), "{text}");
 }
 
 #[test_case(AmdArch::Gfx950; "gfx950")]
 #[test_case(AmdArch::Gfx1201; "gfx1201")]
 fn a_target_without_the_swizzle_stays_flat(arch: AmdArch) {
-    assert!(!amd(arch, 304).cache_swizzle);
+    assert_eq!(amd(arch, 304).cache_swizzle, None);
     let device = declared(amd(arch, 304));
     let cfg = config::gemm_cfg([64, 64, 32], 1, [2, 2], false);
     let spec = GemmSpec { m: 256, n: 256, k: 512, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg };

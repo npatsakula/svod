@@ -784,18 +784,14 @@ impl Swizzle {
     }
 }
 
-/// The row bit that exchanges a chunk's halves in [`shared_element`]: the one
-/// [`Swizzle::B128`] leaves, so 16 rows reach 16 banks of 8 bytes.
-pub const HALVES_ROW_BIT: usize = 3;
-
 /// The offset in elements of `(row, col)` in a row-major shared tile of `cols`
-/// columns: its 16-byte chunk under [`Swizzle::of_row`], and with `halves` the
-/// 8-byte half within it exchanged on a bit of the row.
-pub fn shared_element(row: usize, col: usize, cols: usize, bytes: usize, halves: bool) -> usize {
+/// columns: its 16-byte chunk under [`Swizzle::of_row`], and the half within it
+/// exchanged on the row bit `halves`.
+pub fn shared_element(row: usize, col: usize, cols: usize, bytes: usize, halves: Option<u32>) -> usize {
     let chunk = 16 / bytes;
     let swizzle = Swizzle::of_row(cols, bytes);
     let sw = (row >> (3 - swizzle.bits())) & ((1 << swizzle.bits()) - 1);
-    let half = if halves { ((row >> HALVES_ROW_BIT) & 1) * (chunk / 2) } else { 0 };
+    let half = halves.map_or(0, |bit| ((row >> bit) & 1) * (chunk / 2));
     row * cols + ((col / chunk) ^ sw) * chunk + ((col % chunk) ^ half)
 }
 

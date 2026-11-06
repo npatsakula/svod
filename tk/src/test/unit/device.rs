@@ -50,6 +50,7 @@ fn lcg(seed: &mut u64) -> f32 {
 #[test_case(128, 128, 64, 128, 128, 32, 2, 2, 4; "one block, two stages")]
 #[test_case(256, 128, 256, 128, 64, 32, 3, 4, 2; "four blocks, three stages")]
 #[test_case(64, 64, 128, 64, 64, 64, 2, 2, 2; "64-wide k")]
+#[test_case(128, 128, 192, 128, 128, 64, 2, 2, 4; "rows of no power of two")]
 #[allow(clippy::too_many_arguments)]
 fn gemm_matches_the_interpreter(
     m: usize,
@@ -126,7 +127,7 @@ fn two_crews_match_the_interpreter_and_the_uniform_kernel(tile: [usize; 3]) {
         return;
     };
     let device = &planner.device;
-    let crews = GemmCfg { crews: 2, ..gemm_cfg(tile, 1, [2, 4], false) };
+    let crews = GemmCfg { kslice: device.target.kslice(), ..gemm_cfg(tile, 1, [2, 4], false) };
     check_gemm(device, 200, 136, 128, crews);
     check_gemm(device, 520, 300, 256, crews);
     let (m, n, k) = (1024, 768, 512);
@@ -139,7 +140,7 @@ fn two_crews_match_the_interpreter_and_the_uniform_kernel(tile: [usize; 3]) {
         let out = graph_launch(plain_gemm(m, n, k, cfg), &cfg.lowering(device), &[&a_t, &b_t, &c_t]).unwrap();
         out.cast(DType::Float32).to_vec::<f32>().unwrap().iter().map(|x| x.to_bits()).collect()
     };
-    assert!(bits(crews) == bits(GemmCfg { crews: 1, ..crews }), "{crews:?} differs from the uniform kernel");
+    assert!(bits(crews) == bits(GemmCfg { kslice: None, ..crews }), "{crews:?} differs from the uniform kernel");
 }
 
 /// A config standing in where a spec's own is replaced.
@@ -229,7 +230,8 @@ fn gemm_throughput_probe() {
         cfgs.push(pick);
     }
     for cfg in cfgs {
-        let GemmCfg { tile: [bm, bn, bk], stages, warps: [wr, wc], unroll, core, crews } = cfg;
+        let GemmCfg { tile: [bm, bn, bk], stages, warps: [wr, wc], unroll, core, .. } = cfg;
+        let crews = cfg.crews();
         let (prog, lowering) = (plain_gemm(m, n, k, cfg), cfg.lowering(&planner.device));
         let c_t = Tensor::empty(&[m * n], DType::BFloat16);
         let out = graph_launch(prog, &lowering, &[&a_t, &b_t, &c_t]).unwrap();

@@ -266,7 +266,7 @@ fn param_key(arg: &ParamArg) -> ParamKey {
             svod_ir::AddrSpace::Global => 1,
             svod_ir::AddrSpace::Local => 2,
             svod_ir::AddrSpace::Reg => 3,
-            svod_ir::AddrSpace::Swizzled { row_bytes } => 5 + row_bytes,
+            svod_ir::AddrSpace::Swizzled { stride } => 5 + stride,
         })),
         axis: arg.axis,
         device: arg.device.as_ref().map(|x| x.canonicalize()),
@@ -1016,15 +1016,15 @@ pub fn linearize(sink: Arc<UOp>) -> Vec<Arc<UOp>> {
     newlst
 }
 
-#[cfg(test)]
-#[path = "../test/unit/linearize/linearize_internal.rs"]
-mod tests;
-
 fn addrspace_key(addrspace: svod_dtype::AddrSpace) -> usize {
     match addrspace {
         svod_dtype::AddrSpace::Global => 0,
         svod_dtype::AddrSpace::Local => 1,
         svod_dtype::AddrSpace::Reg => 2,
-        svod_dtype::AddrSpace::Swizzled { row_bytes } => 3 + usize::from(row_bytes),
+        svod_dtype::AddrSpace::Swizzled { stride } => 3 + usize::from(stride),
     }
 }
+
+#[cfg(test)]
+#[path = "../test/unit/linearize/linearize_internal.rs"]
+mod tests;
