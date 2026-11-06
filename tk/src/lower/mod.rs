@@ -10,7 +10,7 @@ use svod_codegen::llvm::LlvmTextRenderer;
 use svod_dtype::{DType, DeviceSpec, GpuArch};
 use svod_ir::{Op, UOp, ops};
 
-use crate::atoms::{Core, Device, Target};
+use crate::atoms::{Core, Device, SharedBanks, Target};
 use crate::ir::*;
 use crate::layouts::{self, Laid, TileLayout};
 use crate::schedule;
@@ -195,6 +195,61 @@ fn orient_shared(laid: &mut Laid, target: &Target) {
         if let Some(l) = l {
             layouts[src.index()] = Some(l);
         }
+    }
+    if let Some(banks) = target.shared_banks {
+        meet_banks(prog, layouts, banks, lanes);
+    }
+}
+
+/// Exchange the chunks' halves of each shared allocation whose readers reach
+/// the target's banks only that way. An allocation qualifies when one tile
+/// shape reads it whole (the exchange follows the view's row) and no reader
+/// holds a run across a half.
+fn meet_banks(prog: &mut Program, layouts: &[Option<TileLayout>], banks: SharedBanks, lanes: u32) {
+    for a in 0..prog.smem.len() {
+        let (along, dtype) = (prog.smem[a].along, prog.smem[a].dtype);
+        let views = prog.values.iter().filter(|v| matches!(v.place, Place::Smem { alloc, .. } if alloc.index() == a));
+        let shapes: Vec<_> = views.map(|v| (v.shape, v.dtype)).collect();
+        let Some(&(shape, _)) = shapes.first() else { continue };
+        let bytes = dtype.bytes();
+        let cols = if along == Axis::Row { shape.rows } else { shape.cols };
+        if bytes > 8 || !cols.is_multiple_of(16 / bytes) || shapes.iter().any(|&s| s != (shape, dtype)) {
+            continue;
+        }
+        let readers: Vec<&TileLayout> = prog
+            .walk()
+            .filter_map(|(_, stmt)| match stmt {
+                Stmt::Copy { dst, src, .. } => match (&prog.value(*src).place, prog.value(*dst).tier()) {
+                    (Place::Smem { alloc, .. }, Tier::Reg) if alloc.index() == a => layouts[dst.index()].as_ref(),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        let warps = prog.warp_grid.count();
+        let group: Vec<u32> = (0..lanes).collect();
+        let width = (16 / bytes) as u32;
+        // Whether each `banks.count` consecutive lanes of every read reach as many banks.
+        let meets = |halves| {
+            readers.iter().all(|l| {
+                let bank = |warp, lane, reg| {
+                    let (r, c) = l.coord(warp, lane, reg);
+                    let (r, c) = if along == Axis::Row { (c, r) } else { (r, c) };
+                    let at = layouts::shared_element(r as usize, c as usize, cols, bytes, halves) * bytes;
+                    1u64 << (at / banks.bytes as usize % banks.count as usize)
+                };
+                (0..warps).all(|warp| {
+                    l.runs(lanes, width, along).iter().all(|&(reg, _)| {
+                        group.chunks(banks.count as usize).all(|g| {
+                            g.iter().fold(0, |seen, &lane| seen | bank(warp, lane, reg)).count_ones() as usize
+                                == g.len()
+                        })
+                    })
+                })
+            })
+        };
+        let narrow = readers.iter().all(|l| l.runs(lanes, width, along).iter().all(|&(_, w)| w as usize * bytes <= 8));
+        prog.smem[a].halves = !readers.is_empty() && narrow && !meets(false) && meets(true);
     }
 }
 

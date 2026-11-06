@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use proptest::prelude::*;
 use svod_dtype::{AmdArch, DType, GpuArch, ScalarDType};
-use svod_ir::{Op, UOp, ops};
+use svod_ir::{CanonicalGraph, Op, UOp, ops};
 use svod_tensor::Tensor;
 use test_case::test_case;
 
@@ -286,6 +286,11 @@ fn every_family_lowers_keeps_its_numbers_and_compiles(target: Target, facts: Fac
         let low = lowered(prog.clone(), &lowering).unwrap();
         let tile = &low.tile;
         let got = interp::run(tile, params, &vars).unwrap();
+        // A device launch digests the program's linear form before anything compiles.
+        let Op::Program(ops::Program { linear: Some(linear), .. }) = low.program.op() else {
+            unreachable!("a program")
+        };
+        check(CanonicalGraph::from_root("identity", linear).is_ok(), "the program has no canonical identity");
         for (i, (g, w)) in got.iter().zip(&want).enumerate() {
             let same = g.iter().zip(w).all(|(a, b)| a == b || (a.is_nan() && b.is_nan()));
             check(same, &format!("parameter {i} differs after lowering"));
@@ -916,7 +921,7 @@ fn register_staged_trips_are_fenced(arch: AmdArch, emitted: bool) {
 fn a_load_crosses_a_barrier(asm: &str) -> bool {
     let mut in_flight = false;
     for op in asm.lines().map(str::trim).filter(|l| !l.starts_with(';')) {
-        if op.starts_with("global_load") {
+        if op.starts_with("global_load") || op.starts_with("buffer_load") {
             in_flight = true;
         } else if (op.starts_with("s_wait_loadcnt") && op.ends_with(" 0x0")) || op.contains("vmcnt(0)") {
             in_flight = false;

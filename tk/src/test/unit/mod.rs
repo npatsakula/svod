@@ -1,5 +1,6 @@
 mod atoms;
 mod attention;
+mod banks;
 mod build;
 mod conv;
 mod cost_model;

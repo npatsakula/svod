@@ -4,6 +4,7 @@
 //! intercepted here, everything else (ALU, INDEX, LOAD, STORE, CAST, RANGE)
 //! falls through to the CPU emitter unchanged.
 
+pub mod buffer;
 pub mod ops;
 pub mod tr;
 pub mod wmma;

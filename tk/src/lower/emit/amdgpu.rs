@@ -2,6 +2,7 @@
 //! product, lane moves on the vector unit and through the LDS crossbar,
 //! the hardware `exp2`, and the scheduling and priority barriers.
 
+use svod_codegen::llvm::amd::buffer::swizzled_load_b128;
 use svod_codegen::llvm::amd::tr::{global_load_tr_b128, global_load_tr_b128_or_zeros};
 
 use crate::layout as frag;
@@ -15,6 +16,27 @@ impl Emit<'_> {
     /// reaches the lanes it scatters to whole, so a lane whose run lies past
     /// the view's bounds, or whose gathered row is outside its map, addresses
     /// a run of zeros instead and every element it supplies reads zero.
+    pub(super) fn swizzled_load(&mut self, s: &View, c: &Coord, w: u32) -> Option<Vec<Arc<UOp>>> {
+        if !self.low.device.target.swizzled_loads || self.inside(s, c).is_some() {
+            return None;
+        }
+        let Some(Place::Global { offset, stride, rows: None, period: None, .. }) = &s.place else { return None };
+        let (offset, stride) = (*offset, *stride);
+        let bytes = s.dtype.bytes();
+        let (Scalar::Const(row), Scalar::Const(1)) = (self.prog.scalar(stride[0]), self.prog.scalar(stride[1])) else {
+            return None;
+        };
+        let row_bytes = u16::try_from(*row as usize * bytes).ok().filter(|&r| r < 1 << 14)?;
+        if !multiple_of(self.prog, offset, i64::from(w)) {
+            return None;
+        }
+        let (base, lane) = self.global_parts(s, c);
+        let base = self.access(&s.buf, &base, 1);
+        let voffset = self.hoist(mul(&lane, &c32(bytes as i64)));
+        let tag = self.next_tag() as usize;
+        Some(swizzled_load_b128(&base, &voffset, row_bytes, s.dtype, w as usize, tag).into_iter().collect())
+    }
+
     pub(super) fn tr_load_regs(&mut self, dst: ValId, s: &View, l: &TileLayout, perm: &[u32]) -> Result<()> {
         let [sub_r, sub_c] = l.sub_shape();
         let rows = TileLayout { frag: frag::global_tr_rows(), reps: [sub_r / 16, sub_c / 16], warps: l.warps.clone() };

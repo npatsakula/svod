@@ -152,6 +152,16 @@ impl Occupancy {
     }
 }
 
+/// Shared memory as `count` banks of `bytes` each, selected by the low address
+/// bits. A read keeps full bandwidth only while each `count` consecutive lanes
+/// reach `count` banks, half of it when they reach half of them (gfx942:
+/// 3.8 against 7.8 cycles per 64-lane read of a compute unit, 2026-11-05).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SharedBanks {
+    pub count: u32,
+    pub bytes: u32,
+}
+
 /// What a target offers the lowering.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Target {
@@ -188,6 +198,13 @@ pub struct Target {
     /// (CDNA3's XCDs): the lowering renumbers blocks so consecutive ones share
     /// a die ([`crate::lower::emit::die_order`]). 1 where a device is one die.
     pub xcds: u32,
+    /// How shared memory serves a wave, where its reads depend on the address
+    /// ([`SharedBanks`]).
+    pub shared_banks: Option<SharedBanks>,
+    /// Staged 16-byte global loads go through a buffer descriptor holding the
+    /// view's row stride and the cache-swizzle bit, which a flat load has no
+    /// room for (gfx942 4096³ GEMM: 562 against 607 TF, 2026-11-05).
+    pub swizzled_loads: bool,
     pub occupancy: Occupancy,
     /// What the semantic syncs a template places become.
     pub sync: SyncCaps,
@@ -615,6 +632,8 @@ fn cuda(c: CudaArch) -> Target {
         memory_bytes: None,
         crews: 1,
         xcds: 1,
+        shared_banks: None,
+        swizzled_loads: false,
         occupancy: Occupancy { simds: 4, file: 512, waves, registers: 255, acc_file: 0 },
         sync: SyncCaps { warp_barrier: true, commit_fence: false, priority: false },
         lane_move: LaneMove::Shuffle,
@@ -671,6 +690,8 @@ fn amd(a: AmdArch) -> Target {
         memory_bytes: None,
         crews: if cdna { 2 } else { 1 },
         xcds: 1,
+        shared_banks: (a == AmdArch::Gfx942).then_some(SharedBanks { count: 16, bytes: 8 }),
+        swizzled_loads: a == AmdArch::Gfx942,
         occupancy,
         sync: SyncCaps { warp_barrier: false, commit_fence: !cdna, priority: true },
         lane_move: if cdna { LaneMove::Permute } else { LaneMove::Dpp },
@@ -695,6 +716,8 @@ fn metal(f: MetalFamily) -> Target {
         memory_bytes: None,
         crews: 1,
         xcds: 1,
+        shared_banks: None,
+        swizzled_loads: false,
         occupancy: Occupancy { simds: 4, file: 1024, waves: 8, registers: 128, acc_file: 0 },
         sync: SyncCaps { warp_barrier: false, commit_fence: false, priority: false },
         lane_move: LaneMove::SimdShuffle,
