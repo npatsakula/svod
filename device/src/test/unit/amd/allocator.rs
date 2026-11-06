@@ -2,10 +2,11 @@ use super::test_support::{
     MockAmdCall, MockAmdIface, MockFreeIssue, amd_alloc_or_skip, install_signal_pool, mock_device,
 };
 use crate::allocator::{Allocator, AmdBufferGuard, BufferSpec, RawBuffer};
-use crate::amd::iface::{AllocKind, AmdIface};
+use crate::amd::iface::{AllocKind, AmdIface, HUGE_PAGE, reserve_va};
 use crate::amd::va_registry::AllocTag;
 use crate::error::Error;
 use std::sync::Arc;
+use test_case::test_case;
 
 /// Live VRAM alloc → free round-trip. Skipped on hosts that can't open an
 /// AmdDevice (no GPU, unsupported arch, missing perms).
@@ -17,6 +18,32 @@ fn alloc_free_roundtrip_if_hw_supports() {
     assert_eq!(buf.size(), 4096);
     assert!(buf.cpu_accessible());
     alloc.free(buf, 4096, &opts);
+}
+
+#[test_case(4096 => 4096; "a small buffer keeps its pages")]
+#[test_case(HUGE_PAGE - 4096 => HUGE_PAGE - 4096; "just below a huge page")]
+#[test_case(HUGE_PAGE => HUGE_PAGE; "one huge page")]
+#[test_case(HUGE_PAGE + 1 => 2 * HUGE_PAGE; "a partial huge page rounds up")]
+#[test_case(35 * HUGE_PAGE / 2 => 18 * HUGE_PAGE; "a large buffer with a tail")]
+fn a_data_buffer_takes_whole_huge_pages(size: usize) -> usize {
+    let (_iface, alloc) = mock_device(1);
+    let opts = BufferSpec { cpu_access: true, ..Default::default() };
+    let buffer = alloc.alloc(size, &opts, false).expect("mock allocation");
+    let bytes = buffer.size();
+    alloc.free(buffer, size, &opts);
+    bytes
+}
+
+/// The reservation is the VA the GPU maps: large ones start on a huge page
+/// whatever their length, and only the reserved range stays mapped.
+#[test_case(HUGE_PAGE; "one huge page")]
+#[test_case(HUGE_PAGE + 4096; "a page past it")]
+#[test_case(35 * HUGE_PAGE / 2; "a large buffer with a tail")]
+fn a_large_reservation_starts_on_a_huge_page(size: usize) {
+    let va = reserve_va(size).expect("reservation");
+    assert_eq!(va as usize % HUGE_PAGE, 0);
+    // SAFETY: the range was reserved above and nothing else uses it.
+    assert_eq!(unsafe { libc::munmap(va, size) }, 0);
 }
 
 #[test]

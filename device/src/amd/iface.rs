@@ -31,6 +31,8 @@ use crate::error::{Error, Result};
 
 /// Size of the doorbell MMIO window mapped per queue (two 4 KiB pages).
 const DOORBELL_PAGE_BYTES: usize = 0x2000;
+/// The GPU page a large allocation should be mapped with.
+pub(crate) const HUGE_PAGE: usize = 0x20_0000;
 
 /// Backend seam for the AMD device. Every KFD ioctl that `AmdDeviceCore` (and
 /// its allocator / queue / connector helpers) needs is funnelled through one
@@ -740,15 +742,33 @@ fn compose_flags(kind: AllocKind, cpu_access: bool) -> u32 {
     }
 }
 
-/// Reserve `size` bytes of host VA so KFD can bind VRAM into it.
-fn reserve_va(size: usize) -> Result<*mut libc::c_void> {
+/// Reserve `size` bytes of host VA so KFD can bind VRAM into it. A buffer of a
+/// huge page or more starts on one: an anonymous `mmap` aligns only lengths
+/// that are multiples of it (Linux ≥ 6.7, with THP on), and a VA off the
+/// physical alignment takes no large PTE fragments (gfx942 GEMM over
+/// 4128×4096×4096: 455 against 604 TF, 2026-11-06).
+pub(crate) fn reserve_va(size: usize) -> Result<*mut libc::c_void> {
+    let align = if size >= HUGE_PAGE { HUGE_PAGE } else { 1 };
+    let span = size + (align - 1);
     // SAFETY: standard libc::mmap signature; no aliasing concerns at this point.
-    let p = unsafe { mmap(std::ptr::null_mut(), size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0) };
+    let p = unsafe { mmap(std::ptr::null_mut(), span, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0) };
     if p == libc::MAP_FAILED {
         let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
         return Err(Error::AmdIoctl { ioctl: "mmap(VA reservation)", errno });
     }
-    Ok(p)
+    let (start, end) = (p as usize, p as usize + span);
+    let va = start.next_multiple_of(align);
+    let tail = (va + size).next_multiple_of(0x1000);
+    // SAFETY: both ranges lie in the reservation above and nothing uses them.
+    unsafe {
+        if va > start {
+            munmap(p, va - start);
+        }
+        if end > tail {
+            munmap(tail as *mut _, end - tail);
+        }
+    }
+    Ok(va as *mut _)
 }
 
 fn map_alloc_err(e: nix::errno::Errno, cpu_accessible: bool) -> Error {

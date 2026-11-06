@@ -2698,8 +2698,10 @@ fn create_queue(
         // Without the header, a restore reads garbage `DebugOffset`/`DebugSize`
         // and the queue silently strands (rptr frozen, no fault) — the exact
         // multi-XCC wedge. Mirrors libhsakmt `fill_cwsr_header`.
-        let ctx_spec = BufferSpec { cpu_access: true, nolru: true, ..Default::default() };
-        let ctx_buf = AmdBufferGuard::new(allocator.alloc(cwsr_buffer_size, &ctx_spec, /*zero=*/ true)?);
+        // KFD takes this buffer at its exact size.
+        let ctx_buf = AmdBufferGuard::new(
+            allocator.alloc_host_visible_tagged(cwsr_buffer_size, crate::amd::va_registry::AllocTag::Vram)?,
+        );
         let eop_gpu = match eop_buf.buffer() {
             crate::allocator::RawBuffer::AmdDevice { gpu_addr, .. } => *gpu_addr,
             _ => 0,
