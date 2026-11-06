@@ -166,11 +166,19 @@ impl Emit<'_> {
                 };
                 let chunk = 16 / bytes as i64;
                 let swizzle = Swizzle::of_row(cols as usize, bytes);
-                let col = if swizzle != Swizzle::None {
-                    let (c, within) = (shr(&col, chunk.trailing_zeros()), and(&col, &c32(chunk - 1)));
-                    let (shift, mask) = (3 - swizzle.bits(), c32((1 << swizzle.bits()) - 1));
-                    let sw = if shift == 0 { and(&row, &mask) } else { and(&shr(&row, shift), &mask) };
-                    add(&mul(&xor(&c, &sw), &c32(chunk)), &within)
+                let halves = self.halves(view);
+                let col = if swizzle != Swizzle::None || halves {
+                    let (mut c, mut within) = (shr(&col, chunk.trailing_zeros()), and(&col, &c32(chunk - 1)));
+                    if swizzle != Swizzle::None {
+                        let (shift, mask) = (3 - swizzle.bits(), c32((1 << swizzle.bits()) - 1));
+                        let sw = if shift == 0 { and(&row, &mask) } else { and(&shr(&row, shift), &mask) };
+                        c = xor(&c, &sw);
+                    }
+                    if halves {
+                        let bit = crate::layouts::HALVES_ROW_BIT as u32;
+                        within = xor(&within, &mul(&and(&shr(&row, bit), &c32(1)), &c32(8 / bytes as i64)));
+                    }
+                    add(&mul(&c, &c32(chunk)), &within)
                 } else {
                     col
                 };
@@ -180,6 +188,16 @@ impl Emit<'_> {
             }
             Some(Place::Reg) => unreachable!(),
         }
+    }
+
+    /// A plain global view's coordinate as its offset, uniform in a wave, and
+    /// the lane's part with the register's constant.
+    pub(super) fn global_parts(&mut self, view: &View, c: &Coord) -> (Arc<UOp>, Arc<UOp>) {
+        let Some(Place::Global { offset, stride, .. }) = &view.place else { unreachable!("a global view") };
+        let ((_, offset), (_, s0), (_, s1)) = (self.scalar(*offset), self.scalar(stride[0]), self.scalar(stride[1]));
+        let lane = self.hoist(add(&mul(&c.row, &s0), &mul(&c.col, &s1)));
+        let delta = [(c.dr, &s0), (c.dc, &s1)].into_iter().filter(|(d, _)| *d != 0).map(|(d, s)| mul(&c32(d), s));
+        (offset, delta.fold(lane, |a, b| add(&a, &b)))
     }
 
     /// Whether coordinate `c` of a global view lies within its bounds and,
@@ -263,6 +281,12 @@ impl Emit<'_> {
         }
     }
 
+    /// Whether a view's allocation exchanges its chunks' halves
+    /// ([`crate::layouts::shared_element`]): its accesses stay within a half.
+    pub(super) fn halves(&self, view: &View) -> bool {
+        matches!(&view.place, Some(Place::Smem { alloc, .. }) if self.prog.smem[alloc.index()].halves)
+    }
+
     /// The width in elements of the column panels a shared row of `cols`
     /// elements is stored as: under the warpgroup core a row longer than the
     /// widest swizzle span (128 bytes) is kept as panels of that span, each
@@ -281,6 +305,9 @@ impl Emit<'_> {
     pub(super) fn runs(&self, l: &TileLayout, view: &View) -> Vec<(u32, u32)> {
         let (along, contiguous) = self.along(view);
         let mut width = if contiguous { 16 / view.dtype.bytes() as u32 } else { 1 };
+        if self.halves(view) {
+            width = width.min(8 / view.dtype.bytes() as u32);
+        }
         // An aligned run no wider than the power of two dividing a period stays within one.
         if let Some(Place::Global { period: Some(p), .. }) = &view.place {
             width = width.min(1 << p.trailing_zeros());

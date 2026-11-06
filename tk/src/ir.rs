@@ -514,13 +514,17 @@ pub struct Param {
 /// A shared allocation. Its tiles are stored with consecutive elements
 /// along `along`: `Col` is row-major, `Row` column-major. The lowering sets
 /// it to the axis the tiles' consumers read fragments along
-/// (`lower::orient_shared`); an author never does.
+/// (`lower::orient_shared`); an author never does. So is `halves`: its tiles
+/// exchange a chunk's 8-byte halves on a bit of the row
+/// ([`crate::layouts::shared_element`]), for readers that meet the target's
+/// banks only then.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SmemAlloc {
     pub name: String,
     pub dtype: ScalarDType,
     pub elems: usize,
     pub along: Axis,
+    pub halves: bool,
 }
 
 /// A bound symbolic variable of the launch, with the range it may take.

@@ -78,6 +78,7 @@ impl Emit<'_> {
                 Some(g) => self.hoist(UOp::try_where(g.clone(), src_off, c32(0)).expect("safe offset")),
                 None => src_off,
             };
+            let (hi_row, hi_col) = (row.clone(), col.clone());
             let (dst_off, _) = self.address(&d, &Coord::plain(row, col));
             if mode == CopyMode::Async && self.low.device.target.fill == Fill::CpAsync {
                 let (dst, src) = (self.access(&d.buf, &dst_off, 1), self.access(&s.buf, &src_off, 1));
@@ -94,8 +95,15 @@ impl Emit<'_> {
                     Some(g) => self.zeroed(&g, v),
                     None => v,
                 };
-                let vals = (0..chunk as usize).map(|e| elem(&v, e, chunk as usize)).collect();
-                self.mem_store(&d.buf, &dst_off, vals);
+                let vals: Vec<_> = (0..chunk as usize).map(|e| elem(&v, e, chunk as usize)).collect();
+                if self.halves(&d) {
+                    let half = chunk as usize / 2;
+                    let (hi_off, _) = self.address(&d, &Coord::plain(hi_row, add(&hi_col, &c32(half as i64))));
+                    self.mem_store(&d.buf, &dst_off, vals[..half].to_vec());
+                    self.mem_store(&d.buf, &hi_off, vals[half..].to_vec());
+                } else {
+                    self.mem_store(&d.buf, &dst_off, vals);
+                }
             }
         }
         Ok(())
@@ -143,6 +151,13 @@ impl Emit<'_> {
         let l2_only = mode == CopyMode::Staged && self.low.device.target.fill == Fill::CpAsync;
         for (j, w) in self.runs(&l, &s) {
             let c = self.coord(&l, j);
+            if mode == CopyMode::Staged
+                && w as usize * s.dtype.bytes() == 16
+                && let Some(vals) = self.swizzled_load(&s, &c, w)
+            {
+                self.reg_store(dst, j, vals);
+                continue;
+            }
             let (off, gate) = self.address(&s, &c);
             if l2_only && w as usize * s.dtype.bytes() == 16 {
                 let vals = self.load_l2_only(&s, off, gate, w as usize);
