@@ -1953,11 +1953,17 @@ impl AmdComputeQueue {
             let g = self.inner.lock();
             (g.queue_id, g.ring_gpu, g.ring_size as u32)
         };
-        self.core.iface().update_queue_percentage(queue_id, ring_gpu, ring_size, 0)?;
+        let fault = |e: &Error| {
+            if let Some(fault) = self.core.poll_faults_nonblocking() {
+                tracing::error!(%e, %fault, "queue update failed behind a memory fault");
+            }
+        };
+        self.core.iface().update_queue_percentage(queue_id, ring_gpu, ring_size, 0).inspect_err(fault)?;
         self.set_aql_scratch(desc);
         self.core
             .iface()
             .update_queue_percentage(queue_id, ring_gpu, ring_size, kfd::KFD_MAX_QUEUE_PERCENTAGE)
+            .inspect_err(fault)
             .inspect_err(|e| self.core.poison(&format!("AQL descriptor remap failed; queue left unmapped: {e}")))
     }
 
