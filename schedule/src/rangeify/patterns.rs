@@ -941,7 +941,7 @@ fn map_after_like_node(node: &Arc<UOp>, ctx: &mut LocalAddBufferContext) -> Opti
     // Only global storage participates in the CALL tuple. Internal storage is
     // unwrapped for kernel use without consuming a PARAM slot or CALL argument.
     match storage_addrspace(&buf) {
-        Some(AddrSpace::Global) => {}
+        Some(AddrSpace::Global | AddrSpace::Swizzled { .. }) => {}
         Some(AddrSpace::Local | AddrSpace::Reg) => return Some(buf),
         None => return None,
     }

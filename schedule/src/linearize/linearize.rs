@@ -211,7 +211,9 @@ fn dtype_key(dtype: &DType) -> DTypeKey {
     let extension = match dtype {
         DType::Scalar(_) => vec![],
         DType::Vector { count, .. } => vec![1, *count],
-        DType::Ptr { addrspace, size, vcount, .. } => vec![2, *addrspace as usize, size.unwrap_or(usize::MAX), *vcount],
+        DType::Ptr { addrspace, size, vcount, .. } => {
+            vec![2, addrspace_key(*addrspace), size.unwrap_or(usize::MAX), *vcount]
+        }
         DType::Image { kind, shape } => {
             let mut out = vec![3, *kind as usize];
             out.extend(shape);
@@ -247,7 +249,7 @@ struct ParamKey {
     vmin_vmax: Option<(ConstKey, ConstKey)>,
     multiple_of: Option<usize>,
     name: Option<String>,
-    addrspace: Option<u8>,
+    addrspace: Option<u16>,
     axis: Option<usize>,
     device: Option<String>,
     volatile: bool,
@@ -264,6 +266,7 @@ fn param_key(arg: &ParamArg) -> ParamKey {
             svod_ir::AddrSpace::Global => 1,
             svod_ir::AddrSpace::Local => 2,
             svod_ir::AddrSpace::Reg => 3,
+            svod_ir::AddrSpace::Swizzled { row_bytes } => 5 + row_bytes,
         })),
         axis: arg.axis,
         device: arg.device.as_ref().map(|x| x.canonicalize()),
@@ -1016,3 +1019,12 @@ pub fn linearize(sink: Arc<UOp>) -> Vec<Arc<UOp>> {
 #[cfg(test)]
 #[path = "../test/unit/linearize/linearize_internal.rs"]
 mod tests;
+
+fn addrspace_key(addrspace: svod_dtype::AddrSpace) -> usize {
+    match addrspace {
+        svod_dtype::AddrSpace::Global => 0,
+        svod_dtype::AddrSpace::Local => 1,
+        svod_dtype::AddrSpace::Reg => 2,
+        svod_dtype::AddrSpace::Swizzled { row_bytes } => 3 + usize::from(row_bytes),
+    }
+}

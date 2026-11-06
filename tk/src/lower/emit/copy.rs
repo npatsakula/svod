@@ -151,13 +151,6 @@ impl Emit<'_> {
         let l2_only = mode == CopyMode::Staged && self.low.device.target.fill == Fill::CpAsync;
         for (j, w) in self.runs(&l, &s) {
             let c = self.coord(&l, j);
-            if mode == CopyMode::Staged
-                && w as usize * s.dtype.bytes() == 16
-                && let Some(vals) = self.swizzled_load(&s, &c, w)
-            {
-                self.reg_store(dst, j, vals);
-                continue;
-            }
             let (off, gate) = self.address(&s, &c);
             if l2_only && w as usize * s.dtype.bytes() == 16 {
                 let vals = self.load_l2_only(&s, off, gate, w as usize);

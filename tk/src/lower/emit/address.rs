@@ -190,16 +190,6 @@ impl Emit<'_> {
         }
     }
 
-    /// A plain global view's coordinate as its offset, uniform in a wave, and
-    /// the lane's part with the register's constant.
-    pub(super) fn global_parts(&mut self, view: &View, c: &Coord) -> (Arc<UOp>, Arc<UOp>) {
-        let Some(Place::Global { offset, stride, .. }) = &view.place else { unreachable!("a global view") };
-        let ((_, offset), (_, s0), (_, s1)) = (self.scalar(*offset), self.scalar(stride[0]), self.scalar(stride[1]));
-        let lane = self.hoist(add(&mul(&c.row, &s0), &mul(&c.col, &s1)));
-        let delta = [(c.dr, &s0), (c.dc, &s1)].into_iter().filter(|(d, _)| *d != 0).map(|(d, s)| mul(&c32(d), s));
-        (offset, delta.fold(lane, |a, b| add(&a, &b)))
-    }
-
     /// Whether coordinate `c` of a global view lies within its bounds and,
     /// gathered, inside its row map; `None` where the view has neither.
     pub(super) fn inside(&mut self, view: &View, c: &Coord) -> Option<Arc<UOp>> {
