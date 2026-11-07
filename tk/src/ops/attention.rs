@@ -313,7 +313,7 @@ fn attend(q: &Tensor, k: &Tensor, v: &Tensor, packed: Option<&Tensor>, opts: Att
 }
 
 /// The merge of `splits` partial results.
-fn merge(batch: Batch, t: usize, heads: usize, d: usize, splits: usize) -> CombineSpec {
+pub(crate) fn merge(batch: Batch, t: usize, heads: usize, d: usize, splits: usize) -> CombineSpec {
     CombineSpec { batch, t, heads, d, splits, cfg: NormCfg { br: MERGE_ROWS } }
 }
 
