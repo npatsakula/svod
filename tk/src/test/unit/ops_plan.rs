@@ -2086,7 +2086,7 @@ fn two_atom_rows_are_a_variant_not_a_tile(target: Planner, tiles: &[(usize, usiz
     use crate::ops::config::{representatives, shortlist};
     let ranked = target.attention_ranked(32, 2048, 2048, 64, false, true);
     let reps = representatives(&ranked);
-    assert!(reps.iter().all(|c| c.warp_rows == narrowest_warp_rows(c.core, c.bq)), "{reps:?}");
+    assert!(reps.iter().all(|c| c.warp_rows == narrowest_warp_rows(c.core, WARP_ROWS, c.bq)), "{reps:?}");
     let clean = vec![Compiled::Clean; reps.len()];
     let mut compiles = Verdicts { verdicts: &clean, order: [0].iter().cycle(), room: 0, flight: vec![], asked: vec![] };
     let at = shortlist(&reps, &mut compiles).expect("a shortlist");
@@ -2119,6 +2119,20 @@ fn a_wide_block_keeps_to_eight_row_warps() {
 /// variant, and its twins are its own core's pipelines. A warp-level config
 /// of one atom row prints as it did before either field existed.
 #[test]
+fn the_wide_core_is_a_tile_of_its_own() {
+    let target = crate::test::unit::targets::amd(AmdArch::Gfx942, 304);
+    let ranked = planner(target).attention_ranked(32, 2048, 2048, 128, false, false);
+    let wide: Vec<&FaCfg> = ranked.iter().filter(|c| c.core == Core::Wide).collect();
+    assert!(!wide.is_empty(), "{ranked:?}");
+    for c in wide {
+        assert!(c.represents(), "{c:?}");
+        assert!(c.warp_rows.is_multiple_of(32), "{c:?}");
+        assert!(c.twins(&ranked).iter().all(|t| t.core == Core::Wide), "{c:?}");
+        assert_eq!(FaCfg::of_code(&c.code()).as_ref(), Some(c), "{c:?}");
+    }
+}
+
+#[test]
 fn the_warpgroup_core_is_a_tile_of_its_own() {
     use crate::ops::config::representatives;
     let ranked = planner(super::targets::hopper()).attention_ranked(32, 2048, 2048, 128, false, false);
@@ -2132,7 +2146,7 @@ fn the_warpgroup_core_is_a_tile_of_its_own() {
     }
     assert_eq!(
         representatives(&ranked).len(),
-        ranked.iter().filter(|c| c.warp_rows == narrowest_warp_rows(c.core, c.bq)).count()
+        ranked.iter().filter(|c| c.warp_rows == narrowest_warp_rows(c.core, WARP_ROWS, c.bq)).count()
     );
     let plain = format!("{:?}", FaCfg::new(64, 32, 2));
     assert!(!plain.contains("core") && !plain.contains("warp_rows"), "{plain}");

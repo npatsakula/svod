@@ -1085,7 +1085,7 @@ fn orient_products(prog: &mut Program, device: &Device, grid: WarpGrid, core: Co
     for (_, s) in prog.walk() {
         if let Stmt::Let { dst, op: TileOp::Mma { a, orient: None, .. } } = s {
             let (va, vd) = (prog.value(*a), prog.value(*dst));
-            if target.mma(va.dtype, vd.dtype).is_some_and(|atom| core == Core::Warp && atom.swappable())
+            if target.mma_on(core, va.dtype, vd.dtype).is_some_and(|atom| core != Core::Group && atom.swappable())
                 && !free.contains(dst)
             {
                 free.push(*dst);
@@ -1530,7 +1530,7 @@ impl<'a> Infer<'a> {
                 let (va, vc) = (self.prog.value(a).clone(), self.prog.value(dst).clone());
                 let atom = self
                     .target
-                    .mma(va.dtype, vc.dtype)
+                    .mma_on(self.core, va.dtype, vc.dtype)
                     .context(NoMatrixCoreSnafu { arch: self.target.arch, dtype_in: va.dtype, dtype_out: vc.dtype })?
                     .clone();
                 let k = if a_t { va.shape.rows } else { va.shape.cols };

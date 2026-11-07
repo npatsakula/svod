@@ -298,6 +298,11 @@ const fn key_warps(kw: usize, bkv: usize) -> FaCfg {
 }
 
 /// Two atom rows of queries per warp, `bq` by `bkv`, in the plain forms.
+/// A config on the wide core, one 32-row atom a warp.
+const fn wide(bq: usize, bkv: usize) -> FaCfg {
+    FaCfg { core: Core::Wide, ..rows32(bq, bkv) }
+}
+
 const fn rows32(bq: usize, bkv: usize) -> FaCfg {
     FaCfg { warp_rows: 2 * WARP_ROWS, ..FaCfg::new(bq, bkv, 2) }
 }
@@ -396,6 +401,12 @@ fn with(cfg: FaCfg, spec: AttnSpec) -> AttnSpec {
 #[test_case(with(FaCfg::new(128, 32, 2), masked(200, 130, 128, 0, 0, LENS_BIAS)), &[130, 99]; "d 128 bias with lengths, bq 128")]
 #[test_case(masked(128, 128, 128, 64, 32, EVERY_BIAS), &[128, 100]; "every mask and a bias, d 128")]
 #[test_case(biased(counted(cached(5, 96, [2, 2, 128], false, 8, 2))), &[64, 96]; "cache biased: d 128, eight counted appended, two splits")]
+#[test_case(with(wide(128, 32), masked(200, 300, 128, 0, 0, AttnMask::default())), &[200, 300]; "wide core, d 128")]
+#[test_case(with(wide(256, 64), masked(300, 300, 64, 0, 0, AttnMask::default())), &[300, 300]; "wide core, d 64, bq 256")]
+#[test_case(with(wide(32, 32), masked(100, 150, 128, 0, 0, AttnMask::default())), &[100, 150]; "wide core, one warp")]
+#[test_case(with(wide(128, 64), masked(200, 130, 128, 0, 0, LENS_BIAS)), &[130, 99]; "wide core, bias with lengths")]
+#[test_case(with(wide(128, 32), masked(128, 128, 128, 64, 32, EVERY_BIAS)), &[128, 100]; "wide core, every mask and a bias")]
+#[test_case(with(FaCfg { splits: 2, ..wide(64, 32) }, masked(100, 300, 64, 0, 0, AttnMask::default())), &[100, 300]; "wide core, two splits")]
 fn attention_matches_a_direct_softmax(spec: AttnSpec, lens: &[i64]) {
     matches_a_direct_softmax(&case(spec.clone(), lens));
     let Some(planner) = super::device_planner() else { return };
@@ -801,7 +812,11 @@ fn label(c: &FaCfg) -> String {
     ];
     let on: Vec<&str> = forms.iter().filter(|(on, _)| *on).map(|(_, name)| *name).collect();
     let rows = if c.warp_rows == WARP_ROWS { String::new() } else { format!(" rows={}", c.warp_rows) };
-    let core = if c.core == Core::Warp { "" } else { " group" };
+    let core = match c.core {
+        Core::Warp => "",
+        Core::Wide => " wide",
+        Core::Group => " group",
+    };
     format!("bq{} bkv{} s{}{rows} unroll={} forms [{}]{core}", c.bq, c.bkv, c.stages, c.unroll, on.join(" "))
 }
 

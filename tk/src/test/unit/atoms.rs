@@ -1,7 +1,7 @@
 use svod_dtype::{AmdArch, CudaArch, GpuArch, ScalarDType};
 use test_case::test_case;
 
-use crate::atoms::Target;
+use crate::atoms::{Core, Target};
 use crate::layout::Dim::{Col, Lane, Reg, Row};
 
 /// Where the instruction reads operand element `(lane, reg)` from, per the
@@ -133,6 +133,22 @@ fn matches_the_isa(
 /// is priced is what runs. An 8-bit atom ([`Target::geometry_of`]), on every
 /// target with kernels, has the geometry's `m` and `n` (an 8-bit tile is laid
 /// over the warps as a 16-bit one) and its `k` or twice it.
+/// A wide atom holds the narrow one's products in half the instructions, over
+/// both 16-bit inputs, and only CDNA offers it.
+#[test]
+fn a_wide_atom_doubles_the_narrow_products() {
+    for (_, target) in crate::sweep::targets() {
+        let cdna = matches!(target.arch, GpuArch::Amd(a) if a.is_cdna());
+        assert_eq!(!target.wide_mma.is_empty(), cdna, "{:?}", target.arch);
+        let Some(wide) = target.geometry_on(Core::Wide) else { continue };
+        let narrow = target.geometry().expect("a matrix core");
+        assert_eq!(wide.m * wide.n * wide.k, 2 * narrow.m * narrow.n * narrow.k, "{:?}", target.arch);
+        for dtype in [ScalarDType::BFloat16, ScalarDType::Float16] {
+            assert!(target.mma_on(Core::Wide, dtype, ScalarDType::Float32).is_some(), "{:?} {dtype:?}", target.arch);
+        }
+    }
+}
+
 #[test]
 fn every_atom_of_a_target_shares_its_geometry() {
     let metal = Target::for_arch(GpuArch::Metal(svod_dtype::MetalFamily::Apple(9)));

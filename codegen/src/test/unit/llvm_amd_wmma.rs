@@ -57,3 +57,12 @@ use ScalarDType::{BFloat16, Bool, FP8E4M3, FP8E5M2, Float16, Float32, Int8, Int3
 fn intrinsic_selection(arch: AmdArch, in_dt: ScalarDType, acc_dt: ScalarDType, k: usize) -> Option<String> {
     resolve_intrinsic(arch, Some(in_dt), Some(acc_dt), (16, 16, k))
 }
+
+#[test_case::test_case(Gfx942, Float16, Float32 => Some("llvm.amdgcn.mfma.f32.32x32x8f16".into()))]
+#[test_case::test_case(Gfx942, BFloat16, Float32 => Some("llvm.amdgcn.mfma.f32.32x32x8bf16.1k".into()))]
+#[test_case::test_case(Gfx950, BFloat16, Float32 => Some("llvm.amdgcn.mfma.f32.32x32x8bf16.1k".into()))]
+#[test_case::test_case(Gfx942, FP8E4M3, Float32 => None; "no fp8 at this shape")]
+#[test_case::test_case(Gfx1201, Float16, Float32 => None; "rdna has no wide core")]
+fn wide_intrinsic_selection(arch: AmdArch, in_dt: ScalarDType, acc_dt: ScalarDType) -> Option<String> {
+    resolve_intrinsic(arch, Some(in_dt), Some(acc_dt), (32, 32, 8))
+}

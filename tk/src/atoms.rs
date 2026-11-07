@@ -16,6 +16,9 @@ pub enum Core {
     /// The warp-level atom ([`MmaAtom`]): operands in registers.
     #[default]
     Warp,
+    /// The wider, shallower warp-level atom ([`Target::wide_mma`]): the same
+    /// products in half the instructions, each reading more registers.
+    Wide,
     /// The warpgroup atom ([`GroupMmaAtom`]): a grid's rows are warpgroups
     /// of four warps, and shared operands are read through descriptors.
     Group,
@@ -184,6 +187,9 @@ pub struct Target {
     pub arch: GpuArch,
     pub wave: u32,
     pub mma: Vec<MmaAtom>,
+    /// A warp-level core wider and shallower than [`Self::mma`]'s, over the
+    /// same 16-bit inputs, where the target has one.
+    pub wide_mma: Vec<MmaAtom>,
     /// Warpgroup matrix instructions over shared descriptors, where the
     /// target has them (Hopper).
     pub group_mma: Vec<GroupMmaAtom>,
@@ -591,6 +597,21 @@ impl Target {
         self.mma.iter().find(|a| a.dtype_in == dtype_in && a.dtype_out == dtype_out)
     }
 
+    /// The warp-level atoms `core` issues on.
+    fn atoms(&self, core: Core) -> &[MmaAtom] {
+        if core == Core::Wide { &self.wide_mma } else { &self.mma }
+    }
+
+    /// [`Self::mma`] on `core`.
+    pub fn mma_on(&self, core: Core, dtype_in: ScalarDType, dtype_out: ScalarDType) -> Option<&MmaAtom> {
+        self.atoms(core).iter().find(|a| a.dtype_in == dtype_in && a.dtype_out == dtype_out)
+    }
+
+    /// [`Self::geometry`] on `core`.
+    pub fn geometry_on(&self, core: Core) -> Option<&MmaAtom> {
+        self.atoms(core).iter().find(|a| a.dtype_in.bytes() == 2)
+    }
+
     /// The warp-level matrix core's geometry over 16-bit operands: its
     /// `m × n × k` and operand layouts, which every 16-bit input's atom
     /// shares (`test::unit::atoms::every_atom_of_a_target_shares_its_geometry`).
@@ -619,7 +640,7 @@ impl Target {
     /// its atoms.
     pub fn issue(&self, core: Core, grid: WarpGrid, m: usize, n: usize, k: usize) -> Option<Issue> {
         match core {
-            Core::Warp => self.geometry()?.issue(Orient::Direct, grid, m, n, k).ok(),
+            Core::Warp | Core::Wide => self.geometry_on(core)?.issue(Orient::Direct, grid, m, n, k).ok(),
             Core::Group => self.group_mma.first()?.issue(grid, m, n, k).ok(),
         }
     }
@@ -643,6 +664,7 @@ fn cuda(c: CudaArch) -> Target {
         arch: GpuArch::Cuda(c),
         wave: c.wave_size(),
         mma,
+        wide_mma: vec![],
         group_mma: if c.major == 9 { group_mma_atoms(renderer.device) } else { vec![] },
         fill: if c.major >= 8 { Fill::CpAsync } else { Fill::Staged },
         ldmatrix: (c.major, c.minor) >= (7, 5),
@@ -692,6 +714,19 @@ fn amd(a: AmdArch) -> Target {
         int8_atom(renderer.tensor_cores.iter(), renderer.device, (16, 16, 16), layouts)
     };
     mma.extend(int8);
+    let wide_mma = if cdna {
+        // Only the operand layouts place data here, so the 16-bit core's
+        // scheduler axes stand: no scheduler picks this atom.
+        let operand = frag::mfma_32x32x8_a();
+        let layouts = [operand.clone(), operand.transpose(), frag::mfma_32x32x8_c()];
+        let narrow = renderer.tensor_cores.iter().filter(|tc| tc.dims == (16, 16, 16));
+        narrow
+            .filter(|tc| is_half(&tc.dtype_in) && tc.dtype_out == DType::Float32)
+            .map(|tc| atom(&TensorCore { dims: (32, 32, 8), ..tc.clone() }, renderer.device, layouts.clone()))
+            .collect()
+    } else {
+        vec![]
+    };
     let occupancy = if cdna {
         Occupancy { simds: 4, file: 512, waves: 8, registers: 256, acc_file: 256 }
     } else {
@@ -701,6 +736,7 @@ fn amd(a: AmdArch) -> Target {
         arch: GpuArch::Amd(a),
         wave: a.wave_size(),
         mma,
+        wide_mma,
         group_mma: vec![],
         fill: Fill::Staged,
         ldmatrix: false,
@@ -731,6 +767,7 @@ fn metal(f: MetalFamily) -> Target {
         arch: GpuArch::Metal(f),
         wave: 32,
         mma: mma_atoms(&Renderer::for_metal_family(f), (8, 8, 8), [s.transpose(), s.clone(), s]),
+        wide_mma: vec![],
         group_mma: vec![],
         fill: Fill::Staged,
         ldmatrix: false,
