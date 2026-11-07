@@ -81,28 +81,50 @@ fn assign_target(uop: &Arc<UOp>) -> Option<&Arc<UOp>> {
     }
 }
 
-/// The outputs of every CALL under `old` that `plan` ran, each to the storage
+/// The outputs of every CALL under `roots` that `plan` ran, each to the storage
 /// that run wrote: a sibling read later reads it rather than running the kernel
-/// again. An output `plan` packed away holds nothing here, so it runs again.
-fn sibling_outputs(plan: &ExecutionPlan, old: &Arc<UOp>) -> HashMap<UOpKey, Arc<UOp>> {
+/// again. An output `plan` packed away holds nothing here, so it runs again, and
+/// so does anything of a chain: a later CALL over a CALL's output may overwrite
+/// the storage that output would resolve to.
+fn sibling_outputs(plan: &ExecutionPlan, roots: Vec<Arc<UOp>>) -> HashMap<UOpKey, Arc<UOp>> {
+    let calls: Vec<_> =
+        UOp::sink(roots).toposort_call_aware(false).into_iter().filter(|u| matches!(u.op(), Op::Call(..))).collect();
+    let args = |call: &Arc<UOp>| match call.op() {
+        Op::Call(ops::Call { args, .. }) => args.clone(),
+        _ => unreachable!("filtered to calls"),
+    };
+    if calls.iter().flat_map(args).any(|arg| UOp::realized_base(&arg).is_some()) {
+        return HashMap::new();
+    }
     let stored = |arg: &Arc<UOp>| {
         arg.has_buffer_identity().then(|| crate::tensor_registry::get_buffer_arc(arg.base().id)).flatten()
     };
+    let written = plan.written_storage_ids();
     let mut outputs = HashMap::new();
-    for call in old.toposort_call_aware(false) {
-        let Op::Call(ops::Call { args, .. }) = call.op() else { continue };
-        if !args.iter().filter_map(stored).any(|buffer| plan.writes_storage(&buffer)) {
+    for call in &calls {
+        let args = args(call);
+        if !args.iter().filter_map(stored).any(|buffer| written.contains(&buffer.storage_id())) {
             continue;
         }
         for arg in args {
-            if UOp::realized_base(arg).is_some() || stored(arg).is_some_and(|buffer| buffer.is_allocated()) {
+            if stored(&arg).is_some_and(|buffer| buffer.is_allocated()) {
                 let after = Op::After(ops::After { passthrough: arg.clone(), deps: smallvec::smallvec![call.clone()] });
                 let after = UOp::new_with_origin(after, arg.dtype(), None, call.origin());
-                outputs.insert(UOpKey(after), arg.clone());
+                outputs.insert(UOpKey(after), arg);
             }
         }
     }
     outputs
+}
+
+/// Points every tensor at what running `plan` made of `old`: `new` for it, and
+/// the storage its kernels' other outputs now hold.
+fn adopt_realized(plan: &ExecutionPlan, old: Arc<UOp>, new: Arc<UOp>) {
+    let mut becomes_map = sibling_outputs(plan, vec![old.clone()]);
+    if !Arc::ptr_eq(&old, &new) {
+        becomes_map.insert(UOpKey(old), new);
+    }
+    crate::tensor_registry::apply_map_to_tensors_realized(&becomes_map);
 }
 
 fn sink_source(uop: &Arc<UOp>) -> Arc<UOp> {
@@ -226,12 +248,7 @@ impl Tensor {
 
         self.finalize_realize(&plan, &old_uop)?;
 
-        let mut becomes_map = sibling_outputs(&plan, &old_uop);
-        let realized_uop = self.uop();
-        if !Arc::ptr_eq(&old_uop, &realized_uop) {
-            becomes_map.insert(UOpKey(old_uop), realized_uop);
-        }
-        crate::tensor_registry::apply_map_to_tensors_realized(&becomes_map);
+        adopt_realized(&plan, old_uop, self.uop());
 
         Ok(())
     }
@@ -284,12 +301,7 @@ impl Tensor {
 
         self.finalize_realize(&plan, &old_uop)?;
 
-        let mut becomes_map = sibling_outputs(&plan, &old_uop);
-        let realized_uop = self.uop();
-        if !Arc::ptr_eq(&old_uop, &realized_uop) {
-            becomes_map.insert(UOpKey(old_uop), realized_uop);
-        }
-        crate::tensor_registry::apply_map_to_tensors_realized(&becomes_map);
+        adopt_realized(&plan, old_uop, self.uop());
 
         Ok(())
     }
@@ -321,12 +333,7 @@ impl Tensor {
         let report = plan.profile(opts).context(ExecutionSnafu)?;
 
         self.finalize_realize(&plan, &old_uop)?;
-        let mut becomes_map = sibling_outputs(&plan, &old_uop);
-        let realized_uop = self.uop();
-        if !Arc::ptr_eq(&old_uop, &realized_uop) {
-            becomes_map.insert(UOpKey(old_uop), realized_uop);
-        }
-        crate::tensor_registry::apply_map_to_tensors_realized(&becomes_map);
+        adopt_realized(&plan, old_uop, self.uop());
         Ok(report)
     }
 
@@ -522,12 +529,11 @@ impl Tensor {
         debug!(prep_ms, exec_ms, num_outputs = old_uops.len(), "realize_batch complete");
 
         // Finalize each plan output once, then wire every tensor that shares it.
-        let mut becomes_map = HashMap::new();
+        let mut becomes_map = sibling_outputs(&plan, old_uops.clone());
         let mut realized: Vec<(u64, Arc<UOp>, Arc<Buffer>)> = Vec::with_capacity(old_uops.len());
         for (buf_idx, old_uop) in old_uops.iter().enumerate() {
             let output_buf = plan.output_buffer_at(buf_idx).expect("buf_idx in range").clone();
             let identity = realized_identity(old_uop, output_buf)?;
-            becomes_map.extend(sibling_outputs(&plan, old_uop));
             becomes_map.insert(UOpKey(old_uop.clone()), identity.1.clone());
             realized.push(identity);
         }

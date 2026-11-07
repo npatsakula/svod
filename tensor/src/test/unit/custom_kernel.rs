@@ -527,3 +527,35 @@ fn an_unallocated_sibling_reads_right_values() {
         assert_eq!(out.as_vec::<f32>().unwrap(), vec![2.0, 3.0, 4.0, 5.0]);
     }
 }
+
+fn bump_body(n: usize, output: usize) -> impl FnOnce(Vec<Arc<UOp>>) -> Arc<UOp> {
+    move |ph| {
+        let i = UOp::range_const(n as i64, 0);
+        let at = UOp::index().buffer(ph[output].clone()).indices(vec![i.clone()]).call().unwrap();
+        let bumped = UOp::load().index(at.clone()).call().try_add(&UOp::const_(DType::Float32, ConstValue::Float(1.0)));
+        let store = at.store(bumped.unwrap()).end(smallvec![i]);
+        UOp::sink_with_info(vec![store], KernelInfo { opts_to_apply: Some(vec![]), ..Default::default() })
+    }
+}
+
+/// A sibling over a kernel chain reads the chain's result once, however its
+/// first output's run left the storage they share.
+#[test]
+fn a_sibling_after_a_chain_runs_each_kernel_once() {
+    let (outs, _) = counted_outputs();
+    let chained = outs[0].custom_kernel(&[&outs[1]], bump_body(4, 1)).unwrap();
+    chained[0].realize().unwrap();
+    chained[1].realize().unwrap();
+    assert_eq!(chained[1].as_vec::<f32>().unwrap(), [3.0, 4.0, 5.0, 6.0]);
+}
+
+/// An output a later kernel overwrites in place keeps its own kernel's values.
+#[test]
+fn an_output_overwritten_in_place_keeps_its_values() {
+    let (outs, _) = counted_outputs();
+    let later = outs[0].custom_kernel(&[&outs[1]], bump_body(4, 0)).unwrap();
+    later[0].realize().unwrap();
+    assert_eq!(later[0].as_vec::<f32>().unwrap(), [3.0, 4.0, 5.0, 6.0]);
+    outs[0].realize().unwrap();
+    assert_eq!(outs[0].as_vec::<f32>().unwrap(), [2.0, 3.0, 4.0, 5.0]);
+}

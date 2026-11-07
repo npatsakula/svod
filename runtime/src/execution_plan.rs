@@ -1704,13 +1704,8 @@ impl ExecutionPlan {
     /// Storage ids this plan writes: kernel outputs, copy destinations,
     /// custom-function arguments (no outs list — conservatively all written,
     /// mirroring `hcq_operations`), and the plan's declared outputs.
-    fn written_storage_ids(&self) -> HashSet<BufferId> {
+    pub fn written_storage_ids(&self) -> HashSet<BufferId> {
         self.written_indices.iter().filter_map(|&index| self.buffers.get(index).map(Buffer::storage_id)).collect()
-    }
-
-    /// Whether this plan writes `buffer`'s storage.
-    pub fn writes_storage(&self, buffer: &Buffer) -> bool {
-        self.written_storage_ids().contains(&buffer.storage_id())
     }
 
     /// The indices [`Self::written_storage_ids`] resolves, from the ops.
