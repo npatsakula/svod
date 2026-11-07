@@ -176,6 +176,33 @@ fn check_gemm(device: &Device, m: usize, n: usize, k: usize, cfg: GemmCfg) -> Ve
     got
 }
 
+/// A batch's output past `i32` elements lands at its full stride: each batch's
+/// last row against a host reference.
+#[test]
+#[ignore = "needs a GPU with 12 GB free"]
+fn a_batch_past_i32_lands_at_its_stride() {
+    let Some(planner) = super::device_planner() else { return };
+    let (batches, m, n, k) = (2, 50_001, 50_001, 32);
+    let cfg = planner.gemm_ranked(batches, m, n, k, false)[0];
+    let spec = GemmSpec { m, n, k, batch: Batch::Static(batches), epilogue: Epilogue::default(), cfg };
+    let mut seed = 17;
+    let mut draw =
+        |len: usize| (0..len).map(|_| round_to(ScalarDType::BFloat16, lcg(&mut seed) as f64) as f32).collect::<Vec<_>>();
+    let (a, b) = (draw(batches * m * k), draw(n * k));
+    let a_t = Tensor::from_slice(&a).cast(DType::BFloat16);
+    let b_t = Tensor::from_slice(&b).cast(DType::BFloat16);
+    let c_t = Tensor::empty(&[batches * m * n], DType::BFloat16);
+    let out = graph_launch(gemm::<BF16>(&spec), &cfg.lowering(&planner.device), &[&a_t, &b_t, &c_t]).unwrap();
+    for batch in 0..batches {
+        let row = batch * m + m - 1;
+        let got = out.narrow(0, row * n, n).unwrap().cast(DType::Float32).to_vec::<f32>().unwrap();
+        for (j, g) in got.iter().enumerate() {
+            let want: f64 = (0..k).map(|p| a[row * k + p] as f64 * b[j * k + p] as f64).sum();
+            assert!((*g as f64 - want).abs() <= 1.6e-2 * want.abs().max(1.0), "c[{row}, {j}] = {g}, host {want}");
+        }
+    }
+}
+
 /// Throughput probe of tk GEMM configs at 4096³ bf16: the configs the
 /// tuner admits on the device (the sm_86 measured set on `cp.async`
 /// targets) and the tuner's pick; prints TFLOP/s and never asserts (run

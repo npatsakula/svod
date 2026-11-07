@@ -9,7 +9,7 @@ use svod_ir::uop::eval::{eval_binary_op, eval_unary_op};
 use svod_ir::{ConstValue, Op, UOp, ops};
 use test_case::test_case;
 
-use crate::atoms::{Core, Costs, Device, Target};
+use crate::atoms::{Core, Costs, Device, Fill, Target};
 use crate::build::*;
 use crate::ir::*;
 use crate::kernels::Batch;
@@ -492,14 +492,62 @@ fn a_products_operand_is_the_load_that_filled_it(target: Target) {
     }
 }
 
-/// A bounded view's fill past `i32` elements clamps and gates in one width,
-/// on the path that copies through shared memory and the one that does not.
-#[test_case(amd(AmdArch::Gfx942, 304); "gfx942")]
+/// Every path of a program past `i32` elements holds the list's type rules,
+/// which a mixed-width select or shift breaks, on every target and on a
+/// target of the other fill.
+#[test]
+fn every_path_past_i32_keeps_one_width() {
+    let staged = ("staged nvidia", Target { fill: Fill::Staged, ldmatrix: false, ..crate::sweep::hopper() });
+    for (name, target) in crate::sweep::targets().into_iter().chain([staged]) {
+        let launches = crate::sweep::past_i32(&target);
+        assert_eq!(launches.len(), 8, "{name}");
+        for (kernel, prog, lowering) in launches {
+            assert!(prog.params.iter().any(|p| p.elems > i32::MAX as usize), "{name}: {kernel} fits i32");
+            crate::lower::render(prog, &lowering).unwrap_or_else(|e| panic!("{name}: {kernel}: {e}"));
+        }
+    }
+}
+
+/// A fill's run past a column bound reads element 0 in the width of its
+/// offset, on the cards that load a bounded run through `load_l2_only`.
+#[test_case(crate::sweep::targets().remove(0).1; "sm_86")]
 #[test_case(crate::sweep::hopper(); "hopper")]
-fn a_bounded_fill_past_i32_selects_in_one_width(target: Target) {
+fn a_bounded_load_past_i32_keeps_one_width(target: Target) {
+    let mut k = crate::build::Kernel::new("past");
+    let wide = (i32::MAX as usize + 1) * 2;
+    let src = k.param::<I32>("src", ParamKind::In, wide);
+    let out = k.param::<I32>("out", ParamKind::Out, wide);
+    k.grid([Sc::from(1), Sc::from(1), Sc::from(1)]);
+    k.warps(4);
+    let tile = Shape::new(32, 32);
+    let from = k.view(src, 0, [32, 1], tile, [None, Some(Sc::from(20))]);
+    let loaded = k.load_as_fill(from);
+    let to = k.view(out, 0, [32, 1], tile, [None, None]);
+    k.store(to, loaded);
+    crate::lower::render(k.finish(), &Lowering::new(&super::declared(target))).unwrap();
+}
+
+/// A count past `i32` is refused rather than cut to its low 32 bits.
+#[test]
+fn a_grid_past_i32_is_refused() {
+    let mut k = crate::build::Kernel::new("past");
+    let out = k.param::<I32>("out", ParamKind::Out, 1);
+    k.grid([Sc::from(1usize << 31), Sc::from(1), Sc::from(1)]);
+    k.warps(4);
+    let v = k.view(out, 0, [1, 1], Shape::new(1, 1), [None, None]);
+    let zero = k.fill::<I32>(Shape::new(1, 1), Const::Int(0));
+    k.store(v, zero);
+    let target = amd(AmdArch::Gfx942, 304);
+    let e = crate::lower::render(k.finish(), &Lowering::new(&super::declared(target))).unwrap_err();
+    assert!(e.to_string().contains("past the i32"), "{e}");
+}
+
+/// A batch's stride past `i32` stays what it is, not its low 32 bits.
+#[test]
+fn a_constant_past_i32_keeps_its_value() {
     let cfg = crate::ops::config::gemm_cfg([128, 128, 32], 1, [2, 2], false);
-    let spec = GemmSpec { m: 50_001, n: 50_001, k: 50_048, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg };
+    let spec = GemmSpec { m: 50_001, n: 50_001, k: 50_048, batch: Batch::Static(2), epilogue: Epilogue::DEFAULT, cfg };
+    let target = amd(AmdArch::Gfx942, 304);
     let text = crate::lower::render(gemm::<BF16>(&spec), &cfg.lowering(&super::declared(target))).unwrap();
-    let mixed = |l: &&str| l.contains("select") && l.contains(" i32 ") && l.contains(" i64 ");
-    assert_eq!(text.lines().find(mixed), None);
+    assert!(text.contains("2500100001") && !text.contains("-1794867295"));
 }

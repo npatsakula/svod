@@ -38,6 +38,8 @@ pub enum Error {
     DivergentBarrier { what: &'static str },
     #[snafu(display("{name} emits {instructions} instructions, past the {most} a kernel may"))]
     TooLarge { name: String, instructions: usize, most: usize },
+    #[snafu(display("{name} counts to {extent}, past the i32 a range, grid or variable holds"))]
+    ExtentPastI32 { name: String, extent: i64 },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -133,6 +135,10 @@ impl Lowered {
         let Op::Program(ops::Program { linear: Some(linear), .. }) = self.program.op() else {
             unreachable!("a lowering emits a linear program")
         };
+        if svod_schedule::spec::spec_enabled() {
+            let nodes = linear.op().sources();
+            svod_schedule::spec::type_verify_list(&nodes, &svod_schedule::spec::spec_program()).expect("a valid list");
+        }
         let name = &self.tile.name;
         Ok(renderer.render(linear, Some(name)).context(RenderSnafu { name })?.code)
     }

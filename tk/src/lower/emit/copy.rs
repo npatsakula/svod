@@ -63,7 +63,11 @@ impl Emit<'_> {
             let src_row = match bounds[0] {
                 Some(b) => {
                     let bound = self.sc(b);
-                    let last = bound.try_sub(&c32(1)).expect("bound").try_max(&c32(0)).expect("floor");
+                    let last = bound
+                        .try_sub(&bound.const_like(1))
+                        .expect("bound")
+                        .try_max(&bound.const_like(0))
+                        .expect("floor");
                     let over = row.try_cmplt(&last).expect("cmp");
                     self.hoist(UOp::try_where(over, self.widened(row.clone()), last).expect("clamp"))
                 }
