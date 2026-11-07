@@ -84,8 +84,8 @@ fn assign_target(uop: &Arc<UOp>) -> Option<&Arc<UOp>> {
 /// The outputs of every CALL under `roots` that `plan` ran, each to the storage
 /// that run wrote: a sibling read later reads it rather than running the kernel
 /// again. An output `plan` packed away holds nothing here, so it runs again, and
-/// so does anything of a chain: a later CALL over a CALL's output may overwrite
-/// the storage that output would resolve to.
+/// so do the outputs of a CALL another reads directly: that reader may overwrite
+/// the storage they would resolve to.
 fn sibling_outputs(plan: &ExecutionPlan, roots: Vec<Arc<UOp>>) -> HashMap<UOpKey, Arc<UOp>> {
     let calls: Vec<_> =
         UOp::sink(roots).toposort_call_aware(false).into_iter().filter(|u| matches!(u.op(), Op::Call(..))).collect();
@@ -93,15 +93,21 @@ fn sibling_outputs(plan: &ExecutionPlan, roots: Vec<Arc<UOp>>) -> HashMap<UOpKey
         Op::Call(ops::Call { args, .. }) => args.clone(),
         _ => unreachable!("filtered to calls"),
     };
-    if calls.iter().flat_map(args).any(|arg| UOp::realized_base(&arg).is_some()) {
-        return HashMap::new();
-    }
+    let chained: HashSet<_> = calls
+        .iter()
+        .flat_map(args)
+        .filter_map(|arg| UOp::realized_base(&arg))
+        .flat_map(|after| match after.op() {
+            Op::After(ops::After { deps, .. }) => deps.iter().map(|dep| dep.id).collect::<Vec<_>>(),
+            _ => unreachable!("a realized base is an AFTER"),
+        })
+        .collect();
     let stored = |arg: &Arc<UOp>| {
         arg.has_buffer_identity().then(|| crate::tensor_registry::get_buffer_arc(arg.base().id)).flatten()
     };
     let written = plan.written_storage_ids();
     let mut outputs = HashMap::new();
-    for call in &calls {
+    for call in calls.iter().filter(|call| !chained.contains(&call.id)) {
         let args = args(call);
         if !args.iter().filter_map(stored).any(|buffer| written.contains(&buffer.storage_id())) {
             continue;

@@ -549,6 +549,23 @@ fn a_sibling_after_a_chain_runs_each_kernel_once() {
     assert_eq!(chained[1].as_vec::<f32>().unwrap(), [3.0, 4.0, 5.0, 6.0]);
 }
 
+/// The last kernel of a chain, writing storage of its own, resolves its outputs
+/// like any other: the chain before it runs once.
+#[test]
+fn a_chains_last_kernel_resolves_its_siblings() {
+    let (outs, first_runs) = counted_outputs();
+    let (c, d) = (Tensor::empty(&[4], DType::Float32), Tensor::empty(&[4], DType::Float32));
+    let last_runs = Tensor::from_slice([0i32]);
+    last_runs.realize().unwrap();
+    let last = c.custom_kernel(&[&d, &outs[0], &last_runs], two_outputs_counting_body(4)).unwrap();
+    last[0].realize().unwrap();
+    assert!(last[1].uop().has_buffer_identity());
+    last[1].realize().unwrap();
+    assert_eq!(first_runs.as_vec::<i32>().unwrap(), [1]);
+    assert_eq!(last_runs.as_vec::<i32>().unwrap(), [1]);
+    assert_eq!(last[1].as_vec::<f32>().unwrap(), [3.0, 4.0, 5.0, 6.0]);
+}
+
 /// An output a later kernel overwrites in place keeps its own kernel's values.
 #[test]
 fn an_output_overwritten_in_place_keeps_its_values() {
