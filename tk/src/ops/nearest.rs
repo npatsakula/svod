@@ -68,7 +68,8 @@ pub fn nearest(x: &Tensor, c: &Tensor, opts: Nearest) -> Result<(Tensor, Tensor)
 /// at index −1; a self-join passes the same tensor as `x` and `c`. `k` and
 /// `N` are counts or bound variables: the kernels are built for their
 /// bounds and take the values bound at launch, the outputs `[N, k]` views
-/// of `[bound]` ones.
+/// of `[bound]` ones. Fixed counts past a launch's modelled time run here,
+/// not at the caller's realize, their rows' launches concatenated.
 pub fn k_nearest(x: &Tensor, c: &Tensor, k: impl Into<SInt>, opts: Nearest) -> Result<(Tensor, Tensor)> {
     let (k, dtype) = (k.into(), x.dtype());
     let (score, index) = picked(x, c, k.clone(), opts, None, |planner, ranked, spec| {
@@ -434,6 +435,9 @@ pub(crate) fn in_launches(
     pick: &mut Pick<'_>,
 ) -> Result<(Tensor, Tensor)> {
     let graph_err = || GraphSnafu { op: OP };
+    let shared = [Some(c), opts.col_floor, opts.groups.map(|(_, col)| col)];
+    let scales = scaled.map(|s| [Some(&s.c_scale), s.c_sq.as_ref()]).unwrap_or_default();
+    Tensor::realize_batch(shared.into_iter().chain(scales).flatten()).context(graph_err())?;
     let mut cfg = None;
     let (mut scores, mut indices) = (vec![], vec![]);
     for start in (0..n).step_by(rows) {
@@ -462,8 +466,7 @@ pub(crate) fn in_launches(
             spec
         };
         let (score, index) = launched(&row, c, k.clone(), opts, scaled.as_ref(), false, &mut first)?;
-        score.realize().context(graph_err())?;
-        index.realize().context(graph_err())?;
+        Tensor::realize_batch([&score, &index]).context(graph_err())?;
         scores.push(score);
         indices.push(index);
     }
@@ -542,7 +545,7 @@ fn launched(
     let (row_group, col_group) = opts.groups.map(|(r, c)| (r.cast(DType::Int32), c.cast(DType::Int32))).unzip();
     let live = Live { rows: live_rows(&x_var), k: k_var.clone().filter(|_| top > 1) };
     let spec = NearestSpec { n, m, d: depth, metric, floors, groups, k: top, cfg: cfgs[0], live };
-    if divide && x_var.is_none() {
+    if divide && x_var.is_none() && k_var.is_none() {
         let p = problem(&spec, x.dtype().scalar().expect("planned"));
         let ns = planner.admit(&p, &cfgs[0]).map_or(0.0, |(ns, _)| ns);
         let block = cfgs.iter().map(|c| c.bq).max().expect("a config");

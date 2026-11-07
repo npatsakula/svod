@@ -2908,12 +2908,32 @@ fn a_parameter_past_i32_counts_in_i64(n: usize, wide: bool) {
     assert_eq!(text.lines().any(|l| l.contains("mul") && l.contains("i64")), wide);
 }
 
+/// A list's length bound at launch keeps the op lazy past a launch's modelled
+/// time: launches run now would fix it, and a plan replayed under another
+/// binding would read their lists.
+#[test]
+fn a_live_list_past_a_launch_stays_lazy() {
+    let Some(_) = super::device_planner() else { return };
+    let device = svod_dtype::default_device::default_device();
+    let x = Tensor::rand_with(&[4_194_304, 768], DType::Float32, device).unwrap().cast(DType::Float16);
+    let k = svod_tensor::Variable::new("k", 1, 16).bind(8).unwrap();
+    let cfg =
+        NearestCfg { warp_rows: 16, bk: Some(32), lanes: Some(LaneQueue::PORTABLE), ..NearestCfg::new(128, 128, 2) };
+    let (score, _) = crate::ops::nearest::picked(&x, &x, k.as_sint(), Nearest::default(), None, |_, _, spec| {
+        NearestSpec { cfg, ..spec }
+    })
+    .unwrap();
+    super::ops::assert_kernel(&score, "nearest");
+}
+
 /// Rows and candidates past `i32` elements on the device: the last rows of
 /// a query matrix past it against a host brute force, and every candidate of
 /// a candidate matrix past it, and both at once through the op, tuned.
 #[test_case(4_194_304, 1024, 1; "queries past i32")]
 #[test_case(4_194_304, 1024, 16; "queries past i32, a list")]
 #[test_case(1024, 4_194_304, 1; "candidates past i32")]
+#[test_case(2_800_001, 1024, 1; "queries past i32, a partial block")]
+#[test_case(1024, 2_800_001, 1; "candidates past i32, a partial block")]
 #[test_case(4_194_304, 4_194_304, 1; "both past i32, tuned and a minute in launches")]
 #[ignore = "needs a GPU with 14 GB free"]
 fn knn_past_i32_elements(n: usize, m: usize, k: usize) {
