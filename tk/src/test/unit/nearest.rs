@@ -2908,6 +2908,28 @@ fn a_parameter_past_i32_counts_in_i64(n: usize, wide: bool) {
     assert_eq!(text.lines().any(|l| l.contains("mul") && l.contains("i64")), wide);
 }
 
+/// Realizing a kernel's outputs one at a time runs it once: the second output
+/// is already its run's storage, and both match a batch's.
+#[test]
+fn realizing_the_outputs_in_turn_runs_the_kernel_once() {
+    let Some(_) = super::device_planner() else { return };
+    let (n, d, k) = (4096, 128, 4);
+    let mut seed = 5;
+    let mut draw = || {
+        let v: Vec<f32> = (0..n * d).map(|_| super::lcg(&mut seed) as f32).collect();
+        Tensor::from_slice(&v).try_reshape([n as isize, d as isize]).unwrap().cast(DType::Float16).contiguous()
+    };
+    let (x, c) = (draw(), draw());
+    let opts = Nearest { metric: Metric::NegDot, ..Nearest::default() };
+    let (score, index) = tk::k_nearest(&x, &c, k, opts).unwrap();
+    score.realize().unwrap();
+    assert!(index.uop().has_buffer_identity(), "the index is still to run");
+    let (score_b, index_b) = tk::k_nearest(&x, &c, k, opts).unwrap();
+    Tensor::realize_batch([&score_b, &index_b]).unwrap();
+    assert_eq!(host(&score), host(&score_b));
+    assert_eq!(host(&index), host(&index_b));
+}
+
 /// A list's length bound at launch keeps the op lazy past a launch's modelled
 /// time: launches run now would fix it, and a plan replayed under another
 /// binding would read their lists.

@@ -186,8 +186,9 @@ fn a_batch_past_i32_lands_at_its_stride() {
     let cfg = planner.gemm_ranked(batches, m, n, k, false)[0];
     let spec = GemmSpec { m, n, k, batch: Batch::Static(batches), epilogue: Epilogue::default(), cfg };
     let mut seed = 17;
-    let mut draw =
-        |len: usize| (0..len).map(|_| round_to(ScalarDType::BFloat16, lcg(&mut seed) as f64) as f32).collect::<Vec<_>>();
+    let mut draw = |len: usize| {
+        (0..len).map(|_| round_to(ScalarDType::BFloat16, lcg(&mut seed) as f64) as f32).collect::<Vec<_>>()
+    };
     let (a, b) = (draw(batches * m * k), draw(n * k));
     let a_t = Tensor::from_slice(&a).cast(DType::BFloat16);
     let b_t = Tensor::from_slice(&b).cast(DType::BFloat16);
