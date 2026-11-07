@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use svod_dtype::default_device::{default_device, with_default_device};
 use svod_dtype::{DType, DeviceSpec, ScalarDType};
+use svod_ir::SInt;
 use svod_ir::UOp;
 use svod_runtime::benchmark::{CLOCK_WARMUP, round_robin_min, warm_clock};
 use svod_runtime::{ExecutionPlan, KernelResources};
@@ -1412,6 +1413,21 @@ impl ScratchPool {
     }
 }
 
+/// The most a scratch buffer draws at once, repeated past it: a clock sees no
+/// period this long, and a draw past `u32` words compiles into a loop per word.
+const SCRATCH_DRAW: usize = 1 << 31;
+
+/// `elems` uniform floats, a run of at most `most` drawn and repeated.
+pub(crate) fn drawn(elems: usize, most: usize) -> Tensor {
+    let run = elems.min(most);
+    let unit = Tensor::rand_with(&[run], DType::Float32, default_device()).expect("a scratch fill");
+    if run == elems {
+        return unit;
+    }
+    let times = SInt::from(elems.div_ceil(run));
+    unit.contiguous().repeat(&[times]).and_then(|t| t.try_shrink([(0, elems)])).expect("a scratch fill")
+}
+
 /// A scratch buffer's unrealized fill: a float parameter holds values in
 /// `[-1, 1)`, drawn on the device, so a card that clocks down under real
 /// data (the RX 9070 XT runs the 4096³ GEMM 15 % slower on random operands
@@ -1419,7 +1435,7 @@ impl ScratchPool {
 /// parameter holds zeros, since a probe reads it as the slot to read next.
 fn scratch(p: &Param) -> Tensor {
     if p.dtype.is_float() {
-        let unit = Tensor::rand_with(&[p.elems], DType::Float32, default_device()).expect("a scratch fill");
+        let unit = drawn(p.elems, SCRATCH_DRAW);
         let spread = unit.try_mul(2.0f32).and_then(|t| t.try_sub(1.0f32)).expect("a scratch fill");
         spread.cast(p.dtype.into()).contiguous()
     } else {
