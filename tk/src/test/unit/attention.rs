@@ -868,6 +868,37 @@ fn attention_throughput_probe() {
     });
 }
 
+/// What the op launches on the device, its merge timed with it: the tuner's
+/// pick among every split count against its pick unsplit. Prints TFLOP/s and
+/// never asserts (run with `--ignored --nocapture`).
+#[test]
+#[ignore = "perf probe: needs a GPU"]
+fn attention_splits_probe() {
+    let Some(planner) = super::device_planner() else { return };
+    crate::tune::scoped(true, || {
+        let (batch, heads, t) = (4usize, 8usize, 2048usize);
+        for (d, causal) in [(64, false), (64, true), (128, false), (128, true)] {
+            let spec = probe_spec(batch, heads, t, t, d, AttnMask { causal, ..AttnMask::default() });
+            let ranked = planner.attention_ranked(batch * heads, t, t, d, causal, false);
+            let flops = 4.0 * (batch * heads * t * t * d) as f64 / if causal { 2.0 } else { 1.0 };
+            for splits in [Some(1), Some(2), Some(4), None] {
+                let store = crate::tune::TuneStore::global();
+                let dtype = DType::BFloat16;
+                let cfg = crate::ops::attention::tuned(store, &planner, dtype, &ranked, spec.clone(), splits).cfg;
+                let mut programs =
+                    vec![(flash_attention(&AttnSpec { cfg, ..spec.clone() }), cfg.lowering(&planner.device))];
+                if cfg.splits > 1 {
+                    let merge = crate::ops::attention::merge(spec.batch.clone(), t, heads, d, cfg.splits);
+                    programs.push((combine::<BF16>(&merge), crate::lower::Lowering::new(&planner.device)));
+                }
+                let ns = super::measure([programs]);
+                let time = ns[0].map_or("failed".into(), |ns| format!("{:6.1} TFLOP/s", flops / ns as f64 / 1e3));
+                eprintln!("d{d} causal={causal} splits={}: {time} {}", cfg.splits, label(&cfg));
+            }
+        }
+    });
+}
+
 /// What the backend allocates for a decoder step's key-warp configs on the
 /// device: registers, shared memory (the rings alone: the merged states
 /// reuse them) and any spill, printed (run with `--ignored --nocapture`);
