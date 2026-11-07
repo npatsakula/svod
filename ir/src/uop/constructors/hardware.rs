@@ -272,10 +272,6 @@ impl UOp {
         }
     }
 
-    /// This PARAM or BUFFER with the weak constants of its shape committed,
-    /// as [`Self::linear_program`] commits them (itself when none are weak,
-    /// or when it is neither): parameters committed before a program is
-    /// built on them spare its assembly rebuilding every op reading them.
     /// This parameter, its storage reached under `addrspace`.
     pub fn with_addrspace(self: &Arc<Self>, addrspace: svod_dtype::AddrSpace) -> Arc<Self> {
         let Op::Param(ops::Param { shape, arg }) = self.op() else { panic!("a parameter's address space") };
@@ -283,6 +279,10 @@ impl UOp {
         Self::new(Op::Param(ops::Param { shape: shape.clone(), arg }), self.dtype())
     }
 
+    /// This PARAM or BUFFER with the weak constants of its shape committed,
+    /// as [`Self::linear_program`] commits them (itself when none are weak,
+    /// or when it is neither): parameters committed before a program is
+    /// built on them spare its assembly rebuilding every op reading them.
     pub fn committed_shape(self: &Arc<Self>) -> Arc<Self> {
         let commit = |shape: &Arc<Self>| {
             let consts: std::collections::HashMap<_, _> = shape
