@@ -204,6 +204,9 @@ pub(crate) enum Steps {
     /// Warpgroup steps over shared descriptors
     /// ([`crate::atoms::Costs::step_group`]).
     Group(f64),
+    /// Wide-core steps ([`crate::atoms::Costs::step_wide`]), priced as the
+    /// warp core's where a store holds no measure of them.
+    Wide(f64),
     /// 8-bit integer steps ([`crate::atoms::Costs::step_i8`], hidden at
     /// their own lone ratio where it was measured: the chain's latency does
     /// not scale with its step's throughput).
@@ -214,7 +217,7 @@ impl Steps {
     /// The step count, in [`STEP`]-elements.
     pub(crate) fn count(&self) -> f64 {
         match *self {
-            Steps::F16(n) | Steps::Group(n) | Steps::I8(n) => n,
+            Steps::F16(n) | Steps::Group(n) | Steps::Wide(n) | Steps::I8(n) => n,
         }
     }
 }
@@ -461,6 +464,7 @@ impl Planner {
         let work = match claim.steps {
             Steps::F16(n) => n * costs.step,
             Steps::Group(n) => n * costs.step_group,
+            Steps::Wide(n) => n * if costs.step_wide > 0.0 { costs.step_wide } else { costs.step },
             Steps::I8(n) => n * costs.step_i8,
         };
         let (reads, epilogue) =

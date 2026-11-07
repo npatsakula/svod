@@ -26,7 +26,7 @@ use std::path::Path;
 
 use svod_dtype::{AmdArch, CudaArch, GpuArch, ScalarDType};
 
-use crate::atoms::{CARDS, Target};
+use crate::atoms::{CARDS, Core, Target};
 use crate::ir::Var;
 use crate::kernels::attention::{AttnMask, Bias, FaCfg};
 use crate::kernels::conv::{ConvCfg, ConvGeom};
@@ -411,6 +411,7 @@ pub fn explained(device: &Device, family: &str, factor: f64) -> Vec<(&'static st
             };
             match field {
                 "step" => costs.step *= factor,
+                "step_wide" => costs.step_wide *= factor,
                 "step_i8" => costs.step_i8 *= factor,
                 "score" => costs.score *= factor,
                 "smem_byte" => costs.smem_byte *= factor,
@@ -1061,6 +1062,17 @@ pub struct Counted {
     pub valu: usize,
     /// The bytes of global memory the program's loads move.
     pub fill: usize,
+    /// What the first innermost loop holding a product does: a staged ring
+    /// peels its first and last trips into loops of their own, so the steady
+    /// trip is the one loop that both loads and multiplies.
+    pub trip: Trip,
+}
+
+/// One loop's matrix instructions and the global bytes it loads.
+#[derive(Clone, Copy, Default)]
+pub struct Trip {
+    pub steps: usize,
+    pub fill: usize,
 }
 
 /// What `program`'s linear list holds, by category.
@@ -1117,30 +1129,45 @@ pub fn counted(program: &svod_ir::UOp) -> Option<Counted> {
         },
         _ => 1,
     };
-    let mut out = Counted { instructions: list.len(), smem, steps: 0, valu: 0, fill: 0 };
+    let mut out = Counted { instructions: list.len(), smem, steps: 0, valu: 0, fill: 0, trip: Trip::default() };
     // The loops the statement at hand sits in: the bytes a trip moves are
     // what a loop body loads — a block's once-over reads (its resident rows)
     // sit outside them, priced as the working set they join, not a trip's.
-    let mut loops = 0usize;
+    let mut loops: Vec<Trip> = vec![];
     for u in &list {
         match u.op() {
-            Op::Wmma(..) => out.steps += 1,
+            Op::Wmma(..) => {
+                out.steps += 1;
+                loops.iter_mut().for_each(|l| l.steps += 1);
+            }
             Op::Unary(..) | Op::Binary(..) | Op::Ternary(..) | Op::Cast(..) | Op::BitCast(..) => out.valu += 1,
-            Op::Range(..) => loops += 1,
-            Op::End(ops::End { ranges, .. }) => loops = loops.saturating_sub(ranges.len()),
-            // A `cp.async` copy moves its width's bytes from global memory
-            // without a load the list would hold; the commit and wait groups
-            // a ring lands them with move nothing.
-            Op::Custom(ops::Custom { code, .. }) if code.contains("cp.async") && code.contains("shared.global") => {
+            Op::Range(..) => loops.push(Trip::default()),
+            Op::End(ops::End { ranges, .. }) => {
+                for ended in loops.split_off(loops.len().saturating_sub(ranges.len())).into_iter().rev() {
+                    if out.trip.steps == 0 {
+                        out.trip = ended;
+                    }
+                }
+            }
+            // A `cp.async` copy or a transposing load moves its width's bytes
+            // from global memory without a load the list would hold; the
+            // commit and wait groups a ring lands them with move nothing.
+            Op::Custom(ops::Custom { code, .. })
+                if code.contains("global.load.tr") || code.contains("cp.async") && code.contains("shared.global") =>
+            {
                 out.fill += 16;
+                loops.iter_mut().for_each(|l| l.fill += 16);
             }
             // A plain load inside a loop body moves its access's width of
             // elements — the fill's own on a staged target, a side read's
             // beside it.
             Op::Load(ops::Load { index, .. })
-                if loops > 0 && matches!(space_of(index), Some(AddrSpace::Global | AddrSpace::Swizzled { .. })) =>
+                if !loops.is_empty()
+                    && matches!(space_of(index), Some(AddrSpace::Global | AddrSpace::Swizzled { .. })) =>
             {
-                out.fill += u.dtype().bytes() * width_of(index);
+                let bytes = u.dtype().bytes() * width_of(index);
+                out.fill += bytes;
+                loops.iter_mut().for_each(|l| l.fill += bytes);
             }
             _ => {}
         }
@@ -1188,7 +1215,8 @@ const HOLDS: f64 = 0.15;
 /// model's predictions — the GEMM tiles of a 4096³ plan, two attention
 /// configs, nearest at `k = 1` resident and streamed, a register list at
 /// `k = 64` and a split at `k = 8` — on `target`'s planner under the
-/// declared guessed costs. The tensors are small (the interpreter's
+/// declared guessed costs, rolled so a trip's counts sit in it once. The
+/// tensors are small (the interpreter's
 /// shapes); the tiles are those a large shape plans. Every row is the
 /// family's own claim, the same construction the ranking prices. The VALU
 /// row's units stay each family's: a nearest or attention pair's bundle in
@@ -1205,38 +1233,46 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
     let device = crate::atoms::Device { target: target.clone(), costs: crate::probe::GUESSED };
     let planner = Planner::new(device.clone()).expect("an SM count");
     let lowering = crate::lower::Lowering::new(&device);
-    let atom = target.geometry().expect("a matrix core");
-    let atom_step = (atom.m as usize * atom.n as usize * atom.k as usize) as f64;
+    let atom_step = |core| {
+        let atom = target.geometry_on(core).expect("a matrix core");
+        (atom.m as usize * atom.n as usize * atom.k as usize) as f64
+    };
     // The program's list is one warp's code, its loads one thread's: the
     // block's per-trip claim divides by the warps for the steps and the
     // VALU, and its fill bytes compare against the threads' loads together.
-    let diff =
-        |name: String, claim: &config::Claim, valu: f64, warps: usize, prog: crate::ir::Program| -> Option<Diffed> {
-            let counted = counted(&crate::lower::standalone(prog, &lowering).ok()?.program)?;
-            let threads = (warps * target.wave as usize) as f64;
-            let predicted = Claim {
-                steps: claim.steps.count() * config::STEP as f64 / atom_step,
-                ops: valu,
-                fill: (claim.fill.bytes + claim.side.bytes) as usize,
-                smem: claim.smem,
-                regs: claim.regs,
-            };
-            let Claim { steps, ops, fill, smem, regs } = predicted;
-            let row = |what: &'static str, predicted: f64, program: f64| {
-                (what, predicted, program, (program - predicted).abs() <= HOLDS * predicted.max(1.0))
-            };
-            Some(Diffed {
-                name,
-                regs,
-                rows: vec![
-                    row("steps/trip", steps / warps as f64, counted.steps as f64),
-                    row("fill bytes/trip", fill as f64, counted.fill as f64 * threads),
-                    row("valu ops/trip", ops, counted.valu as f64 * warps as f64),
-                    row("smem", smem as f64, counted.smem as f64),
-                ],
-            })
+    let diff = |name: String,
+                claim: &config::Claim,
+                valu: f64,
+                warps: usize,
+                prog: crate::ir::Program,
+                core|
+     -> Option<Diffed> {
+        let lowering = crate::lower::Lowering { core, ..lowering.clone() };
+        let counted = counted(&crate::lower::standalone(prog, &lowering).ok()?.program)?;
+        let threads = (warps * target.wave as usize) as f64;
+        let predicted = Claim {
+            steps: claim.steps.count() * config::STEP as f64 / atom_step(core),
+            ops: valu,
+            fill: (claim.fill.bytes + claim.side.bytes) as usize,
+            smem: claim.smem,
+            regs: claim.regs,
         };
-    let mut out: Vec<(String, config::Claim, f64, usize, crate::ir::Program)> = vec![];
+        let Claim { steps, ops, fill, smem, regs } = predicted;
+        let row = |what: &'static str, predicted: f64, program: f64| {
+            (what, predicted, program, (program - predicted).abs() <= HOLDS * predicted.max(1.0))
+        };
+        Some(Diffed {
+            name,
+            regs,
+            rows: vec![
+                row("steps/trip", steps / warps as f64, counted.trip.steps as f64),
+                row("fill bytes/trip", fill as f64, counted.trip.fill as f64 * threads),
+                row("valu ops/trip", ops, counted.valu as f64 * warps as f64),
+                row("smem", smem as f64, counted.smem as f64),
+            ],
+        })
+    };
+    let mut out: Vec<(String, config::Claim, f64, usize, crate::ir::Program, Core)> = vec![];
     // The static decomposition rows (see the k64 list below): what the
     // program's listing adder holds against the counted parts.
     let mut statics: Vec<Diffed> = vec![];
@@ -1254,7 +1290,7 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
             k: cfg.tile[2] * 8,
             batch: Batch::Static(1),
             epilogue: Epilogue { act: Act::Gelu, ..Epilogue::DEFAULT },
-            cfg,
+            cfg: GemmCfg { unroll: false, ..cfg },
         };
         out.push((
             format!("gemm {:?}", cfg.tile),
@@ -1262,11 +1298,17 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
             valu,
             (cfg.warps[0] * cfg.warps[1]) as usize,
             gemm::<BF16>(&spec),
+            Core::Warp,
         ));
     }
     // Attention: two configs of a d64 causal plan, emitted small.
     let p = AttentionProblem { tiles: 8, t: 100, tk: 100, d: 64, causal: true, bias: false };
-    for cfg in config::distinct(&planner.attention_ranked(8, 100, 100, 64, true, false)).take(2) {
+    // The ranking's leaders, and the wide core's own tile where there is one.
+    let wide = target.geometry_on(Core::Wide).map(|atom| {
+        let m = atom.m as usize;
+        FaCfg { core: Core::Wide, warp_rows: m, ..FaCfg::new(4 * m, m, 2) }
+    });
+    for cfg in config::distinct(&planner.attention_ranked(8, 100, 100, 64, true, false)).take(2).chain(wide) {
         let claim = p.claim(&planner, &cfg).expect("ranked");
         let valu = claim.ops.fold(config::pair_op(&device), 1.0, &config::Weights::same());
         let spec = AttnSpec {
@@ -1280,14 +1322,15 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
             cache: None,
             packed: false,
             scale: 0.125,
-            cfg,
+            cfg: FaCfg { unroll: false, ..cfg },
         };
         out.push((
-            format!("attention {}x{}", cfg.bq, cfg.bkv),
+            format!("attention {}x{} {:?}", cfg.bq, cfg.bkv, cfg.core),
             claim,
             valu,
             cfg.warps() as usize,
             attention::<BF16>(&spec),
+            cfg.core,
         ));
     }
     // Nearest: k = 1 resident and streamed, a register list at k = 64, a
@@ -1310,7 +1353,7 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
         floors: Floors::default(),
         groups: false,
         k,
-        cfg,
+        cfg: NearestCfg { unroll: false, ..cfg },
         live: Live::default(),
     };
     let ranked = planner.nearest_ranked(problem(1));
@@ -1327,6 +1370,7 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
             valu,
             cfg.warps() as usize,
             nearest::<F16>(&spec(cfg, 1)),
+            Core::Warp,
         ));
     }
     let ranked = planner.nearest_ranked(problem(64));
@@ -1364,6 +1408,7 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
             valu,
             cfg.warps() as usize,
             nearest::<F16>(&spec(cfg, 64)),
+            Core::Warp,
         ));
     }
     let split_problem = NearestProblem { n: 256, m: 1 << 20, ..problem(8) };
@@ -1380,11 +1425,12 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
             valu,
             cfg.warps() as usize,
             nearest::<F16>(&split_spec),
+            Core::Warp,
         ));
     }
     let diffed = out
         .into_iter()
-        .filter_map(|(name, claim, gelu_ops, warps, prog)| diff(name, &claim, gelu_ops, warps, prog))
+        .filter_map(|(name, claim, gelu_ops, warps, prog, core)| diff(name, &claim, gelu_ops, warps, prog, core))
         .collect();
     (diffed, statics)
 }
