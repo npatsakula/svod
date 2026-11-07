@@ -193,7 +193,7 @@ rocprof, or tk's probes). `llvm-mca` on AMDGPU is a one-wave, no-memory model an
 ## Tune store
 
 `$SVOD_TK_TUNE_DIR`, else `$XDG_CACHE_HOME/svod/tk_tune`, else `~/.cache/svod/tk_tune`; one file per device
-`<arch>_<sms>sm-v<crate version>.txt` (`sm_86_28sm-v0.2.0.txt`) under a `format 6` line (`tune::FORMAT`); lines
+`<arch>_<sms>sm-v<crate version>.txt` (`sm_86_28sm-v0.2.0.txt`) under a `format 7` line (`tune::FORMAT`); lines
 `choice|…` (`idx:code ns` pairs, fastest first, each candidate's config as its family's compact code —
 `Tiled::code`), `admitted|…`/`first|…` (`idx:code`), `value|…` (one number; probes in femtoseconds) keyed by op,
 device, dtype, shape, candidate digest, compiler digest and the

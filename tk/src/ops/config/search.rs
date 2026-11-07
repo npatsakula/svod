@@ -258,7 +258,7 @@ pub(crate) trait Tiled: Copy + Eq + Hash + Send {
     }
 
     /// The config as the compact code a store line carries beside its
-    /// index ([`super::super::tune`]'s format 6): its fields in a fixed
+    /// index ([`super::super::tune`]'s format): its fields in a fixed
     /// order, numbers and markers, `~` a `None` — a family's own form,
     /// round-trip tested per family, so a line's candidates read without
     /// re-deriving the list their digest names.
