@@ -313,7 +313,8 @@ impl GemmProblem {
             waves,
             atoms,
             steps: match cfg.core {
-                Core::Warp | Core::Wide => Steps::F16(steps),
+                Core::Warp => Steps::F16(steps),
+                Core::Wide => Steps::Wide(steps),
                 Core::Group => Steps::Group(steps),
             },
             trips,

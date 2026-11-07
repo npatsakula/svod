@@ -252,6 +252,7 @@ pub const GUESSED: Costs = Costs {
     scatter: 8.0,
     step: 5.0,
     step_group: 5.0,
+    step_wide: 5.0,
     // Twice the 16-bit rate, as most cores with an 8-bit one run it.
     step_i8: 2.5,
     // Three waves a SIMD hide the chain.
@@ -483,6 +484,7 @@ pub(crate) fn probes(target: &Target) -> Result<Vec<Probe>> {
         p.scatter(),
         p.step(),
         p.step_group(),
+        p.step_wide(),
         p.step_i8(),
         p.step_lone(),
         p.step_lone_i8(),
@@ -701,6 +703,21 @@ impl<'a> Probes<'a> {
     fn step(&self) -> Probe {
         let grid = WarpGrid { rows: 2, cols: 2 };
         self.steps::<BF16>("probe:step", [64, 64, 16], self.blocks, grid, self.lowering(), true)
+    }
+
+    /// [`Self::step`] through the wide core, four atoms of it a warp, its
+    /// elements counted alike; no candidates where the target has no such core.
+    fn step_wide(&self) -> Probe {
+        let grid = WarpGrid { rows: 2, cols: 2 };
+        let lowering = Lowering { core: Core::Wide, ..self.lowering() };
+        let Some(atom) = self.target.geometry_on(Core::Wide) else {
+            let mut probe =
+                self.steps::<BF16>("probe:step_wide", [64, 64, 16], self.blocks, grid, self.lowering(), true);
+            probe.candidates.clear();
+            return probe;
+        };
+        let tile = [2 * atom.m as usize, 2 * atom.n as usize, atom.k as usize];
+        self.steps::<BF16>("probe:step_wide", tile, self.blocks, grid, lowering, true)
     }
 
     /// [`Self::step`] over 8-bit integers into i32, two NVIDIA or CDNA atoms

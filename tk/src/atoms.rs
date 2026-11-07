@@ -335,6 +335,9 @@ pub struct Costs {
     /// The same step issued as part of a warpgroup product
     /// ([`GroupMmaAtom`]), 0 where the target has none.
     pub step_group: f64,
+    /// The same step's elements through the wide core ([`Core::Wide`]), 0
+    /// where the target has none.
+    pub step_wide: f64,
     /// The same step's 16×16×16 products over 8-bit integers into i32
     /// ([`Target::geometry_of`]), the SM full of waves; 0 where the target
     /// has no such core.
@@ -407,13 +410,14 @@ pub const LADDER: usize = 9;
 impl Costs {
     /// Every field a pair of programs measures, by name, in declaration
     /// order: all but the cache's, which a series of footprints measures.
-    pub fn fields(&mut self) -> [(&'static str, &mut f64); 18] {
+    pub fn fields(&mut self) -> [(&'static str, &mut f64); 19] {
         let Costs {
             smem_byte,
             global_byte,
             scatter,
             step,
             step_group,
+            step_wide,
             step_i8,
             step_lone,
             step_lone_i8,
@@ -437,6 +441,7 @@ impl Costs {
             ("scatter", scatter),
             ("step", step),
             ("step_group", step_group),
+            ("step_wide", step_wide),
             ("step_i8", step_i8),
             ("step_lone", step_lone),
             ("step_lone_i8", step_lone_i8),

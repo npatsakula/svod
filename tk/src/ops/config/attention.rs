@@ -235,7 +235,8 @@ impl AttentionProblem {
             waves,
             atoms,
             steps: match cfg.core {
-                Core::Warp | Core::Wide => Steps::F16(steps as f64),
+                Core::Warp => Steps::F16(steps as f64),
+                Core::Wide => Steps::Wide(steps as f64),
                 Core::Group => Steps::Group(steps as f64),
             },
             trips,
