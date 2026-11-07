@@ -26,7 +26,7 @@ impl GemmCfg {
     /// (32, 64 or 128 bytes), the descriptor's own.
     fn tiles(&self, target: &Target) -> bool {
         let bk = self.tile[2];
-        let row = self.core == Core::Warp || Swizzle::spans(bk, ELEM);
+        let row = self.core != Core::Group || Swizzle::spans(bk, ELEM);
         // Two crews: the two warp rows of the warp-level core, one slot, and
         // k-slices of a product (one atom deep) each with another to
         // overlap, on a target that interleaves crews.
@@ -92,7 +92,7 @@ impl GemmCfg {
     /// descriptors of every `k16` step of a chain instead.
     fn operand_registers(&self, issue: &Issue, halves: u32) -> u32 {
         match self.core {
-            Core::Warp => (issue.a.regs() + issue.b.regs() * halves).div_ceil(2),
+            Core::Warp | Core::Wide => (issue.a.regs() + issue.b.regs() * halves).div_ceil(2),
             Core::Group => 4 * issue.a.reps[1] * halves,
         }
     }
@@ -238,7 +238,7 @@ impl GemmProblem {
         if self.rope.is_some_and(|rope| !cfg.turns(rope.head_dim)) {
             return Err(Rejected::Lowers);
         }
-        let atom = target.geometry().ok_or(Rejected::Lowers)?;
+        let atom = target.geometry_on(cfg.core).ok_or(Rejected::Lowers)?;
         // A step is at least two matrix-core depths, unless the reduction dim
         // allows nothing deeper.
         let depth = 2 * atom.k as usize;
@@ -265,7 +265,7 @@ impl GemmProblem {
         // A warpgroup product reads no fragments and holds one accumulator
         // chain per instruction column block; its step is the group's.
         let (atoms, fragments) = match cfg.core {
-            Core::Warp => (
+            Core::Warp | Core::Wide => (
                 (bm / wr / atom.m as usize) * (bn * halves / wc / atom.n as usize),
                 waves * (bm / wr + bn * halves / wc) * bk * ELEM,
             ),
@@ -313,7 +313,7 @@ impl GemmProblem {
             waves,
             atoms,
             steps: match cfg.core {
-                Core::Warp => Steps::F16(steps),
+                Core::Warp | Core::Wide => Steps::F16(steps),
                 Core::Group => Steps::Group(steps),
             },
             trips,

@@ -100,12 +100,12 @@ pub(crate) const WARP_ROWS: usize = 16;
 /// Search bound: the row warps a block of the warp-level core spreads over.
 const MOST_ROW_WARPS: usize = 8;
 
-/// The fewest rows a warp of a `bq`-row block owns on `core`: one atom row
-/// (a warpgroup's rows are the instruction's), or on the warp-level core as
-/// many as hold the block in [`MOST_ROW_WARPS`].
-pub(crate) fn narrowest_warp_rows(core: Core, bq: usize) -> usize {
+/// The fewest rows a warp of a `bq`-row block owns on `core`, whose atom has
+/// `rows`: one atom row (a warpgroup's rows are the instruction's), or on a
+/// warp-level core as many as hold the block in [`MOST_ROW_WARPS`].
+pub(crate) fn narrowest_warp_rows(core: Core, rows: usize, bq: usize) -> usize {
     match core {
-        Core::Warp => WARP_ROWS * (bq / (MOST_ROW_WARPS * WARP_ROWS)).max(1),
+        Core::Warp | Core::Wide => rows * (bq / (MOST_ROW_WARPS * rows)).max(1),
         Core::Group => WARP_ROWS,
     }
 }
@@ -178,7 +178,7 @@ impl FaCfg {
     /// read from global memory, which the warpgroup core's shared operands
     /// cannot.
     pub fn holds_appended(&self, appended: usize) -> bool {
-        self.bkv >= appended && (appended == 0 || self.core == Core::Warp)
+        self.bkv >= appended && (appended == 0 || self.core != Core::Group)
     }
 
     /// Whether a bias rides the ring: under a bias, unless the forms read it

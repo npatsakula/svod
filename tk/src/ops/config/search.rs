@@ -306,10 +306,7 @@ impl Tiled for GemmCfg {
     fn code(&self) -> String {
         format!(
             "{},{}",
-            match self.core {
-                Core::Warp => "w",
-                Core::Group => "g",
-            },
+            core_code(self.core),
             coded(&[
                 Some(self.tile[0]),
                 Some(self.tile[1]),
@@ -325,11 +322,7 @@ impl Tiled for GemmCfg {
 
     fn of_code(code: &str) -> Option<Self> {
         let (core, rest) = code.split_once(',')?;
-        let core = match core {
-            "w" => Core::Warp,
-            "g" => Core::Group,
-            _ => return None,
-        };
+        let core = core_of_code(core)?;
         let f = fields(rest)?;
         if f.len() != 8 {
             return None;
@@ -378,6 +371,18 @@ impl Tiled for ConvCfg {
     }
 }
 
+fn core_code(core: Core) -> &'static str {
+    match core {
+        Core::Warp => "w",
+        Core::Wide => "x",
+        Core::Group => "g",
+    }
+}
+
+fn core_of_code(code: &str) -> Option<Core> {
+    [Core::Warp, Core::Wide, Core::Group].into_iter().find(|&c| core_code(c) == code)
+}
+
 /// The blocks, the splits and the softmax forms: a forms pair is two tiles.
 /// A tile is its query and key block sizes and its key warps: a different
 /// number of key warps is a different kernel structure, not a pipeline of
@@ -408,22 +413,12 @@ impl Tiled for FaCfg {
             Some(bits),
             Some(self.key_warps),
             Some(self.warp_rows),
-        ]) + &format!(
-            ",{}",
-            match self.core {
-                Core::Warp => "w",
-                Core::Group => "g",
-            }
-        )
+        ]) + &format!(",{}", core_code(self.core))
     }
 
     fn of_code(code: &str) -> Option<Self> {
         let (rest, core) = code.rsplit_once(',')?;
-        let core = match core {
-            "w" => Core::Warp,
-            "g" => Core::Group,
-            _ => return None,
-        };
+        let core = core_of_code(core)?;
         let f = fields(rest)?;
         if f.len() != 8 {
             return None;
@@ -459,9 +454,10 @@ impl Tiled for FaCfg {
             .collect()
     }
 
-    /// Two atom rows per warp are a variant of a tile that holds one.
+    /// Two atom rows per warp are a variant of a tile that holds one; the
+    /// wide core offers one rows per warp a block.
     fn represents(&self) -> bool {
-        self.warp_rows == narrowest_warp_rows(self.core, self.bq)
+        self.core == Core::Wide || self.warp_rows == narrowest_warp_rows(self.core, WARP_ROWS, self.bq)
     }
 }
 

@@ -13,8 +13,8 @@ use super::cost::{Claim, ELEM, Family, Kind, Ops, PAIR_OPS, Planner, STEP, Sprea
 use super::search::{Rejected, sorted};
 
 impl FaCfg {
-    /// Whether the config lowers on `target` for head size `d`: the atom's M
-    /// is the kernel's [`WARP_ROWS`], a warp owns whole atom rows of queries
+    /// Whether the config lowers on `target` for head size `d`: the core's
+    /// atom holds whole [`WARP_ROWS`], a warp owns whole atom rows of queries
     /// and the block whole warps, both products tile the atoms, the key
     /// warps share the block as the kernel shares it
     /// ([`FaCfg::shares_keys`]), and the K and V fills (and the bias
@@ -25,12 +25,12 @@ impl FaCfg {
     /// (one swizzle span, or 128-byte panels) and no key warps split the
     /// block.
     pub fn fits(&self, target: &Target, d: usize, bias: bool) -> bool {
-        let Some(atom) = target.geometry() else { return false };
+        let Some(atom) = target.geometry_on(self.core) else { return false };
         let (bq, bkv, rows) = (self.bq, self.bkv, self.warp_rows);
         // Key warps fill their own tiles alone.
         let threads = self.row_warps() as usize * target.wave as usize;
         let core = match self.core {
-            Core::Warp => true,
+            Core::Warp | Core::Wide => true,
             Core::Group => target.group_mma.first().is_some_and(|g| {
                 let groups = self.row_warps() / GroupMmaAtom::WARPS;
                 self.key_warps == 1
@@ -42,8 +42,8 @@ impl FaCfg {
                     && (Swizzle::spans(d, ELEM) || (d * ELEM).is_multiple_of(Swizzle::B128.span()))
             }),
         };
-        core && atom.m as usize == WARP_ROWS
-            && rows.is_multiple_of(WARP_ROWS)
+        core && (atom.m as usize).is_multiple_of(WARP_ROWS)
+            && rows.is_multiple_of(atom.m as usize)
             && rows > 0
             && bq.is_multiple_of(rows)
             && bq > 0
@@ -83,7 +83,7 @@ impl FaCfg {
         };
         let (q, o) = (half(qk.a.regs()), pv.c.regs());
         let (k, s, p, v) = match self.core {
-            Core::Warp => (half(qk.b.regs()), qk.c.regs(), half(pv.a.regs()), half(pv.b.regs())),
+            Core::Warp | Core::Wide => (half(qk.b.regs()), qk.c.regs(), half(pv.a.regs()), half(pv.b.regs())),
             Core::Group => (2 * qk.a.reps[1], qk.c.regs(), half(pv.a.regs()), 2 * pv.a.reps[1]),
         };
         Some(q + o + k + s + p + v + fill)
@@ -94,7 +94,7 @@ impl FaCfg {
     /// (CDNA's AGPRs) may hold beside the rest.
     pub(crate) fn accumulators(&self, target: &Target, d: usize) -> Option<u32> {
         let grid = WarpGrid { rows: self.row_warps(), cols: 1 };
-        Some(target.issue(Core::Warp, grid, self.bq, d, self.bkv)?.c.regs())
+        Some(target.issue(self.core, grid, self.bq, d, self.bkv)?.c.regs())
     }
 }
 
@@ -189,8 +189,8 @@ impl AttentionProblem {
         // chain per product, and is past `ptxas` beyond the block's share of
         // the register file.
         let (atoms, kv_reads) = match cfg.core {
-            Core::Warp => {
-                let atom = target.geometry().ok_or(Rejected::Lowers)?;
+            Core::Warp | Core::Wide => {
+                let atom = target.geometry_on(cfg.core).ok_or(Rejected::Lowers)?;
                 let atoms = (cfg.warp_rows / atom.m as usize) * (bkv.min(d) / atom.n as usize);
                 (atoms, 2 * waves * bkv * d * ELEM)
             }
@@ -235,7 +235,7 @@ impl AttentionProblem {
             waves,
             atoms,
             steps: match cfg.core {
-                Core::Warp => Steps::F16(steps as f64),
+                Core::Warp | Core::Wide => Steps::F16(steps as f64),
                 Core::Group => Steps::Group(steps as f64),
             },
             trips,
@@ -264,20 +264,22 @@ impl AttentionProblem {
 
     /// Every config the ranking spans for this problem on `target`: every
     /// pipeline of every query and key block size at one atom row per warp,
-    /// on the warp-level core and, where the target has it, the warpgroup
-    /// core, in the plain softmax forms.
+    /// on the warp-level core and, where the target has them, the wide and
+    /// warpgroup cores, in the plain softmax forms.
     pub fn lattice(&self, target: &Target) -> Vec<FaCfg> {
         let stages: &[usize] = if target.fill == Fill::CpAsync { &FA_STAGES } else { &FA_STAGES[1..] };
-        let cores: &[Core] = if target.group_mma.is_empty() { &[Core::Warp] } else { &[Core::Warp, Core::Group] };
+        let cores = [Core::Warp, Core::Wide, Core::Group];
+        let cores = cores.into_iter().filter(|&c| c != Core::Group || !target.group_mma.is_empty());
+        let cores: Vec<(Core, usize)> = cores.filter_map(|c| Some((c, target.geometry_on(c)?.m as usize))).collect();
         let mut out = vec![];
-        for (core, bq) in cores.iter().flat_map(|&c| QUERY_BLOCKS.map(|bq| (c, bq))) {
+        for (core, atom_rows, bq) in cores.iter().flat_map(|&(c, m)| QUERY_BLOCKS.map(move |bq| (c, m, bq))) {
             // A row warp of queries may share its block with key warps.
             let key_warps: &[usize] = if bq == WARP_ROWS && self.t <= WARP_ROWS { &KEY_WARPS } else { &[1] };
             for bkv in KEY_BLOCKS {
                 for &stages in stages {
                     for unroll in [false, true] {
                         for &key_warps in key_warps {
-                            let warp_rows = narrowest_warp_rows(core, bq);
+                            let warp_rows = narrowest_warp_rows(core, atom_rows, bq);
                             out.push(FaCfg { unroll, key_warps, core, warp_rows, ..FaCfg::new(bq, bkv, stages) });
                         }
                     }

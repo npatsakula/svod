@@ -571,6 +571,13 @@ pub fn digested(target: &Target) -> Vec<Launch> {
         if cache.is_some() {
             cfgs.push(FaCfg { key_warps: 4, splits: 2, ..FaCfg::new(16, 16, 2) });
         }
+        let wide_rows = target.geometry_on(Core::Wide).map(|atom| atom.m as usize);
+        for (bq, bkv, warp_rows) in wide_rows.into_iter().flat_map(|m| [(4 * m, m, m), (2 * m, 2 * m, m)]) {
+            let cfg = FaCfg { core: Core::Wide, warp_rows, ..FaCfg::new(bq, bkv, 2) };
+            if cfg.fits(target, d, mask.bias.is_some()) && cache.is_none_or(|c| c.appended == 0) {
+                cfgs.push(cfg);
+            }
+        }
         if group {
             for (bq, bkv) in [(64, 64), (128, 64), (64, 128)] {
                 let cfg = FaCfg { core: Core::Group, ..FaCfg::new(bq, bkv, 2) };
