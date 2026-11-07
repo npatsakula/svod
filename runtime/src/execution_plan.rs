@@ -1708,6 +1708,11 @@ impl ExecutionPlan {
         self.written_indices.iter().filter_map(|&index| self.buffers.get(index).map(Buffer::storage_id)).collect()
     }
 
+    /// Whether this plan writes `buffer`'s storage.
+    pub fn writes_storage(&self, buffer: &Buffer) -> bool {
+        self.written_storage_ids().contains(&buffer.storage_id())
+    }
+
     /// The indices [`Self::written_storage_ids`] resolves, from the ops.
     fn written_indices(ops: &[PreparedOp], outputs: &[usize]) -> Vec<usize> {
         let mut written: Vec<usize> = outputs.to_vec();

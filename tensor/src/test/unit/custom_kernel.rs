@@ -416,3 +416,114 @@ fn test_custom_kernel_output_shared_with_an_elementwise_reader() {
         assert_close_f32(&out.as_vec::<f32>().unwrap(), &expected, 1e-5);
     });
 }
+
+/// A two-output `out0[i] = out1[i] = in[i] + 1` body that also adds one to
+/// its last argument's first element, counting its runs.
+fn two_outputs_counting_body(n: usize) -> impl FnOnce(Vec<Arc<UOp>>) -> Arc<UOp> {
+    move |ph| {
+        let (out0, out1, input, runs) = (ph[0].clone(), ph[1].clone(), ph[2].clone(), ph[3].clone());
+        let i = UOp::range_const(n as i64, 0);
+        let loaded = UOp::load().index(UOp::index().buffer(input).indices(vec![i.clone()]).call().unwrap()).call();
+        let one = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+        let val = loaded.try_add(&one).unwrap();
+        let idx0 = UOp::index().buffer(out0).indices(vec![i.clone()]).call().unwrap();
+        let idx1 = UOp::index().buffer(out1).indices(vec![i.clone()]).call().unwrap();
+        let stores = UOp::group(vec![idx0.store(val.clone()), idx1.store(val)]).end(smallvec![i]);
+        let at = UOp::index().buffer(runs).indices(vec![UOp::const_(DType::Int32, ConstValue::Int(0))]).call().unwrap();
+        let count = UOp::load().index(at.clone()).call();
+        let bumped = count.try_add(&UOp::const_(DType::Int32, ConstValue::Int(1))).unwrap();
+        let bump = at.store(bumped);
+        UOp::sink_with_info(vec![stores, bump], KernelInfo { opts_to_apply: Some(vec![]), ..Default::default() })
+    }
+}
+
+fn counted_outputs() -> (Vec<Tensor>, Tensor) {
+    let (a, b) = (Tensor::empty(&[4], DType::Float32), Tensor::empty(&[4], DType::Float32));
+    let input = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
+    let runs = Tensor::from_slice([0i32]);
+    input.realize().unwrap();
+    runs.realize().unwrap();
+    let outs = a.custom_kernel(&[&b, &input, &runs], two_outputs_counting_body(4)).unwrap();
+    (outs, runs)
+}
+
+/// Realizing one output runs the kernel its sibling comes from: the sibling
+/// reads what that run wrote, and a later realize of it runs nothing.
+#[test]
+fn realizing_one_output_resolves_its_sibling() {
+    let config = PrepareConfig::for_cpu_backend(CpuBackend::Clang);
+    let (outs, runs) = counted_outputs();
+    outs[0].realize_with(&config).unwrap();
+    assert!(outs[1].uop().has_buffer_identity());
+    outs[1].realize_with(&config).unwrap();
+    assert_eq!(runs.as_vec::<i32>().unwrap(), vec![1]);
+    for out in &outs[..2] {
+        assert_eq!(out.as_vec::<f32>().unwrap(), vec![2.0, 3.0, 4.0, 5.0]);
+    }
+}
+
+/// A view over a sibling reads the run its other output came from.
+#[test]
+fn a_view_of_a_sibling_reads_the_same_run() {
+    let config = PrepareConfig::for_cpu_backend(CpuBackend::Clang);
+    let (outs, runs) = counted_outputs();
+    let view = outs[1].try_shrink([(0, 2)]).unwrap();
+    outs[0].realize_with(&config).unwrap();
+    view.realize_with(&config).unwrap();
+    assert_eq!(view.as_vec::<f32>().unwrap(), vec![2.0, 3.0]);
+    assert_eq!(runs.as_vec::<i32>().unwrap(), vec![1]);
+}
+
+/// A sibling no tensor holds any more is simply not resolved.
+#[test]
+fn a_dropped_sibling_is_harmless() {
+    let config = PrepareConfig::for_cpu_backend(CpuBackend::Clang);
+    let (mut outs, runs) = counted_outputs();
+    outs.truncate(1);
+    outs[0].realize_with(&config).unwrap();
+    assert_eq!(outs[0].as_vec::<f32>().unwrap(), vec![2.0, 3.0, 4.0, 5.0]);
+    assert_eq!(runs.as_vec::<i32>().unwrap(), vec![1]);
+}
+
+/// A graph over both outputs runs the kernel once and leaves them resolved.
+#[test]
+fn a_graph_over_both_outputs_resolves_them() {
+    let config = PrepareConfig::for_cpu_backend(CpuBackend::Clang);
+    let (outs, runs) = counted_outputs();
+    let sum = outs[0].try_add(&outs[1]).unwrap();
+    sum.realize_with(&config).unwrap();
+    assert_eq!(sum.as_vec::<f32>().unwrap(), vec![4.0, 6.0, 8.0, 10.0]);
+    assert!(outs[1].uop().has_buffer_identity());
+    outs[1].realize_with(&config).unwrap();
+    assert_eq!(runs.as_vec::<i32>().unwrap(), vec![1]);
+}
+
+/// A batch resolves an output left out of it too.
+#[test]
+fn a_batch_resolves_an_output_left_out() {
+    let (outs, runs) = counted_outputs();
+    Tensor::realize_batch_with([&outs[0]], &PrepareConfig::for_cpu_backend(CpuBackend::Clang)).unwrap();
+    assert!(outs[1].uop().has_buffer_identity());
+    assert_eq!(outs[1].as_vec::<f32>().unwrap(), vec![2.0, 3.0, 4.0, 5.0]);
+    assert_eq!(runs.as_vec::<i32>().unwrap(), vec![1]);
+}
+
+/// An output the plan packed away holds nothing in its own storage: its
+/// sibling still reads the right values, by running the kernel again.
+#[test]
+fn an_unallocated_sibling_reads_right_values() {
+    let config = PrepareConfig::for_cpu_backend(CpuBackend::Clang);
+    let shape = [SInt::Const(4)];
+    let a = Tensor::empty_dynamic_spec(&shape, DType::Float32, Default::default()).unwrap();
+    let b = Tensor::empty_dynamic_spec(&shape, DType::Float32, Default::default()).unwrap();
+    let input = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
+    let runs = Tensor::from_slice([0i32]);
+    input.realize().unwrap();
+    runs.realize().unwrap();
+    let outs = a.custom_kernel(&[&b, &input, &runs], two_outputs_counting_body(4)).unwrap();
+    outs[0].realize_with(&config).unwrap();
+    outs[1].realize_with(&config).unwrap();
+    for out in &outs[..2] {
+        assert_eq!(out.as_vec::<f32>().unwrap(), vec![2.0, 3.0, 4.0, 5.0]);
+    }
+}
