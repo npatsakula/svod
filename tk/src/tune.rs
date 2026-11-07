@@ -41,14 +41,15 @@ use crate::launch;
 use crate::lower::Lowering;
 
 /// The store's line format, bumped when a line's meaning changes; a file of
-/// another format, or without the line, is dropped whole. 6 carries each
+/// another format, or without the line, is dropped whole. 7 ends a GEMM's
+/// code in its k-slice, where 6 ended it in a crew count. 6 carries each
 /// candidate's config code beside its index (`idx:code ns` a timed pair,
 /// `idx:code` an admitted one), where 5 held indices alone into the list the
 /// line's digest names — a ranking change used to orphan every choice line,
 /// and now the line's own candidates replay ([`crate::rank`]). 5
 /// fingerprinted the emitted kernels, where 4 fingerprinted the programs
 /// and lowerings, targets and costs whole.
-pub(crate) const FORMAT: u32 = 6;
+pub(crate) const FORMAT: u32 = 7;
 /// Measurement: the rounds a contender is timed (the first over every
 /// candidate, the rest over the contenders), and the rounds the two leaders
 /// then run again ([`rounds`]).
