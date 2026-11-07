@@ -151,7 +151,8 @@ fn a_moving_read_pointer_keeps_a_wait_alive() {
     let (_iface, _allocator, _pool, signal) = mock_signal();
     let index = Box::leak(Box::new(std::sync::atomic::AtomicU64::new(0)));
     let read = QueueReadPointer::new(std::ptr::NonNull::new(index.as_ptr()).expect("a leaked box"));
-    assert!(signal.wait_signal_value_with_progress(1, 20, &[], Some(read)).is_err(), "the index stands still");
+    signal.watch_queue(read);
+    assert!(signal.wait_signal_value(1, 20).is_err(), "the index stands still");
     let reader = &*index;
     let done = Arc::clone(&signal);
     let mover = std::thread::spawn(move || {
@@ -161,6 +162,6 @@ fn a_moving_read_pointer_keeps_a_wait_alive() {
         }
         done.reset(1);
     });
-    signal.wait_signal_value_with_progress(1, 50, &[], Some(read)).expect("the index keeps it alive");
+    signal.wait_signal_value(1, 50).expect("the index keeps it alive");
     mover.join().unwrap();
 }

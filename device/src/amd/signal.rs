@@ -10,7 +10,7 @@
 use std::any::Any;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 
 use parking_lot::Mutex;
 
@@ -28,16 +28,17 @@ const WAIT_EVENTS_ESCALATE_MS: u64 = 200;
 #[cfg(test)]
 const WAIT_EVENTS_ESCALATE_MS: u64 = 1;
 
-/// An AQL queue's packet read index, which a graph's waits read as progress:
-/// the graph's one timeline store comes at its end, while the packet processor
-/// moves on from each barriered dispatch once it finishes. It reports in blocks
-/// (four packets on gfx942), so kernels several times shorter than a wait's
-/// limit are what this can tell from a hung queue.
+/// An AQL queue's packet read index, which waits on its timeline read as
+/// progress: a graph's one timeline store comes at its end, while the packet
+/// processor moves on from each barriered dispatch once it finishes. It reports
+/// in blocks (four packets on gfx942), so kernels several times shorter than a
+/// wait's limit are what this can tell from a hung queue.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct QueueReadPointer(NonNull<u64>);
 
 // SAFETY: the pointer targets the queue's GART page, which a queue's teardown
-// keeps until its finalizers retire and quarantines when they fail to.
+// keeps until its timeline is reached and quarantines when it isn't. A wait
+// reads it only short of its target, so a timeline outliving its queue is safe.
 unsafe impl Send for QueueReadPointer {}
 unsafe impl Sync for QueueReadPointer {}
 
@@ -90,6 +91,8 @@ pub struct AmdSignal {
     /// `AMDKFD_IOC_WAIT_EVENTS` on the device's `queue_event`. `Weak` so
     /// signals don't extend device lifetime.
     device: Weak<AmdDeviceCore>,
+    /// The queue this signal is the timeline of, where it reports its reads.
+    queue_read: OnceLock<QueueReadPointer>,
 }
 
 // SAFETY: AtomicU64 covers all reads/writes; the host pointer comes from a
@@ -160,18 +163,16 @@ impl AmdSignal {
     /// Early-exit on fault is load-bearing for BEAM search: a bad kernel config
     /// may fault the GPU, and paying the full timeout per rejected candidate is
     /// unaffordable.
-    fn poll_until(
-        &self,
-        target: u64,
-        timeout_ms: u64,
-        what: &'static str,
-        progress: &[Arc<AmdSignal>],
-        read: Option<QueueReadPointer>,
-    ) -> Result<()> {
+    /// Waits on this signal count `read` moving as progress.
+    pub(crate) fn watch_queue(&self, read: QueueReadPointer) {
+        self.queue_read.set(read).expect("a timeline belongs to one queue");
+    }
+
+    fn poll_until(&self, target: u64, timeout_ms: u64, what: &'static str, progress: &[Arc<AmdSignal>]) -> Result<()> {
         let mut start = std::time::Instant::now();
         let mut prev = u64::MAX;
         let mut progress_values = vec![u64::MAX; progress.len()];
-        let mut read_prev = read.map(QueueReadPointer::load);
+        let mut read_prev = None;
         loop {
             if let Some(error) = self.device.upgrade().and_then(|device| device.poison_error()) {
                 return Err(error);
@@ -187,7 +188,7 @@ impl AmdSignal {
                 advanced |= value != *previous;
                 *previous = value;
             }
-            if let Some(read) = read {
+            if let Some(read) = self.queue_read.get() {
                 let value = read.load();
                 advanced |= read_prev != Some(value);
                 read_prev = Some(value);
@@ -215,7 +216,7 @@ impl AmdSignal {
     /// Spin-wait until the value is ≥ `target` (increment convention — SDMA
     /// fence / monotonic timeline writes a literal increasing value).
     pub(crate) fn wait_signal_value(&self, target: u64, timeout_ms: u64) -> Result<()> {
-        self.poll_until(target, timeout_ms, "wait_signal_value", &[], None)
+        self.poll_until(target, timeout_ms, "wait_signal_value", &[])
     }
 
     pub(crate) fn wait_signal_value_with_progress(
@@ -223,9 +224,8 @@ impl AmdSignal {
         target: u64,
         timeout_ms: u64,
         progress: &[Arc<AmdSignal>],
-        read: Option<QueueReadPointer>,
     ) -> Result<()> {
-        self.poll_until(target, timeout_ms, "wait_signal_value", progress, read)
+        self.poll_until(target, timeout_ms, "wait_signal_value", progress)
     }
 
     /// CP-written dispatch timestamps in nanoseconds, valid only after the
@@ -412,7 +412,7 @@ impl TimelineSignal for AmdSignal {
     fn wait(&self, target: u64, timeout_ms: u64) -> Result<()> {
         // Tiered strategy (spin → yield → KFD WAIT_EVENTS sleep) + fault
         // surfacing live in the shared `poll_until` helper.
-        self.poll_until(target, timeout_ms, "wait", &[], None)
+        self.poll_until(target, timeout_ms, "wait", &[])
     }
 }
 
@@ -537,6 +537,7 @@ impl SignalPool {
             value_addr,
             host_ptr,
             pool: Arc::downgrade(self),
+            queue_read: OnceLock::new(),
             device: Arc::downgrade(&self.device),
         })
     }

@@ -1477,6 +1477,12 @@ impl AmdComputeQueue {
     /// COMPUTE-queue semantics are unreliable, which would deadlock a spin).
     /// The dispatches we wait on were submitted (doorbell rung) in prior calls,
     /// so the GPU will signal them; the wait always makes progress.
+    /// Where an AQL queue reports the packets it read; a PM4 queue's single IB
+    /// shows nothing of its dispatches there.
+    pub(crate) fn aql_read_pointer(&self) -> Option<crate::amd::signal::QueueReadPointer> {
+        (!self.is_pm4).then(|| crate::amd::signal::QueueReadPointer::new(self.inner.lock().read_ptr_host))
+    }
+
     fn wait_dispatch_headroom(&self, pool: &PoolQueue) -> Result<()> {
         let last_reserved = pool.pm4_value().saturating_sub(1);
         if last_reserved > RING_MAX_INFLIGHT {
@@ -1806,8 +1812,7 @@ impl AmdComputeQueue {
         linked.patch(replay, runtime, system)?;
         validate_aql_packet_count(replay.bytes().len() / AQL_PACKET_BYTES)?;
         self.publish_linked_aql_timeline(pool, replay, next)?;
-        let read = crate::amd::signal::QueueReadPointer::new(self.inner.lock().read_ptr_host);
-        Ok(SubmissionFinalizer::timeline_reading(Arc::clone(pool.pm4_signal()), next, read))
+        Ok(SubmissionFinalizer::timeline(Arc::clone(pool.pm4_signal()), next, None))
     }
 
     /// Lower and publish one complete HCQ command buffer with one doorbell.
