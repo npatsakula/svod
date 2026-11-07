@@ -1267,3 +1267,16 @@ fn an_underfloor_measurement_is_never_the_pick() {
     );
     assert_eq!(kept.map(|timed| timed[0].0), Some(0), "a floor refusing everything is ignored");
 }
+
+/// A draw past its most repeats its run to the exact length; within it, it is
+/// one run.
+#[test_case::test_case(100, 1000; "within")]
+#[test_case::test_case(250, 100; "repeated, cut short")]
+fn a_scratch_draw_repeats_its_run(elems: usize, most: usize) {
+    let got = crate::tune::drawn(elems, most).contiguous().to_vec::<f32>().unwrap();
+    assert_eq!(got.len(), elems);
+    assert!(got.iter().all(|v| (0.0..1.0).contains(v)));
+    let run = elems.min(most);
+    assert!((run..elems).all(|i| got[i] == got[i - run]));
+    assert!(got[..run].windows(2).any(|w| w[0] != w[1]));
+}
