@@ -2855,3 +2855,46 @@ fn the_probe_correctness_check_bites() {
         "a traded entry fails its row"
     );
 }
+
+/// A program's scalars count in `i64` only where a parameter's elements pass
+/// `i32`: the row stride's product would wrap into a negative offset.
+#[test_case(1_048_576, false; "within i32")]
+#[test_case(4_194_304, true; "past i32")]
+fn a_parameter_past_i32_counts_in_i64(n: usize, wide: bool) {
+    let target = super::targets::amd(AmdArch::Gfx942, 304);
+    let cfg = NearestCfg { warp_rows: 32, bk: Some(32), ..NearestCfg::new(128, 128, 2) };
+    let spec = plain(n, 1024, 768, Metric::NegDot, 1, cfg);
+    let lowering = Lowering::new(&super::declared(target));
+    let text = crate::lower::render(nearest::<F16>(&spec), &lowering).unwrap();
+    assert_eq!(text.lines().any(|l| l.contains("mul") && l.contains("i64")), wide);
+}
+
+/// Rows and candidates past `i32` elements on the device: the last rows of
+/// a query matrix past it against a host brute force, and every candidate of
+/// a candidate matrix past it. Never times.
+#[test_case(4_194_304, 1024, 1; "queries past i32")]
+#[test_case(4_194_304, 1024, 16; "queries past i32, a list")]
+#[test_case(1024, 4_194_304, 1; "candidates past i32")]
+#[ignore = "needs a GPU with 7 GB free"]
+fn knn_past_i32_elements(n: usize, m: usize, k: usize) {
+    let Some(_) = super::device_planner() else { return };
+    let (d, metric) = (768, Metric::NegDot);
+    let mut seed = 31;
+    let mut draw = |rows: usize| (0..rows * d).map(|_| super::lcg(&mut seed) as f32).collect::<Vec<_>>();
+    let (xs, cs) = (draw(n), draw(m));
+    let mk =
+        |v: &[f32], rows: usize| Tensor::from_slice(v).try_reshape([rows as isize, d as isize]).unwrap().contiguous();
+    let (x, c) = (mk(&xs, n).cast(DType::Float16).contiguous(), mk(&cs, m).cast(DType::Float16).contiguous());
+    let opts = Nearest { metric, ..Nearest::default() };
+    let pick = NearestCfg { warp_rows: 32, bk: Some(32), ..NearestCfg::new(128, 128, 2) };
+    let pick = if k > 1 { NearestCfg { warp_rows: 16, lanes: Some(LaneQueue::PORTABLE), ..pick } } else { pick };
+    let (score, index) =
+        crate::ops::nearest::picked(&x, &c, k, opts, None, |_, _, spec| NearestSpec { cfg: pick, ..spec })
+            .expect("the pick runs");
+    let (score, index) = (host(&score), host(&index));
+    let rows = n.min(64).min((1usize << 33) / (m * d)).max(1);
+    let from = n - rows;
+    let rows = Rows { d, k, rows, metric, xs: &xs[from * d..], cs: &cs };
+    let missed = uncovered(rows, &score[from * k..], &index[from * k..]);
+    assert!(missed.is_empty(), "rows {missed:?} from {from} miss their least");
+}

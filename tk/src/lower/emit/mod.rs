@@ -397,13 +397,16 @@ impl<'a> Emit<'a> {
             }
             // Constants have no position: an unlisted node lands before its first user.
             Scalar::Const(v) => {
-                let u = c32(*v);
+                let u = self.widened(c32(*v));
                 self.scalars.insert(id, (0, u.clone()));
                 return (0, u);
             }
-            Scalar::Var(name) => (0, self.vars[name].clone()),
-            Scalar::Special(Special::Block(axis)) => (0, self.block_index(*axis as usize)),
-            Scalar::Special(Special::Warp) => (0, self.warp.clone()),
+            Scalar::Var(name) => (0, self.widened(self.vars[name].clone())),
+            Scalar::Special(Special::Block(axis)) => {
+                let block = self.block_index(*axis as usize);
+                (0, self.widened(block))
+            }
+            Scalar::Special(Special::Warp) => (0, self.widened(self.warp.clone())),
             Scalar::Induction => return self.inductions[&id].clone(),
             Scalar::Any(_) => unreachable!("a branch reads an any as its predicate, nothing else does"),
             Scalar::Bin(op, a, b) => {
@@ -422,7 +425,7 @@ impl<'a> Emit<'a> {
                     BinOp::And => a.try_and_op(&b),
                     BinOp::Or => a.try_or_op(&b),
                 };
-                (la.max(lb), u.expect("i32 scalar"))
+                (la.max(lb), u.expect("a scalar"))
             }
             // The parameter is an input, so no store moves under its read; a
             // read whose index may leave the parameter stays under the
@@ -442,7 +445,7 @@ impl<'a> Emit<'a> {
                 let inside = self.prog.bounds(*at, &bound).is_some_and(|(lo, hi)| lo >= 0 && hi < elems);
                 let level = if inside { level } else { level.max(self.guards.last().copied().unwrap_or(0)) };
                 let load = self.hoist_at(load_at(&idx, tag), level);
-                (level, load.cast(DType::Int32))
+                (level, self.widened(load.cast(DType::Int32)))
             }
         };
         let u = self.hoist(u);
@@ -451,6 +454,13 @@ impl<'a> Emit<'a> {
             None => self.scalars.insert(id, (level, u.clone())),
         };
         (level, u)
+    }
+
+    /// `u` in the width this program's scalars count in: past `i32` where a
+    /// parameter's elements are.
+    fn widened(&self, u: Arc<UOp>) -> Arc<UOp> {
+        let wide = self.prog.params.iter().any(|p| p.elems > i32::MAX as usize);
+        if wide { u.cast(DType::Int64) } else { u }
     }
 
     fn sc(&mut self, id: ScalarId) -> Arc<UOp> {
@@ -808,7 +818,7 @@ impl<'a> Emit<'a> {
     /// Bind the induction variable for one copy of a body: memoized scalars
     /// of this level or deeper were computed for the previous binding.
     fn bind(&mut self, iv: ScalarId, level: usize, value: Arc<UOp>) {
-        let value = self.hoist(value);
+        let value = self.hoist(self.widened(value));
         self.levels.insert(value.id, level);
         self.inductions.insert(iv, (level, value));
         self.scalars.retain(|_, (l, _)| *l < level);
