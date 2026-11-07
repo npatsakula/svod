@@ -57,6 +57,69 @@ pub(crate) fn conv_first_eight(planner: &Planner, batches: usize, m: usize, g: &
 /// One launch of a family: its name, program and lowering.
 pub type Launch = (String, Program, Lowering);
 
+/// Kernels of parameters past `i32` elements, each path their addressing
+/// takes through a fill: bounded rows and columns, a batch's stride past it, a
+/// gathered row map. Rendered only: no machine here holds their operands.
+pub fn past_i32(target: &Target) -> Vec<Launch> {
+    let mut out: Vec<Launch> = vec![];
+    let planner = planner(target.clone());
+    let device = &planner.device;
+    let (m, n, k) = (50_001, 50_001, 50_048);
+    for (batches, stages) in [(1, 1), (2, 1), (2, 2)] {
+        let cfg = GemmCfg { stages, ..planner.gemm_ranked(batches, m, n, k, false)[0] };
+        let spec = GemmSpec { m, n, k, batch: Batch::Static(batches), epilogue: Epilogue::DEFAULT, cfg };
+        out.push((format!("gemm {batches} batches s{stages}"), gemm::<BF16>(&spec), cfg.lowering(device)));
+    }
+    for (n, m) in [(2_800_001, 1024), (1024, 2_800_001)] {
+        let p = NearestProblem {
+            n,
+            m,
+            d: 768,
+            dtype: ScalarDType::Float16,
+            metric: Metric::NegDot,
+            floors: Floors::default(),
+            groups: false,
+            k: 1,
+        };
+        let cfg = planner.nearest_ranked(p)[0];
+        let spec = NearestSpec {
+            n,
+            m,
+            d: 768,
+            metric: Metric::NegDot,
+            floors: Floors::default(),
+            groups: false,
+            k: 1,
+            cfg,
+            live: Default::default(),
+        };
+        out.push((format!("nearest {n}x{m}"), nearest::<F16>(&spec), Lowering::new(device)));
+    }
+    let (t, tk, d) = (1, 1_000_003, 64);
+    let mask = AttnMask { key_lens: true, ..AttnMask::default() };
+    if let Some(&cfg) = planner.attention_ranked(8, t, tk, d, false, false).first() {
+        let cfg = FaCfg { splits: 2, ..cfg };
+        let cache = Some(CacheLayout { rows: 6, heads_total: 6, row_map: true, appended: 1, app_lens: false });
+        let batch = Batch::var("b", 1, 3);
+        let spec = AttnSpec { batch, t, tk, heads: 4, kv_heads: 2, d, mask, cache, packed: false, scale: 0.125, cfg };
+        out.push(("attention row map".to_string(), attention::<F16>(&spec), cfg.lowering(device)));
+    }
+    // The bias's fill meets the column bound its keys end inside a block of.
+    let (t, tk) = (37, 20_000_003);
+    if let Some(&cfg) = planner.attention_ranked(8, t, tk, d, false, true).first() {
+        let mask = AttnMask { bias: Some(Bias::PerBatch), ..mask };
+        let batch = Batch::Static(2);
+        let spec =
+            AttnSpec { batch, t, tk, heads: 4, kv_heads: 2, d, mask, cache: None, packed: false, scale: 0.125, cfg };
+        out.push(("attention bias".to_string(), attention::<F16>(&spec), cfg.lowering(device)));
+    }
+    // A gathered candidate's row, gated on the candidate and bounded in depth.
+    let (metric, floors, live) = (Metric::SquaredL2, Floors::default(), Live::default());
+    let spec = RescoreSpec { n: 100, m: 2_800_001, d: 770, cols: 20, metric, floors, live };
+    out.push(("nearest rescore".to_string(), nearest_rescore(&spec), Lowering::new(device)));
+    out
+}
+
 /// The first candidate the op layer plans for each kernel family on `target`.
 pub(crate) fn families(target: &Target) -> Vec<Launch> {
     let mut out: Vec<Launch> = vec![];

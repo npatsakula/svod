@@ -10,13 +10,13 @@ use smallvec::smallvec;
 use svod_codegen::llvm::nvptx::smem::{cp_async_commit, cp_async_wait};
 use svod_codegen::llvm::nvptx::wgmma;
 use svod_dtype::{AddrSpace, DType, DeviceSpec, ScalarDType};
-use svod_ir::{AxisId, AxisType, BarrierFence, KernelInfo, Op, UOp};
+use svod_ir::{AxisId, AxisType, BarrierFence, ConstValue, KernelInfo, Op, UOp};
 
 use crate::atoms::{Core, Fill, Target};
 use crate::index::*;
 use crate::ir::*;
 use crate::layouts::{Laid, Moves, TileLayout};
-use crate::lower::{Lowering, ProgramSnafu, Result, TooLargeSnafu, UnsupportedSnafu};
+use crate::lower::{ExtentPastI32Snafu, Lowering, ProgramSnafu, Result, TooLargeSnafu, UnsupportedSnafu};
 use snafu::{ResultExt, ensure};
 
 mod address;
@@ -121,8 +121,19 @@ impl Listing {
     }
 }
 
+/// Ranges, grids and bound variables count in `i32` on every target, whatever
+/// the width of the addresses they build; a count past it is refused.
+fn counted(name: &str, most: Option<i64>) -> Result<()> {
+    let extent = most.unwrap_or(0);
+    ensure!(extent <= i32::MAX as i64, ExtentPastI32Snafu { name, extent });
+    Ok(())
+}
+
 struct Emit<'a> {
     prog: &'a Program,
+    /// The width this program's scalars count in: past `i32` where a
+    /// parameter's elements are.
+    index: DType,
     lay: &'a [Option<TileLayout>],
     low: &'a Lowering,
     params: Vec<Arc<UOp>>,
@@ -223,6 +234,7 @@ impl Coord {
 
 impl<'a> Emit<'a> {
     fn new(prog: &'a Program, lay: &'a [Option<TileLayout>], low: &'a Lowering, params: Vec<Arc<UOp>>) -> Self {
+        let index = if prog.params.iter().any(|p| p.elems > i32::MAX as usize) { DType::Int64 } else { DType::Int32 };
         let threads = prog.warps * low.device.target.wave;
         let tid = UOp::special_dtype(c32(threads as i64), "lidx0".to_string(), DType::Int32);
         let wave = c32(low.device.target.wave as i64);
@@ -255,6 +267,7 @@ impl<'a> Emit<'a> {
         }
         Self {
             prog,
+            index,
             lay,
             low,
             params,
@@ -355,6 +368,12 @@ impl<'a> Emit<'a> {
     }
 
     fn prologue(&mut self) -> Result<()> {
+        for &extent in &self.prog.grid {
+            counted(&self.prog.name, self.prog.bounds(extent, &|_| None).map(|(_, hi)| hi))?;
+        }
+        for v in &self.prog.vars {
+            counted(&self.prog.name, Some(v.max))?;
+        }
         let n = self.params.len();
         for (i, v) in self.prog.vars.iter().enumerate() {
             let p = UOp::scalar_param(n + i, Some(v.name.clone()), DType::Int32, v.min, v.max);
@@ -397,7 +416,7 @@ impl<'a> Emit<'a> {
             }
             // Constants have no position: an unlisted node lands before its first user.
             Scalar::Const(v) => {
-                let u = self.widened(c32(*v));
+                let u = UOp::const_(self.index.clone(), ConstValue::Int(*v));
                 self.scalars.insert(id, (0, u.clone()));
                 return (0, u);
             }
@@ -419,9 +438,9 @@ impl<'a> Emit<'a> {
                     BinOp::Rem => a.try_cmod(&b),
                     BinOp::Min => minimum(&a, &b),
                     BinOp::Max => a.try_max(&b),
-                    BinOp::Lt => a.try_cmplt(&b).map(|c| c.cast(DType::Int32)),
-                    BinOp::Le => a.try_cmple(&b).map(|c| c.cast(DType::Int32)),
-                    BinOp::Eq => a.try_cmpeq(&b).map(|c| c.cast(DType::Int32)),
+                    BinOp::Lt => a.try_cmplt(&b).map(|c| c.cast(self.index.clone())),
+                    BinOp::Le => a.try_cmple(&b).map(|c| c.cast(self.index.clone())),
+                    BinOp::Eq => a.try_cmpeq(&b).map(|c| c.cast(self.index.clone())),
                     BinOp::And => a.try_and_op(&b),
                     BinOp::Or => a.try_or_op(&b),
                 };
@@ -456,11 +475,9 @@ impl<'a> Emit<'a> {
         (level, u)
     }
 
-    /// `u` in the width this program's scalars count in: past `i32` where a
-    /// parameter's elements are.
+    /// `u` in the width this program's scalars count in.
     fn widened(&self, u: Arc<UOp>) -> Arc<UOp> {
-        let wide = self.prog.params.iter().any(|p| p.elems > i32::MAX as usize);
-        if wide { u.cast(DType::Int64) } else { u }
+        u.cast(self.index.clone())
     }
 
     fn sc(&mut self, id: ScalarId) -> Arc<UOp> {
@@ -483,8 +500,9 @@ impl<'a> Emit<'a> {
         let blocks = if dies > 1 {
             let linear = add(&hw[0], &mul(&ends[0], &add(&hw[1], &mul(&ends[1], &hw[2]))));
             let total = mul(&ends[0], &mul(&ends[1], &ends[2]));
-            let (base, tall) = (total.try_cdiv(&c32(dies)).expect("base"), total.try_cmod(&c32(dies)).expect("tall"));
-            let (die, local) = (linear.try_cmod(&c32(dies)).expect("die"), linear.try_cdiv(&c32(dies)).expect("local"));
+            let dies_of = total.const_like(dies);
+            let (base, tall) = (total.try_cdiv(&dies_of).expect("base"), total.try_cmod(&dies_of).expect("tall"));
+            let (die, local) = (linear.try_cmod(&dies_of).expect("die"), linear.try_cdiv(&dies_of).expect("local"));
             // `min(die, tall)`: the dies before `tall` hold a block more.
             let extra = add(&die, &tall).try_sub(&die.try_max(&tall).expect("max")).expect("min");
             let ordered = self.hoist(add(&add(&mul(&die, &base), &extra), &local));
@@ -700,7 +718,7 @@ impl<'a> Emit<'a> {
                     // Listed like any scalar: a compare left to its first user
                     // would land inside whichever branch meets it first and not
                     // reach a later `if` on the same predicate outside it.
-                    let cond = self.hoist(pred.try_cmpne(&c32(0)).expect("predicate"));
+                    let cond = self.hoist(pred.try_cmpne(&pred.const_like(0)).expect("predicate"));
                     (cond.clone(), self.hoist(cond.not()))
                 };
                 self.divergent += divergent;
@@ -774,21 +792,23 @@ impl<'a> Emit<'a> {
             let (_, u) = self.inductions.get(&iv)?;
             Some((u.vmin().try_int()?, u.vmax().try_int()?))
         };
-        if self.prog.bounds(l.extent, &bound).is_some_and(|(lo, _)| lo < 0) {
-            extent = self.hoist(extent.try_max(&c32(0)).expect("a floored extent"));
+        let bounds = self.prog.bounds(l.extent, &bound);
+        counted(&self.prog.name, bounds.map(|(_, hi)| hi))?;
+        if bounds.is_some_and(|(lo, _)| lo < 0) {
+            extent = self.hoist(extent.try_max(&extent.const_like(0)).expect("a floored extent"));
         }
         let u = l.unroll.max(1) as i64;
         let constant = self.constant(l.extent);
         if u == 1 {
             return self.loop_rolled(l, extent, |_, range| add(&start, &range));
         }
-        let main = self.hoist(extent.try_cdiv(&c32(u)).expect("trips"));
-        let rem = self.hoist(extent.try_cmod(&c32(u)).expect("remainder"));
+        let main = self.hoist(extent.try_cdiv(&extent.const_like(u)).expect("trips"));
+        let rem = self.hoist(extent.try_cmod(&extent.const_like(u)).expect("remainder"));
         if constant.is_none_or(|e| e / u > 0) {
             self.loop_unrolled(l, main.clone(), u)?;
         }
         if constant.is_none_or(|e| e % u != 0) {
-            let base = self.hoist(add(&start, &mul(&main, &c32(u))));
+            let base = self.hoist(add(&start, &mul(&main, &main.const_like(u))));
             self.loop_rolled(l, rem, move |_, range| add(&base, &range))?;
         }
         Ok(())
@@ -864,9 +884,10 @@ impl<'a> Emit<'a> {
         let start = self.sc(l.start);
         let range = self.open_range(trips);
         let level = self.level();
-        let base = add(&start, &mul(&range, &c32(u)));
+        let wide_range = self.widened(range.clone());
+        let base = add(&start, &mul(&wide_range, &wide_range.const_like(u)));
         for copy in 0..u {
-            self.bind(l.iv, level, add(&base, &c32(copy)));
+            self.bind(l.iv, level, add(&base, &base.const_like(copy)));
             self.body(l)?;
         }
         self.close_range(range);

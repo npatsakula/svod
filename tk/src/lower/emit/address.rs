@@ -197,7 +197,7 @@ impl Emit<'_> {
         let in_rows = match rows {
             Some(map) => map.valid.map(|v| {
                 let (_, v) = self.scalar_at(v, Some(&row));
-                v.try_cmpne(&c32(0)).expect("row gate")
+                v.try_cmpne(&v.const_like(0)).expect("row gate")
             }),
             None => bounds[0].map(|b| row.try_cmplt(&self.sc(b)).expect("bound compare")),
         };

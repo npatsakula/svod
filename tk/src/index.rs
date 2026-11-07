@@ -1,5 +1,6 @@
-//! Flat `Int32` addressing helpers over the IR: the pre-linearized path runs
-//! no index-dtype lowering, so every constant here is a concrete `i32`.
+//! Flat addressing helpers over the IR: the pre-linearized path runs no
+//! index-dtype lowering, so a [`c32`] is a concrete `i32` and its users choose
+//! it only where the value can't pass one.
 
 use std::sync::Arc;
 
