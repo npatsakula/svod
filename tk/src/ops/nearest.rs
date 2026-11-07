@@ -399,7 +399,87 @@ pub(crate) fn picked(
     scaled: Option<&Scaled>,
     pick: impl FnOnce(&Planner, &[NearestCfg], NearestSpec) -> NearestSpec,
 ) -> Result<(Tensor, Tensor)> {
-    let k = k.into();
+    let mut pick = Some(pick);
+    let mut once = |planner: &Planner, ranked: &[NearestCfg], spec| {
+        pick.take().expect("a launch picks once")(planner, ranked, spec)
+    };
+    launched(x, c, k.into(), opts, scaled, true, &mut once)
+}
+
+/// What [`launched`] asks of its config: the tuner, or the first launch's.
+type Pick<'a> = dyn FnMut(&Planner, &[NearestCfg], NearestSpec) -> NearestSpec + 'a;
+
+/// Model: the longest a kernel launch is planned to run. Past it a query
+/// matrix goes in several launches: a device takes a launch this far past its
+/// waits' tens of seconds for a wedged queue.
+const LAUNCH_NS: f64 = 5e9;
+
+/// The rows a launch takes of `n` costing `ns` in all to hold each under
+/// [`LAUNCH_NS`], whole blocks of `block` rows.
+pub(crate) fn rows_a_launch(ns: f64, n: usize, block: usize) -> usize {
+    let launches = (ns / LAUNCH_NS).ceil().max(1.0) as usize;
+    n.div_ceil(launches).next_multiple_of(block)
+}
+
+/// [`picked`] of `rows` of `x` at a time, each realized before the next is
+/// launched: the query rows are independent, so their lists concatenate. The
+/// first launch picks the config the rest take.
+pub(crate) fn in_launches(
+    x: &Tensor,
+    c: &Tensor,
+    k: SInt,
+    opts: Nearest,
+    scaled: Option<&Scaled>,
+    (n, rows): (usize, usize),
+    pick: &mut Pick<'_>,
+) -> Result<(Tensor, Tensor)> {
+    let graph_err = || GraphSnafu { op: OP };
+    let mut cfg = None;
+    let (mut scores, mut indices) = (vec![], vec![]);
+    for start in (0..n).step_by(rows) {
+        let len = rows.min(n - start);
+        let part = |t: &Tensor| t.narrow(0, start, len).map(|t| t.contiguous()).context(graph_err());
+        let row = part(x)?;
+        let floor = opts.row_floor.map(part).transpose()?;
+        let group = opts.groups.map(|(row, _)| part(row)).transpose()?;
+        let groups = opts.groups.zip(group.as_ref()).map(|((_, col), row)| (row, col));
+        let opts = Nearest { row_floor: floor.as_ref(), groups, ..opts };
+        let scaled = match scaled {
+            Some(s) => Some(Scaled {
+                x_scale: part(&s.x_scale)?,
+                x_sq: s.x_sq.as_ref().map(part).transpose()?,
+                c_scale: s.c_scale.clone(),
+                c_sq: s.c_sq.clone(),
+            }),
+            None => None,
+        };
+        let mut first = |planner: &Planner, ranked: &[NearestCfg], spec: NearestSpec| {
+            let spec = match cfg {
+                Some(cfg) => NearestSpec { cfg, ..spec },
+                None => pick(planner, ranked, spec),
+            };
+            cfg = Some(spec.cfg);
+            spec
+        };
+        let (score, index) = launched(&row, c, k.clone(), opts, scaled.as_ref(), false, &mut first)?;
+        score.realize().context(graph_err())?;
+        index.realize().context(graph_err())?;
+        scores.push(score);
+        indices.push(index);
+    }
+    let cat = |parts: &[Tensor]| Tensor::cat(&parts.iter().collect::<Vec<_>>(), 0).context(graph_err());
+    Ok((cat(&scores)?, cat(&indices)?))
+}
+
+fn launched(
+    x: &Tensor,
+    c: &Tensor,
+    k: SInt,
+    opts: Nearest,
+    scaled: Option<&Scaled>,
+    divide: bool,
+    pick: &mut Pick<'_>,
+) -> Result<(Tensor, Tensor)> {
     let (top, k_var) = list_len(&k)?;
     let shape = |t: &Tensor| shape_of(t).context(GraphSnafu { op: OP });
     let (xs, cs) = (shape(x)?, shape(c)?);
@@ -462,6 +542,15 @@ pub(crate) fn picked(
     let (row_group, col_group) = opts.groups.map(|(r, c)| (r.cast(DType::Int32), c.cast(DType::Int32))).unzip();
     let live = Live { rows: live_rows(&x_var), k: k_var.clone().filter(|_| top > 1) };
     let spec = NearestSpec { n, m, d: depth, metric, floors, groups, k: top, cfg: cfgs[0], live };
+    if divide && x_var.is_none() {
+        let p = problem(&spec, x.dtype().scalar().expect("planned"));
+        let ns = planner.admit(&p, &cfgs[0]).map_or(0.0, |(ns, _)| ns);
+        let block = cfgs.iter().map(|c| c.bq).max().expect("a config");
+        let rows = rows_a_launch(ns, n, block);
+        if rows < n {
+            return in_launches(x, c, k, opts, scaled, (n, rows), pick);
+        }
+    }
     let spec = pick(&planner, &cfgs, spec);
     super::ran(OP, "nearest", spec.cfg);
     let rows_in = [Some(&xp), x_scale.as_ref(), x_sq.as_ref(), row_floor.as_ref(), row_group.as_ref()];

@@ -2856,6 +2856,45 @@ fn the_probe_correctness_check_bites() {
     );
 }
 
+#[test_case(1e9, 4096, 256 => 4096; "under a launch")]
+#[test_case(12e9, 4096, 256 => 1536; "three launches of whole blocks")]
+#[test_case(0.0, 4096, 256 => 4096; "unpriced")]
+fn a_launch_holds_its_rows_under_the_model(ns: f64, n: usize, block: usize) -> usize {
+    tk::nearest::rows_a_launch(ns, n, block)
+}
+
+/// Rows in several launches list what they list in one: a list, row floors and
+/// groups narrowed to each launch's rows.
+#[test_case(1, Metric::NegDot, false; "a row's least")]
+#[test_case(8, Metric::NegDot, false; "a list")]
+#[test_case(8, Metric::L2, true; "floors and groups, l2")]
+fn rows_in_launches_list_what_one_launch_does(k: usize, metric: Metric, masks: bool) {
+    let (n, m, d, rows) = (100usize, 64usize, 16usize, 37usize);
+    let mut seed = 7;
+    let mut draw = |len: usize| (0..len).map(|_| super::lcg(&mut seed) as f32).collect::<Vec<_>>();
+    let shaped = |v: Vec<f32>, r: usize| Tensor::from_slice(&v).try_reshape([r as isize, d as isize]).unwrap();
+    let (x, c) = (shaped(draw(n * d), n).contiguous(), shaped(draw(m * d), m).contiguous());
+    let floor = Tensor::from_slice(draw(n)).contiguous();
+    let ids = |len: usize| Tensor::from_slice((0..len as i32).map(|i| i % 5).collect::<Vec<_>>()).contiguous();
+    let (row_group, col_group) = (ids(n), ids(m));
+    let opts = Nearest {
+        metric,
+        row_floor: masks.then_some(&floor),
+        groups: masks.then_some((&row_group, &col_group)),
+        ..Nearest::default()
+    };
+    let cfg = |_: &Planner, ranked: &[NearestCfg], spec: NearestSpec| NearestSpec { cfg: ranked[0], ..spec };
+    let (one_score, one_index) = tk::nearest::picked(&x, &c, k, opts, None, cfg).unwrap();
+    let mut pick = cfg;
+    let (score, index) = tk::nearest::in_launches(&x, &c, k.into(), opts, None, (n, rows), &mut pick).unwrap();
+    // Another launch folds a row's terms in another order: the same pairs,
+    // within rounding.
+    assert_eq!(host(&index), host(&one_index));
+    for (got, one) in host(&score).into_iter().zip(host(&one_score)) {
+        assert!((got - one).abs() <= 1e-5 * one.abs().max(1.0), "{got} against {one}");
+    }
+}
+
 /// A program's scalars count in `i64` only where a parameter's elements pass
 /// `i32`: the row stride's product would wrap into a negative offset.
 #[test_case(1_048_576, false; "within i32")]
@@ -2871,11 +2910,12 @@ fn a_parameter_past_i32_counts_in_i64(n: usize, wide: bool) {
 
 /// Rows and candidates past `i32` elements on the device: the last rows of
 /// a query matrix past it against a host brute force, and every candidate of
-/// a candidate matrix past it. Never times.
+/// a candidate matrix past it, and both at once through the op, tuned.
 #[test_case(4_194_304, 1024, 1; "queries past i32")]
 #[test_case(4_194_304, 1024, 16; "queries past i32, a list")]
 #[test_case(1024, 4_194_304, 1; "candidates past i32")]
-#[ignore = "needs a GPU with 7 GB free"]
+#[test_case(4_194_304, 4_194_304, 1; "both past i32, tuned and a minute in launches")]
+#[ignore = "needs a GPU with 14 GB free"]
 fn knn_past_i32_elements(n: usize, m: usize, k: usize) {
     let Some(_) = super::device_planner() else { return };
     let (d, metric) = (768, Metric::NegDot);
@@ -2888,10 +2928,15 @@ fn knn_past_i32_elements(n: usize, m: usize, k: usize) {
     let opts = Nearest { metric, ..Nearest::default() };
     let pick = NearestCfg { warp_rows: 32, bk: Some(32), ..NearestCfg::new(128, 128, 2) };
     let pick = if k > 1 { NearestCfg { warp_rows: 16, lanes: Some(LaneQueue::PORTABLE), ..pick } } else { pick };
-    let (score, index) =
+    let started = std::time::Instant::now();
+    let (score, index) = if n == m {
+        tk::nearest::k_nearest(&x, &c, k, opts).expect("the op runs")
+    } else {
         crate::ops::nearest::picked(&x, &c, k, opts, None, |_, _, spec| NearestSpec { cfg: pick, ..spec })
-            .expect("the pick runs");
+            .expect("the pick runs")
+    };
     let (score, index) = (host(&score), host(&index));
+    eprintln!("knn {n}x{m} k{k}: {:?} with its tuning and reads", started.elapsed());
     let rows = n.min(64).min((1usize << 33) / (m * d)).max(1);
     let from = n - rows;
     let rows = Rows { d, k, rows, metric, xs: &xs[from * d..], cs: &cs };
