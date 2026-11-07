@@ -1137,7 +1137,9 @@ pub fn counted(program: &svod_ir::UOp) -> Option<Counted> {
             // A plain load inside a loop body moves its access's width of
             // elements — the fill's own on a staged target, a side read's
             // beside it.
-            Op::Load(ops::Load { index, .. }) if loops > 0 && space_of(index) == Some(AddrSpace::Global) => {
+            Op::Load(ops::Load { index, .. })
+                if loops > 0 && matches!(space_of(index), Some(AddrSpace::Global | AddrSpace::Swizzled { .. })) =>
+            {
                 out.fill += u.dtype().bytes() * width_of(index);
             }
             _ => {}
