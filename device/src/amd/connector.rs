@@ -25,7 +25,7 @@ use crate::amd::AmdAllocator;
 use crate::amd::device::{AmdDeviceCore, ScratchState, alloc_scratch};
 use crate::amd::kernarg::KernargArena;
 use crate::amd::queue::AmdComputeQueue;
-use crate::amd::signal::{AmdSignal, TIMELINE_WRAP_WATERMARK, Timeline};
+use crate::amd::signal::{AmdSignal, QueueReadPointer, TIMELINE_WRAP_WATERMARK, Timeline};
 use crate::error::{Error, Result};
 use crate::sync::TimelineSignal;
 
@@ -269,6 +269,7 @@ pub(crate) struct SubmissionFinalizer {
     signal: Arc<AmdSignal>,
     value: u64,
     progress: Vec<Arc<AmdSignal>>,
+    read: Option<QueueReadPointer>,
     _timestamps: Option<Arc<AmdSignal>>,
     publication: Mutex<PublicationState>,
     publication_changed: Condvar,
@@ -288,7 +289,22 @@ impl SubmissionFinalizer {
             signal,
             value,
             progress: Vec::new(),
+            read: None,
             _timestamps: timestamps,
+            publication: Mutex::new(PublicationState::Published),
+            publication_changed: Condvar::new(),
+            code: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// A published timeline point whose waits count `read` moving as life.
+    pub(crate) fn timeline_reading(signal: Arc<AmdSignal>, value: u64, read: QueueReadPointer) -> Arc<Self> {
+        Arc::new(Self {
+            signal,
+            value,
+            progress: Vec::new(),
+            read: Some(read),
+            _timestamps: None,
             publication: Mutex::new(PublicationState::Published),
             publication_changed: Condvar::new(),
             code: Mutex::new(Vec::new()),
@@ -300,6 +316,7 @@ impl SubmissionFinalizer {
             signal,
             value,
             progress,
+            read: None,
             _timestamps: None,
             publication: Mutex::new(PublicationState::Prepared),
             publication_changed: Condvar::new(),
@@ -350,7 +367,7 @@ impl SubmissionFinalizer {
                 // Whatever the publication wait consumed comes off the signal
                 // wait's budget; never hand it 0, which means "no timeout".
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now()).as_millis() as u64;
-                self.signal.wait_signal_value_with_progress(self.value, remaining.max(1), &self.progress)
+                self.signal.wait_signal_value_with_progress(self.value, remaining.max(1), &self.progress, self.read)
             }
             PublicationState::Failed => Err(Error::Runtime {
                 message: "AMD submission failed before its terminal timeline point was published".into(),

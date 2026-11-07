@@ -1806,7 +1806,8 @@ impl AmdComputeQueue {
         linked.patch(replay, runtime, system)?;
         validate_aql_packet_count(replay.bytes().len() / AQL_PACKET_BYTES)?;
         self.publish_linked_aql_timeline(pool, replay, next)?;
-        Ok(SubmissionFinalizer::timeline(Arc::clone(pool.pm4_signal()), next, None))
+        let read = crate::amd::signal::QueueReadPointer::new(self.inner.lock().read_ptr_host);
+        Ok(SubmissionFinalizer::timeline_reading(Arc::clone(pool.pm4_signal()), next, read))
     }
 
     /// Lower and publish one complete HCQ command buffer with one doorbell.

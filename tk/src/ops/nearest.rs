@@ -411,8 +411,9 @@ pub(crate) fn picked(
 type Pick<'a> = dyn FnMut(&Planner, &[NearestCfg], NearestSpec) -> NearestSpec + 'a;
 
 /// Model: the longest a kernel launch is planned to run. Past it a query
-/// matrix goes in several launches: a device takes a launch this far past its
-/// waits' tens of seconds for a wedged queue.
+/// matrix goes in several launches: a queue shows progress only between
+/// dispatches, several of them at a time, and a device's waits take tens of
+/// seconds without any for a wedged queue.
 const LAUNCH_NS: f64 = 5e9;
 
 /// The rows a launch takes of `n` costing `ns` in all to hold each under
