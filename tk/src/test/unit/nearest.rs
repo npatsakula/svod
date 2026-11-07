@@ -2985,3 +2985,34 @@ fn knn_past_i32_elements(n: usize, m: usize, k: usize) {
     let missed = uncovered(rows, &score[from * k..], &index[from * k..]);
     assert!(missed.is_empty(), "rows {missed:?} from {from} miss their least");
 }
+
+/// A static plan may run past a wait's limit: every dispatch it finishes
+/// counts as progress, though only the whole plan signals its end.
+#[test]
+#[ignore = "takes a minute on a device"]
+fn a_static_plan_past_the_wait_limit_finishes() {
+    let Some(_) = super::device_planner() else { return };
+    let (rows, d, plans) = (1usize << 19, 768, 48);
+    let opts = Nearest { metric: Metric::NegDot, ..Nearest::default() };
+    let pick = NearestCfg { warp_rows: 32, bk: Some(32), ..NearestCfg::new(128, 128, 2) };
+    let run = |c: &Tensor, x: &Tensor| {
+        crate::ops::nearest::picked(x, c, 1, opts, None, |_, _, spec| NearestSpec { cfg: pick, ..spec }).unwrap()
+    };
+    let draw = |rows: usize| {
+        let device = svod_dtype::default_device::default_device();
+        let t = Tensor::rand_with(&[rows, d], DType::Float32, device).unwrap().cast(DType::Float16).contiguous();
+        t.realize().unwrap();
+        t
+    };
+    let (x, c) = (draw(rows), draw(rows + plans));
+    let view = |at: usize| c.try_shrink([(at as isize, (at + rows) as isize), (0, d as isize)]).unwrap();
+    let outs: Vec<_> = (0..plans).map(|at| run(&view(at), &x)).collect();
+    assert!(outs.iter().all(|(score, _)| !score.uop().has_buffer_identity()), "a launch ran on its own");
+    let started = std::time::Instant::now();
+    Tensor::realize_batch(outs.iter().flat_map(|(score, index)| [score, index])).unwrap();
+    let elapsed = started.elapsed();
+    assert!(elapsed.as_secs() > 30, "{elapsed:?} doesn't reach the limit");
+    let (score, index) = run(&view(0), &x);
+    assert_eq!(host(&outs[0].0), host(&score));
+    assert_eq!(host(&outs[0].1), host(&index));
+}
