@@ -224,33 +224,33 @@ fn the_claimed_steps_and_smem_hold_their_programs(target: Target) {
 /// predicts a program's instruction mix from the claim itself: the gelu's
 /// forty tile operations an element. A staged ring's peeled loops repeat a
 /// trip's address arithmetic whatever the epilogue, which the claim doesn't
-/// count: 17 % over on gfx942's smallest tile, hence the wider bound.
-#[test_case(sm86(); "sm86")]
-#[test_case(crate::sweep::amd(AmdArch::Gfx942, 304); "gfx942")]
-#[test_case(crate::sweep::amd(AmdArch::Gfx1201, 96); "gfx1201")]
-fn the_gemm_epilogue_claim_holds_its_program(target: Target) {
+/// count: 17 % over on gfx942's smallest tile.
+#[test_case(sm86(), 0.15; "sm86")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx942, 304), 0.2; "gfx942")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1201, 96), 0.15; "gfx1201")]
+fn the_gemm_epilogue_claim_holds_its_program(target: Target, within: f64) {
     for d in &rank::claims(&target).0 {
         if !d.name.starts_with("gemm") {
             continue;
         }
         let (_, predicted, program, _) =
             d.rows.iter().find(|(w, ..)| *w == "valu ops/trip").copied().expect("the valu row");
-        assert!((program - predicted).abs() <= 0.2 * predicted, "{}: {predicted} VALU against {program}", d.name);
+        assert!((program - predicted).abs() <= within * predicted, "{}: {predicted} VALU against {program}", d.name);
     }
 }
 
 /// A trip's global bytes are the claim's on every ring. Only a resident
 /// nearest's are not: each lane loads the squared norm of its candidate, so
-/// the loads repeat a few bytes of memory the claim counts once, up to three
-/// times the fill on gfx942. Bounded, not pinned.
-#[test_case(sm86(); "sm86")]
-#[test_case(crate::sweep::amd(AmdArch::Gfx942, 304); "gfx942")]
-#[test_case(crate::sweep::amd(AmdArch::Gfx1201, 96); "gfx1201")]
-fn the_claimed_fill_holds_its_program(target: Target) {
+/// the loads repeat a few bytes of memory the claim counts once. Bounded, not
+/// pinned, per the target's lanes.
+#[test_case(sm86(), 2.0; "sm86")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx942, 304), 3.0; "gfx942")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1201, 96), 2.0; "gfx1201")]
+fn the_claimed_fill_holds_its_program(target: Target, most: f64) {
     for d in &rank::claims(&target).0 {
         let (_, predicted, program, holds) = *d.rows.iter().find(|(w, ..)| *w == "fill bytes/trip").expect("the fill");
         let broadcast = d.name.starts_with("nearest") && !d.name.contains("streamed");
-        let bounded = predicted <= program && program <= 3.0 * predicted;
+        let bounded = predicted <= program && program <= most * predicted;
         assert!(
             if broadcast { bounded } else { holds },
             "{}: the program moves {program} of {predicted} fill bytes",

@@ -122,7 +122,8 @@ impl Listing {
 }
 
 /// Ranges, grids and bound variables count in `i32` on every target, whatever
-/// the width of the addresses they build; a count past it is refused.
+/// the width of the addresses they build; a count past it is refused. A count
+/// without a bound is a row coordinate read from memory, in `i32` already.
 fn counted(name: &str, most: Option<i64>) -> Result<()> {
     let extent = most.unwrap_or(0);
     ensure!(extent <= i32::MAX as i64, ExtentPastI32Snafu { name, extent });

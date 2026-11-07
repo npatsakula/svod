@@ -716,7 +716,7 @@ impl<'a> Probes<'a> {
             probe.candidates.clear();
             return probe;
         };
-        let tile = [2 * atom.m as usize, 2 * atom.n as usize, atom.k as usize];
+        let tile = [4 * atom.m as usize, 4 * atom.n as usize, atom.k as usize];
         self.steps::<BF16>("probe:step_wide", tile, self.blocks, grid, lowering, true)
     }
 

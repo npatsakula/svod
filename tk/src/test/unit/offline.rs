@@ -97,7 +97,7 @@ fn costs_read_from_a_copied_store() {
     assert_eq!(unmeasured, ["step_i8", "step_lone_i8", "trip_lone", "trip_one_lone", "latency_one"]);
     // A rolled ring is not probed where fills are `cp.async`: its line is passed over.
     let want = |op: &str| match op {
-        "step_i8" | "step_lone_i8" | "trip_rolled" | "trip_lone" | "trip_one_lone" | "latency_one" => 0.0,
+        "step_wide" | "step_i8" | "step_lone_i8" | "trip_rolled" | "trip_lone" | "trip_one_lone" | "latency_one" => 0.0,
         _ => H100.iter().find(|f| f.0 == op).expect("a probe").1 as f64 * 1e-6,
     };
     let mut costs = costs;
