@@ -63,7 +63,10 @@ impl Emit<'_> {
     /// landing as zeros.
     pub(super) fn load_l2_only(&mut self, s: &View, off: Arc<UOp>, gate: Option<Arc<UOp>>, w: usize) -> Vec<Arc<UOp>> {
         let safe = match &gate {
-            Some(g) => self.hoist(UOp::try_where(g.clone(), off, c32(0)).expect("safe offset")),
+            Some(g) => {
+                let zero = off.const_like(0);
+                self.hoist(UOp::try_where(g.clone(), off, zero).expect("safe offset"))
+            }
             None => off,
         };
         let src = self.access(&s.buf, &safe, 1);

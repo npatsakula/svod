@@ -65,7 +65,7 @@ impl Emit<'_> {
                     let bound = self.sc(b);
                     let last = bound.try_sub(&c32(1)).expect("bound").try_max(&c32(0)).expect("floor");
                     let over = row.try_cmplt(&last).expect("cmp");
-                    self.hoist(UOp::try_where(over, row.clone(), last).expect("clamp"))
+                    self.hoist(UOp::try_where(over, self.widened(row.clone()), last).expect("clamp"))
                 }
                 None => row.clone(),
             };
@@ -75,7 +75,10 @@ impl Emit<'_> {
             // row outside its map does, from element 0 of the operand.
             let gate = gate.filter(|_| gathered || bounds[1].is_some());
             let src_off = match &gate {
-                Some(g) => self.hoist(UOp::try_where(g.clone(), src_off, c32(0)).expect("safe offset")),
+                Some(g) => {
+                    let zero = src_off.const_like(0);
+                    self.hoist(UOp::try_where(g.clone(), src_off, zero).expect("safe offset"))
+                }
                 None => src_off,
             };
             let (hi_row, hi_col) = (row.clone(), col.clone());
@@ -159,7 +162,8 @@ impl Emit<'_> {
             }
             let v = match gate {
                 Some(g) if gathered => {
-                    let safe = self.hoist(UOp::try_where(g.clone(), off, c32(0)).expect("safe offset"));
+                    let zero = off.const_like(0);
+                    let safe = self.hoist(UOp::try_where(g.clone(), off, zero).expect("safe offset"));
                     let v = self.mem_load(&s.buf, &safe, w, None);
                     self.zeroed(&g, v)
                 }
