@@ -491,3 +491,15 @@ fn a_products_operand_is_the_load_that_filled_it(target: Target) {
         assert_eq!(stacked, 0, "no operand is stacked out of the register buffer");
     }
 }
+
+/// A bounded view's fill past `i32` elements clamps and gates in one width,
+/// on the path that copies through shared memory and the one that does not.
+#[test_case(amd(AmdArch::Gfx942, 304); "gfx942")]
+#[test_case(crate::sweep::hopper(); "hopper")]
+fn a_bounded_fill_past_i32_selects_in_one_width(target: Target) {
+    let cfg = crate::ops::config::gemm_cfg([128, 128, 32], 1, [2, 2], false);
+    let spec = GemmSpec { m: 50_001, n: 50_001, k: 50_048, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg };
+    let text = crate::lower::render(gemm::<BF16>(&spec), &cfg.lowering(&super::declared(target))).unwrap();
+    let mixed = |l: &&str| l.contains("select") && l.contains(" i32 ") && l.contains(" i64 ");
+    assert_eq!(text.lines().find(mixed), None);
+}
