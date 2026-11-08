@@ -78,21 +78,22 @@ fn an_integer_minimum_keeps_its_range_exact(a: (i64, i64), b: (i64, i64)) {
 #[test_case(true; "reduced")]
 fn a_lowered_float_minimum_adds_nothing(reduced: bool) {
     let tile = Shape::new(16, 32);
-    let mut k = Kernel::new("min");
-    k.warps(1);
-    let a = k.input::<F32>("a", tile.elems());
-    let b = k.input::<F32>("b", tile.elems());
-    let out_shape = if reduced { Shape::new(tile.rows, 1) } else { tile };
-    let y = k.output::<F32>("y", out_shape.elems());
-    let view = |k: &mut Kernel, p| k.view(p, 0, [tile.cols, 1], tile, [None, None]);
-    let (va, vb) = (view(&mut k, a), view(&mut k, b));
-    let (ra, rb) = (k.load(va), k.load(vb));
-    let m = if reduced { k.reduce(ra, Axis::Row, ReduceOp::Min) } else { k.binary(ra, rb, BinaryOp::Min) };
-    let out = k.view(y, 0, [out_shape.cols, 1], out_shape, [None, None]);
-    k.store(out, m);
+    let prog = Kernel::record("min", |k| {
+        k.warps(1);
+        let a = k.input::<F32>("a", tile.elems());
+        let b = k.input::<F32>("b", tile.elems());
+        let out_shape = if reduced { Shape::new(tile.rows, 1) } else { tile };
+        let y = k.output::<F32>("y", out_shape.elems());
+        let va = k.view(a, 0, [tile.cols, 1], tile, [None, None]);
+        let vb = k.view(b, 0, [tile.cols, 1], tile, [None, None]);
+        let (ra, rb) = (k.load(va), k.load(vb));
+        let m = if reduced { k.reduce(ra, Axis::Row, ReduceOp::Min) } else { k.binary(ra, rb, BinaryOp::Min) };
+        let out = k.view(y, 0, [out_shape.cols, 1], out_shape, [None, None]);
+        k.store(out, m);
+    });
     let device = Device { target: crate::atoms::sm86(), costs: Costs::default() };
     let lowering = Lowering::new(&device);
-    let nodes = linear(k.finish(), &lowering).toposort();
+    let nodes = linear(prog, &lowering).toposort();
     let float = |u: &Arc<UOp>| u.dtype().is_float();
     let sums = nodes
         .iter()
@@ -152,29 +153,29 @@ fn a_transposed_element_past_the_bounds_reads_zero(family: &str) {
 #[test_case(7, 2, false; "a halved index always in range")]
 fn a_guarded_scalar_read_stays_under_its_guard(max: i64, div: i64, guarded: bool) {
     let tile = Shape::new(16, 32);
-    let mut k = Kernel::new("guarded");
-    k.warps(1);
-    let lens = k.input::<I32>("lens", 4);
-    let y = k.output::<F32>("y", 2 * tile.elems());
-    let n = k.var("n", 0, max);
-    let index = if div > 1 { n.clone() / div } else { n.clone() };
-    let len = k.load_scalar(lens, index);
-    let at = |k: &mut Kernel, i: usize| k.view(y, i * tile.elems(), [tile.cols, 1], tile, [None, None]);
-    k.if_(
-        n.lt(4),
-        |k| {
-            let v = k.splat::<F32>(tile, len.clone());
-            let out = at(k, 0);
-            k.store(out, v);
-        },
-        |_| {},
-    );
-    let v = k.splat::<F32>(tile, len);
-    let out = at(&mut k, 1);
-    k.store(out, v);
+    let prog = Kernel::record("guarded", |k| {
+        k.warps(1);
+        let lens = k.input::<I32>("lens", 4);
+        let y = k.output::<F32>("y", 2 * tile.elems());
+        let n = k.var("n", 0, max);
+        let index = if div > 1 { n.clone() / div } else { n.clone() };
+        let len = k.load_scalar(lens, index);
+        k.if_(
+            n.lt(4),
+            |k| {
+                let v = k.splat::<F32>(tile, len.clone());
+                let out = k.view(y, 0, [tile.cols, 1], tile, [None, None]);
+                k.store(out, v);
+            },
+            |_| {},
+        );
+        let v = k.splat::<F32>(tile, len);
+        let out = k.view(y, tile.elems(), [tile.cols, 1], tile, [None, None]);
+        k.store(out, v);
+    });
     let device = Device { target: crate::atoms::sm86(), costs: Costs::default() };
     let lowering = Lowering::new(&device);
-    let linear = linear(k.finish(), &lowering);
+    let linear = linear(prog, &lowering);
     let Op::Linear(ops::Linear { ops: list }) = linear.op() else { panic!("a linear list") };
     let at = |f: &dyn Fn(&Arc<UOp>) -> bool| (0..list.len()).filter(|&i| f(&list[i])).collect::<Vec<_>>();
     let opened = at(&|u| matches!(u.op(), Op::If { .. }));
@@ -203,24 +204,25 @@ fn a_guarded_scalar_read_stays_under_its_guard(max: i64, div: i64, guarded: bool
 #[test_case(9, true, false; "a share's steady trips")]
 fn a_loop_extent_below_zero_runs_no_trip(steps: i64, steady: bool, floored: bool) {
     let tile = Shape::new(16, 32);
-    let mut k = Kernel::new("shares");
-    k.warps(1);
-    let y = k.output::<F32>("y", 4 * tile.elems());
-    k.grid([Sc::from(4), Sc::from(1), Sc::from(1)]);
-    // A share of three steps each: the fourth starts at nine.
-    let count = (Sc::from(steps) - k.block(0) * 3).min(3);
-    let mut count = Sc::Id(k.intern(count));
-    if steady {
-        count = count.clone() - Sc::from(0).lt(count);
-    }
-    let zero = k.zeros::<F32>(tile);
-    let one = k.fill::<F32>(tile, Const::Float(1.0));
-    let [sum] = k.loop_(count, [zero], |k, _, [sum]| [k.binary(sum, one, BinaryOp::Add)]);
-    let at = k.block(0) * tile.elems();
-    let out = k.view(y, at, [tile.cols, 1], tile, [None, None]);
-    k.store(out, sum);
+    let prog = Kernel::record("shares", |k| {
+        k.warps(1);
+        let y = k.output::<F32>("y", 4 * tile.elems());
+        k.grid([Sc::from(4), Sc::from(1), Sc::from(1)]);
+        // A share of three steps each: the fourth starts at nine.
+        let count = (Sc::from(steps) - k.block(0) * 3).min(3);
+        let mut count = Sc::id(k.intern(count));
+        if steady {
+            count = count.clone() - Sc::from(0).lt(count);
+        }
+        let zero = k.zeros::<F32>(tile);
+        let one = k.fill::<F32>(tile, Const::Float(1.0));
+        let [sum] = k.loop_(count, [zero], |k, _, [sum]| [k.binary(sum, one, BinaryOp::Add)]);
+        let at = k.block(0) * tile.elems();
+        let out = k.view(y, at, [tile.cols, 1], tile, [None, None]);
+        k.store(out, sum);
+    });
     let device = Device { target: crate::atoms::sm86(), costs: Costs::default() };
-    let linear = linear(k.finish(), &Lowering::new(&device));
+    let linear = linear(prog, &Lowering::new(&device));
     let Op::Linear(ops::Linear { ops: list }) = linear.op() else { panic!("a linear list") };
     let ends: Vec<&Arc<UOp>> =
         list.iter().filter_map(|u| if let Op::Range(r) = u.op() { Some(&r.end) } else { None }).collect();
@@ -247,19 +249,20 @@ fn a_program_past_the_instruction_bound_is_refused() {
     let (most, shape) = (target.most_instructions(), Shape::new(64, 64));
     assert!(most < crate::atoms::sm86().most_instructions());
     let regs = shape.elems() / (4 * target.wave as usize);
-    let mut k = Kernel::new("huge");
-    k.warps(4);
-    let out = k.output::<F32>("o", shape.elems());
-    let one = k.fill::<F32>(shape, Const::Float(1.0));
-    let mut x = k.zeros::<F32>(shape);
-    // Each add lists its loads, adds and stores: four instructions a register.
-    for _ in 0..most / regs + 1 {
-        x = k.binary(x, one, BinaryOp::Add);
-    }
-    let v = k.view(out, 0, [shape.cols, 1], shape, [None, None]);
-    k.store(v, x);
+    let prog = Kernel::record("huge", |k| {
+        k.warps(4);
+        let out = k.output::<F32>("o", shape.elems());
+        let one = k.fill::<F32>(shape, Const::Float(1.0));
+        let mut x = k.zeros::<F32>(shape);
+        // Each add lists its loads, adds and stores: four instructions a register.
+        for _ in 0..most / regs + 1 {
+            x = k.binary(x, one, BinaryOp::Add);
+        }
+        let v = k.view(out, 0, [shape.cols, 1], shape, [None, None]);
+        k.store(v, x);
+    });
     let lowering = crate::lower::Lowering::new(&super::declared(target));
-    let err = crate::lower::standalone(k.finish(), &lowering).err().expect("refused");
+    let err = crate::lower::standalone(prog, &lowering).err().expect("refused");
     let Error::TooLarge { name, instructions, most: bound } = &err else { panic!("{err}") };
     assert_eq!((name.as_str(), *bound), ("huge", most));
     assert!(*instructions > most && *instructions < 2 * most, "{instructions} of {most}");
@@ -273,18 +276,19 @@ fn a_relayout_through_shared_memory_needs_no_zero_of_the_program() {
     let [from, to] = [Axis::Col, Axis::Row].map(|walk| chunked(tile, 4, 1, lanes, walk).expect("a chunked layout"));
     let costs = super::lane_moves_dear();
     assert_eq!(from.relayout(&to, 1, lanes, &costs, false), Relayout::ViaSmem);
-    let mut k = Kernel::new("relayout");
-    k.warps(1);
-    let x = k.input::<F32>("x", 2 * tile.elems());
-    let y = k.output::<F32>("y", 2 * tile.elems());
-    let src = k.view(x, tile.elems(), [tile.cols, 1], tile, [None, None]);
-    let a = k.load(src);
-    k.pin(a, from);
-    let b = k.unary(a, UnaryOp::Neg);
-    k.pin(b, to);
-    let dst = k.view(y, tile.elems(), [tile.cols, 1], tile, [None, None]);
-    k.store(dst, b);
-    let prog = k.finish();
+    let prog = Kernel::record("relayout", |k| {
+        k.warps(1);
+        let x = k.input::<F32>("x", 2 * tile.elems());
+        let y = k.output::<F32>("y", 2 * tile.elems());
+        let src = k.view(x, tile.elems(), [tile.cols, 1], tile, [None, None]);
+        let a = k.load(src);
+        k.pin(a, from);
+        let b = k.unary(a, UnaryOp::Neg);
+        k.pin(b, to);
+        let dst = k.view(y, tile.elems(), [tile.cols, 1], tile, [None, None]);
+        k.store(dst, b);
+    });
+    let prog = prog;
     assert!(!prog.scalars.contains(&Scalar::Const(0)), "the program interns a zero");
     let device = Device { target: crate::atoms::sm86(), costs };
     let lowering = Lowering::new(&device);
@@ -301,23 +305,24 @@ fn a_relayout_through_shared_memory_needs_no_zero_of_the_program() {
 #[test_case(Shape::new(32, 32), 1, true; "a result laid otherwise")]
 fn a_register_transpose_lowers(tile: Shape, warps: u32, pinned: bool) {
     let lanes = 32;
-    let mut k = Kernel::new("transpose");
-    k.warps(warps);
-    let x = k.input::<F32>("x", tile.elems());
-    let y = k.output::<F32>("y", tile.elems());
-    let src = k.view(x, 0, [tile.cols, 1], tile, [None, None]);
-    let a = k.load(src);
-    let t = k.transpose(a);
-    if pinned {
-        let l = crate::layouts::chunked(tile.transposed(), 4, warps, lanes, Axis::Row).expect("a layout");
-        k.pin(t, l);
-    }
-    let out = tile.transposed();
-    let dst = k.view(y, 0, [out.cols, 1], out, [None, None]);
-    k.store(dst, t);
+    let prog = Kernel::record("transpose", |k| {
+        k.warps(warps);
+        let x = k.input::<F32>("x", tile.elems());
+        let y = k.output::<F32>("y", tile.elems());
+        let src = k.view(x, 0, [tile.cols, 1], tile, [None, None]);
+        let a = k.load(src);
+        let t = k.transpose(a);
+        if pinned {
+            let l = crate::layouts::chunked(tile.transposed(), 4, warps, lanes, Axis::Row).expect("a layout");
+            k.pin(t, l);
+        }
+        let out = tile.transposed();
+        let dst = k.view(y, 0, [out.cols, 1], out, [None, None]);
+        k.store(dst, t);
+    });
     let device = Device { target: crate::atoms::sm86(), costs: super::costs() };
     let lowering = Lowering::new(&device);
-    linear(k.finish(), &lowering);
+    linear(prog, &lowering);
 }
 
 /// The segment mask's last-row start, `seg_start[b·t + min(q_off + bq − 1, t − 1)]`,
@@ -380,14 +385,15 @@ fn the_segment_bounds_are_read_ahead_of_the_key_loop(group: bool) {
 #[test_case(|k, _| k.block(0), Some((0, 4)); "a block index on its grid")]
 #[test_case(|k, _| k.warp() + 1, Some((1, 4)); "a warp index")]
 #[test_case(|k, n| { let p = k.input::<I32>("p", 4); k.load_scalar(p, n) }, None; "a value read")]
-fn a_scalars_bounds_are_its_operations(f: fn(&mut Kernel, Sc) -> Sc, want: Option<(i64, i64)>) {
-    let mut k = Kernel::new("bounds");
-    k.warps(4);
-    k.grid([Sc::from(5), Sc::from(1), Sc::from(1)]);
-    let n = k.var("n", -7, 9);
-    let v = f(&mut k, n);
-    let id = k.intern(v);
-    assert_eq!(k.finish().bounds(id, &|_| None), want);
+fn a_scalars_bounds_are_its_operations(f: for<'k> fn(&mut Kernel<'k>, Sc<'k>) -> Sc<'k>, want: Option<(i64, i64)>) {
+    let (prog, id) = Kernel::record_with("bounds", |k| {
+        k.warps(4);
+        k.grid([Sc::from(5), Sc::from(1), Sc::from(1)]);
+        let n = k.var("n", -7, 9);
+        let v = f(k, n);
+        k.intern(v)
+    });
+    assert_eq!(prog.bounds(id, &|_| None), want);
 }
 
 /// A `cp.async` fill goes in whole 16-byte chunks, the same count per
@@ -399,21 +405,22 @@ fn a_scalars_bounds_are_its_operations(f: fn(&mut Kernel, Sc) -> Sc, want: Optio
 fn a_fill_goes_in_whole_chunks_per_thread(rows: usize, cols: usize, fills: bool) {
     let shape = Shape::new(rows, cols);
     assert_eq!(crate::layouts::fills_in_chunks(shape, 2, 32), fills);
-    let mut k = Kernel::new("fill");
-    k.warps(1);
-    let x = k.input::<F16>("x", shape.elems());
-    let y = k.output::<F16>("y", shape.elems());
-    let s = k.smem::<F16>("s", shape.elems());
-    let src = k.view(x, 0, [cols, 1], shape, [None, None]);
-    let t = k.smem_view::<F16>(s, 0, shape);
-    k.stage(t, src, CopyMode::Async);
-    let held = Shape::new(rows, 16);
-    let v = k.smem_view::<F16>(s, 0, held);
-    let r = k.load(v);
-    let out = k.view(y, 0, [cols, 1], held, [None, None]);
-    k.store(out, r);
+    let prog = Kernel::record("fill", |k| {
+        k.warps(1);
+        let x = k.input::<F16>("x", shape.elems());
+        let y = k.output::<F16>("y", shape.elems());
+        let s = k.smem::<F16>("s", shape.elems());
+        let src = k.view(x, 0, [cols, 1], shape, [None, None]);
+        let t = k.smem_view::<F16>(s, 0, shape);
+        k.stage(t, src, CopyMode::Async);
+        let held = Shape::new(rows, 16);
+        let v = k.smem_view::<F16>(s, 0, held);
+        let r = k.load(v);
+        let out = k.view(y, 0, [cols, 1], held, [None, None]);
+        k.store(out, r);
+    });
     let lowering = Lowering::new(&super::declared(crate::atoms::sm86()));
-    match crate::lower::standalone(k.finish(), &lowering) {
+    match crate::lower::standalone(prog, &lowering) {
         Ok(_) => assert!(fills, "a {rows}×{cols} fill lowered"),
         Err(crate::lower::Error::Unsupported { what }) => {
             assert!(!fills, "{what}");
@@ -516,32 +523,34 @@ fn every_path_past_i32_keeps_one_width() {
 #[test_case(crate::sweep::targets().remove(0).1; "sm_86")]
 #[test_case(crate::sweep::hopper(); "hopper")]
 fn a_bounded_load_past_i32_keeps_one_width(target: Target) {
-    let mut k = crate::build::Kernel::new("past");
-    let wide = (i32::MAX as usize + 1) * 2;
-    let src = k.input::<I32>("src", wide);
-    let out = k.output::<I32>("out", wide);
-    k.grid([Sc::from(1), Sc::from(1), Sc::from(1)]);
-    k.warps(4);
-    let tile = Shape::new(32, 32);
-    let from = k.view(src, 0, [32, 1], tile, [None, Some(Sc::from(20))]);
-    let loaded = k.load_as_fill(from);
-    let to = k.view(out, 0, [32, 1], tile, [None, None]);
-    k.store(to, loaded);
-    crate::lower::render(k.finish(), &Lowering::new(&super::declared(target))).unwrap();
+    let prog = Kernel::record("past", |k| {
+        let wide = (i32::MAX as usize + 1) * 2;
+        let src = k.input::<I32>("src", wide);
+        let out = k.output::<I32>("out", wide);
+        k.grid([Sc::from(1), Sc::from(1), Sc::from(1)]);
+        k.warps(4);
+        let tile = Shape::new(32, 32);
+        let from = k.view(src, 0, [32, 1], tile, [None, Some(Sc::from(20))]);
+        let loaded = k.load_as_fill(from);
+        let to = k.view(out, 0, [32, 1], tile, [None, None]);
+        k.store(to, loaded);
+    });
+    crate::lower::render(prog, &Lowering::new(&super::declared(target))).unwrap();
 }
 
 /// A count past `i32` is refused rather than cut to its low 32 bits.
 #[test]
 fn a_grid_past_i32_is_refused() {
-    let mut k = crate::build::Kernel::new("past");
-    let out = k.output::<I32>("out", 1);
-    k.grid([Sc::from(1usize << 31), Sc::from(1), Sc::from(1)]);
-    k.warps(4);
-    let v = k.view(out, 0, [1, 1], Shape::new(1, 1), [None, None]);
-    let zero = k.fill::<I32>(Shape::new(1, 1), Const::Int(0));
-    k.store(v, zero);
+    let prog = Kernel::record("past", |k| {
+        let out = k.output::<I32>("out", 1);
+        k.grid([Sc::from(1usize << 31), Sc::from(1), Sc::from(1)]);
+        k.warps(4);
+        let v = k.view(out, 0, [1, 1], Shape::new(1, 1), [None, None]);
+        let zero = k.fill::<I32>(Shape::new(1, 1), Const::Int(0));
+        k.store(v, zero);
+    });
     let target = amd(AmdArch::Gfx942, 304);
-    let e = crate::lower::render(k.finish(), &Lowering::new(&super::declared(target))).unwrap_err();
+    let e = crate::lower::render(prog, &Lowering::new(&super::declared(target))).unwrap_err();
     assert!(e.to_string().contains("past the i32"), "{e}");
 }
 

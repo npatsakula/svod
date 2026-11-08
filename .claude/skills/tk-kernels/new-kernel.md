@@ -12,28 +12,31 @@ shape; the excerpts below are verbatim (trimmed) at 2e9d5edb.
   `Lowering::new(&device)`, or the config's `lowering` where it picks the core (`GemmCfg`, `FaCfg`: `Core::Group` →
   the warpgroup atom). A mainloop kernel reuses `gemm::mainloop` with `GemmCfg::ring()`.
 - `XSpec`: shapes, `batch: Batch`, options, `cfg: XCfg`. Size every param at `batch.capacity()`.
-- `pub fn x<T: Elem>(spec: &XSpec) -> Program`. The `Kernel::new` name is what profiles, `assert_kernel`, the IR dump
-  files and `.kd` descriptors show. Param order is the launch order (inputs, then outputs).
+- `pub fn x<T: Elem>(spec: &XSpec) -> Program` is `Kernel::record(name, |k| x_body::<T>(k, spec))` with
+  `fn x_body<'k, T: Elem>(k: &mut Kernel<'k>, spec: &XSpec)`: every handle carries the kernel's brand `'k`, so a
+  helper that takes or returns one names it (`fn at<'k, T: Elem, A: Access>(k: &mut Kernel<'k>, p: ParamRef<'k, T, A>,
+  …) -> Gmem<'k, T, A>`); a closure cannot (`|k: &mut Kernel<'_>|` is higher-ranked and rejects captured handles). The
+  name is what profiles, `assert_kernel`, the IR dump files and `.kd` descriptors show. Param order is the launch
+  order (inputs, then outputs).
 - Ragged edges are view bounds (`bound(len, tile)` from `kernels/mod.rs`); only a reduction dim must divide its step.
 
 ```rust
 // kernels/rows.rs: bounds instead of padding, math in f32, one rounding at the store
 let x = k.input::<T>("x", elems);
-let (gz, bb) = batch.axis(&mut k);                     // Batch::Static(n) | a variable → grid z
+let (gz, bb) = batch.axis(k);                          // Batch::Static(n) | a variable → grid z
 k.grid([Sc::from(rows.div_ceil(br)), Sc::from(1), gz]);
 k.warps(br as u32);
 let row0 = k.block(0) * br;
-let at = |k: &mut Kernel, p: ParamRef<T>| {
-    let v = k.view(p, batch_offset(&bb, rows * d), [d, 1], Shape::new(br, d), [bound(rows, br), None]);
+fn at<'k, T: Elem, A: Access>(k: &mut Kernel<'k>, p: ParamRef<'k, T, A>, bb: &Option<Sc<'k>>, [rows, br, d]: [usize; 3], row0: &Sc<'k>) -> Gmem<'k, T, A> {
+    let v = k.view(p, batch_offset(bb, rows * d), [d, 1], Shape::new(br, d), [bound(rows, br), None]);
     k.at(v, row0.clone(), 0)                            // rows past `rows` read 0, their stores drop
-};
-let xv = at(&mut k, x);
-let mut xs = load_f32(&mut k, xv);
+}
+let xv = at(k, x, &bb, [rows, br, d], &row0);
+let mut xs = load_f32(k, xv);
 // … reduce(.., Axis::Row, ReduceOp::Sum), unary(.., UnaryOp::Rsqrt), binary(..) …
 let y = k.cast::<F32, T>(y);
-let ov = at(&mut k, out);
+let ov = at(k, out, &bb, [rows, br, d], &row0);
 k.store(ov, y);
-k.finish()
 ```
 
 ## 2. The gate (`ops/shape.rs`)

@@ -47,7 +47,7 @@ pub struct Rope {
 }
 
 /// A [`Rope`] with its cos and sin tables.
-type Turn<T> = (Rope, ParamRef<T, In>, ParamRef<T, In>);
+type Turn<'k, T> = (Rope, ParamRef<'k, T, In>, ParamRef<'k, T, In>);
 
 /// The tune store keys by this text: an epilogue without a scale prints as
 /// it did before the field existed, so its stored choices still apply.
@@ -171,10 +171,10 @@ pub struct GemmSpec {
 pub fn gemm<T: MmaIn>(spec: &GemmSpec) -> Program {
     let GemmSpec { m, k: kk, cfg, .. } = *spec;
     let [bm, _, bk] = cfg.tile;
-    mainloop_gemm::<T, _>("gemm", spec, m * kk, 1, |k, a, bb, row0| {
+    mainloop_gemm::<T>("gemm", spec, m * kk, 1, |k, a, bb, row0| {
         let a_view = k.view(a, batch_offset(bb, m * kk), [kk, 1], Shape::new(bm, bk), [bound(m, bm), None]);
         let a_view = k.at(a_view, row0, 0);
-        move |k: &mut Kernel, _step: Sc, koff: Sc| k.at(a_view, 0, koff)
+        Box::new(move |k, _step, koff| k.at(a_view, 0, koff))
     })
 }
 
@@ -186,30 +186,34 @@ pub fn gemm<T: MmaIn>(spec: &GemmSpec) -> Program {
 /// With `split > 1` (a single static batch) grid z splits the reduction:
 /// split `z` walks steps `z·trips/split..`, and the kernel writes its raw f32
 /// accumulator to `c [split, m, n]` for [`split_merge`] to finish.
-pub(crate) fn mainloop_gemm<T: MmaIn, S: Fn(&mut Kernel, Sc, Sc) -> Gmem<T>>(
+pub(crate) fn mainloop_gemm<T: MmaIn>(
     name: &str,
     spec: &GemmSpec,
     a_elems: usize,
     split: usize,
-    a: impl FnOnce(&mut Kernel, ParamRef<T, In>, &Option<Sc>, Sc) -> S,
+    a: impl for<'k> FnOnce(&mut Kernel<'k>, ParamRef<'k, T, In>, &Option<Sc<'k>>, Sc<'k>) -> ASource<'k, T>,
 ) -> Program {
     assert!(T::DTYPE.bytes() == 2 || spec.epilogue.out_f32 || split > 1, "an 8-bit product stores f32");
     if split > 1 {
-        build::<T, F32, S>(name, spec, a_elems, split, a)
+        Kernel::record(name, |k| build::<T, F32>(k, spec, a_elems, split, a))
     } else if spec.epilogue.out_f32 {
-        build::<T, F32, S>(name, spec, a_elems, 1, a)
+        Kernel::record(name, |k| build::<T, F32>(k, spec, a_elems, 1, a))
     } else {
-        build::<T, T, S>(name, spec, a_elems, 1, a)
+        Kernel::record(name, |k| build::<T, T>(k, spec, a_elems, 1, a))
     }
 }
 
-fn build<T: MmaIn, U: Elem, S: Fn(&mut Kernel, Sc, Sc) -> Gmem<T>>(
-    name: &str,
+/// The source of the `[bm, bk]` A tile of a step: given the kernel, the step
+/// and its column offset.
+pub(crate) type ASource<'k, T> = Box<dyn Fn(&mut Kernel<'k>, Sc<'k>, Sc<'k>) -> Gmem<'k, T> + 'k>;
+
+fn build<'k, T: MmaIn, U: Elem>(
+    k: &mut Kernel<'k>,
     spec: &GemmSpec,
     a_elems: usize,
     split: usize,
-    a_source: impl FnOnce(&mut Kernel, ParamRef<T, In>, &Option<Sc>, Sc) -> S,
-) -> Program {
+    a_source: impl FnOnce(&mut Kernel<'k>, ParamRef<'k, T, In>, &Option<Sc<'k>>, Sc<'k>) -> ASource<'k, T>,
+) {
     let GemmSpec { m, n, k: kk, ref batch, epilogue, cfg } = *spec;
     let [bm, bn, bk] = cfg.tile;
     assert!(kk.is_multiple_of(bk), "k is a multiple of bk");
@@ -220,7 +224,6 @@ fn build<T: MmaIn, U: Elem, S: Fn(&mut Kernel, Sc, Sc) -> Gmem<T>>(
     let epi = if partial { Epilogue::DEFAULT } else { epilogue };
     let halves = if epi.gated { 2 } else { 1 };
     let cap = batch.capacity();
-    let mut k = Kernel::new(name);
     let a = k.input::<T>("a", cap * a_elems);
     let b = k.input::<T>("b", halves * n * kk);
     let bias = epi.bias.then(|| k.input::<T>("bias", halves * n));
@@ -234,15 +237,15 @@ fn build<T: MmaIn, U: Elem, S: Fn(&mut Kernel, Sc, Sc) -> Gmem<T>>(
     });
     let c = k.output::<U>("c", cap.max(split) * m * n);
     let (gm, gn) = (m.div_ceil(bm), n.div_ceil(bn));
-    let (gz, bb) = if partial { (Sc::from(split), Some(k.block(2))) } else { batch.axis(&mut k) };
+    let (gz, bb) = if partial { (Sc::from(split), Some(k.block(2))) } else { batch.axis(k) };
     k.grid([Sc::from(gm), Sc::from(gn), gz]);
     k.warps(WarpGrid { rows: cfg.warps[0], cols: cfg.warps[1] });
 
-    let (bx, by) = tile_order(&mut k, gm, gn);
+    let (bx, by) = tile_order(k, gm, gn);
     let (row0, col0) = (bx * bm, by * bn);
     let n_bound = bound(n, bn);
-    let a_tile = a_source(&mut k, a, if partial { &None } else { &bb }, row0.clone());
-    let b_view = |k: &mut Kernel, half: usize| {
+    let a_tile = a_source(k, a, if partial { &None } else { &bb }, row0.clone());
+    let b_view = |k: &mut Kernel<'k>, half: usize| {
         let v = k.view(b, half * n * kk, [kk, 1], Shape::new(bn, bk), [n_bound.clone(), None]);
         k.at(v, col0.clone(), 0)
     };
@@ -250,40 +253,39 @@ fn build<T: MmaIn, U: Elem, S: Fn(&mut Kernel, Sc, Sc) -> Gmem<T>>(
     let first_step = partial.then(|| bb.clone().expect("the split index") * (trips / split));
     let sa = Shape::new(bm, bk);
     let accs = if epi.gated {
-        let halves = [b_view(&mut k, 0), b_view(&mut k, 1)];
-        mainloop(&mut k, sa, &a_tile, halves, trips / split, schedule, bk, first_step, cfg.slices()).to_vec()
+        let halves = [b_view(k, 0), b_view(k, 1)];
+        mainloop(k, sa, &a_tile, halves, trips / split, schedule, bk, first_step, cfg.slices()).to_vec()
     } else {
-        let whole = [b_view(&mut k, 0)];
-        mainloop(&mut k, sa, &a_tile, whole, trips / split, schedule, bk, first_step, cfg.slices()).to_vec()
+        let whole = [b_view(k, 0)];
+        mainloop(k, sa, &a_tile, whole, trips / split, schedule, bk, first_step, cfg.slices()).to_vec()
     };
-    let accs = accs.into_iter().map(|acc| T::widened(&mut k, acc)).collect();
+    let accs = accs.into_iter().map(|acc| T::widened(k, acc)).collect();
     let tile = Tile2 { m, n, bm, bn, row0, col0 };
-    finish::<T, U>(&mut k, accs, epi, bias, residual, rope, c, &bb, &tile);
-    k.finish()
+    finish::<T, U>(k, accs, epi, bias, residual, rope, c, &bb, &tile);
 }
 
 /// Where a block's `[bm, bn]` output tile sits in an `[m, n]` output.
-struct Tile2 {
+struct Tile2<'k> {
     m: usize,
     n: usize,
     bm: usize,
     bn: usize,
-    row0: Sc,
-    col0: Sc,
+    row0: Sc<'k>,
+    col0: Sc<'k>,
 }
 
 /// The epilogue on the f32 accumulators (two when gated) and the store.
 #[allow(clippy::too_many_arguments)]
-fn finish<T: Elem, U: Elem>(
-    k: &mut Kernel,
-    accs: Vec<Regs<F32>>,
+fn finish<'k, T: Elem, U: Elem>(
+    k: &mut Kernel<'k>,
+    accs: Vec<Regs<'k, F32>>,
     epi: Epilogue,
-    bias: Option<ParamRef<T, In>>,
-    residual: Option<ParamRef<U, In>>,
-    rope: Option<Turn<T>>,
-    c: ParamRef<U, Out>,
-    bb: &Option<Sc>,
-    t: &Tile2,
+    bias: Option<ParamRef<'k, T, In>>,
+    residual: Option<ParamRef<'k, U, In>>,
+    rope: Option<Turn<'k, T>>,
+    c: ParamRef<'k, U, Out>,
+    bb: &Option<Sc<'k>>,
+    t: &Tile2<'k>,
 ) {
     let Tile2 { n, bn, ref col0, .. } = *t;
     let n_bound = bound(n, bn);
@@ -320,7 +322,12 @@ fn finish<T: Elem, U: Elem>(
 }
 
 /// The block's `[bm, bn]` window of an `[m, n]` parameter.
-fn tile<U: Elem, A: Access>(k: &mut Kernel, p: ParamRef<U, A>, bb: &Option<Sc>, t: &Tile2) -> Gmem<U, A> {
+fn tile<'k, U: Elem, A: Access>(
+    k: &mut Kernel<'k>,
+    p: ParamRef<'k, U, A>,
+    bb: &Option<Sc<'k>>,
+    t: &Tile2<'k>,
+) -> Gmem<'k, U, A> {
     let Tile2 { m, n, bm, bn, ref row0, ref col0 } = *t;
     let v = k.view(p, batch_offset(bb, m * n), [n, 1], Shape::new(bm, bn), [bound(m, bm), bound(n, bn)]);
     k.at(v, row0.clone(), col0.clone())
@@ -330,21 +337,21 @@ fn tile<U: Elem, A: Access>(k: &mut Kernel, p: ParamRef<U, A>, bb: &Option<Sc>, 
 /// columns: `x·cos + x'·sin`, `x'` the element half a head along
 /// ([`Kernel::flip`]) and `sin` negated over a head's first half.
 /// A tile across the last rotated head keeps `x` past it.
-fn turn<T: Elem>(
-    k: &mut Kernel,
-    x: Regs<F32>,
+fn turn<'k, T: Elem>(
+    k: &mut Kernel<'k>,
+    x: Regs<'k, F32>,
     rope: Rope,
-    cos: ParamRef<T, In>,
-    sin: ParamRef<T, In>,
-    t: &Tile2,
-) -> Regs<F32> {
+    cos: ParamRef<'k, T, In>,
+    sin: ParamRef<'k, T, In>,
+    t: &Tile2<'k>,
+) -> Regs<'k, F32> {
     let Tile2 { bm, bn, ref row0, ref col0, .. } = *t;
     let (half, turned) = (rope.head_dim / 2, rope.heads * rope.head_dim);
     let [y] = k.select_if(
         col0.clone().lt(turned),
         |k| {
             // Every head of row `r` reads the table row of its position.
-            let table = |k: &mut Kernel, p: ParamRef<T, In>| {
+            let table = |k: &mut Kernel<'k>, p: ParamRef<'k, T, In>| {
                 let at = (row0.clone() + k.row()) % rope.seq * half;
                 let v = k.gather(p, 0, at, None, Shape::new(bm, bn), None);
                 let v = k.periodic(v, half);
@@ -353,7 +360,7 @@ fn turn<T: Elem>(
             let (c, s) = (table(k, cos), table(k, sin));
             let cols = Shape::new(1, bn);
             let col = k.coord(cols, Axis::Col);
-            let int = |k: &mut Kernel, v: Sc| k.splat::<I32>(cols, v);
+            let int = |k: &mut Kernel<'k>, v: Sc<'k>| k.splat::<I32>(cols, v);
             // A column of a head's first half: `c / half` is twice `c / head_dim`.
             let (halves, heads, two) = (int(k, Sc::from(half)), int(k, Sc::from(rope.head_dim)), int(k, Sc::from(2)));
             let in_half = k.binary(col, halves, BinaryOp::Div);
@@ -399,9 +406,12 @@ pub fn split_merge<T: Elem>(spec: &SplitMergeSpec) -> Program {
 }
 
 fn merge<T: Elem, U: Elem>(spec: &SplitMergeSpec) -> Program {
+    Kernel::record("split_merge", |k| merge_body::<T, U>(k, spec))
+}
+
+fn merge_body<'k, T: Elem, U: Elem>(k: &mut Kernel<'k>, spec: &SplitMergeSpec) {
     let SplitMergeSpec { m, n, split, epilogue: epi, tile: [bm, bn] } = *spec;
     assert!(!epi.gated && epi.rope.is_none(), "a gated or turned output is not split");
-    let mut k = Kernel::new("split_merge");
     let partial = k.input::<F32>("partial", split * m * n);
     let bias = epi.bias.then(|| k.input::<T>("bias", n));
     let residual = epi.residual.then(|| k.input::<U>("residual", m * n));
@@ -417,12 +427,11 @@ fn merge<T: Elem, U: Elem>(spec: &SplitMergeSpec) -> Program {
         [k.binary(acc, part, BinaryOp::Add)]
     });
     let tile = Tile2 { m, n, bm, bn, row0, col0 };
-    finish::<T, U>(&mut k, vec![sum], epi, bias, residual, None, c, &None, &tile);
-    k.finish()
+    finish::<T, U>(k, vec![sum], epi, bias, residual, None, c, &None, &tile);
 }
 
 /// The `(row, col)` tile of this block, walking groups of [`GROUP_ROWS`] tile rows.
-pub(super) fn tile_order(k: &mut Kernel, gm: impl Into<Sc>, gn: usize) -> (Sc, Sc) {
+pub(super) fn tile_order<'k>(k: &mut Kernel<'k>, gm: impl Into<Sc<'k>>, gn: usize) -> (Sc<'k>, Sc<'k>) {
     let gm = gm.into();
     let id = k.block(0) + k.block(1) * gm.clone();
     let first_m = id.clone() / (GROUP_ROWS * gn) * GROUP_ROWS;
@@ -436,17 +445,17 @@ pub(super) fn tile_order(k: &mut Kernel, gm: impl Into<Sc>, gn: usize) -> (Sc, S
 /// slot held as `slices` k-slices ([`GemmCfg::slices`]), one accumulator
 /// per B ([`MmaIn::Acc`]).
 #[allow(clippy::too_many_arguments)]
-pub(super) fn mainloop<T: MmaIn, const N: usize>(
-    k: &mut Kernel,
+pub(super) fn mainloop<'k, T: MmaIn, const N: usize>(
+    k: &mut Kernel<'k>,
     sa: Shape,
-    a: &impl Fn(&mut Kernel, Sc, Sc) -> Gmem<T>,
-    bs: [Gmem<T>; N],
+    a: &impl Fn(&mut Kernel<'k>, Sc<'k>, Sc<'k>) -> Gmem<'k, T>,
+    bs: [Gmem<'k, T>; N],
     trips: usize,
     schedule: Schedule,
     bk: usize,
-    first_step: Option<Sc>,
+    first_step: Option<Sc<'k>>,
     slices: usize,
-) -> [Regs<T::Acc>; N] {
+) -> [Regs<'k, T::Acc>; N] {
     let sb = k.shape(bs[0]);
     let (sa_s, sb_s) = (Shape::new(sa.rows, bk / slices), Shape::new(sb.rows, bk / slices));
     let stages = schedule.stages();

@@ -47,7 +47,7 @@ impl Batch {
     }
 
     /// The grid z extent and the batch index, `None` for a single static batch.
-    fn axis(&self, k: &mut Kernel) -> (Sc, Option<Sc>) {
+    fn axis<'k>(&self, k: &mut Kernel<'k>) -> (Sc<'k>, Option<Sc<'k>>) {
         match self {
             Batch::Static(1) => (Sc::from(1), None),
             Batch::Static(n) => (Sc::from(*n), Some(k.block(2))),
@@ -57,12 +57,12 @@ impl Batch {
 }
 
 /// `batch · stride`, the element offset of the current batch.
-fn batch_offset(batch: &Option<Sc>, stride: usize) -> Sc {
+fn batch_offset<'k>(batch: &Option<Sc<'k>>, stride: usize) -> Sc<'k> {
     batch.clone().map_or(Sc::from(0), |b| b * stride)
 }
 
 /// A row/column bound only where the tile grid overhangs `len`.
-fn bound(len: usize, tile: usize) -> Option<Sc> {
+fn bound<'k>(len: usize, tile: usize) -> Option<Sc<'k>> {
     (!len.is_multiple_of(tile)).then(|| Sc::from(len))
 }
 
@@ -77,7 +77,7 @@ pub enum Act {
 }
 
 impl Act {
-    fn apply(self, k: &mut Kernel, x: Regs<F32>) -> Regs<F32> {
+    fn apply<'k>(self, k: &mut Kernel<'k>, x: Regs<'k, F32>) -> Regs<'k, F32> {
         match self {
             Act::None => x,
             Act::Gelu => gelu(k, x),
@@ -86,12 +86,12 @@ impl Act {
     }
 }
 
-fn konst(k: &mut Kernel, like: Regs<F32>, v: f64) -> Regs<F32> {
+fn konst<'k>(k: &mut Kernel<'k>, like: Regs<'k, F32>, v: f64) -> Regs<'k, F32> {
     let shape = k.shape(like);
     k.fill(shape, Const::Float(v))
 }
 
-fn affine(k: &mut Kernel, x: Regs<F32>, mul: f64, add: f64) -> Regs<F32> {
+fn affine<'k>(k: &mut Kernel<'k>, x: Regs<'k, F32>, mul: f64, add: f64) -> Regs<'k, F32> {
     let m = konst(k, x, mul);
     let x = k.binary(x, m, BinaryOp::Mul);
     let a = konst(k, x, add);
@@ -99,7 +99,7 @@ fn affine(k: &mut Kernel, x: Regs<F32>, mul: f64, add: f64) -> Regs<F32> {
 }
 
 /// `x / (1 + 2^(-x·log2 e))`.
-fn silu(k: &mut Kernel, x: Regs<F32>) -> Regs<F32> {
+fn silu<'k>(k: &mut Kernel<'k>, x: Regs<'k, F32>) -> Regs<'k, F32> {
     let e = affine(k, x, -LOG2_E, 0.0);
     let e = k.unary(e, UnaryOp::Exp2);
     let one = konst(k, x, 1.0);
@@ -108,7 +108,7 @@ fn silu(k: &mut Kernel, x: Regs<F32>) -> Regs<F32> {
 }
 
 /// `0.5·(x + |x|·erf(|x|/√2))`, the sign of erf folded into `|x|`.
-fn gelu(k: &mut Kernel, x: Regs<F32>) -> Regs<F32> {
+fn gelu<'k>(k: &mut Kernel<'k>, x: Regs<'k, F32>) -> Regs<'k, F32> {
     const P: f64 = 0.327_591_1;
     const A: [f64; 5] = [0.254_829_592, -0.284_496_736, 1.421_413_741, -1.453_152_027, 1.061_405_429];
     let ax = k.unary(x, UnaryOp::Abs);
@@ -132,7 +132,7 @@ fn gelu(k: &mut Kernel, x: Regs<F32>) -> Regs<F32> {
 }
 
 /// A 16-bit tile loaded and widened to f32.
-fn load_f32<T: Elem, P: Readable>(k: &mut Kernel, view: Tile<P, T>) -> Regs<F32> {
+fn load_f32<'k, T: Elem, P: Readable>(k: &mut Kernel<'k>, view: Tile<'k, P, T>) -> Regs<'k, F32> {
     let v = k.load(view);
     k.cast::<T, F32>(v)
 }

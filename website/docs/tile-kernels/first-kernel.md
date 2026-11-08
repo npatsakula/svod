@@ -4,12 +4,14 @@ sidebar_label: Your First Kernel
 
 # Your First Kernel
 
-A tk kernel is a Rust function that records a tile program with the `Kernel` builder. Every
-call appends one statement to the open block and returns a typed handle. A handle carries its
-tier (`Gmem<T>`, `Shared<T>`, `Regs<T>`) and element type (`BF16`, `F16`, `F32`, `I32`,
-`Bool`); a shared allocation is a `SmemRef<T>`. Shapes are checked when the statement is
-recorded. Scalars such as block indices, offsets and trip counts are `Sc` expressions built
-with ordinary operators.
+A tk kernel is a Rust function that records a tile program with the `Kernel` builder:
+`Kernel::record(name, |k| …)` opens the kernel and returns its `Program`. Every call appends
+one statement to the open block and returns a typed handle. A handle carries its tier
+(`Gmem<T>`, `Shared<T>`, `Regs<T>`), element type (`BF16`, `F16`, `F32`, `I32`, `Bool`) and
+its kernel's brand, a lifetime no other kernel has, so a handle used in another kernel or a
+pipeline slot kept past its stage is a compile error; a shared allocation is a `SmemRef<T>`.
+Shapes are checked when the statement is recorded. Scalars such as block indices, offsets and
+trip counts are `Sc` expressions built with ordinary operators, branded too.
 
 ## A minimal kernel
 
@@ -24,24 +26,22 @@ use svod_tk::ir::*;
 
 fn axpb(rows: usize) -> Program {
     let cols = 64;
-    let mut k = Kernel::new("axpb");
-    let x = k.input::<F32>("x", rows * cols);
-    let y = k.output::<F32>("y", rows * cols);
-    k.grid([Sc::from(rows.div_ceil(16)), Sc::from(1), Sc::from(1)]);
-    k.warps(4);
-    let row0 = k.block(0) * 16;
-    let tile = |k: &mut Kernel, p: ParamRef<F32>| {
-        let v = k.view(p, 0, [cols, 1], Shape::new(16, cols), [Some(Sc::from(rows)), None]);
-        k.at(v, row0.clone(), 0)
-    };
-    let xv = tile(&mut k, x);
-    let v = k.load(xv);
-    let two = k.fill::<F32>(Shape::new(16, cols), Const::Float(2.0));
-    let one = k.fill::<F32>(Shape::new(16, cols), Const::Float(1.0));
-    let v = k.mul_add(v, two, one);
-    let yv = tile(&mut k, y);
-    k.store(yv, v);
-    k.finish()
+    Kernel::record("axpb", |k| {
+        let x = k.input::<F32>("x", rows * cols);
+        let y = k.output::<F32>("y", rows * cols);
+        k.grid([Sc::from(rows.div_ceil(16)), Sc::from(1), Sc::from(1)]);
+        k.warps(4);
+        let (row0, shape) = (k.block(0) * 16, Shape::new(16, cols));
+        let xv = k.view(x, 0, [cols, 1], shape, [Some(Sc::from(rows)), None]);
+        let xv = k.at(xv, row0.clone(), 0);
+        let v = k.load(xv);
+        let two = k.fill::<F32>(shape, Const::Float(2.0));
+        let one = k.fill::<F32>(shape, Const::Float(1.0));
+        let v = k.mul_add(v, two, one);
+        let yv = k.view(y, 0, [cols, 1], shape, [Some(Sc::from(rows)), None]);
+        let yv = k.at(yv, row0, 0);
+        k.store(yv, v);
+    })
 }
 
 // On the host, no GPU: one Vec<f64> per parameter in, every parameter out.
@@ -62,46 +62,46 @@ f32 output), grouped tile order, split reductions, the warpgroup core and two-cr
 ```rust
 fn gemm_nt(m: usize, n: usize, kk: usize, [bm, bn, bk]: [usize; 3], stages: usize) -> Program {
     assert!(kk.is_multiple_of(bk), "k is a multiple of bk");
-    let mut k = Kernel::new("gemm_nt");
-    let a = k.input::<BF16>("a", m * kk);
-    let b = k.input::<BF16>("b", n * kk);
-    let c = k.output::<BF16>("c", m * n);
-    k.grid([Sc::from(m.div_ceil(bm)), Sc::from(n.div_ceil(bn)), Sc::from(1)]);
-    k.warps(4);
-    let (row0, col0) = (k.block(0) * bm, k.block(1) * bn);
-    let bound = |len: usize, tile: usize| (!len.is_multiple_of(tile)).then(|| Sc::from(len));
-    let a_view = k.view(a, 0, [kk, 1], Shape::new(bm, bk), [bound(m, bm), None]);
-    let a_view = k.at(a_view, row0.clone(), 0);
-    let b_view = k.view(b, 0, [kk, 1], Shape::new(bn, bk), [bound(n, bn), None]);
-    let b_view = k.at(b_view, col0.clone(), 0);
-    let (sa, sb) = (Shape::new(bm, bk), Shape::new(bn, bk));
-    let a_s = k.ring::<BF16>("a_s", sa.elems(), stages);
-    let b_s = k.ring::<BF16>("b_s", sb.elems(), stages);
-    let acc = k.zeros::<F32>(Shape::new(bm, bn));
-    let [acc] = k.pipeline(
-        kk / bk,
-        stages,
-        [acc],
-        |k, step, slot| {
-            let koff = step * bk;
-            let a_g = k.at(a_view, 0, koff.clone());
-            let a_t = k.slot(a_s, &slot, sa);
-            k.stage(a_t, a_g, CopyMode::Async);
-            let b_g = k.at(b_view, 0, koff);
-            let b_t = k.slot(b_s, &slot, sb);
-            k.stage(b_t, b_g, CopyMode::Async);
-        },
-        |k, _step, slot, [acc]| {
-            let a_t = k.slot(a_s, &slot, sa);
-            let b_t = k.slot(b_s, &slot, sb);
-            [k.mma(acc, a_t, false, b_t, true)]
-        },
-    );
-    let out = k.cast::<F32, BF16>(acc);
-    let c_view = k.view(c, 0, [n, 1], Shape::new(bm, bn), [bound(m, bm), bound(n, bn)]);
-    let c_view = k.at(c_view, row0, col0);
-    k.store(c_view, out);
-    k.finish()
+    Kernel::record("gemm_nt", |k| {
+        let a = k.input::<BF16>("a", m * kk);
+        let b = k.input::<BF16>("b", n * kk);
+        let c = k.output::<BF16>("c", m * n);
+        k.grid([Sc::from(m.div_ceil(bm)), Sc::from(n.div_ceil(bn)), Sc::from(1)]);
+        k.warps(4);
+        let (row0, col0) = (k.block(0) * bm, k.block(1) * bn);
+        let bound = |len: usize, tile: usize| (!len.is_multiple_of(tile)).then(|| Sc::from(len));
+        let a_view = k.view(a, 0, [kk, 1], Shape::new(bm, bk), [bound(m, bm), None]);
+        let a_view = k.at(a_view, row0.clone(), 0);
+        let b_view = k.view(b, 0, [kk, 1], Shape::new(bn, bk), [bound(n, bn), None]);
+        let b_view = k.at(b_view, col0.clone(), 0);
+        let (sa, sb) = (Shape::new(bm, bk), Shape::new(bn, bk));
+        let a_s = k.ring::<BF16>("a_s", sa.elems(), stages);
+        let b_s = k.ring::<BF16>("b_s", sb.elems(), stages);
+        let acc = k.zeros::<F32>(Shape::new(bm, bn));
+        let [acc] = k.pipeline(
+            kk / bk,
+            stages,
+            [acc],
+            |k, step, slot| {
+                let koff = step * bk;
+                let a_g = k.at(a_view, 0, koff.clone());
+                let a_t = k.slot(a_s, &slot, sa);
+                k.stage(a_t, a_g, CopyMode::Async);
+                let b_g = k.at(b_view, 0, koff);
+                let b_t = k.slot(b_s, &slot, sb);
+                k.stage(b_t, b_g, CopyMode::Async);
+            },
+            |k, _step, slot, [acc]| {
+                let a_t = k.slot(a_s, &slot, sa);
+                let b_t = k.slot(b_s, &slot, sb);
+                [k.mma(acc, a_t, false, b_t, true)]
+            },
+        );
+        let out = k.cast::<F32, BF16>(acc);
+        let c_view = k.view(c, 0, [n, 1], Shape::new(bm, bn), [bound(m, bm), bound(n, bn)]);
+        let c_view = k.at(c_view, row0, col0);
+        k.store(c_view, out);
+    })
 }
 ```
 

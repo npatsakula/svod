@@ -582,33 +582,33 @@ impl<'a> Probes<'a> {
         let (op, tile, iters) = ("probe:smem_byte", Shape::new(32, 128), 1024);
         let units = (self.blocks * iters * tile.elems() * 4) as f64;
         self.make(op, ScalarDType::Float32, units, true, self.lowering(), |on| {
-            let mut k = kernel(op, self.blocks, WARPS);
-            let x = input::<F32>(&mut k, tile);
-            let ring = on.then(|| {
-                let ring = k.smem::<F32>("ring", 2 * tile.elems());
-                for slot in 0..2 {
-                    let s = k.smem_slot::<F32>(ring, slot, tile);
-                    k.store(s, x);
-                }
-                (ring, k.input::<I32>("order", iters))
-            });
-            let zero = k.zeros::<F32>(tile);
-            if on {
-                k.barrier();
-            }
-            let [sum] = k.loop_(iters, [zero], |k, i, [sum]| {
-                let y = match ring {
-                    Some((ring, order)) => {
-                        let slot = k.load_scalar(order, i) % 2;
+            probe_kernel(op, self.blocks, WARPS, |k| {
+                let x = input::<F32>(k, tile);
+                let ring = on.then(|| {
+                    let ring = k.smem::<F32>("ring", 2 * tile.elems());
+                    for slot in 0..2 {
                         let s = k.smem_slot::<F32>(ring, slot, tile);
-                        k.load(s)
+                        k.store(s, x);
                     }
-                    None => x,
-                };
-                [k.binary(sum, y, BinaryOp::Add)]
-            });
-            output(&mut k, self.blocks, sum);
-            k.finish()
+                    (ring, k.input::<I32>("order", iters))
+                });
+                let zero = k.zeros::<F32>(tile);
+                if on {
+                    k.barrier();
+                }
+                let [sum] = k.loop_(iters, [zero], |k, i, [sum]| {
+                    let y = match ring {
+                        Some((ring, order)) => {
+                            let slot = k.load_scalar(order, i) % 2;
+                            let s = k.smem_slot::<F32>(ring, slot, tile);
+                            k.load(s)
+                        }
+                        None => x,
+                    };
+                    [k.binary(sum, y, BinaryOp::Add)]
+                });
+                output(k, self.blocks, sum);
+            })
         })
     }
 
@@ -618,19 +618,19 @@ impl<'a> Probes<'a> {
         let (op, tile) = ("probe:global_byte", Shape::new(32, 128));
         let (blocks, iters) = self.stream_grid(tile.elems() * 4);
         self.make(op, ScalarDType::Int32, STREAM as f64, true, self.lowering(), |on| {
-            let mut k = kernel(op, blocks, WARPS);
-            let src = k.input::<I32>("src", STREAM / 4);
-            let block = k.block(0);
-            let zero = k.fill::<I32>(tile, Const::Int(0));
-            let sum = if on {
-                sum_loads(&mut k, iters, zero, |k, i| {
-                    k.view(src, (i * blocks + block) * tile.elems(), [tile.cols, 1], tile, [None, None])
-                })
-            } else {
-                zero
-            };
-            output(&mut k, blocks, sum);
-            k.finish()
+            probe_kernel(op, blocks, WARPS, |k| {
+                let src = k.input::<I32>("src", STREAM / 4);
+                let block = k.block(0);
+                let zero = k.fill::<I32>(tile, Const::Int(0));
+                let sum = if on {
+                    sum_loads(k, iters, zero, |k, i| {
+                        k.view(src, (i * blocks + block) * tile.elems(), [tile.cols, 1], tile, [None, None])
+                    })
+                } else {
+                    zero
+                };
+                output(k, blocks, sum);
+            })
         })
     }
 
@@ -650,20 +650,20 @@ impl<'a> Probes<'a> {
         let region = region_tiles(footprint);
         let units = (blocks * iters * tile.elems() * 4) as f64;
         self.make(op, ScalarDType::Int32, units, true, self.lowering(), |on| {
-            let mut k = kernel(op, blocks, WARPS);
-            let src = k.input::<I32>("src", region * tile.elems());
-            let block = k.block(0);
-            let zero = k.fill::<I32>(tile, Const::Int(0));
-            let sum = if on {
-                sum_loads(&mut k, iters, zero, |k, i| {
-                    let at = (i * blocks + block.clone()) % region * tile.elems();
-                    k.view(src, at, [tile.cols, 1], tile, [None, None])
-                })
-            } else {
-                zero
-            };
-            output(&mut k, blocks, sum);
-            k.finish()
+            probe_kernel(op, blocks, WARPS, |k| {
+                let src = k.input::<I32>("src", region * tile.elems());
+                let block = k.block(0);
+                let zero = k.fill::<I32>(tile, Const::Int(0));
+                let sum = if on {
+                    sum_loads(k, iters, zero, |k, i| {
+                        let at = (i * blocks + block.clone()) % region * tile.elems();
+                        k.view(src, at, [tile.cols, 1], tile, [None, None])
+                    })
+                } else {
+                    zero
+                };
+                output(k, blocks, sum);
+            })
         })
     }
 
@@ -677,16 +677,16 @@ impl<'a> Probes<'a> {
         let tile = Shape::new(self.warps as usize, cols);
         let units = (iters * cols) as f64;
         self.make(op, ScalarDType::BFloat16, units, false, self.chain(Costs::default()), |on| {
-            let mut k = kernel(op, self.sms as usize, self.warps);
-            let src = k.input::<BF16>("src", region * span);
-            let block = k.block(0);
-            let zero = k.zeros::<BF16>(tile);
-            let stride = if on { [1, span / cols] } else { [tile.cols, 1] };
-            let sum = sum_loads(&mut k, iters, zero, |k, i| {
-                k.view(src, (i + block) % region * span, stride, tile, [None, None])
-            });
-            output(&mut k, self.sms as usize, sum);
-            k.finish()
+            probe_kernel(op, self.sms as usize, self.warps, |k| {
+                let src = k.input::<BF16>("src", region * span);
+                let block = k.block(0);
+                let zero = k.zeros::<BF16>(tile);
+                let stride = if on { [1, span / cols] } else { [tile.cols, 1] };
+                let sum = sum_loads(k, iters, zero, |k, i| {
+                    k.view(src, (i + block) % region * span, stride, tile, [None, None])
+                });
+                output(k, self.sms as usize, sum);
+            })
         })
     }
 
@@ -753,18 +753,18 @@ impl<'a> Probes<'a> {
         let mut lowering = self.lowering();
         lowering.core = Core::Group;
         let mut probe = self.make(op, ScalarDType::BFloat16, units, true, lowering, |on| {
-            let mut k = kernel(op, self.blocks, WARPS);
-            let (sa, sb) = (Shape::new(bm, bk), Shape::new(bn, bk));
-            let (a, b) = (input::<BF16>(&mut k, sa), input::<BF16>(&mut k, sb));
-            let (a_s, b_s) = (k.smem::<BF16>("a_s", sa.elems()), k.smem::<BF16>("b_s", sb.elems()));
-            let (a_t, b_t) = (k.smem_view::<BF16>(a_s, 0, sa), k.smem_view::<BF16>(b_s, 0, sb));
-            k.store(a_t, a);
-            k.store(b_t, b);
-            let zero = k.zeros::<F32>(Shape::new(bm, bn));
-            let [acc] =
-                if on { k.loop_(iters, [zero], |k, _, [acc]| [k.mma(acc, a_t, false, b_t, true)]) } else { [zero] };
-            output(&mut k, self.blocks, acc);
-            k.finish()
+            probe_kernel(op, self.blocks, WARPS, |k| {
+                let (sa, sb) = (Shape::new(bm, bk), Shape::new(bn, bk));
+                let (a, b) = (input::<BF16>(k, sa), input::<BF16>(k, sb));
+                let (a_s, b_s) = (k.smem::<BF16>("a_s", sa.elems()), k.smem::<BF16>("b_s", sb.elems()));
+                let (a_t, b_t) = (k.smem_view::<BF16>(a_s, 0, sa), k.smem_view::<BF16>(b_s, 0, sb));
+                k.store(a_t, a);
+                k.store(b_t, b);
+                let zero = k.zeros::<F32>(Shape::new(bm, bn));
+                let [acc] =
+                    if on { k.loop_(iters, [zero], |k, _, [acc]| [k.mma(acc, a_t, false, b_t, true)]) } else { [zero] };
+                output(k, self.blocks, acc);
+            })
         });
         if self.target.group_mma.is_empty() {
             probe.candidates.clear();
@@ -826,17 +826,17 @@ impl<'a> Probes<'a> {
         let steps = iters * bm * bn * bk / 4096;
         let units = if per_sm { blocks * steps } else { steps / grid.count() as usize } as f64;
         self.make(op, T::DTYPE, units, per_sm, lowering, |on| {
-            let mut k = kernel(op, blocks, grid);
-            let a = input::<T>(&mut k, Shape::new(bm, bk));
-            let b = input::<T>(&mut k, Shape::new(bn, bk));
-            let zero = k.zeros::<T::Acc>(Shape::new(bm, bn));
-            let [acc] = if on {
-                k.loop_(iters, [zero], |k, _, [acc]| [k.mma_oriented(acc, a, false, b, true, Some(Orient::Direct))])
-            } else {
-                [zero]
-            };
-            output(&mut k, blocks, acc);
-            k.finish()
+            probe_kernel(op, blocks, grid, |k| {
+                let a = input::<T>(k, Shape::new(bm, bk));
+                let b = input::<T>(k, Shape::new(bn, bk));
+                let zero = k.zeros::<T::Acc>(Shape::new(bm, bn));
+                let [acc] = if on {
+                    k.loop_(iters, [zero], |k, _, [acc]| [k.mma_oriented(acc, a, false, b, true, Some(Orient::Direct))])
+                } else {
+                    [zero]
+                };
+                output(k, blocks, acc);
+            })
         })
     }
 
@@ -846,25 +846,25 @@ impl<'a> Probes<'a> {
         let (op, tile, iters) = ("probe:score", Shape::new(64, 128), 256);
         let units = (self.blocks * iters * tile.elems()) as f64;
         self.make(op, ScalarDType::Float32, units, true, self.lowering(), |on| {
-            let mut k = kernel(op, self.blocks, WARPS);
-            let x = input::<F32>(&mut k, tile);
-            let zero = k.zeros::<F32>(Shape::new(tile.rows, 1));
-            let [x, l] = if on {
-                k.loop_(iters, [x, zero], |k, _, [x, l]| {
-                    let scale = k.fill::<F32>(tile, Const::Float(0.5));
-                    let s = k.binary(x, scale, BinaryOp::Mul);
-                    let m = k.reduce(s, Axis::Row, ReduceOp::Max);
-                    let d = k.binary(s, m, BinaryOp::Sub);
-                    let e = k.unary(d, UnaryOp::Exp2);
-                    let r = k.reduce(e, Axis::Row, ReduceOp::Sum);
-                    [e, k.binary(l, r, BinaryOp::Add)]
-                })
-            } else {
-                [x, zero]
-            };
-            output(&mut k, self.blocks, x);
-            output(&mut k, self.blocks, l);
-            k.finish()
+            probe_kernel(op, self.blocks, WARPS, |k| {
+                let x = input::<F32>(k, tile);
+                let zero = k.zeros::<F32>(Shape::new(tile.rows, 1));
+                let [x, l] = if on {
+                    k.loop_(iters, [x, zero], |k, _, [x, l]| {
+                        let scale = k.fill::<F32>(tile, Const::Float(0.5));
+                        let s = k.binary(x, scale, BinaryOp::Mul);
+                        let m = k.reduce(s, Axis::Row, ReduceOp::Max);
+                        let d = k.binary(s, m, BinaryOp::Sub);
+                        let e = k.unary(d, UnaryOp::Exp2);
+                        let r = k.reduce(e, Axis::Row, ReduceOp::Sum);
+                        [e, k.binary(l, r, BinaryOp::Add)]
+                    })
+                } else {
+                    [x, zero]
+                };
+                output(k, self.blocks, x);
+                output(k, self.blocks, l);
+            })
         })
     }
 
@@ -927,58 +927,66 @@ impl<'a> Probes<'a> {
         let sms = self.sms as usize;
         let probe = self.make(op, ScalarDType::Int32, units, true, self.lowering(), |on| {
             // Every trip probe runs these programs, named alike.
-            let mut k = kernel("probe:trip", blocks, WARPS);
-            let src = k.input::<I32>("src", sms * region * tile.elems());
-            // Zeros at run (the scratch pool's integers), unknown to the
-            // compiler: every trip's chunk and fragment slot is a runtime
-            // value, so no ring depth folds an index to a constant and no
-            // period of the region lets a loop's loads leave it.
-            let order = k.input::<I32>("order", TRIPS);
-            let first = k.block(0) % sms * region;
-            let zero = k.fill::<I32>(tile, Const::Int(0));
-            let chunk = |k: &mut Kernel, step: Sc| {
-                let at = (step.clone() + k.load_scalar(order, step)) % region;
-                k.view(src, (first.clone() + at) * tile.elems(), [32, 1], tile, [None, None])
-            };
-            let sum = if on {
-                ring_sum(&mut k, TRIPS, Schedule::ring(stages, unroll), zero, chunk)
-            } else {
-                // The ring's slots, written once and fenced before the loop; a
-                // trip reads the slot `order` names, as the ring's consume
-                // reads its tile.
-                let ring = k.smem::<I32>("ring", stages * tile.elems());
-                for slot in 0..stages {
-                    let s = k.smem_slot::<I32>(ring, slot, tile);
-                    k.store(s, zero);
+            probe_kernel("probe:trip", blocks, WARPS, |k| {
+                let src = k.input::<I32>("src", sms * region * tile.elems());
+                // Zeros at run (the scratch pool's integers), unknown to the
+                // compiler: every trip's chunk and fragment slot is a runtime
+                // value, so no ring depth folds an index to a constant and no
+                // period of the region lets a loop's loads leave it.
+                let order = k.input::<I32>("order", TRIPS);
+                let first = k.block(0) % sms * region;
+                let zero = k.fill::<I32>(tile, Const::Int(0));
+                // The trip's chunk: the tile `order` names at `step`.
+                fn chunk<'k>(
+                    k: &mut Kernel<'k>,
+                    step: Sc<'k>,
+                    (src, order): (ParamRef<'k, I32, In>, ParamRef<'k, I32, In>),
+                    first: &Sc<'k>,
+                    (region, tile): (usize, Shape),
+                ) -> Gmem<'k, I32> {
+                    let at = (step.clone() + k.load_scalar(order, step)) % region;
+                    k.view(src, (first.clone() + at) * tile.elems(), [32, 1], tile, [None, None])
                 }
-                k.barrier();
-                k.pin(zero, chunks.clone());
-                // As many loads in flight as the ring holds slots: each
-                // iteration issues `stages` trips' loads before it sums any.
-                let [sum] = k.loop_(TRIPS / stages, [zero], |k, i, [mut sum]| {
-                    let trips: Vec<Sc> = (0..stages).map(|j| i.clone() * stages + j).collect();
-                    let loaded: Vec<Regs<I32>> = trips
-                        .iter()
-                        .map(|t| {
-                            let v = chunk(k, t.clone());
-                            let y = k.load_as_fill(v);
-                            k.pin(y, chunks.clone());
-                            y
-                        })
-                        .collect();
-                    for (t, y) in trips.into_iter().zip(loaded) {
-                        let slot = k.load_scalar(order, t);
+                let sum = if on {
+                    let view = |k: &mut _, step| chunk(k, step, (src, order), &first, (region, tile));
+                    ring_sum(k, TRIPS, Schedule::ring(stages, unroll), zero, view)
+                } else {
+                    // The ring's slots, written once and fenced before the loop; a
+                    // trip reads the slot `order` names, as the ring's consume
+                    // reads its tile.
+                    let ring = k.smem::<I32>("ring", stages * tile.elems());
+                    for slot in 0..stages {
                         let s = k.smem_slot::<I32>(ring, slot, tile);
-                        let fragment = k.load(s);
-                        sum = k.binary(sum, y, BinaryOp::Add);
-                        sum = k.binary(sum, fragment, BinaryOp::Add);
+                        k.store(s, zero);
                     }
-                    [sum]
-                });
-                sum
-            };
-            output(&mut k, blocks, sum);
-            k.finish()
+                    k.barrier();
+                    k.pin(zero, chunks.clone());
+                    // As many loads in flight as the ring holds slots: each
+                    // iteration issues `stages` trips' loads before it sums any.
+                    let [sum] = k.loop_(TRIPS / stages, [zero], |k, i, [mut sum]| {
+                        let trips: Vec<Sc<'_>> = (0..stages).map(|j| i.clone() * stages + j).collect();
+                        let loaded: Vec<Regs<'_, I32>> = trips
+                            .iter()
+                            .map(|t| {
+                                let v = chunk(k, t.clone(), (src, order), &first, (region, tile));
+                                let y = k.load_as_fill(v);
+                                k.pin(y, chunks.clone());
+                                y
+                            })
+                            .collect();
+                        for (t, y) in trips.into_iter().zip(loaded) {
+                            let slot = k.load_scalar(order, t);
+                            let s = k.smem_slot::<I32>(ring, slot, tile);
+                            let fragment = k.load(s);
+                            sum = k.binary(sum, y, BinaryOp::Add);
+                            sum = k.binary(sum, fragment, BinaryOp::Add);
+                        }
+                        [sum]
+                    });
+                    sum
+                };
+                output(k, blocks, sum);
+            })
         });
         Probe { signal: Signal::Resolved, ..probe }
     }
@@ -1028,20 +1036,20 @@ impl<'a> Probes<'a> {
             .sum();
         let units = iters as f64 * work * tile.elems() as f64 / warps as f64;
         self.make(op, ScalarDType::BFloat16, units, false, self.chain(costs), |on| {
-            let mut k = kernel(op, self.sms as usize, warps);
-            let x = input::<BF16>(&mut k, tile);
-            let [x] = k.loop_(iters, [x], |k, _, [x]| {
-                k.pin(x, plain.clone());
-                [helds.iter().fold(x, |x, held| {
-                    let y = k.unary(x, UnaryOp::Neg);
-                    let next = k.unary(y, UnaryOp::Neg);
-                    k.pin(y, if on { held.clone() } else { plain.clone() });
-                    k.pin(next, plain.clone());
-                    next
-                })]
-            });
-            output(&mut k, self.sms as usize, x);
-            k.finish()
+            probe_kernel(op, self.sms as usize, warps, |k| {
+                let x = input::<BF16>(k, tile);
+                let [x] = k.loop_(iters, [x], |k, _, [x]| {
+                    k.pin(x, plain.clone());
+                    [helds.iter().fold(x, |x, held| {
+                        let y = k.unary(x, UnaryOp::Neg);
+                        let next = k.unary(y, UnaryOp::Neg);
+                        k.pin(y, if on { held.clone() } else { plain.clone() });
+                        k.pin(next, plain.clone());
+                        next
+                    })]
+                });
+                output(k, self.sms as usize, x);
+            })
         })
     }
 
@@ -1071,33 +1079,40 @@ impl<'a> Probes<'a> {
         let stages = self.target.fill.stages(stages);
         let lowering = self.lowering();
         self.make(op, ScalarDType::Int32, (trips - stages) as f64, false, lowering, |on| {
-            let mut k = kernel(op, waves, 1);
-            let src = k.input::<I32>("src", STREAM / 4);
-            let block = k.block(0);
-            let zero = k.fill::<I32>(tile, Const::Int(0));
-            let sum = ring_sum(&mut k, if on { trips } else { stages }, stages, zero, |k, step| {
-                k.view(src, (step * waves + block) * tile.elems(), [4, 1], tile, [None, None])
-            });
-            output(&mut k, waves, sum);
-            k.finish()
+            probe_kernel(op, waves, 1, |k| {
+                let src = k.input::<I32>("src", STREAM / 4);
+                let block = k.block(0);
+                let zero = k.fill::<I32>(tile, Const::Int(0));
+                let sum = ring_sum(k, if on { trips } else { stages }, stages, zero, |k, step| {
+                    k.view(src, (step * waves + block) * tile.elems(), [4, 1], tile, [None, None])
+                });
+                output(k, waves, sum);
+            })
         })
     }
 }
 
-fn kernel(op: &str, blocks: usize, warps: impl Into<WarpGrid>) -> Kernel {
-    let mut k = Kernel::new(op.replace(':', "_"));
-    k.grid([Sc::from(blocks), Sc::from(1), Sc::from(1)]);
-    k.warps(warps);
-    k
+/// A probe's kernel is named after it, `blocks` blocks of `warps`.
+fn probe_kernel(
+    op: &str,
+    blocks: usize,
+    warps: impl Into<WarpGrid>,
+    f: impl for<'k> FnOnce(&mut Kernel<'k>),
+) -> Program {
+    Kernel::record(op.replace(':', "_"), |k| {
+        k.grid([Sc::from(blocks), Sc::from(1), Sc::from(1)]);
+        k.warps(warps);
+        f(k)
+    })
 }
 
 /// `init` plus the tile `view` reads at each of `iters` iterations.
-fn sum_loads<T: Elem>(
-    k: &mut Kernel,
+fn sum_loads<'k, T: Elem>(
+    k: &mut Kernel<'k>,
     iters: usize,
-    init: Regs<T>,
-    view: impl FnOnce(&mut Kernel, Sc) -> Gmem<T>,
-) -> Regs<T> {
+    init: Regs<'k, T>,
+    view: impl FnOnce(&mut Kernel<'k>, Sc<'k>) -> Gmem<'k, T>,
+) -> Regs<'k, T> {
     let [sum] = k.loop_(iters, [init], |k, i, [sum]| {
         let v = view(k, i);
         let y = k.load(v);
@@ -1108,13 +1123,13 @@ fn sum_loads<T: Elem>(
 
 /// `init` plus the tile `view` reads at each of `trips` trips of a pipeline
 /// staging it through a ring of `stages` slots.
-fn ring_sum(
-    k: &mut Kernel,
+fn ring_sum<'k>(
+    k: &mut Kernel<'k>,
     trips: usize,
     schedule: impl Into<Schedule>,
-    init: Regs<I32>,
-    view: impl FnOnce(&mut Kernel, Sc) -> Gmem<I32>,
-) -> Regs<I32> {
+    init: Regs<'k, I32>,
+    view: impl FnOnce(&mut Kernel<'k>, Sc<'k>) -> Gmem<'k, I32>,
+) -> Regs<'k, I32> {
     let (tile, schedule) = (k.shape(init), schedule.into());
     let slots = k.ring::<I32>("ring", tile.elems(), schedule.stages());
     let [sum] = k.pipeline(
@@ -1137,14 +1152,14 @@ fn ring_sum(
 
 /// A `shape` tile loaded from a parameter of its own, so no value is known
 /// to the compiler.
-fn input<T: Elem>(k: &mut Kernel, shape: Shape) -> Regs<T> {
+fn input<'k, T: Elem>(k: &mut Kernel<'k>, shape: Shape) -> Regs<'k, T> {
     let p = k.input::<T>("x", shape.elems());
     let v = k.view(p, 0, [shape.cols, 1], shape, [None, None]);
     k.load(v)
 }
 
 /// `v` stored to block `block(0)`'s slot of an output, so nothing is dead.
-fn output<T: Elem>(k: &mut Kernel, blocks: usize, v: Regs<T>) {
+fn output<'k, T: Elem>(k: &mut Kernel<'k>, blocks: usize, v: Regs<'k, T>) {
     let shape = k.shape(v);
     let p = k.output::<T>("y", blocks * shape.elems());
     let block = k.block(0);

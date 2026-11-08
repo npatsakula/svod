@@ -41,7 +41,7 @@ optimization"), `do_linearize` returns before the `SVOD_DUMP_LINEAR` dump (`code
 
 ## Mental model
 
-1. **Tile program** (`ir.rs`, recorded by `build::Kernel`): statements in program order
+1. **Tile program** (`ir.rs`, recorded by `build::Kernel::record(name, |k| …)`; every handle and `Sc` carries the kernel's brand `'k`): statements in program order
    (`Stmt::{Let, Copy, Loop, Pipeline, Warps, If, Sync}`) over typed tiles `Gmem<T>`/`Shared<T>`/`Regs<T>`, shared
    allocations as `SmemRef<T>`; comparisons are `k.compare(a, b, CmpOp::{Lt,Le,Eq,Ne})` → `Regs<Bool>`. No DAG.
 2. **`lower::lower`** (`lower/mod.rs`): grid check → `materialize_operands` (non-register `mma` operands become loads;

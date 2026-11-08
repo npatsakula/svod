@@ -308,40 +308,40 @@ impl AttnSpec {
 }
 
 /// The scores of a key block starting at the scalar, masked.
-type Mask<'a> = &'a dyn Fn(&mut Kernel, Regs<F32>, Sc) -> Regs<F32>;
+type Mask<'a, 'k> = &'a dyn Fn(&mut Kernel<'k>, Regs<'k, F32>, Sc<'k>) -> Regs<'k, F32>;
 
 /// The online-softmax step over one key block: `q_r` against `k_t`, the
 /// scores (plus `bias(block_start)`, in the scaled log2 units) masked by
 /// `mask(block_start)`, folded into `(m, l, o)` with `v_t`. The running
 /// maximum `m` is in the raw scores' units when [`raw_max`](Self::raw_max)
 /// holds, else in the scaled log2 units of the exponent.
-struct Step<'a, T> {
-    q_r: Regs<T>,
+struct Step<'a, 'k, T> {
+    q_r: Regs<'k, T>,
     scale_log2e: f64,
     shape: Shape,
-    bias: Option<Mask<'a>>,
-    mask: Mask<'a>,
+    bias: Option<Mask<'a, 'k>>,
+    mask: Mask<'a, 'k>,
     cfg: FaCfg,
 }
 
-impl<T> Clone for Step<'_, T> {
+impl<T> Clone for Step<'_, '_, T> {
     fn clone(&self) -> Self {
         *self
     }
 }
-impl<T> Copy for Step<'_, T> {}
+impl<T> Copy for Step<'_, '_, T> {}
 
 /// `s` plus a bias tile, in the scores' log2 units: one fused multiply-add,
 /// so the result does not depend on which product the backend would fuse
 /// into a separate add (the scaled scores' or the bias's), which varies with
 /// the layout around it.
-fn biased<T: Elem, P: Readable>(k: &mut Kernel, s: Regs<F32>, tile: Tile<P, T>) -> Regs<F32> {
+fn biased<'k, T: Elem, P: Readable>(k: &mut Kernel<'k>, s: Regs<'k, F32>, tile: Tile<'k, P, T>) -> Regs<'k, F32> {
     let b = load_f32(k, tile);
     let log2e = k.fill::<F32>(k.shape(s), Const::Float(std::f64::consts::LOG2_E));
     k.mul_add(b, log2e, s)
 }
 
-impl<T> Step<'_, T> {
+impl<T> Step<'_, '_, T> {
     /// Whether the running maximum is kept in the raw scores' units: the
     /// planned form, where a positive scale commutes with the maximum and no
     /// bias joins the scores before it.
@@ -358,14 +358,14 @@ impl<T> Step<'_, T> {
 /// what keeps that sum finite for any value magnitude.
 const RESCALE_ABOVE: f64 = 8.0;
 
-fn step<T: Half, PK: Readable, PV: Readable>(
-    k: &mut Kernel,
-    st: &Step<'_, T>,
-    k_t: Tile<PK, T>,
-    v_t: Tile<PV, T>,
-    block_start: Sc,
-    [m, l, o]: [Regs<F32>; 3],
-) -> [Regs<F32>; 3] {
+fn step<'k, T: Half, PK: Readable, PV: Readable>(
+    k: &mut Kernel<'k>,
+    st: &Step<'_, 'k, T>,
+    k_t: Tile<'k, PK, T>,
+    v_t: Tile<'k, PV, T>,
+    block_start: Sc<'k>,
+    [m, l, o]: [Regs<'k, F32>; 3],
+) -> [Regs<'k, F32>; 3] {
     let zero = k.zeros::<F32>(st.shape);
     let s = k.mma(zero, st.q_r, false, k_t, true);
     let scale = k.fill::<F32>(st.shape, Const::Float(st.scale_log2e));
@@ -387,7 +387,7 @@ fn step<T: Half, PK: Readable, PV: Readable>(
         (s, k.reduce(s, Axis::Row, ReduceOp::Max))
     };
     let unit = if st.raw_max() { st.scale_log2e } else { 1.0 };
-    let scaled = |k: &mut Kernel, x: Regs<F32>| {
+    let scaled = |k: &mut Kernel<'k>, x: Regs<'k, F32>| {
         if !st.raw_max() {
             return x;
         }
@@ -415,7 +415,7 @@ fn step<T: Half, PK: Readable, PV: Readable>(
     // Truncated probabilities are summed as held, so the normalization stays
     // unbiased; rounded ones are summed in f32. Where the sum goes is
     // `sum_after`'s.
-    let summed = |k: &mut Kernel| {
+    let summed = |k: &mut Kernel<'k>| {
         let block_sum =
             if truncate { k.reduce_f32(p16, Axis::Row, ReduceOp::Sum) } else { k.reduce(p, Axis::Row, ReduceOp::Sum) };
         let l = k.binary(l, corr, BinaryOp::Mul);
@@ -437,6 +437,12 @@ fn step<T: Half, PK: Readable, PV: Readable>(
 /// evenly by the splits; only blocks a mask edge crosses pay for the mask,
 /// except under a key mask or a bias, which every block reads.
 pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
+    Kernel::record(if spec.packed { "flash_attention_packed" } else { "flash_attention" }, |k| {
+        attention_body::<T>(k, spec)
+    })
+}
+
+fn attention_body<'k, T: Half>(k: &mut Kernel<'k>, spec: &AttnSpec) {
     let AttnSpec { ref batch, t, tk, heads, kv_heads, d, mask, cache, packed, scale, cfg } = *spec;
     let AttnMask { causal, window, chunk, key_lens, key_mask, seg_start, bias } = mask;
     let FaCfg { bq, bkv, splits, .. } = cfg;
@@ -447,7 +453,6 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
     assert!(appended <= bkv, "{appended} appended rows overflow a key block of {bkv}");
     assert!(!packed || (cache.is_none() && tk == t), "a packed operand holds its own keys");
     let slots = heads + 2 * kv_heads;
-    let mut k = Kernel::new(if packed { "flash_attention_packed" } else { "flash_attention" });
     let (q, kk, v) = if packed {
         let qkv = k.input::<T>("qkv", cap * t * slots * d);
         (qkv, qkv, qkv)
@@ -481,7 +486,7 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
         let n = if rows == Bias::Shared { 1 } else { cap };
         (k.input::<T>("bias", n * heads * t * bias_stride), rows)
     });
-    let (gz, bb) = batch.axis(&mut k);
+    let (gz, bb) = batch.axis(k);
     k.grid([Sc::from(t.div_ceil(bq) * splits), Sc::from(heads), gz]);
     let kw = cfg.key_warps;
     if let Err(e) = cfg.shares_keys() {
@@ -515,7 +520,7 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
     // The packed operand's keys follow its queries, its values its keys.
     let (k_first, v_first) = if packed { (heads, heads + kv_heads) } else { (0, 0) };
     let rows = Rows { bb: bb.clone(), hh: hh.clone(), q_off: q_off.clone(), t, d, bq };
-    let q_view = rows.of(&mut k, q, q_stride);
+    let q_view = rows.of(k, q, q_stride);
     let kv_row = match row_map {
         Some(map) => k.load_scalar(map, b.clone()),
         None => b.clone(),
@@ -593,7 +598,7 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
     let o0 = k.zeros::<F32>(Shape::new(bq, d));
     let scale_log2e = (scale * std::f32::consts::LOG2_E) as f64;
     // The key coordinates of a block's scores and the query rows'.
-    let coords = |k: &mut Kernel, block_start: Sc| {
+    let coords = |k: &mut Kernel<'k>, block_start: Sc<'k>| {
         let col = k.coord(shape, Axis::Col);
         let start = k.splat::<I32>(shape, block_start);
         let col = k.binary(col, start, BinaryOp::Add);
@@ -603,19 +608,19 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
     };
     // The bias tile of the key block at `col` read from global memory: the
     // appended block's, outside the ring.
-    let biased_at = |k: &mut Kernel, s: Regs<F32>, col: Sc| -> Regs<F32> {
+    let biased_at = |k: &mut Kernel<'k>, s: Regs<'k, F32>, col: Sc<'k>| -> Regs<'k, F32> {
         let Some(view) = bias_view else { return s };
         let tile = k.at(view, q_off.clone(), col);
         biased(k, s, tile)
     };
-    let hide = |k: &mut Kernel, keep: Regs<Bool>, plain: Regs<F32>| {
+    let hide = |k: &mut Kernel<'k>, keep: Regs<'k, Bool>, plain: Regs<'k, F32>| {
         let hidden = k.fill::<F32>(shape, Const::Float(f64::NEG_INFINITY));
         k.where_(keep, plain, hidden)
     };
-    let masked = |k: &mut Kernel, plain: Regs<F32>, block_start: Sc| {
+    let masked = |k: &mut Kernel<'k>, plain: Regs<'k, F32>, block_start: Sc<'k>| {
         let (col, row) = coords(k, block_start.clone());
-        let mut keep: Option<Regs<Bool>> = None;
-        let mut and = |k: &mut Kernel, cond| {
+        let mut keep: Option<Regs<'k, Bool>> = None;
+        let mut and = |k: &mut Kernel<'k>, cond| {
             keep = Some(match keep {
                 Some(keep) => k.binary(keep, cond, BinaryOp::And),
                 None => cond,
@@ -670,7 +675,7 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
         hide(k, keep.expect("a mask"), plain)
     };
     let edges = causal || keys_masked || window.is_some() || chunk.is_some() || seg.is_some();
-    let mask = |k: &mut Kernel, s: Regs<F32>, block_start: Sc| -> Regs<F32> {
+    let mask = |k: &mut Kernel<'k>, s: Regs<'k, F32>, block_start: Sc<'k>| -> Regs<'k, F32> {
         if key_mask {
             return masked(k, s, block_start);
         }
@@ -711,7 +716,7 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
     let bias_tile = bias_view.is_some().then_some(&biased_at as Mask);
     let st = Step { q_r, scale_log2e, shape, bias: bias_tile, mask: &mask, cfg };
     let app_views = app.map(|(k_app, v_app)| {
-        let app = |k: &mut Kernel, p: ParamRef<T, In>| {
+        let app = |k: &mut Kernel<'k>, p: ParamRef<'k, T, In>| {
             k.view(
                 p,
                 batch_offset(&bb, appended * kv_heads * d) + kv_head.clone() * d,
@@ -720,7 +725,7 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
                 [Some(Sc::from(appended)), None],
             )
         };
-        let (k_g, v_g) = (app(&mut k, k_app), app(&mut k, v_app));
+        let (k_g, v_g) = (app(k, k_app), app(k, v_app));
         let visible = match app_lens {
             Some(p) => k.load_scalar(p, b.clone()).min(appended),
             None => Sc::from(appended),
@@ -730,7 +735,7 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
     // One warp's share of the split's key blocks (`warp` is `None` for the
     // whole share), folded into `(m, l, o)`, the maximum in the exponent's
     // units at the end.
-    let run = |k: &mut Kernel, warp: Option<Sc>| -> [Regs<F32>; 3] {
+    let run = |k: &mut Kernel<'k>, warp: Option<Sc<'k>>| -> [Regs<'k, F32>; 3] {
         let (w_first, w_blocks, slot0, owner) = match &warp {
             Some(w) => (
                 s_first.clone() + blocks.clone() * w.clone() / kw,
@@ -763,7 +768,7 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
                 let k_t = k.slot(k_s, &slot, Shape::new(bkv, d));
                 let v_t = k.slot(v_s, &slot, Shape::new(bkv, d));
                 let b_t = bias_s.map(|ring| k.slot(ring, &slot, shape));
-                let from_ring = |k: &mut Kernel, s, _| biased(k, s, b_t.expect("a bias ring"));
+                let from_ring = |k: &mut Kernel<'k>, s, _| biased(k, s, b_t.expect("a bias ring"));
                 let st = if b_t.is_some() { Step { bias: Some(&from_ring as Mask), ..st } } else { st };
                 step(k, &st, k_t, v_t, (w_first.clone() + step_) * bkv, carried)
             },
@@ -773,8 +778,8 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
         // as they were, and a branch would cost more than the step.
         let [m, l, acc] = match &app_views {
             Some((k_g, v_g, visible)) => {
-                let app_bias = |k: &mut Kernel, s: Regs<F32>, _: Sc| biased_at(k, s, Sc::from(tk));
-                let rows = |k: &mut Kernel, s: Regs<F32>, _: Sc| {
+                let app_bias = |k: &mut Kernel<'k>, s: Regs<'k, F32>, _: Sc<'k>| biased_at(k, s, Sc::from(tk));
+                let rows = |k: &mut Kernel<'k>, s: Regs<'k, F32>, _: Sc<'k>| {
                     let col = k.coord(shape, Axis::Col);
                     let visible = k.splat::<I32>(shape, visible.clone());
                     let seen = k.compare(col, visible, CmpOp::Lt);
@@ -799,7 +804,7 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
         [m, l, acc]
     };
     let [m, l, acc] = match kw {
-        1 => run(&mut k, None),
+        1 => run(k, None),
         // Every warp leaves its state over its own ring slots, dead once its
         // pipeline ends, as f32 views of the 16-bit rings: the output over
         // its key slots, the maximum and sum over its value slots; the block
@@ -809,7 +814,7 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
             // SAFETY: a warp's region is its own run of slots, and both uses
             // come after that warp's pipeline: the warp's own stores once its
             // pipeline ends, the block's loads after every warp's.
-            let views = |k: &mut Kernel, at: Sc| unsafe {
+            let views = |k: &mut Kernel<'k>, at: Sc<'k>| unsafe {
                 let o = k.ring_scratch::<F32>(k_s, at.clone() * region, Shape::new(WARP_ROWS, d));
                 let m = k.ring_scratch::<F32>(v_s, at.clone() * region, Shape::new(WARP_ROWS, 1));
                 let l = k.ring_scratch::<F32>(v_s, at * region + WARP_ROWS, Shape::new(WARP_ROWS, 1));
@@ -823,21 +828,21 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
                 k.store(m_v, m);
                 k.store(l_v, l);
             });
-            let parts: Vec<State> = (0..kw)
+            let parts: Vec<State<'k>> = (0..kw)
                 .map(|w| {
-                    let (o_v, m_v, l_v) = views(&mut k, Sc::from(w));
+                    let (o_v, m_v, l_v) = views(k, Sc::from(w));
                     State { m: k.load(m_v), l: k.load(l_v), o: k.load(o_v) }
                 })
                 .collect();
-            let State { m, l, o } = merged(&mut k, &parts);
+            let State { m, l, o } = merged(k, &parts);
             [m, l, o]
         }
     };
     match (o, parts) {
         (Some(o), _) => {
-            let out = normalized(&mut k, acc, l, bq);
+            let out = normalized(k, acc, l, bq);
             let out = k.cast::<F32, T>(out);
-            let o_view = rows.of(&mut k, o, o_stride);
+            let o_view = rows.of(k, o, o_stride);
             k.store(o_view, out);
         }
         (None, Some((o_part, m_part, l_part))) => {
@@ -865,7 +870,6 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
         }
         (None, None) => unreachable!("an output"),
     }
-    k.finish()
 }
 
 /// `[splits, batch, t, heads]` rows of partial results merged into
@@ -882,15 +886,15 @@ pub struct CombineSpec {
 
 /// A partial online-softmax state: the maximum in the exponent's units, the
 /// sum and the output accumulator over some of the keys.
-struct State {
-    m: Regs<F32>,
-    l: Regs<F32>,
-    o: Regs<F32>,
+struct State<'k> {
+    m: Regs<'k, F32>,
+    l: Regs<'k, F32>,
+    o: Regs<'k, F32>,
 }
 
 /// The state over every part's keys: each part rescaled to the largest
 /// maximum and summed.
-fn merged(k: &mut Kernel, parts: &[State]) -> State {
+fn merged<'k>(k: &mut Kernel<'k>, parts: &[State<'k>]) -> State<'k> {
     let mut m = parts[0].m;
     for part in &parts[1..] {
         m = k.binary(m, part.m, BinaryOp::Max);
@@ -916,7 +920,7 @@ fn merged(k: &mut Kernel, parts: &[State]) -> State {
 /// `acc / l` row by row, where a row no key reached (its sum `l` is zero,
 /// and so is its accumulator) comes out as zeros, as the graph writes it,
 /// rather than as the NaN of a division by zero.
-fn normalized(k: &mut Kernel, acc: Regs<F32>, l: Regs<F32>, rows: usize) -> Regs<F32> {
+fn normalized<'k>(k: &mut Kernel<'k>, acc: Regs<'k, F32>, l: Regs<'k, F32>, rows: usize) -> Regs<'k, F32> {
     let zero = k.zeros::<F32>(Shape::new(rows, 1));
     let one = k.fill::<F32>(Shape::new(rows, 1), Const::Float(1.0));
     let empty = k.compare(l, zero, CmpOp::Eq);
@@ -927,48 +931,50 @@ fn normalized(k: &mut Kernel, acc: Regs<F32>, l: Regs<F32>, rows: usize) -> Regs
 /// Parameters in order: `o_part`, `m_part`, `l_part` (f32, as the
 /// attention kernel writes them), `o`.
 pub fn combine<T: Elem>(spec: &CombineSpec) -> Program {
+    Kernel::record("combine_splits", |k| combine_body::<T>(k, spec))
+}
+
+fn combine_body<'k, T: Elem>(k: &mut Kernel<'k>, spec: &CombineSpec) {
     let CombineSpec { ref batch, t, heads, d, splits, cfg: NormCfg { br } } = *spec;
     let (cap, rows) = (batch.capacity(), t * heads);
-    let mut k = Kernel::new("combine_splits");
     let o_part = k.input::<F32>("o_part", splits * cap * rows * d);
     let m_part = k.input::<F32>("m_part", splits * cap * rows);
     let l_part = k.input::<F32>("l_part", splits * cap * rows);
     let o = k.output::<T>("o", cap * rows * d);
-    let (gz, bb) = batch.axis(&mut k);
+    let (gz, bb) = batch.axis(k);
     k.grid([Sc::from(rows.div_ceil(br)), Sc::from(1), gz]);
     k.warps(br as u32);
     let row0 = k.block(0) * br;
-    let part = |k: &mut Kernel, p: ParamRef<F32, In>, split: usize, width: usize| {
+    let part = |k: &mut Kernel<'k>, p: ParamRef<'k, F32, In>, split: usize, width: usize| {
         let base = Sc::from(split * cap * rows * width) + batch_offset(&bb, rows * width);
         let view = k.view(p, base, [width, 1], Shape::new(br, width), [bound(rows, br), None]);
         let tile = k.at(view, row0.clone(), 0);
         k.load(tile)
     };
-    let parts: Vec<State> = (0..splits)
-        .map(|s| State { m: part(&mut k, m_part, s, 1), l: part(&mut k, l_part, s, 1), o: part(&mut k, o_part, s, d) })
+    let parts: Vec<State<'k>> = (0..splits)
+        .map(|s| State { m: part(k, m_part, s, 1), l: part(k, l_part, s, 1), o: part(k, o_part, s, d) })
         .collect();
-    let State { l, o: acc, .. } = merged(&mut k, &parts);
-    let out = normalized(&mut k, acc, l, br);
+    let State { l, o: acc, .. } = merged(k, &parts);
+    let out = normalized(k, acc, l, br);
     let out = k.cast::<F32, T>(out);
     let view = k.view(o, batch_offset(&bb, rows * d), [d, 1], Shape::new(br, d), [bound(rows, br), None]);
     let view = k.at(view, row0, 0);
     k.store(view, out);
-    k.finish()
 }
 
 /// The block's `[bq, d]` query rows of head `hh` in a `[batch·t, stride]`
 /// parameter, read or written.
-struct Rows {
-    bb: Option<Sc>,
-    hh: Sc,
-    q_off: Sc,
+struct Rows<'k> {
+    bb: Option<Sc<'k>>,
+    hh: Sc<'k>,
+    q_off: Sc<'k>,
     t: usize,
     d: usize,
     bq: usize,
 }
 
-impl Rows {
-    fn of<T: Elem, A: Access>(&self, k: &mut Kernel, p: ParamRef<T, A>, stride: usize) -> Gmem<T, A> {
+impl<'k> Rows<'k> {
+    fn of<T: Elem, A: Access>(&self, k: &mut Kernel<'k>, p: ParamRef<'k, T, A>, stride: usize) -> Gmem<'k, T, A> {
         let Rows { bb, hh, q_off, t, d, bq } = self;
         let offset = batch_offset(bb, t * stride) + hh.clone() * *d;
         let v = k.view(p, offset, [stride, 1], Shape::new(*bq, *d), [bound(*t, *bq), None]);

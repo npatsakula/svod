@@ -37,26 +37,27 @@ fn source(i: usize, m: usize) -> Option<usize> {
 #[test_case(true; "through shared memory")]
 fn gathered_rows_follow_their_map_and_read_zero_outside_it(staged: bool) {
     let (m, cols) = (16usize, 16usize);
-    let mut k = Kernel::new("gather");
-    let x = k.input::<F32>("x", m * cols);
-    let y = k.output::<F32>("y", 8 * 8);
-    let r = k.row();
-    let rows = r.clone() * 7 % m * cols;
-    let valid = Sc::from(0).lt(r % 3);
-    let g = k.gather(x, 0, rows, Some(valid), Shape::new(8, 8), None);
-    let g = k.at(g, 0, 8);
-    let v = if staged {
-        let s = k.smem::<F32>("s", 64);
-        let t = k.smem_view::<F32>(s, 0, Shape::new(8, 8));
-        k.stage(t, g, CopyMode::Sync);
-        k.load(t)
-    } else {
-        k.load(g)
-    };
-    let out = k.view(y, 0, [8, 1], Shape::new(8, 8), [None, None]);
-    k.store(out, v);
+    let prog = Kernel::record("gather", |k| {
+        let x = k.input::<F32>("x", m * cols);
+        let y = k.output::<F32>("y", 8 * 8);
+        let r = k.row();
+        let rows = r.clone() * 7 % m * cols;
+        let valid = Sc::from(0).lt(r % 3);
+        let g = k.gather(x, 0, rows, Some(valid), Shape::new(8, 8), None);
+        let g = k.at(g, 0, 8);
+        let v = if staged {
+            let s = k.smem::<F32>("s", 64);
+            let t = k.smem_view::<F32>(s, 0, Shape::new(8, 8));
+            k.stage(t, g, CopyMode::Sync);
+            k.load(t)
+        } else {
+            k.load(g)
+        };
+        let out = k.view(y, 0, [8, 1], Shape::new(8, 8), [None, None]);
+        k.store(out, v);
+    });
     let xs: Vec<f64> = (0..m * cols).map(|i| i as f64 + 1.0).collect();
-    let got = run(&k.finish(), vec![xs.clone(), vec![-1.0; 64]], &[]).unwrap();
+    let got = run(&prog, vec![xs.clone(), vec![-1.0; 64]], &[]).unwrap();
     for i in 0..8 {
         for j in 0..8 {
             let want = source(i, m).map_or(0.0, |s| xs[s * cols + 8 + j]);
@@ -69,18 +70,19 @@ fn gathered_rows_follow_their_map_and_read_zero_outside_it(staged: bool) {
 #[test]
 fn gathered_stores_drop_rejected_rows() {
     let m = 16usize;
-    let mut k = Kernel::new("scatter");
-    let x = k.input::<F32>("x", m * 8);
-    let y = k.output::<F32>("y", m * 8);
-    let src = k.view(x, 0, [8, 1], Shape::new(m, 8), [None, None]);
-    let v = k.load(src);
-    let r = k.row();
-    let rows = r.clone() * 7 % m * 8;
-    let valid = Sc::from(0).lt(r % 3);
-    let dst = k.gather(y, 0, rows, Some(valid), Shape::new(m, 8), None);
-    k.store(dst, v);
+    let prog = Kernel::record("scatter", |k| {
+        let x = k.input::<F32>("x", m * 8);
+        let y = k.output::<F32>("y", m * 8);
+        let src = k.view(x, 0, [8, 1], Shape::new(m, 8), [None, None]);
+        let v = k.load(src);
+        let r = k.row();
+        let rows = r.clone() * 7 % m * 8;
+        let valid = Sc::from(0).lt(r % 3);
+        let dst = k.gather(y, 0, rows, Some(valid), Shape::new(m, 8), None);
+        k.store(dst, v);
+    });
     let xs: Vec<f64> = (0..m * 8).map(|i| i as f64).collect();
-    let got = run(&k.finish(), vec![xs.clone(), vec![-1.0; m * 8]], &[]).unwrap();
+    let got = run(&prog, vec![xs.clone(), vec![-1.0; m * 8]], &[]).unwrap();
     for i in 0..m {
         for j in 0..8 {
             let kept = (0..m).find(|&r| source(r, m) == Some(i));
@@ -93,11 +95,12 @@ fn gathered_stores_drop_rejected_rows() {
 #[test]
 #[should_panic(expected = "moves along its columns only")]
 fn a_gathered_view_does_not_move_rows() {
-    let mut k = Kernel::new("gather");
-    let x = k.input::<F32>("x", 64);
-    let r = k.row();
-    let g = k.gather(x, 0, r * 8, None, Shape::new(8, 8), None);
-    k.at(g, 1, 0);
+    Kernel::record("gather", |k| {
+        let x = k.input::<F32>("x", 64);
+        let r = k.row();
+        let g = k.gather(x, 0, r * 8, None, Shape::new(8, 8), None);
+        k.at(g, 1, 0);
+    });
 }
 
 /// `c = gather(a) · bᵀ` with gathered row `i` = source row `(7·i) % m` or
@@ -105,43 +108,43 @@ fn a_gathered_view_does_not_move_rows() {
 /// padding included, through the pipelined mainloop.
 fn gathered_gemm(m: usize, n: usize, kk: usize, tile: [usize; 3], stages: usize, warps: [u32; 2]) -> Program {
     let [bm, bn, bk] = tile;
-    let mut k = Kernel::new("gathered_gemm");
-    let a = k.input::<BF16>("a", m * kk);
-    let b = k.input::<BF16>("b", n * kk);
-    let c = k.output::<F32>("c", m * n);
-    k.grid([Sc::from(m / bm), Sc::from(n / bn), Sc::from(1)]);
-    k.warps(WarpGrid { rows: warps[0], cols: warps[1] });
-    let (row0, col0) = (k.block(0) * bm, k.block(1) * bn);
-    let i = row0.clone() + k.row();
-    let start = i.clone() * 7 % m * kk;
-    let valid = Sc::from(0).lt(i % 3);
-    let a_s = k.ring::<BF16>("a_s", bm * bk, stages);
-    let b_s = k.ring::<BF16>("b_s", bn * bk, stages);
-    let b_view = k.view(b, 0, [kk, 1], Shape::new(bn, bk), [None, None]);
-    let b_view = k.at(b_view, col0.clone(), 0);
-    let init = k.zeros::<F32>(Shape::new(bm, bn));
-    let [acc] = k.pipeline(
-        kk / bk,
-        Schedule::ring(stages, true),
-        [init],
-        |k, step, slot| {
-            let a_g = k.gather(a, step.clone() * bk, start.clone(), Some(valid.clone()), Shape::new(bm, bk), None);
-            let a_t = k.slot(a_s, &slot, Shape::new(bm, bk));
-            k.stage(a_t, a_g, CopyMode::Async);
-            let b_g = k.at(b_view, 0, step * bk);
-            let b_t = k.slot(b_s, &slot, Shape::new(bn, bk));
-            k.stage(b_t, b_g, CopyMode::Async);
-        },
-        |k, _step, slot, [acc]| {
-            let a_t = k.slot(a_s, &slot, Shape::new(bm, bk));
-            let b_t = k.slot(b_s, &slot, Shape::new(bn, bk));
-            [k.mma(acc, a_t, false, b_t, true)]
-        },
-    );
-    let out = k.view(c, 0, [n, 1], Shape::new(bm, bn), [None, None]);
-    let out = k.at(out, row0, col0);
-    k.store(out, acc);
-    k.finish()
+    Kernel::record("gathered_gemm", |k| {
+        let a = k.input::<BF16>("a", m * kk);
+        let b = k.input::<BF16>("b", n * kk);
+        let c = k.output::<F32>("c", m * n);
+        k.grid([Sc::from(m / bm), Sc::from(n / bn), Sc::from(1)]);
+        k.warps(WarpGrid { rows: warps[0], cols: warps[1] });
+        let (row0, col0) = (k.block(0) * bm, k.block(1) * bn);
+        let i = row0.clone() + k.row();
+        let start = i.clone() * 7 % m * kk;
+        let valid = Sc::from(0).lt(i % 3);
+        let a_s = k.ring::<BF16>("a_s", bm * bk, stages);
+        let b_s = k.ring::<BF16>("b_s", bn * bk, stages);
+        let b_view = k.view(b, 0, [kk, 1], Shape::new(bn, bk), [None, None]);
+        let b_view = k.at(b_view, col0.clone(), 0);
+        let init = k.zeros::<F32>(Shape::new(bm, bn));
+        let [acc] = k.pipeline(
+            kk / bk,
+            Schedule::ring(stages, true),
+            [init],
+            |k, step, slot| {
+                let a_g = k.gather(a, step.clone() * bk, start.clone(), Some(valid.clone()), Shape::new(bm, bk), None);
+                let a_t = k.slot(a_s, &slot, Shape::new(bm, bk));
+                k.stage(a_t, a_g, CopyMode::Async);
+                let b_g = k.at(b_view, 0, step * bk);
+                let b_t = k.slot(b_s, &slot, Shape::new(bn, bk));
+                k.stage(b_t, b_g, CopyMode::Async);
+            },
+            |k, _step, slot, [acc]| {
+                let a_t = k.slot(a_s, &slot, Shape::new(bm, bk));
+                let b_t = k.slot(b_s, &slot, Shape::new(bn, bk));
+                [k.mma(acc, a_t, false, b_t, true)]
+            },
+        );
+        let out = k.view(c, 0, [n, 1], Shape::new(bm, bn), [None, None]);
+        let out = k.at(out, row0, col0);
+        k.store(out, acc);
+    })
 }
 
 fn reference(a: &[f64], b: &[f64], m: usize, n: usize, kk: usize) -> Vec<f64> {

@@ -566,25 +566,26 @@ fn a_product_deals_its_columns_on_device(per_lane: usize) {
     let device = declared(target);
     let (rows, cols, depth) = (64usize, 64usize, 32usize);
     let w = 4 * per_lane;
-    let mut k = Kernel::new("deal");
-    let x = k.input::<BF16>("x", rows * depth);
-    let c = k.input::<BF16>("c", cols * depth);
-    let y = k.output::<F32>("y", rows * cols);
-    let at = k.output::<I32>("at", rows * cols);
-    k.warps(4);
-    let xv = k.view(x, 0, [depth, 1], Shape::new(rows, depth), [None, None]);
-    let cv = k.view(c, 0, [depth, 1], Shape::new(cols, depth), [None, None]);
-    let (xr, cr) = (k.load(xv), k.load(cv));
-    let zero = k.zeros::<F32>(Shape::new(rows, cols));
-    let s = k.mma(zero, xr, false, cr, true);
-    for j in 0..cols / w {
-        let (v, col) = (k.deal(s, w, j), k.deal_col(s, w, j));
-        let yv = k.view(y, j * w, [cols, 1], Shape::new(rows, w), [None, None]);
-        k.store(yv, v);
-        let av = k.view(at, j * w, [cols, 1], Shape::new(rows, w), [None, None]);
-        k.store(av, col);
-    }
-    let prog = k.finish();
+    let prog = Kernel::record("deal", |k| {
+        let x = k.input::<BF16>("x", rows * depth);
+        let c = k.input::<BF16>("c", cols * depth);
+        let y = k.output::<F32>("y", rows * cols);
+        let at = k.output::<I32>("at", rows * cols);
+        k.warps(4);
+        let xv = k.view(x, 0, [depth, 1], Shape::new(rows, depth), [None, None]);
+        let cv = k.view(c, 0, [depth, 1], Shape::new(cols, depth), [None, None]);
+        let (xr, cr) = (k.load(xv), k.load(cv));
+        let zero = k.zeros::<F32>(Shape::new(rows, cols));
+        let s = k.mma(zero, xr, false, cr, true);
+        for j in 0..cols / w {
+            let (v, col) = (k.deal(s, w, j), k.deal_col(s, w, j));
+            let yv = k.view(y, j * w, [cols, 1], Shape::new(rows, w), [None, None]);
+            k.store(yv, v);
+            let av = k.view(at, j * w, [cols, 1], Shape::new(rows, w), [None, None]);
+            k.store(av, col);
+        }
+    });
+    let prog = prog;
     let mut seed = 3;
     let xs = super::rounded(ScalarDType::BFloat16, rows * depth, &mut seed, |v| v);
     let cs = super::rounded(ScalarDType::BFloat16, cols * depth, &mut seed, |v| v);
@@ -625,17 +626,18 @@ fn a_flip_of_the_accumulator_matches_the_interpreter(grid: [u32; 2], half: usize
     let warps = WarpGrid { rows: grid[0], cols: grid[1] };
     let atom = target.mma(ScalarDType::BFloat16, ScalarDType::Float32).expect("a bf16 matrix core");
     let held = atom.issue(Orient::Direct, warps, rows, cols, 16).unwrap().c;
-    let mut k = Kernel::new("flip");
-    let x = k.input::<F32>("x", rows * cols);
-    let y = k.output::<F32>("y", rows * cols);
-    k.warps(warps.count());
-    let src = k.view(x, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
-    let v = k.load(src);
-    k.pin(v, held);
-    let flipped = k.flip(v, Axis::Col, half as u32);
-    let dst = k.view(y, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
-    k.store(dst, flipped);
-    let prog = k.finish();
+    let prog = Kernel::record("flip", |k| {
+        let x = k.input::<F32>("x", rows * cols);
+        let y = k.output::<F32>("y", rows * cols);
+        k.warps(warps.count());
+        let src = k.view(x, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
+        let v = k.load(src);
+        k.pin(v, held);
+        let flipped = k.flip(v, Axis::Col, half as u32);
+        let dst = k.view(y, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
+        k.store(dst, flipped);
+    });
+    let prog = prog;
     let xs: Vec<f64> = (0..rows * cols).map(|i| i as f64).collect();
     let want = run(&prog, vec![xs.clone(), vec![0.0; rows * cols]], &[]).unwrap();
     let x_t = Tensor::from_slice(xs.iter().map(|&v| v as f32).collect::<Vec<_>>());
@@ -654,18 +656,19 @@ fn a_flip_of_the_accumulator_matches_the_interpreter(grid: [u32; 2], half: usize
 fn a_periodic_table_matches_the_interpreter(period: usize) {
     let Some(target) = super::device_target() else { return };
     let (rows, cols, table_rows) = (64usize, 96usize, 37usize);
-    let mut k = Kernel::new("periodic");
-    let x = k.input::<BF16>("x", table_rows * period);
-    let y = k.output::<F32>("y", rows * cols);
-    k.warps(4);
-    let r = k.row();
-    let g = k.gather(x, 0, (r * 5 + 3) % table_rows * period, None, Shape::new(rows, cols), None);
-    let g = k.periodic(g, period);
-    let v = k.load(g);
-    let v = k.cast::<BF16, F32>(v);
-    let dst = k.view(y, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
-    k.store(dst, v);
-    let prog = k.finish();
+    let prog = Kernel::record("periodic", |k| {
+        let x = k.input::<BF16>("x", table_rows * period);
+        let y = k.output::<F32>("y", rows * cols);
+        k.warps(4);
+        let r = k.row();
+        let g = k.gather(x, 0, (r * 5 + 3) % table_rows * period, None, Shape::new(rows, cols), None);
+        let g = k.periodic(g, period);
+        let v = k.load(g);
+        let v = k.cast::<BF16, F32>(v);
+        let dst = k.view(y, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
+        k.store(dst, v);
+    });
+    let prog = prog;
     let mut seed = 3;
     let xs = super::rounded(ScalarDType::BFloat16, table_rows * period, &mut seed, |x| x);
     let want = run(&prog, vec![xs.clone(), vec![0.0; rows * cols]], &[]).unwrap();

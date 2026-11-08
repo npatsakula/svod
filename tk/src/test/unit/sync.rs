@@ -35,7 +35,7 @@ fn top(prog: &Program) -> Vec<&'static str> {
     kinds(prog, &prog.body)
 }
 
-fn out_view(k: &mut Kernel, out: ParamRef<BF16, Out>, at: usize) -> Gmem<BF16, Out> {
+fn out_view<'k>(k: &mut Kernel<'k>, out: ParamRef<'k, BF16, Out>, at: usize) -> Gmem<'k, BF16, Out> {
     k.view(out, at, [16, 1], Shape::new(16, 16), [None, None])
 }
 
@@ -44,24 +44,25 @@ fn out_view(k: &mut Kernel, out: ParamRef<BF16, Out>, at: usize) -> Gmem<BF16, O
 /// before the block reads it.
 #[test]
 fn warps_fence_their_own_effects_and_the_block_fences_theirs() {
-    let mut k = Kernel::new("warps");
-    k.warps(4);
-    let scratch = k.smem::<BF16>("scratch", 4 * 256);
-    let out = k.output::<BF16>("o", 2 * 256);
-    k.each_warp(|k| {
-        let w = k.warp();
-        let region = k.smem_view::<BF16>(scratch, w * 256, Shape::new(16, 16));
-        let z = k.zeros::<BF16>(Shape::new(16, 16));
-        k.store(region, z);
-        let back = k.load(region);
-        let o = out_view(k, out, 0);
-        k.store(o, back);
+    let prog = Kernel::record("warps", |k| {
+        k.warps(4);
+        let scratch = k.smem::<BF16>("scratch", 4 * 256);
+        let out = k.output::<BF16>("o", 2 * 256);
+        k.each_warp(|k| {
+            let w = k.warp();
+            let region = k.smem_view::<BF16>(scratch, w * 256, Shape::new(16, 16));
+            let z = k.zeros::<BF16>(Shape::new(16, 16));
+            k.store(region, z);
+            let back = k.load(region);
+            let o = out_view(k, out, 0);
+            k.store(o, back);
+        });
+        let first = k.smem_view::<BF16>(scratch, 0, Shape::new(16, 16));
+        let merged = k.load(first);
+        let o = out_view(k, out, 256);
+        k.store(o, merged);
     });
-    let first = k.smem_view::<BF16>(scratch, 0, Shape::new(16, 16));
-    let merged = k.load(first);
-    let o = out_view(&mut k, out, 256);
-    k.store(o, merged);
-    let mut prog = k.finish();
+    let mut prog = prog;
     insert_barriers(&mut prog).unwrap();
     assert_eq!(
         top(&prog),
@@ -132,22 +133,23 @@ fn a_key_warps_state_over_its_ring_is_fenced_by_the_warp_then_the_block() {
 /// not only fenced, before the block reads its tile.
 #[test]
 fn a_warps_async_copy_is_landed_before_the_block_reads_it() {
-    let mut k = Kernel::new("warps_async");
-    k.warps(4);
-    let src = k.input::<BF16>("x", 4 * 256);
-    let scratch = k.smem::<BF16>("scratch", 4 * 256);
-    k.each_warp(|k| {
-        let w = k.warp();
-        let g = k.view(src, w.clone() * 256, [16, 1], Shape::new(16, 16), [None, None]);
-        let region = k.smem_view::<BF16>(scratch, w * 256, Shape::new(16, 16));
-        k.stage(region, g, CopyMode::Async);
+    let prog = Kernel::record("warps_async", |k| {
+        k.warps(4);
+        let src = k.input::<BF16>("x", 4 * 256);
+        let scratch = k.smem::<BF16>("scratch", 4 * 256);
+        k.each_warp(|k| {
+            let w = k.warp();
+            let g = k.view(src, w.clone() * 256, [16, 1], Shape::new(16, 16), [None, None]);
+            let region = k.smem_view::<BF16>(scratch, w * 256, Shape::new(16, 16));
+            k.stage(region, g, CopyMode::Async);
+        });
+        let first = k.smem_view::<BF16>(scratch, 0, Shape::new(16, 16));
+        let merged = k.load(first);
+        let out = k.output::<BF16>("o", 256);
+        let o = out_view(k, out, 0);
+        k.store(o, merged);
     });
-    let first = k.smem_view::<BF16>(scratch, 0, Shape::new(16, 16));
-    let merged = k.load(first);
-    let out = k.output::<BF16>("o", 256);
-    let o = out_view(&mut k, out, 0);
-    k.store(o, merged);
-    let mut prog = k.finish();
+    let mut prog = prog;
     insert_barriers(&mut prog).unwrap();
     assert_eq!(top(&prog), ["other", "commit", "wait", "barrier", "load", "out"]);
 }
@@ -156,18 +158,19 @@ fn a_warps_async_copy_is_landed_before_the_block_reads_it() {
 /// after it even when its body ends on a barrier.
 #[test]
 fn a_store_before_a_loop_is_fenced_past_it() {
-    let mut k = Kernel::new("zero_trips");
-    let n = k.var("n", 0, 4);
-    let s = k.smem::<F32>("s", 256);
-    let tile = k.smem_view::<F32>(s, 0, Shape::new(16, 16));
-    let x = k.zeros::<F32>(Shape::new(16, 16));
-    k.store(tile, x);
-    k.loop_::<F32, 0>(n, [], |_, _, c| c);
-    let y = k.load(tile);
-    let out = k.output::<F32>("o", 256);
-    let o = k.view(out, 0, [16, 1], Shape::new(16, 16), [None, None]);
-    k.store(o, y);
-    let mut prog = k.finish();
+    let prog = Kernel::record("zero_trips", |k| {
+        let n = k.var("n", 0, 4);
+        let s = k.smem::<F32>("s", 256);
+        let tile = k.smem_view::<F32>(s, 0, Shape::new(16, 16));
+        let x = k.zeros::<F32>(Shape::new(16, 16));
+        k.store(tile, x);
+        k.loop_::<F32, 0>(n, [], |_, _, c| c);
+        let y = k.load(tile);
+        let out = k.output::<F32>("o", 256);
+        let o = k.view(out, 0, [16, 1], Shape::new(16, 16), [None, None]);
+        k.store(o, y);
+    });
+    let mut prog = prog;
     let Some(Stmt::Loop(l)) = prog.body.0.iter_mut().find(|s| matches!(s, Stmt::Loop(_))) else { panic!("a loop") };
     l.body.0.push(Stmt::Sync(Sync::Barrier { scope: Scope::Block }));
     insert_barriers(&mut prog).unwrap();
@@ -180,17 +183,18 @@ fn a_store_before_a_loop_is_fenced_past_it() {
 /// fenced before its tile is read.
 #[test]
 fn an_async_copy_is_waited_for_before_a_read() {
-    let mut k = Kernel::new("async");
-    let src = k.input::<BF16>("x", 256);
-    let g = k.view(src, 0, [16, 1], Shape::new(16, 16), [None, None]);
-    let s = k.smem::<BF16>("s", 256);
-    let tile = k.smem_view::<BF16>(s, 0, Shape::new(16, 16));
-    k.stage(tile, g, CopyMode::Async);
-    let y = k.load(tile);
-    let out = k.output::<BF16>("o", 256);
-    let o = out_view(&mut k, out, 0);
-    k.store(o, y);
-    let mut prog = k.finish();
+    let prog = Kernel::record("async", |k| {
+        let src = k.input::<BF16>("x", 256);
+        let g = k.view(src, 0, [16, 1], Shape::new(16, 16), [None, None]);
+        let s = k.smem::<BF16>("s", 256);
+        let tile = k.smem_view::<BF16>(s, 0, Shape::new(16, 16));
+        k.stage(tile, g, CopyMode::Async);
+        let y = k.load(tile);
+        let out = k.output::<BF16>("o", 256);
+        let o = out_view(k, out, 0);
+        k.store(o, y);
+    });
+    let mut prog = prog;
     insert_barriers(&mut prog).unwrap();
     assert_eq!(top(&prog), ["async", "commit", "wait", "barrier", "load", "out"]);
 }
@@ -212,35 +216,36 @@ enum Between {
 #[test_case(Between::Barrier; "an author's barrier")]
 #[test_case(Between::Loop; "a loop ending on a barrier")]
 fn a_pending_async_copy_survives_a_barrier(between: Between) {
-    let mut k = Kernel::new("async_then_barrier");
-    let src = k.input::<BF16>("x", 256);
-    let g = k.view(src, 0, [16, 1], Shape::new(16, 16), [None, None]);
-    let a = k.smem::<BF16>("a", 256);
-    let ta = k.smem_view::<BF16>(a, 0, Shape::new(16, 16));
-    let out = k.output::<BF16>("o", 768);
-    k.stage(ta, g, CopyMode::Async);
-    match between {
-        Between::Fence => {
-            let b = k.smem::<BF16>("b", 256);
-            let tb = k.smem_view::<BF16>(b, 0, Shape::new(16, 16));
-            let z = k.zeros::<BF16>(Shape::new(16, 16));
-            k.store(tb, z);
-            let yb = k.load(tb);
-            let o = out_view(&mut k, out, 512);
-            k.store(o, yb);
+    let prog = Kernel::record("async_then_barrier", |k| {
+        let src = k.input::<BF16>("x", 256);
+        let g = k.view(src, 0, [16, 1], Shape::new(16, 16), [None, None]);
+        let a = k.smem::<BF16>("a", 256);
+        let ta = k.smem_view::<BF16>(a, 0, Shape::new(16, 16));
+        let out = k.output::<BF16>("o", 768);
+        k.stage(ta, g, CopyMode::Async);
+        match between {
+            Between::Fence => {
+                let b = k.smem::<BF16>("b", 256);
+                let tb = k.smem_view::<BF16>(b, 0, Shape::new(16, 16));
+                let z = k.zeros::<BF16>(Shape::new(16, 16));
+                k.store(tb, z);
+                let yb = k.load(tb);
+                let o = out_view(k, out, 512);
+                k.store(o, yb);
+            }
+            Between::Loop => {
+                let n = k.var("n", 0, 4);
+                k.loop_::<F32, 0>(n, [], |_, _, c| c);
+            }
+            Between::Barrier => {}
         }
-        Between::Loop => {
-            let n = k.var("n", 0, 4);
-            k.loop_::<F32, 0>(n, [], |_, _, c| c);
+        for at in [0, 256] {
+            let y = k.load(ta);
+            let o = out_view(k, out, at);
+            k.store(o, y);
         }
-        Between::Barrier => {}
-    }
-    for at in [0, 256] {
-        let y = k.load(ta);
-        let o = out_view(&mut k, out, at);
-        k.store(o, y);
-    }
-    let mut prog = k.finish();
+    });
+    let mut prog = prog;
     let after_copy = top(&prog).iter().position(|s| *s == "async").unwrap() + 1;
     match between {
         Between::Barrier => prog.body.0.insert(after_copy, Stmt::Sync(Sync::Barrier { scope: Scope::Block })),
@@ -263,39 +268,39 @@ fn a_pending_async_copy_survives_a_barrier(between: Between) {
 /// A pipeline over a 16×16 ring in `ring`, summing its steps, with `before`
 /// and `after` run around it.
 fn around_a_pipeline(
-    before: impl FnOnce(&mut Kernel, Ring<BF16>),
-    after: impl FnOnce(&mut Kernel, Ring<BF16>),
+    before: impl for<'k> FnOnce(&mut Kernel<'k>, Ring<'k, BF16>),
+    after: impl for<'k> FnOnce(&mut Kernel<'k>, Ring<'k, BF16>),
 ) -> Program {
-    let mut k = Kernel::new("around_a_pipeline");
-    let x = k.input::<BF16>("x", 4 * 256);
-    let g = k.view(x, 0, [16, 1], Shape::new(16, 16), [None, None]);
-    let ring = k.ring::<BF16>("ring", 256, 2);
-    before(&mut k, ring);
-    let init = k.zeros::<F32>(Shape::new(16, 16));
-    let [sum] = k.pipeline(
-        4,
-        2,
-        [init],
-        |k, step, slot| {
-            let t = k.slot(ring, &slot, Shape::new(16, 16));
-            let src = k.at(g, step * 16, 0);
-            k.stage(t, src, CopyMode::Async);
-        },
-        |k, _step, slot, [sum]| {
-            let t = k.slot(ring, &slot, Shape::new(16, 16));
-            let y = k.load(t);
-            let y = k.cast::<BF16, F32>(y);
-            [k.binary(sum, y, BinaryOp::Add)]
-        },
-    );
-    after(&mut k, ring);
-    let out = k.output::<F32>("o", 256);
-    let o = k.view(out, 0, [16, 1], Shape::new(16, 16), [None, None]);
-    k.store(o, sum);
-    k.finish()
+    Kernel::record("around_a_pipeline", |k| {
+        let x = k.input::<BF16>("x", 4 * 256);
+        let g = k.view(x, 0, [16, 1], Shape::new(16, 16), [None, None]);
+        let ring = k.ring::<BF16>("ring", 256, 2);
+        before(k, ring);
+        let init = k.zeros::<F32>(Shape::new(16, 16));
+        let [sum] = k.pipeline(
+            4,
+            2,
+            [init],
+            |k, step, slot| {
+                let t = k.slot(ring, &slot, Shape::new(16, 16));
+                let src = k.at(g, step * 16, 0);
+                k.stage(t, src, CopyMode::Async);
+            },
+            |k, _step, slot, [sum]| {
+                let t = k.slot(ring, &slot, Shape::new(16, 16));
+                let y = k.load(t);
+                let y = k.cast::<BF16, F32>(y);
+                [k.binary(sum, y, BinaryOp::Add)]
+            },
+        );
+        after(k, ring);
+        let out = k.output::<F32>("o", 256);
+        let o = k.view(out, 0, [16, 1], Shape::new(16, 16), [None, None]);
+        k.store(o, sum);
+    })
 }
 
-fn zero_slot(k: &mut Kernel, ring: Ring<BF16>) -> Shared<BF16> {
+fn zero_slot<'k>(k: &mut Kernel<'k>, ring: Ring<'k, BF16>) -> Shared<'k, BF16> {
     // SAFETY: outside the pipeline, which the tests' fences order it against.
     let t = unsafe { k.ring_scratch::<BF16>(ring, 0, Shape::new(16, 16)) };
     let z = k.zeros::<BF16>(Shape::new(16, 16));
@@ -360,33 +365,34 @@ fn an_async_copy_is_landed_before_a_pipeline() {
 /// its own tiles within one step is fenced.
 #[test]
 fn a_consume_body_fences_its_own_tiles() {
-    let mut k = Kernel::new("consume_scratch");
-    let x = k.input::<BF16>("x", 4 * 256);
-    let g = k.view(x, 0, [16, 1], Shape::new(16, 16), [None, None]);
-    let ring = k.ring::<BF16>("ring", 256, 2);
-    let scratch = k.smem::<BF16>("scratch", 256);
-    let init = k.zeros::<BF16>(Shape::new(16, 16));
-    let [last] = k.pipeline(
-        4,
-        2,
-        [init],
-        |k, step, slot| {
-            let t = k.slot(ring, &slot, Shape::new(16, 16));
-            let src = k.at(g, step * 16, 0);
-            k.stage(t, src, CopyMode::Async);
-        },
-        |k, _step, slot, _| {
-            let t = k.slot(ring, &slot, Shape::new(16, 16));
-            let y = k.load(t);
-            let s = k.smem_view::<BF16>(scratch, 0, Shape::new(16, 16));
-            k.store(s, y);
-            [k.load(s)]
-        },
-    );
-    let out = k.output::<BF16>("o", 256);
-    let o = out_view(&mut k, out, 0);
-    k.store(o, last);
-    let mut prog = k.finish();
+    let prog = Kernel::record("consume_scratch", |k| {
+        let x = k.input::<BF16>("x", 4 * 256);
+        let g = k.view(x, 0, [16, 1], Shape::new(16, 16), [None, None]);
+        let ring = k.ring::<BF16>("ring", 256, 2);
+        let scratch = k.smem::<BF16>("scratch", 256);
+        let init = k.zeros::<BF16>(Shape::new(16, 16));
+        let [last] = k.pipeline(
+            4,
+            2,
+            [init],
+            |k, step, slot| {
+                let t = k.slot(ring, &slot, Shape::new(16, 16));
+                let src = k.at(g, step * 16, 0);
+                k.stage(t, src, CopyMode::Async);
+            },
+            |k, _step, slot, _| {
+                let t = k.slot(ring, &slot, Shape::new(16, 16));
+                let y = k.load(t);
+                let s = k.smem_view::<BF16>(scratch, 0, Shape::new(16, 16));
+                k.store(s, y);
+                [k.load(s)]
+            },
+        );
+        let out = k.output::<BF16>("o", 256);
+        let o = out_view(k, out, 0);
+        k.store(o, last);
+    });
+    let mut prog = prog;
     insert_barriers(&mut prog).unwrap();
     let Some(Stmt::Pipeline(p)) = prog.body.0.iter().find(|s| matches!(s, Stmt::Pipeline(_))) else {
         panic!("a pipeline")
@@ -436,24 +442,25 @@ fn a_block_barrier_under_a_branch_on_the_warp_is_refused(
     on_warp: bool,
     own: bool,
 ) -> Result<Vec<&'static str>, String> {
-    let mut k = Kernel::new("divergent");
-    let s = k.smem::<F32>("s", 256);
-    let out = k.output::<F32>("o", 256);
-    let pred = if on_warp { k.warp().lt(2) } else { k.block(0).lt(2) };
-    let body = |k: &mut Kernel| {
+    fn body<'k>(k: &mut Kernel<'k>, s: SmemRef<'k, F32>, out: ParamRef<'k, F32, Out>) {
         let tile = k.smem_view::<F32>(s, 0, Shape::new(16, 16));
         let x = k.zeros::<F32>(Shape::new(16, 16));
         k.store(tile, x);
         let y = k.load(tile);
         let o = k.view(out, 0, [16, 1], Shape::new(16, 16), [None, None]);
         k.store(o, y);
-    };
-    if own {
-        k.each_warp(|k| k.if_(pred, body, |_| {}));
-    } else {
-        k.if_(pred, body, |_| {});
     }
-    let mut prog = k.finish();
+    let prog = Kernel::record("divergent", |k| {
+        let s = k.smem::<F32>("s", 256);
+        let out = k.output::<F32>("o", 256);
+        let pred = if on_warp { k.warp().lt(2) } else { k.block(0).lt(2) };
+        if own {
+            k.each_warp(|k| k.if_(pred, |k| body(k, s, out), |_| {}));
+        } else {
+            k.if_(pred, |k| body(k, s, out), |_| {});
+        }
+    });
+    let mut prog = prog;
     insert_barriers(&mut prog).map_err(|e| e.to_string())?;
     let mut stmt = &prog.body.0[0];
     if let Stmt::Warps { body } = stmt {
@@ -469,26 +476,27 @@ fn a_block_barrier_under_a_branch_on_the_warp_is_refused(
 #[test_case(true => Err("a shared tile's fence is a block barrier under a branch on the warp, which some warps skip".into()); "through shared memory")]
 #[test_case(false => Ok(()); "in registers")]
 fn a_block_barrier_under_a_vote_is_refused(shared: bool) -> Result<(), String> {
-    let mut k = Kernel::new("voted");
-    let s = k.smem::<F32>("s", 256);
-    let x = k.zeros::<F32>(Shape::new(16, 16));
-    let low = k.reduce(x, Axis::Row, ReduceOp::Min);
-    let zero = k.zeros::<F32>(Shape::new(16, 1));
-    let pred = k.compare(low, zero, CmpOp::Lt);
-    k.where_any(
-        pred,
-        |k| {
-            if shared {
-                let tile = k.smem_view::<F32>(s, 0, Shape::new(16, 16));
-                k.store(tile, x);
-                let y = k.load(tile);
-                return [k.reduce(y, Axis::Row, ReduceOp::Max)];
-            }
-            [k.reduce(x, Axis::Row, ReduceOp::Max)]
-        },
-        [low],
-    );
-    let mut prog = k.finish();
+    let prog = Kernel::record("voted", |k| {
+        let s = k.smem::<F32>("s", 256);
+        let x = k.zeros::<F32>(Shape::new(16, 16));
+        let low = k.reduce(x, Axis::Row, ReduceOp::Min);
+        let zero = k.zeros::<F32>(Shape::new(16, 1));
+        let pred = k.compare(low, zero, CmpOp::Lt);
+        k.where_any(
+            pred,
+            |k| {
+                if shared {
+                    let tile = k.smem_view::<F32>(s, 0, Shape::new(16, 16));
+                    k.store(tile, x);
+                    let y = k.load(tile);
+                    return [k.reduce(y, Axis::Row, ReduceOp::Max)];
+                }
+                [k.reduce(x, Axis::Row, ReduceOp::Max)]
+            },
+            [low],
+        );
+    });
+    let mut prog = prog;
     insert_barriers(&mut prog).map_err(|e| e.to_string())
 }
 

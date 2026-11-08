@@ -524,19 +524,20 @@ fn a_predicate_met_inside_a_branch_guards_a_later_if(target: Target) {
     use crate::build::{I32, Kernel, Sc};
     use crate::ir::{Const, Shape};
     let GpuArch::Amd(arch) = target.arch else { unreachable!() };
-    let mut k = Kernel::new("nested_if");
-    k.grid([Sc::from(4), Sc::from(1), Sc::from(1)]);
-    k.warps(2);
-    let tile = Shape::new(16, 16);
-    let y = k.output::<I32>("y", 4 * 2 * tile.elems());
-    let slot = k.block(0) * 2 + k.warp();
-    let dst = k.view(y, slot * tile.elems(), [tile.cols, 1], tile, [None, None]);
-    let (outer, inner) = (k.block(0).lt(2), k.warp().eq(0));
-    let ones = k.fill::<I32>(tile, Const::Int(1));
-    let twos = k.fill::<I32>(tile, Const::Int(2));
-    k.if_(outer, |k| k.if_(inner.clone(), |k| k.store(dst, ones), |_| {}), |_| {});
-    k.if_(inner, |k| k.store(dst, twos), |_| {});
-    let prog = k.finish();
+    let prog = Kernel::record("nested_if", |k| {
+        k.grid([Sc::from(4), Sc::from(1), Sc::from(1)]);
+        k.warps(2);
+        let tile = Shape::new(16, 16);
+        let y = k.output::<I32>("y", 4 * 2 * tile.elems());
+        let slot = k.block(0) * 2 + k.warp();
+        let dst = k.view(y, slot * tile.elems(), [tile.cols, 1], tile, [None, None]);
+        let (outer, inner) = (k.block(0).lt(2), k.warp().eq(0));
+        let ones = k.fill::<I32>(tile, Const::Int(1));
+        let twos = k.fill::<I32>(tile, Const::Int(2));
+        k.if_(outer, |k| k.if_(inner.clone(), |k| k.store(dst, ones), |_| {}), |_| {});
+        k.if_(inner, |k| k.store(dst, twos), |_| {});
+    });
+    let prog = prog;
     let device = crate::atoms::Device { target: target.clone(), costs: crate::atoms::Costs::default() };
     let lowering = Lowering::new(&device);
     let ir = render(prog, &lowering);
@@ -918,17 +919,18 @@ fn a_bf16_sum_in_f32_takes_the_pair_dot_product_where_it_exists(target: Target, 
     use crate::ir::{ReduceOp, Shape};
     assert_eq!(target.dot2_bf16, dot2);
     let (rows, cols) = (4usize, 128usize);
-    let mut k = Kernel::new("held_sum");
-    k.warps(1);
-    let x = k.input::<F32>("x", rows * cols);
-    let y = k.output::<F32>("y", rows);
-    let xv = k.view(x, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
-    let xr = k.load(xv);
-    let held = k.cast_toward_zero::<BF16>(xr);
-    let sum = k.reduce_f32(held, Axis::Row, ReduceOp::Sum);
-    let yv = k.view(y, 0, [1, 1], Shape::new(rows, 1), [None, None]);
-    k.store(yv, sum);
-    let ir = render(k.finish(), &Lowering::new(&declared(target)));
+    let prog = Kernel::record("held_sum", |k| {
+        k.warps(1);
+        let x = k.input::<F32>("x", rows * cols);
+        let y = k.output::<F32>("y", rows);
+        let xv = k.view(x, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
+        let xr = k.load(xv);
+        let held = k.cast_toward_zero::<BF16>(xr);
+        let sum = k.reduce_f32(held, Axis::Row, ReduceOp::Sum);
+        let yv = k.view(y, 0, [1, 1], Shape::new(rows, 1), [None, None]);
+        k.store(yv, sum);
+    });
+    let ir = render(prog, &Lowering::new(&declared(target)));
     assert_eq!(ir.contains("@llvm.amdgcn.fdot2.f32.bf16("), dot2, "{ir}");
     // A lane's odd member out is widened on every target.
     assert!(dot2 || ir.contains("fpext bfloat"), "{ir}");
@@ -1084,19 +1086,19 @@ fn voted_rows() -> Program {
     use crate::build::{CmpOp, F32, Kernel};
     use crate::ir::{ReduceOp, Shape};
     let (rows, d) = (4, 256);
-    let mut k = Kernel::new("voted");
-    let x = k.input::<F32>("x", rows * d);
-    let y = k.output::<F32>("y", rows);
-    k.warps(rows as u32);
-    let xv = k.view(x, 0, [d, 1], Shape::new(rows, d), [None, None]);
-    let xs = k.load(xv);
-    let most = k.reduce(xs, Axis::Row, ReduceOp::Max);
-    let zero = k.zeros::<F32>(Shape::new(rows, 1));
-    let positive = k.compare(zero, most, CmpOp::Lt);
-    let [out] = k.where_any(positive, |k| [k.reduce(xs, Axis::Row, ReduceOp::Sum)], [most]);
-    let yv = k.view(y, 0, [1, 1], Shape::new(rows, 1), [None, None]);
-    k.store(yv, out);
-    k.finish()
+    Kernel::record("voted", |k| {
+        let x = k.input::<F32>("x", rows * d);
+        let y = k.output::<F32>("y", rows);
+        k.warps(rows as u32);
+        let xv = k.view(x, 0, [d, 1], Shape::new(rows, d), [None, None]);
+        let xs = k.load(xv);
+        let most = k.reduce(xs, Axis::Row, ReduceOp::Max);
+        let zero = k.zeros::<F32>(Shape::new(rows, 1));
+        let positive = k.compare(zero, most, CmpOp::Lt);
+        let [out] = k.where_any(positive, |k| [k.reduce(xs, Axis::Row, ReduceOp::Sum)], [most]);
+        let yv = k.view(y, 0, [1, 1], Shape::new(rows, 1), [None, None]);
+        k.store(yv, out);
+    })
 }
 
 /// Small integers, every one of rows 0 and 2 negative, so their sums and

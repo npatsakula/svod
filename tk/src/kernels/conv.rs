@@ -112,13 +112,13 @@ pub fn conv<T: Half>(spec: &ConvSpec) -> Program {
         Batch::Static(n) => n,
         Batch::Var(_) => 1,
     };
-    mainloop_gemm::<T, _>("conv", &gemm, images * g.h * g.w * g.cin, spec.split, |_k, x, bb, row0| {
+    let (m, slices, shape) = (gemm.m, spec.cfg.slices(), Shape::new(spec.cfg.tile[0], bk));
+    mainloop_gemm::<T>("conv", &gemm, images * g.h * g.w * g.cin, spec.split, |_k, x, bb, row0| {
         let base = bb.clone().map_or(Sc::from(0), |b| b * (g.h * g.w * g.cin));
-        let shape = Shape::new(spec.cfg.tile[0], bk);
-        move |k: &mut Kernel, step: Sc, koff: Sc| {
-            let v = im2col_view(k, x, &g, gemm.m, base.clone(), row0.clone(), step.clone(), shape);
-            if spec.cfg.slices() == 1 { v } else { k.at(v, 0, koff - step * bk) }
-        }
+        Box::new(move |k, step: Sc<'_>, koff| {
+            let v = im2col_view(k, x, &g, m, base.clone(), row0.clone(), step.clone(), shape);
+            if slices == 1 { v } else { k.at(v, 0, koff - step * bk) }
+        })
     })
 }
 
@@ -128,16 +128,16 @@ pub fn conv<T: Half>(spec: &ConvSpec) -> Program {
 /// padding or past `m`. The row decode reads only the row and the block, so
 /// the lowering lists it once; a step adds the tap's offset.
 #[allow(clippy::too_many_arguments)]
-pub fn im2col_view<T: Elem>(
-    k: &mut Kernel,
-    x: ParamRef<T, In>,
+pub fn im2col_view<'k, T: Elem>(
+    k: &mut Kernel<'k>,
+    x: ParamRef<'k, T, In>,
     g: &ConvGeom,
     m: usize,
-    base: Sc,
-    row0: Sc,
-    step: Sc,
+    base: Sc<'k>,
+    row0: Sc<'k>,
+    step: Sc<'k>,
     shape: Shape,
-) -> Gmem<T> {
+) -> Gmem<'k, T> {
     let [ho, wo] = g.out_hw();
     let (bk, kw, [sh, sw], [ph, pw], [dh, dw]) = (shape.cols, g.kernel[1], g.stride, g.pad, g.dilation);
     let spt = g.cin / bk;
@@ -149,7 +149,7 @@ pub fn im2col_view<T: Elem>(
     let (iy0, ix0) = (rem.clone() / wo * sh - ph as i64, rem % wo * sw - pw as i64);
     let start = ((i.clone() / (ho * wo) * g.h + iy0.clone()) * g.w + ix0.clone()) * g.cin;
     let (iy, ix) = (iy0 + ky.clone(), ix0 + kx.clone());
-    let inside = |v: Sc, len: usize| Sc::from(0).le(v.clone()).and(v.lt(len));
+    let inside = |v: Sc<'k>, len: usize| Sc::from(0).le(v.clone()).and(v.lt(len));
     let mut valid = inside(iy, g.h).and(inside(ix, g.w));
     if !m.is_multiple_of(shape.rows) {
         valid = valid.and(i.lt(m));
