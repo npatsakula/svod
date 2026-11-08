@@ -554,16 +554,16 @@ fn transposing_loads_land_as_their_layout() {
 #[test_case(2; "two of a lane's columns each deal")]
 fn a_product_deals_its_columns_on_device(per_lane: usize) {
     use crate::build::{F32, I32, Kernel};
-    use crate::ir::{ParamKind, Shape};
+    use crate::ir::Shape;
     let Some(target) = super::device_target() else { return };
     let device = declared(target);
     let (rows, cols, depth) = (64usize, 64usize, 32usize);
     let w = 4 * per_lane;
     let mut k = Kernel::new("deal");
-    let x = k.param::<BF16>("x", ParamKind::In, rows * depth);
-    let c = k.param::<BF16>("c", ParamKind::In, cols * depth);
-    let y = k.param::<F32>("y", ParamKind::Out, rows * cols);
-    let at = k.param::<I32>("at", ParamKind::Out, rows * cols);
+    let x = k.input::<BF16>("x", rows * depth);
+    let c = k.input::<BF16>("c", cols * depth);
+    let y = k.output::<F32>("y", rows * cols);
+    let at = k.output::<I32>("at", rows * cols);
     k.warps(4);
     let xv = k.view(x, 0, [depth, 1], Shape::new(rows, depth), [None, None]);
     let cv = k.view(c, 0, [depth, 1], Shape::new(cols, depth), [None, None]);
@@ -619,8 +619,8 @@ fn a_flip_of_the_accumulator_matches_the_interpreter(grid: [u32; 2], half: usize
     let atom = target.mma(ScalarDType::BFloat16, ScalarDType::Float32).expect("a bf16 matrix core");
     let held = atom.issue(Orient::Direct, warps, rows, cols, 16).unwrap().c;
     let mut k = Kernel::new("flip");
-    let x = k.param::<F32>("x", ParamKind::In, rows * cols);
-    let y = k.param::<F32>("y", ParamKind::Out, rows * cols);
+    let x = k.input::<F32>("x", rows * cols);
+    let y = k.output::<F32>("y", rows * cols);
     k.warps(warps.count());
     let src = k.view(x, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
     let v = k.load(src);
@@ -648,8 +648,8 @@ fn a_periodic_table_matches_the_interpreter(period: usize) {
     let Some(target) = super::device_target() else { return };
     let (rows, cols, table_rows) = (64usize, 96usize, 37usize);
     let mut k = Kernel::new("periodic");
-    let x = k.param::<BF16>("x", ParamKind::In, table_rows * period);
-    let y = k.param::<F32>("y", ParamKind::Out, rows * cols);
+    let x = k.input::<BF16>("x", table_rows * period);
+    let y = k.output::<F32>("y", rows * cols);
     k.warps(4);
     let r = k.row();
     let g = k.gather(x, 0, (r * 5 + 3) % table_rows * period, None, Shape::new(rows, cols), None);

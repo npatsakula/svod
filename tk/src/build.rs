@@ -60,7 +60,39 @@ impl MmaIn for I8 {
     }
 }
 
+/// How a kernel touches a parameter: reads it, writes it, or both.
+pub trait Access: Copy {
+    const KIND: ParamKind;
+}
+macro_rules! access {
+    ($($name:ident),*) => {$(
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub struct $name;
+        impl Access for $name {
+            const KIND: ParamKind = ParamKind::$name;
+        }
+    )*};
+}
+access!(In, Out, InOut);
+
 pub trait TierMark: Copy {}
+/// A tier a register tile is loaded from.
+pub trait Readable: TierMark {}
+/// A tier a register tile is stored to.
+pub trait Writable: TierMark {}
+/// A window into a parameter, which the author moves ([`Kernel::at`]).
+pub trait Window: TierMark {}
+
+/// A view of a parameter the kernel accesses as `A`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Global<A: Access>(PhantomData<A>);
+impl<A: Access> TierMark for Global<A> {}
+impl<A: Access> Window for Global<A> {}
+impl Readable for Global<In> {}
+impl Readable for Global<InOut> {}
+impl Writable for Global<Out> {}
+impl Writable for Global<InOut> {}
+
 macro_rules! tier {
     ($($name:ident),*) => {$(
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,7 +100,12 @@ macro_rules! tier {
         impl TierMark for $name {}
     )*};
 }
-tier!(Global, Smem, Reg);
+tier!(Smem, Reg, Period);
+impl Readable for Reg {}
+impl Readable for Smem {}
+impl Writable for Smem {}
+impl Readable for Period {}
+impl Window for Period {}
 
 /// A tile handle; `P` is its tier marker and `T` its element type.
 pub struct Tile<P, T>(pub ValId, PhantomData<(P, T)>);
@@ -95,9 +132,12 @@ impl<P, T> Tile<P, T> {
     }
 }
 
-pub type Gmem<T> = Tile<Global, T>;
+pub type Gmem<T, A = In> = Tile<Global<A>, T>;
 pub type Shared<T> = Tile<Smem, T>;
 pub type Regs<T> = Tile<Reg, T>;
+/// A global view whose columns repeat ([`Kernel::periodic`]): read into
+/// registers only.
+pub type Periodic<T> = Tile<Period, T>;
 
 /// A scalar expression: built with ordinary operators, interned into the
 /// program's arena by the builder call that consumes it.
@@ -156,8 +196,9 @@ macro_rules! sc_ops {
 }
 sc_ops!(Add add Add, Sub sub Sub, Mul mul Mul, Div div Div, Rem rem Rem);
 
+/// A parameter of `T` elements the kernel accesses as `A`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ParamRef<T>(pub ParamId, PhantomData<T>);
+pub struct ParamRef<T, A: Access>(pub ParamId, PhantomData<(T, A)>);
 
 /// A shared allocation of `T` elements.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -232,9 +273,28 @@ impl Kernel {
 
     // ---- program-level declarations -------------------------------------
 
-    pub fn param<T: Elem>(&mut self, name: impl Into<String>, kind: ParamKind, elems: usize) -> ParamRef<T> {
-        self.prog.params.push(Param { name: name.into(), dtype: T::DTYPE, kind, elems });
+    fn param<T: Elem, A: Access>(&mut self, name: impl Into<String>, elems: usize) -> ParamRef<T, A> {
+        self.prog.params.push(Param { name: name.into(), dtype: T::DTYPE, kind: A::KIND, elems });
         ParamRef(ParamId(self.prog.params.len() as u32 - 1), PhantomData)
+    }
+
+    /// A parameter of `elems` elements the kernel reads.
+    pub fn input<T: Elem>(&mut self, name: impl Into<String>, elems: usize) -> ParamRef<T, In> {
+        self.param(name, elems)
+    }
+
+    /// A parameter of `elems` elements the kernel writes and never reads.
+    pub fn output<T: Elem>(&mut self, name: impl Into<String>, elems: usize) -> ParamRef<T, Out> {
+        self.param(name, elems)
+    }
+
+    /// A parameter of `elems` elements the kernel writes and reads back.
+    /// Nothing orders a load after a store to it but each lane's own program
+    /// order: no fence is emitted, so a read-back is correct only where the
+    /// lanes that read an element are the lanes that stored it, which is the
+    /// case for the same tile shape under the same layout.
+    pub fn inout<T: Elem>(&mut self, name: impl Into<String>, elems: usize) -> ParamRef<T, InOut> {
+        self.param(name, elems)
     }
 
     /// A symbolic variable in `min..=max` the launch binds by name; asked
@@ -304,8 +364,14 @@ impl Kernel {
 
     /// `param[index]` of an integer input: no store of the kernel changes it,
     /// so the lowering reads it once, wherever its index is known.
-    pub fn load_scalar<T: Elem>(&mut self, param: ParamRef<T>, index: impl Into<Sc>) -> Sc {
-        assert_eq!(self.prog.params[param.0.index()].kind, ParamKind::In, "a scalar load reads an input");
+    ///
+    /// ```compile_fail
+    /// use svod_tk::build::*;
+    /// let mut k = Kernel::new("read");
+    /// let p = k.inout::<I32>("p", 4);
+    /// k.load_scalar(p, 0); // a parameter the kernel writes is not `In`
+    /// ```
+    pub fn load_scalar<T: Elem>(&mut self, param: ParamRef<T, In>, index: impl Into<Sc>) -> Sc {
         let index = self.intern(index);
         self.scalar(Scalar::Load { param: param.0, index })
     }
@@ -325,14 +391,14 @@ impl Kernel {
     /// apart and columns `stride.1` apart; `bounds` are its valid row/column
     /// counts: writes past them are dropped, register loads read zero, and a
     /// fill into shared memory clamps (see [`Place::Global`]).
-    pub fn view<T: Elem>(
+    pub fn view<T: Elem, A: Access>(
         &mut self,
-        param: ParamRef<T>,
+        param: ParamRef<T, A>,
         offset: impl Into<Sc>,
         stride: [impl Into<Sc>; 2],
         shape: Shape,
         bounds: [Option<Sc>; 2],
-    ) -> Gmem<T> {
+    ) -> Gmem<T, A> {
         let offset = self.intern(offset);
         let stride = stride.map(|s| self.intern(s));
         let bounds = bounds.map(|b| b.map(|s| self.intern(s)));
@@ -344,15 +410,15 @@ impl Kernel {
     /// `offset + rows[Row := r]` (see [`Self::row`]) and reads zero wherever
     /// `valid[Row := r]` is zero, on every path; `col_bound` is a plain column
     /// bound.
-    pub fn gather<T: Elem>(
+    pub fn gather<T: Elem, A: Access>(
         &mut self,
-        param: ParamRef<T>,
+        param: ParamRef<T, A>,
         offset: impl Into<Sc>,
         rows: Sc,
         valid: Option<Sc>,
         shape: Shape,
         col_bound: Option<Sc>,
-    ) -> Gmem<T> {
+    ) -> Gmem<T, A> {
         let offset = self.intern(offset);
         let rows = RowMap { offset: self.intern(rows), valid: valid.map(|v| self.intern(v)) };
         let stride = [self.intern(0), self.intern(1)];
@@ -368,7 +434,22 @@ impl Kernel {
     /// column `c % period`, a table every block of `period` columns shares.
     /// Its contiguous columns hold the period, and it is read into
     /// registers only.
-    pub fn periodic<T: Elem>(&mut self, view: Gmem<T>, period: usize) -> Gmem<T> {
+    ///
+    /// ```compile_fail
+    /// use svod_tk::build::*;
+    /// use svod_tk::ir::Shape;
+    /// let mut k = Kernel::new("table");
+    /// let p = k.input::<F32>("p", 16);
+    /// let v = k.view(p, 0, [4, 1], Shape::new(1, 16), [None, None]);
+    /// let table = k.periodic(v, 4);
+    /// let s = k.smem::<F32>("s", 16);
+    /// let t = k.smem_view(s, 0, Shape::new(1, 16));
+    /// k.stage(t, table, svod_tk::ir::CopyMode::Sync); // a periodic view is not staged
+    /// ```
+    pub fn periodic<T: Elem, A: Access>(&mut self, view: Gmem<T, A>, period: usize) -> Periodic<T>
+    where
+        Global<A>: Readable,
+    {
         let Value { dtype, shape, place } = self.prog.value(view.0).clone();
         let Place::Global { param, offset, stride, bounds, rows, period: None } = place else {
             unreachable!("a global view of one period")
@@ -386,7 +467,7 @@ impl Kernel {
 
     /// The same window moved by `rows`/`cols` elements, keeping its bounds
     /// relative to the new origin. A gathered view moves along its columns only.
-    pub fn at<T: Elem>(&mut self, view: Gmem<T>, rows: impl Into<Sc>, cols: impl Into<Sc>) -> Gmem<T> {
+    pub fn at<T: Elem, P: Window>(&mut self, view: Tile<P, T>, rows: impl Into<Sc>, cols: impl Into<Sc>) -> Tile<P, T> {
         let (rows, cols) = (rows.into(), cols.into());
         let Value { dtype, shape, place } = self.prog.value(view.0).clone();
         let Place::Global { param, offset, stride, bounds, rows: map, period } = place else {
@@ -401,7 +482,7 @@ impl Kernel {
     }
 
     /// The first `shape` rows and columns of `view`.
-    pub fn narrow<T: Elem>(&mut self, view: Gmem<T>, shape: Shape) -> Gmem<T> {
+    pub fn narrow<T: Elem, P: Window>(&mut self, view: Tile<P, T>, shape: Shape) -> Tile<P, T> {
         let Value { dtype, shape: whole, place } = self.prog.value(view.0).clone();
         assert!(shape.rows <= whole.rows && shape.cols <= whole.cols, "a window within the view");
         Tile::new(self.value(dtype, shape, place))
@@ -514,7 +595,7 @@ impl Kernel {
     /// `acc + A·B` where `A` is `[m, k]` (or `[k, m]` when `a_t`) and `B` is
     /// `[k, n]` (or `[n, k]` when `b_t`); operands may live in registers or
     /// shared memory, the accumulator in `T`'s type ([`MmaIn::Acc`]).
-    pub fn mma<T: MmaIn, PA: TierMark, PB: TierMark>(
+    pub fn mma<T: MmaIn, PA: Readable, PB: Readable>(
         &mut self,
         acc: Regs<T::Acc>,
         a: Tile<PA, T>,
@@ -527,7 +608,7 @@ impl Kernel {
 
     /// [`Self::mma`] pinned to issue `orient` way round; `None` leaves the
     /// choice to the layout inference.
-    pub fn mma_oriented<T: MmaIn, PA: TierMark, PB: TierMark>(
+    pub fn mma_oriented<T: MmaIn, PA: Readable, PB: Readable>(
         &mut self,
         acc: Regs<T::Acc>,
         a: Tile<PA, T>,
@@ -624,26 +705,40 @@ impl Kernel {
     // ---- movement --------------------------------------------------------
 
     fn copy(&mut self, dst: ValId, src: ValId, mode: CopyMode) {
-        let (d, s) = (self.prog.value(dst), self.prog.value(src));
-        assert_eq!(d.shape, s.shape, "copy shapes");
-        assert_eq!(d.dtype, s.dtype, "copy dtypes");
-        if let Place::Global { param, period, .. } = d.place {
-            assert_ne!(self.prog.params[param.index()].kind, ParamKind::In, "a store into an input");
-            assert!(period.is_none(), "a store into a periodic view");
-        }
-        if let Place::Global { period: Some(_), .. } = s.place {
-            assert_eq!(d.place, Place::Reg, "a periodic view is read into registers only");
-        }
+        assert_eq!(self.prog.value(dst).shape, self.prog.value(src).shape, "copy shapes");
         self.push(Stmt::Copy { dst, src, mode, scope: self.scope });
     }
 
     /// Global → shared; `Async` lets the lowering overlap it.
-    pub fn stage<T: Elem>(&mut self, dst: Shared<T>, src: Gmem<T>, mode: CopyMode) {
+    ///
+    /// ```compile_fail
+    /// use svod_tk::build::*;
+    /// use svod_tk::ir::{CopyMode, Shape};
+    /// let mut k = Kernel::new("stage");
+    /// let p = k.output::<F32>("p", 16);
+    /// let v = k.view(p, 0, [4, 1], Shape::new(4, 4), [None, None]);
+    /// let s = k.smem::<F32>("s", 16);
+    /// let t = k.smem_view(s, 0, Shape::new(4, 4));
+    /// k.stage(t, v, CopyMode::Async); // an output is not `Readable`
+    /// ```
+    pub fn stage<T: Elem, A: Access>(&mut self, dst: Shared<T>, src: Gmem<T, A>, mode: CopyMode)
+    where
+        Global<A>: Readable,
+    {
         self.copy(dst.0, src.0, mode);
     }
 
     /// Shared or global → a fresh register tile.
-    pub fn load<T: Elem, P: TierMark>(&mut self, src: Tile<P, T>) -> Regs<T> {
+    ///
+    /// ```compile_fail
+    /// use svod_tk::build::*;
+    /// use svod_tk::ir::Shape;
+    /// let mut k = Kernel::new("load");
+    /// let p = k.output::<F32>("p", 16);
+    /// let v = k.view(p, 0, [4, 1], Shape::new(4, 4), [None, None]);
+    /// k.load(v); // an output is not `Readable`
+    /// ```
+    pub fn load<T: Elem, P: Readable>(&mut self, src: Tile<P, T>) -> Regs<T> {
         let Value { dtype, shape, .. } = self.prog.value(src.0).clone();
         let dst = self.value(dtype, shape, Place::Reg);
         self.copy(dst, src.0, CopyMode::Sync);
@@ -653,7 +748,10 @@ impl Kernel {
     /// Global → registers as the register half of the target's fill loads:
     /// the same instruction class and cache policy as a fill of `src`
     /// ([`CopyMode::Staged`]), where [`Self::load`] is a plain load.
-    pub fn load_as_fill<T: Elem>(&mut self, src: Gmem<T>) -> Regs<T> {
+    pub fn load_as_fill<T: Elem, A: Access>(&mut self, src: Gmem<T, A>) -> Regs<T>
+    where
+        Global<A>: Readable,
+    {
         let Value { dtype, shape, .. } = self.prog.value(src.0).clone();
         let dst = self.value(dtype, shape, Place::Reg);
         self.copy(dst, src.0, CopyMode::Staged);
@@ -661,7 +759,17 @@ impl Kernel {
     }
 
     /// Registers → shared or global.
-    pub fn store<T: Elem, P: TierMark>(&mut self, dst: Tile<P, T>, src: Regs<T>) {
+    ///
+    /// ```compile_fail
+    /// use svod_tk::build::*;
+    /// use svod_tk::ir::Shape;
+    /// let mut k = Kernel::new("store");
+    /// let p = k.input::<I32>("p", 4);
+    /// let v = k.splat::<I32>(Shape::new(1, 4), 1);
+    /// let out = k.view(p, 0, [4, 1], Shape::new(1, 4), [None, None]);
+    /// k.store(out, v); // an input is not `Writable`
+    /// ```
+    pub fn store<T: Elem, P: Writable>(&mut self, dst: Tile<P, T>, src: Regs<T>) {
         self.copy(dst.0, src.0, CopyMode::Sync);
     }
 

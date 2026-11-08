@@ -45,28 +45,35 @@ pub fn norm<T: Elem>(spec: &NormSpec) -> Program {
         Norm::Layer => "layer_norm",
         Norm::Rms => "rms_norm",
     });
-    let x = k.param::<T>("x", ParamKind::In, elems);
-    let r = residual.then(|| k.param::<T>("residual", ParamKind::In, elems));
-    let w = k.param::<T>("w", ParamKind::In, d);
-    let b = (norm == Norm::Layer && bias).then(|| k.param::<T>("b", ParamKind::In, d));
-    let out = k.param::<T>("out", ParamKind::Out, elems);
-    let sum = residual.then(|| k.param::<T>("sum", ParamKind::Out, elems));
+    let x = k.input::<T>("x", elems);
+    let r = residual.then(|| k.input::<T>("residual", elems));
+    let w = k.input::<T>("w", d);
+    let b = (norm == Norm::Layer && bias).then(|| k.input::<T>("b", d));
+    let out = k.output::<T>("out", elems);
+    let sum = residual.then(|| k.output::<T>("sum", elems));
     let (gz, bb) = batch.axis(&mut k);
     k.grid([Sc::from(rows.div_ceil(br)), Sc::from(1), gz]);
     k.warps(br as u32);
     let row0 = k.block(0) * br;
-    let at = |k: &mut Kernel, p: ParamRef<T>| {
-        let v = k.view(p, batch_offset(&bb, rows * d), [d, 1], Shape::new(br, d), [bound(rows, br), None]);
+    // The block's rows of an `[rows, d]` parameter.
+    fn at<T: Elem, A: Access>(
+        k: &mut Kernel,
+        p: ParamRef<T, A>,
+        bb: &Option<Sc>,
+        [rows, br, d]: [usize; 3],
+        row0: &Sc,
+    ) -> Gmem<T, A> {
+        let v = k.view(p, batch_offset(bb, rows * d), [d, 1], Shape::new(br, d), [bound(rows, br), None]);
         k.at(v, row0.clone(), 0)
-    };
-    let xv = at(&mut k, x);
+    }
+    let xv = at(&mut k, x, &bb, [rows, br, d], &row0);
     let mut xs = load_f32(&mut k, xv);
     if let (Some(r), Some(sum)) = (r, sum) {
-        let rv = at(&mut k, r);
+        let rv = at(&mut k, r, &bb, [rows, br, d], &row0);
         let rs = load_f32(&mut k, rv);
         let s = k.binary(xs, rs, BinaryOp::Add);
         let s = k.cast::<F32, T>(s);
-        let sv = at(&mut k, sum);
+        let sv = at(&mut k, sum, &bb, [rows, br, d], &row0);
         k.store(sv, s);
         xs = k.cast::<T, F32>(s);
     }
@@ -86,7 +93,7 @@ pub fn norm<T: Elem>(spec: &NormSpec) -> Program {
     let var = affine(&mut k, var, 1.0, eps);
     let inv = k.unary(var, UnaryOp::Rsqrt);
     let mut y = k.binary(centered, inv, BinaryOp::Mul);
-    let vector = |k: &mut Kernel, p: ParamRef<T>| {
+    let vector = |k: &mut Kernel, p: ParamRef<T, In>| {
         let v = k.view(p, 0, [0, 1], Shape::new(1, d), [None, None]);
         load_f32(k, v)
     };
@@ -97,7 +104,7 @@ pub fn norm<T: Elem>(spec: &NormSpec) -> Program {
         y = k.binary(y, bv, BinaryOp::Add);
     }
     let y = k.cast::<F32, T>(y);
-    let ov = at(&mut k, out);
+    let ov = at(&mut k, out, &bb, [rows, br, d], &row0);
     k.store(ov, y);
     k.finish()
 }

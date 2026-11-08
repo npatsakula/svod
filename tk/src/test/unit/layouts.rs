@@ -82,7 +82,7 @@ fn gemm_accumulator_gets_the_core_layout_over_the_warp_grid() {
 fn attention_probabilities_feed_the_second_mma_without_data_movement() {
     let (bq, bkv, d) = (64usize, 64usize, 64usize);
     let mut k = Kernel::new("fa");
-    let q = k.param::<BF16>("q", ParamKind::In, bq * d);
+    let q = k.input::<BF16>("q", bq * d);
     let kk = k.smem::<BF16>("k", bkv * d);
     let vv = k.smem::<BF16>("v", bkv * d);
     let q_g = k.view(q, 0, [d, 1], Shape::new(bq, d), [None, None]);
@@ -99,7 +99,7 @@ fn attention_probabilities_feed_the_second_mma_without_data_movement() {
     let o0 = k.zeros::<F32>(Shape::new(bq, d));
     let o = k.mma(o0, p16, false, v_s, false);
     let o = k.binary(o, l, BinaryOp::Div);
-    let out = k.param::<F32>("o", ParamKind::Out, bq * d);
+    let out = k.output::<F32>("o", bq * d);
     let o_g = k.view(out, 0, [d, 1], Shape::new(bq, d), [None, None]);
     k.store(o_g, o);
     k.warps(4);
@@ -156,8 +156,8 @@ fn a_product_result_pinned_off_its_atom_is_refused() {
     let shape = Shape::new(16, 16);
     let mut k = Kernel::new("pinned_product");
     k.warps(1);
-    let a = k.param::<BF16>("a", ParamKind::In, shape.elems());
-    let c = k.param::<F32>("c", ParamKind::Out, shape.elems());
+    let a = k.input::<BF16>("a", shape.elems());
+    let c = k.output::<F32>("c", shape.elems());
     let v = k.view(a, 0, [16, 1], shape, [None, None]);
     let x = k.load(v);
     let zero = k.zeros::<F32>(shape);
@@ -226,8 +226,8 @@ fn chunked_layouts_cover_their_tile_in_16_byte_runs(
 fn elementwise_operands_reach_the_op_in_its_layout() {
     let mut k = Kernel::new("mixed");
     k.warps(1);
-    let x = k.param::<BF16>("x", ParamKind::In, 256);
-    let y = k.param::<BF16>("y", ParamKind::In, 256);
+    let x = k.input::<BF16>("x", 256);
+    let y = k.input::<BF16>("y", 256);
     let view = |k: &mut Kernel, p| k.view(p, 0, [16, 1], Shape::new(16, 16), [None, None]);
     let (xg, yg) = (view(&mut k, x), view(&mut k, y));
     let (xr, yr) = (k.load(xg), k.load(yg));
@@ -237,7 +237,7 @@ fn elementwise_operands_reach_the_op_in_its_layout() {
     let sum = k.cast::<BF16, F32>(sum);
     let both = k.binary(prod, sum, BinaryOp::Mul);
     // Laid only by what follows: the sum as a B operand, `u` as an A one.
-    let z = k.param::<BF16>("z", ParamKind::In, 512);
+    let z = k.input::<BF16>("z", 512);
     let (ug, wg) = (view(&mut k, z), k.view(z, 256, [16, 1], Shape::new(16, 16), [None, None]));
     let (u, w) = (k.load(ug), k.load(wg));
     let uw = k.binary(u, w, BinaryOp::Add);
@@ -245,7 +245,7 @@ fn elementwise_operands_reach_the_op_in_its_layout() {
     let first = k.mma(acc, u, false, yr, false);
     let again = k.mma(first, xr, false, uw, false);
     let both = k.binary(both, again, BinaryOp::Add);
-    let out = k.param::<F32>("o", ParamKind::Out, 256);
+    let out = k.output::<F32>("o", 256);
     let o = k.view(out, 0, [16, 1], Shape::new(16, 16), [None, None]);
     k.store(o, both);
     let Laid { prog, layouts } = infer(k.finish(), &declared(sm86()), Core::Warp).unwrap();
@@ -267,10 +267,10 @@ fn elementwise_operands_reach_the_op_in_its_layout() {
 fn attention_step(bias: bool) -> Program {
     let (bq, bkv, d) = (64usize, 16usize, 64usize);
     let mut k = Kernel::new("fa");
-    let q = k.param::<BF16>("q", ParamKind::In, bq * d);
+    let q = k.input::<BF16>("q", bq * d);
     // Rows a line apart, as the kernel's bias views are (`bias_stride`):
     // a lane's row is a line of its own.
-    let b = k.param::<BF16>("bias", ParamKind::In, bq * 64);
+    let b = k.input::<BF16>("bias", bq * 64);
     let kk = k.smem::<BF16>("k", bkv * d);
     let vv = k.smem::<BF16>("v", bkv * d);
     let q_g = k.view(q, 0, [d, 1], Shape::new(bq, d), [None, None]);
@@ -291,7 +291,7 @@ fn attention_step(bias: bool) -> Program {
     let p16 = k.cast::<F32, BF16>(p);
     let o0 = k.zeros::<F32>(Shape::new(bq, d));
     let o = k.mma(o0, p16, false, v_s, false);
-    let out = k.param::<F32>("o", ParamKind::Out, bq * d);
+    let out = k.output::<F32>("o", bq * d);
     let o_g = k.view(out, 0, [d, 1], Shape::new(bq, d), [None, None]);
     k.store(o_g, o);
     let mut prog = k.finish();
@@ -566,13 +566,13 @@ fn a_fold_issues_the_lane_moves_it_is_priced(target: Target, orient: Orient, axi
     let mut k = Kernel::new("fold");
     k.warps(grid);
     let tile = Shape::new(rows, cols);
-    let x = k.param::<F32>("x", ParamKind::In, tile.elems());
+    let x = k.input::<F32>("x", tile.elems());
     let x = k.view(x, 0, [cols, 1], tile, [None, None]);
     let x = k.load(x);
     k.pin(x, held.clone());
     let folded = k.reduce(x, axis, ReduceOp::Max);
     let out = k.shape(folded);
-    let y = k.param::<F32>("y", ParamKind::Out, out.elems());
+    let y = k.output::<F32>("y", out.elems());
     let y = k.view(y, 0, [out.cols, 1], out, [None, None]);
     k.store(y, folded);
     let device = Device { target: target.clone(), costs: costs() };

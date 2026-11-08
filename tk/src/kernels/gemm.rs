@@ -46,6 +46,9 @@ pub struct Rope {
     pub seq: usize,
 }
 
+/// A [`Rope`] with its cos and sin tables.
+type Turn<T> = (Rope, ParamRef<T, In>, ParamRef<T, In>);
+
 /// The tune store keys by this text: an epilogue without a scale prints as
 /// it did before the field existed, so its stored choices still apply.
 impl fmt::Debug for Epilogue {
@@ -208,7 +211,7 @@ pub(crate) fn mainloop_gemm<T: MmaIn, S: Fn(&mut Kernel, Sc, Sc) -> Gmem<T>>(
     spec: &GemmSpec,
     a_elems: usize,
     split: usize,
-    a: impl FnOnce(&mut Kernel, ParamRef<T>, &Option<Sc>, Sc) -> S,
+    a: impl FnOnce(&mut Kernel, ParamRef<T, In>, &Option<Sc>, Sc) -> S,
 ) -> Program {
     assert!(T::DTYPE.bytes() == 2 || spec.epilogue.out_f32 || split > 1, "an 8-bit product stores f32");
     if split > 1 {
@@ -225,7 +228,7 @@ fn build<T: MmaIn, U: Elem, S: Fn(&mut Kernel, Sc, Sc) -> Gmem<T>>(
     spec: &GemmSpec,
     a_elems: usize,
     split: usize,
-    a_source: impl FnOnce(&mut Kernel, ParamRef<T>, &Option<Sc>, Sc) -> S,
+    a_source: impl FnOnce(&mut Kernel, ParamRef<T, In>, &Option<Sc>, Sc) -> S,
 ) -> Program {
     let GemmSpec { m, n, k: kk, ref batch, epilogue, cfg } = *spec;
     let [bm, bn, bk] = cfg.tile;
@@ -238,18 +241,18 @@ fn build<T: MmaIn, U: Elem, S: Fn(&mut Kernel, Sc, Sc) -> Gmem<T>>(
     let halves = if epi.gated { 2 } else { 1 };
     let cap = batch.capacity();
     let mut k = Kernel::new(name);
-    let a = k.param::<T>("a", ParamKind::In, cap * a_elems);
-    let b = k.param::<T>("b", ParamKind::In, halves * n * kk);
-    let bias = epi.bias.then(|| k.param::<T>("bias", ParamKind::In, halves * n));
-    let residual = epi.residual.then(|| k.param::<U>("residual", ParamKind::In, cap * m * n));
+    let a = k.input::<T>("a", cap * a_elems);
+    let b = k.input::<T>("b", halves * n * kk);
+    let bias = epi.bias.then(|| k.input::<T>("bias", halves * n));
+    let residual = epi.residual.then(|| k.input::<U>("residual", cap * m * n));
     let rope = epi.rope.map(|rope| {
         let plain = Epilogue { bias: epi.bias, rope: epi.rope, ..Epilogue::DEFAULT };
         assert!(epi == plain && rope.heads * rope.head_dim <= n, "{epi:?} turns no more than a bias");
         assert!(cfg.turns(rope.head_dim), "{cfg:?} holds no whole heads of {}", rope.head_dim);
         let table = rope.seq * rope.head_dim / 2;
-        (rope, k.param::<T>("cos", ParamKind::In, table), k.param::<T>("sin", ParamKind::In, table))
+        (rope, k.input::<T>("cos", table), k.input::<T>("sin", table))
     });
-    let c = k.param::<U>("c", ParamKind::Out, cap.max(split) * m * n);
+    let c = k.output::<U>("c", cap.max(split) * m * n);
     let (gm, gn) = (m.div_ceil(bm), n.div_ceil(bn));
     let (gz, bb) = if partial { (Sc::from(split), Some(k.block(2))) } else { batch.axis(&mut k) };
     k.grid([Sc::from(gm), Sc::from(gn), gz]);
@@ -295,15 +298,15 @@ fn finish<T: Elem, U: Elem>(
     k: &mut Kernel,
     accs: Vec<Regs<F32>>,
     epi: Epilogue,
-    bias: Option<ParamRef<T>>,
-    residual: Option<ParamRef<U>>,
-    rope: Option<(Rope, ParamRef<T>, ParamRef<T>)>,
-    c: ParamRef<U>,
+    bias: Option<ParamRef<T, In>>,
+    residual: Option<ParamRef<U, In>>,
+    rope: Option<Turn<T>>,
+    c: ParamRef<U, Out>,
     bb: &Option<Sc>,
     t: &Tile2,
 ) {
-    let Tile2 { m, n, bm, bn, ref row0, ref col0 } = *t;
-    let (m_bound, n_bound) = (bound(m, bm), bound(n, bn));
+    let Tile2 { n, bn, ref col0, .. } = *t;
+    let n_bound = bound(n, bn);
     let mut accs = accs.into_iter().enumerate().map(|(half, acc)| match bias {
         Some(bias) => {
             let v = k.view(bias, half * n, [0, 1], Shape::new(1, bn), [None, n_bound.clone()]);
@@ -326,32 +329,42 @@ fn finish<T: Elem, U: Elem>(
     if let Some((rope, cos, sin)) = rope {
         out = turn(k, out, rope, cos, sin, t);
     }
-    let tile = |k: &mut Kernel, p: ParamRef<U>| {
-        let v = k.view(p, batch_offset(bb, m * n), [n, 1], Shape::new(bm, bn), [m_bound.clone(), n_bound.clone()]);
-        k.at(v, row0.clone(), col0.clone())
-    };
     if let Some(residual) = residual {
-        let r = tile(k, residual);
+        let r = tile(k, residual, bb, t);
         let r = load_f32(k, r);
         out = k.binary(out, r, BinaryOp::Add);
     }
     let out = k.cast::<F32, U>(out);
-    let c_view = tile(k, c);
+    let c_view = tile(k, c, bb, t);
     k.store(c_view, out);
+}
+
+/// The block's `[bm, bn]` window of an `[m, n]` parameter.
+fn tile<U: Elem, A: Access>(k: &mut Kernel, p: ParamRef<U, A>, bb: &Option<Sc>, t: &Tile2) -> Gmem<U, A> {
+    let Tile2 { m, n, bm, bn, ref row0, ref col0 } = *t;
+    let v = k.view(p, batch_offset(bb, m * n), [n, 1], Shape::new(bm, bn), [bound(m, bm), bound(n, bn)]);
+    k.at(v, row0.clone(), col0.clone())
 }
 
 /// [`Epilogue::rope`] on the output tile `x`, in a tile holding rotated
 /// columns: `x·cos + x'·sin`, `x'` the element half a head along
 /// ([`Kernel::flip`]) and `sin` negated over a head's first half.
 /// A tile across the last rotated head keeps `x` past it.
-fn turn<T: Elem>(k: &mut Kernel, x: Regs<F32>, rope: Rope, cos: ParamRef<T>, sin: ParamRef<T>, t: &Tile2) -> Regs<F32> {
+fn turn<T: Elem>(
+    k: &mut Kernel,
+    x: Regs<F32>,
+    rope: Rope,
+    cos: ParamRef<T, In>,
+    sin: ParamRef<T, In>,
+    t: &Tile2,
+) -> Regs<F32> {
     let Tile2 { bm, bn, ref row0, ref col0, .. } = *t;
     let (half, turned) = (rope.head_dim / 2, rope.heads * rope.head_dim);
     let [y] = k.select_if(
         col0.clone().lt(turned),
         |k| {
             // Every head of row `r` reads the table row of its position.
-            let table = |k: &mut Kernel, p: ParamRef<T>| {
+            let table = |k: &mut Kernel, p: ParamRef<T, In>| {
                 let at = (row0.clone() + k.row()) % rope.seq * half;
                 let v = k.gather(p, 0, at, None, Shape::new(bm, bn), None);
                 let v = k.periodic(v, half);
@@ -409,10 +422,10 @@ fn merge<T: Elem, U: Elem>(spec: &SplitMergeSpec) -> Program {
     let SplitMergeSpec { m, n, split, epilogue: epi, tile: [bm, bn] } = *spec;
     assert!(!epi.gated && epi.rope.is_none(), "a gated or turned output is not split");
     let mut k = Kernel::new("split_merge");
-    let partial = k.param::<F32>("partial", ParamKind::In, split * m * n);
-    let bias = epi.bias.then(|| k.param::<T>("bias", ParamKind::In, n));
-    let residual = epi.residual.then(|| k.param::<U>("residual", ParamKind::In, m * n));
-    let c = k.param::<U>("c", ParamKind::Out, m * n);
+    let partial = k.input::<F32>("partial", split * m * n);
+    let bias = epi.bias.then(|| k.input::<T>("bias", n));
+    let residual = epi.residual.then(|| k.input::<U>("residual", m * n));
+    let c = k.output::<U>("c", m * n);
     k.grid([Sc::from(m.div_ceil(bm)), Sc::from(n.div_ceil(bn)), Sc::from(1)]);
     k.warps(4);
     let (row0, col0) = (k.block(0) * bm, k.block(1) * bn);

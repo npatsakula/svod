@@ -25,8 +25,8 @@ use svod_tk::ir::*;
 fn axpb(rows: usize) -> Program {
     let cols = 64;
     let mut k = Kernel::new("axpb");
-    let x = k.param::<F32>("x", ParamKind::In, rows * cols);
-    let y = k.param::<F32>("y", ParamKind::Out, rows * cols);
+    let x = k.input::<F32>("x", rows * cols);
+    let y = k.output::<F32>("y", rows * cols);
     k.grid([Sc::from(rows.div_ceil(16)), Sc::from(1), Sc::from(1)]);
     k.warps(4);
     let row0 = k.block(0) * 16;
@@ -64,9 +64,9 @@ ping-pong двух бригад.
 fn gemm_nt(m: usize, n: usize, kk: usize, [bm, bn, bk]: [usize; 3], stages: usize) -> Program {
     assert!(kk.is_multiple_of(bk), "k is a multiple of bk");
     let mut k = Kernel::new("gemm_nt");
-    let a = k.param::<BF16>("a", ParamKind::In, m * kk);
-    let b = k.param::<BF16>("b", ParamKind::In, n * kk);
-    let c = k.param::<BF16>("c", ParamKind::Out, m * n);
+    let a = k.input::<BF16>("a", m * kk);
+    let b = k.input::<BF16>("b", n * kk);
+    let c = k.output::<BF16>("c", m * n);
     k.grid([Sc::from(m.div_ceil(bm)), Sc::from(n.div_ceil(bn)), Sc::from(1)]);
     k.warps(4);
     let (row0, col0) = (k.block(0) * bm, k.block(1) * bn);
@@ -159,7 +159,7 @@ c.realize()?;
 
 | Группа | Вызовы |
 |---|---|
-| Объявления | `param`, `var` (переменная запуска, связываемая по имени), `grid`, `warps` (число, столбец варпов, или `WarpGrid`, по которому раскладываются регистровые тайлы), `smem` |
+| Объявления | `input`, `output`, `inout`, `var` (переменная запуска, связываемая по имени), `grid`, `warps` (число, столбец варпов, или `WarpGrid`, по которому раскладываются регистровые тайлы), `smem` |
 | Скаляры | `block(axis)`, `warp()`, `row()` (внутри отображения gather), `load_scalar(param, index)`, операторы `Sc` и `min`/`max`/`lt`/`le`/`eq`/`and`/`or` |
 | View | `view`, `gather` (view с отображением строк), `at`, `narrow`, `smem_view`, `smem_view_as`, `smem_slot` |
 | Тайловые операции | `fill`, `zeros`, `splat`, `coord`, `unary`, `binary` (вектор-строка или вектор-столбец транслируется), `scale`, `compare` (`CmpOp`), `cast`, `cast_toward_zero`, `where_`, `mul_add` (одно округление), `reduce`, `reduce_f32`, `transpose`, `shift` (сдвиг на шаг вдоль оси, первым — заполнитель), `flip` (обмен каждого элемента с партнёром через биты маски вдоль оси: шаг сортирующей сети), `mma`, `mma_oriented`, `pin` |

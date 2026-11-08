@@ -102,7 +102,7 @@ pub(crate) fn graph_launch_lowered(
 }
 
 pub(crate) fn first_output(prog: &Program) -> usize {
-    prog.params.iter().position(|p| p.kind == ParamKind::Out).expect("a program writes something")
+    prog.params.iter().position(|p| p.kind != ParamKind::In).expect("a program writes something")
 }
 
 /// [`graph_launch`] returning every parameter's tensor as it is after the

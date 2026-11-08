@@ -18,7 +18,7 @@ shape; the excerpts below are verbatim (trimmed) at 2e9d5edb.
 
 ```rust
 // kernels/rows.rs: bounds instead of padding, math in f32, one rounding at the store
-let x = k.param::<T>("x", ParamKind::In, elems);
+let x = k.input::<T>("x", elems);
 let (gz, bb) = batch.axis(&mut k);                     // Batch::Static(n) | a variable → grid z
 k.grid([Sc::from(rows.div_ceil(br)), Sc::from(1), gz]);
 k.warps(br as u32);

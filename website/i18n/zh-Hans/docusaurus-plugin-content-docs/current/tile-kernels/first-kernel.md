@@ -18,8 +18,8 @@ use svod_tk::ir::*;
 fn axpb(rows: usize) -> Program {
     let cols = 64;
     let mut k = Kernel::new("axpb");
-    let x = k.param::<F32>("x", ParamKind::In, rows * cols);
-    let y = k.param::<F32>("y", ParamKind::Out, rows * cols);
+    let x = k.input::<F32>("x", rows * cols);
+    let y = k.output::<F32>("y", rows * cols);
     k.grid([Sc::from(rows.div_ceil(16)), Sc::from(1), Sc::from(1)]);
     k.warps(4);
     let row0 = k.block(0) * 16;
@@ -53,9 +53,9 @@ assert_eq!(out[1][64 * 39 + 1], 2.0 * (64.0 * 39.0 + 1.0) + 1.0);
 fn gemm_nt(m: usize, n: usize, kk: usize, [bm, bn, bk]: [usize; 3], stages: usize) -> Program {
     assert!(kk.is_multiple_of(bk), "k is a multiple of bk");
     let mut k = Kernel::new("gemm_nt");
-    let a = k.param::<BF16>("a", ParamKind::In, m * kk);
-    let b = k.param::<BF16>("b", ParamKind::In, n * kk);
-    let c = k.param::<BF16>("c", ParamKind::Out, m * n);
+    let a = k.input::<BF16>("a", m * kk);
+    let b = k.input::<BF16>("b", n * kk);
+    let c = k.output::<BF16>("c", m * n);
     k.grid([Sc::from(m.div_ceil(bm)), Sc::from(n.div_ceil(bn)), Sc::from(1)]);
     k.warps(4);
     let (row0, col0) = (k.block(0) * bm, k.block(1) * bn);
@@ -133,7 +133,7 @@ c.realize()?;
 
 | 分组 | 调用 |
 |---|---|
-| 声明 | `param`、`var`（按名称绑定的启动变量）、`grid`、`warps`（一个数量、一列 warp，或寄存器 tile 铺开所依据的 `WarpGrid`）、`smem` |
+| 声明 | `input`、`output`、`inout`、`var`（按名称绑定的启动变量）、`grid`、`warps`（一个数量、一列 warp，或寄存器 tile 铺开所依据的 `WarpGrid`）、`smem` |
 | 标量 | `block(axis)`、`warp()`、`row()`（在 gather 映射内部）、`load_scalar(param, index)`、`Sc` 运算符以及 `min`/`max`/`lt`/`le`/`eq`/`and`/`or` |
 | 视图 | `view`、`gather`（按行映射的视图）、`at`、`narrow`、`smem_view`、`smem_view_as`、`smem_slot` |
 | Tile 操作 | `fill`、`zeros`、`splat`、`coord`、`unary`、`binary`（行向量或列向量会广播）、`scale`、`compare`（`CmpOp`）、`cast`、`cast_toward_zero`、`where_`、`mul_add`（只舍入一次）、`reduce`、`reduce_f32`、`transpose`、`shift`（沿某轴移动一步，首位填充）、`flip`（每个元素沿某轴与掩码各位相异的元素交换：排序网络的一步）、`mma`、`mma_oriented`、`pin` |

@@ -348,7 +348,7 @@ impl<T> Copy for Step<'_, T> {}
 /// so the result does not depend on which product the backend would fuse
 /// into a separate add (the scaled scores' or the bias's), which varies with
 /// the layout around it.
-fn biased<T: Elem, P: TierMark>(k: &mut Kernel, s: Regs<F32>, tile: Tile<P, T>) -> Regs<F32> {
+fn biased<T: Elem, P: Readable>(k: &mut Kernel, s: Regs<F32>, tile: Tile<P, T>) -> Regs<F32> {
     let b = load_f32(k, tile);
     let log2e = k.fill::<F32>(k.shape(s), Const::Float(std::f64::consts::LOG2_E));
     k.mul_add(b, log2e, s)
@@ -371,7 +371,7 @@ impl<T> Step<'_, T> {
 /// what keeps that sum finite for any value magnitude.
 const RESCALE_ABOVE: f64 = 8.0;
 
-fn step<T: Half, PK: TierMark, PV: TierMark>(
+fn step<T: Half, PK: Readable, PV: Readable>(
     k: &mut Kernel,
     st: &Step<'_, T>,
     k_t: Tile<PK, T>,
@@ -461,37 +461,37 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
     let slots = heads + 2 * kv_heads;
     let mut k = Kernel::new(if packed { "flash_attention_packed" } else { "flash_attention" });
     let (q, kk, v) = if packed {
-        let qkv = k.param::<T>("qkv", ParamKind::In, cap * t * slots * d);
+        let qkv = k.input::<T>("qkv", cap * t * slots * d);
         (qkv, qkv, qkv)
     } else {
-        let q = k.param::<T>("q", ParamKind::In, cap * t * heads * d);
-        let kk = k.param::<T>("k", ParamKind::In, kv_rows * tk * heads_total * d);
-        (q, kk, k.param::<T>("v", ParamKind::In, kv_rows * tk * heads_total * d))
+        let q = k.input::<T>("q", cap * t * heads * d);
+        let kk = k.input::<T>("k", kv_rows * tk * heads_total * d);
+        (q, kk, k.input::<T>("v", kv_rows * tk * heads_total * d))
     };
-    let o = (splits == 1).then(|| k.param::<T>("o", ParamKind::Out, cap * t * heads * d));
+    let o = (splits == 1).then(|| k.output::<T>("o", cap * t * heads * d));
     let parts = (splits > 1).then(|| {
-        let o = k.param::<F32>("o_part", ParamKind::Out, splits * cap * t * heads * d);
-        let m = k.param::<F32>("m_part", ParamKind::Out, splits * cap * t * heads);
-        let l = k.param::<F32>("l_part", ParamKind::Out, splits * cap * t * heads);
+        let o = k.output::<F32>("o_part", splits * cap * t * heads * d);
+        let m = k.output::<F32>("m_part", splits * cap * t * heads);
+        let l = k.output::<F32>("l_part", splits * cap * t * heads);
         (o, m, l)
     });
-    let lens = key_lens.then(|| k.param::<I32>("key_lens", ParamKind::In, cap));
+    let lens = key_lens.then(|| k.input::<I32>("key_lens", cap));
     let mask_stride = key_mask_stride(tk);
-    let masks = key_mask.then(|| k.param::<I32>("key_mask", ParamKind::In, cap * mask_stride));
-    let segs = seg_start.then(|| k.param::<I32>("seg_start", ParamKind::In, cap * t));
-    let row_map = cache.is_some_and(|c| c.row_map).then(|| k.param::<I32>("row_map", ParamKind::In, cap));
-    let head_start = cache.is_some().then(|| k.param::<I32>("head_start", ParamKind::In, 1));
+    let masks = key_mask.then(|| k.input::<I32>("key_mask", cap * mask_stride));
+    let segs = seg_start.then(|| k.input::<I32>("seg_start", cap * t));
+    let row_map = cache.is_some_and(|c| c.row_map).then(|| k.input::<I32>("row_map", cap));
+    let head_start = cache.is_some().then(|| k.input::<I32>("head_start", 1));
     let app = (appended > 0).then(|| {
-        let k_app = k.param::<T>("k_app", ParamKind::In, cap * appended * kv_heads * d);
-        let v_app = k.param::<T>("v_app", ParamKind::In, cap * appended * kv_heads * d);
+        let k_app = k.input::<T>("k_app", cap * appended * kv_heads * d);
+        let v_app = k.input::<T>("v_app", cap * appended * kv_heads * d);
         (k_app, v_app)
     });
-    let app_lens = cache.is_some_and(|c| c.app_lens).then(|| k.param::<I32>("app_lens", ParamKind::In, cap));
+    let app_lens = cache.is_some_and(|c| c.app_lens).then(|| k.input::<I32>("app_lens", cap));
     let keys = tk + appended;
     let bias_stride = key_mask_stride(keys);
     let bias = bias.map(|rows| {
         let n = if rows == Bias::Shared { 1 } else { cap };
-        (k.param::<T>("bias", ParamKind::In, n * heads * t * bias_stride), rows)
+        (k.input::<T>("bias", n * heads * t * bias_stride), rows)
     });
     let (gz, bb) = batch.axis(&mut k);
     k.grid([Sc::from(t.div_ceil(bq) * splits), Sc::from(heads), gz]);
@@ -526,17 +526,8 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
     let (q_stride, kv_stride) = if packed { (slots * d, slots * d) } else { (o_stride, heads_total * d) };
     // The packed operand's keys follow its queries, its values its keys.
     let (k_first, v_first) = if packed { (heads, heads + kv_heads) } else { (0, 0) };
-    let rows = |k: &mut Kernel, p: ParamRef<T>, stride: usize| {
-        let v = k.view(
-            p,
-            batch_offset(&bb, t * stride) + hh.clone() * d,
-            [stride, 1],
-            Shape::new(bq, d),
-            [bound(t, bq), None],
-        );
-        k.at(v, q_off.clone(), 0)
-    };
-    let q_view = rows(&mut k, q, q_stride);
+    let rows = Rows { bb: bb.clone(), hh: hh.clone(), q_off: q_off.clone(), t, d, bq };
+    let q_view = rows.of(&mut k, q, q_stride);
     let kv_row = match row_map {
         Some(map) => k.load_scalar(map, b.clone()),
         None => b.clone(),
@@ -732,7 +723,7 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
     let bias_tile = bias_view.is_some().then_some(&biased_at as Mask);
     let st = Step { q_r, scale_log2e, shape, bias: bias_tile, mask: &mask, cfg };
     let app_views = app.map(|(k_app, v_app)| {
-        let app = |k: &mut Kernel, p: ParamRef<T>| {
+        let app = |k: &mut Kernel, p: ParamRef<T, In>| {
             k.view(
                 p,
                 batch_offset(&bb, appended * kv_heads * d) + kv_head.clone() * d,
@@ -855,7 +846,7 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
         (Some(o), _) => {
             let out = normalized(&mut k, acc, l, bq);
             let out = k.cast::<F32, T>(out);
-            let o_view = rows(&mut k, o, o_stride);
+            let o_view = rows.of(&mut k, o, o_stride);
             k.store(o_view, out);
         }
         (None, Some((o_part, m_part, l_part))) => {
@@ -948,15 +939,15 @@ pub fn combine<T: Elem>(spec: &CombineSpec) -> Program {
     let CombineSpec { ref batch, t, heads, d, splits, cfg: NormCfg { br } } = *spec;
     let (cap, rows) = (batch.capacity(), t * heads);
     let mut k = Kernel::new("combine_splits");
-    let o_part = k.param::<F32>("o_part", ParamKind::In, splits * cap * rows * d);
-    let m_part = k.param::<F32>("m_part", ParamKind::In, splits * cap * rows);
-    let l_part = k.param::<F32>("l_part", ParamKind::In, splits * cap * rows);
-    let o = k.param::<T>("o", ParamKind::Out, cap * rows * d);
+    let o_part = k.input::<F32>("o_part", splits * cap * rows * d);
+    let m_part = k.input::<F32>("m_part", splits * cap * rows);
+    let l_part = k.input::<F32>("l_part", splits * cap * rows);
+    let o = k.output::<T>("o", cap * rows * d);
     let (gz, bb) = batch.axis(&mut k);
     k.grid([Sc::from(rows.div_ceil(br)), Sc::from(1), gz]);
     k.warps(br as u32);
     let row0 = k.block(0) * br;
-    let part = |k: &mut Kernel, p: ParamRef<F32>, split: usize, width: usize| {
+    let part = |k: &mut Kernel, p: ParamRef<F32, In>, split: usize, width: usize| {
         let base = Sc::from(split * cap * rows * width) + batch_offset(&bb, rows * width);
         let view = k.view(p, base, [width, 1], Shape::new(br, width), [bound(rows, br), None]);
         let tile = k.at(view, row0.clone(), 0);
@@ -972,4 +963,24 @@ pub fn combine<T: Elem>(spec: &CombineSpec) -> Program {
     let view = k.at(view, row0, 0);
     k.store(view, out);
     k.finish()
+}
+
+/// The block's `[bq, d]` query rows of head `hh` in a `[batch·t, stride]`
+/// parameter, read or written.
+struct Rows {
+    bb: Option<Sc>,
+    hh: Sc,
+    q_off: Sc,
+    t: usize,
+    d: usize,
+    bq: usize,
+}
+
+impl Rows {
+    fn of<T: Elem, A: Access>(&self, k: &mut Kernel, p: ParamRef<T, A>, stride: usize) -> Gmem<T, A> {
+        let Rows { bb, hh, q_off, t, d, bq } = self;
+        let offset = batch_offset(bb, t * stride) + hh.clone() * *d;
+        let v = k.view(p, offset, [stride, 1], Shape::new(*bq, *d), [bound(*t, *bq), None]);
+        k.at(v, q_off.clone(), 0)
+    }
 }

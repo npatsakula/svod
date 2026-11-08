@@ -35,7 +35,7 @@ fn top(prog: &Program) -> Vec<&'static str> {
     kinds(prog, &prog.body)
 }
 
-fn out_view(k: &mut Kernel, out: ParamRef<BF16>, at: usize) -> Gmem<BF16> {
+fn out_view(k: &mut Kernel, out: ParamRef<BF16, Out>, at: usize) -> Gmem<BF16, Out> {
     k.view(out, at, [16, 1], Shape::new(16, 16), [None, None])
 }
 
@@ -47,7 +47,7 @@ fn warps_fence_their_own_effects_and_the_block_fences_theirs() {
     let mut k = Kernel::new("warps");
     k.warps(4);
     let scratch = k.smem::<BF16>("scratch", 4 * 256);
-    let out = k.param::<BF16>("o", ParamKind::Out, 2 * 256);
+    let out = k.output::<BF16>("o", 2 * 256);
     k.each_warp(|k| {
         let w = k.warp();
         let region = k.smem_view::<BF16>(scratch, w * 256, Shape::new(16, 16));
@@ -134,7 +134,7 @@ fn a_key_warps_state_over_its_ring_is_fenced_by_the_warp_then_the_block() {
 fn a_warps_async_copy_is_landed_before_the_block_reads_it() {
     let mut k = Kernel::new("warps_async");
     k.warps(4);
-    let src = k.param::<BF16>("x", ParamKind::In, 4 * 256);
+    let src = k.input::<BF16>("x", 4 * 256);
     let scratch = k.smem::<BF16>("scratch", 4 * 256);
     k.each_warp(|k| {
         let w = k.warp();
@@ -144,7 +144,7 @@ fn a_warps_async_copy_is_landed_before_the_block_reads_it() {
     });
     let first = k.smem_view::<BF16>(scratch, 0, Shape::new(16, 16));
     let merged = k.load(first);
-    let out = k.param::<BF16>("o", ParamKind::Out, 256);
+    let out = k.output::<BF16>("o", 256);
     let o = out_view(&mut k, out, 0);
     k.store(o, merged);
     let mut prog = k.finish();
@@ -164,7 +164,7 @@ fn a_store_before_a_loop_is_fenced_past_it() {
     k.store(tile, x);
     k.loop_::<F32, 0>(n, [], |_, _, c| c);
     let y = k.load(tile);
-    let out = k.param::<F32>("o", ParamKind::Out, 256);
+    let out = k.output::<F32>("o", 256);
     let o = k.view(out, 0, [16, 1], Shape::new(16, 16), [None, None]);
     k.store(o, y);
     let mut prog = k.finish();
@@ -181,13 +181,13 @@ fn a_store_before_a_loop_is_fenced_past_it() {
 #[test]
 fn an_async_copy_is_waited_for_before_a_read() {
     let mut k = Kernel::new("async");
-    let src = k.param::<BF16>("x", ParamKind::In, 256);
+    let src = k.input::<BF16>("x", 256);
     let g = k.view(src, 0, [16, 1], Shape::new(16, 16), [None, None]);
     let s = k.smem::<BF16>("s", 256);
     let tile = k.smem_view::<BF16>(s, 0, Shape::new(16, 16));
     k.stage(tile, g, CopyMode::Async);
     let y = k.load(tile);
-    let out = k.param::<BF16>("o", ParamKind::Out, 256);
+    let out = k.output::<BF16>("o", 256);
     let o = out_view(&mut k, out, 0);
     k.store(o, y);
     let mut prog = k.finish();
@@ -213,11 +213,11 @@ enum Between {
 #[test_case(Between::Loop; "a loop ending on a barrier")]
 fn a_pending_async_copy_survives_a_barrier(between: Between) {
     let mut k = Kernel::new("async_then_barrier");
-    let src = k.param::<BF16>("x", ParamKind::In, 256);
+    let src = k.input::<BF16>("x", 256);
     let g = k.view(src, 0, [16, 1], Shape::new(16, 16), [None, None]);
     let a = k.smem::<BF16>("a", 256);
     let ta = k.smem_view::<BF16>(a, 0, Shape::new(16, 16));
-    let out = k.param::<BF16>("o", ParamKind::Out, 768);
+    let out = k.output::<BF16>("o", 768);
     k.stage(ta, g, CopyMode::Async);
     match between {
         Between::Fence => {
@@ -267,7 +267,7 @@ fn around_a_pipeline(
     after: impl FnOnce(&mut Kernel, SmemRef<BF16>),
 ) -> Program {
     let mut k = Kernel::new("around_a_pipeline");
-    let x = k.param::<BF16>("x", ParamKind::In, 4 * 256);
+    let x = k.input::<BF16>("x", 4 * 256);
     let g = k.view(x, 0, [16, 1], Shape::new(16, 16), [None, None]);
     let ring = k.smem::<BF16>("ring", 2 * 256);
     before(&mut k, ring);
@@ -289,7 +289,7 @@ fn around_a_pipeline(
         },
     );
     after(&mut k, ring);
-    let out = k.param::<F32>("o", ParamKind::Out, 256);
+    let out = k.output::<F32>("o", 256);
     let o = k.view(out, 0, [16, 1], Shape::new(16, 16), [None, None]);
     k.store(o, sum);
     k.finish()
@@ -341,7 +341,7 @@ fn a_ring_written_after_its_pipeline_is_fenced() {
 fn an_async_copy_is_landed_before_a_pipeline() {
     let mut prog = around_a_pipeline(
         |k, _| {
-            let x = k.param::<BF16>("y", ParamKind::In, 256);
+            let x = k.input::<BF16>("y", 256);
             let g = k.view(x, 0, [16, 1], Shape::new(16, 16), [None, None]);
             let other = k.smem::<BF16>("other", 256);
             let t = k.smem_view::<BF16>(other, 0, Shape::new(16, 16));
@@ -360,7 +360,7 @@ fn an_async_copy_is_landed_before_a_pipeline() {
 #[test]
 fn a_consume_body_fences_its_own_tiles() {
     let mut k = Kernel::new("consume_scratch");
-    let x = k.param::<BF16>("x", ParamKind::In, 4 * 256);
+    let x = k.input::<BF16>("x", 4 * 256);
     let g = k.view(x, 0, [16, 1], Shape::new(16, 16), [None, None]);
     let ring = k.smem::<BF16>("ring", 2 * 256);
     let scratch = k.smem::<BF16>("scratch", 256);
@@ -382,7 +382,7 @@ fn a_consume_body_fences_its_own_tiles() {
             [k.load(s)]
         },
     );
-    let out = k.param::<BF16>("o", ParamKind::Out, 256);
+    let out = k.output::<BF16>("o", 256);
     let o = out_view(&mut k, out, 0);
     k.store(o, last);
     let mut prog = k.finish();
@@ -437,7 +437,7 @@ fn a_block_barrier_under_a_branch_on_the_warp_is_refused(
 ) -> Result<Vec<&'static str>, String> {
     let mut k = Kernel::new("divergent");
     let s = k.smem::<F32>("s", 256);
-    let out = k.param::<F32>("o", ParamKind::Out, 256);
+    let out = k.output::<F32>("o", 256);
     let pred = if on_warp { k.warp().lt(2) } else { k.block(0).lt(2) };
     let body = |k: &mut Kernel| {
         let tile = k.smem_view::<F32>(s, 0, Shape::new(16, 16));

@@ -33,8 +33,8 @@ fn gemm_matches_a_naive_reference(m: usize, n: usize, k: usize, bm: usize, bn: u
 fn an_8_bit_product_accumulates_exactly_in_i32() {
     let (rows, depth) = (16, 1057);
     let mut k = Kernel::new("int8");
-    let a = k.param::<I8>("a", ParamKind::In, rows * depth);
-    let c = k.param::<I32>("c", ParamKind::Out, rows * rows);
+    let a = k.input::<I8>("a", rows * depth);
+    let c = k.output::<I32>("c", rows * rows);
     let view = k.view(a, 0, [depth, 1], Shape::new(rows, depth), [None, None]);
     let x = k.load(view);
     let zero = k.zeros::<I32>(Shape::new(rows, rows));
@@ -53,8 +53,8 @@ fn an_8_bit_product_accumulates_exactly_in_i32() {
 fn loop_carries_registers_and_bounds_gate_the_tail() {
     let (rows, cols, valid) = (4usize, 8usize, 5i64);
     let mut k = Kernel::new("prefix");
-    let x = k.param::<F32>("x", ParamKind::In, rows * cols);
-    let y = k.param::<F32>("y", ParamKind::Out, rows);
+    let x = k.input::<F32>("x", rows * cols);
+    let y = k.output::<F32>("y", rows);
     let view = k.view(x, 0, [cols, 1], Shape::new(rows, 1), [None, Some(Sc::from(valid))]);
     let acc0 = k.zeros::<F32>(Shape::new(rows, 1));
     let [acc] = k.loop_(cols, [acc0], |k, i, [acc]| {
@@ -80,7 +80,7 @@ fn loop_carries_registers_and_bounds_gate_the_tail() {
 fn carried_registers_sharing_a_next_both_take_it() {
     let shape = Shape::new(4, 32);
     let mut k = Kernel::new("shared_next");
-    let y = k.param::<F32>("y", ParamKind::Out, 2 * shape.elems());
+    let y = k.output::<F32>("y", 2 * shape.elems());
     let zero = k.zeros::<F32>(shape);
     let one = k.fill::<F32>(shape, Const::Float(1.0));
     let [a, b] = k.loop_(3, [zero, zero], |k, _, [a, _]| {
@@ -101,8 +101,8 @@ fn carried_registers_sharing_a_next_both_take_it() {
 fn online_softmax_normalizer_matches_the_direct_one() {
     let (rows, cols, blk) = (2usize, 16usize, 4usize);
     let mut k = Kernel::new("online");
-    let x = k.param::<F32>("x", ParamKind::In, rows * cols);
-    let l = k.param::<F32>("l", ParamKind::Out, rows);
+    let x = k.input::<F32>("x", rows * cols);
+    let l = k.output::<F32>("l", rows);
     let view = k.view(x, 0, [cols, 1], Shape::new(rows, blk), [None, None]);
     let m0 = k.fill::<F32>(Shape::new(rows, 1), Const::Float(f64::NEG_INFINITY));
     let l0 = k.zeros::<F32>(Shape::new(rows, 1));
@@ -155,9 +155,9 @@ proptest! {
 #[test_case(0.0, 0.0, 0.0; "zero")]
 fn a_truncating_cast_keeps_the_upper_half(x: f64, nearest: f64, toward_zero: f64) {
     let mut k = Kernel::new("casts");
-    let src = k.param::<F32>("x", ParamKind::In, 1);
-    let near = k.param::<BF16>("nearest", ParamKind::Out, 1);
-    let zero = k.param::<BF16>("toward_zero", ParamKind::Out, 1);
+    let src = k.input::<F32>("x", 1);
+    let near = k.output::<BF16>("nearest", 1);
+    let zero = k.output::<BF16>("toward_zero", 1);
     let v = k.view(src, 0, [1, 1], Shape::new(1, 1), [None, None]);
     let v = k.load(v);
     let (a, b) = (k.cast::<F32, BF16>(v), k.cast_toward_zero::<BF16>(v));
@@ -175,8 +175,8 @@ fn a_truncating_cast_keeps_the_upper_half(x: f64, nearest: f64, toward_zero: f64
 fn a_bf16_tile_is_summed_as_held() {
     let (rows, cols) = (4usize, 64usize);
     let mut k = Kernel::new("held_sum");
-    let x = k.param::<F32>("x", ParamKind::In, rows * cols);
-    let y = k.param::<F32>("y", ParamKind::Out, rows);
+    let x = k.input::<F32>("x", rows * cols);
+    let y = k.output::<F32>("y", rows);
     let xv = k.view(x, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
     let xr = k.load(xv);
     let held = k.cast_toward_zero::<BF16>(xr);
@@ -200,9 +200,9 @@ fn a_bf16_tile_is_summed_as_held() {
 fn scale_is_a_product() {
     let (rows, cols) = (4usize, 8usize);
     let mut k = Kernel::new("scale");
-    let x = k.param::<F32>("x", ParamKind::In, rows * cols);
-    let f = k.param::<F32>("f", ParamKind::In, rows);
-    let y = k.param::<F32>("y", ParamKind::Out, rows * cols);
+    let x = k.input::<F32>("x", rows * cols);
+    let f = k.input::<F32>("f", rows);
+    let y = k.output::<F32>("y", rows * cols);
     let xv = k.view(x, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
     let fv = k.view(f, 0, [1, 1], Shape::new(rows, 1), [None, None]);
     let (xr, fr) = (k.load(xv), k.load(fv));
@@ -226,7 +226,7 @@ fn scale_is_a_product() {
 fn scalar_division_truncates(n: i64, d: i64) -> Result<[f64; 2], String> {
     let mut k = Kernel::new("div");
     let (nv, dv) = (k.var("n", -8, 8), k.var("d", -8, 8));
-    let y = k.param::<I32>("y", ParamKind::Out, 2);
+    let y = k.output::<I32>("y", 2);
     for (i, v) in [nv.clone() / dv.clone(), nv % dv].into_iter().enumerate() {
         let tile = k.splat::<I32>(Shape::new(1, 1), v);
         let out = k.view(y, i, [1, 1], Shape::new(1, 1), [None, None]);
@@ -258,8 +258,8 @@ enum Access {
 fn an_access_past_the_capacity_is_an_error(access: Access, at: i64) -> Result<(), String> {
     let tile = Shape::new(4, 4);
     let mut k = Kernel::new("oob");
-    let x = k.param::<F32>("x", ParamKind::In, 16);
-    let y = k.param::<F32>("y", ParamKind::Out, 16);
+    let x = k.input::<F32>("x", 16);
+    let y = k.output::<F32>("y", 16);
     let rows = |of: Access| if std::mem::discriminant(&access) == std::mem::discriminant(&of) { at } else { 0 };
     let (read_at, write_at) = (rows(Access::Read) * 4, rows(Access::Write) * 4);
     let src = k.view(x, read_at, [tile.cols, 1], tile, [None, None]);
@@ -290,8 +290,8 @@ fn an_access_past_the_capacity_is_an_error(access: Access, at: i64) -> Result<()
 fn a_shift_moves_every_element_one_step(axis: Axis) {
     let (rows, cols) = (3usize, 5usize);
     let mut k = Kernel::new("shift");
-    let x = k.param::<F32>("x", ParamKind::In, rows * cols);
-    let y = k.param::<F32>("y", ParamKind::Out, rows * cols);
+    let x = k.input::<F32>("x", rows * cols);
+    let y = k.output::<F32>("y", rows * cols);
     let xv = k.view(x, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
     let xr = k.load(xv);
     let out = k.shift(xr, axis, Const::Float(-9.0));
@@ -319,8 +319,8 @@ fn a_shift_moves_every_element_one_step(axis: Axis) {
 fn a_flip_exchanges_across_its_mask(axis: Axis, mask: u32) {
     let (rows, cols) = (4usize, 8usize);
     let mut k = Kernel::new("flip");
-    let x = k.param::<F32>("x", ParamKind::In, rows * cols);
-    let y = k.param::<F32>("y", ParamKind::Out, rows * cols);
+    let x = k.input::<F32>("x", rows * cols);
+    let y = k.output::<F32>("y", rows * cols);
     let xv = k.view(x, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
     let xr = k.load(xv);
     let out = k.flip(xr, axis, mask);
@@ -356,8 +356,8 @@ fn a_deal_takes_a_column_of_each_run(w: usize) {
     let (rows, cols) = (3usize, 8usize);
     let n = cols / w;
     let mut k = Kernel::new("deal");
-    let x = k.param::<F32>("x", ParamKind::In, rows * cols);
-    let (y, at) = (k.param::<F32>("y", ParamKind::Out, rows * cols), k.param::<I32>("at", ParamKind::Out, rows * cols));
+    let x = k.input::<F32>("x", rows * cols);
+    let (y, at) = (k.output::<F32>("y", rows * cols), k.output::<I32>("at", rows * cols));
     let xv = k.view(x, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
     let xr = k.load(xv);
     for j in 0..n {
@@ -388,9 +388,9 @@ fn a_lowered_deal_replays_the_devices_order() {
     let (rows, cols, depth, w) = (64usize, 64usize, 32usize, 8usize);
     let n = cols / w;
     let mut k = Kernel::new("dealt");
-    let x = k.param::<BF16>("x", ParamKind::In, rows * depth);
-    let c = k.param::<BF16>("c", ParamKind::In, cols * depth);
-    let (y, at) = (k.param::<F32>("y", ParamKind::Out, rows * cols), k.param::<I32>("at", ParamKind::Out, rows * cols));
+    let x = k.input::<BF16>("x", rows * depth);
+    let c = k.input::<BF16>("c", cols * depth);
+    let (y, at) = (k.output::<F32>("y", rows * cols), k.output::<I32>("at", rows * cols));
     k.warps(4);
     let xv = k.view(x, 0, [depth, 1], Shape::new(rows, depth), [None, None]);
     let cv = k.view(c, 0, [depth, 1], Shape::new(cols, depth), [None, None]);
@@ -445,8 +445,8 @@ fn a_deal_divides_its_columns() {
 fn a_periodic_view_repeats_its_columns(gathered: bool) {
     let (rows, period, cols) = (4usize, 4usize, 12usize);
     let mut k = Kernel::new("periodic");
-    let x = k.param::<F32>("x", ParamKind::In, (rows + 2) * period);
-    let y = k.param::<F32>("y", ParamKind::Out, rows * cols);
+    let x = k.input::<F32>("x", (rows + 2) * period);
+    let y = k.output::<F32>("y", rows * cols);
     let src = if gathered {
         let r = k.row();
         let g = k.gather(x, 0, (r + 2) * period, None, Shape::new(rows, cols), None);

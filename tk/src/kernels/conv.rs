@@ -130,7 +130,7 @@ pub fn conv<T: Half>(spec: &ConvSpec) -> Program {
 #[allow(clippy::too_many_arguments)]
 pub fn im2col_view<T: Elem>(
     k: &mut Kernel,
-    x: ParamRef<T>,
+    x: ParamRef<T, In>,
     g: &ConvGeom,
     m: usize,
     base: Sc,

@@ -42,8 +42,8 @@ fn device_matches(prog: Program) {
 #[test]
 fn a_row_window_reduced_in_a_warp_per_row_loop() {
     let mut k = Kernel::new("row_window");
-    let src = k.param::<F32>("src", ParamKind::In, ROWS * COLS);
-    let out = k.param::<F32>("out", ParamKind::Out, ROWS * 32);
+    let src = k.input::<F32>("src", ROWS * COLS);
+    let out = k.output::<F32>("out", ROWS * 32);
     k.grid([Sc::from(1), Sc::from(1), Sc::from(1)]);
     k.warps(ROWS as u32);
     let lane = Shape::new(ROWS, 32);
@@ -76,8 +76,8 @@ fn a_row_window_reduced_in_a_warp_per_row_loop() {
 fn a_read_ahead_ring_under_a_branch() {
     const AHEAD: usize = 2;
     let mut k = Kernel::new("read_ahead");
-    let src = k.param::<F32>("src", ParamKind::In, ROWS * COLS * 32);
-    let out = k.param::<F32>("out", ParamKind::Out, ROWS * 32);
+    let src = k.input::<F32>("src", ROWS * COLS * 32);
+    let out = k.output::<F32>("out", ROWS * 32);
     k.grid([Sc::from(1), Sc::from(1), Sc::from(1)]);
     k.warps(ROWS as u32);
     let lane = Shape::new(ROWS, 32);

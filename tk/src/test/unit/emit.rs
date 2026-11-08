@@ -80,10 +80,10 @@ fn a_lowered_float_minimum_adds_nothing(reduced: bool) {
     let tile = Shape::new(16, 32);
     let mut k = Kernel::new("min");
     k.warps(1);
-    let a = k.param::<F32>("a", ParamKind::In, tile.elems());
-    let b = k.param::<F32>("b", ParamKind::In, tile.elems());
+    let a = k.input::<F32>("a", tile.elems());
+    let b = k.input::<F32>("b", tile.elems());
     let out_shape = if reduced { Shape::new(tile.rows, 1) } else { tile };
-    let y = k.param::<F32>("y", ParamKind::Out, out_shape.elems());
+    let y = k.output::<F32>("y", out_shape.elems());
     let view = |k: &mut Kernel, p| k.view(p, 0, [tile.cols, 1], tile, [None, None]);
     let (va, vb) = (view(&mut k, a), view(&mut k, b));
     let (ra, rb) = (k.load(va), k.load(vb));
@@ -154,8 +154,8 @@ fn a_guarded_scalar_read_stays_under_its_guard(max: i64, div: i64, guarded: bool
     let tile = Shape::new(16, 32);
     let mut k = Kernel::new("guarded");
     k.warps(1);
-    let lens = k.param::<I32>("lens", ParamKind::In, 4);
-    let y = k.param::<F32>("y", ParamKind::Out, 2 * tile.elems());
+    let lens = k.input::<I32>("lens", 4);
+    let y = k.output::<F32>("y", 2 * tile.elems());
     let n = k.var("n", 0, max);
     let index = if div > 1 { n.clone() / div } else { n.clone() };
     let len = k.load_scalar(lens, index);
@@ -205,7 +205,7 @@ fn a_loop_extent_below_zero_runs_no_trip(steps: i64, steady: bool, floored: bool
     let tile = Shape::new(16, 32);
     let mut k = Kernel::new("shares");
     k.warps(1);
-    let y = k.param::<F32>("y", ParamKind::Out, 4 * tile.elems());
+    let y = k.output::<F32>("y", 4 * tile.elems());
     k.grid([Sc::from(4), Sc::from(1), Sc::from(1)]);
     // A share of three steps each: the fourth starts at nine.
     let count = (Sc::from(steps) - k.block(0) * 3).min(3);
@@ -249,7 +249,7 @@ fn a_program_past_the_instruction_bound_is_refused() {
     let regs = shape.elems() / (4 * target.wave as usize);
     let mut k = Kernel::new("huge");
     k.warps(4);
-    let out = k.param::<F32>("o", ParamKind::Out, shape.elems());
+    let out = k.output::<F32>("o", shape.elems());
     let one = k.fill::<F32>(shape, Const::Float(1.0));
     let mut x = k.zeros::<F32>(shape);
     // Each add lists its loads, adds and stores: four instructions a register.
@@ -275,8 +275,8 @@ fn a_relayout_through_shared_memory_needs_no_zero_of_the_program() {
     assert_eq!(from.relayout(&to, 1, lanes, &costs, false), Relayout::ViaSmem);
     let mut k = Kernel::new("relayout");
     k.warps(1);
-    let x = k.param::<F32>("x", ParamKind::In, 2 * tile.elems());
-    let y = k.param::<F32>("y", ParamKind::Out, 2 * tile.elems());
+    let x = k.input::<F32>("x", 2 * tile.elems());
+    let y = k.output::<F32>("y", 2 * tile.elems());
     let src = k.view(x, tile.elems(), [tile.cols, 1], tile, [None, None]);
     let a = k.load(src);
     k.pin(a, from);
@@ -303,8 +303,8 @@ fn a_register_transpose_lowers(tile: Shape, warps: u32, pinned: bool) {
     let lanes = 32;
     let mut k = Kernel::new("transpose");
     k.warps(warps);
-    let x = k.param::<F32>("x", ParamKind::In, tile.elems());
-    let y = k.param::<F32>("y", ParamKind::Out, tile.elems());
+    let x = k.input::<F32>("x", tile.elems());
+    let y = k.output::<F32>("y", tile.elems());
     let src = k.view(x, 0, [tile.cols, 1], tile, [None, None]);
     let a = k.load(src);
     let t = k.transpose(a);
@@ -379,7 +379,7 @@ fn the_segment_bounds_are_read_ahead_of_the_key_loop(group: bool) {
 #[test_case(|_, n| n.lt(2), Some((0, 1)); "a comparison")]
 #[test_case(|k, _| k.block(0), Some((0, 4)); "a block index on its grid")]
 #[test_case(|k, _| k.warp() + 1, Some((1, 4)); "a warp index")]
-#[test_case(|k, n| { let p = k.param::<I32>("p", ParamKind::In, 4); k.load_scalar(p, n) }, None; "a value read")]
+#[test_case(|k, n| { let p = k.input::<I32>("p", 4); k.load_scalar(p, n) }, None; "a value read")]
 fn a_scalars_bounds_are_its_operations(f: fn(&mut Kernel, Sc) -> Sc, want: Option<(i64, i64)>) {
     let mut k = Kernel::new("bounds");
     k.warps(4);
@@ -401,8 +401,8 @@ fn a_fill_goes_in_whole_chunks_per_thread(rows: usize, cols: usize, fills: bool)
     assert_eq!(crate::layouts::fills_in_chunks(shape, 2, 32), fills);
     let mut k = Kernel::new("fill");
     k.warps(1);
-    let x = k.param::<F16>("x", ParamKind::In, shape.elems());
-    let y = k.param::<F16>("y", ParamKind::Out, shape.elems());
+    let x = k.input::<F16>("x", shape.elems());
+    let y = k.output::<F16>("y", shape.elems());
     let s = k.smem::<F16>("s", shape.elems());
     let src = k.view(x, 0, [cols, 1], shape, [None, None]);
     let t = k.smem_view::<F16>(s, 0, shape);
@@ -515,8 +515,8 @@ fn every_path_past_i32_keeps_one_width() {
 fn a_bounded_load_past_i32_keeps_one_width(target: Target) {
     let mut k = crate::build::Kernel::new("past");
     let wide = (i32::MAX as usize + 1) * 2;
-    let src = k.param::<I32>("src", ParamKind::In, wide);
-    let out = k.param::<I32>("out", ParamKind::Out, wide);
+    let src = k.input::<I32>("src", wide);
+    let out = k.output::<I32>("out", wide);
     k.grid([Sc::from(1), Sc::from(1), Sc::from(1)]);
     k.warps(4);
     let tile = Shape::new(32, 32);
@@ -531,7 +531,7 @@ fn a_bounded_load_past_i32_keeps_one_width(target: Target) {
 #[test]
 fn a_grid_past_i32_is_refused() {
     let mut k = crate::build::Kernel::new("past");
-    let out = k.param::<I32>("out", ParamKind::Out, 1);
+    let out = k.output::<I32>("out", 1);
     k.grid([Sc::from(1usize << 31), Sc::from(1), Sc::from(1)]);
     k.warps(4);
     let v = k.view(out, 0, [1, 1], Shape::new(1, 1), [None, None]);

@@ -500,6 +500,8 @@ pub struct Block(pub Vec<Stmt>);
 pub enum ParamKind {
     In,
     Out,
+    /// Written, then read back by the lanes that wrote it ([`crate::build::Kernel::inout`]).
+    InOut,
 }
 
 #[derive(Clone, Debug, PartialEq)]

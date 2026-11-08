@@ -38,8 +38,8 @@ fn source(i: usize, m: usize) -> Option<usize> {
 fn gathered_rows_follow_their_map_and_read_zero_outside_it(staged: bool) {
     let (m, cols) = (16usize, 16usize);
     let mut k = Kernel::new("gather");
-    let x = k.param::<F32>("x", ParamKind::In, m * cols);
-    let y = k.param::<F32>("y", ParamKind::Out, 8 * 8);
+    let x = k.input::<F32>("x", m * cols);
+    let y = k.output::<F32>("y", 8 * 8);
     let r = k.row();
     let rows = r.clone() * 7 % m * cols;
     let valid = Sc::from(0).lt(r % 3);
@@ -70,8 +70,8 @@ fn gathered_rows_follow_their_map_and_read_zero_outside_it(staged: bool) {
 fn gathered_stores_drop_rejected_rows() {
     let m = 16usize;
     let mut k = Kernel::new("scatter");
-    let x = k.param::<F32>("x", ParamKind::In, m * 8);
-    let y = k.param::<F32>("y", ParamKind::Out, m * 8);
+    let x = k.input::<F32>("x", m * 8);
+    let y = k.output::<F32>("y", m * 8);
     let src = k.view(x, 0, [8, 1], Shape::new(m, 8), [None, None]);
     let v = k.load(src);
     let r = k.row();
@@ -94,7 +94,7 @@ fn gathered_stores_drop_rejected_rows() {
 #[should_panic(expected = "moves along its columns only")]
 fn a_gathered_view_does_not_move_rows() {
     let mut k = Kernel::new("gather");
-    let x = k.param::<F32>("x", ParamKind::In, 64);
+    let x = k.input::<F32>("x", 64);
     let r = k.row();
     let g = k.gather(x, 0, r * 8, None, Shape::new(8, 8), None);
     k.at(g, 1, 0);
@@ -106,9 +106,9 @@ fn a_gathered_view_does_not_move_rows() {
 fn gathered_gemm(m: usize, n: usize, kk: usize, tile: [usize; 3], stages: usize, warps: [u32; 2]) -> Program {
     let [bm, bn, bk] = tile;
     let mut k = Kernel::new("gathered_gemm");
-    let a = k.param::<BF16>("a", ParamKind::In, m * kk);
-    let b = k.param::<BF16>("b", ParamKind::In, n * kk);
-    let c = k.param::<F32>("c", ParamKind::Out, m * n);
+    let a = k.input::<BF16>("a", m * kk);
+    let b = k.input::<BF16>("b", n * kk);
+    let c = k.output::<F32>("c", m * n);
     k.grid([Sc::from(m / bm), Sc::from(n / bn), Sc::from(1)]);
     k.warps(WarpGrid { rows: warps[0], cols: warps[1] });
     let (row0, col0) = (k.block(0) * bm, k.block(1) * bn);

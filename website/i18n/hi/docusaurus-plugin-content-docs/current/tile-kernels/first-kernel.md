@@ -24,8 +24,8 @@ use svod_tk::ir::*;
 fn axpb(rows: usize) -> Program {
     let cols = 64;
     let mut k = Kernel::new("axpb");
-    let x = k.param::<F32>("x", ParamKind::In, rows * cols);
-    let y = k.param::<F32>("y", ParamKind::Out, rows * cols);
+    let x = k.input::<F32>("x", rows * cols);
+    let y = k.output::<F32>("y", rows * cols);
     k.grid([Sc::from(rows.div_ceil(16)), Sc::from(1), Sc::from(1)]);
     k.warps(4);
     let row0 = k.block(0) * 16;
@@ -62,9 +62,9 @@ grouped tile order, split reductions, warpgroup core और two-crew ping-pong �
 fn gemm_nt(m: usize, n: usize, kk: usize, [bm, bn, bk]: [usize; 3], stages: usize) -> Program {
     assert!(kk.is_multiple_of(bk), "k is a multiple of bk");
     let mut k = Kernel::new("gemm_nt");
-    let a = k.param::<BF16>("a", ParamKind::In, m * kk);
-    let b = k.param::<BF16>("b", ParamKind::In, n * kk);
-    let c = k.param::<BF16>("c", ParamKind::Out, m * n);
+    let a = k.input::<BF16>("a", m * kk);
+    let b = k.input::<BF16>("b", n * kk);
+    let c = k.output::<BF16>("c", m * n);
     k.grid([Sc::from(m.div_ceil(bm)), Sc::from(n.div_ceil(bn)), Sc::from(1)]);
     k.warps(4);
     let (row0, col0) = (k.block(0) * bm, k.block(1) * bn);
@@ -155,7 +155,7 @@ c.realize()?;
 
 | समूह | कॉल्स |
 |---|---|
-| घोषणाएँ | `param`, `var` (launch variable जो नाम से bind होता है), `grid`, `warps` (एक गिनती, warps का एक column, या `WarpGrid` जिस पर register tiles फैलती हैं), `smem` |
+| घोषणाएँ | `input`, `output`, `inout`, `var` (launch variable जो नाम से bind होता है), `grid`, `warps` (एक गिनती, warps का एक column, या `WarpGrid` जिस पर register tiles फैलती हैं), `smem` |
 | Scalars | `block(axis)`, `warp()`, `row()` (gather map के भीतर), `load_scalar(param, index)`, `Sc` operators और `min`/`max`/`lt`/`le`/`eq`/`and`/`or` |
 | Views | `view`, `gather` (row-mapped view), `at`, `narrow`, `smem_view`, `smem_view_as`, `smem_slot` |
 | Tile ops | `fill`, `zeros`, `splat`, `coord`, `unary`, `binary` (row या column vector broadcast होता है), `scale`, `compare` (`CmpOp`), `cast`, `cast_toward_zero`, `where_`, `mul_add` (एक ही rounding), `reduce`, `reduce_f32`, `transpose`, `shift` (axis के साथ एक step आगे, पहले स्थान पर fill), `flip` (हर element axis के साथ mask के bits पार अपने partner से बदलता है: sorting network का एक step), `mma`, `mma_oriented`, `pin` |

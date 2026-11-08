@@ -590,7 +590,7 @@ impl<'a> Probes<'a> {
                     let s = k.smem_slot::<F32>(ring, slot, tile);
                     k.store(s, x);
                 }
-                (ring, k.param::<I32>("order", ParamKind::In, iters))
+                (ring, k.input::<I32>("order", iters))
             });
             let zero = k.zeros::<F32>(tile);
             if on {
@@ -619,7 +619,7 @@ impl<'a> Probes<'a> {
         let (blocks, iters) = self.stream_grid(tile.elems() * 4);
         self.make(op, ScalarDType::Int32, STREAM as f64, true, self.lowering(), |on| {
             let mut k = kernel(op, blocks, WARPS);
-            let src = k.param::<I32>("src", ParamKind::In, STREAM / 4);
+            let src = k.input::<I32>("src", STREAM / 4);
             let block = k.block(0);
             let zero = k.fill::<I32>(tile, Const::Int(0));
             let sum = if on {
@@ -651,7 +651,7 @@ impl<'a> Probes<'a> {
         let units = (blocks * iters * tile.elems() * 4) as f64;
         self.make(op, ScalarDType::Int32, units, true, self.lowering(), |on| {
             let mut k = kernel(op, blocks, WARPS);
-            let src = k.param::<I32>("src", ParamKind::In, region * tile.elems());
+            let src = k.input::<I32>("src", region * tile.elems());
             let block = k.block(0);
             let zero = k.fill::<I32>(tile, Const::Int(0));
             let sum = if on {
@@ -678,7 +678,7 @@ impl<'a> Probes<'a> {
         let units = (iters * cols) as f64;
         self.make(op, ScalarDType::BFloat16, units, false, self.chain(Costs::default()), |on| {
             let mut k = kernel(op, self.sms as usize, self.warps);
-            let src = k.param::<BF16>("src", ParamKind::In, region * span);
+            let src = k.input::<BF16>("src", region * span);
             let block = k.block(0);
             let zero = k.zeros::<BF16>(tile);
             let stride = if on { [1, span / cols] } else { [tile.cols, 1] };
@@ -928,12 +928,12 @@ impl<'a> Probes<'a> {
         let probe = self.make(op, ScalarDType::Int32, units, true, self.lowering(), |on| {
             // Every trip probe runs these programs, named alike.
             let mut k = kernel("probe:trip", blocks, WARPS);
-            let src = k.param::<I32>("src", ParamKind::In, sms * region * tile.elems());
+            let src = k.input::<I32>("src", sms * region * tile.elems());
             // Zeros at run (the scratch pool's integers), unknown to the
             // compiler: every trip's chunk and fragment slot is a runtime
             // value, so no ring depth folds an index to a constant and no
             // period of the region lets a loop's loads leave it.
-            let order = k.param::<I32>("order", ParamKind::In, TRIPS);
+            let order = k.input::<I32>("order", TRIPS);
             let first = k.block(0) % sms * region;
             let zero = k.fill::<I32>(tile, Const::Int(0));
             let chunk = |k: &mut Kernel, step: Sc| {
@@ -1072,7 +1072,7 @@ impl<'a> Probes<'a> {
         let lowering = self.lowering();
         self.make(op, ScalarDType::Int32, (trips - stages) as f64, false, lowering, |on| {
             let mut k = kernel(op, waves, 1);
-            let src = k.param::<I32>("src", ParamKind::In, STREAM / 4);
+            let src = k.input::<I32>("src", STREAM / 4);
             let block = k.block(0);
             let zero = k.fill::<I32>(tile, Const::Int(0));
             let sum = ring_sum(&mut k, if on { trips } else { stages }, stages, zero, |k, step| {
@@ -1138,7 +1138,7 @@ fn ring_sum(
 /// A `shape` tile loaded from a parameter of its own, so no value is known
 /// to the compiler.
 fn input<T: Elem>(k: &mut Kernel, shape: Shape) -> Regs<T> {
-    let p = k.param::<T>("x", ParamKind::In, shape.elems());
+    let p = k.input::<T>("x", shape.elems());
     let v = k.view(p, 0, [shape.cols, 1], shape, [None, None]);
     k.load(v)
 }
@@ -1146,7 +1146,7 @@ fn input<T: Elem>(k: &mut Kernel, shape: Shape) -> Regs<T> {
 /// `v` stored to block `block(0)`'s slot of an output, so nothing is dead.
 fn output<T: Elem>(k: &mut Kernel, blocks: usize, v: Regs<T>) {
     let shape = k.shape(v);
-    let p = k.param::<T>("y", ParamKind::Out, blocks * shape.elems());
+    let p = k.output::<T>("y", blocks * shape.elems());
     let block = k.block(0);
     let view = k.view(p, block * shape.elems(), [shape.cols, 1], shape, [None, None]);
     k.store(view, v);

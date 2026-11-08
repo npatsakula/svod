@@ -527,7 +527,7 @@ fn a_predicate_met_inside_a_branch_guards_a_later_if(target: Target) {
     k.grid([Sc::from(4), Sc::from(1), Sc::from(1)]);
     k.warps(2);
     let tile = Shape::new(16, 16);
-    let y = k.param::<I32>("y", ParamKind::Out, 4 * 2 * tile.elems());
+    let y = k.output::<I32>("y", 4 * 2 * tile.elems());
     let slot = k.block(0) * 2 + k.warp();
     let dst = k.view(y, slot * tile.elems(), [tile.cols, 1], tile, [None, None]);
     let (outer, inner) = (k.block(0).lt(2), k.warp().eq(0));
@@ -893,8 +893,8 @@ fn a_bf16_sum_in_f32_takes_the_pair_dot_product_where_it_exists(target: Target, 
     let (rows, cols) = (4usize, 128usize);
     let mut k = Kernel::new("held_sum");
     k.warps(1);
-    let x = k.param::<F32>("x", ParamKind::In, rows * cols);
-    let y = k.param::<F32>("y", ParamKind::Out, rows);
+    let x = k.input::<F32>("x", rows * cols);
+    let y = k.output::<F32>("y", rows);
     let xv = k.view(x, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
     let xr = k.load(xv);
     let held = k.cast_toward_zero::<BF16>(xr);
@@ -1058,8 +1058,8 @@ fn voted_rows() -> Program {
     use crate::ir::{ReduceOp, Shape};
     let (rows, d) = (4, 256);
     let mut k = Kernel::new("voted");
-    let x = k.param::<F32>("x", ParamKind::In, rows * d);
-    let y = k.param::<F32>("y", ParamKind::Out, rows);
+    let x = k.input::<F32>("x", rows * d);
+    let y = k.output::<F32>("y", rows);
     k.warps(rows as u32);
     let xv = k.view(x, 0, [d, 1], Shape::new(rows, d), [None, None]);
     let xs = k.load(xv);

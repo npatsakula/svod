@@ -42,9 +42,9 @@ fn check(prog: Program, inputs: Vec<Vec<f64>>, out_elems: usize, tol: f64) {
 #[test_case(64, 32, 128; "d 128, narrow k")]
 fn qk_from_registers_and_shared(bq: usize, bkv: usize, d: usize) {
     let mut k = Kernel::new("qk");
-    let q = k.param::<BF16>("q", ParamKind::In, bq * d);
-    let kk = k.param::<BF16>("k", ParamKind::In, bkv * d);
-    let s_out = k.param::<F32>("s", ParamKind::Out, bq * bkv);
+    let q = k.input::<BF16>("q", bq * d);
+    let kk = k.input::<BF16>("k", bkv * d);
+    let s_out = k.output::<F32>("s", bq * bkv);
     k.warps((bq / 16) as u32);
     let k_s = k.smem::<BF16>("k_s", bkv * d);
     let q_g = k.view(q, 0, [d, 1], Shape::new(bq, d), [None, None]);
@@ -67,9 +67,9 @@ fn qk_from_registers_and_shared(bq: usize, bkv: usize, d: usize) {
 #[test_case(64, 32, 128; "d 128")]
 fn pv_with_a_transposed_gather(bq: usize, bkv: usize, d: usize) {
     let mut k = Kernel::new("pv");
-    let p = k.param::<BF16>("p", ParamKind::In, bq * bkv);
-    let v = k.param::<BF16>("v", ParamKind::In, bkv * d);
-    let o_out = k.param::<F32>("o", ParamKind::Out, bq * d);
+    let p = k.input::<BF16>("p", bq * bkv);
+    let v = k.input::<BF16>("v", bkv * d);
+    let o_out = k.output::<F32>("o", bq * d);
     k.warps((bq / 16) as u32);
     let v_s = k.smem::<BF16>("v_s", bkv * d);
     let p_g = k.view(p, 0, [bkv, 1], Shape::new(bq, bkv), [None, None]);
@@ -92,9 +92,9 @@ fn pv_with_a_transposed_gather(bq: usize, bkv: usize, d: usize) {
 fn row_reductions_and_broadcast() {
     let (bq, bkv, d) = (64usize, 64usize, 64usize);
     let mut k = Kernel::new("rows");
-    let q = k.param::<BF16>("q", ParamKind::In, bq * d);
-    let kk = k.param::<BF16>("k", ParamKind::In, bkv * d);
-    let out = k.param::<F32>("out", ParamKind::Out, bq * (bkv + 2));
+    let q = k.input::<BF16>("q", bq * d);
+    let kk = k.input::<BF16>("k", bkv * d);
+    let out = k.output::<F32>("out", bq * (bkv + 2));
     k.warps((bq / 16) as u32);
     let k_s = k.smem::<BF16>("k_s", bkv * d);
     let q_g = k.view(q, 0, [d, 1], Shape::new(bq, d), [None, None]);
@@ -126,9 +126,9 @@ fn mma_peak_probe() {
     let Some(target) = super::cp_async_target() else { return };
     let (bm, bn, bk, iters, blocks) = (64usize, 64usize, 16usize, 4096i64, 28 * 16usize);
     let mut k = Kernel::new("mma_peak");
-    let a = k.param::<BF16>("a", ParamKind::In, bm * bk);
-    let b = k.param::<BF16>("b", ParamKind::In, bn * bk);
-    let c = k.param::<F32>("c", ParamKind::Out, blocks * bm * bn);
+    let a = k.input::<BF16>("a", bm * bk);
+    let b = k.input::<BF16>("b", bn * bk);
+    let c = k.output::<F32>("c", blocks * bm * bn);
     k.grid([Sc::from(blocks), Sc::from(1), Sc::from(1)]);
     k.warps(WarpGrid { rows: 2, cols: 2 });
     let a_g = k.view(a, 0, [bk, 1], Shape::new(bm, bk), [None, None]);
