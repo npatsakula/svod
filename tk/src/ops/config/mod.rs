@@ -46,6 +46,8 @@ pub(crate) use self::facts::facts_of;
 
 pub(crate) use self::gemm::gemm_cfg;
 pub(crate) use self::norm::heads_candidates;
+#[cfg(test)]
+pub(crate) use self::search::Field;
 pub(crate) use self::search::{
     Compiles, FIRST, SHORTLIST, TWIN_TILES, Tiled, compiled, distinct, distinct_configs, first_clean, representatives,
     shortlist,

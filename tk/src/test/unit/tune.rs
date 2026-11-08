@@ -1031,8 +1031,8 @@ const VENDORED_RATES: [(&str, u64); 9] = [
 /// landed off the compute, timed 1.3 ms — three candidates under their
 /// floor beside the honest sample of the same lines.
 const VENDORED_CHOICES: [&str; 2] = [
-    "choice|nearest|gfx1151-40sm|Float16|256x1048576x768x64|0000000000000001|0000000000000001|0000000000000001 0:128,128,2,0,16,32,1,~,4,2,1,~,~,~ 1297360 1:128,128,2,1,16,32,1,~,4,2,1,~,~,~ 1305240 2:128,128,1,0,16,32,1,~,4,2,1,~,~,~ 296351560",
-    "choice|nearest|gfx1151-40sm|Float16|256x1048576x768x64|0000000000000002|0000000000000001|0000000000000002 1:128,128,2,0,16,32,1,~,4,2,1,~,~,~ 1325040 32:64,32,2,0,16,32,128,~,~,~,~,4,4,1 25261320",
+    "choice|nearest|gfx1151-40sm|Float16|256x1048576x768x64|0000000000000001|0000000000000001|0000000000000001 0:128,128,r2,16,32,1,~,4,2,1,~ 1297360 1:128,128,r2u,16,32,1,~,4,2,1,~ 1305240 2:128,128,r1,16,32,1,~,4,2,1,~ 296351560",
+    "choice|nearest|gfx1151-40sm|Float16|256x1048576x768x64|0000000000000002|0000000000000001|0000000000000002 1:128,128,r2,16,32,1,~,4,2,1,~ 1325040 32:64,32,r2,16,32,128,~,~,4,4,1 25261320",
 ];
 
 /// Every timed candidate of the stores' choice lines clears its physical
@@ -1190,7 +1190,7 @@ fn timed_candidates_clear_their_physical_floor() {
         worst.sort_by(|a, b| a.0.total_cmp(&b.0));
         worst
     }
-    let lie = |what: &str| what.contains("gfx1151") && what.contains("nearest [256, 1048576, 768, 64] 128,128,2,");
+    let lie = |what: &str| what.contains("gfx1151") && what.contains("nearest [256, 1048576, 768, 64] 128,128,r2");
 
     let dir = Scratch::new("floor-store");
     let file = TuneStore::at(Some(dir.to_path_buf())).file("gfx1151-40sm").expect("a rooted store");

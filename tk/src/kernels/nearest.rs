@@ -11,8 +11,6 @@
 //! scores as a matrix, block by block, whose rows [`nearest_select`] lists a
 //! warp each.
 
-use std::fmt;
-
 use svod_dtype::ScalarDType;
 
 use super::attention::WARP_ROWS;
@@ -1048,7 +1046,7 @@ pub fn nearest<T: MmaIn>(spec: &NearestSpec) -> Program {
 }
 
 /// How [`nearest_select`] lists a score matrix's rows.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SelectCfg {
     /// Rows a block lists, a warp each.
     pub warps: u32,
@@ -1059,19 +1057,6 @@ pub struct SelectCfg {
     /// their trips' leasts, which the score matrix's [`nearest`] stores
     /// beside them.
     pub filter: bool,
-}
-
-/// The tune store keys by this text: an unfiltered config prints as it did
-/// before the filter existed.
-impl fmt::Debug for SelectCfg {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut s = f.debug_struct("SelectCfg");
-        s.field("warps", &self.warps).field("queue", &self.queue);
-        if self.filter {
-            s.field("filter", &true);
-        }
-        s.finish()
-    }
 }
 
 impl SelectCfg {

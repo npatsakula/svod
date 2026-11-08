@@ -725,14 +725,15 @@ impl config::Tiled for Pipe {
     fn twins(&self, ranked: &[Self]) -> Vec<Self> {
         ranked.iter().filter(|p| p.tile == self.tile).copied().collect()
     }
+}
 
-    fn code(&self) -> String {
-        format!("{},{}", self.at, self.tile)
+impl config::Field for Pipe {
+    fn put(&self, out: &mut Vec<String>) {
+        out.extend([self.at.to_string(), self.tile.to_string()]);
     }
 
-    fn of_code(code: &str) -> Option<Self> {
-        let (at, tile) = code.split_once(',')?;
-        Some(Pipe { at: at.parse().ok()?, tile: tile.parse().ok()? })
+    fn take(fields: &mut std::iter::Peekable<std::str::Split<'_, char>>) -> Option<Self> {
+        Some(Pipe { at: fields.next()?.parse().ok()?, tile: fields.next()?.parse().ok()? })
     }
 }
 
