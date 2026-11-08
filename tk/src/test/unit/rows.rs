@@ -16,7 +16,6 @@ use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Scale, gemm};
 use crate::kernels::rows::{Norm, NormCfg, NormSpec, norm};
 use crate::kernels::{Act, Batch};
 use crate::launch::graph_launch_all;
-use crate::layouts::{Laid, infer};
 use crate::lower::Lowering;
 
 fn gemm_nt_epilogue(
@@ -149,7 +148,8 @@ fn epilogue_interpreter_matches_the_reference(which: usize) {
 fn bias_vector_takes_the_accumulators_column_layout() {
     let epi = Epilogue { bias: true, ..Epilogue::default() };
     let prog = gemm_nt_epilogue(128, 128, 64, [128, 128, 32], 2, [2, 4], epi);
-    let Laid { prog, layouts: lay } = infer(prog, &declared(sm86()), Core::Warp).unwrap();
+    let prog = super::laid(prog, &declared(sm86())).unwrap();
+    let lay = &prog.layouts;
     let add = prog
         .walk()
         .find_map(|(_, s)| match s {

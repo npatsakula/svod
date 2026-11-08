@@ -104,7 +104,7 @@ impl Emit<'_> {
     /// committed inside the one statement (`codegen::llvm::nvptx::wgmma`) and
     /// waited for there too, unless the block holds the
     /// [`Sync::WaitProducts`] that waits for it later.
-    pub(super) fn group_mma(&mut self, dst: ValId, op: &TileOp) -> Result<()> {
+    pub(super) fn group_mma(&mut self, dst: ValId, op: &TileOp<Laid>) -> Result<()> {
         let TileOp::Mma { acc, a, b, a_t, b_t, .. } = *op else { unreachable!("a product") };
         let (va, vb, vd) = (self.value(a).clone(), self.value(b).clone(), self.value(dst).clone());
         let atom = self.low.device.target.group_mma(va.dtype, vd.dtype).expect("inference found the core").clone();

@@ -15,7 +15,7 @@ use svod_ir::{AxisId, AxisType, BarrierFence, ConstValue, KernelInfo, Op, UOp};
 use crate::atoms::{Core, Fill, Target};
 use crate::index::*;
 use crate::ir::*;
-use crate::layouts::{Laid, Moves, TileLayout};
+use crate::layouts::{Moves, TileLayout};
 use crate::lower::{ExtentPastI32Snafu, Lowering, ProgramSnafu, Result, TooLargeSnafu, UnsupportedSnafu};
 use snafu::{ResultExt, ensure};
 
@@ -32,13 +32,19 @@ thread_local! {
     pub(super) static ROLLED: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(vec![]) };
 }
 
-pub fn emit(laid: &Laid, low: &Lowering, params: Vec<Arc<UOp>>, device: DeviceSpec) -> Result<Arc<UOp>> {
-    let (prog, lay) = (&laid.prog, laid.layouts.as_slice());
+/// The laid program as a pre-linearized Svod program, and the instruction
+/// list it holds.
+pub fn emit(
+    prog: &Program<Laid>,
+    low: &Lowering,
+    params: Vec<Arc<UOp>>,
+    device: DeviceSpec,
+) -> Result<(Arc<UOp>, Arc<UOp>)> {
     // Parameters and buffers committed up front: the assembly rebuilds none
     // of the ops reading them to commit their shapes.
     let params = params.iter().map(UOp::committed_shape).collect();
     let params = amdgpu::swizzled(params, prog, &low.device.target);
-    let mut e = Emit::new(prog, lay, low, params);
+    let mut e = Emit::new(prog, low, params);
     e.prologue()?;
     e.block(&prog.body)?;
     e.list.within(&prog.name)?;
@@ -51,7 +57,7 @@ pub fn emit(laid: &Laid, low: &Lowering, params: Vec<Arc<UOp>>, device: DeviceSp
     }
     let info = KernelInfo { name: Some(prog.name.clone()), ..Default::default() };
     ROLLED.with(|cell| cell.borrow_mut().extend(e.rolled));
-    UOp::linear_program(info, list, device).context(ProgramSnafu)
+    UOp::listed_program(info, list, device).context(ProgramSnafu)
 }
 
 /// The instruction list cut at the insertion point of every nesting level
@@ -132,10 +138,11 @@ fn counted(name: &str, most: Option<i64>) -> Result<()> {
 }
 
 struct Emit<'a> {
-    prog: &'a Program,
+    prog: &'a Program<Laid>,
     /// The width this program's scalars count in: past `i32` where a
     /// parameter's elements are.
     index: DType,
+    /// The program's layouts ([`Program::layouts`]).
     lay: &'a [Option<TileLayout>],
     low: &'a Lowering,
     params: Vec<Arc<UOp>>,
@@ -235,7 +242,7 @@ impl Coord {
 }
 
 impl<'a> Emit<'a> {
-    fn new(prog: &'a Program, lay: &'a [Option<TileLayout>], low: &'a Lowering, params: Vec<Arc<UOp>>) -> Self {
+    fn new(prog: &'a Program<Laid>, low: &'a Lowering, params: Vec<Arc<UOp>>) -> Self {
         let index = prog.index.dtype();
         let threads = prog.warps * low.device.target.wave;
         let tid = UOp::special_dtype(c32(threads as i64), "lidx0".to_string(), DType::Int32);
@@ -246,9 +253,8 @@ impl<'a> Emit<'a> {
         // every iteration (a body may read `phi` after computing `next`). A
         // value that starts several loops starts none in place: each copies
         // it in ([`Self::loop_`]).
-        let carried = |stmt: &Stmt| match stmt {
+        let carried = |stmt: &Stmt<Laid>| match stmt {
             Stmt::Loop(l) => l.carried.clone(),
-            Stmt::Pipeline(p) => p.carried.clone(),
             _ => vec![],
         };
         let mut starts: HashMap<ValId, usize> = HashMap::new();
@@ -270,7 +276,7 @@ impl<'a> Emit<'a> {
         Self {
             prog,
             index,
-            lay,
+            lay: &prog.layouts,
             low,
             params,
             vars: HashMap::new(),
@@ -665,7 +671,7 @@ impl<'a> Emit<'a> {
         }
     }
 
-    fn block(&mut self, block: &Block) -> Result<()> {
+    fn block(&mut self, block: &Block<Laid>) -> Result<()> {
         self.pending.push(vec![]);
         let waited = block.0.iter().any(|s| matches!(s, Stmt::Sync(Sync::WaitProducts { .. })));
         let outer = std::mem::replace(&mut self.async_products, waited);
@@ -686,7 +692,7 @@ impl<'a> Emit<'a> {
         Ok(())
     }
 
-    fn stmt(&mut self, stmt: &Stmt) -> Result<()> {
+    fn stmt(&mut self, stmt: &Stmt<Laid>) -> Result<()> {
         match stmt {
             Stmt::Let { dst, op } => {
                 self.let_(*dst, op)?;
@@ -699,7 +705,7 @@ impl<'a> Emit<'a> {
                 Ok(())
             }
             Stmt::Loop(l) => self.loop_(l),
-            Stmt::Pipeline(_) => UnsupportedSnafu { what: "an unexpanded pipeline" }.fail(),
+            Stmt::Pipeline(never) => match *never {},
             Stmt::Warps { body } => {
                 let outer = std::mem::replace(&mut self.scope, Scope::Warp);
                 let out = self.block(body);
@@ -762,18 +768,18 @@ impl<'a> Emit<'a> {
     /// A rolled loop, or `unroll` copies of the body per iteration followed by
     /// a rolled remainder (skipped when a constant extent divides evenly).
     /// Whether any statement of `block`, at any depth, is a product.
-    fn holds_product(block: &Block) -> bool {
+    fn holds_product(block: &Block<Laid>) -> bool {
         block.walk().any(|(_, s)| matches!(s, Stmt::Let { op: TileOp::Mma { .. }, .. }))
     }
 
-    fn loop_(&mut self, l: &Loop) -> Result<()> {
+    fn loop_(&mut self, l: &Loop<Laid>) -> Result<()> {
         self.rolling.push(Self::holds_product(&l.body));
         let out = self.loop_inner(l);
         self.rolling.pop();
         out
     }
 
-    fn loop_inner(&mut self, l: &Loop) -> Result<()> {
+    fn loop_inner(&mut self, l: &Loop<Laid>) -> Result<()> {
         let copied: Vec<Carried> =
             l.carried.iter().filter(|c| self.root(c.init) != self.root(c.phi)).copied().collect();
         for c in copied {
@@ -847,7 +853,7 @@ impl<'a> Emit<'a> {
     /// One iteration's body; a carried value's move into its `phi` is
     /// scheduled for the end of the block that defines its `next` (see
     /// [`Self::advance`]).
-    fn body(&mut self, l: &Loop) -> Result<()> {
+    fn body(&mut self, l: &Loop<Laid>) -> Result<()> {
         self.carried.push(l.carried.clone());
         self.block(&l.body)?;
         self.carried.pop();
@@ -869,7 +875,12 @@ impl<'a> Emit<'a> {
         self.pending.last_mut().expect("an open block").extend(moves);
     }
 
-    fn loop_rolled(&mut self, l: &Loop, end: Arc<UOp>, iv: impl Fn(&mut Self, Arc<UOp>) -> Arc<UOp>) -> Result<()> {
+    fn loop_rolled(
+        &mut self,
+        l: &Loop<Laid>,
+        end: Arc<UOp>,
+        iv: impl Fn(&mut Self, Arc<UOp>) -> Arc<UOp>,
+    ) -> Result<()> {
         let range = self.open_range(end);
         let level = self.level();
         let value = iv(self, range.clone());
@@ -879,7 +890,7 @@ impl<'a> Emit<'a> {
         Ok(())
     }
 
-    fn loop_unrolled(&mut self, l: &Loop, trips: Arc<UOp>, u: i64) -> Result<()> {
+    fn loop_unrolled(&mut self, l: &Loop<Laid>, trips: Arc<UOp>, u: i64) -> Result<()> {
         let start = self.sc(l.start);
         let range = self.open_range(trips);
         let level = self.level();
@@ -951,7 +962,7 @@ fn lane_of(u: &Arc<UOp>) -> Option<(&Arc<UOp>, u32)> {
 }
 
 /// Whether scalar `id` is a multiple of `m` whatever its inputs.
-fn multiple_of(prog: &Program, id: ScalarId, m: i64) -> bool {
+fn multiple_of(prog: &Program<Laid>, id: ScalarId, m: i64) -> bool {
     match prog.scalar(id) {
         Scalar::Const(v) => v % m == 0,
         Scalar::Bin(BinOp::Add | BinOp::Sub | BinOp::Min | BinOp::Max, a, b) => {
@@ -963,7 +974,7 @@ fn multiple_of(prog: &Program, id: ScalarId, m: i64) -> bool {
 }
 
 /// Whether scalar `id` reads [`Scalar::Row`], memoized in `memo`.
-fn reads_row(prog: &Program, id: ScalarId, memo: &mut Vec<Option<bool>>) -> bool {
+fn reads_row(prog: &Program<Laid>, id: ScalarId, memo: &mut Vec<Option<bool>>) -> bool {
     if let Some(known) = memo[id.index()] {
         return known;
     }

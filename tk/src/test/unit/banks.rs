@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 
+use proptest::prelude::*;
 use svod_dtype::AmdArch;
 use test_case::test_case;
 
@@ -12,25 +13,30 @@ use crate::kernels::Admitted;
 use crate::kernels::Batch;
 use crate::kernels::attention::{AttnMask, AttnSpec, FaCfg, attention};
 use crate::kernels::gemm::{Epilogue, GemmSpec, gemm};
-use crate::layouts::shared_element;
+use crate::layouts::SharedSwizzle;
 use crate::lower::{Lowered, Lowering, standalone};
 use crate::ops::config;
 use crate::sweep::{amd, declared};
 
-#[test_case(16, 8, 2, false; "one chunk a row")]
-#[test_case(16, 8, 2, true; "one chunk a row, halves")]
-#[test_case(64, 16, 2, true; "two chunks")]
-#[test_case(64, 32, 2, true; "four chunks")]
-#[test_case(64, 64, 2, true; "eight chunks")]
-#[test_case(32, 256, 2, true; "a row past the widest span")]
-#[test_case(32, 24, 2, true; "unswizzled")]
-#[test_case(32, 64, 1, true; "bytes")]
-#[test_case(32, 16, 4, true; "words")]
-fn a_shared_tile_keeps_each_element_a_place(rows: usize, cols: usize, bytes: usize, halves: bool) {
-    let at: BTreeSet<_> = (0..rows)
-        .flat_map(|r| (0..cols).map(move |c| shared_element(r, c, cols, bytes, halves.then_some(3))))
-        .collect();
-    assert_eq!(at, (0..rows * cols).collect());
+proptest! {
+    /// The swizzle is an F2 map that leaves a row's columns a permutation of
+    /// themselves by construction; what the algebra does not say is that a
+    /// row of chunks that is no power of two (unswizzled, its halves still
+    /// exchanged) stays within its row, so every tile of whole chunks keeps
+    /// each element a place of its own.
+    #[test]
+    fn a_shared_tile_keeps_each_element_a_place(
+        rows in 1usize..=64,
+        chunks in 1usize..=20,
+        bytes in prop::sample::select(vec![1usize, 2, 4, 8]),
+        halves in prop::option::of(0u32..6),
+    ) {
+        let cols = chunks * (16 / bytes);
+        let swizzle = SharedSwizzle::new(cols, bytes, halves);
+        let swizzle = &swizzle;
+        let at: BTreeSet<_> = (0..rows).flat_map(|r| (0..cols).map(move |c| swizzle.element(r, c))).collect();
+        prop_assert_eq!(at, (0..rows * cols).collect());
+    }
 }
 
 fn gemm_on(arch: AmdArch) -> Lowered {
@@ -76,21 +82,23 @@ fn missed(low: &Lowered, banks: SharedBanks) -> usize {
     let mut missed = 0;
     for (_, stmt) in prog.walk() {
         let Stmt::Copy { dst, src, .. } = stmt else { continue };
-        let (Place::Smem { alloc, .. }, Some(l)) = (&prog.value(*src).place, low.layouts[dst.index()].as_ref()) else {
+        let (Place::Smem { alloc, .. }, Some(l)) = (&prog.value(*src).place, prog.layouts[dst.index()].as_ref()) else {
             continue;
         };
         let a = &prog.smem[alloc.index()];
+        let Storage { along, halves } = a.storage;
         let shape = prog.value(*src).shape;
-        let cols = if a.along == Axis::Row { shape.rows } else { shape.cols };
+        let cols = if along == Axis::Row { shape.rows } else { shape.cols };
         let bytes = a.dtype.bytes();
         let width = 16 / bytes as u32;
-        for (reg, _) in l.runs(lanes, width, a.along) {
+        let swizzle = SharedSwizzle::new(cols, bytes, halves);
+        for (reg, _) in l.runs(lanes, width, along) {
             for group in 0..lanes / banks.count {
                 let reached: BTreeSet<_> = (0..banks.count)
                     .map(|i| {
                         let (r, c) = l.coord(0, group * banks.count + i, reg);
-                        let (r, c) = if a.along == Axis::Row { (c, r) } else { (r, c) };
-                        let at = shared_element(r as usize, c as usize, cols, bytes, a.halves) * bytes;
+                        let (r, c) = if along == Axis::Row { (c, r) } else { (r, c) };
+                        let at = swizzle.element(r as usize, c as usize) * bytes;
                         at / banks.bytes as usize % banks.count as usize
                     })
                     .collect();
@@ -104,7 +112,7 @@ fn missed(low: &Lowered, banks: SharedBanks) -> usize {
 #[test]
 fn gemm_reads_reach_every_bank() {
     let low = gemm_on(AmdArch::Gfx942);
-    assert!(low.tile.smem.iter().all(|a| a.halves.is_some()), "{:?}", low.tile.smem);
+    assert!(low.tile.smem.iter().all(|a| a.storage.halves.is_some()), "{:?}", low.tile.smem);
     assert_eq!(missed(&low, amd(AmdArch::Gfx942, 304).shared_banks.unwrap()), 0);
 }
 
@@ -112,7 +120,7 @@ fn gemm_reads_reach_every_bank() {
 #[test_case(128; "d128")]
 fn attention_reads_reach_every_bank(d: usize) {
     let low = attention_on(AmdArch::Gfx942, d);
-    assert!(low.tile.smem.iter().all(|a| a.halves.is_some()), "{:?}", low.tile.smem);
+    assert!(low.tile.smem.iter().all(|a| a.storage.halves.is_some()), "{:?}", low.tile.smem);
     assert_eq!(missed(&low, amd(AmdArch::Gfx942, 304).shared_banks.unwrap()), 0);
 }
 
@@ -121,7 +129,7 @@ fn attention_reads_reach_every_bank(d: usize) {
 fn a_target_without_banks_keeps_its_chunks(arch: AmdArch) {
     assert!(amd(arch, 304).shared_banks.is_none());
     let low = attention_on(arch, 64);
-    assert!(low.tile.smem.iter().all(|a| a.halves.is_none()));
+    assert!(low.tile.smem.iter().all(|a| a.storage.halves.is_none()));
 }
 
 #[test]

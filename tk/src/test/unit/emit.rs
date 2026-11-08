@@ -490,11 +490,8 @@ fn a_products_operand_is_the_load_that_filled_it(target: Target) {
     };
     let lowered =
         crate::lower::standalone(gemm::<BF16>(&spec), &Lowering::new(&super::declared(target.clone()))).unwrap();
-    let Op::Program(ops::Program { linear: Some(linear), .. }) = lowered.program.op() else {
-        unreachable!("a lowering emits a linear program")
-    };
     let (mut folded, mut stacked) = (0, 0);
-    for u in linear.op().sources() {
+    for u in lowered.linear.op().sources() {
         let Op::Wmma(ops::Wmma { a, b, .. }) = u.op() else { continue };
         for operand in [a, b] {
             folded += matches!(operand.op(), Op::Shuffle(..)) as usize;

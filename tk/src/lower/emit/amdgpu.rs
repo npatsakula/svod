@@ -63,7 +63,7 @@ impl Emit<'_> {
 /// stride. The stride only steers the cache, and only a power of two spreads
 /// rows: the largest within the row, whose loads gain most, of the widest input
 /// row or else output row that gains. A byte offset must fit 31 bits.
-pub(super) fn swizzled(params: Vec<Arc<UOp>>, prog: &Program, target: &Target) -> Vec<Arc<UOp>> {
+pub(super) fn swizzled(params: Vec<Arc<UOp>>, prog: &Program<Laid>, target: &Target) -> Vec<Arc<UOp>> {
     let fits = |p: &Param| p.elems.saturating_mul(p.dtype.bytes()) <= i32::MAX as usize;
     let Some(swizzle) = target.cache_swizzle.filter(|_| prog.params.iter().all(fits)) else { return params };
     let widest = |input: bool| {

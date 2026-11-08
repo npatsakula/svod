@@ -49,8 +49,11 @@ optimization"), `do_linearize` returns before the `SVOD_DUMP_LINEAR` dump (`code
    `schedule::expand` (each `Pipeline`'s `Schedule` under the target's `Fill`; on the warpgroup
    core a `cp.async` ring of ≥ 3 slots whose consume only chains products leaves them in flight) → `layouts::infer`
    (F2 `TileLayout` per register tile, priced relayouts; a product whose result is dealt issues the narrow way,
-   `MmaAtom::narrow`) → `orient_shared` → `emit::emit` (`lower/emit/{mod,address,
-   copy,compute,nvptx,amdgpu}.rs`; vendor intrinsics only in the last two). `Lowering { device, core }`
+   `MmaAtom::narrow`; each shared allocation's `Storage`, its axis and bank halves) → `emit::emit` (`lower/emit/{mod,address,
+   copy,compute,nvptx,amdgpu}.rs`; vendor intrinsics only in the last two). A program's phase is its type
+   (`ir::Phase`): `Program` is authored, `expand` returns `Program<Expanded>` (no `Stmt::Pipeline`), `infer` returns
+   `Program<Laid>` (every product's `Orient`, every deal's order, `Storage`, `layouts`); `interp::run` takes any.
+   `Lowering { device, core }`
    (`Lowering::new(device)` on the warp-level core); the warp grid is the program's (`Kernel::warps`,
    `Program::warp_grid`); `layouts::Swizzle::{None,B32,B64,B128}`.
 3. **Target** (`atoms.rs`): matrix cores (`mma: Vec<MmaAtom>`, `group_mma`; `geometry()` the 16-bit atom the

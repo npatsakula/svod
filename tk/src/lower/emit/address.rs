@@ -264,17 +264,17 @@ impl Emit<'_> {
                 let unit = |s: ScalarId| matches!(self.prog.scalar(s), Scalar::Const(1));
                 if unit(stride[1]) { (Axis::Col, true) } else { (Axis::Row, unit(stride[0])) }
             }
-            Some(Place::Smem { alloc, .. }) => (self.prog.smem[alloc.index()].along, true),
+            Some(Place::Smem { alloc, .. }) => (self.prog.smem[alloc.index()].storage.along, true),
             None => (Axis::Col, true),
             Some(Place::Reg) => unreachable!(),
         }
     }
 
     /// The row bit a view's allocation exchanges its chunks' halves on
-    /// ([`crate::layouts::shared_element`]): its accesses stay within a half.
+    /// ([`crate::layouts::SharedSwizzle`]): its accesses stay within a half.
     pub(super) fn halves(&self, view: &View) -> Option<u32> {
         match &view.place {
-            Some(Place::Smem { alloc, .. }) => self.prog.smem[alloc.index()].halves,
+            Some(Place::Smem { alloc, .. }) => self.prog.smem[alloc.index()].storage.halves,
             _ => None,
         }
     }

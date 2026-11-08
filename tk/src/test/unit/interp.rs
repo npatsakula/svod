@@ -461,19 +461,18 @@ fn a_lowered_deal_replays_the_devices_order() {
         }
     });
     let lowered = crate::lower::standalone(prog, &Lowering::new(&super::declared(sm86()))).unwrap();
-    let mut orders = 0;
+    let mut renamed = false;
     for (_, stmt) in lowered.tile.walk() {
         let Stmt::Let { op: TileOp::Deal { src, order, .. }, .. } = stmt else { continue };
-        let Some(order) = order else { continue };
-        orders += 1;
         let cols = lowered.tile.value(*src).shape.cols;
         for row in order {
             let mut sorted = row.clone();
             sorted.sort_unstable();
             assert_eq!(sorted, (0..cols as u32).collect::<Vec<_>>(), "a row's columns once");
+            renamed |= row.iter().enumerate().any(|(i, &c)| c != i as u32);
         }
     }
-    assert!(orders > 0, "the device's renaming order was recorded");
+    assert!(renamed, "the device's renaming order was recorded");
     let mut seed = 5;
     let xs = super::rounded(ScalarDType::BFloat16, rows * depth, &mut seed, |v| v);
     let cs = super::rounded(ScalarDType::BFloat16, cols * depth, &mut seed, |v| v);

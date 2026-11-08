@@ -11,7 +11,7 @@ use snafu::OptionExt;
 use super::*;
 
 impl Emit<'_> {
-    pub(super) fn let_(&mut self, dst: ValId, op: &TileOp) -> Result<()> {
+    pub(super) fn let_(&mut self, dst: ValId, op: &TileOp<Laid>) -> Result<()> {
         let dtype = DType::Scalar(self.value(dst).dtype);
         let regs = self.layout(dst).regs();
         match *op {
@@ -172,9 +172,8 @@ impl Emit<'_> {
             .collect()
     }
 
-    pub(super) fn mma(&mut self, dst: ValId, op: &TileOp) -> Result<()> {
+    pub(super) fn mma(&mut self, dst: ValId, op: &TileOp<Laid>) -> Result<()> {
         let TileOp::Mma { acc, a, b, a_t, b_t, orient } = *op else { unreachable!("a product") };
-        let orient = orient.expect("a laid program orients every product");
         let (va, vd) = (self.value(a).clone(), self.value(dst).clone());
         let atom =
             self.low.device.target.mma_on(self.low.core, va.dtype, vd.dtype).expect("inference found the core").clone();

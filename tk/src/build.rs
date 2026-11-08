@@ -385,6 +385,7 @@ impl<'k> Kernel<'k> {
                 values: vec![],
                 body: Block::default(),
                 pins: vec![],
+                layouts: (),
             },
             blocks: vec![Block::default()],
             scope: Scope::Block,
@@ -454,7 +455,7 @@ impl<'k> Kernel<'k> {
     }
 
     pub fn smem<T: Elem>(&mut self, name: impl Into<String>, elems: usize) -> SmemRef<'k, T> {
-        self.prog.smem.push(SmemAlloc { name: name.into(), dtype: T::DTYPE, elems, halves: None, along: Axis::Col });
+        self.prog.smem.push(SmemAlloc { name: name.into(), dtype: T::DTYPE, elems, storage: () });
         SmemRef(SmemId(self.prog.smem.len() as u32 - 1), PhantomData)
     }
 
@@ -939,7 +940,7 @@ impl<'k> Kernel<'k> {
     fn dealt<T: Elem, U: Elem>(&mut self, src: Regs<'k, T>, w: usize, j: usize, col: bool) -> Regs<'k, U> {
         let shape = self.shape(src);
         assert!(w > 0 && shape.cols.is_multiple_of(w) && j < shape.cols / w, "deal {j} of {shape:?} by {w}");
-        self.let_(Shape::new(shape.rows, w), TileOp::Deal { src: src.0, j: j as u32, col, order: None })
+        self.let_(Shape::new(shape.rows, w), TileOp::Deal { src: src.0, j: j as u32, col, order: () })
     }
 
     /// Hold `v` under `layout` (see [`Program::pins`]).

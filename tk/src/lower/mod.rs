@@ -8,11 +8,11 @@ use snafu::{ResultExt, Snafu, ensure};
 use svod_codegen::Renderer;
 use svod_codegen::llvm::LlvmTextRenderer;
 use svod_dtype::{DType, DeviceSpec, GpuArch};
-use svod_ir::{Op, UOp, ops};
+use svod_ir::UOp;
 
-use crate::atoms::{Core, Device, SharedBanks, Target};
+use crate::atoms::{Core, Device, Target};
 use crate::ir::*;
-use crate::layouts::{self, Laid, TileLayout};
+use crate::layouts;
 use crate::schedule;
 
 pub mod emit;
@@ -68,8 +68,10 @@ impl Lowering {
 
 pub struct Lowered {
     pub program: Arc<UOp>,
-    pub tile: Program,
-    pub layouts: Vec<Option<TileLayout>>,
+    /// The instruction list `program` holds (its LINEAR stage).
+    pub linear: Arc<UOp>,
+    /// The tile program as emitted: laid, with every register value's layout.
+    pub tile: Program<Laid>,
     /// The ranges the program's own schedule kept rolled (a loop whose body
     /// holds a product), which [`Lowered::text`] hints every target against
     /// unrolling further.
@@ -90,14 +92,12 @@ pub fn lower(mut prog: Program, lowering: &Lowering, params: Vec<Arc<UOp>>, devi
     ensure!(prog.warps.is_multiple_of(grid) && (prog.warps == grid || lone), GridSnafu { warps: prog.warps, grid });
     materialize_operands(&mut prog, lowering.core);
     sync::insert_barriers(&mut prog)?;
-    schedule::expand(&mut prog, lowering.device.target.fill, lowering.core);
-    let mut laid = layouts::infer(prog, &lowering.device, lowering.core).context(LayoutSnafu)?;
-    orient_shared(&mut laid, &lowering.device.target);
+    let prog = schedule::expand(prog, lowering.device.target.fill, lowering.core);
+    let laid = layouts::infer(prog, &lowering.device, lowering.core).context(LayoutSnafu)?;
     emit::ROLLED.with(|cell| cell.borrow_mut().clear());
-    let program = emit::emit(&laid, lowering, params, device)?;
+    let (program, linear) = emit::emit(&laid, lowering, params, device)?;
     let rolled = emit::ROLLED.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
-    let Laid { prog, layouts } = laid;
-    Ok(Lowered { program, tile: prog, layouts, rolled })
+    Ok(Lowered { program, linear, tile: laid, rolled })
 }
 
 /// `prog` lowered for its lowering's target alone, its parameters declared
@@ -123,10 +123,7 @@ impl Lowered {
     /// The instructions the program emitted (within
     /// [`Target::most_instructions`]).
     pub fn instructions(&self) -> usize {
-        let Op::Program(ops::Program { linear: Some(linear), .. }) = self.program.op() else {
-            unreachable!("a lowering emits a linear program")
-        };
-        linear.op().sources().len()
+        self.linear.op().sources().len()
     }
 
     /// The LLVM text of the program for `target`: what the backend's
@@ -138,138 +135,12 @@ impl Lowered {
             GpuArch::Metal(_) => return UnsupportedSnafu { what: "Metal's LLVM text" }.fail(),
         }
         .rolled(self.rolled.iter().copied());
-        let Op::Program(ops::Program { linear: Some(linear), .. }) = self.program.op() else {
-            unreachable!("a lowering emits a linear program")
-        };
         if svod_schedule::spec::spec_enabled() {
-            let nodes = linear.op().sources();
+            let nodes = self.linear.op().sources();
             svod_schedule::spec::type_verify_list(&nodes, &svod_schedule::spec::spec_program()).expect("a valid list");
         }
         let name = &self.tile.name;
-        Ok(renderer.render(linear, Some(name)).context(RenderSnafu { name })?.code)
-    }
-}
-
-/// Store every shared allocation along the axis its readers' fragments run
-/// along: a tile whose consumers each hold runs of rows (a value tile under
-/// the product's B operand, say) is kept column-major, so the gathers are
-/// 16-byte loads instead of one load per element. Only allocations filled
-/// through registers can be stored transposed (the stores scatter; a chunk
-/// copy cannot), and readers that disagree keep the row-major default.
-fn orient_shared(laid: &mut Laid, target: &Target) {
-    let Laid { prog, layouts } = laid;
-    let lanes = target.wave;
-    let alloc = |prog: &Program, v: ValId| match prog.value(v).place {
-        Place::Smem { alloc, .. } => Some(alloc.index()),
-        _ => None,
-    };
-    let mut wants: Vec<Option<Axis>> = vec![None; prog.smem.len()];
-    let mut staged = vec![true; prog.smem.len()];
-    for (_, stmt) in prog.walk() {
-        let Stmt::Copy { dst, src, mode, .. } = stmt else { continue };
-        if let (Some(a), Tier::Global) = (alloc(prog, *dst), prog.value(*src).tier()) {
-            staged[a] &= *mode == CopyMode::Staged;
-        }
-        let (Some(a), Tier::Reg) = (alloc(prog, *src), prog.value(*dst).tier()) else { continue };
-        // A view under another type is scratch over a dead region: it takes
-        // the allocation's axis as it finds it.
-        if prog.value(*dst).dtype != prog.smem[a].dtype {
-            continue;
-        }
-        let l = layouts[dst.index()].as_ref().expect("a laid register tile");
-        let width = 16 / prog.value(*dst).dtype.bytes() as u32;
-        let widest = |along| l.runs(lanes, width, along).iter().map(|&(_, w)| w).max().unwrap_or(1);
-        let along = if widest(Axis::Row) > widest(Axis::Col) { Axis::Row } else { Axis::Col };
-        wants[a] = Some(match wants[a] {
-            Some(other) if other != along => Axis::Col,
-            _ => along,
-        });
-    }
-    let transposed: Vec<usize> = (0..prog.smem.len()).filter(|&i| staged[i] && wants[i] == Some(Axis::Row)).collect();
-    for &i in &transposed {
-        prog.smem[i].along = Axis::Row;
-    }
-    // The staged registers of a column-major tile hold column runs where the
-    // target loads them transposed, else are walked down its rows so a
-    // wave's lanes store consecutive elements; a warp's own copy spreads
-    // its chunks over that warp's lanes alone.
-    for (_, stmt) in prog.walk() {
-        let Stmt::Copy { dst, src, mode: CopyMode::Staged, scope } = stmt else { continue };
-        if !(alloc(prog, *dst).is_some_and(|a| transposed.contains(&a)) && prog.value(*src).tier() == Tier::Reg) {
-            continue;
-        }
-        let tmp = prog.value(*src);
-        let bytes = tmp.dtype.bytes();
-        let warps = if *scope == Scope::Warp { 1 } else { prog.warps };
-        let l = layouts::transposing(tmp.shape, warps, lanes)
-            .filter(|_| target.tr_load && bytes == 2)
-            .or_else(|| layouts::chunked(tmp.shape, bytes, warps, lanes, Axis::Row));
-        if let Some(l) = l {
-            layouts[src.index()] = Some(l);
-        }
-    }
-    if let Some(banks) = target.shared_banks {
-        meet_banks(prog, layouts, banks, lanes);
-    }
-}
-
-/// Exchange the chunks' halves of each shared allocation whose readers reach
-/// the target's banks only that way. An allocation qualifies when one tile
-/// shape reads it whole (the exchange follows the view's row) and no reader
-/// holds a run across a half. Only banks of half a chunk are met this way, on
-/// the row bit that doubles the banks the lower bits reach.
-fn meet_banks(prog: &mut Program, layouts: &[Option<TileLayout>], banks: SharedBanks, lanes: u32) {
-    if 2 * banks.bytes != 16 {
-        return;
-    }
-    let bit = banks.count.ilog2() - 1;
-    for a in 0..prog.smem.len() {
-        let (along, dtype) = (prog.smem[a].along, prog.smem[a].dtype);
-        let views = prog.values.iter().filter(|v| matches!(v.place, Place::Smem { alloc, .. } if alloc.index() == a));
-        let shapes: Vec<_> = views.map(|v| (v.shape, v.dtype)).collect();
-        let Some(&(shape, _)) = shapes.first() else { continue };
-        let bytes = dtype.bytes();
-        let cols = if along == Axis::Row { shape.rows } else { shape.cols };
-        if bytes > 8 || !cols.is_multiple_of(16 / bytes) || shapes.iter().any(|&s| s != (shape, dtype)) {
-            continue;
-        }
-        let readers: Vec<&TileLayout> = prog
-            .walk()
-            .filter_map(|(_, stmt)| match stmt {
-                Stmt::Copy { dst, src, .. } => match (&prog.value(*src).place, prog.value(*dst).tier()) {
-                    (Place::Smem { alloc, .. }, Tier::Reg) if alloc.index() == a => layouts[dst.index()].as_ref(),
-                    _ => None,
-                },
-                _ => None,
-            })
-            .collect();
-        let warps = prog.warp_grid.count();
-        let group: Vec<u32> = (0..lanes).collect();
-        let width = (16 / bytes) as u32;
-        // Whether each `banks.count` consecutive lanes of every read reach as many banks.
-        let meets = |halves: Option<u32>| {
-            readers.iter().all(|l| {
-                let bank = |warp, lane, reg| {
-                    let (r, c) = l.coord(warp, lane, reg);
-                    let (r, c) = if along == Axis::Row { (c, r) } else { (r, c) };
-                    let at = layouts::shared_element(r as usize, c as usize, cols, bytes, halves) * bytes;
-                    1u64 << (at / banks.bytes as usize % banks.count as usize)
-                };
-                (0..warps).all(|warp| {
-                    l.runs(lanes, width, along).iter().all(|&(reg, _)| {
-                        group.chunks(banks.count as usize).all(|g| {
-                            g.iter().fold(0, |seen, &lane| seen | bank(warp, lane, reg)).count_ones() as usize
-                                == g.len()
-                        })
-                    })
-                })
-            })
-        };
-        let narrow = readers
-            .iter()
-            .all(|l| l.runs(lanes, width, along).iter().all(|&(_, w)| w as usize * bytes <= banks.bytes as usize));
-        let exchange = !readers.is_empty() && narrow && !meets(None) && meets(Some(bit));
-        prog.smem[a].halves = exchange.then_some(bit);
+        Ok(renderer.render(&self.linear, Some(name)).context(RenderSnafu { name })?.code)
     }
 }
 

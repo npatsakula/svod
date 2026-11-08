@@ -9,7 +9,7 @@ use svod_tensor::Tensor;
 use test_case::test_case;
 
 use super::{first_eight, self_join};
-use crate::atoms::{Core, Target};
+use crate::atoms::Target;
 use crate::build::{BF16, F16, I8};
 use crate::interp::{round_to, run};
 use crate::ir::Orient;
@@ -1292,9 +1292,9 @@ fn a_list_is_held_beside_its_rows(target: Target) {
         [(NearestCfg::new(64, 32, 2), 8), (NearestCfg::streamed(64, 64, 32, 2), 16), (NearestCfg::new(32, 16, 2), 3)]
     {
         let spec = plain(300, 500, 64, Metric::SquaredL2, k, cfg);
-        let laid = crate::layouts::infer(nearest::<BF16>(&spec), &device, Core::Warp).unwrap();
+        let laid = super::laid(nearest::<BF16>(&spec), &device).unwrap();
         let (mut lists, mut deals) = (0, 0);
-        for (_, stmt) in laid.prog.walk() {
+        for (_, stmt) in laid.walk() {
             let Stmt::Let { dst, op } = stmt else { continue };
             assert!(!matches!(op, TileOp::Relayout { .. }), "{cfg:?} k{k}: a relayout of {dst:?}");
             if let TileOp::Deal { src, j, .. } = *op {
@@ -1304,7 +1304,7 @@ fn a_list_is_held_beside_its_rows(target: Target) {
                 deals += 1;
             }
             let w = cfg.lanes.unwrap_or(LaneQueue::PORTABLE).width;
-            if laid.prog.value(*dst).shape == crate::ir::Shape::new(cfg.bq, w) {
+            if laid.value(*dst).shape == crate::ir::Shape::new(cfg.bq, w) {
                 let l = laid.layouts[dst.index()].as_ref().unwrap();
                 assert_eq!(*l, TileLayout::spread_row(&l.row_vector(), w as u32), "{cfg:?} k{k}");
                 lists += 1;
@@ -1360,7 +1360,7 @@ fn a_list_is_dealt_in_lane_under_measured_costs(target: Target, costs: crate::at
                     let lowered = crate::lower::standalone(prog, &Lowering::new(&device)).ok()?;
                     let dealt_in_lane = lowered.tile.walk().all(|(_, stmt)| match stmt {
                         crate::ir::Stmt::Let { dst, op: crate::ir::TileOp::Deal { src, j, .. } } => {
-                            let [s, t] = [*src, *dst].map(|v| lowered.layouts[v.index()].as_ref().unwrap());
+                            let [s, t] = [*src, *dst].map(|v| lowered.tile.layouts[v.index()].as_ref().unwrap());
                             s.deal(t, *j, c.warps(), device.target.wave)
                                 .is_some_and(|moves| moves.iter().all(|(picks, _)| picks.iter().all(|p| p.mask == 0)))
                         }
@@ -1396,7 +1396,7 @@ fn a_list_is_dealt_in_lane_under_measured_costs(target: Target, costs: crate::at
                     // count whatever way round it issues.
                     TileOp::Mma { .. } => products += 1,
                     TileOp::Deal { src, j, .. } => {
-                        let [s, t] = [src, *dst].map(|v| lowered.layouts[v.index()].as_ref().unwrap());
+                        let [s, t] = [src, *dst].map(|v| lowered.tile.layouts[v.index()].as_ref().unwrap());
                         let moves = s.deal(t, j, cfg.warps(), device.target.wave).unwrap();
                         assert!(
                             moves.iter().all(|(picks, _)| picks.iter().all(|p| p.mask == 0)),
@@ -2195,17 +2195,20 @@ fn a_swapped_product_folds_a_row_in_lanes(target: Target, direct: usize, swapped
         }
     }
     // Each reduction's fold masks and the lane moves a lane issues for it,
-    // and the product's orientation.
+    // and the product's orientation; a statement the ring's template lists
+    // twice (a peeled trip) is one decision.
     let folds = |orient: Option<Orient>| {
         let mut prog = nearest::<BF16>(&spec);
         if let Some(o) = orient {
             pin(&mut prog.body, o);
         }
-        let laid = crate::layouts::infer(prog, &planner.device, Core::Warp).unwrap();
+        let laid = super::laid(prog, &planner.device).unwrap();
         let (mut masks, mut moves, mut issued) = (vec![], vec![], vec![]);
-        for (_, s) in laid.prog.walk() {
+        let mut seen = std::collections::HashSet::new();
+        for (_, s) in laid.walk() {
             match s {
-                Stmt::Let { op: TileOp::Mma { orient, .. }, .. } => issued.push(orient.unwrap()),
+                Stmt::Let { dst, .. } if !seen.insert(*dst) => {}
+                Stmt::Let { op: TileOp::Mma { orient, .. }, .. } => issued.push(*orient),
                 Stmt::Let { dst, op: TileOp::Reduce { src, axis, .. } } => {
                     let (ls, ld) =
                         (laid.layouts[src.index()].as_ref().unwrap(), laid.layouts[dst.index()].as_ref().unwrap());

@@ -629,10 +629,7 @@ pub(crate) fn linear(prog: Program, lowering: &Lowering) -> std::sync::Arc<svod_
     let name = prog.name.clone();
     let lowered = crate::lower::lower(prog, lowering, params, device(&lowering.device.target))
         .unwrap_or_else(|e| panic!("{name}: {e}"));
-    let svod_ir::Op::Program(svod_ir::ops::Program { linear: Some(linear), .. }) = lowered.program.op() else {
-        panic!("a program")
-    };
-    linear.clone()
+    lowered.linear
 }
 
 /// LLVM text of `prog` for its lowering's target.

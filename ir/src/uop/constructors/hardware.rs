@@ -208,6 +208,16 @@ impl UOp {
         ops: impl IntoIterator<Item = Arc<Self>>,
         target: svod_dtype::DeviceSpec,
     ) -> Result<Arc<Self>> {
+        Ok(Self::listed_program(info, ops, target)?.0)
+    }
+
+    /// [`Self::linear_program`] with the LINEAR stage it holds, for a caller
+    /// that renders or counts the list without taking the program apart.
+    pub fn listed_program(
+        info: crate::KernelInfo,
+        ops: impl IntoIterator<Item = Arc<Self>>,
+        target: svod_dtype::DeviceSpec,
+    ) -> Result<(Arc<Self>, Arc<Self>)> {
         use std::collections::HashSet;
 
         let ops = Self::commit_param_shapes(ops.into_iter().collect());
@@ -260,7 +270,8 @@ impl UOp {
         let sink = Self::sink_with_info(roots, info);
         list.push(sink.clone());
         let program_info = crate::ProgramInfo::from_sink(&sink, target);
-        Ok(Self::program(sink, program_info, Some(Self::linear(list.into())), None, None))
+        let linear = Self::linear(list.into());
+        Ok((Self::program(sink, program_info, Some(linear.clone()), None, None), linear))
     }
 
     /// The dtype a program commits a weak integer constant of a shape to:

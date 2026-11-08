@@ -54,7 +54,7 @@ pub(super) fn lowered(prog: Program, lowering: &Lowering) -> crate::lower::Resul
 }
 
 /// The tile program after `lowering` for interpretation.
-fn lowered_tile(prog: Program, lowering: &Lowering) -> Program {
+fn lowered_tile(prog: Program, lowering: &Lowering) -> Program<crate::ir::Laid> {
     lowered(prog, lowering).unwrap().tile
 }
 
@@ -288,9 +288,7 @@ fn every_family_lowers_keeps_its_numbers_and_compiles(target: Target, facts: Fac
         let tile = &low.tile;
         let got = interp::run(tile, params, &vars).unwrap();
         // A device launch digests the program's linear form before anything compiles.
-        let Op::Program(ops::Program { linear: Some(linear), .. }) = low.program.op() else {
-            unreachable!("a program")
-        };
+        let linear = &low.linear;
         check(CanonicalGraph::from_root("identity", linear).is_ok(), "the program has no canonical identity");
         for (i, (g, w)) in got.iter().zip(&want).enumerate() {
             let same = g.iter().zip(w).all(|(a, b)| a == b || (a.is_nan() && b.is_nan()));
@@ -304,8 +302,7 @@ fn every_family_lowers_keeps_its_numbers_and_compiles(target: Target, facts: Fac
         insert_barriers(&mut twice).unwrap();
         check(twice == once, "the barrier pass fences what it fenced again");
 
-        let Op::Program(ops::Program { linear: Some(linear), .. }) = low.program.op() else { panic!("a program") };
-        let Op::Linear(ops::Linear { ops: list }) = linear.op() else { panic!("a linear list") };
+        let Op::Linear(ops::Linear { ops: list }) = low.linear.op() else { panic!("a linear list") };
         let zero = |u: &Arc<UOp>| matches!(u.op(), Op::Const(v) if v.0.try_int() == Some(0));
         for u in list.iter() {
             let buf = match u.op() {
@@ -318,7 +315,7 @@ fn every_family_lowers_keeps_its_numbers_and_compiles(target: Target, facts: Fac
             }
         }
 
-        let along = |ring: &str| tile.smem.iter().find(|a| a.name == ring).map(|a| a.along);
+        let along = |ring: &str| tile.smem.iter().find(|a| a.name == ring).map(|a| a.storage.along);
         let attention = name.starts_with("attention d");
         let rings = (along("k_s"), along("v_s"));
         if attention {
@@ -328,7 +325,7 @@ fn every_family_lowers_keeps_its_numbers_and_compiles(target: Target, facts: Fac
                 check((n == 0) == free, &format!("{n} tile relayouts"));
             }
         } else if name.starts_with("gemm") || name.starts_with("group gemm") || name.starts_with("conv") {
-            check(tile.smem.iter().all(|a| a.along == Axis::Col), "a GEMM tile stored column-major");
+            check(tile.smem.iter().all(|a| a.storage.along == Axis::Col), "a GEMM tile stored column-major");
         }
 
         let ir = low.text(&target).unwrap();
@@ -353,7 +350,7 @@ fn every_family_lowers_keeps_its_numbers_and_compiles(target: Target, facts: Fac
             check(ir.contains("ldmatrix") == target.ldmatrix, "fragments not read by ldmatrix where it is");
         }
         if name.starts_with("group gemm") {
-            let reg_operand = |s: &crate::ir::Stmt| matches!(s, crate::ir::Stmt::Copy { dst, .. } if tile.value(*dst).place == crate::ir::Place::Reg && tile.value(*dst).dtype == ScalarDType::BFloat16);
+            let reg_operand = |s: &crate::ir::Stmt<crate::ir::Laid>| matches!(s, crate::ir::Stmt::Copy { dst, .. } if tile.value(*dst).place == crate::ir::Place::Reg && tile.value(*dst).dtype == ScalarDType::BFloat16);
             check(!tile.walk().any(|(_, s)| reg_operand(s)), "an operand was loaded into registers");
             check(ir.contains("wgmma.mma_async.sync.aligned.m64n"), "no warpgroup product");
             check(!ir.contains("@llvm.nvvm.mma.") && !ir.contains("ldmatrix"), "a warp-level product");
@@ -975,7 +972,7 @@ fn a_bf16_sum_in_f32_takes_the_pair_dot_product_where_it_exists(target: Target, 
 }
 
 /// `Sync::Fence` statements in `block`, recursively.
-fn fences(block: &crate::ir::Block) -> usize {
+fn fences(block: &crate::ir::Block<crate::ir::Laid>) -> usize {
     use crate::ir::{Stmt, Sync};
     block.walk().filter(|(_, s)| matches!(s, Stmt::Sync(Sync::Fence))).count()
 }
@@ -1074,7 +1071,7 @@ fn prefetch_loads_stay_in_flight_across_a_barrier(arch: AmdArch, rdna: bool) {
 
 /// `Relayout` statements of tiles in `block`, recursively; vectors are not
 /// counted.
-fn tile_relayouts(prog: &Program, block: &crate::ir::Block) -> usize {
+fn tile_relayouts(prog: &Program<crate::ir::Laid>, block: &crate::ir::Block<crate::ir::Laid>) -> usize {
     use crate::ir::{Stmt, TileOp};
     let tile = |src: &crate::ir::ValId| prog.value(*src).shape.rows > 1 && prog.value(*src).shape.cols > 1;
     block.walk().filter(|(_, s)| matches!(s, Stmt::Let { op: TileOp::Relayout { src }, .. } if tile(src))).count()

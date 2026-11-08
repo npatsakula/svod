@@ -1,16 +1,16 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use test_case::test_case;
 
 use svod_dtype::{AmdArch, GpuArch, ScalarDType};
 
-use super::{costs, declared, lane_moves_dear};
+use super::{costs, declared, laid, lane_moves_dear};
 use crate::atoms::{Core, Costs, Device, Target, sm86};
 use crate::build::*;
 use crate::ir::*;
 use crate::layout::{self as frag, Dim};
 use crate::layouts::{
-    Issue, Laid, Pick, Relayout, Swizzle, TileLayout, WarpGrid, chunked, fills_in_chunks, infer, natural, transposing,
+    Issue, Pick, Relayout, Swizzle, TileLayout, WarpGrid, chunked, fills_in_chunks, natural, transposing,
 };
 
 fn coords(l: &TileLayout, warps: u32, lanes: u32) -> Vec<(u32, u32)> {
@@ -42,8 +42,6 @@ fn transposing_layouts_hold_16_byte_column_runs(rows: usize, cols: usize, warps:
     assert!(transposing(Shape::new(8, cols), warps, 32).is_none(), "blocks of 16");
 }
 
-/// The GEMM's accumulator takes the matrix core's C layout tiled over the
-/// warp grid, and the output cast inherits it.
 /// Inference that runs out of passes before every value is laid is an error,
 /// not a program the emitter finds unlaid values in.
 #[test_case(0 => matches Err(crate::layouts::Error::NotConverged { passes: 0 }); "out of passes")]
@@ -51,24 +49,27 @@ fn transposing_layouts_hold_16_byte_column_runs(rows: usize, cols: usize, warps:
 fn inference_out_of_passes_is_an_error(passes: usize) -> crate::layouts::Result<()> {
     let (target, grid) = (sm86(), WarpGrid { rows: 2, cols: 4 });
     let prog = Program { warps: 8, warp_grid: grid, ..super::gemm_nt(256, 256, 256, 128, 128, 32, 3) };
-    let Laid { prog, .. } = infer(prog, &declared(target.clone()), Core::Warp).unwrap();
-    crate::layouts::Infer::new(&prog, &target, grid, Core::Warp).solve_within(passes)
+    let prog = crate::schedule::expand(prog, target.fill, Core::Warp);
+    crate::layouts::Infer::new(&prog, &target, grid, Core::Warp, &HashMap::new()).solve_within(passes)
 }
 
+/// The GEMM's accumulator, carried by its ring's loop, takes the matrix
+/// core's C layout tiled over the warp grid, and the output cast inherits it.
 #[test]
 fn gemm_accumulator_gets_the_core_layout_over_the_warp_grid() {
     let grid = WarpGrid { rows: 2, cols: 4 };
     let prog = Program { warps: 8, warp_grid: grid, ..super::gemm_nt(256, 256, 256, 128, 128, 32, 3) };
-    let Laid { prog, layouts: lay } = infer(prog, &declared(sm86()), Core::Warp).unwrap();
-    let Stmt::Pipeline(p) = &prog.body.0[1] else { panic!("pipeline") };
-    let acc = lay[p.carried[0].phi.index()].as_ref().unwrap();
+    let prog = laid(prog, &declared(sm86())).unwrap();
+    let lay = &prog.layouts;
+    let Stmt::Loop(l) = &prog.body.0[1] else { panic!("the ring's loop") };
+    let acc = lay[l.carried[0].phi.index()].as_ref().unwrap();
     assert_eq!(acc.frag, frag::mma_sync_c());
     assert_eq!(acc.reps, [4, 4]);
     assert_eq!(acc.shape(), Shape::new(128, 128));
     assert_eq!(acc.regs(), 64, "128·128 f32 over 256 threads");
     let Stmt::Let { dst, op: TileOp::Cast { .. } } = &prog.body.0[2] else { panic!("cast") };
     assert_eq!(lay[dst.index()], Some(acc.clone()));
-    let init = p.carried[0].init;
+    let init = l.carried[0].init;
     assert_eq!(lay[init.index()], Some(acc.clone()), "the zero init adopts the carried layout");
     // every element of the block tile is held exactly once
     let held: HashSet<_> = coords(acc, 8, 32).into_iter().collect();
@@ -105,7 +106,8 @@ fn attention_probabilities_feed_the_second_mma_without_data_movement() {
         k.warps(4);
         (q_r.0, m.0)
     });
-    let Laid { prog, layouts: lay } = infer(prog, &declared(sm86()), Core::Warp).unwrap();
+    let prog = laid(prog, &declared(sm86())).unwrap();
+    let lay = &prog.layouts;
     let relayouts: Vec<_> = prog
         .walk()
         .filter_map(|(_, s)| match s {
@@ -169,7 +171,7 @@ fn a_product_result_pinned_off_its_atom_is_refused() {
         k.store(out, acc);
         acc.0
     });
-    let err = infer(prog, &declared(sm86()), Core::Warp).err();
+    let err = laid(prog, &declared(sm86())).err();
     assert!(matches!(err, Some(crate::layouts::Error::Unresolved { value }) if value == acc), "{err:?}");
 }
 
@@ -255,8 +257,8 @@ fn elementwise_operands_reach_the_op_in_its_layout() {
         let o = k.view(out, 0, [16, 1], Shape::new(16, 16), [None, None]);
         k.store(o, both);
     });
-    let Laid { prog, layouts } = infer(prog, &declared(sm86()), Core::Warp).unwrap();
-    let lay = |v: &ValId| layouts[v.index()].clone().unwrap();
+    let prog = laid(prog, &declared(sm86())).unwrap();
+    let lay = |v: &ValId| prog.layouts[v.index()].clone().unwrap();
     let mut checked = 0;
     for (_, s) in prog.walk() {
         if let Stmt::Let { dst, op: TileOp::Binary { a, b, .. } } = s {
@@ -318,11 +320,12 @@ fn gfx1151_attention(prog: Program, costs: &Costs) -> (Vec<Orient>, Vec<(TileLay
 fn gfx1151_attention_folds(prog: Program, costs: &Costs) -> (Vec<Orient>, Vec<(TileLayout, TileLayout)>, Vec<u32>) {
     let target = Target::for_arch(GpuArch::Amd(AmdArch::Gfx1151));
     let how = target.lane_move;
-    let Laid { prog, layouts: lay } = infer(prog, &Device { target, costs: *costs }, Core::Warp).unwrap();
+    let prog = laid(prog, &Device { target, costs: *costs }).unwrap();
+    let lay = &prog.layouts;
     let orients = prog
         .walk()
         .filter_map(|(_, s)| match s {
-            Stmt::Let { op: TileOp::Mma { orient, .. }, .. } => *orient,
+            Stmt::Let { op: TileOp::Mma { orient, .. }, .. } => Some(*orient),
             _ => None,
         })
         .collect();
@@ -586,18 +589,13 @@ fn a_fold_issues_the_lane_moves_it_is_priced(target: Target, orient: Orient, axi
     });
     let device = Device { target: target.clone(), costs: costs() };
     let lowering = crate::lower::Lowering::new(&device);
-    let prog = prog;
-    let laid = infer(prog.clone(), &device, Core::Warp).unwrap();
-    let priced: u32 = laid
-        .prog
+    let inferred = laid(prog.clone(), &device).unwrap();
+    let priced: u32 = inferred
         .walk()
         .filter_map(|(_, s)| match s {
             Stmt::Let { dst, op: TileOp::Reduce { src, axis, .. } } => {
-                Some(laid.layouts[src.index()].as_ref()?.fold_moves(
-                    laid.layouts[dst.index()].as_ref()?,
-                    *axis,
-                    target.lane_move,
-                ))
+                let (ls, ld) = (inferred.layouts[src.index()].as_ref()?, inferred.layouts[dst.index()].as_ref()?);
+                Some(ls.fold_moves(ld, *axis, target.lane_move))
             }
             _ => None,
         })

@@ -404,9 +404,8 @@ fn shared_reads_are_unfenced(target: Target, barrier: &str) {
 /// baseline, and the probe's per loop trip.
 fn relayouts(target: &Target, p: &Probe, i: usize) -> Vec<Relayout> {
     let (prog, lowering) = &p.candidates[i][0];
-    let Lowered { tile, layouts, .. } =
-        lowered(prog.clone(), lowering).unwrap_or_else(|e| panic!("{}: {e}", prog.name));
-    let lay = |v: ValId| layouts[v.index()].clone().expect("laid");
+    let Lowered { tile, .. } = lowered(prog.clone(), lowering).unwrap_or_else(|e| panic!("{}: {e}", prog.name));
+    let lay = |v: ValId| tile.layouts[v.index()].clone().expect("laid");
     tile.walk()
         .filter_map(|(_, s)| match s {
             Stmt::Let { dst, op: TileOp::Relayout { src } } => {
