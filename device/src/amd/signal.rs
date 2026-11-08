@@ -20,13 +20,23 @@ use crate::amd::device::AmdDeviceCore;
 use crate::error::{Error, Result};
 use crate::sync::TimelineSignal;
 
-/// Spin / yield budget before escalating to a KFD WAIT_EVENTS sleep: cheap
-/// polling for short waits, kernel blocking for long ones so a stalled wait
-/// doesn't pin a CPU.
+/// How long a wait polls before it sleeps in KFD `WAIT_EVENTS`, counted from
+/// the wait's start (ROCr `InterruptSignal::WaitRelaxed`: 200 µs). Every
+/// completion the host waits on raises the queue event, so a sleeping wait
+/// wakes as it retires, and a long one doesn't pin a CPU however often the
+/// queue moves.
 #[cfg(not(test))]
-const WAIT_EVENTS_ESCALATE_MS: u64 = 200;
+const SPIN: std::time::Duration = std::time::Duration::from_micros(200);
 #[cfg(test)]
-const WAIT_EVENTS_ESCALATE_MS: u64 = 1;
+const SPIN: std::time::Duration = std::time::Duration::from_millis(1);
+/// The polling part of [`SPIN`] that only spins; the rest yields.
+const SPIN_HOT: std::time::Duration = std::time::Duration::from_micros(100);
+/// The longest single `WAIT_EVENTS` sleep: a wait rechecks its value, its
+/// progress and its deadline at least this often.
+#[cfg(not(test))]
+const SLEEP_MS: u32 = 200;
+#[cfg(test)]
+const SLEEP_MS: u32 = 1;
 
 /// An AQL queue's packet read index, which waits on its timeline read as
 /// progress: a graph's one timeline store comes at its end, while the packet
@@ -156,20 +166,24 @@ impl AmdSignal {
         }
     }
 
-    /// Tiered busy-wait until `ready(value)` holds, or `timeout_ms` of *no
-    /// progress* elapses, or KFD reports a GPU fault. Shared by the
-    /// monotonic timeline waits.
-    ///
-    /// Early-exit on fault is load-bearing for BEAM search: a bad kernel config
-    /// may fault the GPU, and paying the full timeout per rejected candidate is
-    /// unaffordable.
     /// Waits on this signal count `read` moving as progress.
     pub(crate) fn watch_queue(&self, read: QueueReadPointer) {
         self.queue_read.set(read).expect("a timeline belongs to one queue");
     }
 
+    /// Wait until the value reaches `target`, `timeout_ms` passes with *no
+    /// progress* (the value, `progress` or the queue's read index moving), or
+    /// KFD reports a GPU fault. Shared by the monotonic timeline waits.
+    ///
+    /// Early-exit on fault is load-bearing for BEAM search: a bad kernel config
+    /// may fault the GPU, and paying the full timeout per rejected candidate is
+    /// unaffordable.
     fn poll_until(&self, target: u64, timeout_ms: u64, what: &'static str, progress: &[Arc<AmdSignal>]) -> Result<()> {
-        let mut start = std::time::Instant::now();
+        // Two clocks: `waiting` paces polling against sleeping and never
+        // resets; `quiet` is time since the last progress and alone decides a
+        // hang, so a long healthy plan neither spins nor times out.
+        let waiting = std::time::Instant::now();
+        let mut quiet = waiting;
         let mut prev = u64::MAX;
         let mut progress_values = vec![u64::MAX; progress.len()];
         let mut read_prev = None;
@@ -194,9 +208,9 @@ impl AmdSignal {
                 read_prev = Some(value);
             }
             if advanced {
-                start = std::time::Instant::now();
+                quiet = std::time::Instant::now();
             }
-            if timeout_ms > 0 && start.elapsed().as_millis() as u64 >= timeout_ms {
+            if timeout_ms > 0 && quiet.elapsed().as_millis() as u64 >= timeout_ms {
                 // A hung kernel almost always raised a fault; surface it
                 // alongside the deadline.
                 let fault = self.device.upgrade().and_then(|d| d.poll_faults_nonblocking());
@@ -207,7 +221,7 @@ impl AmdSignal {
                     waited_ms: timeout_ms,
                 }));
             }
-            if let Some(fault) = self.spin_or_escalate(start)? {
+            if let Some(fault) = self.spin_or_sleep(waiting)? {
                 return Err(fault);
             }
         }
@@ -245,34 +259,25 @@ impl AmdSignal {
         (start != 0 && end >= start).then(|| (start * NS_PER_TICK, end * NS_PER_TICK))
     }
 
-    /// Tiered polling backoff: tight spin → `yield_now` → KFD `WAIT_EVENTS`
-    /// once we've burned `WAIT_EVENTS_ESCALATE_MS` of wall time. The kernel
-    /// wakes us when the device's `queue_event` fires, eliminating CPU burn
-    /// for stalled or long-running dispatches.
+    /// Tiered backoff by the wait's age: spin, then yield, then from [`SPIN`]
+    /// on sleep in KFD `WAIT_EVENTS` for at most [`SLEEP_MS`]. The sleep wakes
+    /// on the queue event a completion raises and on the memory and hardware
+    /// fault events.
     ///
     /// Returns the typed `WAIT_EVENTS` failure directly. Otherwise, `Some`
     /// carries a reported GPU fault and `None` means a normal wake-up, timeout,
     /// dropped device, or the pure spin/yield path.
     #[inline]
-    fn spin_or_escalate(&self, start: std::time::Instant) -> Result<Option<Error>> {
-        let elapsed_ms = start.elapsed().as_millis() as u64;
-        if elapsed_ms >= WAIT_EVENTS_ESCALATE_MS
+    fn spin_or_sleep(&self, waiting: std::time::Instant) -> Result<Option<Error>> {
+        let elapsed = waiting.elapsed();
+        if elapsed >= SPIN
             && let Some(dev) = self.device.upgrade()
         {
-            // Sleep in the kernel for at most another tier worth of time;
-            // on return we re-check the host value and either complete
-            // or escalate again. wait_events watches the three KFD
-            // events (queue, mem fault, hw fault); a fault is returned
-            // here so we bail with the actual error instead of grinding
-            // through the rest of the timeout.
-            match dev.wait_events(WAIT_EVENTS_ESCALATE_MS as u32) {
-                Ok(Some(fault)) => return Ok(Some(fault)),
-                Ok(None) => return Ok(None),
-                Err(error) => return Err(error),
-            }
+            return dev.wait_events(SLEEP_MS);
         }
-        std::hint::spin_loop();
-        if start.elapsed().as_micros() >= 100 {
+        if elapsed < SPIN_HOT {
+            std::hint::spin_loop();
+        } else {
             std::thread::yield_now();
         }
         Ok(None)

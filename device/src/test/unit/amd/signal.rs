@@ -165,3 +165,33 @@ fn a_moving_read_pointer_keeps_a_wait_alive() {
     signal.wait_signal_value(1, 50).expect("the index keeps it alive");
     mover.join().unwrap();
 }
+
+/// A wait sleeps in `WAIT_EVENTS` once it outlives its polling budget, even
+/// while the queue keeps moving, and a silent one times out no sooner than its
+/// limit.
+#[test]
+fn a_long_wait_sleeps_while_the_queue_moves() {
+    let (iface, _allocator, _pool, signal) = mock_signal();
+    let index = Box::leak(Box::new(std::sync::atomic::AtomicU64::new(0)));
+    signal.watch_queue(QueueReadPointer::new(std::ptr::NonNull::new(index.as_ptr()).expect("a leaked box")));
+
+    let started = std::time::Instant::now();
+    let error = signal.wait_signal_value(1, 20).expect_err("the index stands still");
+    assert!(matches!(error, Error::TimelineTimeout { .. }), "{error:?}");
+    assert!(started.elapsed() >= std::time::Duration::from_millis(20));
+
+    let reader = &*index;
+    let done = Arc::clone(&signal);
+    let mover = std::thread::spawn(move || {
+        // Faster than the polling budget, so only the wait's age can sleep it.
+        for _ in 0..300 {
+            reader.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        done.reset(1);
+    });
+    let sleeps = wait_count(&iface);
+    signal.wait_signal_value(1, 20).expect("the index keeps it alive");
+    mover.join().unwrap();
+    assert!(wait_count(&iface) > sleeps, "a moving queue kept the wait polling");
+}
