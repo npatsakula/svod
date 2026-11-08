@@ -443,18 +443,67 @@ impl Tensor {
         if axis_idx != ndim - 1 { x.try_transpose(axis_idx as isize, -1) } else { Ok(x) }
     }
 
+    /// [`Self::_cumalu`] in two stages past 512 elements, as Tinygrad's
+    /// `_split_cumalu`: the axis in chunks of 256 reduced on their own, then
+    /// each chunk combined with the running total of the chunks before it, so
+    /// a long axis costs O(n·256) elements where one stage costs O(n²) (and
+    /// its pool's repeat count no longer overflows). A symbolic axis takes
+    /// the one stage.
+    fn _split_cumalu(&self, axis: isize, reduce: CumReduceOp) -> Result<Self> {
+        const SPLIT: usize = 256;
+        let shape = self.shape()?;
+        let ndim = shape.len();
+        let axis_idx = Self::normalize_axis(axis, ndim)?;
+        let Some(n) = shape[axis_idx].as_const().filter(|&n| n > 2 * SPLIT) else {
+            return self._cumalu(axis, reduce);
+        };
+        let identity = reduce.identity_value(self.uop().dtype());
+        let x = if axis_idx != ndim - 1 { self.try_transpose(axis_idx as isize, -1)? } else { self.clone() };
+        let (chunks, padded) = (n.div_ceil(SPLIT), n.div_ceil(SPLIT) * SPLIT);
+        let lead: Vec<SInt> = x.shape()?[..ndim - 1].to_vec();
+        let mut pad = vec![(0isize, 0isize); ndim];
+        pad[ndim - 1] = ((padded - n) as isize, 0);
+        let split = lead.iter().cloned().chain([SInt::Const(chunks), SInt::Const(SPLIT)]);
+        let x = x.try_pad_value(&pad, identity)?.try_reshape(split)?._cumalu(-1, reduce)?;
+        // What a chunk's prefixes combine with: the total of the chunks before it.
+        let mut last = vec![None; ndim + 1];
+        last[ndim] = Some((SInt::Const(SPLIT - 1), SInt::Const(SPLIT)));
+        let totals = x.try_shrink(last)?.try_reshape(lead.iter().cloned().chain([SInt::Const(chunks)]))?;
+        let mut shift = vec![(0isize, 0isize); ndim];
+        shift[ndim - 1] = (1, -1);
+        let before = totals._cumalu(-1, reduce)?.try_pad_value(&shift, identity)?.try_unsqueeze(-1)?;
+        let x = match reduce {
+            CumReduceOp::Add => x.try_add(&before)?,
+            CumReduceOp::Mul => x.try_mul(&before)?,
+            CumReduceOp::Max => x.maximum(&before)?,
+        };
+        let mut keep = vec![None; ndim];
+        keep[ndim - 1] = Some((SInt::Const(padded - n), SInt::Const(padded)));
+        let x = x.try_reshape(lead.into_iter().chain([SInt::Const(padded)]))?.try_shrink(keep)?;
+        if axis_idx != ndim - 1 { x.try_transpose(axis_idx as isize, -1) } else { Ok(x) }
+    }
+
+    /// The cumulative sum of the step vector an arange is: one stage, which
+    /// the arange collapse of rangeify folds to a range index where two stages
+    /// never do, except a count past `i32`, whose one-stage pool no `usize`
+    /// can size.
+    fn arange_cumsum(&self) -> Result<Self> {
+        let past_i32 = self.shape()?[0].as_const().is_some_and(|n| n > i32::MAX as usize);
+        if past_i32 { self._split_cumalu(0, CumReduceOp::Add) } else { self._cumalu(0, CumReduceOp::Add) }
+    }
+
     /// Cumulative sum along an axis.
     #[track_caller]
     pub fn cumsum(&self, axis: isize) -> Result<Self> {
         origin_call!("cumsum");
-        self._cumalu(axis, CumReduceOp::Add)
+        self._split_cumalu(axis, CumReduceOp::Add)
     }
 
     /// Cumulative product along an axis.
     #[track_caller]
     pub fn cumprod(&self, axis: isize) -> Result<Self> {
         origin_call!("cumprod");
-        self._cumalu(axis, CumReduceOp::Mul)
+        self._split_cumalu(axis, CumReduceOp::Mul)
     }
 
     /// Create 1D tensor with evenly spaced values and explicit dtype.
@@ -496,7 +545,7 @@ impl Tensor {
             Self::new(reshaped.try_expand(&target).unwrap())
         };
 
-        let cumsum = step_tensor._cumalu(0, CumReduceOp::Add)?;
+        let cumsum = step_tensor.arange_cumsum()?;
         let offset = Self::new(start.sub(&step));
         Ok(cumsum.try_add(&offset)?.cast(dtype))
     }
@@ -527,7 +576,7 @@ impl Tensor {
         }
         let count = count as usize;
         let step_tensor = Self::full(&[count], ConstValue::Float(step), dtype.clone());
-        let cumsum = step_tensor._cumalu(0, CumReduceOp::Add)?;
+        let cumsum = step_tensor.arange_cumsum()?;
         let offset = Self::const_(ConstValue::Float(start - step), dtype.clone());
         Ok(cumsum.try_add(&offset)?.cast(dtype))
     }
