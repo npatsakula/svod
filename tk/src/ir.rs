@@ -626,11 +626,34 @@ pub enum Orient {
     Swapped,
 }
 
+/// The width a program's scalars count in, fixed when it is built
+/// ([`crate::build::Kernel::finish`]): `i32`, or `i64` where a parameter's
+/// elements pass it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum IndexWidth {
+    I32,
+    I64,
+}
+
+impl IndexWidth {
+    pub fn of(params: &[Param]) -> Self {
+        if params.iter().any(|p| p.elems > i32::MAX as usize) { Self::I64 } else { Self::I32 }
+    }
+
+    pub fn dtype(self) -> svod_dtype::DType {
+        match self {
+            Self::I32 => svod_dtype::DType::Int32,
+            Self::I64 => svod_dtype::DType::Int64,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Program {
     pub name: String,
     pub params: Vec<Param>,
     pub vars: Vec<Var>,
+    pub index: IndexWidth,
     pub grid: [ScalarId; 3],
     pub warps: u32,
     /// How the warps spread a block-wide register tile: every warp, or a

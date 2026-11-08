@@ -30,3 +30,11 @@ fn a_variable_asked_for_again_keeps_its_range(min: i64, max: i64) {
     k.var("b", min, max);
     assert_eq!(k.finish().vars, vec![Var { name: "b".into(), min: 1, max: 8 }]);
 }
+
+/// A variable's range counts in `i32`, as every range does: one past it is
+/// refused where it is declared, before any program holds it.
+#[test]
+#[should_panic(expected = "counts to 2147483648, past i32")]
+fn a_variable_past_i32_is_refused_when_declared() {
+    crate::build::Kernel::new("vars").var("b", 1, i64::from(i32::MAX) + 1);
+}

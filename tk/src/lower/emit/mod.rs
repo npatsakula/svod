@@ -121,9 +121,10 @@ impl Listing {
     }
 }
 
-/// Ranges, grids and bound variables count in `i32` on every target, whatever
-/// the width of the addresses they build; a count past it is refused. A count
-/// without a bound is a row coordinate read from memory, in `i32` already.
+/// Ranges and grids count in `i32` on every target, whatever the width of the
+/// addresses they build (a bound variable's range does by construction,
+/// [`crate::build::Kernel::var`]); a count past it is refused. A count without a
+/// bound is a row coordinate read from memory, in `i32` already.
 fn counted(name: &str, most: Option<i64>) -> Result<()> {
     let extent = most.unwrap_or(0);
     ensure!(extent <= i32::MAX as i64, ExtentPastI32Snafu { name, extent });
@@ -235,7 +236,7 @@ impl Coord {
 
 impl<'a> Emit<'a> {
     fn new(prog: &'a Program, lay: &'a [Option<TileLayout>], low: &'a Lowering, params: Vec<Arc<UOp>>) -> Self {
-        let index = if prog.params.iter().any(|p| p.elems > i32::MAX as usize) { DType::Int64 } else { DType::Int32 };
+        let index = prog.index.dtype();
         let threads = prog.warps * low.device.target.wave;
         let tid = UOp::special_dtype(c32(threads as i64), "lidx0".to_string(), DType::Int32);
         let wave = c32(low.device.target.wave as i64);
@@ -371,9 +372,6 @@ impl<'a> Emit<'a> {
     fn prologue(&mut self) -> Result<()> {
         for &extent in &self.prog.grid {
             counted(&self.prog.name, self.prog.bounds(extent, &|_| None).map(|(_, hi)| hi))?;
-        }
-        for v in &self.prog.vars {
-            counted(&self.prog.name, Some(v.max))?;
         }
         let n = self.params.len();
         for (i, v) in self.prog.vars.iter().enumerate() {

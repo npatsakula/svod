@@ -238,6 +238,7 @@ impl Kernel {
                 name: name.into(),
                 params: vec![],
                 vars: vec![],
+                index: IndexWidth::I32,
                 grid: [ScalarId(0); 3],
                 warps: 4,
                 warp_grid: WarpGrid { rows: 4, cols: 1 },
@@ -281,10 +282,12 @@ impl Kernel {
         self.param(name, elems)
     }
 
-    /// A symbolic variable in `min..=max` the launch binds by name; asked
-    /// for again, the same variable over the same range.
+    /// A symbolic variable in `min..=max` the launch binds by name, counting
+    /// in `i32` as every range does; asked for again, the same variable over
+    /// the same range.
     pub fn var(&mut self, name: impl Into<String>, min: i64, max: i64) -> Sc {
         let name = name.into();
+        assert!(max <= i64::from(i32::MAX), "variable {name} counts to {max}, past i32");
         match self.prog.vars.iter().find(|v| v.name == name) {
             Some(v) => assert!(v.min == min && v.max == max, "variable {name} is in {}..={}", v.min, v.max),
             None => self.prog.vars.push(Var { name: name.clone(), min, max }),
@@ -1028,6 +1031,7 @@ impl Kernel {
     pub fn finish(mut self) -> Program {
         assert_eq!(self.blocks.len(), 1, "every block closed");
         self.prog.body = self.blocks.pop().expect("the root block");
+        self.prog.index = IndexWidth::of(&self.prog.params);
         check_carried(&self.prog.body);
         self.prog
     }
