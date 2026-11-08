@@ -184,6 +184,7 @@ impl AmdSignal {
         // hang, so a long healthy plan neither spins nor times out.
         let waiting = std::time::Instant::now();
         let mut quiet = waiting;
+        let mut age = 1;
         let mut prev = u64::MAX;
         let mut progress_values = vec![u64::MAX; progress.len()];
         let mut read_prev = None;
@@ -221,7 +222,7 @@ impl AmdSignal {
                     waited_ms: timeout_ms,
                 }));
             }
-            if let Some(fault) = self.spin_or_sleep(waiting)? {
+            if let Some(fault) = self.spin_or_sleep(waiting, &mut age)? {
                 return Err(fault);
             }
         }
@@ -268,12 +269,12 @@ impl AmdSignal {
     /// carries a reported GPU fault and `None` means a normal wake-up, timeout,
     /// dropped device, or the pure spin/yield path.
     #[inline]
-    fn spin_or_sleep(&self, waiting: std::time::Instant) -> Result<Option<Error>> {
+    fn spin_or_sleep(&self, waiting: std::time::Instant, age: &mut u64) -> Result<Option<Error>> {
         let elapsed = waiting.elapsed();
         if elapsed >= SPIN
             && let Some(dev) = self.device.upgrade()
         {
-            return dev.wait_events(SLEEP_MS);
+            return dev.wait_events(SLEEP_MS, age);
         }
         if elapsed < SPIN_HOT {
             std::hint::spin_loop();

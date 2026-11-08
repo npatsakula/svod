@@ -67,7 +67,13 @@ pub trait AmdIface: Send + Sync + std::fmt::Debug {
     /// `Ok(Some(Error::GpuFault{..}))` on a memory fault,
     /// `Ok(Some(Error::Runtime{..}))` on a hardware exception, `Ok(None)` on a
     /// normal wake-up/timeout, `Err` if the WAIT_EVENTS ioctl itself failed.
-    fn wait_events(&self, timeout_ms: u32) -> Result<Option<Error>>;
+    ///
+    /// `age` is the queue event's age this waiter last saw (KFD ≥ 1.14): the
+    /// call returns at once if the event fired since, and writes the new age
+    /// back, so every waiter sees each completion however many share the
+    /// auto-reset event. A wait starts at 1, the age of an event that never
+    /// fired; 0 opts out (ROCr `InterruptSignal::WaitRelaxed`).
+    fn wait_events(&self, timeout_ms: u32, age: &mut u64) -> Result<Option<Error>>;
 
     /// The KFD queue-completion event mailbox, when this backend has one.
     /// A completion packet that writes `event_id` there and raises an interrupt
@@ -187,11 +193,6 @@ pub struct KfdIface {
     drm_fd: OwnedFd,
     /// Its own clone of the topology node (gpu_id, drm minor, etc.).
     node: AmdNode,
-    // The following are captured at bring-up and retained for parity with the
-    // pre-refactor `AmdDeviceCore` (KFD ABI gating + event-page bookkeeping).
-    // They are read only during `open`/diagnostics today, so allow the
-    // not-currently-reread fields rather than churn the layout.
-    #[allow(dead_code)]
     kfd_version: (u32, u32),
     /// VA + size of the GTT-pinned event page (held to keep it mapped).
     #[allow(dead_code)]
@@ -585,9 +586,13 @@ impl AmdIface for KfdIface {
         Ok(QueueTeardown::Complete)
     }
 
-    fn wait_events(&self, timeout_ms: u32) -> Result<Option<Error>> {
+    fn wait_events(&self, timeout_ms: u32, age: &mut u64) -> Result<Option<Error>> {
         let mut events: [kfd::kfd_event_data; 3] = [Default::default(); 3];
         events[0].event_id = self.queue_event_id;
+        let aged = self.kfd_version >= (1, 14);
+        if aged {
+            events[0].__bindgen_anon_1.signal_event_data.last_event_age = *age;
+        }
         events[1].event_id = self.mem_fault_event_id;
         events[2].event_id = self.hw_fault_event_id;
         let mut args = kfd::kfd_ioctl_wait_events_args {
@@ -601,6 +606,10 @@ impl AmdIface for KfdIface {
         let rc = unsafe { ioctl::kfd_wait_events(self.kfd_fd.as_raw_fd(), &mut args as *mut _) };
         if let Err(e) = rc {
             return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_WAIT_EVENTS", errno: e as i32 });
+        }
+        if aged {
+            // SAFETY: slot [0] is the signal event, whose payload KFD writes back.
+            *age = unsafe { events[0].__bindgen_anon_1.signal_event_data.last_event_age };
         }
         // Inspect each event's union payload. `gpu_id != 0` signals the fault
         // was actually written by KFD (the union is zero-initialized when

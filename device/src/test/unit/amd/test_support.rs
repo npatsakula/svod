@@ -334,7 +334,7 @@ impl AmdIface for MockAmdIface {
         Ok(QueueTeardown::Complete)
     }
 
-    fn wait_events(&self, timeout_ms: u32) -> Result<Option<Error>> {
+    fn wait_events(&self, timeout_ms: u32, _age: &mut u64) -> Result<Option<Error>> {
         let scripted = {
             let mut state = self.state.lock();
             state.transcript.push(MockAmdCall::WaitEvents { timeout_ms });

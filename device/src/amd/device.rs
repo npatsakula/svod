@@ -673,9 +673,10 @@ impl AmdDeviceCore {
     /// Returns `Ok(Some(fault))` when a fault event fired (caller should bail
     /// with that error rather than continue polling the signal value).
     /// Returns `Ok(None)` for normal wake-ups (queue_event fired, timeout,
-    /// or no event yet).
-    pub fn wait_events(&self, timeout_ms: u32) -> Result<Option<Error>> {
-        match self.iface.wait_events(timeout_ms) {
+    /// or no event yet). `age` is the waiter's queue-event age
+    /// ([`AmdIface::wait_events`](crate::amd::iface::AmdIface::wait_events)).
+    pub fn wait_events(&self, timeout_ms: u32, age: &mut u64) -> Result<Option<Error>> {
+        match self.iface.wait_events(timeout_ms, age) {
             Ok(fault) => {
                 if let Some(error) = &fault {
                     self.poison_error_message(error);
@@ -729,7 +730,7 @@ impl AmdDeviceCore {
         // Non-blocking poll = `wait_events` with timeout 0. Preserves the
         // pre-refactor contract: ioctl error / no fault → `None`; fault →
         // poison with the bare message + return `Some`.
-        match self.iface.wait_events(0) {
+        match self.iface.wait_events(0, &mut 0) {
             Ok(Some(error)) => {
                 self.poison_error_message(&error);
                 Some(error)
