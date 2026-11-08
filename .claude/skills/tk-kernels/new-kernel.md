@@ -8,7 +8,7 @@ shape; the excerpts below are verbatim (trimmed) at 2e9d5edb.
 
 - `XCfg` (`Clone + Copy + Debug + PartialEq + Eq + Hash`): the knobs the tuner picks. The program states its warp
   grid (`k.warps(br as u32)`, a column; `k.warps(WarpGrid { rows, cols })`) and each ring
-  (`k.pipeline(extent, Ring { stages, unroll, crews }, …)`, or a slot count); the launch takes
+  (`k.pipeline(extent, Schedule::ring(stages, unroll), …)`, or a slot count); the launch takes
   `Lowering::new(&device)`, or the config's `lowering` where it picks the core (`GemmCfg`, `FaCfg`: `Core::Group` →
   the warpgroup atom). A mainloop kernel reuses `gemm::mainloop` with `GemmCfg::ring()`.
 - `XSpec`: shapes, `batch: Batch`, options, `cfg: XCfg`. Size every param at `batch.capacity()`.

@@ -48,8 +48,10 @@ use crate::lower::Lowering;
 /// line's digest names — a ranking change used to orphan every choice line,
 /// and now the line's own candidates replay ([`crate::rank`]). 5
 /// fingerprinted the emitted kernels, where 4 fingerprinted the programs
+/// and lowerings, targets and costs whole. 8 keys configs by their derived
+/// `Debug`, a ring a [`crate::ir::Schedule`].
 /// and lowerings, targets and costs whole.
-pub(crate) const FORMAT: u32 = 7;
+pub(crate) const FORMAT: u32 = 8;
 /// Measurement: the rounds a contender is timed (the first over every
 /// candidate, the rest over the contenders), and the rounds the two leaders
 /// then run again ([`rounds`]).

@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use crate::atoms::{Core, Fill, GroupMmaAtom, Target};
-use crate::ir::{Axis, Shape};
+use crate::ir::{Axis, Schedule, Shape};
 use crate::kernels::attention::{FaCfg, WARP_ROWS, narrowest_warp_rows};
 use crate::layouts::{Swizzle, WarpGrid, chunked, fills_in_chunks};
 
@@ -51,7 +51,7 @@ impl FaCfg {
             && [bkv, d].iter().all(|&x| x.is_multiple_of(atom.n as usize) && x.is_multiple_of(atom.k as usize))
             && fills_in_chunks(Shape::new(bkv, d), ELEM, threads)
             && (!self.bias_ring(bias) || fills_in_chunks(Shape::new(bq, bkv), ELEM, threads))
-            && target.fill.runs(self.stages)
+            && target.fill.runs(self.schedule)
     }
 
     /// The registers a lane holds for head size `d`, from the layouts the
@@ -205,7 +205,7 @@ impl AttentionProblem {
         // the splits' own blocks fill), writing f32 partials a row a split.
         let trips = if self.causal { self.causal_trips(bq, bkv) } else { self.tk.div_ceil(bkv) };
         let trips = trips.div_ceil(kw).div_ceil(cfg.splits);
-        let (blocks, stages) = (self.blocks(cfg), cfg.stages);
+        let (blocks, stages) = (self.blocks(cfg), cfg.stages());
         let rows = (self.tiles * self.t) as f64;
         let (parts, combine) = match cfg.splits {
             1 => (0.0, Spread::default()),
@@ -246,7 +246,7 @@ impl AttentionProblem {
             side: Stream::default(),
             stores: parts,
             ring: stages,
-            unroll: cfg.unroll,
+            unroll: cfg.unroll(),
             waits: 0.0,
             sections: [combine, Spread::default()],
         })
@@ -281,7 +281,8 @@ impl AttentionProblem {
                     for unroll in [false, true] {
                         for &key_warps in key_warps {
                             let warp_rows = narrowest_warp_rows(core, atom_rows, bq);
-                            out.push(FaCfg { unroll, key_warps, core, warp_rows, ..FaCfg::new(bq, bkv, stages) });
+                            let schedule = Schedule::ring(stages, unroll);
+                            out.push(FaCfg { schedule, key_warps, core, warp_rows, ..FaCfg::new(bq, bkv, stages) });
                         }
                     }
                 }

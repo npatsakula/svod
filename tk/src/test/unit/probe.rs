@@ -273,8 +273,8 @@ fn units_count_the_primitive(target: Target) {
         let ring = |c: &crate::tune::Candidate| {
             c[0].0.walk().find_map(|(_, s)| match s {
                 Stmt::Pipeline(p) => {
-                    assert_eq!(p.crews, 1, "a probe runs every warp alike");
-                    Some(p.unroll)
+                    assert_eq!(p.schedule.crews(), 1, "a probe runs every warp alike");
+                    Some(p.schedule.unroll())
                 }
                 _ => None,
             })
@@ -289,7 +289,7 @@ fn units_count_the_primitive(target: Target) {
         fn roll(block: &mut Block) {
             for s in &mut block.0 {
                 if let Stmt::Pipeline(p) = s {
-                    p.unroll = false;
+                    p.schedule = p.schedule.rolled();
                 }
                 s.blocks_mut().for_each(roll);
             }
@@ -307,7 +307,9 @@ fn units_count_the_primitive(target: Target) {
         assert_eq!(ring(base), ring(probe), "{}: the baseline reads a ring as deep as the probe's", p.op);
     }
     let depth = |p: &Program| {
-        p.walk().find_map(|(_, s)| if let Stmt::Pipeline(p) = s { Some(p.stages) } else { None }).expect("a ring")
+        p.walk()
+            .find_map(|(_, s)| if let Stmt::Pipeline(p) = s { Some(p.schedule.stages()) } else { None })
+            .expect("a ring")
     };
     assert_eq!(
         (depth(pair(one).1), depth(pair(trip).1)),

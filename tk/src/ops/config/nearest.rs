@@ -8,7 +8,7 @@ use std::sync::Arc;
 use svod_dtype::ScalarDType;
 
 use crate::atoms::{Fill, Target};
-use crate::ir::{Axis, Orient, Shape};
+use crate::ir::{Axis, Orient, Schedule, Shape};
 use crate::kernels::attention::WARP_ROWS;
 use crate::kernels::gemm::GROUP_ROWS;
 use crate::kernels::nearest::{Floors, LANES, LaneQueue, Metric, NearestCfg, SelectCfg, select_runs};
@@ -52,7 +52,7 @@ impl NearestCfg {
             && depth.is_multiple_of(atom.k as usize)
             && d.is_multiple_of(if self.bk.is_some() { chunk } else { atom.k as usize })
             && fills
-            && target.fill.runs(self.stages)
+            && target.fill.runs(self.schedule)
     }
 
     /// The registers a lane holds at depth `d`, from the layouts the lowering
@@ -110,7 +110,7 @@ impl NearestCfg {
         let rest = if passes { 0 } else { (self.bkv / width) as u32 };
         let tiles = 2 * pairs + 2 * depth as u32 + flush + pairs + rest;
         let unrolled = match target.fill {
-            Fill::Staged if self.unroll => 2 * pairs * tile + self.lane_parts(target, d, dtype)?[0] / 2,
+            Fill::Staged if self.unroll() => 2 * pairs * tile + self.lane_parts(target, d, dtype)?[0] / 2,
             _ => 0,
         };
         Some(tiles * tile + 4 * row.regs() + unrolled)
@@ -385,7 +385,8 @@ impl NearestProblem {
         let companions = [self.metric.row_norms(), row, col, clamp].into_iter().filter(|&on| on).count() + scaled;
         // Split, every query block's candidate tiles in shares, a block each.
         let splits = cfg.splits;
-        let (blocks, tiles, stages) = (self.n.div_ceil(bq) * splits, self.m.div_ceil(bkv).div_ceil(splits), cfg.stages);
+        let (blocks, tiles, stages) =
+            (self.n.div_ceil(bq) * splits, self.m.div_ceil(bkv).div_ceil(splits), cfg.stages());
         let share = NearestProblem { m: self.m.min(tiles * bkv), ..*self };
         let depth = cfg.bk.unwrap_or(d);
         let chunks = d.div_ceil(depth);
@@ -473,7 +474,7 @@ impl NearestProblem {
             side: Stream::default(),
             stores,
             ring: stages,
-            unroll: cfg.unroll,
+            unroll: cfg.unroll(),
             waits,
             sections,
         })
@@ -689,7 +690,8 @@ impl NearestProblem {
                             for unroll in [false, true] {
                                 for &(queue, select) in lists {
                                     let cfg = NearestCfg::new(bq, bkv, stages);
-                                    let cfg = NearestCfg { unroll, warp_rows, bk, queue, select, ..cfg };
+                                    let schedule = Schedule::ring(stages, unroll);
+                                    let cfg = NearestCfg { schedule, warp_rows, bk, queue, select, ..cfg };
                                     if self.k == 1 || select.is_some() {
                                         out.push(cfg);
                                         continue;

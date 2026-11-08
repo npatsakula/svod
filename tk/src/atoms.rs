@@ -260,10 +260,17 @@ impl Fill {
         }
     }
 
-    /// Whether this fill runs a ring `stages` deep as asked: what a config
-    /// asks of its ring is what the template builds ([`Self::stages`]).
-    pub fn runs(self, stages: usize) -> bool {
-        self.stages(stages) == stages
+    /// The ring this fill runs `stages` deep, unrolled or not: any depth
+    /// through `cp.async`, one or two slots through registers; `None` where
+    /// it runs none, so a config holds only rings its template builds.
+    pub fn ring(self, stages: usize, unroll: bool) -> Option<crate::ir::Schedule> {
+        (stages >= 1 && self.stages(stages) == stages).then(|| crate::ir::Schedule::ring(stages, unroll))
+    }
+
+    /// Whether this fill runs `schedule`: a ring it builds ([`Self::ring`]),
+    /// or two crews, whose one slot any fill stages.
+    pub fn runs(self, schedule: crate::ir::Schedule) -> bool {
+        !matches!(schedule, crate::ir::Schedule::Ring { depth, .. } if self.stages(depth.get()) != depth.get())
     }
 }
 

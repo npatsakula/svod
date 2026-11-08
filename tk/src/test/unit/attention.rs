@@ -10,6 +10,7 @@ use crate::atoms::{Core, Target};
 use crate::build::BF16;
 use crate::interp::{round_to, run};
 use crate::ir::Program;
+use crate::ir::Schedule;
 use crate::kernels::Batch;
 use crate::kernels::attention::{
     AttnMask, AttnSpec, Bias, CacheLayout, Chunk, CombineSpec, FaCfg, Forms, Invalid, WARP_ROWS, attention, combine,
@@ -357,7 +358,7 @@ fn with(cfg: FaCfg, spec: AttnSpec) -> AttnSpec {
 #[test_case(with(rows32(64, 32), spec(100, 150, 128, 64, 32, true, true)), &[150, 77]; "two atom rows a warp, causal, d 128")]
 #[test_case(with(rows32(128, 64), masked(100, 150, 64, 128, 64, AttnMask { key_lens: true, ..PER_BATCH })), &[150, 77]; "two atom rows a warp, bias")]
 #[test_case(with(rows32(64, 32), masked(100, 150, 64, 64, 32, AttnMask { causal: true, key_lens: true, ..PER_BATCH })), &[150, 77]; "two atom rows a warp, causal bias")]
-#[test_case(with(FaCfg { stages: 1, ..rows32(64, 32) }, spec(100, 150, 64, 64, 32, true, true)), &[150, 77]; "two atom rows a warp, one slot")]
+#[test_case(with(FaCfg { schedule: Schedule::ring(1, false), ..rows32(64, 32) }, spec(100, 150, 64, 64, 32, true, true)), &[150, 77]; "two atom rows a warp, one slot")]
 #[test_case(cached(1, 100, [4, 4, 64], false, 0, 1), &[100, 37]; "cache slice")]
 #[test_case(cached(1, 100, [4, 2, 64], true, 1, 1), &[100, 37]; "row map, appended, gqa")]
 #[test_case(cached(1, 200, [4, 4, 64], true, 1, 4), &[200, 70]; "four splits")]
@@ -411,7 +412,10 @@ fn attention_matches_a_direct_softmax(spec: AttnSpec, lens: &[i64]) {
     matches_a_direct_softmax(&case(spec.clone(), lens));
     let Some(planner) = super::device_planner() else { return };
     let target = planner.device.target.clone();
-    let spec = AttnSpec { cfg: FaCfg { stages: target.fill.stages(spec.cfg.stages), ..spec.cfg }, ..spec };
+    let spec = AttnSpec {
+        cfg: FaCfg { schedule: Schedule::ring(target.fill.stages(spec.cfg.stages()), spec.cfg.unroll()), ..spec.cfg },
+        ..spec
+    };
     let bias = spec.mask.bias.is_some();
     let smem = spec.cfg.smem_bytes(spec.d, bias);
     if !spec.cfg.fits(&target, spec.d, bias) || smem > target.smem_bytes {
@@ -566,7 +570,10 @@ fn two_atom_rows_match_one_on_the_device(causal: bool, bias: bool, d: usize, bq:
 fn a_non_finite_unread_element_never_reaches_the_output(cfg: FaCfg) {
     let Some(target) = super::device_target() else { return };
     let spec = with(cfg, cached(1, 100, [4, 4, 64], true, 0, 1));
-    let spec = AttnSpec { cfg: FaCfg { stages: target.fill.stages(spec.cfg.stages), ..spec.cfg }, ..spec };
+    let spec = AttnSpec {
+        cfg: FaCfg { schedule: Schedule::ring(target.fill.stages(spec.cfg.stages()), spec.cfg.unroll()), ..spec.cfg },
+        ..spec
+    };
     let mut c = case(spec, &[100, 37]);
     assert!(c.row_map.iter().all(|&r| r > 0), "no batch reads the cache's first row");
     c.v[0] = f64::INFINITY;
@@ -817,7 +824,7 @@ fn label(c: &FaCfg) -> String {
         Core::Wide => " wide",
         Core::Group => " group",
     };
-    format!("bq{} bkv{} s{}{rows} unroll={} forms [{}]{core}", c.bq, c.bkv, c.stages, c.unroll, on.join(" "))
+    format!("bq{} bkv{} s{}{rows} unroll={} forms [{}]{core}", c.bq, c.bkv, c.stages(), c.unroll(), on.join(" "))
 }
 
 /// Flash attention throughput at B 4, H 8, T 2048 bf16, causal and plain,
@@ -975,7 +982,7 @@ fn attention_candidates_probe() {
         for bq in [16, 32, 64, 128] {
             for bkv in [16, 32, 64, 128] {
                 for unroll in [false, true] {
-                    let cfg = FaCfg { unroll, ..FaCfg::new(bq, bkv, 2) };
+                    let cfg = FaCfg { schedule: Schedule::ring(2, unroll), ..FaCfg::new(bq, bkv, 2) };
                     if cfg.fits(target, d, false)
                         && cfg.smem_bytes(d, false) <= target.smem_bytes
                         && !cfgs.contains(&cfg)
@@ -1002,11 +1009,11 @@ fn attention_candidates_probe() {
                     "  {set:7} bq{} bkv{} unroll={}: {:8.1} us {:6.1} TFLOP/s",
                     c.bq,
                     c.bkv,
-                    c.unroll,
+                    c.unroll(),
                     ns as f64 / 1e3,
                     flops / ns as f64 / 1e3
                 ),
-                None => eprintln!("  {set:7} bq{} bkv{} unroll={}: failed", c.bq, c.bkv, c.unroll),
+                None => eprintln!("  {set:7} bq{} bkv{} unroll={}: failed", c.bq, c.bkv, c.unroll()),
             }
         }
     }

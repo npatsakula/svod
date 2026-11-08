@@ -5,11 +5,13 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::hash::Hash;
+use std::num::NonZeroUsize;
 
 use svod_dtype::GpuArch;
 
 use crate::atoms::Core;
 use crate::atoms::Target;
+use crate::ir::Schedule;
 use crate::kernels::attention::{FaCfg, Forms, WARP_ROWS, narrowest_warp_rows};
 use crate::kernels::conv::ConvCfg;
 use crate::kernels::gemm::GemmCfg;
@@ -298,7 +300,7 @@ pub(crate) fn representatives<C: Tiled>(ranked: &[C]) -> Vec<C> {
 
 impl Tiled for GemmCfg {
     fn tile(&self) -> Self {
-        GemmCfg { tile: [self.tile[0], self.tile[1], 0], stages: 0, unroll: false, ..*self }
+        GemmCfg { tile: [self.tile[0], self.tile[1], 0], schedule: self.schedule.tile(), ..*self }
     }
 
     /// `w|g` (the core), the tile, the ring, the warp grid, unrolling and
@@ -311,11 +313,11 @@ impl Tiled for GemmCfg {
                 Some(self.tile[0]),
                 Some(self.tile[1]),
                 Some(self.tile[2]),
-                Some(self.stages),
+                Some(self.stages()),
                 Some(self.warps[0] as usize),
                 Some(self.warps[1] as usize),
-                Some(self.unroll as usize),
-                Some(self.kslice.unwrap_or(1)),
+                Some(self.unroll() as usize),
+                Some(self.schedule.kslice().unwrap_or(1)),
             ])
         )
     }
@@ -331,10 +333,11 @@ impl Tiled for GemmCfg {
         Some(GemmCfg {
             core,
             tile: [n(0)?, n(1)?, n(2)?],
-            stages: n(3)?,
             warps: [n(4)? as u32, n(5)? as u32],
-            unroll: n(6)? == 1,
-            kslice: Some(n(7)?).filter(|&k| k != 1),
+            schedule: match n(7)? {
+                1 => Schedule::Ring { depth: NonZeroUsize::new(n(3)?)?, unroll: n(6)? == 1 },
+                k => Schedule::PingPong { kslice: NonZeroUsize::new(k)? },
+            },
         })
     }
 
@@ -390,7 +393,7 @@ fn core_of_code(code: &str) -> Option<Core> {
 /// pipelines are: the one-row config represents the tile.
 impl Tiled for FaCfg {
     fn tile(&self) -> Self {
-        FaCfg { stages: 0, unroll: false, warp_rows: WARP_ROWS, ..*self }
+        FaCfg { schedule: self.schedule.tile(), warp_rows: WARP_ROWS, ..*self }
     }
 
     /// The blocks, ring, splits, unrolling, the softmax forms as their five
@@ -407,9 +410,9 @@ impl Tiled for FaCfg {
         coded(&[
             Some(self.bq),
             Some(self.bkv),
-            Some(self.stages),
+            Some(self.stages()),
             Some(self.splits),
-            Some(self.unroll as usize),
+            Some(self.unroll() as usize),
             Some(bits),
             Some(self.key_warps),
             Some(self.warp_rows),
@@ -429,9 +432,8 @@ impl Tiled for FaCfg {
         Some(FaCfg {
             bq: n(0)?,
             bkv: n(1)?,
-            stages: n(2)?,
+            schedule: Schedule::Ring { depth: NonZeroUsize::new(n(2)?)?, unroll: n(4)? == 1 },
             splits: n(3)?,
-            unroll: n(4)? == 1,
             forms: Forms {
                 truncate_p: bit(0),
                 sum_after: bit(1),
@@ -450,7 +452,7 @@ impl Tiled for FaCfg {
         ranked
             .iter()
             .filter(|c| block(c) == block(self))
-            .map(|c| FaCfg { stages: c.stages, unroll: c.unroll, warp_rows: c.warp_rows, ..*self })
+            .map(|c| FaCfg { schedule: c.schedule, warp_rows: c.warp_rows, ..*self })
             .collect()
     }
 
@@ -487,7 +489,7 @@ impl Tiled for NormCfg {
 impl Tiled for NearestCfg {
     fn tile(&self) -> Self {
         let lanes = self.lanes.map(|l| LaneQueue { passes: false, ..l });
-        NearestCfg { stages: 0, unroll: false, lanes, ..*self }
+        NearestCfg { schedule: self.schedule.tile(), lanes, ..*self }
     }
 
     /// The blocks, ring, rows a warp, the streamed depth, the splits, the
@@ -498,8 +500,8 @@ impl Tiled for NearestCfg {
         coded(&[
             Some(self.bq),
             Some(self.bkv),
-            Some(self.stages),
-            Some(self.unroll as usize),
+            Some(self.stages()),
+            Some(self.unroll() as usize),
             Some(self.warp_rows),
             self.bk,
             Some(self.splits),
@@ -529,8 +531,7 @@ impl Tiled for NearestCfg {
         Some(NearestCfg {
             bq: n(0)?,
             bkv: n(1)?,
-            stages: n(2)?,
-            unroll: n(3)? == 1,
+            schedule: Schedule::Ring { depth: NonZeroUsize::new(n(2)?)?, unroll: n(3)? == 1 },
             warp_rows: n(4)?,
             bk: n(5),
             splits: n(6)?,

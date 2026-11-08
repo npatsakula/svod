@@ -941,7 +941,7 @@ impl<'a> Probes<'a> {
                 k.view(src, (first.clone() + at) * tile.elems(), [32, 1], tile, [None, None])
             };
             let sum = if on {
-                ring_sum(&mut k, TRIPS, Ring { stages, unroll, crews: 1 }, zero, chunk)
+                ring_sum(&mut k, TRIPS, Schedule::ring(stages, unroll), zero, chunk)
             } else {
                 // The ring's slots, written once and fenced before the loop; a
                 // trip reads the slot `order` names, as the ring's consume
@@ -1111,15 +1111,15 @@ fn sum_loads<T: Elem>(
 fn ring_sum(
     k: &mut Kernel,
     trips: usize,
-    ring: impl Into<Ring>,
+    schedule: impl Into<Schedule>,
     init: Regs<I32>,
     view: impl FnOnce(&mut Kernel, Sc) -> Gmem<I32>,
 ) -> Regs<I32> {
-    let (tile, ring) = (k.shape(init), ring.into());
-    let slots = k.smem::<I32>("ring", ring.stages * tile.elems());
+    let (tile, schedule) = (k.shape(init), schedule.into());
+    let slots = k.smem::<I32>("ring", schedule.stages() * tile.elems());
     let [sum] = k.pipeline(
         trips,
-        ring,
+        schedule,
         [init],
         |k, step, slot| {
             let v = view(k, step);

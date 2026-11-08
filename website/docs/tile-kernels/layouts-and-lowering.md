@@ -9,7 +9,7 @@ whose instruction list is already in order. A `Lowering` holds what the program 
 the `Device` (the target and its costs) and which matrix instruction the products issue on
 (`core`): `Lowering::new(&device)` for the warp-level core, `GemmCfg::lowering` and
 `FaCfg::lowering` for their config's. The `WarpGrid` over the block tile (`Kernel::warps`) and
-each ring's schedule (`pipeline`'s `Ring`) are the program's own; shared rows are always
+each ring's schedule (`pipeline`'s `Schedule`) are the program's own; shared rows are always
 XOR-swizzled. `lower::standalone(program, &lowering)` lowers for a target with no device
 attached, and `lower::render` returns the LLVM text the backend's compiler would be handed.
 
@@ -111,9 +111,9 @@ attention configs both offer this core on sm_90.
 
 ## Schedule templates
 
-`schedule::expand` runs each `Pipeline` by its `Ring { stages, unroll, crews }` and the
+`schedule::expand` runs each `Pipeline` by its `Schedule` (a ring of `depth` slots, unrolled or not, or two crews) and the
 target's `Fill`. One crew: every warp loads and computes. Two crews: the block's warps as two
-crews a cluster apart over one register-staged slot (CDNA GEMM, `GemmCfg::crews == 2`).
+crews a cluster apart over one register-staged slot (CDNA GEMM, `Schedule::PingPong`).
 
 | Fill | Expansion of `pipeline(extent, ring, …)` |
 |---|---|

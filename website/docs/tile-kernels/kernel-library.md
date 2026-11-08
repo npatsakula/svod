@@ -37,9 +37,9 @@ the matrix product runs on the f32 accumulator, and the result is rounded once a
 | `out_f32` | f32 output and residual, the accumulator stored unrounded |
 | `rope` | `Rope { heads, head_dim, seq }`: the first `heads` heads of `head_dim` columns rotated by `[seq, head_dim/2]` cos and sin tables (output row `m` at position `m % seq`), the columns after them stored as they are; with a bias alone, on a tile whose warps hold whole heads (`GemmCfg::turns`) |
 
-`GemmCfg { tile: [bm, bn, bk], stages, warps: [rows, cols], unroll, core, crews }`. Rows
+`GemmCfg { tile: [bm, bn, bk], warps: [rows, cols], core, schedule }`. Rows
 past `m` and columns past `n` are bounded views, so `m` and `n` are free. `k` must be a multiple
-of `bk`. `core: Core::Group` issues the products on `wgmma` (sm_90); `crews: 2` runs the two
+of `bk`. `core: Core::Group` issues the products on `wgmma` (sm_90); `schedule: Schedule::ping_pong(k)` runs the two
 warp rows in ping-pong over one slot (CDNA). The blocks walk the output tiles in groups of
 8 tile rows (`gemm::GROUP_ROWS`), so blocks resident together read the same B tiles.
 
@@ -114,7 +114,7 @@ Each split writes f32 partials `o_part`, `m_part` and `l_part`, and `combine` me
 counts around two blocks per SM and one split per key block, and the tuner times each split
 candidate together with its merge.
 
-`FaCfg { bq, bkv, stages, splits, unroll, forms, key_warps, warp_rows, core }`:
+`FaCfg { bq, bkv, schedule, splits, forms, key_warps, warp_rows, core }`:
 
 | Field | Effect |
 |---|---|

@@ -471,7 +471,7 @@ fn the_text_claims_exactly_the_aliasing_tk_knows(target: Target) {
 #[test_case(amd(AmdArch::Gfx1201, 64); "gfx1201 folds the fragment to its load")]
 #[test_case(crate::atoms::sm86(); "sm_86 keeps its pairs")]
 fn a_products_operand_is_the_load_that_filled_it(target: Target) {
-    let cfg = GemmCfg { tile: [64, 64, 32], stages: 2, warps: [2, 2], unroll: false, core: Core::Warp, kslice: None };
+    let cfg = GemmCfg { tile: [64, 64, 32], warps: [2, 2], core: Core::Warp, schedule: Schedule::ring(2, false) };
     let spec = GemmSpec { m: 128, n: 128, k: 128, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg };
     let lowered =
         crate::lower::standalone(gemm::<BF16>(&spec), &Lowering::new(&super::declared(target.clone()))).unwrap();

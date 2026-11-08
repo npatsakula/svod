@@ -9,6 +9,7 @@ use svod_dtype::{DType, DeviceSpec};
 use svod_tensor::Tensor;
 use svod_tk::atoms::{Core, Device, Target};
 use svod_tk::build::BF16;
+use svod_tk::ir::Schedule;
 use svod_tk::kernels::Batch;
 use svod_tk::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
 use svod_tk::launch::graph_launch;
@@ -28,7 +29,7 @@ fn flat(n: usize, seed: &mut u64) -> Tensor {
 }
 
 const fn cfg(tile: [usize; 3], warps: [u32; 2], unroll: bool) -> GemmCfg {
-    GemmCfg { tile, stages: 2, warps, unroll, core: Core::Warp, kslice: None }
+    GemmCfg { tile, warps, core: Core::Warp, schedule: Schedule::ring(2, unroll) }
 }
 
 #[test]
@@ -92,7 +93,7 @@ fn tk_gemm_tuned_vs_pinned() {
             }
             params.push(&out);
             let y = graph_launch(gemm::<BF16>(&spec), &c.lowering(&device), &params).unwrap();
-            plans.push((format!("tk {label} {:?} {:?} unroll={}", c.tile, c.warps, c.unroll), y.prepare().unwrap()));
+            plans.push((format!("tk {label} {:?} {:?} unroll={}", c.tile, c.warps, c.unroll()), y.prepare().unwrap()));
         };
         pinned("tabled", tabled);
         if let Some(l) = lattice {

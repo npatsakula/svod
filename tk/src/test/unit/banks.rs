@@ -34,7 +34,10 @@ fn a_shared_tile_keeps_each_element_a_place(rows: usize, cols: usize, bytes: usi
 
 fn gemm_on(arch: AmdArch) -> Lowered {
     let device = declared(amd(arch, 304));
-    let cfg = crate::kernels::gemm::GemmCfg { kslice: Some(16), ..config::gemm_cfg([256, 256, 64], 1, [2, 4], false) };
+    let cfg = crate::kernels::gemm::GemmCfg {
+        schedule: Schedule::ping_pong(16),
+        ..config::gemm_cfg([256, 256, 64], 1, [2, 4], false)
+    };
     let spec = GemmSpec { m: 512, n: 512, k: 256, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg };
     standalone(gemm::<BF16>(&spec), &cfg.lowering(&device)).unwrap()
 }
@@ -130,7 +133,10 @@ fn a_store_stays_within_a_half() {
 
 fn gemm_text_on(target: Target, m: usize, n: usize, k: usize) -> String {
     let device = declared(target);
-    let cfg = crate::kernels::gemm::GemmCfg { kslice: Some(16), ..config::gemm_cfg([256, 256, 64], 1, [2, 4], false) };
+    let cfg = crate::kernels::gemm::GemmCfg {
+        schedule: Schedule::ping_pong(16),
+        ..config::gemm_cfg([256, 256, 64], 1, [2, 4], false)
+    };
     let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg };
     crate::lower::render(gemm::<BF16>(&spec), &cfg.lowering(&device)).unwrap()
 }

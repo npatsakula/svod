@@ -89,41 +89,18 @@ impl fmt::Debug for Scale {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+/// The tune store keys by this text ([`Schedule`]'s included); every config
+/// walks [`GROUP_ROWS`] of tile rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct GemmCfg {
     /// `[bm, bn, bk]`.
     pub tile: [usize; 3],
-    pub stages: usize,
     /// `[rows, cols]` of the warp grid over the output tile.
     pub warps: [u32; 2],
-    pub unroll: bool,
     pub core: Core,
-    /// `None`: every warp loads and computes together. `Some(k)`: the warp
-    /// rows form two crews a cluster apart over one slot
-    /// ([`Schedule::PingPong`]), the operands held as k-slices `k` deep, the k
-    /// of the target's atom, so a slice is one product's fragments and they
-    /// are read a cluster ahead.
-    pub kslice: Option<usize>,
-}
-
-/// The tune store keys by this text: a config on the warp-level core and
-/// one crew prints as it did before the fields existed, so its stored
-/// choices still apply, and every config walks [`GROUP_ROWS`] as when it
-/// was a field (`group_m`). A store is one target's, whose atom fixes the
-/// k-slices, so two crews print as just that.
-impl fmt::Debug for GemmCfg {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut s = f.debug_struct("GemmCfg");
-        s.field("tile", &self.tile).field("stages", &self.stages).field("warps", &self.warps);
-        s.field("group_m", &GROUP_ROWS).field("unroll", &self.unroll);
-        if self.core != Core::Warp {
-            s.field("core", &self.core);
-        }
-        if self.crews() != 1 {
-            s.field("crews", &self.crews());
-        }
-        s.finish()
-    }
+    /// The ring: one crew over `depth` slots, or the two warp rows as crews
+    /// a cluster apart over one slot, the operands k-sliced a product deep.
+    pub schedule: Schedule,
 }
 
 /// Search bound: the tile rows the blocks in flight walk together, so
@@ -136,20 +113,23 @@ impl GemmCfg {
         Lowering { core: self.core, ..Lowering::new(device) }
     }
 
-    /// The pipeline's ring.
-    pub fn ring(&self) -> Ring {
-        Ring { stages: self.stages, unroll: self.unroll, crews: self.crews() }
+    pub fn stages(&self) -> usize {
+        self.schedule.stages()
+    }
+
+    pub fn unroll(&self) -> bool {
+        self.schedule.unroll()
     }
 
     pub fn crews(&self) -> u32 {
-        if self.kslice.is_some() { 2 } else { 1 }
+        self.schedule.crews()
     }
 
     /// The k-slices each operand of a slot is held as, one after another:
     /// under two crews one matrix-core step deep, so a slice is a plain view
     /// and a product's fragments are one cluster's reads; else the slot whole.
     pub fn slices(&self) -> usize {
-        self.kslice.map_or(1, |k| self.tile[2] / k)
+        self.schedule.kslice().map_or(1, |k| self.tile[2] / k)
     }
 
     /// Whether the tile carries an [`Epilogue::rope`] of `head_dim` heads:
@@ -166,7 +146,7 @@ impl GemmCfg {
     /// each B tile (two gated) per stage.
     pub fn smem_bytes(&self, gated: bool, bytes: usize) -> usize {
         let [bm, bn, bk] = self.tile;
-        self.stages * (bm + bn * if gated { 2 } else { 1 }) * bk * bytes
+        self.stages() * (bm + bn * if gated { 2 } else { 1 }) * bk * bytes
     }
 }
 
@@ -266,15 +246,15 @@ fn build<T: MmaIn, U: Elem, S: Fn(&mut Kernel, Sc, Sc) -> Gmem<T>>(
         let v = k.view(b, half * n * kk, [kk, 1], Shape::new(bn, bk), [n_bound.clone(), None]);
         k.at(v, col0.clone(), 0)
     };
-    let ring = cfg.ring();
+    let schedule = cfg.schedule;
     let first_step = partial.then(|| bb.clone().expect("the split index") * (trips / split));
     let sa = Shape::new(bm, bk);
     let accs = if epi.gated {
         let halves = [b_view(&mut k, 0), b_view(&mut k, 1)];
-        mainloop(&mut k, sa, &a_tile, halves, trips / split, ring, bk, first_step, cfg.slices()).to_vec()
+        mainloop(&mut k, sa, &a_tile, halves, trips / split, schedule, bk, first_step, cfg.slices()).to_vec()
     } else {
         let whole = [b_view(&mut k, 0)];
-        mainloop(&mut k, sa, &a_tile, whole, trips / split, ring, bk, first_step, cfg.slices()).to_vec()
+        mainloop(&mut k, sa, &a_tile, whole, trips / split, schedule, bk, first_step, cfg.slices()).to_vec()
     };
     let accs = accs.into_iter().map(|acc| T::widened(&mut k, acc)).collect();
     let tile = Tile2 { m, n, bm, bn, row0, col0 };
@@ -462,20 +442,20 @@ pub(super) fn mainloop<T: MmaIn, const N: usize>(
     a: &impl Fn(&mut Kernel, Sc, Sc) -> Gmem<T>,
     bs: [Gmem<T>; N],
     trips: usize,
-    ring: Ring,
+    schedule: Schedule,
     bk: usize,
     first_step: Option<Sc>,
     slices: usize,
 ) -> [Regs<T::Acc>; N] {
     let sb = k.shape(bs[0]);
     let (sa_s, sb_s) = (Shape::new(sa.rows, bk / slices), Shape::new(sb.rows, bk / slices));
-    let stages = ring.stages;
+    let stages = schedule.stages();
     let a_s = k.smem::<T>("a_s", stages * sa.elems());
     let b_s = [(); N].map(|()| k.smem::<T>("b_s", stages * sb.elems()));
     let init = [(); N].map(|()| k.zeros::<T::Acc>(Shape::new(sa.rows, sb.rows)));
     k.pipeline(
         trips,
-        ring,
+        schedule,
         init,
         |k, step, slot| {
             let step = first_step.map_or(step.clone(), |s| s + step);

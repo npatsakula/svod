@@ -109,7 +109,7 @@ fn gemm_nt(m: usize, n: usize, kk: usize, [bm, bn, bk]: [usize; 3], stages: usiz
 overhangs `len`, so any `m` and `n` run without a copy. Only `k` must be a multiple of `bk`.
 
 **The pipeline.** `pipeline(extent, stages, init, produce, consume)` declares a producer and a
-consumer over a ring of `stages` shared slots (a `Ring { stages, unroll, crews }` also copies
+consumer over a ring of `stages` shared slots (a `Schedule::ring(stages, unroll)` also copies
 the loop once per slot or runs two crews), carrying `init` (here the accumulator) through
 the consumer. The author says what to copy into a slot and what to compute from it. The
 [schedule template](./layouts-and-lowering#schedule-templates) decides how far ahead copies

@@ -13,6 +13,7 @@ use crate::atoms::{Core, Target};
 use crate::build::{BF16, F16, I8};
 use crate::interp::{round_to, run};
 use crate::ir::Orient;
+use crate::ir::Schedule;
 use crate::kernels::nearest::{
     Floors, Invalid, LaneQueue, Metric, NearestCfg, NearestMergeSpec, NearestSpec, SCRATCH, SelectCfg, SelectSpec,
     nearest, nearest_merge, nearest_select, share_stride,
@@ -440,7 +441,13 @@ fn small_cfg() -> impl Strategy<Value = NearestCfg> {
     (shape, prop::option::of(0usize..2), 1usize..5).prop_map(|((q, kv, stages, wide, unroll), bk, splits)| {
         let bq = 16 << q;
         let warp_rows = if wide && bq >= 32 { 32 } else { 16 };
-        NearestCfg { unroll, warp_rows, bk: bk.map(|k| 16 << k), splits, ..NearestCfg::new(bq, 16 << kv, stages) }
+        NearestCfg {
+            schedule: Schedule::ring(stages, unroll),
+            warp_rows,
+            bk: bk.map(|k| 16 << k),
+            splits,
+            ..NearestCfg::new(bq, 16 << kv, stages)
+        }
     })
 }
 
@@ -2516,7 +2523,12 @@ fn list_ir_dump() {
         let passes = std::env::var_os("LIST_PASSES").is_some();
         let lanes = Some(LaneQueue { width: v[4], depth: v[3], passes });
         let unroll = std::env::var_os("LIST_UNROLL").is_some();
-        let cfg = NearestCfg { lanes, unroll, queue: v.get(5).copied(), ..NearestCfg::new(v[0], v[1], v[2]) };
+        let cfg = NearestCfg {
+            lanes,
+            schedule: Schedule::ring(v[2], unroll),
+            queue: v.get(5).copied(),
+            ..NearestCfg::new(v[0], v[1], v[2])
+        };
         for &k in &ks {
             let spec = plain(1 << 14, 1 << 14, 128, Metric::SquaredL2, k, cfg);
             let start = std::time::Instant::now();
@@ -2554,7 +2566,13 @@ fn list_time_probe() {
             let passes = std::env::var_os("LIST_PASSES").is_some();
             let lanes = Some(LaneQueue { width: v[4], depth: v[3], passes });
             let unroll = std::env::var_os("LIST_UNROLL").is_some();
-            let cfg = NearestCfg { lanes, unroll, bk, queue: v.get(5).copied(), ..NearestCfg::new(v[0], v[1], v[2]) };
+            let cfg = NearestCfg {
+                lanes,
+                schedule: Schedule::ring(v[2], unroll),
+                bk,
+                queue: v.get(5).copied(),
+                ..NearestCfg::new(v[0], v[1], v[2])
+            };
             splits.iter().map(move |&splits| NearestCfg { splits, ..cfg })
         })
         .collect();
@@ -2583,8 +2601,8 @@ fn parsed_cfg(text: &str) -> NearestCfg {
         match key {
             "bq" => cfg.bq = n(),
             "bkv" => cfg.bkv = n(),
-            "stages" => cfg.stages = n(),
-            "unroll" => cfg.unroll = n() == 1,
+            "stages" => cfg.schedule = Schedule::ring(n(), cfg.unroll()),
+            "unroll" => cfg.schedule = Schedule::ring(cfg.stages(), n() == 1),
             "warp_rows" => cfg.warp_rows = n(),
             "bk" => cfg.bk = Some(n()),
             "splits" => cfg.splits = n(),
@@ -2658,13 +2676,13 @@ fn the_resident_list_keeps_the_shallow_search() {
         k: 32,
     };
     let resident = NearestCfg {
-        unroll: true,
+        schedule: Schedule::ring(3, true),
         splits: 4,
         lanes: Some(LaneQueue { width: 4, depth: 4, passes: true }),
         ..NearestCfg::new(64, 32, 3)
     };
     let streamed = NearestCfg {
-        unroll: true,
+        schedule: Schedule::ring(3, true),
         splits: 4,
         lanes: Some(LaneQueue { width: 4, depth: 2, passes: true }),
         ..NearestCfg::streamed(64, 32, 64, 3)

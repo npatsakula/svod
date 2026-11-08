@@ -78,13 +78,14 @@ impl Expander<'_> {
     }
 
     fn pipeline(&mut self, p: Pipeline) -> Vec<Stmt> {
-        let Pipeline { extent, stages, unroll, crews, carried, produce, consume } = p;
+        let Pipeline { extent, schedule, carried, produce, consume } = p;
         let produce = Stage { body: self.block(produce.body), ..produce };
         let consume = Stage { body: self.block(consume.body), ..consume };
-        if crews == 2 {
-            let crew = self.prog.warps / crews;
-            return self.ping_pong(extent, stages, carried, produce, consume, crew);
-        }
+        let Schedule::Ring { depth, unroll } = schedule else {
+            let crew = self.prog.warps / schedule.crews();
+            return self.ping_pong(extent, carried, produce, consume, crew);
+        };
+        let stages = depth.get();
         let in_flight = self.core == Core::Group && chains_only(&consume.body);
         let mut out = match self.fill {
             Fill::CpAsync if stages >= 3 && in_flight => {
@@ -249,13 +250,11 @@ impl Expander<'_> {
     fn ping_pong(
         &mut self,
         extent: ScalarId,
-        stages: usize,
         carried: Vec<Carried>,
         produce: Stage,
         consume: Stage,
         crew: u32,
     ) -> Vec<Stmt> {
-        assert_eq!(stages, 1, "ping-pong runs over one slot");
         let iv = self.scalar(Scalar::Induction);
         let (zero, one, before) = (self.c(0), self.c(1), self.c(-1));
         let nonempty = self.bin(BinOp::Lt, zero, extent);
@@ -352,7 +351,7 @@ impl Expander<'_> {
         produce: Stage,
         consume: Stage,
     ) -> Vec<Stmt> {
-        assert!(matches!(stages, 1 | 2), "register staging runs one step ahead over one or two slots");
+        assert!(matches!(stages, 1 | 2), "register staging runs one step ahead over one or two slots (`Fill::ring`)");
         let iv = self.scalar(Scalar::Induction);
         let one = self.c(1);
         let two = self.c(2);

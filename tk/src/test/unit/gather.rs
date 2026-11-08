@@ -122,7 +122,7 @@ fn gathered_gemm(m: usize, n: usize, kk: usize, tile: [usize; 3], stages: usize,
     let init = k.zeros::<F32>(Shape::new(bm, bn));
     let [acc] = k.pipeline(
         kk / bk,
-        Ring { stages, unroll: true, crews: 1 },
+        Schedule::ring(stages, true),
         [init],
         |k, step, slot| {
             let a_g = k.gather(a, step.clone() * bk, start.clone(), Some(valid.clone()), Shape::new(bm, bk), None);

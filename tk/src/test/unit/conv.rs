@@ -11,6 +11,7 @@ use super::{assert_rel_close, conv_first_eight, declared, planner};
 use crate::atoms::{Target, sm86};
 use crate::build::F16;
 use crate::interp::{round_to, run};
+use crate::ir::Schedule;
 use crate::kernels::conv::{ConvCfg, ConvGeom, ConvSpec, conv};
 use crate::kernels::gemm::{Epilogue, GemmCfg};
 use crate::kernels::{Act, Batch};
@@ -102,7 +103,7 @@ fn check_interp(g: ConvGeom, batch: Batch, epi: Epilogue, c: GemmCfg) {
 #[test_case(geom([7, 9], 64, 64, 3, 1, 1, 1), [32, 64, 64], [2, 1]; "one tap to a step")]
 #[test_case(geom([6, 5], 64, 96, 3, 2, 1, 1), [64, 96, 32], [2, 2]; "two steps to a tap")]
 fn two_crews_read_each_slice_of_a_step(g: ConvGeom, tile: [usize; 3], warps: [u32; 2]) {
-    let c = GemmCfg { kslice: Some(16), ..gemm_cfg(tile, 1, warps, false) };
+    let c = GemmCfg { schedule: Schedule::ping_pong(16), ..gemm_cfg(tile, 1, warps, false) };
     check_interp(g, Batch::Static(1), SILU_BIAS, c);
 }
 
@@ -524,7 +525,10 @@ fn conv_throughput_probe() {
             let picked = if Some(*cand) == pick { " (tuner's pick)" } else { "" };
             eprintln!(
                 "  {label} tk {:?} s{} {:?} unroll={} split {split}: {t}{picked}",
-                c.tile, c.stages, c.warps, c.unroll
+                c.tile,
+                c.stages(),
+                c.warps,
+                c.unroll()
             );
         }
 

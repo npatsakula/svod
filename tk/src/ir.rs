@@ -6,6 +6,8 @@
 //! that consume each value and keeps them in a side table, starting from the
 //! few an author pins ([`Program::pins`]).
 
+use std::num::NonZeroUsize;
+
 use svod_dtype::ScalarDType;
 
 macro_rules! id {
@@ -395,20 +397,86 @@ pub struct Stage {
     pub body: Block,
 }
 
-/// A producer/consumer loop over `extent` steps with a ring of `stages`
-/// shared-memory slots. `produce` fills its slot for its step; `consume`
-/// reads its slot for its step; the schedule template decides how far ahead
-/// production runs and which warps do what.
+/// How a [`Pipeline`] runs its ring of shared-memory slots; a target's
+/// [`crate::atoms::Fill::ring`] builds the rings it runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Schedule {
+    /// `depth` slots every warp fills and consumes, the loop copied once per
+    /// slot when `unroll`, so slot addressing folds to constants.
+    Ring { depth: NonZeroUsize, unroll: bool },
+    /// The block's warps as two crews a cluster apart over one slot, each
+    /// operand held as k-slices `kslice` deep, the target atom's k, so a
+    /// slice is one product's fragments ([`crate::schedule`]'s ping-pong).
+    PingPong { kslice: NonZeroUsize },
+}
+
+impl Schedule {
+    /// A ring of `stages` slots, which is at least one, over one crew.
+    pub const fn ring(stages: usize, unroll: bool) -> Self {
+        Self::Ring { depth: NonZeroUsize::new(stages).expect("a ring has a slot"), unroll }
+    }
+
+    /// Two crews over one slot, the operands k-sliced `kslice` deep, which is
+    /// at least one.
+    pub const fn ping_pong(kslice: usize) -> Self {
+        Self::PingPong { kslice: NonZeroUsize::new(kslice).expect("a slice has a depth") }
+    }
+
+    pub fn stages(self) -> usize {
+        match self {
+            Self::Ring { depth, .. } => depth.get(),
+            Self::PingPong { .. } => 1,
+        }
+    }
+
+    pub fn unroll(self) -> bool {
+        matches!(self, Self::Ring { unroll: true, .. })
+    }
+
+    pub fn crews(self) -> u32 {
+        if matches!(self, Self::PingPong { .. }) { 2 } else { 1 }
+    }
+
+    pub fn kslice(self) -> Option<usize> {
+        match self {
+            Self::PingPong { kslice } => Some(kslice.get()),
+            Self::Ring { .. } => None,
+        }
+    }
+
+    /// The schedule as part of a tile: a ring's depth and unrolling, its
+    /// pipelines, erased; the crews stay.
+    pub fn tile(self) -> Self {
+        match self {
+            Self::Ring { .. } => Self::ring(1, false),
+            pong => pong,
+        }
+    }
+
+    /// The schedule with its ring rolled.
+    pub fn rolled(self) -> Self {
+        match self {
+            Self::Ring { depth, .. } => Self::Ring { depth, unroll: false },
+            pong => pong,
+        }
+    }
+}
+
+/// A count of slots: a rolled ring of one crew.
+impl From<usize> for Schedule {
+    fn from(stages: usize) -> Self {
+        Self::ring(stages, false)
+    }
+}
+
+/// A producer/consumer loop over `extent` steps with a ring of shared-memory
+/// slots run as `schedule` says. `produce` fills its slot for its step;
+/// `consume` reads its slot for its step; the schedule template decides how
+/// far ahead production runs and which warps do what.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Pipeline {
     pub extent: ScalarId,
-    pub stages: usize,
-    /// The loop copied once per ring slot, so slot addressing folds to
-    /// constants.
-    pub unroll: bool,
-    /// 1: every warp loads and computes; 2: the block's warps as two crews
-    /// a cluster apart over one slot ([`crate::schedule`]'s ping-pong).
-    pub crews: u32,
+    pub schedule: Schedule,
     pub carried: Vec<Carried>,
     pub produce: Stage,
     pub consume: Stage,

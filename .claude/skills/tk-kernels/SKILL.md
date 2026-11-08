@@ -46,7 +46,7 @@ optimization"), `do_linearize` returns before the `SVOD_DUMP_LINEAR` dump (`code
    allocations as `SmemRef<T>`; comparisons are `k.compare(a, b, CmpOp::{Lt,Le,Eq,Ne})` → `Regs<Bool>`. No DAG.
 2. **`lower::lower`** (`lower/mod.rs`): grid check → `materialize_operands` (non-register `mma` operands become loads;
    on `Core::Group` shared operands stay in place) → `sync::insert_barriers` (fences from shared-memory effects) →
-   `schedule::expand` (each `Pipeline`'s `Ring { stages, unroll, crews }` under the target's `Fill`; on the warpgroup
+   `schedule::expand` (each `Pipeline`'s `Schedule` under the target's `Fill`; on the warpgroup
    core a `cp.async` ring of ≥ 3 slots whose consume only chains products leaves them in flight) → `layouts::infer`
    (F2 `TileLayout` per register tile, priced relayouts; a product whose result is dealt issues the narrow way,
    `MmaAtom::narrow`) → `orient_shared` → `emit::emit` (`lower/emit/{mod,address,

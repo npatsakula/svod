@@ -8,6 +8,7 @@ use super::Scratch;
 use svod_dtype::{AmdArch, ScalarDType};
 
 use crate::atoms::{Target, sm86};
+use crate::ir::Schedule;
 use crate::kernels::Batch;
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec};
 use crate::ops::config::{GemmProblem, Planner, Tiled, representatives};
@@ -287,8 +288,7 @@ fn the_listing_static_decomposition_maps_its_programs() {
     let base = |bkv, lanes, queue| NearestCfg {
         bq: 128,
         bkv,
-        stages: 3,
-        unroll: false,
+        schedule: Schedule::ring(3, false),
         warp_rows: 16,
         bk: None,
         splits: 1,

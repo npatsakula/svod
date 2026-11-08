@@ -13,6 +13,7 @@ use super::tune::Select;
 use super::{costs, first_eight, planner, self_join};
 use crate::atoms::{Core, Costs, Device, Fill, Target, sm86};
 use crate::build::BF16 as BF16T;
+use crate::ir::Schedule;
 use crate::kernels::Batch;
 use crate::kernels::attention::{FaCfg, Forms, WARP_ROWS, narrowest_warp_rows};
 use crate::kernels::conv::ConvCfg;
@@ -283,11 +284,11 @@ fn a_one_slot_ring_is_charged_its_own_trip(target: Target, bk: usize, cheap_wins
     let problem = config::GemmProblem { batches: 1, m: 4096, n: 4096, k: 4096, halves: 1, rope: None };
     // A small tile: its residency is bound by shared memory, not registers.
     let two = gemm_cfg([64, 64, bk], target.fill.stages(3), [2, 2], false);
-    let one = GemmCfg { stages: 1, ..two };
+    let one = GemmCfg { schedule: Schedule::ring(1, two.unroll()), ..two };
     let c = costs();
-    let latency_one = c.latency / (two.stages - 1) as f64;
+    let latency_one = c.latency / (two.stages() - 1) as f64;
     let cost = |trip_one: f64, cfg: &GemmCfg| {
-        let costs = Costs { trip_one, latency: latency_one * (two.stages - 1) as f64, latency_one, ..c };
+        let costs = Costs { trip_one, latency: latency_one * (two.stages() - 1) as f64, latency_one, ..c };
         let planner = planned(Device { target: target.clone(), costs });
         problem.admit(&planner, cfg).expect("admitted").0
     };
@@ -646,9 +647,9 @@ fn two_crews_are_ranked_only_where_the_target_interleaves_them(arch: AmdArch, so
     let crews: Vec<&GemmCfg> = ranked.iter().filter(|c| c.crews() == 2).collect();
     assert_eq!(!crews.is_empty(), some, "{ranked:?}");
     assert!(crews.iter().all(|c| c.core == Core::Warp
-        && c.stages == 1
+        && c.stages() == 1
         && c.warps[0] == 2
-        && !c.unroll
+        && !c.unroll()
         && c.tile[2] >= 32
         && c.fits(&target)));
 }
@@ -1022,7 +1023,7 @@ fn a_gemm_tiles_twins_are_its_pipelines() {
     assert!(twins.contains(&winner));
     assert!(twins.len() >= 4, "{twins:?}");
     assert!(twins.iter().all(|c| c.tile[..2] == [64, 64] && c.warps == [2, 2]), "{twins:?}");
-    assert!(twins.iter().any(|c| c.tile[2] != winner.tile[2]) && twins.iter().any(|c| c.stages != winner.stages));
+    assert!(twins.iter().any(|c| c.tile[2] != winner.tile[2]) && twins.iter().any(|c| c.stages() != winner.stages()));
     let order: Vec<usize> = twins.iter().map(|t| ranked.iter().position(|c| c == t).unwrap()).collect();
     assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
     assert_eq!(config::distinct_configs(&twins), twins);
@@ -1062,7 +1063,7 @@ fn variants_keep_their_variant_across_twins() {
                 == (winner.bq, winner.bkv, winner.key_warps, 4, forms)),
         "{twins:?}"
     );
-    assert!(twins.iter().any(|c| (c.stages, c.unroll) != (winner.stages, winner.unroll)));
+    assert!(twins.iter().any(|c| (c.stages(), c.unroll()) != (winner.stages(), winner.unroll())));
     let norm = NormCfg { br: 8 };
     assert_eq!(norm.twins(&[NormCfg { br: 4 }, norm, NormCfg { br: 16 }]), vec![norm]);
 }
@@ -1187,7 +1188,7 @@ fn gated_linear_drops_a_stage_under_a_static_cap() {
     let planner = planner(target.clone());
     let list = kernel_plan(shape::linear(Some(&planner), &[BF16, BF16], Some(&ext(&[4096, 4096])), 4096, true));
     assert_valid(&list, &target, 4096, true);
-    assert!(!list.iter().any(|c| c.tile == [128, 128, 32] && c.stages == 3), "{list:?}");
+    assert!(!list.iter().any(|c| c.tile == [128, 128, 32] && c.stages() == 3), "{list:?}");
 }
 
 #[test_case(None, &[BF16, BF16], true, Fallback::Target; "no target")]
@@ -2053,13 +2054,13 @@ fn rdna_plans_register_staged_kernels() {
     let gemms =
         kernel_plan(shape::linear(Some(&planner(target.clone())), &[BF16; 2], Some(&ext(&[4096, 4096])), 4096, false));
     assert_valid(&gemms, &target, 4096, false);
-    assert!(first_eight(&gemms).iter().all(|c| c.unroll == (c.stages == 2) && c.fits(&target)), "{gemms:?}");
+    assert!(first_eight(&gemms).iter().all(|c| c.unroll() == (c.stages() == 2) && c.fits(&target)), "{gemms:?}");
     for (d, t) in [(64, 1500), (64, 1)] {
         let q = ext(&[1, t, 8, d]);
         let fa =
             kernel_plan(shape::attention(Some(&planner(target.clone())), &[BF16; 3], Some(&q), Some(&q), false, false));
         let within = |c: &FaCfg| c.smem_bytes(d, false) <= 64 << 10;
-        assert!(fa.iter().all(|c| c.stages == 2 && within(c)), "{fa:?}");
+        assert!(fa.iter().all(|c| c.stages() == 2 && within(c)), "{fa:?}");
         assert!(
             fa.iter().any(|c| c.smem_bytes(64, false) == 64 << 10),
             "a 64 KB-exact tile is admitted: its probabilities exchange, not cross"
@@ -2148,8 +2149,6 @@ fn the_warpgroup_core_is_a_tile_of_its_own() {
         representatives(&ranked).len(),
         ranked.iter().filter(|c| c.warp_rows == narrowest_warp_rows(c.core, WARP_ROWS, c.bq)).count()
     );
-    let plain = format!("{:?}", FaCfg::new(64, 32, 2));
-    assert!(!plain.contains("core") && !plain.contains("warp_rows"), "{plain}");
 }
 
 fn gfx1151_planner() -> Planner {

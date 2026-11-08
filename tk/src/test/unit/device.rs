@@ -127,7 +127,10 @@ fn two_crews_match_the_interpreter_and_the_uniform_kernel(tile: [usize; 3]) {
         return;
     };
     let device = &planner.device;
-    let crews = GemmCfg { kslice: device.target.kslice(), ..gemm_cfg(tile, 1, [2, 4], false) };
+    let crews = GemmCfg {
+        schedule: device.target.kslice().map_or(Schedule::ring(1, false), Schedule::ping_pong),
+        ..gemm_cfg(tile, 1, [2, 4], false)
+    };
     check_gemm(device, 200, 136, 128, crews);
     check_gemm(device, 520, 300, 256, crews);
     let (m, n, k) = (1024, 768, 512);
@@ -140,7 +143,10 @@ fn two_crews_match_the_interpreter_and_the_uniform_kernel(tile: [usize; 3]) {
         let out = graph_launch(plain_gemm(m, n, k, cfg), &cfg.lowering(device), &[&a_t, &b_t, &c_t]).unwrap();
         out.cast(DType::Float32).to_vec::<f32>().unwrap().iter().map(|x| x.to_bits()).collect()
     };
-    assert!(bits(crews) == bits(GemmCfg { kslice: None, ..crews }), "{crews:?} differs from the uniform kernel");
+    assert!(
+        bits(crews) == bits(GemmCfg { schedule: Schedule::ring(1, false), ..crews }),
+        "{crews:?} differs from the uniform kernel"
+    );
 }
 
 /// A config standing in where a spec's own is replaced.
@@ -258,7 +264,8 @@ fn gemm_throughput_probe() {
         cfgs.push(pick);
     }
     for cfg in cfgs {
-        let GemmCfg { tile: [bm, bn, bk], stages, warps: [wr, wc], unroll, core, .. } = cfg;
+        let GemmCfg { tile: [bm, bn, bk], warps: [wr, wc], core, schedule } = cfg;
+        let (stages, unroll) = (schedule.stages(), schedule.unroll());
         let crews = cfg.crews();
         let (prog, lowering) = (plain_gemm(m, n, k, cfg), cfg.lowering(&planner.device));
         let c_t = Tensor::empty(&[m * n], DType::BFloat16);
@@ -327,15 +334,15 @@ fn gemm_candidates_probe() {
                 _ => "",
             };
             let t = t.map_or("failed".into(), |t| format!("{:6.1} us {:5.1} TFLOP/s", t as f64 / 1e3, tflops(t)));
-            eprintln!("  {:?} s{} {:?} unroll={}: {t}{label}", c.tile, c.stages, c.warps, c.unroll);
+            eprintln!("  {:?} s{} {:?} unroll={}: {t}{label}", c.tile, c.stages(), c.warps, c.unroll());
         }
         let (t, i) = ns.iter().enumerate().filter_map(|(i, t)| Some((t.as_ref().copied()?, i))).min().unwrap();
         eprintln!(
             "  fastest: {:?} s{} {:?} unroll={} at {:.1} TFLOP/s",
             cfgs[i].tile,
-            cfgs[i].stages,
+            cfgs[i].stages(),
             cfgs[i].warps,
-            cfgs[i].unroll,
+            cfgs[i].unroll(),
             tflops(t)
         );
     }
@@ -468,7 +475,7 @@ fn qwen3_gemm_candidates_probe() {
                     }
                     None => "failed".to_string(),
                 };
-                eprintln!("  {set:7} {:?} s{} {:?} unroll={}: {t}", c.tile, c.stages, c.warps, c.unroll);
+                eprintln!("  {set:7} {:?} s{} {:?} unroll={}: {t}", c.tile, c.stages(), c.warps, c.unroll());
             }
             best
         };
@@ -488,7 +495,7 @@ fn qwen3_gemm_candidates_probe() {
                     tflops(t),
                     c.tile,
                     c.warps,
-                    c.unroll
+                    c.unroll()
                 )
             })
         };

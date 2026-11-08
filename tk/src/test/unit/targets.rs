@@ -16,7 +16,7 @@ use test_case::test_case;
 use crate::atoms::{Core, Fill, Target};
 use crate::build::{BF16, F16};
 use crate::interp;
-use crate::ir::{Axis, ParamKind, Program};
+use crate::ir::{Axis, ParamKind, Program, Schedule};
 use crate::kernels::Batch;
 use crate::kernels::attention::{AttnMask, AttnSpec, Bias, CombineSpec, Forms, attention, combine};
 use crate::kernels::conv::ConvSpec;
@@ -357,7 +357,8 @@ fn every_family_lowers_keeps_its_numbers_and_compiles(target: Target, facts: Fac
             check(ir.contains("wgmma.mma_async.sync.aligned.m64n"), "no warpgroup product");
             check(!ir.contains("@llvm.nvvm.mma.") && !ir.contains("ldmatrix"), "a warp-level product");
             check(ir.contains("wgmma.fence") && ir.contains("fence.proxy.async"), "an unfenced chain");
-            let in_flight = prog.walk().any(|(_, s)| matches!(s, crate::ir::Stmt::Pipeline(p) if p.stages >= 3));
+            let in_flight =
+                prog.walk().any(|(_, s)| matches!(s, crate::ir::Stmt::Pipeline(p) if p.schedule.stages() >= 3));
             check(ir.contains("@llvm.nvvm.wgmma.wait_group") == in_flight, "the template's wait");
             check(ir.contains("wgmma.wait_group.sync.aligned 0;") == !in_flight, "the chain's own wait");
         }
@@ -642,7 +643,10 @@ fn an_operand_read_twice_matches_the_interpreter_on_the_device() {
     let Some(planner) = super::device_planner() else { return };
     let (m, k) = (512, 256);
     let cfg = config::gemm_cfg([256, 256, 64], 1, [2, 4], false);
-    let cfg = crate::kernels::gemm::GemmCfg { kslice: planner.device.target.kslice(), ..cfg };
+    let cfg = crate::kernels::gemm::GemmCfg {
+        schedule: planner.device.target.kslice().map_or(cfg.schedule, Schedule::ping_pong),
+        ..cfg
+    };
     let spec = GemmSpec { m, n: m, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg };
     let prog = gemm::<BF16>(&spec);
     let mut seed = 5;
@@ -1057,7 +1061,7 @@ fn two_atom_rows_per_warp_lower(target: Target) {
     // the 16-row tile a chunk.
     let deep = if target.wave == 64 { 2 } else { 1 };
     for (d, bq, bkv) in [(64, 128, 32 * deep), (128, 128, 16 * deep), (64, 64, 64)] {
-        let one = FaCfg { unroll: true, forms: all, ..FaCfg::new(bq, bkv, 2) };
+        let one = FaCfg { schedule: Schedule::ring(2, true), forms: all, ..FaCfg::new(bq, bkv, 2) };
         let two = FaCfg { warp_rows: 2 * WARP_ROWS, ..one };
         assert!(one.fits(&target, d, false) && two.fits(&target, d, false));
         assert_eq!(two.warps() * 2, one.warps());

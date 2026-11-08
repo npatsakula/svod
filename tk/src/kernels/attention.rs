@@ -1,8 +1,6 @@
 //! Flash attention forward: Q resident in registers, K/V streamed through a
 //! shared ring, the online-softmax state `(m, l, o)` carried.
 
-use std::fmt;
-
 use super::rows::NormCfg;
 use super::{Batch, batch_offset, bound, load_f32};
 use crate::atoms::{Core, Device};
@@ -10,16 +8,16 @@ use crate::build::*;
 use crate::ir::*;
 use crate::lower::Lowering;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+/// The tune store keys by this text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FaCfg {
     pub bq: usize,
     pub bkv: usize,
-    pub stages: usize,
+    /// The ring over the key blocks.
+    pub schedule: Schedule,
     /// Key splits: each is a block along grid x writing a partial result
     /// that [`combine`] merges; `1` writes the output directly.
     pub splits: usize,
-    /// The ring loop unrolled over its slots.
-    pub unroll: bool,
     pub forms: Forms,
     /// Warps sharing a block of one row-warp of queries (`bq` = [`WARP_ROWS`])
     /// by its keys: each walks its own range of key blocks through its own
@@ -39,25 +37,6 @@ pub struct FaCfg {
     /// probabilities as they stand in registers over the shared value rows
     /// (MN-major); a head wider than a 128-byte row is kept as column panels.
     pub core: Core,
-}
-
-/// The tune store keys by this text: a config of one atom row per warp on
-/// the warp-level core prints as it did before the fields existed, so its
-/// stored choices still apply.
-impl fmt::Debug for FaCfg {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut s = f.debug_struct("FaCfg");
-        s.field("bq", &self.bq).field("bkv", &self.bkv).field("stages", &self.stages);
-        s.field("splits", &self.splits).field("unroll", &self.unroll).field("forms", &self.forms);
-        s.field("key_warps", &self.key_warps);
-        if self.warp_rows != WARP_ROWS {
-            s.field("warp_rows", &self.warp_rows);
-        }
-        if self.core != Core::Warp {
-            s.field("core", &self.core);
-        }
-        s.finish()
-    }
 }
 
 /// The softmax forms: all off as planned; the tuner flips each where it
@@ -126,7 +105,8 @@ impl FaCfg {
     /// block of one row warp, and a warp's merged output takes `16·d` f32
     /// of its 16-bit K ring.
     pub fn shares_keys(&self) -> Result<(), Invalid> {
-        let Self { bq, bkv, stages, key_warps, .. } = *self;
+        let Self { bq, bkv, key_warps, .. } = *self;
+        let stages = self.stages();
         if key_warps == 1 {
             return Ok(());
         }
@@ -143,9 +123,8 @@ impl FaCfg {
         Self {
             bq,
             bkv,
-            stages,
+            schedule: Schedule::ring(stages, false),
             splits: 1,
-            unroll: false,
             forms: Forms {
                 truncate_p: false,
                 sum_after: false,
@@ -161,6 +140,14 @@ impl FaCfg {
 
     /// One warp per [`warp_rows`](Self::warp_rows) query rows: the warps a
     /// tile is spread over.
+    pub fn stages(&self) -> usize {
+        self.schedule.stages()
+    }
+
+    pub fn unroll(&self) -> bool {
+        self.schedule.unroll()
+    }
+
     pub fn row_warps(&self) -> u32 {
         (self.bq / self.warp_rows) as u32
     }
@@ -199,7 +186,7 @@ impl FaCfg {
     /// whose rings alone are its whole 64 KB.)
     pub fn smem_bytes(&self, d: usize, bias: bool) -> usize {
         let slot = 2 * self.bkv * d + usize::from(self.bias_ring(bias)) * self.bq * self.bkv;
-        self.key_warps * self.stages * slot * 2
+        self.key_warps * self.stages() * slot * 2
     }
 }
 
@@ -452,7 +439,8 @@ fn step<T: Half, PK: Readable, PV: Readable>(
 pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
     let AttnSpec { ref batch, t, tk, heads, kv_heads, d, mask, cache, packed, scale, cfg } = *spec;
     let AttnMask { causal, window, chunk, key_lens, key_mask, seg_start, bias } = mask;
-    let FaCfg { bq, bkv, stages, splits, .. } = cfg;
+    let FaCfg { bq, bkv, splits, .. } = cfg;
+    let stages = cfg.stages();
     let cap = batch.capacity();
     let (kv_rows, heads_total) = cache.map_or((cap, kv_heads), |c| (c.rows, c.heads_total));
     let appended = cache.map_or(0, |c| c.appended);
@@ -754,7 +742,7 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
         };
         let [m, l, acc] = k.pipeline(
             w_blocks,
-            Ring { stages, unroll: cfg.unroll, crews: 1 },
+            Schedule::ring(stages, cfg.unroll()),
             [m0, l0, o0],
             |k, step, slot| {
                 let (kv_off, slot) = ((w_first.clone() + step) * bkv, slot0.clone() + slot);

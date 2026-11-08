@@ -1290,7 +1290,7 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
             k: cfg.tile[2] * 8,
             batch: Batch::Static(1),
             epilogue: Epilogue { act: Act::Gelu, ..Epilogue::DEFAULT },
-            cfg: GemmCfg { unroll: false, ..cfg },
+            cfg: GemmCfg { schedule: cfg.schedule.rolled(), ..cfg },
         };
         out.push((
             format!("gemm {:?}", cfg.tile),
@@ -1322,7 +1322,7 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
             cache: None,
             packed: false,
             scale: 0.125,
-            cfg: FaCfg { unroll: false, ..cfg },
+            cfg: FaCfg { schedule: cfg.schedule.rolled(), ..cfg },
         };
         out.push((
             format!("attention {}x{} {:?}", cfg.bq, cfg.bkv, cfg.core),
@@ -1345,7 +1345,7 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
         groups: false,
         k,
     };
-    let spec = |cfg, k| NearestSpec {
+    let spec = |cfg: NearestCfg, k| NearestSpec {
         n: 100,
         m: 960,
         d: 128,
@@ -1353,7 +1353,7 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
         floors: Floors::default(),
         groups: false,
         k,
-        cfg: NearestCfg { unroll: false, ..cfg },
+        cfg: NearestCfg { schedule: cfg.schedule.rolled(), ..cfg },
         live: Live::default(),
     };
     let ranked = planner.nearest_ranked(problem(1));

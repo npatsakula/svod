@@ -185,7 +185,7 @@ impl Frame<'_> {
                 for i in 0..extent {
                     for stage in [&p.produce, &p.consume] {
                         self.induction.insert(stage.step, i);
-                        self.induction.insert(stage.slot, i % p.stages as i64);
+                        self.induction.insert(stage.slot, i % p.schedule.stages() as i64);
                         self.block_run(&stage.body)?;
                     }
                     self.advance(&p.carried);

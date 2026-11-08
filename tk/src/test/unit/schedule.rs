@@ -288,3 +288,31 @@ fn register_staging_peels_the_ring_into_three_branch_free_loops(stages: usize, t
     let (s, d) = (steady.carried[0], drain.carried[0]);
     assert_eq!((d.init, d.phi, d.next), (s.phi, s.phi, s.next), "the drain continues the steady accumulator");
 }
+
+/// A fill builds only the rings its template runs: through registers one
+/// or two slots, so a three-slot register-staged ring (which the template
+/// refused with a panic) is `None` before any program holds it, and every
+/// config a family's lattice spans on a target runs on that target's fill.
+#[test]
+fn a_fill_builds_only_the_rings_it_runs() {
+    assert_eq!(Fill::Staged.ring(3, false), None);
+    assert_eq!(Fill::Staged.ring(2, true), Some(Schedule::ring(2, true)));
+    assert_eq!(Fill::CpAsync.ring(3, false), Some(Schedule::ring(3, false)));
+    assert_eq!(Fill::CpAsync.ring(0, false), None);
+    for (name, target) in crate::sweep::targets() {
+        let fill = target.fill;
+        let gemm = crate::ops::config::gemm_lattice(&target).into_iter().map(|c| c.schedule);
+        let attention =
+            crate::ops::config::AttentionProblem { tiles: 1, t: 1024, tk: 1024, d: 64, causal: false, bias: false }
+                .lattice(&target)
+                .into_iter()
+                .map(|c| c.schedule);
+        let nearest = super::self_join(4096, 4096, 128, crate::kernels::nearest::Metric::L2, 8)
+            .lattice(&target)
+            .into_iter()
+            .map(|c| c.schedule);
+        for schedule in gemm.chain(attention).chain(nearest) {
+            assert!(fill.runs(schedule), "{name}: {schedule:?} on {fill:?}");
+        }
+    }
+}

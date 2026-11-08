@@ -12,7 +12,9 @@ use svod_dtype::{AmdArch, CudaArch, GpuArch, ScalarDType};
 
 use crate::atoms::{Core, Costs, Device, Target};
 use crate::build::{BF16, F16, I8};
-use crate::ir::{Program, Var};
+use std::num::NonZeroUsize;
+
+use crate::ir::{Program, Schedule, Var};
 use crate::kernels::attention::{AttnMask, AttnSpec, Bias, CacheLayout, Chunk, CombineSpec, FaCfg, attention, combine};
 use crate::kernels::conv::{ConvCfg, ConvGeom, ConvSpec};
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Scale, gemm};
@@ -66,7 +68,8 @@ pub fn past_i32(target: &Target) -> Vec<Launch> {
     let device = &planner.device;
     let (m, n, k) = (50_001, 50_001, 50_048);
     for (batches, stages) in [(1, 1), (2, 1), (2, 2)] {
-        let cfg = GemmCfg { stages, ..planner.gemm_ranked(batches, m, n, k, false)[0] };
+        let base = planner.gemm_ranked(batches, m, n, k, false)[0];
+        let cfg = GemmCfg { schedule: Schedule::ring(stages, base.unroll()), ..base };
         let spec = GemmSpec { m, n, k, batch: Batch::Static(batches), epilogue: Epilogue::DEFAULT, cfg };
         out.push((format!("gemm {batches} batches s{stages}"), gemm::<BF16>(&spec), cfg.lowering(device)));
     }
@@ -135,13 +138,14 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
     let plain = gemm_spec(130, 192, 128, Epilogue::DEFAULT);
     for (i, cfg) in first_eight(&planner.gemm_ranked(1, 4096, 4096, 4096, false)).into_iter().enumerate() {
         let spec = GemmSpec { cfg, ..plain.clone() };
-        push(&format!("gemm #{i} {:?}x{}", cfg.tile, cfg.stages), gemm::<BF16>(&spec), cfg.lowering(&planner.device));
+        push(&format!("gemm #{i} {:?}x{}", cfg.tile, cfg.stages()), gemm::<BF16>(&spec), cfg.lowering(&planner.device));
     }
     // One slot holds a tile twice as deep in the same shared memory.
     let one_slot = GemmSpec { cfg: config::gemm_cfg([64, 64, 64], 1, [2, 2], false), ..plain.clone() };
     push("gemm one slot", gemm::<BF16>(&one_slot), one_slot.cfg.lowering(&planner.device));
-    if let kslice @ Some(_) = target.kslice() {
-        let cfg = GemmCfg { kslice, ..config::gemm_cfg([64, 64, 64], 1, [2, 4], false) };
+    if let Some(kslice) = target.kslice().and_then(NonZeroUsize::new) {
+        let schedule = Schedule::PingPong { kslice };
+        let cfg = GemmCfg { schedule, ..config::gemm_cfg([64, 64, 64], 1, [2, 4], false) };
         let crews = GemmSpec { cfg, ..plain.clone() };
         push("gemm two crews", gemm::<BF16>(&crews), cfg.lowering(&planner.device));
     }
@@ -157,7 +161,7 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
         let out_f32 = Epilogue { out_f32: true, ..Epilogue::DEFAULT };
         for cfg in [config::gemm_cfg([64, 64, 64], 2, [2, 2], true), config::gemm_cfg([32, 64, 64], 1, [1, 2], false)] {
             let spec = GemmSpec { m: 130, n: 192, k: 256, batch: Batch::Static(1), epilogue: out_f32, cfg };
-            let name = format!("gemm int8 {:?}x{}", cfg.tile, cfg.stages);
+            let name = format!("gemm int8 {:?}x{}", cfg.tile, cfg.stages());
             push(&name, gemm::<I8>(&spec), cfg.lowering(&planner.device));
         }
     }
@@ -185,7 +189,7 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
         let Some(spec) = fa(100, 100, d, causal, None, Batch::Static(2)) else { continue };
         for (i, cfg) in first_eight(&planner.attention_ranked(8, 100, 100, d, true, false)).into_iter().enumerate() {
             let spec = AttnSpec { cfg, ..spec.clone() };
-            let name = format!("attention d{d} causal #{i} {}x{}x{}", cfg.bq, cfg.bkv, cfg.stages);
+            let name = format!("attention d{d} causal #{i} {}x{}x{}", cfg.bq, cfg.bkv, cfg.stages());
             push(&name, attention::<BF16>(&spec), cfg.lowering(&planner.device));
         }
     }
@@ -443,7 +447,7 @@ pub(crate) fn group_families(target: &Target) -> Vec<Launch> {
     tiles
         .into_iter()
         .map(|(tile, warps, stages)| {
-            let cfg = GemmCfg { tile, stages, warps, unroll: false, core: Core::Group, kslice: None };
+            let cfg = GemmCfg { tile, warps, core: Core::Group, schedule: Schedule::ring(stages, false) };
             assert!(cfg.fits(target), "{cfg:?} fits the warpgroup core");
             let (m, n, k) = (tile[0] + 2, tile[1] - 3, 3 * tile[2]);
             let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg };

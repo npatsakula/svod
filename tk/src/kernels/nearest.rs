@@ -21,15 +21,15 @@ use super::gemm::{mainloop, tile_order};
 use crate::build::*;
 use crate::ir::*;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+/// The tune store keys by this text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NearestCfg {
     /// Query rows per block.
     pub bq: usize,
     /// Candidates per trip.
     pub bkv: usize,
-    pub stages: usize,
-    /// The ring loop unrolled over its slots.
-    pub unroll: bool,
+    /// The ring over the candidate tiles.
+    pub schedule: Schedule,
     /// Query rows a warp owns: [`WARP_ROWS`] or a multiple, every candidate
     /// fragment read from the ring feeding that many rows.
     pub warp_rows: usize,
@@ -59,7 +59,7 @@ pub struct NearestCfg {
 /// its columns of a trip's scores a register at a time and queues those
 /// below the row's `k`-th, `depth` deep, until some lane's queue is full and
 /// the warp merges every queue into its rows' lists.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct LaneQueue {
     /// A row's queues side by side, the columns a deal takes of a row: a
     /// power of two, a multiple of the lanes a product spreads a row over,
@@ -79,45 +79,6 @@ impl LaneQueue {
     /// As wide as the lanes CUDA's and RDNA's swapped products spread a row
     /// over, or more: what a list config without its own takes.
     pub const PORTABLE: Self = Self { width: 4, depth: 2, passes: false };
-}
-
-/// Rounds print as lane queues did before passes were an option.
-impl fmt::Debug for LaneQueue {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut s = f.debug_struct("LaneQueue");
-        s.field("width", &self.width).field("depth", &self.depth);
-        if self.passes {
-            s.field("passes", &true);
-        }
-        s.finish()
-    }
-}
-
-/// The tune store keys by this text: a resident, unsplit config prints as it
-/// did before the depth chunk and the splits existed, so its stored choices
-/// still apply.
-impl fmt::Debug for NearestCfg {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut s = f.debug_struct("NearestCfg");
-        s.field("bq", &self.bq).field("bkv", &self.bkv).field("stages", &self.stages);
-        s.field("unroll", &self.unroll).field("warp_rows", &self.warp_rows);
-        if let Some(bk) = self.bk {
-            s.field("bk", &bk);
-        }
-        if self.splits != 1 {
-            s.field("splits", &self.splits);
-        }
-        if let Some(queue) = self.queue {
-            s.field("queue", &queue);
-        }
-        if let Some(select) = self.select {
-            s.field("select", &select);
-        }
-        if let Some(lanes) = self.lanes {
-            s.field("lanes", &lanes);
-        }
-        s.finish()
-    }
 }
 
 /// Why [`nearest`] refuses a config's lists, whatever the target: what its
@@ -166,8 +127,7 @@ impl NearestCfg {
         Self {
             bq,
             bkv,
-            stages,
-            unroll: false,
+            schedule: Schedule::ring(stages, false),
             warp_rows: WARP_ROWS,
             bk: None,
             splits: 1,
@@ -186,9 +146,12 @@ impl NearestCfg {
         (self.bq / self.warp_rows) as u32
     }
 
-    /// The pipelines' ring.
-    pub fn ring(&self) -> Ring {
-        Ring { stages: self.stages, unroll: self.unroll, crews: 1 }
+    pub fn stages(&self) -> usize {
+        self.schedule.stages()
+    }
+
+    pub fn unroll(&self) -> bool {
+        self.schedule.unroll()
     }
 
     /// The lane queues a list takes ([`LaneQueue::PORTABLE`] unless set).
@@ -208,8 +171,8 @@ impl NearestCfg {
     pub fn smem_bytes(&self, d: usize, dtype: ScalarDType) -> usize {
         let bytes = dtype.bytes();
         match self.bk {
-            None => self.stages * self.bkv * d * bytes,
-            Some(bk) => self.stages * (self.bq + self.bkv) * bk * bytes,
+            None => self.stages() * self.bkv * d * bytes,
+            Some(bk) => self.stages() * (self.bq + self.bkv) * bk * bytes,
         }
     }
 }
@@ -385,7 +348,8 @@ pub(crate) const MAX_CANDIDATES: usize = 1 << 24;
 /// the metric's own.
 pub fn nearest<T: MmaIn>(spec: &NearestSpec) -> Program {
     let NearestSpec { n, m, d, metric, floors, groups, k: top, cfg, ref live } = *spec;
-    let NearestCfg { bq, bkv, stages, splits, .. } = cfg;
+    let NearestCfg { bq, bkv, splits, .. } = cfg;
+    let stages = cfg.stages();
     let tiles = m.div_ceil(bkv);
     assert!(m <= MAX_CANDIDATES, "{m} candidates pass the f32 index's {MAX_CANDIDATES}");
     assert!(top >= 1, "a row keeps a score at least");
@@ -1015,7 +979,7 @@ pub fn nearest<T: MmaIn>(spec: &NearestSpec) -> Program {
     let carried = match (q_r, c_s) {
         (Some(q_r), Some(c_s)) => k.pipeline_vec(
             count,
-            cfg.ring(),
+            cfg.schedule,
             init,
             |k, step, slot| {
                 let c_g = k.at(c_view, tile_start(step), 0);
@@ -1036,7 +1000,7 @@ pub fn nearest<T: MmaIn>(spec: &NearestSpec) -> Program {
             let c_g = k.at(c_view, start.clone(), 0);
             let x_chunk = |k: &mut Kernel, _: Sc, col: Sc| k.at(x_view, 0, col);
             let chunks = d.div_ceil(depth);
-            let [dot] = mainloop(k, Shape::new(bq, depth), &x_chunk, [c_g], chunks, cfg.ring(), depth, None, 1);
+            let [dot] = mainloop(k, Shape::new(bq, depth), &x_chunk, [c_g], chunks, cfg.schedule, depth, None, 1);
             let dot = T::widened(k, dot);
             folded(k, dot, start, carried)
         }),

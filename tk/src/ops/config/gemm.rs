@@ -5,7 +5,9 @@
 use std::sync::Arc;
 
 use crate::atoms::{Core, Fill, Target};
-use crate::ir::{Axis, Shape};
+use std::num::NonZeroUsize;
+
+use crate::ir::{Axis, Schedule, Shape};
 use crate::kernels::gemm::{GROUP_ROWS, GemmCfg, Rope};
 use crate::layouts::{Issue, Swizzle, WarpGrid, chunked, fills_in_chunks};
 
@@ -30,15 +32,18 @@ impl GemmCfg {
         // Two crews: the two warp rows of the warp-level core, one slot, and
         // k-slices of a product (one atom deep) each with another to
         // overlap, on a target that interleaves crews.
-        let crews = self.kslice.is_none_or(|k| {
-            self.core == Core::Warp
-                && target.kslice() == Some(k)
-                && self.stages == 1
-                && self.warps[0] == 2
-                && bk.is_multiple_of(k)
-                && bk >= 2 * k
-        });
-        row && crews && self.issue(target, bk).is_some() && target.fill.runs(self.stages)
+        let crews = match self.schedule {
+            Schedule::Ring { .. } => true,
+            Schedule::PingPong { kslice } => {
+                let k = kslice.get();
+                self.core == Core::Warp
+                    && target.kslice() == Some(k)
+                    && self.warps[0] == 2
+                    && bk.is_multiple_of(k)
+                    && bk >= 2 * k
+            }
+        };
+        row && crews && self.issue(target, bk).is_some() && target.fill.runs(self.schedule)
     }
 
     /// Whether the config lowers on `target`: it [`tiles`](Self::tiles), and
@@ -99,7 +104,7 @@ impl GemmCfg {
 }
 
 pub(crate) const fn gemm_cfg(tile: [usize; 3], stages: usize, warps: [u32; 2], unroll: bool) -> GemmCfg {
-    GemmCfg { core: Core::Warp, tile, stages, warps, unroll, kslice: None }
+    GemmCfg { core: Core::Warp, tile, warps, schedule: Schedule::ring(stages, unroll) }
 }
 
 /// Model: a representative layer epilogue's tile operations an output
@@ -162,9 +167,14 @@ pub fn gemm_lattice(target: &Target) -> Vec<GemmCfg> {
                             );
                             // Two crews: the warp-level core's two warp rows a
                             // cluster apart over the one slot.
-                            let kslice = target.kslice();
-                            if core == Core::Warp && kslice.is_some() && stages == 1 && warps[0] == 2 {
-                                out.push(GemmCfg { kslice, ..gemm_cfg([bm, bn, bk], 1, warps, false) });
+                            let kslice = target.kslice().and_then(NonZeroUsize::new);
+                            if core == Core::Warp
+                                && stages == 1
+                                && warps[0] == 2
+                                && let Some(kslice) = kslice
+                            {
+                                let schedule = Schedule::PingPong { kslice };
+                                out.push(GemmCfg { schedule, ..gemm_cfg([bm, bn, bk], 1, warps, false) });
                             }
                         }
                     }
@@ -276,7 +286,7 @@ impl GemmProblem {
             }
         };
         let (fill, steps) = ((bm + bn * halves) * bk * ELEM, (bm * bn * halves * bk / STEP) as f64);
-        let (blocks, trips, stages) = (self.blocks(cfg), self.k / bk, cfg.stages);
+        let (blocks, trips, stages) = (self.blocks(cfg), self.k / bk, cfg.stages());
         let unique = (self.batches * (self.m + self.n * halves) * self.k * ELEM) as f64;
         let flight = planner.sms().min(blocks).max(1);
         let group = GROUP_ROWS.min(flight);
@@ -324,7 +334,7 @@ impl GemmProblem {
             side,
             stores: 0.0,
             ring: stages,
-            unroll: cfg.unroll,
+            unroll: cfg.unroll(),
             waits: 0.0,
             sections: [Spread::default(); 2],
         })

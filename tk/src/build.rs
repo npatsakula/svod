@@ -224,22 +224,6 @@ impl From<CmpOp> for BinaryOp {
     }
 }
 
-/// How a [`Kernel::pipeline`] runs its ring: `stages` slots, the loop
-/// copied once per slot or not, over one crew or two ([`Pipeline`]); a
-/// count of slots is a rolled ring of one crew.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Ring {
-    pub stages: usize,
-    pub unroll: bool,
-    pub crews: u32,
-}
-
-impl From<usize> for Ring {
-    fn from(stages: usize) -> Self {
-        Self { stages, unroll: false, crews: 1 }
-    }
-}
-
 pub struct Kernel {
     prog: Program,
     blocks: Vec<Block>,
@@ -868,33 +852,32 @@ impl Kernel {
         phi.into_iter().map(Tile::new).collect()
     }
 
-    /// A producer/consumer loop over `extent` steps with `stages` slots.
+    /// A producer/consumer loop over `extent` steps with a ring of slots run
+    /// as `schedule` says ([`Schedule`]; a count of slots is a rolled ring).
     /// `produce(k, step, slot)` stages step `step` into slot `slot`;
     /// `consume(k, step, slot, carried)` computes from it.
     pub fn pipeline<T: Elem, const N: usize>(
         &mut self,
         extent: impl Into<Sc>,
-        ring: impl Into<Ring>,
+        schedule: impl Into<Schedule>,
         init: [Regs<T>; N],
         produce: impl FnOnce(&mut Self, Sc, Sc),
         consume: impl FnOnce(&mut Self, Sc, Sc, [Regs<T>; N]) -> [Regs<T>; N],
     ) -> [Regs<T>; N] {
         let consume = |k: &mut Self, step, slot, phi: Vec<Regs<T>>| consume(k, step, slot, tiles(phi)).to_vec();
-        tiles(self.pipeline_vec(extent, ring, init.to_vec(), produce, consume))
+        tiles(self.pipeline_vec(extent, schedule, init.to_vec(), produce, consume))
     }
 
     /// [`Self::pipeline`] over as many tiles as `init` holds.
     pub fn pipeline_vec<T: Elem>(
         &mut self,
         extent: impl Into<Sc>,
-        ring: impl Into<Ring>,
+        schedule: impl Into<Schedule>,
         init: Vec<Regs<T>>,
         produce: impl FnOnce(&mut Self, Sc, Sc),
         consume: impl FnOnce(&mut Self, Sc, Sc, Vec<Regs<T>>) -> Vec<Regs<T>>,
     ) -> Vec<Regs<T>> {
-        let Ring { stages, unroll, crews } = ring.into();
-        assert!(stages >= 1, "at least one stage");
-        assert!(crews == 1 || (crews == 2 && stages == 1), "two crews run over one slot");
+        let schedule = schedule.into();
         let extent = self.intern(extent);
         let [pstep, pslot, cstep, cslot] = [(); 4].map(|()| self.push_scalar(Scalar::Induction));
         let phi = self.carried(&init);
@@ -908,7 +891,7 @@ impl Kernel {
         self.deshare_carried(&mut body, &mut next);
         let consume = Stage { step: cstep, slot: cslot, body };
         let carried = carry(&init, &phi, &next);
-        self.push(Stmt::Pipeline(Pipeline { extent, stages, unroll, crews, carried, produce, consume }));
+        self.push(Stmt::Pipeline(Pipeline { extent, schedule, carried, produce, consume }));
         phi.into_iter().map(Tile::new).collect()
     }
 
