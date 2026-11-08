@@ -23,7 +23,7 @@ use crate::kernels::conv::ConvSpec;
 use crate::kernels::gemm::{Epilogue, GemmSpec, gemm};
 use crate::kernels::nearest::{Floors, Metric, NearestSpec, nearest};
 use crate::kernels::rows::NormCfg;
-use crate::launch::graph_launch_all;
+use crate::launch::{self, aliasing, graph_launch_all};
 use crate::lower::sync::insert_barriers;
 use crate::lower::{Lowering, lower};
 use crate::ops::config::{self, NearestProblem, Planner};
@@ -657,6 +657,29 @@ fn an_operand_read_twice_matches_the_interpreter_on_the_device() {
     for (i, (g, w)) in super::decode(ScalarDType::BFloat16, &bytes).iter().zip(&want).enumerate() {
         assert!((g - w).abs() <= 2e-2 * w.abs().max(1.0), "[{i}] = {g} vs {w}");
     }
+}
+
+/// A parameter the kernel writes shares storage with no other, since the body
+/// declares its buffers `noalias`: parameters all read may be one tensor (the
+/// self-join above), an output that is one of them, or a window into one, is
+/// refused, realized or still lazy.
+#[test]
+fn a_launch_refuses_an_output_sharing_storage() {
+    let (m, k) = (64, 32);
+    let cfg = config::gemm_cfg([64, 64, 32], 1, [2, 2], false);
+    let prog = gemm::<BF16>(&GemmSpec { m, n: m, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg });
+    let aliased = |tensors: &[&Tensor]| matches!(aliasing(&prog, tensors), Err(launch::Error::Aliased { .. }));
+    let (a, b, out) = (
+        Tensor::from_slice(vec![0.5f32; m * k]),
+        Tensor::from_slice(vec![1.0f32; m * k]),
+        Tensor::from_slice(vec![0.0f32; m * m]),
+    );
+    assert!(!aliased(&[&a, &a, &out]), "two inputs may be one tensor");
+    assert!(aliased(&[&a, &b, &a]), "an input is not the output");
+    let window = out.try_shrink([(0usize, m)]).unwrap();
+    assert!(aliased(&[&window, &b, &out]), "a window into the output shares its storage");
+    let lazy = a.try_add(&b).unwrap();
+    assert!(!aliased(&[&lazy, &lazy, &out]) && aliased(&[&lazy, &b, &lazy]), "a lazy node is itself");
 }
 
 /// Each family lowered for its target alone and launched as that body, as
