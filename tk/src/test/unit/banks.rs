@@ -154,7 +154,7 @@ const FAT_POINTER: &str = "@llvm.amdgcn.make.buffer.rsrc.p7.p1";
 fn a_kernel_takes_the_power_of_two_within_its_widest_row(k: usize, stride: u32) {
     let text = gemm_text(AmdArch::Gfx942, k);
     assert!(text.contains(FAT_POINTER), "{text}");
-    let field = format!("i16 {}, i32 -1", stride | 0x4000);
+    let field = format!("i16 {}, i64 -1", stride | 0x4000);
     assert!(text.contains(&field), "{field}:\n{text}");
 }
 
