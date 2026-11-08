@@ -470,7 +470,7 @@ pub struct Pm4LoweringState {
 /// store (`ops_amd.py:391-393`): write the event id into the device's event
 /// mailbox so a host blocked in `WAIT_EVENTS` wakes on completion instead of at
 /// its next poll tier. No-op on backends without a KFD event.
-fn push_queue_event_mailbox(submission: &mut crate::hcq::Submission, core: &AmdDeviceCore) {
+pub(crate) fn push_queue_event_mailbox(submission: &mut crate::hcq::Submission, core: &AmdDeviceCore) {
     if let Some(mailbox) = core.queue_event_mailbox() {
         submission.push(crate::hcq::Command::Store {
             dst: mailbox.address,

@@ -7,7 +7,8 @@ use crate::amd::connector::{OwnerCtx, PoolQueue, SubmissionFinalizer};
 use crate::amd::program::AmdProgram;
 use crate::amd::queue::{
     AQL_PACKET_BYTES, COPY_RING_BYTES, Pm4LoweringState, lower_hcq_aql_submission_program,
-    lower_hcq_pm4_command_buffer, lower_hcq_sdma_command_buffer, validate_aql_packet_count, validate_pm4_dword_count,
+    lower_hcq_pm4_command_buffer, lower_hcq_sdma_command_buffer, push_queue_event_mailbox, validate_aql_packet_count,
+    validate_pm4_dword_count,
 };
 use crate::device::PlanCall;
 use crate::error::{Error, Result};
@@ -298,6 +299,10 @@ impl AmdLinkedPlan {
             if submission.commands.is_empty() {
                 continue;
             }
+            // Each submission ends on a timeline store, and the last one is the
+            // plan's: its interrupt wakes a host blocked in `WAIT_EVENTS`.
+            push_queue_event_mailbox(&mut submission, lane.core());
+            let queue_event_mailbox = lane.core().queue_event_mailbox().map(|mailbox| mailbox.address);
             let mut control = None;
             let lowered = match submission.queue {
                 QueueKind::Compute(_) if pm4 => lower_hcq_pm4_command_buffer(
@@ -307,9 +312,7 @@ impl AmdLinkedPlan {
                         tmpring_size: lane.tmpring_size(),
                         target_major: lane.core().arch.gfx_major(),
                         completion_xcc_mask: None,
-                        // Linked timeline stores are placeholders patched per
-                        // replay, so they carry no KFD interrupt companion.
-                        queue_event_mailbox: None,
+                        queue_event_mailbox,
                     },
                 )?,
                 QueueKind::Compute(_) => {
@@ -321,7 +324,7 @@ impl AmdLinkedPlan {
                             tmpring_size: lane.tmpring_size(),
                             target_major: lane.core().arch.gfx_major(),
                             completion_xcc_mask: (lane.core().node.num_xcc > 1).then_some(1),
-                            queue_event_mailbox: None,
+                            queue_event_mailbox,
                         },
                         PatchSource::LinkAddress(control_link),
                     )?;
@@ -343,7 +346,9 @@ impl AmdLinkedPlan {
                     });
                     program.aql
                 }
-                QueueKind::Copy(_) => lower_hcq_sdma_command_buffer(&submission, lane.core().arch.gfx_major(), None)?,
+                QueueKind::Copy(_) => {
+                    lower_hcq_sdma_command_buffer(&submission, lane.core().arch.gfx_major(), queue_event_mailbox)?
+                }
             };
             match submission.queue {
                 QueueKind::Compute(_) if pm4 => validate_pm4_dword_count(lowered.bytes.len() / 4)?,
@@ -403,6 +408,12 @@ impl AmdLinkedPlan {
                 .collect(),
             _code: programs.iter().map(|program| program.code_object()).collect(),
         }))
+    }
+
+    /// Each native submission's linked stream as captured. Test-only.
+    #[cfg(test)]
+    pub(crate) fn submission_bytes(&self) -> Vec<&[u8]> {
+        self.submissions.iter().map(|submission| submission.linked.static_bytes()).collect()
     }
 
     pub(crate) fn replay(

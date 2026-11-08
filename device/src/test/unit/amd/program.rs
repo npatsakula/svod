@@ -252,6 +252,66 @@ fn graph_capture_emits_one_memory_barrier_for_the_whole_chain() {
     assert_eq!(runs(&pm4::event_write(pm4::CS_PARTIAL_FLUSH, pm4::EVENT_INDEX_PARTIAL_FLUSH)), 3);
 }
 
+const MAILBOX: crate::amd::iface::QueueEventMailbox =
+    crate::amd::iface::QueueEventMailbox { address: 0x7_0000_1238, event_id: 9 };
+
+/// A captured graph ends on the KFD completion interrupt, after its timeline
+/// store, so a host blocked in `WAIT_EVENTS` wakes as the replay retires; a
+/// backend without the mailbox captures the stream unchanged.
+#[test]
+fn graph_capture_ends_on_the_completion_interrupt() {
+    let Some(mock) = mock_program(EMPTY_IR, "empty", &[], true) else { return };
+    let kernels = std::array::from_fn::<_, 2, _>(|_| graph_kernel(&mock.program, Vec::new(), Vec::new()));
+    let capture =
+        || replay_dwords(AmdGraph::capture_amd(&mock.allocator, &kernels).unwrap().expect("graph").linked_bytes());
+    let quiet = capture();
+    mock.iface.set_queue_event_mailbox(MAILBOX);
+    let woken = capture();
+    let interrupt = crate::amd::sys::pm4::release_mem_event(MAILBOX.address, MAILBOX.event_id, false);
+    // Each capture links its own kernargs, so compare the shape around them.
+    assert!(woken.ends_with(&interrupt), "{woken:x?}");
+    assert_eq!(woken.len(), quiet.len() + interrupt.len());
+    assert!(!quiet.windows(interrupt.len()).any(|run| run == interrupt));
+}
+
+/// Every native submission of a linked plan ends on the completion interrupt:
+/// the last one's timeline store is the plan's.
+#[test]
+fn linked_plan_submissions_end_on_the_completion_interrupt() {
+    let Some(mock) = mock_program(EMPTY_IR, "empty", &[], false) else { return };
+    install_signal_pool(&mock.allocator);
+    mock.iface.set_queue_event_mailbox(MAILBOX);
+    let pool =
+        crate::amd::connector::PoolQueue::new_with_resources(Arc::clone(mock.device.core()), &mock.allocator).unwrap();
+    let owner = crate::amd::connector::OwnerCtx::new(Arc::clone(mock.device.core()), mock.allocator.clone());
+    let lane = crate::hcq::LaneSubmission {
+        lane: crate::hcq::DeviceQueue {
+            device: svod_dtype::DeviceSpec::Amd { device_id: 0 },
+            queue: crate::hcq::QueueKind::Compute(0),
+        },
+        waits: Vec::new(),
+        commands: vec![crate::hcq::TopologyCommand { operation: 0, copy_leg: None }],
+        signal_value: 1,
+    };
+    let semantic = crate::hcq::SemanticLinkedPlan::from_lane_submissions(vec![lane], |_| [0x1000, 0x1008]).unwrap();
+    let calls = [crate::device::PlanCall::Program {
+        program: &mock.program,
+        buffers: &[],
+        vals: &[],
+        global_size: Some([1, 1, 1]),
+        local_size: Some([1, 1, 1]),
+    }];
+    let linked = crate::amd::AmdLinkedPlan::capture(&owner, &pool, &semantic, &calls).unwrap().expect("linked plan");
+    let interrupt = crate::amd::sys::pm4::release_mem_event(MAILBOX.address, MAILBOX.event_id, false);
+    let streams = linked.submission_bytes();
+    assert!(!streams.is_empty());
+    for stream in streams {
+        let dwords = replay_dwords(stream);
+        assert!(dwords.ends_with(&interrupt), "{dwords:x?}");
+        assert_eq!(dwords.windows(interrupt.len()).filter(|run| *run == interrupt).count(), 1);
+    }
+}
+
 #[test]
 fn graph_failed_drain_quarantines_graph_program_and_queue_storage() {
     let Some(mock) = mock_program(EMPTY_IR, "empty", &[], true) else { return };
@@ -484,6 +544,176 @@ fn pm4_graph_two_kernel_raw_dependency() {
     let _pm4 = Pm4GraphOverride::enable(alloc.dev.core());
     ensure_hw_signal_pool(&alloc);
     graph_two_kernel_raw_probe(&alloc, alloc.dev.arch.mcpu());
+}
+
+/// One work-item that sleeps `iterations` times (`s_sleep 127`, a few µs
+/// each), then stores 0.0.
+fn sleepy_ir(iterations: u32) -> String {
+    format!(
+        r#"target triple = "amdgcn-amd-amdhsa"
+declare void @llvm.amdgcn.s.sleep(i32)
+define amdgpu_kernel void @sleepy(ptr noalias %buf0) #0 {{
+entry:
+  br label %loop
+loop:
+  %i = phi i32 [ 0, %entry ], [ %next, %loop ]
+  call void @llvm.amdgcn.s.sleep(i32 127)
+  %next = add i32 %i, 1
+  %done = icmp eq i32 %next, {iterations}
+  br i1 %done, label %exit, label %loop
+exit:
+  store float 0.0, ptr %buf0
+  ret void
+}}
+attributes #0 = {{ nounwind "amdgpu-flat-work-group-size"="1,1" }}
+"#
+    )
+}
+
+/// A graph of `count` sleepy kernels over one host-visible output, or `None`
+/// where clang or capture isn't available.
+fn sleepy_graph(
+    alloc: &AmdAllocator,
+    iterations: u32,
+    count: usize,
+) -> Option<(Box<dyn crate::device::Graph>, AmdProgram, ProbeBuffer)> {
+    let bytes = clang_amdgcn(&sleepy_ir(iterations), alloc.dev.arch.mcpu())?;
+    let program =
+        AmdProgram::load(alloc.dev.clone(), alloc, &bytes, "sleepy", &global_f32_buffer_abi()).expect("load program");
+    let output = ProbeBuffer::new(alloc);
+    let kernels = (0..count)
+        .map(|index| graph_kernel(&program, vec![output.gpu as *mut u8], Vec::from_iter(index.checked_sub(1))))
+        .collect::<Vec<_>>();
+    let graph = AmdGraph::capture(alloc, &kernels).expect("capture")?;
+    Some((graph, program, output))
+}
+
+/// CPU time the calling thread has used.
+fn thread_cpu() -> std::time::Duration {
+    // SAFETY: getrusage writes the struct it is given.
+    let usage = unsafe {
+        let mut usage = std::mem::zeroed::<libc::rusage>();
+        assert_eq!(libc::getrusage(libc::RUSAGE_THREAD, &mut usage), 0);
+        usage
+    };
+    let time = |t: libc::timeval| std::time::Duration::new(t.tv_sec as u64, t.tv_usec as u32 * 1000);
+    time(usage.ru_utime) + time(usage.ru_stime)
+}
+
+/// Two threads blocked on one graph replay both wake as it retires: the replay
+/// raises the completion interrupt, and each waiter's event age sees it though
+/// the queue event resets on the first wake. Lateness is wall time past the
+/// kernel's GPU span; a missed interrupt leaves a waiter to its next
+/// `WAIT_EVENTS` slice (up to 200 ms).
+///
+/// Run: `cargo test -p svod-device --lib graph_waiters -- --ignored --nocapture --test-threads=1`
+#[test]
+#[ignore = "manual hardware probe; needs a real AMD GPU + clang"]
+fn graph_waiters_wake_as_the_replay_retires() {
+    let Some(alloc) = amd_alloc_or_skip() else { return };
+    let _serial = PM4_GRAPH_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _pm4 = Pm4GraphOverride::enable(alloc.dev.core());
+    ensure_hw_signal_pool(&alloc);
+    let iterations = std::env::var("SLEEPY_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(80_000);
+    let Some((graph, _program, output)) = sleepy_graph(&alloc, iterations, 1) else { return };
+
+    for trial in 0..3 {
+        output.set(-1.0);
+        let started = std::time::Instant::now();
+        let timestamps = graph.replay_profiled(&[], &[]).expect("profiled replay").expect("profile support");
+        let woke = std::thread::scope(|scope| {
+            let waiters = [(); 2].map(|()| {
+                scope.spawn(|| {
+                    alloc.dev.core().synchronize_all().expect("synchronize_all");
+                    started.elapsed()
+                })
+            });
+            waiters.map(|waiter| waiter.join().unwrap())
+        });
+        assert_eq!(output.get(), 0.0, "trial {trial}: the kernel store must land");
+        let (start, end) = timestamps[0].timestamps_ns().expect("graph GPU timestamps");
+        let span = std::time::Duration::from_nanos(end - start);
+        assert!(
+            span > std::time::Duration::from_millis(10),
+            "trial {trial}: the kernel must outlast the spin, {span:?}"
+        );
+        for wall in woke {
+            let late = wall.saturating_sub(span);
+            println!("waiters trial {trial}: GPU {span:?}, woke after {wall:?}, {late:?} late");
+            assert!(late < std::time::Duration::from_millis(30), "trial {trial}: {late:?} late past {span:?}");
+        }
+    }
+    drop(graph);
+    output.raw.free_amd_device_in_place();
+}
+
+/// A long graph of short kernels: the waiting thread's CPU time against the
+/// wall time. A wait that sleeps uses a sliver of a core; one kept polling by
+/// progress (an AQL queue's read index) uses the whole wait. Prints only.
+///
+/// Run: `cargo test -p svod-device --release --lib long_graph_wait -- --ignored --nocapture --test-threads=1`
+#[test]
+#[ignore = "manual hardware probe; needs a real AMD GPU + clang"]
+fn long_graph_wait_cpu_probe() {
+    let Some(alloc) = amd_alloc_or_skip() else { return };
+    let _serial = PM4_GRAPH_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _pm4 = Pm4GraphOverride::enable(alloc.dev.core());
+    ensure_hw_signal_pool(&alloc);
+    let Some((graph, _program, output)) = sleepy_graph(&alloc, 800, 400) else { return };
+    for trial in 0..3 {
+        output.set(-1.0);
+        let (wall, cpu) = (std::time::Instant::now(), thread_cpu());
+        graph.replay(&[], &[]).expect("replay");
+        alloc.dev.core().synchronize_all().expect("synchronize_all");
+        let (wall, cpu) = (wall.elapsed(), thread_cpu() - cpu);
+        assert_eq!(output.get(), 0.0);
+        println!(
+            "long-wait trial {trial}: wall {wall:?}, waiter CPU {cpu:?} ({:.1} %)",
+            100.0 * cpu.as_secs_f64() / wall.as_secs_f64()
+        );
+    }
+    drop(graph);
+    output.raw.free_amd_device_in_place();
+}
+
+/// Replay-to-wake latency of a short graph: mean wall time per replay and
+/// synchronize, which a wait's spin budget trades against CPU. Prints only.
+///
+/// Run: `cargo test -p svod-device --release --lib short_graph_wait -- --ignored --nocapture --test-threads=1`
+#[test]
+#[ignore = "manual hardware probe; needs a real AMD GPU + clang"]
+fn short_graph_wait_latency_probe() {
+    let Some(alloc) = amd_alloc_or_skip() else { return };
+    let _serial = PM4_GRAPH_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _pm4 = Pm4GraphOverride::enable(alloc.dev.core());
+    ensure_hw_signal_pool(&alloc);
+    for iterations in [0, 30, 300] {
+        let Some((graph, _program, output)) = sleepy_graph(&alloc, iterations.max(1), 1) else { return };
+        let span = {
+            let timestamps = graph.replay_profiled(&[], &[]).expect("profiled replay").expect("profile support");
+            alloc.dev.core().synchronize_all().expect("synchronize_all");
+            let (start, end) = timestamps[0].timestamps_ns().expect("graph GPU timestamps");
+            std::time::Duration::from_nanos(end - start)
+        };
+        let mut walls = (0..300)
+            .map(|_| {
+                let wall = std::time::Instant::now();
+                graph.replay(&[], &[]).expect("replay");
+                alloc.dev.core().synchronize_all().expect("synchronize_all");
+                wall.elapsed()
+            })
+            .collect::<Vec<_>>();
+        walls.sort();
+        let cpu = thread_cpu();
+        println!(
+            "short-wait GPU {span:?}: median {:?}, p90 {:?}, max {:?} (thread CPU so far {cpu:?})",
+            walls[walls.len() / 2],
+            walls[walls.len() * 9 / 10],
+            walls[walls.len() - 1]
+        );
+        drop(graph);
+        output.raw.free_amd_device_in_place();
+    }
 }
 
 /// Dispatch one kernel through the per-plan `PlanContext` with `profile=true`,

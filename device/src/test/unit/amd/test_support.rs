@@ -14,7 +14,9 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use crate::amd::device::AmdDevice;
-use crate::amd::iface::{AllocKind, AllocResult, AmdIface, PublicationStage, QueueHandle, QueueTeardown, RingDesc};
+use crate::amd::iface::{
+    AllocKind, AllocResult, AmdIface, PublicationStage, QueueEventMailbox, QueueHandle, QueueTeardown, RingDesc,
+};
 use crate::amd::va_registry::AllocTag;
 use crate::error::{Error, Result};
 
@@ -96,6 +98,7 @@ struct MockAmdState {
     alloc_tags: Vec<AllocTag>,
     transcript: Vec<MockAmdCall>,
     free_issues: Vec<MockFreeIssue>,
+    queue_event_mailbox: Option<QueueEventMailbox>,
 }
 
 /// Host-only AMD backend with page-aligned, stable allocations and explicit
@@ -129,6 +132,11 @@ impl MockAmdIface {
 
     pub(crate) fn script_teardown(&self, outcome: Result<QueueTeardown>) {
         self.state.lock().teardown_script.push_back(outcome);
+    }
+
+    /// Give the mock KFD's queue-completion mailbox, as a real event page does.
+    pub(crate) fn set_queue_event_mailbox(&self, mailbox: QueueEventMailbox) {
+        self.state.lock().queue_event_mailbox = Some(mailbox);
     }
 
     pub(crate) fn script_wait(&self, outcome: Result<Option<Error>>) {
@@ -339,6 +347,10 @@ impl AmdIface for MockAmdIface {
             std::thread::sleep(std::time::Duration::from_millis(timeout_ms.into()));
         }
         Ok(None)
+    }
+
+    fn queue_event_mailbox(&self) -> Option<QueueEventMailbox> {
+        self.state.lock().queue_event_mailbox
     }
 
     fn publication_checkpoint(&self, stage: PublicationStage) -> Result<()> {

@@ -14,7 +14,7 @@ use crate::amd::connector::OwnerCtx;
 use crate::amd::program::AmdProgram;
 use crate::amd::queue::{
     AQL_PACKET_BYTES, Pm4LoweringState, build_pm4_indirect_buffer, lower_hcq_aql_submission_program,
-    lower_hcq_pm4_command_buffer, validate_aql_packet_count,
+    lower_hcq_pm4_command_buffer, push_queue_event_mailbox, validate_aql_packet_count,
 };
 use crate::device::{Graph, GraphKernel};
 use crate::error::{Error, Result};
@@ -292,6 +292,8 @@ impl AmdGraph {
         submission.push(Command::Store { dst: 0, value: 0, scope: StoreScope::System });
         submission.bind(store, CommandField::StoreDst, PatchSource::System(SystemField::TimelineSignal(0)))?;
         submission.bind(store, CommandField::StoreValue, PatchSource::System(SystemField::TimelineValue(1)))?;
+        push_queue_event_mailbox(&mut submission, device.core());
+        let queue_event_mailbox = device.core().queue_event_mailbox().map(|mailbox| mailbox.address);
 
         let profile_linked = {
             let mut profiled = submission.clone();
@@ -321,9 +323,7 @@ impl AmdGraph {
                 tmpring_size: lane.tmpring_size(),
                 target_major: device.core().arch.gfx_major(),
                 completion_xcc_mask: (!pm4 && device.core().node.num_xcc > 1).then_some(1),
-                // Captured timeline stores are placeholders patched per replay, so
-                // they never carry the KFD interrupt companion.
-                queue_event_mailbox: None,
+                queue_event_mailbox,
             };
             Some(lower_graph_submission(allocator, &lane, &profiled, &links, state, pm4)?)
         };
@@ -333,9 +333,7 @@ impl AmdGraph {
             tmpring_size: lane.tmpring_size(),
             target_major: device.core().arch.gfx_major(),
             completion_xcc_mask: (!pm4 && device.core().node.num_xcc > 1).then_some(1),
-            // Captured timeline stores are placeholders patched per replay, so
-            // they never carry the KFD interrupt companion.
-            queue_event_mailbox: None,
+            queue_event_mailbox,
         };
         let (linked, control) = lower_graph_submission(allocator, &lane, &submission, &links, state, pm4)?;
         let command = linked.replay_buffer();
