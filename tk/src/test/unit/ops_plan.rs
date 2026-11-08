@@ -1599,7 +1599,7 @@ fn nearest_plans(x: &[usize], c: &[usize], dtype: DType, k: usize, want: Result<
 #[test_case(crate::test::unit::targets::amd(AmdArch::Gfx1151, 40), 1, 2; "gfx1151")]
 fn a_list_costs_its_registers_and_merges(target: Target, per_16_rows: u32, sharing: u32) {
     use crate::kernels::nearest::{LaneQueue, Metric, NearestCfg};
-    use crate::ops::config::{REGISTER_K, Rejected};
+    use crate::ops::config::{REGISTER_K, Rejected, TargetRejected};
     let planner = planner(target.clone());
     let cfg = NearestCfg::new(64, 32, 2);
     let p = |k| self_join(1 << 16, 1 << 16, 64, Metric::SquaredL2, k);
@@ -1619,7 +1619,10 @@ fn a_list_costs_its_registers_and_merges(target: Target, per_16_rows: u32, shari
     let costs: Vec<f64> = [1, 2, 4, 8, 16].map(|k| p(k).admit(&planner, &cfg).unwrap().0).to_vec();
     assert!(costs.is_sorted_by(|a, b| a < b), "{costs:?}");
     let past = REGISTER_K + 1;
-    assert_eq!(p(past).admit(&planner, &cfg), Err(Rejected::TopK { k: past, most: REGISTER_K }));
+    assert_eq!(
+        p(past).admit(&planner, &cfg),
+        Err(Rejected::Target(TargetRejected::TopK { k: past, most: REGISTER_K }))
+    );
 }
 
 /// A list past 32 is ranked two ways besides the registers (up to
@@ -1633,7 +1636,7 @@ fn a_list_costs_its_registers_and_merges(target: Target, per_16_rows: u32, shari
 #[test_case(crate::test::unit::targets::amd(AmdArch::Gfx1151, 40); "gfx1151")]
 fn a_long_list_is_queued_or_listed_from_a_matrix(target: Target) {
     use crate::kernels::nearest::{Floors, Metric, NearestCfg, SelectCfg};
-    use crate::ops::config::{NearestProblem, REGISTER_K, Rejected};
+    use crate::ops::config::{NearestProblem, REGISTER_K, Rejected, TargetRejected};
     let planner = planner(target.clone());
     let p = |k| NearestProblem {
         dtype: svod_dtype::ScalarDType::Float16,
@@ -1659,8 +1662,15 @@ fn a_long_list_is_queued_or_listed_from_a_matrix(target: Target) {
         assert!(costs.is_sorted_by(|a, b| a < b), "{cfg:?}: {costs:?}");
     }
     let past = REGISTER_K + 1;
-    assert_eq!(p(past).admit(&planner, &base), Err(Rejected::TopK { k: past, most: REGISTER_K }));
-    assert_eq!(p(16).admit(&planner, &queued), Err(Rejected::Lowers), "a queue as long as the list");
+    assert_eq!(
+        p(past).admit(&planner, &base),
+        Err(Rejected::Target(TargetRejected::TopK { k: past, most: REGISTER_K }))
+    );
+    assert_eq!(
+        p(16).admit(&planner, &queued),
+        Err(Rejected::Target(TargetRejected::Lowers)),
+        "a queue as long as the list"
+    );
     let ways = |k| {
         let lattice = p(k).lattice(&target);
         let has = |f: fn(&NearestCfg) -> bool| lattice.iter().any(f);
@@ -1708,7 +1718,7 @@ fn deep_rows_stream(target: Target, held: usize) {
 #[test_case(gfx1201(); "gfx1201")]
 fn a_streamed_tile_pays_its_rows_again(target: Target) {
     use crate::kernels::nearest::{Floors, Metric, NearestCfg};
-    use crate::ops::config::{NearestProblem, Rejected};
+    use crate::ops::config::{NearestProblem, Rejected, TargetRejected};
     let planner = planner(target);
     let (resident, streamed) = (NearestCfg::new(64, 64, 2), NearestCfg::streamed(64, 64, 32, 2));
     let p = |d| NearestProblem {
@@ -1723,7 +1733,10 @@ fn a_streamed_tile_pays_its_rows_again(target: Target) {
     };
     let (r, s) = (p(64).admit(&planner, &resident).unwrap().0, p(64).admit(&planner, &streamed).unwrap().0);
     assert!(r < s, "resident {r} against streamed {s}");
-    assert!(matches!(p(1024).admit(&planner, &resident), Err(Rejected::Registers { .. } | Rejected::Smem { .. })));
+    assert!(matches!(
+        p(1024).admit(&planner, &resident),
+        Err(Rejected::Target(TargetRejected::Registers { .. } | TargetRejected::Smem { .. }))
+    ));
     assert!(p(1024).admit(&planner, &streamed).is_ok());
 }
 

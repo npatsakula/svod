@@ -1145,7 +1145,7 @@ fn timed_candidates_clear_their_physical_floor() {
                     geom: g,
                 };
                 let c: crate::kernels::conv::ConvCfg = Tiled::of_code(code)?;
-                p.claim(planner, &c.gemm).ok().map(|claim| planner.floor(&claim))
+                planner.claim_of(&p, &c.gemm).ok().map(|claim| planner.floor(&claim))
             }
             _ => None,
         }

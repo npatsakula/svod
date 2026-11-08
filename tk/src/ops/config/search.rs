@@ -32,9 +32,33 @@ pub fn has_kernels(target: &Target) -> bool {
     }
 }
 
-/// Why a ranking leaves a config out.
+/// Why a ranking leaves a config out: what the target and the problem's
+/// static part decide, settled once per
+/// [`Family::Static`](super::cost::Family::Static)
+/// ([`Planner::feasible`](super::cost::Planner::feasible)), or what its
+/// shape does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Rejected {
+    Target(TargetRejected),
+    Shape(ShapeRejected),
+}
+
+impl From<TargetRejected> for Rejected {
+    fn from(why: TargetRejected) -> Self {
+        Self::Target(why)
+    }
+}
+
+impl From<ShapeRejected> for Rejected {
+    fn from(why: ShapeRejected) -> Self {
+        Self::Shape(why)
+    }
+}
+
+/// Why a config runs no problem of its statics on the target, whatever the
+/// shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetRejected {
     /// It does not lower on the target: no matrix core, a warp grid that
     /// does not tile the core's atoms, a fill that does not split into whole
     /// 16-byte chunks per thread ([`fills_in_chunks`]), a ring depth the
@@ -42,12 +66,6 @@ pub enum Rejected {
     /// refuses ([`NearestCfg::lists`], [`FaCfg::shares_keys`]), or lane
     /// queues past the search's bounds.
     Lowers,
-    /// Its step is shallower than two matrix-core depths where the
-    /// reduction allows one.
-    Shallow,
-    /// Its step does not divide the reduction (a nearest chunk: is deeper
-    /// than the whole reduction, a product over zeros).
-    Divides,
     /// Its shared memory passes the block's.
     Smem { need: usize, have: usize },
     /// Its tiles have no register layout.
@@ -56,6 +74,20 @@ pub enum Rejected {
     Registers { need: u32, have: u32 },
     /// It keeps more least scores a row than a register list holds.
     TopK { k: usize, most: usize },
+}
+
+/// Why a feasible config is left out of one problem's ranking: its shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShapeRejected {
+    /// Its step is shallower than two matrix-core depths where the
+    /// reduction allows one.
+    Shallow,
+    /// Its step does not divide the reduction (a nearest chunk: is deeper
+    /// than the whole reduction, a product over zeros; a convolution's: a
+    /// tap).
+    Divides,
+    /// Its tiles pad the output past what a convolution bears.
+    Padding,
 }
 
 /// A ranking: its configs with their costs ([`Planner::price`] ns of SM

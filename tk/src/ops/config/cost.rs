@@ -16,7 +16,7 @@ use crate::kernels::nearest::NearestCfg;
 use super::attention::AttentionProblem;
 use super::gemm::GemmProblem;
 use super::nearest::NearestProblem;
-use super::search::{Rejected, Tiled};
+use super::search::{Rejected, TargetRejected, Tiled};
 
 /// Model: the elements of one 16×16×16 matrix-core step, [`Costs::step`]'s
 /// unit.
@@ -346,14 +346,40 @@ pub(crate) trait Family {
     /// The configs the family ranks.
     type Cfg: Tiled;
 
+    /// The problem's static part: what decides, with the target, which of
+    /// the lattice's configs are feasible whatever the shape, and the key
+    /// the planner keeps them under ([`Planner::feasible`]).
+    type Static: std::hash::Hash + Eq + Clone;
+
+    fn statics(&self) -> Self::Static;
+
     /// Every config the family spans on `target`: its lattice, the search
     /// bounds' shape.
     fn lattice(&self, target: &Target) -> Vec<Self::Cfg>;
 
-    /// One config's [resources](Claim) on the planner's device: the checks
-    /// first — why it is left out — then what it uses.
-    fn claim(&self, planner: &Planner, cfg: &Self::Cfg) -> Result<Claim, Rejected>;
+    /// Whether `cfg` runs problems of `statics` on `target`: why it does
+    /// not, or the registers a lane holds by the layout count.
+    fn feasible(cfg: &Self::Cfg, target: &Target, statics: &Self::Static) -> Result<u32, TargetRejected>;
+
+    /// The planner's feasible configs of this family, by their statics.
+    fn kept(planner: &Planner) -> &Kept<Self::Static, Self::Cfg>;
+
+    /// A feasible config's [resources](Claim) on this problem's shape: why
+    /// it is left out, or what it uses; `regs` is what [`Self::feasible`]
+    /// counted for it.
+    fn claim(&self, planner: &Planner, cfg: &Self::Cfg, regs: u32) -> Result<Claim, Rejected>;
 }
+
+/// A config feasible on the planner's target for a family's statics, with
+/// the registers a lane holds by the layout count.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Feasible<C> {
+    pub cfg: C,
+    pub regs: u32,
+}
+
+/// A family's feasible configs by their statics.
+pub(crate) type Kept<S, C> = papaya::HashMap<S, Arc<[Feasible<C>]>>;
 
 /// What the op layer plans with on one device: its target, what its
 /// primitives cost, and the problems ranked for it so far. An op plans its
@@ -381,6 +407,10 @@ pub struct Planner {
     pub(super) attention: papaya::HashMap<AttentionProblem, Arc<[FaCfg]>>,
     pub(super) nearest: papaya::HashMap<NearestProblem, Arc<[NearestCfg]>>,
     pub(super) conv: papaya::HashMap<super::conv::ConvProblem, Arc<[ConvCfg]>>,
+    /// Each family's feasible configs by its statics ([`Self::feasible`]).
+    pub(super) gemm_feasible: Kept<<GemmProblem as Family>::Static, GemmCfg>,
+    pub(super) attention_feasible: Kept<<AttentionProblem as Family>::Static, FaCfg>,
+    pub(super) nearest_feasible: Kept<<NearestProblem as Family>::Static, NearestCfg>,
 }
 
 /// The ranking kept under `key`, made by `rank` the first time it is asked for.
@@ -406,7 +436,37 @@ impl Planner {
             attention: papaya::HashMap::new(),
             nearest: papaya::HashMap::new(),
             conv: papaya::HashMap::new(),
+            gemm_feasible: papaya::HashMap::new(),
+            attention_feasible: papaya::HashMap::new(),
+            nearest_feasible: papaya::HashMap::new(),
         })
+    }
+
+    /// The lattice's configs feasible for `problem`'s statics on the target,
+    /// in lattice order, kept once per statics: the checks no shape moves
+    /// run once, and a ranking prices what is left.
+    pub(crate) fn feasible<P: Family>(&self, problem: &P) -> Arc<[Feasible<P::Cfg>]> {
+        let (target, statics) = (&self.device.target, problem.statics());
+        cached(P::kept(self), statics.clone(), || {
+            let feasible = |cfg: P::Cfg| P::feasible(&cfg, target, &statics).ok().map(|regs| Feasible { cfg, regs });
+            problem.lattice(target).into_iter().filter_map(feasible).collect()
+        })
+    }
+
+    /// A config's [claim](Claim) for `problem` through the one admission path:
+    /// feasible for the problem's statics ([`Family::feasible`]), then claimed on
+    /// its shape.
+    pub(crate) fn claim_of<P: Family>(&self, problem: &P, cfg: &P::Cfg) -> Result<Claim, Rejected> {
+        let regs = P::feasible(cfg, &self.device.target, &problem.statics())?;
+        problem.claim(self, cfg, regs)
+    }
+
+    /// What a feasible config costs the planner's device and the registers
+    /// its claim counts: [`Self::admit`] past the feasibility
+    /// [`Self::feasible`] settled; `None` where its shape leaves it out.
+    pub(crate) fn price_of<P: Family>(&self, problem: &P, feasible: &Feasible<P::Cfg>) -> Option<(f64, u32)> {
+        let claim = problem.claim(self, &feasible.cfg, feasible.regs).ok()?;
+        Some((self.price(&claim), claim.regs))
     }
 
     /// A planner over what the device's probes measured, as [`Self::new`].
@@ -539,7 +599,8 @@ impl Planner {
     /// lane's registers by the layout count: the one admission path, a
     /// [`Family`]'s claim priced; `None` with why the config is left out.
     pub(crate) fn admit<P: Family>(&self, problem: &P, cfg: &P::Cfg) -> Result<(f64, u32), Rejected> {
-        let claim = problem.claim(self, cfg)?;
+        let regs = P::feasible(cfg, &self.device.target, &problem.statics())?;
+        let claim = problem.claim(self, cfg, regs)?;
         Ok((self.price(&claim), claim.regs))
     }
 
@@ -547,7 +608,8 @@ impl Planner {
     /// ([`Planner::floor_of`] of its claim): a measured time under it is a
     /// measurement that lied, never a fast kernel.
     pub(crate) fn floor_of<P: Family>(&self, problem: &P, cfg: &P::Cfg) -> Option<f64> {
-        Some(self.floor(&problem.claim(self, cfg).ok()?))
+        let regs = P::feasible(cfg, &self.device.target, &problem.statics()).ok()?;
+        Some(self.floor(&problem.claim(self, cfg, regs).ok()?))
     }
 
     /// The least wall ns a claim's kernel can take: the bytes it must move

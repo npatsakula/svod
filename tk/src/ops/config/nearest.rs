@@ -15,9 +15,9 @@ use crate::kernels::nearest::{Floors, LANES, LaneQueue, Metric, NearestCfg, Sele
 use crate::layouts::{TileLayout, WarpGrid, chunked, fills_in_chunks};
 
 use super::attention::{FA_STAGES, QUERY_BLOCKS};
-use super::cost::{Claim, Family, Kind, Ops, PAIR_OPS, Planner, STEP, Spread, Steps, Stream, cached};
+use super::cost::{Claim, Family, Feasible, Kept, Kind, Ops, PAIR_OPS, Planner, STEP, Spread, Steps, Stream, cached};
 use super::gemm::DEPTHS;
-use super::search::{Rejected, Tiled, fired, sorted};
+use super::search::{Rejected, ShapeRejected, TargetRejected, Tiled, fired, sorted};
 
 impl NearestCfg {
     /// The depth a trip's product spans: the whole `d` resident, else a chunk.
@@ -349,34 +349,59 @@ impl NearestProblem {
     /// resources, the split shares the config asks counted whole. A wave's
     /// independent accumulators are its atom rows times the trip's atom
     /// columns.
-    pub(crate) fn claim(&self, planner: &Planner, cfg: &NearestCfg) -> Result<Claim, Rejected> {
-        let target = &planner.device.target;
-        let (bq, bkv, d, k) = (cfg.bq, cfg.bkv, self.d, self.k);
+    /// Whether `cfg` keeps `k` scores a row at depth `d` of `dtype` on `target`,
+    /// whatever the rows and candidates: a list a register list holds
+    /// ([`NearestCfg::lists`]), a config that lowers ([`NearestCfg::fits`]),
+    /// fits the shared memory and the lane's register budget, lane queues
+    /// within the search's bounds (as wide as the lanes a row spreads over, a
+    /// trip in few deals, a register queue at least twice the lanes'); the
+    /// registers it holds by the layout count.
+    pub(crate) fn feasible(
+        cfg: &NearestCfg,
+        target: &Target,
+        &(d, dtype, k): &(usize, ScalarDType, usize),
+    ) -> Result<u32, TargetRejected> {
         if cfg.queue.is_none() && cfg.select.is_none() && k > REGISTER_K {
-            return Err(Rejected::TopK { k, most: REGISTER_K });
+            return Err(TargetRejected::TopK { k, most: REGISTER_K });
         }
-        let dtype = self.dtype;
-        if cfg.lists(k).is_err() || !cfg.fits(target, d, dtype) {
-            return Err(Rejected::Lowers);
-        }
-        let atom = target.geometry_of(dtype).ok_or(Rejected::Lowers)?;
-        let elem = dtype.bytes();
-        if cfg.bk.is_some_and(|bk| bk < 2 * atom.k as usize && d.is_multiple_of(2 * atom.k as usize)) {
-            return Err(Rejected::Shallow);
-        }
-        if cfg.bk.is_some_and(|bk| bk > d) {
-            return Err(Rejected::Divides);
+        if cfg.lists(k).is_err() || !cfg.fits(target, d, dtype) || target.geometry_of(dtype).is_none() {
+            return Err(TargetRejected::Lowers);
         }
         let smem = cfg.smem_bytes(d, dtype);
         if smem > target.smem_bytes {
-            return Err(Rejected::Smem { need: smem, have: target.smem_bytes });
+            return Err(TargetRejected::Smem { need: smem, have: target.smem_bytes });
         }
-        let regs = cfg.registers(target, d, k, dtype).ok_or(Rejected::Layout)?;
+        let regs = cfg.registers(target, d, k, dtype).ok_or(TargetRejected::Layout)?;
+        let held = cfg.held(target, d, k, dtype).ok_or(TargetRejected::Layout)?;
+        if held > target.lane_budget(cfg.warps()) {
+            return Err(TargetRejected::Registers { need: held, have: target.lane_budget(cfg.warps()) });
+        }
+        if k > 1 && cfg.select.is_none() {
+            let lanes = cfg.lane_queue();
+            let sharing = cfg.sharing(target, d, dtype).ok_or(TargetRejected::Layout)?;
+            let queued = lanes.width * lanes.depth;
+            if lanes.width < sharing || cfg.bkv / lanes.width > MOST_DEALS || cfg.queue.is_some_and(|q| 2 * queued > q)
+            {
+                return Err(TargetRejected::Lowers);
+            }
+        }
+        Ok(regs)
+    }
+
+    pub(crate) fn claim(&self, planner: &Planner, cfg: &NearestCfg, regs: u32) -> Result<Claim, Rejected> {
+        let target = &planner.device.target;
+        let (bq, bkv, d, k) = (cfg.bq, cfg.bkv, self.d, self.k);
+        let dtype = self.dtype;
+        let atom = target.geometry_of(dtype).ok_or(Rejected::Target(TargetRejected::Lowers))?;
+        let elem = dtype.bytes();
+        if cfg.bk.is_some_and(|bk| bk < 2 * atom.k as usize && d.is_multiple_of(2 * atom.k as usize)) {
+            return Err(ShapeRejected::Shallow.into());
+        }
+        if cfg.bk.is_some_and(|bk| bk > d) {
+            return Err(ShapeRejected::Divides.into());
+        }
+        let smem = cfg.smem_bytes(d, dtype);
         let waves = cfg.warps() as usize;
-        let held = cfg.held(target, d, k, dtype).ok_or(Rejected::Layout)?;
-        if held > target.lane_budget(waves as u32) {
-            return Err(Rejected::Registers { need: held, have: target.lane_budget(waves as u32) });
-        }
         let atoms = (cfg.warp_rows / atom.m as usize) * (bkv / atom.n as usize);
         let Floors { row, col } = self.floors;
         let clamp = self.metric == Metric::L2 && !(row || col);
@@ -434,15 +459,6 @@ impl NearestProblem {
         .add(Kind::Pair, pairs * (companions as f64 + if self.groups { GROUPS_PAIR } else { 0.0 }));
         if k > 1 && cfg.select.is_none() {
             let lanes = cfg.lane_queue();
-            let sharing = cfg.sharing(target, d, dtype).ok_or(Rejected::Layout)?;
-            let queued = lanes.width * lanes.depth;
-            let deals = bkv / lanes.width;
-            // Search bounds over the lanes the kernel runs: queues as wide
-            // as the lanes a row spreads over, a trip in few deals, a
-            // register queue at least twice the lanes'.
-            if lanes.width < sharing || deals > MOST_DEALS || cfg.queue.is_some_and(|q| 2 * queued > q) {
-                return Err(Rejected::Lowers);
-            }
             ops = ops.plus(share.listing(cfg, lanes, target.wave).scaled(waves as f64 / (tiles * chunks) as f64));
         }
         // A streamed tile's ring starts empty at every tile: a memory
@@ -725,16 +741,19 @@ impl NearestProblem {
     /// `k > 1` is priced at its [split](Planner::nearest_split) where that
     /// is cheaper, as the tuner times it.
     pub(crate) fn ranked(&self, planner: &Planner) -> Vec<NearestCfg> {
-        let lattice = self.lattice(&planner.device.target);
-        let count = lattice.len();
-        let split = |c: &NearestCfg, whole: f64| {
-            let splits = planner.nearest_split(self, c).filter(|_| self.k > 1);
-            let split = splits.and_then(|splits| self.admit(planner, &NearestCfg { splits, ..*c }).ok());
+        let feasible = planner.feasible(self);
+        let count = feasible.len();
+        // A split shares a tile's feasibility: its claim prices it.
+        let split = |f: &Feasible<NearestCfg>, whole: f64| {
+            let splits = planner.nearest_split(self, &f.cfg).filter(|_| self.k > 1);
+            let split = splits.and_then(|splits| {
+                planner.price_of(self, &Feasible { cfg: NearestCfg { splits, ..f.cfg }, regs: f.regs })
+            });
             split.map_or(whole, |(ns, _)| ns.min(whole))
         };
-        let mut admitted: Vec<(f64, u32, NearestCfg)> = lattice
-            .into_iter()
-            .filter_map(|c| self.admit(planner, &c).ok().map(|(cost, regs)| (split(&c, cost), regs, c)))
+        let mut admitted: Vec<(f64, u32, NearestCfg)> = feasible
+            .iter()
+            .filter_map(|f| planner.price_of(self, f).map(|(cost, regs)| (split(f, cost), regs, f.cfg)))
             .collect();
         // A score matrix's listing costs alike whatever its product's tile:
         // the cheapest few products a listing.
@@ -813,13 +832,27 @@ impl NearestProblem {
 
 impl Family for NearestProblem {
     type Cfg = NearestCfg;
+    /// The depth, the element type and the scores a row keeps.
+    type Static = (usize, ScalarDType, usize);
+
+    fn statics(&self) -> Self::Static {
+        (self.d, self.dtype, self.k)
+    }
 
     fn lattice(&self, target: &Target) -> Vec<NearestCfg> {
         NearestProblem::lattice(self, target)
     }
 
-    fn claim(&self, planner: &Planner, cfg: &NearestCfg) -> Result<Claim, Rejected> {
-        NearestProblem::claim(self, planner, cfg)
+    fn feasible(cfg: &NearestCfg, target: &Target, statics: &Self::Static) -> Result<u32, TargetRejected> {
+        NearestProblem::feasible(cfg, target, statics)
+    }
+
+    fn kept(planner: &Planner) -> &Kept<Self::Static, NearestCfg> {
+        &planner.nearest_feasible
+    }
+
+    fn claim(&self, planner: &Planner, cfg: &NearestCfg, regs: u32) -> Result<Claim, Rejected> {
+        NearestProblem::claim(self, planner, cfg, regs)
     }
 }
 

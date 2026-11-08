@@ -136,7 +136,7 @@ any target: `lower::render(prog, &lowering)` or `lower::standalone(prog, &loweri
 | `NAME emits N instructions, past the M a kernel may` | `lower::Error::TooLarge` (`Target::most_instructions`: 2^18 AMD, 2^19 CUDA): refused before any compiler sees it; the tuner rejects the config as failed |
 | `program assembly: …` / `rendering <name>: …` | `svod_ir::Error` from `UOp::linear_program` / the LLVM renderer; rerun with `SVOD_SPEC_DEBUG=1 TK_DUMP_LIST=1` |
 | `element I of NAME is accessed, which holds N` / `scalar A Div B is undefined` (also `Rem`) | `interp::Error::{OutOfBounds, Division}`; also `UnboundVar`, `ParamSize` |
-| `Rejected::{Lowers, Shallow, Divides, Smem, Layout, Registers}` | why `admit` left a lattice config out (`tk_dump` counts them, `plan.txt` lists each) |
+| `Rejected::Target(TargetRejected::{Lowers, Smem, Layout, Registers, TopK})` (settled once per family statics) and `Rejected::Shape(ShapeRejected::{Shallow, Divides, Padding})` | why `admit` left a lattice config out (`tk_dump` counts them, `plan.txt` lists each) |
 | op silently runs graph kernels (`E_…`, `r_…` in a profile) | `Plan::Graph(Fallback::…)`: the `graph` line of the planner log says which |
 | RDNA4 reads past a view's bounds | transposing loads read a zero run there (`emit::a_transposed_element_past_the_bounds_reads_zero`) |
 

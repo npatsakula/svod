@@ -323,7 +323,7 @@ fn a_side_stream_prices_alongside_the_epilogue() {
     let planner = Planner::new(Device { target, costs: crate::test::unit::sm86_costs() }).expect("an SM count");
     let p = GemmProblem { batches: 1, m: 4096, n: 4096, k: 1024, halves: 1, rope: None };
     let cfg = planner.gemm_ranked(1, 4096, 4096, 1024, false)[0];
-    let mut claim = p.claim(&planner, &cfg).expect("ranked");
+    let mut claim = planner.claim_of(&p, &cfg).expect("ranked");
     let (plain, floor) = (planner.price(&claim), planner.floor(&claim));
     assert_eq!((claim.side.bytes, claim.side.unique), (0.0, 0.0));
     claim.side = Stream { bytes: 0.0, unique: 0.0, shared: 1.0 };

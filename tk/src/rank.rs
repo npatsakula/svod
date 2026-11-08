@@ -257,7 +257,7 @@ impl Configs {
             Self::Gemm { problem, list } => of(problem, &list[at]),
             Self::Attention { problem, list } => problem.admit(planner, &list[at]).ok().map(|(ns, _)| ns),
             Self::Nearest { problem, list } => problem.admit(planner, &list[at]).ok().map(|(ns, _)| ns),
-            Self::Conv { problem, list } => problem.claim(planner, &list[at].gemm).ok().map(|c| planner.price(&c)),
+            Self::Conv { problem, list } => planner.claim_of(problem, &list[at].gemm).ok().map(|c| planner.price(&c)),
         }
     }
 }
@@ -1039,7 +1039,7 @@ fn conv(lines: &mut Lines, planner: &Planner, dtype: ScalarDType, shape: &[usize
         lines,
         &group,
         count,
-        |h: usize, c: &ConvCfg| problems[h].claim(planner, &c.gemm).is_ok(),
+        |h: usize, c: &ConvCfg| planner.claim_of(&problems[h], &c.gemm).is_ok(),
         |h, list| Configs::Conv { problem: problems[h], list },
     ));
     out
@@ -1282,7 +1282,7 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
     // instruction mix counts (the lane operations over a wave).
     let p = GemmProblem { batches: 1, m: 4096, n: 4096, k: 4096, halves: 1, rope: None };
     for cfg in config::distinct(&planner.gemm_ranked(1, 4096, 4096, 4096, false)).take(3) {
-        let claim = p.claim(&planner, &cfg).expect("ranked");
+        let claim = planner.claim_of(&p, &cfg).expect("ranked");
         let valu = claim.ops.epilogue * (4096 / cfg.tile[2]) as f64 / target.wave as f64;
         let spec = GemmSpec {
             m: 130,
@@ -1309,7 +1309,7 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
         FaCfg { core: Core::Wide, warp_rows: m, ..FaCfg::new(4 * m, m, 2) }
     });
     for cfg in config::distinct(&planner.attention_ranked(8, 100, 100, 64, true, false)).take(2).chain(wide) {
-        let claim = p.claim(&planner, &cfg).expect("ranked");
+        let claim = planner.claim_of(&p, &cfg).expect("ranked");
         let valu = claim.ops.fold(config::pair_op(&device), 1.0, &config::Weights::same());
         let spec = AttnSpec {
             batch: Batch::Static(2),
@@ -1362,7 +1362,7 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
         ("streamed", ranked.iter().find(|c| c.bk.is_some()).copied()),
     ] {
         let Some(cfg) = way else { continue };
-        let claim = problem(1).claim(&planner, &cfg).expect("ranked");
+        let claim = planner.claim_of(&problem(1), &cfg).expect("ranked");
         let valu = claim.ops.fold(config::pair_op(&device), 1.0, &config::Weights::same());
         out.push((
             format!("nearest k1 {name} {}x{}", cfg.bq, cfg.bkv),
@@ -1375,7 +1375,7 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
     }
     let ranked = planner.nearest_ranked(problem(64));
     if let Some(&cfg) = ranked.iter().find(|c| c.queue.is_none() && c.select.is_none()) {
-        let claim = problem(64).claim(&planner, &cfg).expect("ranked");
+        let claim = planner.claim_of(&problem(64), &cfg).expect("ranked");
         let valu = claim.ops.fold(config::pair_op(&device), 1.0, &config::Weights::same());
         // The listing's static decomposition beside the expected-ops row:
         // the program's listing adder (its count less the same tile's at
@@ -1415,7 +1415,7 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
     let ranked = planner.nearest_ranked(split_problem);
     let split = planner.nearest_splits(&split_problem, &config::distinct(&ranked).take(16).collect::<Vec<_>>());
     if let Some(&cfg) = split.iter().find(|c| c.splits > 1 && c.splits <= 32) {
-        let claim = split_problem.claim(&planner, &cfg).expect("ranked");
+        let claim = planner.claim_of(&split_problem, &cfg).expect("ranked");
         let valu = claim.ops.fold(config::pair_op(&device), 1.0, &config::Weights::same());
         let mut split_spec = spec(cfg, 8);
         split_spec.m = cfg.splits * cfg.bkv * 2;

@@ -11,8 +11,8 @@ use crate::ir::{Axis, Schedule, Shape};
 use crate::kernels::gemm::{GROUP_ROWS, GemmCfg, Rope};
 use crate::layouts::{Issue, Swizzle, WarpGrid, chunked, fills_in_chunks};
 
-use super::cost::{Claim, ELEM, Family, Kind, Ops, Planner, STEP, Spread, Steps, Stream, cached};
-use super::search::{Rejected, sorted, spread};
+use super::cost::{Claim, ELEM, Family, Feasible, Kept, Kind, Ops, Planner, STEP, Spread, Steps, Stream, cached};
+use super::search::{Rejected, ShapeRejected, TargetRejected, sorted, spread};
 
 impl GemmCfg {
     /// The operand layouts of the tile's product on `target`, over the
@@ -157,6 +157,10 @@ pub fn gemm_lattice(target: &Target) -> Vec<GemmCfg> {
             for bk in DEPTHS {
                 for &(core, grids, stages) in cores {
                     for &warps in grids {
+                        // A grid that does not tile the core's atoms lowers no tile.
+                        if target.issue(core, WarpGrid { rows: warps[0], cols: warps[1] }, bm, bn, bk).is_none() {
+                            continue;
+                        }
                         for &stages in stages {
                             // One slot has no slot arithmetic to fold: rolled only.
                             let unrolls: &[bool] = if stages == 1 { &[false] } else { &[false, true] };
@@ -232,46 +236,57 @@ impl GemmProblem {
         planner.admit(self, cfg)
     }
 
-    /// The config's [claim](super::cost::Claim): its checks run first — a
-    /// step at least two matrix-core depths where the reduction allows one,
-    /// a step that divides it, a config that lowers and fits the target's
-    /// shared memory, registers the lane may hold — then its resources. A
+    /// Whether `cfg` runs `halves` halves on `target`, a `rope` turning the
+    /// output, whatever the shape: a tile holding whole heads (a turn moves
+    /// each element's partner half a head along, which the flip the kernel
+    /// issues reaches only within a lane's own head), one that lowers
+    /// ([`GemmCfg::fits`]), fits the target's shared memory and holds no
+    /// more registers than a lane may; the registers it holds by the layout
+    /// count.
+    pub(crate) fn feasible(
+        cfg: &GemmCfg,
+        target: &Target,
+        &(halves, rope): &(usize, Option<Rope>),
+    ) -> Result<u32, TargetRejected> {
+        if rope.is_some_and(|rope| !cfg.turns(rope.head_dim))
+            || target.geometry_on(cfg.core).is_none()
+            || !cfg.fits(target)
+        {
+            return Err(TargetRejected::Lowers);
+        }
+        let smem = cfg.smem_bytes(halves == 2, ELEM);
+        if smem > target.smem_bytes {
+            return Err(TargetRejected::Smem { need: smem, have: target.smem_bytes });
+        }
+        let regs = cfg.registers(target, halves).ok_or(TargetRejected::Layout)?;
+        let (acc, live) = cfg.live_registers(target, halves).ok_or(TargetRejected::Layout)?;
+        let budget = target.lane_budget(cfg.warps[0] * cfg.warps[1]);
+        if !target.occupancy.holds(acc, live) || acc + live > budget {
+            return Err(TargetRejected::Registers { need: acc + live, have: budget });
+        }
+        Ok(regs)
+    }
+
+    /// A feasible config's [claim](super::cost::Claim) on this shape: its
+    /// checks first — a step at least two matrix-core depths where the
+    /// reduction allows one, a step that divides it — then its resources. A
     /// warpgroup product reads no fragments and holds one accumulator chain
     /// per instruction column block; its step is the group's.
-    pub(crate) fn claim(&self, planner: &Planner, cfg: &GemmCfg) -> Result<Claim, Rejected> {
+    pub(crate) fn claim(&self, planner: &Planner, cfg: &GemmCfg, regs: u32) -> Result<Claim, Rejected> {
         let target = &planner.device.target;
         let ([bm, bn, bk], [wr, wc]) = (cfg.tile, cfg.warps.map(|w| w as usize));
-        let gated = self.halves == 2;
-        // A turn moves each element's partner half a head along: a tile whose
-        // block or warps do not hold whole heads has partners another lane or
-        // warp holds, which the flip the kernel issues cannot reach.
-        if self.rope.is_some_and(|rope| !cfg.turns(rope.head_dim)) {
-            return Err(Rejected::Lowers);
-        }
-        let atom = target.geometry_on(cfg.core).ok_or(Rejected::Lowers)?;
+        let atom = target.geometry_on(cfg.core).ok_or(Rejected::Target(TargetRejected::Lowers))?;
         // A step is at least two matrix-core depths, unless the reduction dim
         // allows nothing deeper.
         let depth = 2 * atom.k as usize;
-        let smem = cfg.smem_bytes(gated, ELEM);
         if bk < depth && self.k.is_multiple_of(depth) {
-            return Err(Rejected::Shallow);
+            return Err(ShapeRejected::Shallow.into());
         }
         if !self.k.is_multiple_of(bk) {
-            return Err(Rejected::Divides);
+            return Err(ShapeRejected::Divides.into());
         }
-        if !cfg.fits(target) {
-            return Err(Rejected::Lowers);
-        }
-        if smem > target.smem_bytes {
-            return Err(Rejected::Smem { need: smem, have: target.smem_bytes });
-        }
-        let regs = cfg.registers(target, self.halves).ok_or(Rejected::Layout)?;
+        let smem = cfg.smem_bytes(self.halves == 2, ELEM);
         let (halves, waves) = (self.halves, wr * wc);
-        let (acc, live) = cfg.live_registers(target, self.halves).ok_or(Rejected::Layout)?;
-        let budget = target.lane_budget(waves as u32);
-        if !target.occupancy.holds(acc, live) || acc + live > budget {
-            return Err(Rejected::Registers { need: acc + live, have: budget });
-        }
         // A warpgroup product reads no fragments and holds one accumulator
         // chain per instruction column block; its step is the group's.
         let (atoms, fragments) = match cfg.core {
@@ -280,8 +295,8 @@ impl GemmProblem {
                 waves * (bm / wr + bn * halves / wc) * bk * ELEM,
             ),
             Core::Group => {
-                let group = target.group_mma.first().ok_or(Rejected::Lowers)?;
-                let n = group.n_for((bn / wc) as u32).ok_or(Rejected::Lowers)? as usize;
+                let group = target.group_mma.first().ok_or(Rejected::Target(TargetRejected::Lowers))?;
+                let n = group.n_for((bn / wc) as u32).ok_or(Rejected::Target(TargetRejected::Lowers))? as usize;
                 (bn * halves / wc / n, 0)
             }
         };
@@ -346,26 +361,36 @@ impl GemmProblem {
     /// the cost band holds: the shortlist keeps a tile's first clean one
     /// ([`shortlist`](super::search::shortlist)).
     pub(crate) fn ranked(&self, planner: &Planner) -> Vec<GemmCfg> {
-        let lattice = self.lattice(&planner.device.target);
-        let count = lattice.len();
-        let admitted: Vec<(f64, u32, GemmCfg)> = lattice
-            .into_iter()
-            .filter_map(|c| self.admit(planner, &c).ok().map(|(cost, regs)| (cost, regs, c)))
-            .collect();
-        let ranked = sorted(self, admitted, count);
+        let feasible = planner.feasible(self);
+        let priced = |f: &Feasible<GemmCfg>| planner.price_of(self, f).map(|(cost, regs)| (cost, regs, f.cfg));
+        let admitted: Vec<(f64, u32, GemmCfg)> = feasible.iter().filter_map(priced).collect();
+        let ranked = sorted(self, admitted, feasible.len());
         spread(ranked.into_iter().map(|(cost, _, c)| (cost, c)).collect(), |c| [c.tile[0], c.tile[1]])
     }
 }
 
 impl Family for GemmProblem {
     type Cfg = GemmCfg;
+    type Static = (usize, Option<Rope>);
+
+    fn statics(&self) -> Self::Static {
+        (self.halves, self.rope)
+    }
 
     fn lattice(&self, target: &Target) -> Vec<GemmCfg> {
         gemm_lattice(target)
     }
 
-    fn claim(&self, planner: &Planner, cfg: &GemmCfg) -> Result<Claim, Rejected> {
-        GemmProblem::claim(self, planner, cfg)
+    fn feasible(cfg: &GemmCfg, target: &Target, statics: &Self::Static) -> Result<u32, TargetRejected> {
+        GemmProblem::feasible(cfg, target, statics)
+    }
+
+    fn kept(planner: &Planner) -> &Kept<Self::Static, GemmCfg> {
+        &planner.gemm_feasible
+    }
+
+    fn claim(&self, planner: &Planner, cfg: &GemmCfg, regs: u32) -> Result<Claim, Rejected> {
+        GemmProblem::claim(self, planner, cfg, regs)
     }
 }
 

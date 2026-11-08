@@ -12,9 +12,9 @@ use crate::kernels::conv::{ConvCfg, ConvGeom};
 use crate::kernels::gemm::GemmCfg;
 
 use super::cost::ELEM;
-use super::cost::{Claim, Family, Planner, cached};
+use super::cost::{Claim, Family, Feasible, Kept, Planner, cached};
 use super::gemm::{GemmProblem, gemm_lattice};
-use super::search::{Rejected, sorted, spread};
+use super::search::{Rejected, ShapeRejected, TargetRejected, sorted, spread};
 
 /// Search bound: half the blocks per SM a single-batch convolution's grid
 /// must reach before its reduction is left whole ([`Planner::conv_splits`]).
@@ -41,8 +41,21 @@ impl ConvProblem {
     /// it, so the stream's distinct bytes are the image's and the weight's —
     /// the working set the cache ladder prices the gathers' re-reads at —
     /// while a trip still fills the expanded tile's.
-    pub(crate) fn claim(&self, planner: &Planner, cfg: &GemmCfg) -> Result<Claim, Rejected> {
-        let mut claim = self.gemm.claim(planner, cfg)?;
+    pub(crate) fn claim(&self, planner: &Planner, cfg: &GemmCfg, regs: u32) -> Result<Claim, Rejected> {
+        let depth = match (planner.device.target.fill, planner.device.target.geometry()) {
+            (Fill::CpAsync, Some(atom)) => 2 * atom.k as usize,
+            _ => 0,
+        };
+        if !self.geom.cin.is_multiple_of(cfg.tile[2]) {
+            return Err(ShapeRejected::Divides.into());
+        }
+        if cfg.tile[2] < depth {
+            return Err(ShapeRejected::Shallow.into());
+        }
+        if self.gemm.padding(cfg) > CONV_PADDING {
+            return Err(ShapeRejected::Padding.into());
+        }
+        let mut claim = self.gemm.claim(planner, cfg, regs)?;
         let ConvGeom { h, w, cin, cout, .. } = self.geom;
         claim.fill.unique = (self.gemm.batches * (h * w * cin + cout * self.geom.k()) * ELEM) as f64;
         Ok(claim)
@@ -54,21 +67,10 @@ impl ConvProblem {
     /// `m × n` by at most 1/8. On the cp.async path a step is at least two
     /// matrix-core depths, else the conv takes the graph.
     fn ranked(&self, planner: &Planner) -> Vec<ConvCfg> {
-        let depth = match (planner.device.target.fill, planner.device.target.geometry()) {
-            (Fill::CpAsync, Some(atom)) => 2 * atom.k as usize,
-            _ => 0,
-        };
-        let eligible = |c: &GemmCfg| {
-            self.geom.cin.is_multiple_of(c.tile[2]) && c.tile[2] >= depth && self.gemm.padding(c) <= CONV_PADDING
-        };
-        let lattice = gemm_lattice(&planner.device.target);
-        let count = lattice.len();
-        let admitted: Vec<(f64, u32, GemmCfg)> = lattice
-            .into_iter()
-            .filter(|c| eligible(c))
-            .filter_map(|c| self.claim(planner, &c).ok().map(|claim| (planner.price(&claim), claim.regs, c)))
-            .collect();
-        spread(sorted(self, admitted, count).into_iter().map(|(cost, _, c)| (cost, c)).collect(), |c| {
+        let feasible = planner.feasible(self);
+        let priced = |f: &Feasible<GemmCfg>| planner.price_of(self, f).map(|(cost, regs)| (cost, regs, f.cfg));
+        let admitted: Vec<(f64, u32, GemmCfg)> = feasible.iter().filter_map(priced).collect();
+        spread(sorted(self, admitted, feasible.len()).into_iter().map(|(cost, _, c)| (cost, c)).collect(), |c| {
             [c.tile[0], c.tile[1]]
         })
         .into_iter()
@@ -77,28 +79,32 @@ impl ConvProblem {
     }
 }
 
+/// The GEMM family over the gemm lattice, its feasible configs the GEMM's
+/// own; the convolution's claim adds its shape's checks (a step within one
+/// tap, tiles that pad `m × n` by at most an eighth and, on the cp.async
+/// path, at least two matrix-core depths) and its fill.
 impl Family for ConvProblem {
     type Cfg = GemmCfg;
+    type Static = <GemmProblem as Family>::Static;
 
-    /// The gemm lattice's configs a convolution body can run: a step that
-    /// stays within one tap and tiles that pad `m × n` by at most an
-    /// eighth; on the cp.async path a step at least two matrix-core depths,
-    /// else the conv takes the graph.
-    fn lattice(&self, target: &Target) -> Vec<GemmCfg> {
-        let depth = match (target.fill, target.geometry()) {
-            (Fill::CpAsync, Some(atom)) => 2 * atom.k as usize,
-            _ => 0,
-        };
-        gemm_lattice(target)
-            .into_iter()
-            .filter(|c| {
-                self.geom.cin.is_multiple_of(c.tile[2]) && c.tile[2] >= depth && self.gemm.padding(c) <= CONV_PADDING
-            })
-            .collect()
+    fn statics(&self) -> Self::Static {
+        self.gemm.statics()
     }
 
-    fn claim(&self, planner: &Planner, cfg: &GemmCfg) -> Result<Claim, Rejected> {
-        ConvProblem::claim(self, planner, cfg)
+    fn lattice(&self, target: &Target) -> Vec<GemmCfg> {
+        gemm_lattice(target)
+    }
+
+    fn feasible(cfg: &GemmCfg, target: &Target, statics: &Self::Static) -> Result<u32, TargetRejected> {
+        GemmProblem::feasible(cfg, target, statics)
+    }
+
+    fn kept(planner: &Planner) -> &Kept<Self::Static, GemmCfg> {
+        &planner.gemm_feasible
+    }
+
+    fn claim(&self, planner: &Planner, cfg: &GemmCfg, regs: u32) -> Result<Claim, Rejected> {
+        ConvProblem::claim(self, planner, cfg, regs)
     }
 }
 

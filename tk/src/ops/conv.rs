@@ -187,7 +187,7 @@ pub fn tuned(store: &TuneStore, planner: &Planner, dtype: DType, ranked: &[ConvC
     let build = |c: ConvCfg| programs(&ConvSpec { cfg: c.gemm, split: c.split, ..spec.clone() }, &dtype, planner);
     let problem = ConvProblem { gemm: GemmProblem { batches, m, n: g.cout, k: g.k(), halves: 1, rope: None }, geom: g };
     let cfg = Tuner::new(store, &planner.device, dtype.clone(), &key, (&spec.batch, spec.epilogue), build)
-        .floored(|c| problem.claim(planner, &c.gemm).ok().map(|claim| planner.floor(&claim)))
+        .floored(|c| planner.claim_of(&problem, &c.gemm).ok().map(|claim| planner.floor(&claim)))
         .tuned(OP, ranked, expand);
     ConvSpec { cfg: cfg.gemm, split: cfg.split, ..spec }
 }
