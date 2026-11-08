@@ -38,7 +38,7 @@ fn an_8_bit_product_accumulates_exactly_in_i32() {
         let view = k.view(a, 0, [depth, 1], Shape::new(rows, depth), [None, None]);
         let x = k.load(view);
         let zero = k.zeros::<I32>(Shape::new(rows, rows));
-        let acc = k.mma(zero, x, false, x, true);
+        let acc = *k.mma(zero, x, false, x, true);
         let out = k.view(c, 0, [rows, 1], Shape::new(rows, rows), [None, None]);
         k.store(out, acc);
     });
@@ -61,10 +61,10 @@ fn loop_carries_registers_and_bounds_gate_the_tail() {
         let [acc] = k.loop_(cols, [acc0], |k, i, [acc]| {
             let col = k.at(view, 0, i);
             let v = k.load(col);
-            [k.binary(acc, v, BinaryOp::Add)]
+            [k.binary(*acc, v, BinaryOp::Add).into()]
         });
         let out = k.view(y, 0, [1, 1], Shape::new(rows, 1), [None, None]);
-        k.store(out, acc);
+        k.store(out, *acc);
     });
     let prog = prog;
     let x: Vec<f64> = (0..rows * cols).map(|i| i as f64).collect();
@@ -86,10 +86,10 @@ fn carried_registers_sharing_a_next_both_take_it() {
         let zero = k.zeros::<F32>(shape);
         let one = k.fill::<F32>(shape, Const::Float(1.0));
         let [a, b] = k.loop_(3, [zero, zero], |k, _, [a, _]| {
-            let next = k.binary(a, one, BinaryOp::Add);
-            [next, next]
+            let next = k.binary(*a, one, BinaryOp::Add);
+            [next.into(), next.into()]
         });
-        for (at, v) in [(0, a), (shape.elems(), b)] {
+        for (at, v) in [(0, *a), (shape.elems(), *b)] {
             let out = k.view(y, at, [32, 1], shape, [None, None]);
             k.store(out, v);
         }
@@ -110,6 +110,7 @@ fn online_softmax_normalizer_matches_the_direct_one() {
         let m0 = k.fill::<F32>(Shape::new(rows, 1), Const::Float(f64::NEG_INFINITY));
         let l0 = k.zeros::<F32>(Shape::new(rows, 1));
         let [_m, l_acc] = k.loop_(cols / blk, [m0, l0], |k, i, [m, l]| {
+            let (m, l) = (*m, *l);
             let off = i * blk;
             let block = k.at(view, 0, off);
             let s = k.load(block);
@@ -121,10 +122,10 @@ fn online_softmax_normalizer_matches_the_direct_one() {
             let p = k.unary(p, UnaryOp::Exp2);
             let psum = k.reduce(p, Axis::Row, ReduceOp::Sum);
             let l_scaled = k.binary(l, corr, BinaryOp::Mul);
-            [m_new, k.binary(l_scaled, psum, BinaryOp::Add)]
+            [m_new.into(), k.binary(l_scaled, psum, BinaryOp::Add).into()]
         });
         let out = k.view(l, 0, [1, 1], Shape::new(rows, 1), [None, None]);
-        k.store(out, l_acc);
+        k.store(out, *l_acc);
     });
     let prog = prog;
     let x: Vec<f64> = (0..rows * cols).map(|i| ((i * 7) % 11) as f64 * 0.25).collect();
@@ -409,7 +410,7 @@ fn a_lowered_deal_replays_the_devices_order() {
         let cv = k.view(c, 0, [depth, 1], Shape::new(cols, depth), [None, None]);
         let (xr, cr) = (k.load(xv), k.load(cv));
         let zero = k.zeros::<F32>(Shape::new(rows, cols));
-        let s = k.mma(zero, xr, false, cr, true);
+        let s = *k.mma(zero, xr, false, cr, true);
         for j in 0..n {
             let (v, col) = (k.deal(s, w, j), k.deal_col(s, w, j));
             let yv = k.view(y, j * w, [cols, 1], Shape::new(rows, w), [None, None]);

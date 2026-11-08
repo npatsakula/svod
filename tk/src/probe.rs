@@ -605,9 +605,9 @@ impl<'a> Probes<'a> {
                         }
                         None => x,
                     };
-                    [k.binary(sum, y, BinaryOp::Add)]
+                    [k.binary(*sum, y, BinaryOp::Add).into()]
                 });
-                output(k, self.blocks, sum);
+                output(k, self.blocks, *sum);
             })
         })
     }
@@ -761,9 +761,12 @@ impl<'a> Probes<'a> {
                 k.store(a_t, a);
                 k.store(b_t, b);
                 let zero = k.zeros::<F32>(Shape::new(bm, bn));
-                let [acc] =
-                    if on { k.loop_(iters, [zero], |k, _, [acc]| [k.mma(acc, a_t, false, b_t, true)]) } else { [zero] };
-                output(k, self.blocks, acc);
+                let [acc] = if on {
+                    k.loop_(iters, [zero], |k, _, [acc]| [k.mma(acc, a_t, false, b_t, true)])
+                } else {
+                    [zero.into()]
+                };
+                output(k, self.blocks, *acc);
             })
         });
         if self.target.group_mma.is_empty() {
@@ -833,9 +836,9 @@ impl<'a> Probes<'a> {
                 let [acc] = if on {
                     k.loop_(iters, [zero], |k, _, [acc]| [k.mma_oriented(acc, a, false, b, true, Some(Orient::Direct))])
                 } else {
-                    [zero]
+                    [zero.into()]
                 };
-                output(k, blocks, acc);
+                output(k, blocks, *acc);
             })
         })
     }
@@ -852,18 +855,18 @@ impl<'a> Probes<'a> {
                 let [x, l] = if on {
                     k.loop_(iters, [x, zero], |k, _, [x, l]| {
                         let scale = k.fill::<F32>(tile, Const::Float(0.5));
-                        let s = k.binary(x, scale, BinaryOp::Mul);
+                        let s = k.binary(*x, scale, BinaryOp::Mul);
                         let m = k.reduce(s, Axis::Row, ReduceOp::Max);
                         let d = k.binary(s, m, BinaryOp::Sub);
                         let e = k.unary(d, UnaryOp::Exp2);
                         let r = k.reduce(e, Axis::Row, ReduceOp::Sum);
-                        [e, k.binary(l, r, BinaryOp::Add)]
+                        [e.into(), k.binary(*l, r, BinaryOp::Add).into()]
                     })
                 } else {
-                    [x, zero]
+                    [x.into(), zero.into()]
                 };
-                output(k, self.blocks, x);
-                output(k, self.blocks, l);
+                output(k, self.blocks, *x);
+                output(k, self.blocks, *l);
             })
         })
     }
@@ -963,7 +966,8 @@ impl<'a> Probes<'a> {
                     k.pin(zero, chunks.clone());
                     // As many loads in flight as the ring holds slots: each
                     // iteration issues `stages` trips' loads before it sums any.
-                    let [sum] = k.loop_(TRIPS / stages, [zero], |k, i, [mut sum]| {
+                    let [sum] = k.loop_(TRIPS / stages, [zero], |k, i, [sum]| {
+                        let mut sum = *sum;
                         let trips: Vec<Sc<'_>> = (0..stages).map(|j| i.clone() * stages + j).collect();
                         let loaded: Vec<Regs<'_, I32>> = trips
                             .iter()
@@ -981,9 +985,9 @@ impl<'a> Probes<'a> {
                             sum = k.binary(sum, y, BinaryOp::Add);
                             sum = k.binary(sum, fragment, BinaryOp::Add);
                         }
-                        [sum]
+                        [sum.into()]
                     });
-                    sum
+                    *sum
                 };
                 output(k, blocks, sum);
             })
@@ -1039,16 +1043,19 @@ impl<'a> Probes<'a> {
             probe_kernel(op, self.sms as usize, warps, |k| {
                 let x = input::<BF16>(k, tile);
                 let [x] = k.loop_(iters, [x], |k, _, [x]| {
-                    k.pin(x, plain.clone());
-                    [helds.iter().fold(x, |x, held| {
-                        let y = k.unary(x, UnaryOp::Neg);
-                        let next = k.unary(y, UnaryOp::Neg);
-                        k.pin(y, if on { held.clone() } else { plain.clone() });
-                        k.pin(next, plain.clone());
-                        next
-                    })]
+                    k.pin(*x, plain.clone());
+                    [helds
+                        .iter()
+                        .fold(*x, |x, held| {
+                            let y = k.unary(x, UnaryOp::Neg);
+                            let next = k.unary(y, UnaryOp::Neg);
+                            k.pin(y, if on { held.clone() } else { plain.clone() });
+                            k.pin(next, plain.clone());
+                            next
+                        })
+                        .into()]
                 });
-                output(k, self.sms as usize, x);
+                output(k, self.sms as usize, *x);
             })
         })
     }
@@ -1116,9 +1123,9 @@ fn sum_loads<'k, T: Elem>(
     let [sum] = k.loop_(iters, [init], |k, i, [sum]| {
         let v = view(k, i);
         let y = k.load(v);
-        [k.binary(sum, y, BinaryOp::Add)]
+        [k.binary(*sum, y, BinaryOp::Add).into()]
     });
-    sum
+    *sum
 }
 
 /// `init` plus the tile `view` reads at each of `trips` trips of a pipeline
@@ -1144,10 +1151,10 @@ fn ring_sum<'k>(
         |k, _, slot, [sum]| {
             let s = k.slot(slots, &slot, tile);
             let y = k.load(s);
-            [k.binary(sum, y, BinaryOp::Add)]
+            [k.binary(*sum, y, BinaryOp::Add).into()]
         },
     );
-    sum
+    *sum
 }
 
 /// A `shape` tile loaded from a parameter of its own, so no value is known

@@ -164,7 +164,7 @@ fn a_store_before_a_loop_is_fenced_past_it() {
         let tile = k.smem_view::<F32>(s, 0, Shape::new(16, 16));
         let x = k.zeros::<F32>(Shape::new(16, 16));
         k.store(tile, x);
-        k.loop_::<F32, 0>(n, [], |_, _, c| c);
+        k.loop_vec::<F32>(n, vec![], |_, _, c| c);
         let y = k.load(tile);
         let out = k.output::<F32>("o", 256);
         let o = k.view(out, 0, [16, 1], Shape::new(16, 16), [None, None]);
@@ -235,7 +235,7 @@ fn a_pending_async_copy_survives_a_barrier(between: Between) {
             }
             Between::Loop => {
                 let n = k.var("n", 0, 4);
-                k.loop_::<F32, 0>(n, [], |_, _, c| c);
+                k.loop_vec::<F32>(n, vec![], |_, _, c| c);
             }
             Between::Barrier => {}
         }
@@ -290,13 +290,13 @@ fn around_a_pipeline(
                 let t = k.slot(ring, &slot, Shape::new(16, 16));
                 let y = k.load(t);
                 let y = k.cast::<BF16, F32>(y);
-                [k.binary(sum, y, BinaryOp::Add)]
+                [k.binary(*sum, y, BinaryOp::Add).into()]
             },
         );
         after(k, ring);
         let out = k.output::<F32>("o", 256);
         let o = k.view(out, 0, [16, 1], Shape::new(16, 16), [None, None]);
-        k.store(o, sum);
+        k.store(o, *sum);
     })
 }
 
@@ -385,12 +385,12 @@ fn a_consume_body_fences_its_own_tiles() {
                 let y = k.load(t);
                 let s = k.smem_view::<BF16>(scratch, 0, Shape::new(16, 16));
                 k.store(s, y);
-                [k.load(s)]
+                [k.load(s).into()]
             },
         );
         let out = k.output::<BF16>("o", 256);
         let o = out_view(k, out, 0);
-        k.store(o, last);
+        k.store(o, *last);
     });
     let mut prog = prog;
     insert_barriers(&mut prog).unwrap();

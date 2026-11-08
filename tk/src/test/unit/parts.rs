@@ -53,7 +53,7 @@ fn qk_from_registers_and_shared(bq: usize, bkv: usize, d: usize) {
         let k_t = k.smem_view::<BF16>(k_s, 0, Shape::new(bkv, d));
         k.stage(k_t, k_g, CopyMode::Sync);
         let zero = k.zeros::<F32>(Shape::new(bq, bkv));
-        let s = k.mma(zero, q_r, false, k_t, true);
+        let s = *k.mma(zero, q_r, false, k_t, true);
         let s_view = k.view(s_out, 0, [bkv, 1], Shape::new(bq, bkv), [None, None]);
         k.store(s_view, s);
     });
@@ -79,7 +79,7 @@ fn pv_with_a_transposed_gather(bq: usize, bkv: usize, d: usize) {
         let v_t = k.smem_view::<BF16>(v_s, 0, Shape::new(bkv, d));
         k.stage(v_t, v_g, CopyMode::Sync);
         let zero = k.zeros::<F32>(Shape::new(bq, d));
-        let o = k.mma(zero, p_r, false, v_t, false);
+        let o = *k.mma(zero, p_r, false, v_t, false);
         let o_view = k.view(o_out, 0, [d, 1], Shape::new(bq, d), [None, None]);
         k.store(o_view, o);
     });
@@ -105,7 +105,7 @@ fn row_reductions_and_broadcast() {
         let k_t = k.smem_view::<BF16>(k_s, 0, Shape::new(bkv, d));
         k.stage(k_t, k_g, CopyMode::Sync);
         let zero = k.zeros::<F32>(Shape::new(bq, bkv));
-        let s = k.mma(zero, q_r, false, k_t, true);
+        let s = *k.mma(zero, q_r, false, k_t, true);
         let mx = k.reduce(s, Axis::Row, ReduceOp::Max);
         let sum = k.reduce(s, Axis::Row, ReduceOp::Sum);
         let centred = k.binary(s, mx, BinaryOp::Sub);
@@ -142,7 +142,7 @@ fn mma_peak_probe() {
         let [acc] = k.loop_(iters, [acc0], |k, _, [acc]| [k.mma(acc, a_r, false, b_r, true)]);
         let block = k.block(0);
         let c_view = k.view(c, block * (bm * bn), [bn, 1], Shape::new(bm, bn), [None, None]);
-        k.store(c_view, acc);
+        k.store(c_view, *acc);
     });
     let prog = prog;
     let lowering = Lowering::new(&declared(target));

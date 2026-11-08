@@ -216,10 +216,10 @@ fn a_loop_extent_below_zero_runs_no_trip(steps: i64, steady: bool, floored: bool
         }
         let zero = k.zeros::<F32>(tile);
         let one = k.fill::<F32>(tile, Const::Float(1.0));
-        let [sum] = k.loop_(count, [zero], |k, _, [sum]| [k.binary(sum, one, BinaryOp::Add)]);
+        let [sum] = k.loop_(count, [zero], |k, _, [sum]| [k.binary(*sum, one, BinaryOp::Add).into()]);
         let at = k.block(0) * tile.elems();
         let out = k.view(y, at, [tile.cols, 1], tile, [None, None]);
-        k.store(out, sum);
+        k.store(out, *sum);
     });
     let device = Device { target: crate::atoms::sm86(), costs: Costs::default() };
     let linear = linear(prog, &Lowering::new(&device));

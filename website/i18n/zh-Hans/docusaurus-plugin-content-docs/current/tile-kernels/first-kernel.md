@@ -85,7 +85,7 @@ fn gemm_nt(m: usize, n: usize, kk: usize, [bm, bn, bk]: [usize; 3], stages: usiz
                 [k.mma(acc, a_t, false, b_t, true)]
             },
         );
-        let out = k.cast::<F32, BF16>(acc);
+        let out = k.cast::<F32, BF16>(*acc);
         let c_view = k.view(c, 0, [n, 1], Shape::new(bm, bn), [bound(m, bm), bound(n, bn)]);
         let c_view = k.at(c_view, row0, col0);
         k.store(c_view, out);
@@ -97,7 +97,7 @@ fn gemm_nt(m: usize, n: usize, kk: usize, [bm, bn, bk]: [usize; 3], stages: usiz
 
 **流水线。** `pipeline(extent, stages, init, produce, consume)` 在由 `stages` 个共享槽组成的环上（`Schedule::ring(stages, unroll)` 还可以按每个槽复制一次循环，或用两个工作组运行）声明一个生产者和一个消费者，并让 `init`（这里是累加器）贯穿消费者传递。作者只说明要把什么拷贝进槽、以及从槽中计算什么。[调度模板](./layouts-and-lowering#schedule-templates)决定拷贝提前多少步，并放置每一个等待和屏障。槽归持有它的阶段所有：`slot` 给生产者一个可写的瓦片，给消费者一个只读的瓦片。
 
-**乘积。** `mma(acc, a, a_t, b, b_t)` 在 f32 累加器（8 位整数时为 i32，`MmaIn::Acc`）上计算 `acc + A·B`，这里 `B` 以转置方式读取。它从不指名某条指令：降级会选择目标的矩阵核心原子，并为 `a`、`b` 和 `acc` 赋予该原子的布局。结果只在存储前的类型转换处舍入一次。
+**乘积。** `mma(acc, a, a_t, b, b_t)` 在 f32 累加器（8 位整数时为 i32，`MmaIn::Acc`）上计算 `acc + A·B`，这里 `B` 以转置方式读取。它从不指名某条指令：降级会选择目标的矩阵核心原子，并为 `a`、`b` 和 `acc` 赋予该原子的布局。累加器（`Acc`）是被拥有的值而非拷贝：乘积消耗它并返回下一个，循环体返回它携带的累加器，过期的累加器是编译错误；`*acc` 是它当前持有的寄存器 tile，供收尾阶段使用。结果只在存储前的类型转换处舍入一次。
 
 ## 在设备上运行 {#running-it-on-the-device}
 
@@ -136,4 +136,4 @@ c.realize()?;
 | 视图 | `view`、`gather`（按行映射的视图）、`at`、`narrow`、`smem_view`、`smem_slot`、`ring`、`slot`、`ring_scratch` |
 | Tile 操作 | `fill`、`zeros`、`splat`、`coord`、`unary`、`binary`（行向量或列向量会广播）、`scale`、`compare`（`CmpOp`）、`cast`、`cast_toward_zero`、`where_`、`mul_add`（只舍入一次）、`reduce`、`reduce_f32`、`transpose`、`shift`（沿某轴移动一步，首位填充）、`flip`（每个元素沿某轴与掩码各位相异的元素交换：排序网络的一步）、`mma`、`mma_oriented`、`pin` |
 | 数据移动 | `stage`（全局 → 共享，`CopyMode::Async` 或 `Sync`）、`load`、`load_as_fill`、`store` |
-| 控制 | `loop_`（携带寄存器 tile）、`pipeline`、`if_`、`select_if`（产生 tile 的分支）、`where_any`（一个 `where_`，只有持有已置位谓词元素的 warp 计算其选中一侧）、`each_warp`（一条 `Warps` 语句）、`barrier` |
+| 控制 | `loop_`（在循环体中携带被拥有的累加器；`loop_vec` 携带普通 tile）、`pipeline`、`if_`、`select_if`（产生 tile 的分支）、`where_any`（一个 `where_`，只有持有已置位谓词元素的 warp 计算其选中一侧）、`each_warp`（一条 `Warps` 语句）、`barrier` |

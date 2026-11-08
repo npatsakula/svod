@@ -90,14 +90,14 @@ fn attention_probabilities_feed_the_second_mma_without_data_movement() {
         let k_s = k.smem_view::<BF16>(kk, 0, Shape::new(bkv, d));
         let v_s = k.smem_view::<BF16>(vv, 0, Shape::new(bkv, d));
         let zero = k.zeros::<F32>(Shape::new(bq, bkv));
-        let s = k.mma(zero, q_r, false, k_s, true);
+        let s = *k.mma(zero, q_r, false, k_s, true);
         let m = k.reduce(s, Axis::Row, ReduceOp::Max);
         let p = k.binary(s, m, BinaryOp::Sub);
         let p = k.unary(p, UnaryOp::Exp2);
         let l = k.reduce(p, Axis::Row, ReduceOp::Sum);
         let p16 = k.cast::<F32, BF16>(p);
         let o0 = k.zeros::<F32>(Shape::new(bq, d));
-        let o = k.mma(o0, p16, false, v_s, false);
+        let o = *k.mma(o0, p16, false, v_s, false);
         let o = k.binary(o, l, BinaryOp::Div);
         let out = k.output::<F32>("o", bq * d);
         let o_g = k.view(out, 0, [d, 1], Shape::new(bq, d), [None, None]);
@@ -163,7 +163,7 @@ fn a_product_result_pinned_off_its_atom_is_refused() {
         let v = k.view(a, 0, [16, 1], shape, [None, None]);
         let x = k.load(v);
         let zero = k.zeros::<F32>(shape);
-        let acc = k.mma(zero, x, false, x, true);
+        let acc = *k.mma(zero, x, false, x, true);
         k.pin(acc, natural(shape, 1, 32).unwrap());
         let out = k.view(c, 0, [16, 1], shape, [None, None]);
         k.store(out, acc);
@@ -238,7 +238,7 @@ fn elementwise_operands_reach_the_op_in_its_layout() {
         let (xg, yg) = (view(k, x), view(k, y));
         let (xr, yr) = (k.load(xg), k.load(yg));
         let acc = k.zeros::<F32>(Shape::new(16, 16));
-        let prod = k.mma(acc, xr, false, yr, false);
+        let prod = *k.mma(acc, xr, false, yr, false);
         let sum = k.binary(xr, yr, BinaryOp::Add);
         let sum = k.cast::<BF16, F32>(sum);
         let both = k.binary(prod, sum, BinaryOp::Mul);
@@ -249,7 +249,7 @@ fn elementwise_operands_reach_the_op_in_its_layout() {
         let uw = k.binary(u, w, BinaryOp::Add);
         let acc = k.zeros::<F32>(Shape::new(16, 16));
         let first = k.mma(acc, u, false, yr, false);
-        let again = k.mma(first, xr, false, uw, false);
+        let again = *k.mma(first, xr, false, uw, false);
         let both = k.binary(both, again, BinaryOp::Add);
         let out = k.output::<F32>("o", 256);
         let o = k.view(out, 0, [16, 1], Shape::new(16, 16), [None, None]);
@@ -285,7 +285,7 @@ fn attention_step(bias: bool) -> Program {
         let k_s = k.smem_view::<BF16>(kk, 0, Shape::new(bkv, d));
         let v_s = k.smem_view::<BF16>(vv, 0, Shape::new(bkv, d));
         let zero = k.zeros::<F32>(Shape::new(bq, bkv));
-        let mut s = k.mma(zero, q_r, false, k_s, true);
+        let mut s = *k.mma(zero, q_r, false, k_s, true);
         if bias {
             let b_g = k.view(b, 0, [64, 1], Shape::new(bq, bkv), [None, None]);
             let b_r = k.load(b_g);
@@ -297,7 +297,7 @@ fn attention_step(bias: bool) -> Program {
         let p = k.unary(p, UnaryOp::Exp2);
         let p16 = k.cast::<F32, BF16>(p);
         let o0 = k.zeros::<F32>(Shape::new(bq, d));
-        let o = k.mma(o0, p16, false, v_s, false);
+        let o = *k.mma(o0, p16, false, v_s, false);
         let out = k.output::<F32>("o", bq * d);
         let o_g = k.view(out, 0, [d, 1], Shape::new(bq, d), [None, None]);
         k.store(o_g, o);

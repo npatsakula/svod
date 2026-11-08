@@ -1779,13 +1779,13 @@ fn merge_body<'k>(k: &mut Kernel<'k>, spec: &NearestMergeSpec) {
         let i = k.load(v);
         // Exact in f32 below `MAX_CANDIDATES`, as the kernel's index.
         let i = k.cast::<I32, F32>(i);
-        let lower = k.compare(s, best, CmpOp::Lt);
-        [k.where_(lower, s, best), k.where_(lower, i, at)]
+        let lower = k.compare(s, *best, CmpOp::Lt);
+        [k.where_(lower, s, *best).into(), k.where_(lower, i, *at).into()]
     });
-    let best = finished(k, best, metric);
+    let best = finished(k, *best, metric);
     let v = rows(k, score, &n, row0.clone(), Sc::from(0));
     k.store(v, best);
-    let at = k.cast::<F32, I32>(at);
+    let at = k.cast::<F32, I32>(*at);
     let v = rows(k, index, &n, row0, Sc::from(0));
     k.store(v, at);
 }
@@ -1912,9 +1912,9 @@ fn rescore_body<'k>(k: &mut Kernel<'k>, spec: &RescoreSpec) {
         let g = k.load(cv);
         let xv = k.at(x_rows, 0, at);
         let q = k.load(xv);
-        [k.mul_add(g, q, xc), k.mul_add(g, g, cc), k.mul_add(q, q, xx)]
+        [k.mul_add(g, q, *xc).into(), k.mul_add(g, g, *cc).into(), k.mul_add(q, q, *xx).into()]
     });
-    let [xc, cc, xx] = [xc, cc, xx].map(|t| k.reduce(t, Axis::Row, ReduceOp::Sum));
+    let [xc, cc, xx] = [xc, cc, xx].map(|t| k.reduce(*t, Axis::Row, ReduceOp::Sum));
     let column = Shape::new(RESCORE_PAIRS, 1);
     let two = k.fill::<F32>(column, Const::Float(2.0));
     let dot2 = k.binary(xc, two, BinaryOp::Mul);

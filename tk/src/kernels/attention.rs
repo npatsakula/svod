@@ -364,11 +364,12 @@ fn step<'k, T: Half, PK: Readable, PV: Readable>(
     k_t: Tile<'k, PK, T>,
     v_t: Tile<'k, PV, T>,
     block_start: Sc<'k>,
-    [m, l, o]: [Regs<'k, F32>; 3],
-) -> [Regs<'k, F32>; 3] {
+    [m, l, o]: [Acc<'k, F32>; 3],
+) -> [Acc<'k, F32>; 3] {
     let zero = k.zeros::<F32>(st.shape);
-    let s = k.mma(zero, st.q_r, false, k_t, true);
+    let s = *k.mma(zero, st.q_r, false, k_t, true);
     let scale = k.fill::<F32>(st.shape, Const::Float(st.scale_log2e));
+    let (m, l) = (*m, *l);
     let rows = k.shape(m);
     // With the maximum in raw units the raw scores are masked and reduced,
     // and the scale reaches only the two row values the exponent and the
@@ -422,10 +423,10 @@ fn step<'k, T: Half, PK: Readable, PV: Readable>(
         k.binary(l, block_sum, BinaryOp::Add)
     };
     let early = (!st.cfg.forms.sum_after).then(|| summed(k));
-    let o = if st.cfg.forms.skip_rescale { k.scale(o, corr) } else { k.binary(o, corr, BinaryOp::Mul) };
+    let o = if st.cfg.forms.skip_rescale { k.scale(*o, corr) } else { k.binary(*o, corr, BinaryOp::Mul) };
     let o = k.mma(o, p16, false, v_t, false);
     let l = early.unwrap_or_else(|| summed(k));
-    [m_new, l, o]
+    [m_new.into(), l.into(), o]
 }
 
 /// `o = softmax(q·kᵀ·scale + bias)·v`. Parameters in order: `q`, `k`, `v`
@@ -797,11 +798,11 @@ fn attention_body<'k, T: Half>(k: &mut Kernel<'k>, spec: &AttnSpec) {
         };
         let m = if st.raw_max() {
             let row_scale = k.fill::<F32>(Shape::new(bq, 1), Const::Float(scale_log2e));
-            k.binary(m, row_scale, BinaryOp::Mul)
+            k.binary(*m, row_scale, BinaryOp::Mul)
         } else {
-            m
+            *m
         };
-        [m, l, acc]
+        [m, *l, *acc]
     };
     let [m, l, acc] = match kw {
         1 => run(k, None),

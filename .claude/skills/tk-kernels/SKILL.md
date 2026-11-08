@@ -83,7 +83,8 @@ gathers (`Kernel::gather`): `kernels/conv.rs`. Builder call table: `first-kernel
 Rules the code enforces:
 - Split `XSpec` (shapes, options, `cfg`) / `Lowering::new(&device)` (or `GemmCfg`/`FaCfg::lowering`) / `pub fn x<T: Half>(&XSpec)
   -> Program`, dispatched on bf16/f16 by `ops::typed!` (`typed!(…, int8)` adds `I8`). `Kernel::mma` takes `T: MmaIn`
-  (bf16/f16 → f32, `I8` → i32 exact; `MmaIn::widened` to f32): `gemm` and `nearest` run over `I8`, the rest 16-bit
+  (bf16/f16 → f32, `I8` → i32 exact; `MmaIn::widened` to f32) and an owned `Acc` it consumes and returns; `loop_`/`pipeline`
+  carry `Acc`s (`*acc` reads one, `.into()` makes one from a `Regs`), the `_vec` forms plain `Regs`: `gemm` and `nearest` run over `I8`, the rest 16-bit
   only; f32 stays on the graph except `k_nearest_reranked` (8-bit or f16 search, f32 pass by `nearest_rescore`).
 - Effects are not declared by hand: async stages inside a `pipeline` belong to the template, `Sync` copies and shared
   stores are fenced by `sync::insert_barriers`; `k.barrier()` is the only hand-placed sync. A block barrier under a

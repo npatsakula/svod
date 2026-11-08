@@ -97,7 +97,7 @@ fn gemm_nt(m: usize, n: usize, kk: usize, [bm, bn, bk]: [usize; 3], stages: usiz
                 [k.mma(acc, a_t, false, b_t, true)]
             },
         );
-        let out = k.cast::<F32, BF16>(acc);
+        let out = k.cast::<F32, BF16>(*acc);
         let c_view = k.view(c, 0, [n, 1], Shape::new(bm, bn), [bound(m, bm), bound(n, bn)]);
         let c_view = k.at(c_view, row0, col0);
         k.store(c_view, out);
@@ -119,8 +119,10 @@ producer a writable tile and the consumer a read-only one.
 **The product.** `mma(acc, a, a_t, b, b_t)` is `acc + A·B` on f32 accumulators (i32 over 8-bit
 integers, `MmaIn::Acc`), here with `B`
 read transposed. It never names an instruction: the lowering picks the target's matrix-core
-atom and gives `a`, `b` and `acc` its layouts. The result is rounded once, at the cast before
-the store.
+atom and gives `a`, `b` and `acc` its layouts. An accumulator (`Acc`) is owned, not copied:
+the product consumes it and returns the next, a loop body returns its carried ones, and a
+stale one is a compile error; `*acc` is the register tile it holds, for the epilogue. The
+result is rounded once, at the cast before the store.
 
 ## Running it on the device
 
@@ -162,4 +164,4 @@ output and falls back to the graph when the kernel does not apply.
 | Views | `view`, `gather` (a row-mapped view), `periodic` (columns repeating a table), `at`, `narrow`, `smem_view`, `smem_slot`, `ring`, `slot`, `ring_scratch` |
 | Tile ops | `fill`, `zeros`, `splat`, `coord`, `unary`, `binary` (a row or column vector broadcasts), `scale`, `compare` (`CmpOp`), `cast`, `cast_toward_zero`, `where_`, `mul_add` (one rounding), `reduce`, `reduce_f32`, `transpose`, `shift` (one step along an axis, a fill first), `flip` (each element exchanged across a mask's bits along an axis: a sorting network's step, a rotary half's partner), `mma`, `mma_oriented`, `pin` |
 | Movement | `stage` (global → shared, `CopyMode::Async` or `Sync`), `load`, `load_as_fill`, `store` |
-| Control | `loop_` (carried register tiles), `pipeline`, `if_`, `select_if` (branches producing tiles), `where_any` (a `where_` whose taken side only the warps holding a set predicate element compute), `each_warp` (a `Warps` statement), `barrier` |
+| Control | `loop_` (owned accumulators carried through the body; `loop_vec` carries plain tiles), `pipeline`, `if_`, `select_if` (branches producing tiles), `where_any` (a `where_` whose taken side only the warps holding a set predicate element compute), `each_warp` (a `Warps` statement), `barrier` |

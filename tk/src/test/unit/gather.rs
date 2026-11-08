@@ -143,7 +143,7 @@ fn gathered_gemm(m: usize, n: usize, kk: usize, tile: [usize; 3], stages: usize,
         );
         let out = k.view(c, 0, [n, 1], Shape::new(bm, bn), [None, None]);
         let out = k.at(out, row0, col0);
-        k.store(out, acc);
+        k.store(out, *acc);
     })
 }
 

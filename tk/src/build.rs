@@ -4,6 +4,7 @@
 //! Scalars are ordinary expressions with operators, interned when consumed.
 
 use std::marker::PhantomData;
+use std::ops::Deref;
 use std::rc::Rc;
 
 use svod_dtype::ScalarDType;
@@ -37,7 +38,7 @@ pub trait MmaIn: Elem {
     type Acc: Elem;
 
     /// An accumulator's values in f32: as held, or converted from i32.
-    fn widened<'k>(k: &mut Kernel<'k>, acc: Regs<'k, Self::Acc>) -> Regs<'k, F32>;
+    fn widened<'k>(k: &mut Kernel<'k>, acc: Acc<'k, Self::Acc>) -> Regs<'k, F32>;
 }
 
 /// A 16-bit float operand, accumulated in f32.
@@ -48,8 +49,8 @@ macro_rules! half {
         impl MmaIn for $name {
             type Acc = F32;
 
-            fn widened<'k>(_: &mut Kernel<'k>, acc: Regs<'k, F32>) -> Regs<'k, F32> {
-                acc
+            fn widened<'k>(_: &mut Kernel<'k>, acc: Acc<'k, F32>) -> Regs<'k, F32> {
+                *acc
             }
         }
         impl Half for $name {}
@@ -60,8 +61,8 @@ half!(BF16, F16);
 impl MmaIn for I8 {
     type Acc = I32;
 
-    fn widened<'k>(k: &mut Kernel<'k>, acc: Regs<'k, I32>) -> Regs<'k, F32> {
-        k.cast::<I32, F32>(acc)
+    fn widened<'k>(k: &mut Kernel<'k>, acc: Acc<'k, I32>) -> Regs<'k, F32> {
+        k.cast::<I32, F32>(*acc)
     }
 }
 
@@ -164,6 +165,31 @@ pub type Regs<'k, T> = Tile<'k, Reg, T>;
 pub type Periodic<'k, T> = Tile<'k, Period, T>;
 /// A ring slot as a pipeline's consume of stage `'r` sees it.
 pub type Slotted<'k, 'r, T> = Tile<'k, Held<'r>, T>;
+
+/// A register tile a loop carries or a product accumulates into: owned, not
+/// copied, so what consumes it ([`Kernel::mma`], the next a loop body
+/// returns) retires it, and a stale one is a compile error where a register
+/// tile would be read or carried on by mistake. `*acc` is the tile it holds
+/// now, for the operands of other ops; any register tile becomes one with
+/// `into`. The `_vec` forms of the loops carry plain register tiles.
+pub struct Acc<'k, T>(pub Regs<'k, T>);
+
+impl<'k, T> From<Regs<'k, T>> for Acc<'k, T> {
+    fn from(v: Regs<'k, T>) -> Self {
+        Acc(v)
+    }
+}
+impl<'k, T> Deref for Acc<'k, T> {
+    type Target = Regs<'k, T>;
+    fn deref(&self) -> &Regs<'k, T> {
+        &self.0
+    }
+}
+impl<T> std::fmt::Debug for Acc<'_, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Acc({})", self.0.0.0)
+    }
+}
 
 /// A scalar expression: built with ordinary operators, interned into the
 /// program's arena by the builder call that consumes it.
@@ -796,15 +822,29 @@ impl<'k> Kernel<'k> {
 
     /// `acc + A·B` where `A` is `[m, k]` (or `[k, m]` when `a_t`) and `B` is
     /// `[k, n]` (or `[n, k]` when `b_t`); operands may live in registers or
-    /// shared memory, the accumulator in `T`'s type ([`MmaIn::Acc`]).
+    /// shared memory, the accumulator in `T`'s type ([`MmaIn::Acc`]). The
+    /// product consumes `acc` and is the accumulator from then on.
+    ///
+    /// ```compile_fail
+    /// use svod_tk::build::*;
+    /// use svod_tk::ir::{BinaryOp, Shape};
+    /// Kernel::record("mma", |k| {
+    ///     let p = k.input::<BF16>("p", 256);
+    ///     let x = k.view(p, 0, [16, 1], Shape::new(16, 16), [None, None]);
+    ///     let x = k.load(x);
+    ///     let acc: Acc<'_, F32> = k.zeros::<F32>(Shape::new(16, 16)).into();
+    ///     let next = k.mma(acc, x, false, x, true);
+    ///     k.binary(*acc, *next, BinaryOp::Add); // `acc` is consumed: `next` holds the sum
+    /// });
+    /// ```
     pub fn mma<T: MmaIn, PA: Readable, PB: Readable>(
         &mut self,
-        acc: Regs<'k, T::Acc>,
+        acc: impl Into<Acc<'k, T::Acc>>,
         a: Tile<'k, PA, T>,
         a_t: bool,
         b: Tile<'k, PB, T>,
         b_t: bool,
-    ) -> Regs<'k, T::Acc> {
+    ) -> Acc<'k, T::Acc> {
         self.mma_oriented(acc, a, a_t, b, b_t, None)
     }
 
@@ -812,19 +852,20 @@ impl<'k> Kernel<'k> {
     /// choice to the layout inference.
     pub fn mma_oriented<T: MmaIn, PA: Readable, PB: Readable>(
         &mut self,
-        acc: Regs<'k, T::Acc>,
+        acc: impl Into<Acc<'k, T::Acc>>,
         a: Tile<'k, PA, T>,
         a_t: bool,
         b: Tile<'k, PB, T>,
         b_t: bool,
         orient: Option<Orient>,
-    ) -> Regs<'k, T::Acc> {
-        let (sacc, sa, sb) = (self.shape(acc), self.shape(a), self.shape(b));
+    ) -> Acc<'k, T::Acc> {
+        let acc = acc.into();
+        let (sacc, sa, sb) = (self.shape(*acc), self.shape(a), self.shape(b));
         let (m, ka) = if a_t { (sa.cols, sa.rows) } else { (sa.rows, sa.cols) };
         let (kb, n) = if b_t { (sb.cols, sb.rows) } else { (sb.rows, sb.cols) };
         assert_eq!(ka, kb, "mma reduction dims");
         assert_eq!(sacc, Shape::new(m, n), "mma accumulator shape");
-        self.let_(sacc, TileOp::Mma { acc: acc.0, a: a.0, b: b.0, a_t, b_t, orient })
+        Acc(self.let_(sacc, TileOp::Mma { acc: acc.0.0, a: a.0, b: b.0, a_t, b_t, orient }))
     }
 
     pub fn reduce<T: Elem>(&mut self, src: Regs<'k, T>, axis: Axis, f: ReduceOp) -> Regs<'k, T> {
@@ -1042,19 +1083,37 @@ impl<'k> Kernel<'k> {
         self.blocks.pop().expect("the block just opened")
     }
 
-    /// `for iv in 0..extent`, threading `init` through `body` as register
-    /// tiles; returns the values after the last iteration.
-    pub fn loop_<T: Elem, const N: usize>(
+    /// `for iv in 0..extent`, threading `init` through `body` as owned
+    /// accumulators ([`Acc`]): the body returns each one's next, and the
+    /// values after the last iteration come back.
+    ///
+    /// ```compile_fail
+    /// use svod_tk::build::*;
+    /// use svod_tk::ir::Shape;
+    /// Kernel::record("stale", |k| {
+    ///     let p = k.input::<BF16>("p", 256);
+    ///     let x = k.view(p, 0, [16, 1], Shape::new(16, 16), [None, None]);
+    ///     let x = k.load(x);
+    ///     let zero = k.zeros::<F32>(Shape::new(16, 16));
+    ///     k.loop_(4, [zero], |k, _, [acc]| {
+    ///         let _sum = k.mma(acc, x, false, x, true);
+    ///         [acc] // the accumulator before the product, which `_sum` retired
+    ///     });
+    /// });
+    /// ```
+    pub fn loop_<T: Elem, I: Into<Acc<'k, T>>, const N: usize>(
         &mut self,
         extent: impl Into<Sc<'k>>,
-        init: [Regs<'k, T>; N],
-        body: impl FnOnce(&mut Self, Sc<'k>, [Regs<'k, T>; N]) -> [Regs<'k, T>; N],
-    ) -> [Regs<'k, T>; N] {
-        let out = self.loop_vec(extent, init.to_vec(), |k, iv, phi| body(k, iv, tiles(phi)).to_vec());
-        tiles(out)
+        init: [I; N],
+        body: impl FnOnce(&mut Self, Sc<'k>, [Acc<'k, T>; N]) -> [Acc<'k, T>; N],
+    ) -> [Acc<'k, T>; N] {
+        let init = init.map(|i| i.into().0).to_vec();
+        let out = self.loop_vec(extent, init, |k, iv, phi| body(k, iv, tiles(phi).map(Acc)).map(|a| a.0).to_vec());
+        tiles(out).map(Acc)
     }
 
-    /// [`Self::loop_`] over as many tiles as `init` holds.
+    /// [`Self::loop_`] over as many tiles as `init` holds, carried as plain
+    /// register tiles.
     pub fn loop_vec<T: Elem>(
         &mut self,
         extent: impl Into<Sc<'k>>,
@@ -1078,21 +1137,23 @@ impl<'k> Kernel<'k> {
     /// `produce(k, step, slot)` stages step `step` into the slot it fills
     /// ([`Kernel::slot`]); `consume(k, step, slot, carried)` computes from the
     /// slot it reads. A slot is its stage's alone.
-    pub fn pipeline<T: Elem, const N: usize>(
+    pub fn pipeline<T: Elem, I: Into<Acc<'k, T>>, const N: usize>(
         &mut self,
         extent: impl Into<Sc<'k>>,
         schedule: impl Into<Schedule>,
-        init: [Regs<'k, T>; N],
+        init: [I; N],
         produce: impl for<'r> FnOnce(&mut Self, Sc<'k>, Filling<'k, 'r>),
-        consume: impl for<'r> FnOnce(&mut Self, Sc<'k>, Reading<'k, 'r>, [Regs<'k, T>; N]) -> [Regs<'k, T>; N],
-    ) -> [Regs<'k, T>; N] {
+        consume: impl for<'r> FnOnce(&mut Self, Sc<'k>, Reading<'k, 'r>, [Acc<'k, T>; N]) -> [Acc<'k, T>; N],
+    ) -> [Acc<'k, T>; N] {
+        let init = init.map(|i| i.into().0).to_vec();
         let consume = |k: &mut Self, step, slot: Reading<'k, '_>, phi: Vec<Regs<'k, T>>| {
-            consume(k, step, slot, tiles(phi)).to_vec()
+            consume(k, step, slot, tiles(phi).map(Acc)).map(|a| a.0).to_vec()
         };
-        tiles(self.pipeline_vec(extent, schedule, init.to_vec(), produce, consume))
+        tiles(self.pipeline_vec(extent, schedule, init, produce, consume)).map(Acc)
     }
 
-    /// [`Self::pipeline`] over as many tiles as `init` holds.
+    /// [`Self::pipeline`] over as many tiles as `init` holds, carried as
+    /// plain register tiles.
     pub fn pipeline_vec<T: Elem>(
         &mut self,
         extent: impl Into<Sc<'k>>,

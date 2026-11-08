@@ -97,7 +97,7 @@ fn gemm_nt(m: usize, n: usize, kk: usize, [bm, bn, bk]: [usize; 3], stages: usiz
                 [k.mma(acc, a_t, false, b_t, true)]
             },
         );
-        let out = k.cast::<F32, BF16>(acc);
+        let out = k.cast::<F32, BF16>(*acc);
         let c_view = k.view(c, 0, [n, 1], Shape::new(bm, bn), [bound(m, bm), bound(n, bn)]);
         let c_view = k.at(c_view, row0, col0);
         k.store(c_view, out);
@@ -118,8 +118,10 @@ fn gemm_nt(m: usize, n: usize, kk: usize, [bm, bn, bk]: [usize; 3], stages: usiz
 **गुणनफल.** `mma(acc, a, a_t, b, b_t)` f32 accumulators (8-bit integers पर i32, `MmaIn::Acc`) पर `acc + A·B` है,
 यहाँ `B` transposed
 पढ़ा जाता है। यह कभी किसी instruction का नाम नहीं लेता: lowering target का matrix-core atom चुनती है
-और `a`, `b` और `acc` को उसके layouts देती है। नतीजा एक ही बार round होता है, store से पहले के cast
-पर।
+और `a`, `b` और `acc` को उसके layouts देती है। एक accumulator (`Acc`) owned है, copy नहीं: product उसे
+consume करके अगला लौटाता है, loop body अपने carried accumulators लौटाती है, और stale accumulator compile
+error है; `*acc` वह register tile है जो वह अभी रखता है, epilogue के लिए। नतीजा एक ही बार round होता है,
+store से पहले के cast पर।
 
 ## इसे device पर चलाना {#running-it-on-the-device}
 
@@ -161,4 +163,4 @@ c.realize()?;
 | Views | `view`, `gather` (row-mapped view), `at`, `narrow`, `smem_view`, `smem_slot`, `ring`, `slot`, `ring_scratch` |
 | Tile ops | `fill`, `zeros`, `splat`, `coord`, `unary`, `binary` (row या column vector broadcast होता है), `scale`, `compare` (`CmpOp`), `cast`, `cast_toward_zero`, `where_`, `mul_add` (एक ही rounding), `reduce`, `reduce_f32`, `transpose`, `shift` (axis के साथ एक step आगे, पहले स्थान पर fill), `flip` (हर element axis के साथ mask के bits पार अपने partner से बदलता है: sorting network का एक step), `mma`, `mma_oriented`, `pin` |
 | Movement | `stage` (global → shared, `CopyMode::Async` या `Sync`), `load`, `load_as_fill`, `store` |
-| Control | `loop_` (carried register tiles), `pipeline`, `if_`, `select_if` (tiles बनाने वाली branches), `where_any` (एक `where_` जिसका चुना हुआ पक्ष केवल वे warps गणना करते हैं जिनके पास predicate का कोई set element है), `each_warp` (एक `Warps` statement), `barrier` |
+| Control | `loop_` (body के through carried owned accumulators; `loop_vec` plain tiles carry करता है), `pipeline`, `if_`, `select_if` (tiles बनाने वाली branches), `where_any` (एक `where_` जिसका चुना हुआ पक्ष केवल वे warps गणना करते हैं जिनके पास predicate का कोई set element है), `each_warp` (एक `Warps` statement), `barrier` |

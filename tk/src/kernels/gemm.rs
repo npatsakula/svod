@@ -254,10 +254,10 @@ fn build<'k, T: MmaIn, U: Elem>(
     let sa = Shape::new(bm, bk);
     let accs = if epi.gated {
         let halves = [b_view(k, 0), b_view(k, 1)];
-        mainloop(k, sa, &a_tile, halves, trips / split, schedule, bk, first_step, cfg.slices()).to_vec()
+        Vec::from(mainloop(k, sa, &a_tile, halves, trips / split, schedule, bk, first_step, cfg.slices()))
     } else {
         let whole = [b_view(k, 0)];
-        mainloop(k, sa, &a_tile, whole, trips / split, schedule, bk, first_step, cfg.slices()).to_vec()
+        Vec::from(mainloop(k, sa, &a_tile, whole, trips / split, schedule, bk, first_step, cfg.slices()))
     };
     let accs = accs.into_iter().map(|acc| T::widened(k, acc)).collect();
     let tile = Tile2 { m, n, bm, bn, row0, col0 };
@@ -424,10 +424,10 @@ fn merge_body<'k, T: Elem, U: Elem>(k: &mut Kernel<'k>, spec: &SplitMergeSpec) {
         let part = k.view(partial, z * (m * n), [n, 1], Shape::new(bm, bn), [bound(m, bm), bound(n, bn)]);
         let part = k.at(part, row0.clone(), col0.clone());
         let part = k.load(part);
-        [k.binary(acc, part, BinaryOp::Add)]
+        [k.binary(*acc, part, BinaryOp::Add).into()]
     });
     let tile = Tile2 { m, n, bm, bn, row0, col0 };
-    finish::<T, U>(k, vec![sum], epi, bias, residual, None, c, &None, &tile);
+    finish::<T, U>(k, vec![*sum], epi, bias, residual, None, c, &None, &tile);
 }
 
 /// The `(row, col)` tile of this block, walking groups of [`GROUP_ROWS`] tile rows.
@@ -455,7 +455,7 @@ pub(super) fn mainloop<'k, T: MmaIn, const N: usize>(
     bk: usize,
     first_step: Option<Sc<'k>>,
     slices: usize,
-) -> [Regs<'k, T::Acc>; N] {
+) -> [Acc<'k, T::Acc>; N] {
     let sb = k.shape(bs[0]);
     let (sa_s, sb_s) = (Shape::new(sa.rows, bk / slices), Shape::new(sb.rows, bk / slices));
     let stages = schedule.stages();

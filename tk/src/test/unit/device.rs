@@ -576,7 +576,7 @@ fn a_product_deals_its_columns_on_device(per_lane: usize) {
         let cv = k.view(c, 0, [depth, 1], Shape::new(cols, depth), [None, None]);
         let (xr, cr) = (k.load(xv), k.load(cv));
         let zero = k.zeros::<F32>(Shape::new(rows, cols));
-        let s = k.mma(zero, xr, false, cr, true);
+        let s = *k.mma(zero, xr, false, cr, true);
         for j in 0..cols / w {
             let (v, col) = (k.deal(s, w, j), k.deal_col(s, w, j));
             let yv = k.view(y, j * w, [cols, 1], Shape::new(rows, w), [None, None]);
