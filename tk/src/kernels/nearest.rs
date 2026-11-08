@@ -388,7 +388,7 @@ pub fn nearest<T: MmaIn>(spec: &NearestSpec) -> Program {
     let blocks = launched(&rows_live, n, bq);
     k.grid([blocks.clone(), Sc::from(splits), Sc::from(1)]);
     k.warps(cfg.warps());
-    let c_s = cfg.bk.is_none().then(|| k.smem::<T>("c_s", stages * bkv * d));
+    let c_s = cfg.bk.is_none().then(|| k.ring::<T>("c_s", bkv * d, stages));
 
     // The query block, and split, the first candidate tile of its share and
     // how many it takes.
@@ -981,12 +981,12 @@ pub fn nearest<T: MmaIn>(spec: &NearestSpec) -> Program {
             init,
             |k, step, slot| {
                 let c_g = k.at(c_view, tile_start(step), 0);
-                let c_t = k.smem_slot::<T>(c_s, slot, Shape::new(bkv, d));
+                let c_t = k.slot(c_s, &slot, Shape::new(bkv, d));
                 k.stage(c_t, c_g, CopyMode::Async);
             },
             |k, step, slot, carried| {
                 let start = tile_start(step);
-                let c_t = k.smem_slot::<T>(c_s, slot, Shape::new(bkv, d));
+                let c_t = k.slot(c_s, &slot, Shape::new(bkv, d));
                 let zero = k.zeros::<T::Acc>(shape);
                 let dot = k.mma(zero, q_r, false, c_t, true);
                 let dot = T::widened(k, dot);

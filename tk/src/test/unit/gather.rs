@@ -115,8 +115,8 @@ fn gathered_gemm(m: usize, n: usize, kk: usize, tile: [usize; 3], stages: usize,
     let i = row0.clone() + k.row();
     let start = i.clone() * 7 % m * kk;
     let valid = Sc::from(0).lt(i % 3);
-    let a_s = k.smem::<BF16>("a_s", stages * bm * bk);
-    let b_s = k.smem::<BF16>("b_s", stages * bn * bk);
+    let a_s = k.ring::<BF16>("a_s", bm * bk, stages);
+    let b_s = k.ring::<BF16>("b_s", bn * bk, stages);
     let b_view = k.view(b, 0, [kk, 1], Shape::new(bn, bk), [None, None]);
     let b_view = k.at(b_view, col0.clone(), 0);
     let init = k.zeros::<F32>(Shape::new(bm, bn));
@@ -126,15 +126,15 @@ fn gathered_gemm(m: usize, n: usize, kk: usize, tile: [usize; 3], stages: usize,
         [init],
         |k, step, slot| {
             let a_g = k.gather(a, step.clone() * bk, start.clone(), Some(valid.clone()), Shape::new(bm, bk), None);
-            let a_t = k.smem_slot::<BF16>(a_s, slot.clone(), Shape::new(bm, bk));
+            let a_t = k.slot(a_s, &slot, Shape::new(bm, bk));
             k.stage(a_t, a_g, CopyMode::Async);
             let b_g = k.at(b_view, 0, step * bk);
-            let b_t = k.smem_slot::<BF16>(b_s, slot, Shape::new(bn, bk));
+            let b_t = k.slot(b_s, &slot, Shape::new(bn, bk));
             k.stage(b_t, b_g, CopyMode::Async);
         },
         |k, _step, slot, [acc]| {
-            let a_t = k.smem_slot::<BF16>(a_s, slot.clone(), Shape::new(bm, bk));
-            let b_t = k.smem_slot::<BF16>(b_s, slot, Shape::new(bn, bk));
+            let a_t = k.slot(a_s, &slot, Shape::new(bm, bk));
+            let b_t = k.slot(b_s, &slot, Shape::new(bn, bk));
             [k.mma(acc, a_t, false, b_t, true)]
         },
     );

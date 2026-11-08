@@ -450,8 +450,8 @@ pub(super) fn mainloop<T: MmaIn, const N: usize>(
     let sb = k.shape(bs[0]);
     let (sa_s, sb_s) = (Shape::new(sa.rows, bk / slices), Shape::new(sb.rows, bk / slices));
     let stages = schedule.stages();
-    let a_s = k.smem::<T>("a_s", stages * sa.elems());
-    let b_s = [(); N].map(|()| k.smem::<T>("b_s", stages * sb.elems()));
+    let a_s = k.ring::<T>("a_s", sa.elems(), stages);
+    let b_s = [(); N].map(|()| k.ring::<T>("b_s", sb.elems(), stages));
     let init = [(); N].map(|()| k.zeros::<T::Acc>(Shape::new(sa.rows, sb.rows)));
     k.pipeline(
         trips,
@@ -464,22 +464,22 @@ pub(super) fn mainloop<T: MmaIn, const N: usize>(
                 let kcol = koff.clone() + s * sa_s.cols;
                 let a_g = a(k, step.clone(), kcol.clone());
                 let a_g = k.narrow(a_g, sa_s);
-                let a_t = k.smem_view::<T>(a_s, slot.clone() * sa.elems() + s * sa_s.elems(), sa_s);
+                let a_t = k.slot_part(a_s, &slot, s, sa_s);
                 k.stage(a_t, a_g, CopyMode::Async);
                 for (src, alloc) in bs.into_iter().zip(b_s) {
                     let g = k.at(src, 0, kcol.clone());
                     let g = k.narrow(g, sb_s);
-                    let t = k.smem_view::<T>(alloc, slot.clone() * sb.elems() + s * sb_s.elems(), sb_s);
+                    let t = k.slot_part(alloc, &slot, s, sb_s);
                     k.stage(t, g, CopyMode::Async);
                 }
             }
         },
         |k, _step, slot, mut accs| {
             for s in 0..slices {
-                let a_t = k.smem_view::<T>(a_s, slot.clone() * sa.elems() + s * sa_s.elems(), sa_s);
+                let a_t = k.slot_part(a_s, &slot, s, sa_s);
                 let mut i = 0;
                 accs = accs.map(|acc| {
-                    let b_t = k.smem_view::<T>(b_s[i], slot.clone() * sb.elems() + s * sb_s.elems(), sb_s);
+                    let b_t = k.slot_part(b_s[i], &slot, s, sb_s);
                     i += 1;
                     k.mma(acc, a_t, false, b_t, true)
                 });

@@ -74,8 +74,8 @@ fn gemm_nt(m: usize, n: usize, kk: usize, [bm, bn, bk]: [usize; 3], stages: usiz
     let b_view = k.view(b, 0, [kk, 1], Shape::new(bn, bk), [bound(n, bn), None]);
     let b_view = k.at(b_view, col0.clone(), 0);
     let (sa, sb) = (Shape::new(bm, bk), Shape::new(bn, bk));
-    let a_s = k.smem::<BF16>("a_s", stages * sa.elems());
-    let b_s = k.smem::<BF16>("b_s", stages * sb.elems());
+    let a_s = k.ring::<BF16>("a_s", sa.elems(), stages);
+    let b_s = k.ring::<BF16>("b_s", sb.elems(), stages);
     let acc = k.zeros::<F32>(Shape::new(bm, bn));
     let [acc] = k.pipeline(
         kk / bk,
@@ -84,15 +84,15 @@ fn gemm_nt(m: usize, n: usize, kk: usize, [bm, bn, bk]: [usize; 3], stages: usiz
         |k, step, slot| {
             let koff = step * bk;
             let a_g = k.at(a_view, 0, koff.clone());
-            let a_t = k.smem_slot(a_s, slot.clone(), sa);
+            let a_t = k.slot(a_s, &slot, sa);
             k.stage(a_t, a_g, CopyMode::Async);
             let b_g = k.at(b_view, 0, koff);
-            let b_t = k.smem_slot(b_s, slot, sb);
+            let b_t = k.slot(b_s, &slot, sb);
             k.stage(b_t, b_g, CopyMode::Async);
         },
         |k, _step, slot, [acc]| {
-            let a_t = k.smem_slot(a_s, slot.clone(), sa);
-            let b_t = k.smem_slot(b_s, slot, sb);
+            let a_t = k.slot(a_s, &slot, sa);
+            let b_t = k.slot(b_s, &slot, sb);
             [k.mma(acc, a_t, false, b_t, true)]
         },
     );
@@ -112,7 +112,7 @@ fn gemm_nt(m: usize, n: usize, kk: usize, [bm, bn, bk]: [usize; 3], stages: usiz
 एक producer और एक consumer घोषित करता है, और `init` (यहाँ accumulator) को consumer के ज़रिए आगे
 ले जाता है। लेखक बताता है कि slot में क्या copy करना है और उससे क्या गणना करनी है।
 [Schedule template](./layouts-and-lowering#schedule-templates) तय करता है कि copies कितना आगे चलें,
-और हर wait और barrier को जगह देता है।
+और हर wait और barrier को जगह देता है। Slot उसी stage का है जो उसे रखता है: `slot` producer को लिखने योग्य tile देता है और consumer को केवल पढ़ने योग्य।
 
 **गुणनफल.** `mma(acc, a, a_t, b, b_t)` f32 accumulators (8-bit integers पर i32, `MmaIn::Acc`) पर `acc + A·B` है,
 यहाँ `B` transposed
@@ -157,7 +157,7 @@ c.realize()?;
 |---|---|
 | घोषणाएँ | `input`, `output`, `inout`, `var` (launch variable जो नाम से bind होता है), `grid`, `warps` (एक गिनती, warps का एक column, या `WarpGrid` जिस पर register tiles फैलती हैं), `smem` |
 | Scalars | `block(axis)`, `warp()`, `row()` (gather map के भीतर), `load_scalar(param, index)`, `Sc` operators और `min`/`max`/`lt`/`le`/`eq`/`and`/`or` |
-| Views | `view`, `gather` (row-mapped view), `at`, `narrow`, `smem_view`, `smem_view_as`, `smem_slot` |
+| Views | `view`, `gather` (row-mapped view), `at`, `narrow`, `smem_view`, `smem_slot`, `ring`, `slot`, `ring_scratch` |
 | Tile ops | `fill`, `zeros`, `splat`, `coord`, `unary`, `binary` (row या column vector broadcast होता है), `scale`, `compare` (`CmpOp`), `cast`, `cast_toward_zero`, `where_`, `mul_add` (एक ही rounding), `reduce`, `reduce_f32`, `transpose`, `shift` (axis के साथ एक step आगे, पहले स्थान पर fill), `flip` (हर element axis के साथ mask के bits पार अपने partner से बदलता है: sorting network का एक step), `mma`, `mma_oriented`, `pin` |
 | Movement | `stage` (global → shared, `CopyMode::Async` या `Sync`), `load`, `load_as_fill`, `store` |
 | Control | `loop_` (carried register tiles), `pipeline`, `if_`, `select_if` (tiles बनाने वाली branches), `where_any` (एक `where_` जिसका चुना हुआ पक्ष केवल वे warps गणना करते हैं जिनके पास predicate का कोई set element है), `each_warp` (एक `Warps` statement), `barrier` |

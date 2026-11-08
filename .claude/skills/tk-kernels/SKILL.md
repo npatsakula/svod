@@ -77,7 +77,7 @@ optimization"), `do_linearize` returns before the `SVOD_DUMP_LINEAR` dump (`code
 ## Writing a kernel
 
 Smallest real kernel: `kernels/rows.rs::norm` (one warp per row, no matrix core). Pipeline + `mma`: `kernels/gemm.rs`.
-Masks, `select_if`, `each_warp`, `smem_view_as`, `load_scalar`, `where_`, `mul_add`: `kernels/attention.rs`. Row-mapped
+Masks, `select_if`, `each_warp`, `ring_scratch`, `load_scalar`, `where_`, `mul_add`: `kernels/attention.rs`. Row-mapped
 gathers (`Kernel::gather`): `kernels/conv.rs`. Builder call table: `first-kernel.md`. Full wiring: [new-kernel.md](new-kernel.md).
 
 Rules the code enforces:

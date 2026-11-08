@@ -100,10 +100,11 @@ macro_rules! tier {
         impl TierMark for $name {}
     )*};
 }
-tier!(Smem, Reg, Period);
+tier!(Smem, Reg, Period, Held);
 impl Readable for Reg {}
 impl Readable for Smem {}
 impl Writable for Smem {}
+impl Readable for Held {}
 impl Readable for Period {}
 impl Window for Period {}
 
@@ -138,6 +139,8 @@ pub type Regs<T> = Tile<Reg, T>;
 /// A global view whose columns repeat ([`Kernel::periodic`]): read into
 /// registers only.
 pub type Periodic<T> = Tile<Period, T>;
+/// A ring slot as a pipeline's consume sees it: read, never written.
+pub type Slotted<T> = Tile<Held, T>;
 
 /// A scalar expression: built with ordinary operators, interned into the
 /// program's arena by the builder call that consumes it.
@@ -203,6 +206,52 @@ pub struct ParamRef<T, A: Access>(pub ParamId, PhantomData<(T, A)>);
 /// A shared allocation of `T` elements.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SmemRef<T>(pub SmemId, PhantomData<T>);
+
+/// A shared allocation of slots of `slot` elements that only a pipeline's
+/// stages reach ([`Kernel::slot`]): its produce fills a slot, its consume
+/// reads one. Anything else over it is [`Kernel::ring_scratch`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ring<T> {
+    alloc: SmemRef<T>,
+    slot: usize,
+}
+
+/// The slot a pipeline stage holds, branded by the stage so it cannot leave
+/// it: a produce's [`Filling`] or a consume's [`Reading`].
+pub trait Hold: Clone {
+    /// What a view of the slot is: writable while filled, read-only while read.
+    type Tier: TierMark;
+    fn index(&self) -> Sc;
+}
+
+/// The slot a produce fills.
+#[derive(Clone, Debug)]
+pub struct Filling<'r>(Sc, PhantomData<fn(&'r ()) -> &'r ()>);
+/// The slot a consume reads.
+#[derive(Clone, Debug)]
+pub struct Reading<'r>(Sc, PhantomData<fn(&'r ()) -> &'r ()>);
+
+macro_rules! hold {
+    ($($name:ident => $tier:ident),*) => {$(
+        impl Hold for $name<'_> {
+            type Tier = $tier;
+            fn index(&self) -> Sc {
+                self.0.clone()
+            }
+        }
+        impl $name<'_> {
+            fn new(slot: ScalarId) -> Self {
+                Self(Sc::Id(slot), PhantomData)
+            }
+            /// The stage's slot past the first `first`, where the ring holds a
+            /// run of slots per warp.
+            pub fn past(self, first: impl Into<Sc>) -> Self {
+                Self(first.into() + self.0, PhantomData)
+            }
+        }
+    )*};
+}
+hold!(Filling => Smem, Reading => Held);
 
 /// An elementwise comparison ([`Kernel::compare`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -476,20 +525,14 @@ impl Kernel {
     }
 
     pub fn smem_view<T: Elem>(&mut self, alloc: SmemRef<T>, offset: impl Into<Sc>, shape: Shape) -> Shared<T> {
-        self.smem_view_as(alloc, offset, shape)
+        self.view_as(alloc, offset, shape)
     }
 
     /// `shape` of `T` at `offset` (in `T` elements) of `alloc`, read under
-    /// `T` whatever the allocation's type: scratch over a region whose tiles
-    /// are dead, as a key warp's merge state reuses its ring. The allocation
-    /// holds a whole number of `T`s; a `T` of the allocation's width or wider
-    /// keeps every element of the view aligned.
-    pub fn smem_view_as<T: Elem>(
-        &mut self,
-        alloc: SmemRef<impl Elem>,
-        offset: impl Into<Sc>,
-        shape: Shape,
-    ) -> Shared<T> {
+    /// `T` whatever the allocation's type. The allocation holds a whole number
+    /// of `T`s; a `T` of the allocation's width or wider keeps every element
+    /// of the view aligned.
+    fn view_as<T: Elem, P>(&mut self, alloc: SmemRef<impl Elem>, offset: impl Into<Sc>, shape: Shape) -> Tile<P, T> {
         let alloc = alloc.0;
         let a = &self.prog.smem[alloc.index()];
         let (held, bytes) = (a.elems * a.dtype.bytes(), T::DTYPE.bytes());
@@ -501,6 +544,78 @@ impl Kernel {
     /// Slot `slot` of a ring of `shape` tiles in `alloc`.
     pub fn smem_slot<T: Elem>(&mut self, alloc: SmemRef<T>, slot: impl Into<Sc>, shape: Shape) -> Shared<T> {
         self.smem_view(alloc, slot.into() * shape.elems(), shape)
+    }
+
+    /// A ring of `slots` slots of `slot` elements, for a pipeline's stages.
+    pub fn ring<T: Elem>(&mut self, name: impl Into<String>, slot: usize, slots: usize) -> Ring<T> {
+        Ring { alloc: self.smem(name, slots * slot), slot }
+    }
+
+    /// The stage's slot of `ring` as one `shape` tile: written by a produce,
+    /// read by a consume.
+    ///
+    /// ```compile_fail
+    /// use svod_tk::build::*;
+    /// use svod_tk::ir::{CopyMode, Shape};
+    /// let mut k = Kernel::new("ring");
+    /// let p = k.input::<F32>("p", 16);
+    /// let v = k.view(p, 0, [4, 1], Shape::new(4, 4), [None, None]);
+    /// let ring = k.ring::<F32>("ring", 16, 2);
+    /// let zero = k.zeros::<F32>(Shape::new(4, 4));
+    /// k.pipeline(1, 2, [zero], |k, _, slot| {
+    ///     let t = k.slot(ring, &slot, Shape::new(4, 4));
+    ///     k.stage(t, v, CopyMode::Async);
+    /// }, |k, _, slot, [acc]| {
+    ///     let t = k.slot(ring, &slot, Shape::new(4, 4));
+    ///     k.store(t, acc); // a consume reads its slot, never writes it
+    ///     [acc]
+    /// });
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use svod_tk::build::*;
+    /// use svod_tk::ir::Shape;
+    /// let mut k = Kernel::new("ring");
+    /// let ring = k.ring::<F32>("ring", 16, 2);
+    /// let zero = k.zeros::<F32>(Shape::new(4, 4));
+    /// let mut kept = None;
+    /// k.pipeline(1, 2, [zero], |_, _, slot| kept = Some(slot), |_, _, _, c| c);
+    /// let t = k.slot(ring, &kept.unwrap(), Shape::new(4, 4)); // a slot stays in its stage
+    /// ```
+    pub fn slot<T: Elem, H: Hold>(&mut self, ring: Ring<T>, slot: &H, shape: Shape) -> Tile<H::Tier, T> {
+        assert_eq!(shape.elems(), ring.slot, "a whole slot");
+        self.view_as(ring.alloc, slot.index() * shape.elems(), shape)
+    }
+
+    /// Part `part` of the stage's slot of `ring`, the slot cut into `shape`
+    /// tiles.
+    pub fn slot_part<T: Elem, H: Hold>(
+        &mut self,
+        ring: Ring<T>,
+        slot: &H,
+        part: usize,
+        shape: Shape,
+    ) -> Tile<H::Tier, T> {
+        assert!((part + 1) * shape.elems() <= ring.slot, "a part within the slot");
+        self.view_as(ring.alloc, slot.index() * ring.slot + part * shape.elems(), shape)
+    }
+
+    /// `shape` of `T` at `offset` (in `T` elements) of `ring`, whatever the
+    /// ring's element type, as scratch shared by the block.
+    ///
+    /// # Safety
+    ///
+    /// No pipeline stage reaches the slots the view covers while it is used:
+    /// their pipeline has ended (as a key warp's merge state reuses its own
+    /// run of slots) or not begun. The lowering fences the view against the
+    /// block's other accesses; it cannot tell a live slot from a dead one.
+    pub unsafe fn ring_scratch<T: Elem>(
+        &mut self,
+        ring: Ring<impl Elem>,
+        offset: impl Into<Sc>,
+        shape: Shape,
+    ) -> Shared<T> {
+        self.view_as(ring.alloc, offset, shape)
     }
 
     // ---- tile ops --------------------------------------------------------
@@ -857,17 +972,19 @@ impl Kernel {
 
     /// A producer/consumer loop over `extent` steps with a ring of slots run
     /// as `schedule` says ([`Schedule`]; a count of slots is a rolled ring).
-    /// `produce(k, step, slot)` stages step `step` into slot `slot`;
-    /// `consume(k, step, slot, carried)` computes from it.
+    /// `produce(k, step, slot)` stages step `step` into the slot it fills
+    /// ([`Kernel::slot`]); `consume(k, step, slot, carried)` computes from the
+    /// slot it reads. A slot is its stage's alone.
     pub fn pipeline<T: Elem, const N: usize>(
         &mut self,
         extent: impl Into<Sc>,
         schedule: impl Into<Schedule>,
         init: [Regs<T>; N],
-        produce: impl FnOnce(&mut Self, Sc, Sc),
-        consume: impl FnOnce(&mut Self, Sc, Sc, [Regs<T>; N]) -> [Regs<T>; N],
+        produce: impl for<'r> FnOnce(&mut Self, Sc, Filling<'r>),
+        consume: impl for<'r> FnOnce(&mut Self, Sc, Reading<'r>, [Regs<T>; N]) -> [Regs<T>; N],
     ) -> [Regs<T>; N] {
-        let consume = |k: &mut Self, step, slot, phi: Vec<Regs<T>>| consume(k, step, slot, tiles(phi)).to_vec();
+        let consume =
+            |k: &mut Self, step, slot: Reading<'_>, phi: Vec<Regs<T>>| consume(k, step, slot, tiles(phi)).to_vec();
         tiles(self.pipeline_vec(extent, schedule, init.to_vec(), produce, consume))
     }
 
@@ -877,18 +994,18 @@ impl Kernel {
         extent: impl Into<Sc>,
         schedule: impl Into<Schedule>,
         init: Vec<Regs<T>>,
-        produce: impl FnOnce(&mut Self, Sc, Sc),
-        consume: impl FnOnce(&mut Self, Sc, Sc, Vec<Regs<T>>) -> Vec<Regs<T>>,
+        produce: impl for<'r> FnOnce(&mut Self, Sc, Filling<'r>),
+        consume: impl for<'r> FnOnce(&mut Self, Sc, Reading<'r>, Vec<Regs<T>>) -> Vec<Regs<T>>,
     ) -> Vec<Regs<T>> {
         let schedule = schedule.into();
         let extent = self.intern(extent);
         let [pstep, pslot, cstep, cslot] = [(); 4].map(|()| self.push_scalar(Scalar::Induction));
         let phi = self.carried(&init);
-        let body = self.with_block(|k| produce(k, Sc::Id(pstep), Sc::Id(pslot)));
+        let body = self.with_block(|k| produce(k, Sc::Id(pstep), Filling::new(pslot)));
         let produce = Stage { step: pstep, slot: pslot, body };
         let mut next = vec![];
         let mut body = self.with_block(|k| {
-            next = consume(k, Sc::Id(cstep), Sc::Id(cslot), phi.iter().map(|&v| Tile::new(v)).collect())
+            next = consume(k, Sc::Id(cstep), Reading::new(cslot), phi.iter().map(|&v| Tile::new(v)).collect())
         });
         self.snapshot_carried(&mut body, &phi, &mut next);
         self.deshare_carried(&mut body, &mut next);

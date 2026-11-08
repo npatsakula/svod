@@ -1116,18 +1116,18 @@ fn ring_sum(
     view: impl FnOnce(&mut Kernel, Sc) -> Gmem<I32>,
 ) -> Regs<I32> {
     let (tile, schedule) = (k.shape(init), schedule.into());
-    let slots = k.smem::<I32>("ring", schedule.stages() * tile.elems());
+    let slots = k.ring::<I32>("ring", tile.elems(), schedule.stages());
     let [sum] = k.pipeline(
         trips,
         schedule,
         [init],
         |k, step, slot| {
             let v = view(k, step);
-            let s = k.smem_slot::<I32>(slots, slot, tile);
+            let s = k.slot(slots, &slot, tile);
             k.stage(s, v, CopyMode::Async);
         },
         |k, _, slot, [sum]| {
-            let s = k.smem_slot::<I32>(slots, slot, tile);
+            let s = k.slot(slots, &slot, tile);
             let y = k.load(s);
             [k.binary(sum, y, BinaryOp::Add)]
         },

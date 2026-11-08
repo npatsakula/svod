@@ -65,8 +65,8 @@ fn gemm_nt(m: usize, n: usize, kk: usize, [bm, bn, bk]: [usize; 3], stages: usiz
     let b_view = k.view(b, 0, [kk, 1], Shape::new(bn, bk), [bound(n, bn), None]);
     let b_view = k.at(b_view, col0.clone(), 0);
     let (sa, sb) = (Shape::new(bm, bk), Shape::new(bn, bk));
-    let a_s = k.smem::<BF16>("a_s", stages * sa.elems());
-    let b_s = k.smem::<BF16>("b_s", stages * sb.elems());
+    let a_s = k.ring::<BF16>("a_s", sa.elems(), stages);
+    let b_s = k.ring::<BF16>("b_s", sb.elems(), stages);
     let acc = k.zeros::<F32>(Shape::new(bm, bn));
     let [acc] = k.pipeline(
         kk / bk,
@@ -75,15 +75,15 @@ fn gemm_nt(m: usize, n: usize, kk: usize, [bm, bn, bk]: [usize; 3], stages: usiz
         |k, step, slot| {
             let koff = step * bk;
             let a_g = k.at(a_view, 0, koff.clone());
-            let a_t = k.smem_slot(a_s, slot.clone(), sa);
+            let a_t = k.slot(a_s, &slot, sa);
             k.stage(a_t, a_g, CopyMode::Async);
             let b_g = k.at(b_view, 0, koff);
-            let b_t = k.smem_slot(b_s, slot, sb);
+            let b_t = k.slot(b_s, &slot, sb);
             k.stage(b_t, b_g, CopyMode::Async);
         },
         |k, _step, slot, [acc]| {
-            let a_t = k.smem_slot(a_s, slot.clone(), sa);
-            let b_t = k.smem_slot(b_s, slot, sb);
+            let a_t = k.slot(a_s, &slot, sa);
+            let b_t = k.slot(b_s, &slot, sb);
             [k.mma(acc, a_t, false, b_t, true)]
         },
     );
@@ -97,7 +97,7 @@ fn gemm_nt(m: usize, n: usize, kk: usize, [bm, bn, bk]: [usize; 3], stages: usiz
 
 **用边界代替填充。** 只有在 tile 网格超出 `len` 时，`bound(len, tile)` 才是 `Some(len)`，因此任意 `m` 和 `n` 都无需拷贝即可运行。只有 `k` 必须是 `bk` 的倍数。
 
-**流水线。** `pipeline(extent, stages, init, produce, consume)` 在由 `stages` 个共享槽组成的环上（`Ring { stages, unroll, crews }` 还可以按每个槽复制一次循环，或用两个工作组运行）声明一个生产者和一个消费者，并让 `init`（这里是累加器）贯穿消费者传递。作者只说明要把什么拷贝进槽、以及从槽中计算什么。[调度模板](./layouts-and-lowering#schedule-templates)决定拷贝提前多少步，并放置每一个等待和屏障。
+**流水线。** `pipeline(extent, stages, init, produce, consume)` 在由 `stages` 个共享槽组成的环上（`Schedule::ring(stages, unroll)` 还可以按每个槽复制一次循环，或用两个工作组运行）声明一个生产者和一个消费者，并让 `init`（这里是累加器）贯穿消费者传递。作者只说明要把什么拷贝进槽、以及从槽中计算什么。[调度模板](./layouts-and-lowering#schedule-templates)决定拷贝提前多少步，并放置每一个等待和屏障。槽归持有它的阶段所有：`slot` 给生产者一个可写的瓦片，给消费者一个只读的瓦片。
 
 **乘积。** `mma(acc, a, a_t, b, b_t)` 在 f32 累加器（8 位整数时为 i32，`MmaIn::Acc`）上计算 `acc + A·B`，这里 `B` 以转置方式读取。它从不指名某条指令：降级会选择目标的矩阵核心原子，并为 `a`、`b` 和 `acc` 赋予该原子的布局。结果只在存储前的类型转换处舍入一次。
 
@@ -135,7 +135,7 @@ c.realize()?;
 |---|---|
 | 声明 | `input`、`output`、`inout`、`var`（按名称绑定的启动变量）、`grid`、`warps`（一个数量、一列 warp，或寄存器 tile 铺开所依据的 `WarpGrid`）、`smem` |
 | 标量 | `block(axis)`、`warp()`、`row()`（在 gather 映射内部）、`load_scalar(param, index)`、`Sc` 运算符以及 `min`/`max`/`lt`/`le`/`eq`/`and`/`or` |
-| 视图 | `view`、`gather`（按行映射的视图）、`at`、`narrow`、`smem_view`、`smem_view_as`、`smem_slot` |
+| 视图 | `view`、`gather`（按行映射的视图）、`at`、`narrow`、`smem_view`、`smem_slot`、`ring`、`slot`、`ring_scratch` |
 | Tile 操作 | `fill`、`zeros`、`splat`、`coord`、`unary`、`binary`（行向量或列向量会广播）、`scale`、`compare`（`CmpOp`）、`cast`、`cast_toward_zero`、`where_`、`mul_add`（只舍入一次）、`reduce`、`reduce_f32`、`transpose`、`shift`（沿某轴移动一步，首位填充）、`flip`（每个元素沿某轴与掩码各位相异的元素交换：排序网络的一步）、`mma`、`mma_oriented`、`pin` |
 | 数据移动 | `stage`（全局 → 共享，`CopyMode::Async` 或 `Sync`）、`load`、`load_as_fill`、`store` |
 | 控制 | `loop_`（携带寄存器 tile）、`pipeline`、`if_`、`select_if`（产生 tile 的分支）、`where_any`（一个 `where_`，只有持有已置位谓词元素的 warp 计算其选中一侧）、`each_warp`（一条 `Warps` 语句）、`barrier` |

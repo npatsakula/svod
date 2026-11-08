@@ -489,11 +489,11 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
     }
     k.warps(cfg.row_warps());
     k.lone_warps(cfg.warps());
-    let k_s = k.smem::<T>("k_s", kw * stages * bkv * d);
-    let v_s = k.smem::<T>("v_s", kw * stages * bkv * d);
+    let k_s = k.ring::<T>("k_s", bkv * d, kw * stages);
+    let v_s = k.ring::<T>("v_s", bkv * d, kw * stages);
     // The bias streams through a ring of its own beside K and V, unless the
     // forms read its tiles directly.
-    let bias_s = cfg.bias_ring(bias.is_some()).then(|| k.smem::<T>("bias_s", kw * stages * bq * bkv));
+    let bias_s = cfg.bias_ring(bias.is_some()).then(|| k.ring::<T>("bias_s", bq * bkv, kw * stages));
 
     let (order, split, hh) = (k.block(0) / splits, k.block(0) % splits, k.block(1));
     // Where later queries see more keys (a causal mask, chunks with every
@@ -745,24 +745,24 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
             Schedule::ring(stages, cfg.unroll()),
             [m0, l0, o0],
             |k, step, slot| {
-                let (kv_off, slot) = ((w_first.clone() + step) * bkv, slot0.clone() + slot);
+                let (kv_off, slot) = ((w_first.clone() + step) * bkv, slot.past(slot0.clone()));
                 let k_g = k.at(k_view, kv_off.clone(), 0);
                 let v_g = k.at(v_view, kv_off.clone(), 0);
-                let k_t = k.smem_slot::<T>(k_s, slot.clone(), Shape::new(bkv, d));
-                let v_t = k.smem_slot::<T>(v_s, slot.clone(), Shape::new(bkv, d));
+                let k_t = k.slot(k_s, &slot, Shape::new(bkv, d));
+                let v_t = k.slot(v_s, &slot, Shape::new(bkv, d));
                 k.stage(k_t, k_g, CopyMode::Async);
                 k.stage(v_t, v_g, CopyMode::Async);
                 if let (Some(view), Some(ring)) = (bias_view, bias_s) {
                     let b_g = k.at(view, q_off.clone(), kv_off);
-                    let b_t = k.smem_slot::<T>(ring, slot, shape);
+                    let b_t = k.slot(ring, &slot, shape);
                     k.stage(b_t, b_g, CopyMode::Async);
                 }
             },
             |k, step_, slot, carried| {
-                let slot = slot0.clone() + slot;
-                let k_t = k.smem_slot::<T>(k_s, slot.clone(), Shape::new(bkv, d));
-                let v_t = k.smem_slot::<T>(v_s, slot.clone(), Shape::new(bkv, d));
-                let b_t = bias_s.map(|ring| k.smem_slot::<T>(ring, slot, shape));
+                let slot = slot.past(slot0.clone());
+                let k_t = k.slot(k_s, &slot, Shape::new(bkv, d));
+                let v_t = k.slot(v_s, &slot, Shape::new(bkv, d));
+                let b_t = bias_s.map(|ring| k.slot(ring, &slot, shape));
                 let from_ring = |k: &mut Kernel, s, _| biased(k, s, b_t.expect("a bias ring"));
                 let st = if b_t.is_some() { Step { bias: Some(&from_ring as Mask), ..st } } else { st };
                 step(k, &st, k_t, v_t, (w_first.clone() + step_) * bkv, carried)
@@ -806,10 +806,13 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
         // then folds the regions as the split merge does.
         _ => {
             let region = stages * bkv * d * T::DTYPE.bytes() / F32::DTYPE.bytes();
-            let views = |k: &mut Kernel, at: Sc| {
-                let o = k.smem_view_as::<F32>(k_s, at.clone() * region, Shape::new(WARP_ROWS, d));
-                let m = k.smem_view_as::<F32>(v_s, at.clone() * region, Shape::new(WARP_ROWS, 1));
-                let l = k.smem_view_as::<F32>(v_s, at * region + WARP_ROWS, Shape::new(WARP_ROWS, 1));
+            // SAFETY: a warp's region is its own run of slots, and both uses
+            // come after that warp's pipeline: the warp's own stores once its
+            // pipeline ends, the block's loads after every warp's.
+            let views = |k: &mut Kernel, at: Sc| unsafe {
+                let o = k.ring_scratch::<F32>(k_s, at.clone() * region, Shape::new(WARP_ROWS, d));
+                let m = k.ring_scratch::<F32>(v_s, at.clone() * region, Shape::new(WARP_ROWS, 1));
+                let l = k.ring_scratch::<F32>(v_s, at * region + WARP_ROWS, Shape::new(WARP_ROWS, 1));
                 (o, m, l)
             };
             k.each_warp(|k| {

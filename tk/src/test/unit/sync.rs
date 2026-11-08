@@ -263,13 +263,13 @@ fn a_pending_async_copy_survives_a_barrier(between: Between) {
 /// A pipeline over a 16×16 ring in `ring`, summing its steps, with `before`
 /// and `after` run around it.
 fn around_a_pipeline(
-    before: impl FnOnce(&mut Kernel, SmemRef<BF16>),
-    after: impl FnOnce(&mut Kernel, SmemRef<BF16>),
+    before: impl FnOnce(&mut Kernel, Ring<BF16>),
+    after: impl FnOnce(&mut Kernel, Ring<BF16>),
 ) -> Program {
     let mut k = Kernel::new("around_a_pipeline");
     let x = k.input::<BF16>("x", 4 * 256);
     let g = k.view(x, 0, [16, 1], Shape::new(16, 16), [None, None]);
-    let ring = k.smem::<BF16>("ring", 2 * 256);
+    let ring = k.ring::<BF16>("ring", 256, 2);
     before(&mut k, ring);
     let init = k.zeros::<F32>(Shape::new(16, 16));
     let [sum] = k.pipeline(
@@ -277,12 +277,12 @@ fn around_a_pipeline(
         2,
         [init],
         |k, step, slot| {
-            let t = k.smem_slot::<BF16>(ring, slot, Shape::new(16, 16));
+            let t = k.slot(ring, &slot, Shape::new(16, 16));
             let src = k.at(g, step * 16, 0);
             k.stage(t, src, CopyMode::Async);
         },
         |k, _step, slot, [sum]| {
-            let t = k.smem_slot::<BF16>(ring, slot, Shape::new(16, 16));
+            let t = k.slot(ring, &slot, Shape::new(16, 16));
             let y = k.load(t);
             let y = k.cast::<BF16, F32>(y);
             [k.binary(sum, y, BinaryOp::Add)]
@@ -295,8 +295,9 @@ fn around_a_pipeline(
     k.finish()
 }
 
-fn zero_slot(k: &mut Kernel, ring: SmemRef<BF16>) -> Shared<BF16> {
-    let t = k.smem_view::<BF16>(ring, 0, Shape::new(16, 16));
+fn zero_slot(k: &mut Kernel, ring: Ring<BF16>) -> Shared<BF16> {
+    // SAFETY: outside the pipeline, which the tests' fences order it against.
+    let t = unsafe { k.ring_scratch::<BF16>(ring, 0, Shape::new(16, 16)) };
     let z = k.zeros::<BF16>(Shape::new(16, 16));
     k.store(t, z);
     t
@@ -362,7 +363,7 @@ fn a_consume_body_fences_its_own_tiles() {
     let mut k = Kernel::new("consume_scratch");
     let x = k.input::<BF16>("x", 4 * 256);
     let g = k.view(x, 0, [16, 1], Shape::new(16, 16), [None, None]);
-    let ring = k.smem::<BF16>("ring", 2 * 256);
+    let ring = k.ring::<BF16>("ring", 256, 2);
     let scratch = k.smem::<BF16>("scratch", 256);
     let init = k.zeros::<BF16>(Shape::new(16, 16));
     let [last] = k.pipeline(
@@ -370,12 +371,12 @@ fn a_consume_body_fences_its_own_tiles() {
         2,
         [init],
         |k, step, slot| {
-            let t = k.smem_slot::<BF16>(ring, slot, Shape::new(16, 16));
+            let t = k.slot(ring, &slot, Shape::new(16, 16));
             let src = k.at(g, step * 16, 0);
             k.stage(t, src, CopyMode::Async);
         },
         |k, _step, slot, _| {
-            let t = k.smem_slot::<BF16>(ring, slot, Shape::new(16, 16));
+            let t = k.slot(ring, &slot, Shape::new(16, 16));
             let y = k.load(t);
             let s = k.smem_view::<BF16>(scratch, 0, Shape::new(16, 16));
             k.store(s, y);
