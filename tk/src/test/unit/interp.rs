@@ -98,6 +98,47 @@ fn carried_registers_sharing_a_next_both_take_it() {
     assert!(out[0].iter().all(|&v| v == 3.0), "{:?}", &out[0][..]);
 }
 
+/// An inner loop's result returned as the outer body's `next` is read after
+/// the inner loop ran, not where the body starts: `3 · 2` ones summed.
+#[test_case(false; "a loop")]
+#[test_case(true; "a pipeline")]
+fn an_inner_loops_result_is_the_outer_next_after_it_runs(pipelined: bool) {
+    let shape = Shape::new(4, 32);
+    let prog = Kernel::record("inner_next", |k| {
+        let x = k.input::<F32>("x", shape.elems());
+        let y = k.output::<F32>("y", shape.elems());
+        let xv = k.view(x, 0, [32, 1], shape, [None, None]);
+        let zero = k.zeros::<F32>(shape);
+        let [acc] = k.loop_(3, [zero], |k, _, [acc]| {
+            if pipelined {
+                let ring = k.ring::<F32>("ring", shape.elems(), 2);
+                return k.pipeline(
+                    2,
+                    2,
+                    [acc],
+                    |k, _, slot| {
+                        let t = k.slot(ring, &slot, shape);
+                        k.stage(t, xv, CopyMode::Async);
+                    },
+                    |k, _, slot, [a]| {
+                        let t = k.slot(ring, &slot, shape);
+                        let one = k.load(t);
+                        [k.binary(*a, one, BinaryOp::Add).into()]
+                    },
+                );
+            }
+            k.loop_(2, [acc], |k, _, [a]| {
+                let one = k.load(xv);
+                [k.binary(*a, one, BinaryOp::Add).into()]
+            })
+        });
+        let out = k.view(y, 0, [32, 1], shape, [None, None]);
+        k.store(out, *acc);
+    });
+    let out = run(&prog, vec![vec![1.0; shape.elems()], vec![0.0; shape.elems()]], &[]).unwrap();
+    assert!(out[1].iter().all(|&v| v == 6.0), "{:?}", &out[1][..4]);
+}
+
 /// Online softmax as a monoid over `(max, sum)` carried through a loop of
 /// column blocks equals the direct softmax normalizer.
 #[test]

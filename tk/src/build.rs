@@ -1039,13 +1039,7 @@ impl<'k> Kernel<'k> {
     fn snapshot_carried<T: Elem>(&mut self, body: &mut Block, phi: &[ValId], next: &mut [Regs<'k, T>]) {
         let mut defined = std::collections::HashSet::new();
         for (_, s) in body.walk() {
-            match s {
-                Stmt::Let { dst, .. } | Stmt::Copy { dst, .. } => {
-                    defined.insert(*dst);
-                }
-                Stmt::If { results, .. } => defined.extend(results.iter().map(|&(dst, ..)| dst)),
-                _ => {}
-            }
+            defined.extend(defines(s));
         }
         let mut copies = vec![];
         for (n, &p) in next.iter_mut().zip(phi) {
@@ -1319,6 +1313,19 @@ impl<'k> Kernel<'k> {
     }
 }
 
+/// The register values `s` leaves defined past itself: its result, an
+/// `if`'s merges, a loop's or pipeline's carried values.
+fn defines(s: &Stmt) -> Vec<ValId> {
+    match s {
+        Stmt::Let { dst, .. } | Stmt::Copy { dst, .. } => vec![*dst],
+        Stmt::If { results, .. } => results.iter().map(|&(dst, ..)| dst).collect(),
+        Stmt::Loop(Loop { carried, .. }) | Stmt::Pipeline(Pipeline { carried, .. }) => {
+            carried.iter().map(|c| c.phi).collect()
+        }
+        _ => vec![],
+    }
+}
+
 /// Every loop's and pipeline's `next`s are statements of its own body (an
 /// `if`'s merge among them, never a branch of one) and pairwise distinct:
 /// the moves into the `phi`s all run at that body's end, which is where the
@@ -1337,13 +1344,7 @@ fn check_carried(block: &Block) {
         };
         let mut defined = std::collections::HashSet::new();
         for s in &body.0 {
-            match s {
-                Stmt::Let { dst, .. } | Stmt::Copy { dst, .. } => {
-                    defined.insert(*dst);
-                }
-                Stmt::If { results, .. } => defined.extend(results.iter().map(|&(dst, ..)| dst)),
-                _ => {}
-            }
+            defined.extend(defines(s));
         }
         let mut nexts = std::collections::HashSet::new();
         for c in carried {
