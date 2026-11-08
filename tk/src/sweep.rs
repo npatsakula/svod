@@ -12,6 +12,7 @@ use svod_dtype::{AmdArch, CudaArch, GpuArch, ScalarDType};
 
 use crate::atoms::{Core, Costs, Device, Target};
 use crate::build::{BF16, F16, I8};
+use crate::kernels::Admitted;
 use std::num::NonZeroUsize;
 
 use crate::ir::{Program, Schedule, Var};
@@ -70,7 +71,14 @@ pub fn past_i32(target: &Target) -> Vec<Launch> {
     for (batches, stages) in [(1, 1), (2, 1), (2, 2)] {
         let base = planner.gemm_ranked(batches, m, n, k, false)[0];
         let cfg = GemmCfg { schedule: Schedule::ring(stages, base.unroll()), ..base };
-        let spec = GemmSpec { m, n, k, batch: Batch::Static(batches), epilogue: Epilogue::DEFAULT, cfg };
+        let spec = GemmSpec {
+            m,
+            n,
+            k,
+            batch: Batch::Static(batches),
+            epilogue: Epilogue::DEFAULT,
+            cfg: Admitted::assume(cfg),
+        };
         out.push((format!("gemm {batches} batches s{stages}"), gemm::<BF16>(&spec), cfg.lowering(device)));
     }
     for (n, m) in [(2_800_001, 1024), (1024, 2_800_001)] {
@@ -93,7 +101,7 @@ pub fn past_i32(target: &Target) -> Vec<Launch> {
             floors: Floors::default(),
             groups: false,
             k: 1,
-            cfg,
+            cfg: Admitted::assume(cfg),
             live: Default::default(),
         };
         out.push((format!("nearest {n}x{m}"), nearest::<F16>(&spec), Lowering::new(device)));
@@ -104,7 +112,19 @@ pub fn past_i32(target: &Target) -> Vec<Launch> {
         let cfg = FaCfg { splits: 2, ..cfg };
         let cache = Some(CacheLayout { rows: 6, heads_total: 6, row_map: true, appended: 1, app_lens: false });
         let batch = Batch::var("b", 1, 3);
-        let spec = AttnSpec { batch, t, tk, heads: 4, kv_heads: 2, d, mask, cache, packed: false, scale: 0.125, cfg };
+        let spec = AttnSpec {
+            batch,
+            t,
+            tk,
+            heads: 4,
+            kv_heads: 2,
+            d,
+            mask,
+            cache,
+            packed: false,
+            scale: 0.125,
+            cfg: Admitted::assume(cfg),
+        };
         out.push(("attention row map".to_string(), attention::<F16>(&spec), cfg.lowering(device)));
     }
     // The bias's fill meets the column bound its keys end inside a block of.
@@ -112,8 +132,19 @@ pub fn past_i32(target: &Target) -> Vec<Launch> {
     if let Some(&cfg) = planner.attention_ranked(8, t, tk, d, false, true).first() {
         let mask = AttnMask { bias: Some(Bias::PerBatch), ..mask };
         let batch = Batch::Static(2);
-        let spec =
-            AttnSpec { batch, t, tk, heads: 4, kv_heads: 2, d, mask, cache: None, packed: false, scale: 0.125, cfg };
+        let spec = AttnSpec {
+            batch,
+            t,
+            tk,
+            heads: 4,
+            kv_heads: 2,
+            d,
+            mask,
+            cache: None,
+            packed: false,
+            scale: 0.125,
+            cfg: Admitted::assume(cfg),
+        };
         out.push(("attention bias".to_string(), attention::<F16>(&spec), cfg.lowering(device)));
     }
     // A gathered candidate's row, gated on the candidate and bounded in depth.
@@ -133,34 +164,44 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
     // for a large GEMM, so the biggest register tiles are lowered too.
     let gemm_spec = |m, n, k, epilogue: Epilogue| {
         let cfg = planner.gemm_ranked(1, 4096, 4096, k, epilogue.gated)[0];
-        GemmSpec { m, n, k, batch: Batch::Static(1), epilogue, cfg }
+        GemmSpec { m, n, k, batch: Batch::Static(1), epilogue, cfg: Admitted::assume(cfg) }
     };
     let plain = gemm_spec(130, 192, 128, Epilogue::DEFAULT);
     for (i, cfg) in first_eight(&planner.gemm_ranked(1, 4096, 4096, 4096, false)).into_iter().enumerate() {
-        let spec = GemmSpec { cfg, ..plain.clone() };
+        let spec = GemmSpec { cfg: Admitted::assume(cfg), ..plain.clone() };
         push(&format!("gemm #{i} {:?}x{}", cfg.tile, cfg.stages()), gemm::<BF16>(&spec), cfg.lowering(&planner.device));
     }
     // One slot holds a tile twice as deep in the same shared memory.
-    let one_slot = GemmSpec { cfg: config::gemm_cfg([64, 64, 64], 1, [2, 2], false), ..plain.clone() };
+    let one_slot =
+        GemmSpec { cfg: Admitted::assume(config::gemm_cfg([64, 64, 64], 1, [2, 2], false)), ..plain.clone() };
     push("gemm one slot", gemm::<BF16>(&one_slot), one_slot.cfg.lowering(&planner.device));
     if let Some(kslice) = target.kslice().and_then(NonZeroUsize::new) {
         let schedule = Schedule::PingPong { kslice };
         let cfg = GemmCfg { schedule, ..config::gemm_cfg([64, 64, 64], 1, [2, 4], false) };
-        let crews = GemmSpec { cfg, ..plain.clone() };
+        let crews = GemmSpec { cfg: Admitted::assume(cfg), ..plain.clone() };
         push("gemm two crews", gemm::<BF16>(&crews), cfg.lowering(&planner.device));
     }
     let swiglu = gemm_spec(70, 64, 64, Epilogue { bias: true, act: Act::Silu, gated: true, ..Epilogue::DEFAULT });
     push("gemm swiglu", gemm::<F16>(&swiglu), swiglu.cfg.lowering(&planner.device));
     let half_step = Epilogue { residual: true, act: Act::Gelu, scale: Some(Scale::new(0.5)), ..Epilogue::DEFAULT };
-    let half_step =
-        GemmSpec { cfg: planner.gemm_ranked(1, 300, 512, 256, false)[0], ..gemm_spec(100, 96, 256, half_step) };
+    let half_step = GemmSpec {
+        cfg: Admitted::assume(planner.gemm_ranked(1, 300, 512, 256, false)[0]),
+        ..gemm_spec(100, 96, 256, half_step)
+    };
     push("gemm gelu scale residual", gemm::<BF16>(&half_step), half_step.cfg.lowering(&planner.device));
     // The 8-bit integer core where the target has one: its products exact
     // into f32, over a whole tile two atoms deep and over a lone warp row.
     if target.geometry_of(ScalarDType::Int8).is_some() {
         let out_f32 = Epilogue { out_f32: true, ..Epilogue::DEFAULT };
         for cfg in [config::gemm_cfg([64, 64, 64], 2, [2, 2], true), config::gemm_cfg([32, 64, 64], 1, [1, 2], false)] {
-            let spec = GemmSpec { m: 130, n: 192, k: 256, batch: Batch::Static(1), epilogue: out_f32, cfg };
+            let spec = GemmSpec {
+                m: 130,
+                n: 192,
+                k: 256,
+                batch: Batch::Static(1),
+                epilogue: out_f32,
+                cfg: Admitted::assume(cfg),
+            };
             let name = format!("gemm int8 {:?}x{}", cfg.tile, cfg.stages());
             push(&name, gemm::<I8>(&spec), cfg.lowering(&planner.device));
         }
@@ -172,7 +213,7 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
     if let Some(cfg) = turning {
         let rope = crate::kernels::gemm::Rope { heads: 6, head_dim: 64, seq: 50 };
         let epilogue = Epilogue { rope: Some(rope), ..Epilogue::DEFAULT };
-        let spec = GemmSpec { m: 130, n: 576, k: 128, batch: Batch::Static(1), epilogue, cfg };
+        let spec = GemmSpec { m: 130, n: 576, k: 128, batch: Batch::Static(1), epilogue, cfg: Admitted::assume(cfg) };
         push("gemm rope", gemm::<BF16>(&spec), cfg.lowering(&planner.device));
     }
 
@@ -182,13 +223,25 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
         let cfg = *planner.attention_ranked(8, t, tk, d, mask.causal, mask.bias.is_some()).first()?;
         let splits = if cache.is_some() { 2 } else { 1 };
         let cfg = crate::kernels::attention::FaCfg { splits, ..cfg };
-        Some(AttnSpec { batch, t, tk, heads: 4, kv_heads: 2, d, mask, cache, packed: false, scale: 0.125, cfg })
+        Some(AttnSpec {
+            batch,
+            t,
+            tk,
+            heads: 4,
+            kv_heads: 2,
+            d,
+            mask,
+            cache,
+            packed: false,
+            scale: 0.125,
+            cfg: Admitted::assume(cfg),
+        })
     };
     let causal = AttnMask { causal: true, ..AttnMask::default() };
     for d in [64, 128] {
         let Some(spec) = fa(100, 100, d, causal, None, Batch::Static(2)) else { continue };
         for (i, cfg) in first_eight(&planner.attention_ranked(8, 100, 100, d, true, false)).into_iter().enumerate() {
-            let spec = AttnSpec { cfg, ..spec.clone() };
+            let spec = AttnSpec { cfg: Admitted::assume(cfg), ..spec.clone() };
             let name = format!("attention d{d} causal #{i} {}x{}x{}", cfg.bq, cfg.bkv, cfg.stages());
             push(&name, attention::<BF16>(&spec), cfg.lowering(&planner.device));
         }
@@ -216,7 +269,7 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
         splits: 2,
         ..crate::kernels::attention::FaCfg::new(16, 16, 2)
     };
-    let spec = AttnSpec { cfg, ..spec };
+    let spec = AttnSpec { cfg: Admitted::assume(cfg), ..spec };
     push("attention d64 cache key warps", attention::<F16>(&spec), spec.cfg.lowering(&planner.device));
     // Key warps re-hold the biased score tile through their own regions of
     // the relayout scratch where the core's accumulator cannot feed a product.
@@ -279,7 +332,17 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
             _ => true,
         };
         let Some(&cfg) = planner.nearest_ranked(p).iter().find(way) else { continue };
-        let spec = NearestSpec { n: 100, m: 150, d, metric, floors, groups, k, cfg, live: Live::default() };
+        let spec = NearestSpec {
+            n: 100,
+            m: 150,
+            d,
+            metric,
+            floors,
+            groups,
+            k,
+            cfg: Admitted::assume(cfg),
+            live: Live::default(),
+        };
         push(name, nearest::<BF16>(&spec), Lowering::new(&planner.device));
     }
     // Over 8-bit rows scaled per row, where the target has the core: the
@@ -301,7 +364,17 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
         let streamed = |c: &&NearestCfg| name.contains("streamed") == c.bk.is_some();
         let ranked = planner.nearest_ranked(p);
         let Some(&cfg) = ranked.iter().filter(way).find(streamed).or(ranked.iter().find(way)) else { continue };
-        let spec = NearestSpec { n: 100, m: 150, d, metric, floors, groups, k, cfg, live: Live::default() };
+        let spec = NearestSpec {
+            n: 100,
+            m: 150,
+            d,
+            metric,
+            floors,
+            groups,
+            k,
+            cfg: Admitted::assume(cfg),
+            live: Live::default(),
+        };
         push(name, nearest::<I8>(&spec), Lowering::new(&planner.device));
     }
     // A reranked search's exact pass: a ragged depth, floors, rows bound at launch.
@@ -321,7 +394,8 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
     if target.geometry_of(ScalarDType::Int8).is_some() {
         let cfg = NearestCfg { splits: 2, ..NearestCfg::streamed(32, 32, 64, 2) };
         let (metric, floors, live) = (Metric::SquaredL2, Floors::default(), Live::default());
-        let spec = NearestSpec { n: 100, m: 90, d: 128, metric, floors, groups: true, k: 8, cfg, live };
+        let spec =
+            NearestSpec { n: 100, m: 90, d: 128, metric, floors, groups: true, k: 8, cfg: Admitted::assume(cfg), live };
         push("nearest int8 8 split", nearest::<I8>(&spec), Lowering::new(&planner.device));
     }
     // Split over the candidates (shares of one tile and of two), and a merge
@@ -330,7 +404,8 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
     for (k, queue, name) in [(1, None, ""), (8, None, " 8"), (64, None, " 64"), (256, Some(32), " 256 queued")] {
         let cfg = NearestCfg { splits: 2, queue, ..NearestCfg::streamed(32, 32, 32, 2) };
         let (metric, floors, live) = (Metric::L2, Floors::default(), Live::default());
-        let spec = NearestSpec { n: 100, m: 90, d: 64, metric, floors, groups: true, k, cfg, live };
+        let spec =
+            NearestSpec { n: 100, m: 90, d: 64, metric, floors, groups: true, k, cfg: Admitted::assume(cfg), live };
         push(&format!("nearest{name} split"), nearest::<BF16>(&spec), Lowering::new(&planner.device));
         let merge = NearestMergeSpec { n: 300, splits: 3, metric: Metric::L2, k, live: Live::default() };
         push(&format!("nearest{name} merge"), nearest_merge(&merge), Lowering::new(&planner.device));
@@ -341,7 +416,17 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
     let select = SelectCfg { warps: 4, queue: 2, filter: false };
     let cfg = NearestCfg { select: Some(select), ..NearestCfg::new(64, 32, 2) };
     let (metric, live) = (Metric::L2, Live::default());
-    let spec = NearestSpec { n: 100, m: 150, d: 64, metric, floors: both, groups: true, k: 100, cfg, live };
+    let spec = NearestSpec {
+        n: 100,
+        m: 150,
+        d: 64,
+        metric,
+        floors: both,
+        groups: true,
+        k: 100,
+        cfg: Admitted::assume(cfg),
+        live,
+    };
     push("nearest matrix", nearest::<BF16>(&spec), Lowering::new(&planner.device));
     for (k, queue, name) in [(100, 2, "100"), (100, 4, "100 queue 4"), (1024, 8, "1024")] {
         let select = SelectCfg { queue, ..select };
@@ -379,19 +464,38 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
         let way = |c: &&NearestCfg| c.queue.is_some() == queued && c.select.is_none();
         let Some(&cfg) = planner.nearest_ranked(p).iter().find(way) else { continue };
         let (metric, floors, live) = (Metric::SquaredL2, both, live(0, k as i64));
-        let spec = NearestSpec { n: 100, m: 150, d, metric, floors, groups: true, k, cfg, live };
+        let spec = NearestSpec { n: 100, m: 150, d, metric, floors, groups: true, k, cfg: Admitted::assume(cfg), live };
         push(name, nearest::<F16>(&spec), Lowering::new(&planner.device));
     }
     let cfg = NearestCfg { splits: 2, ..NearestCfg::streamed(32, 32, 32, 2) };
     let (metric, floors) = (Metric::NegDot, Floors::default());
-    let spec = NearestSpec { n: 100, m: 90, d: 64, metric, floors, groups: false, k: 8, cfg, live: live(0, 8) };
+    let spec = NearestSpec {
+        n: 100,
+        m: 90,
+        d: 64,
+        metric,
+        floors,
+        groups: false,
+        k: 8,
+        cfg: Admitted::assume(cfg),
+        live: live(0, 8),
+    };
     push("nearest live split", nearest::<BF16>(&spec), Lowering::new(&planner.device));
     let merge = NearestMergeSpec { n: 100, splits: 3, metric, k: 8, live: live(0, 8) };
     push("nearest live merge", nearest_merge(&merge), Lowering::new(&planner.device));
     let cfg = NearestCfg { select: Some(select), ..NearestCfg::new(64, 32, 2) };
     let (metric, live) = (Metric::L2, live(30, 100));
-    let spec =
-        NearestSpec { n: 64, m: 150, d: 64, metric, floors: both, groups: true, k: 100, cfg, live: live.clone() };
+    let spec = NearestSpec {
+        n: 64,
+        m: 150,
+        d: 64,
+        metric,
+        floors: both,
+        groups: true,
+        k: 100,
+        cfg: Admitted::assume(cfg),
+        live: live.clone(),
+    };
     push("nearest live matrix panel", nearest::<BF16>(&spec), Lowering::new(&planner.device));
     let wide = select.wide(planner.device.target.wave);
     let b =
@@ -402,7 +506,17 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
     let filtered = SelectCfg { queue: 1, filter: true, ..select };
     let cfg = NearestCfg { select: Some(filtered), splits: 2, ..NearestCfg::new(64, 32, 2) };
     let (metric, live) = (Metric::NegDot, Live::default());
-    let spec = NearestSpec { n: 100, m: 300, d: 64, metric, floors: both, groups: true, k: 2, cfg, live: live.clone() };
+    let spec = NearestSpec {
+        n: 100,
+        m: 300,
+        d: 64,
+        metric,
+        floors: both,
+        groups: true,
+        k: 2,
+        cfg: Admitted::assume(cfg),
+        live: live.clone(),
+    };
     push("nearest matrix filtered", nearest::<F16>(&spec), Lowering::new(&planner.device));
     let (wide, filter) = (filtered.wide(planner.device.target.wave), Some(32));
     let b = SelectSpec { n: 100, cols: 300, k: 2, metric, first: true, cfg: filtered, live, wide, filter, shares: 3 };
@@ -416,7 +530,13 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
         let [ho, wo] = g.out_hw();
         let cfgs = conv_first_eight(&planner, 1, images * ho * wo, &g);
         let c = cfgs.iter().find(|c| (c.split > 1) == name.ends_with("split")).unwrap_or(&cfgs[0]);
-        let spec = ConvSpec { batch: Batch::Static(images), geom: g, epilogue: silu_bias, cfg: c.gemm, split: c.split };
+        let spec = ConvSpec {
+            batch: Batch::Static(images),
+            geom: g,
+            epilogue: silu_bias,
+            cfg: Admitted::assume(c.gemm),
+            split: c.split,
+        };
         for (i, (prog, lowering)) in spec.programs::<F16>(&planner.device).into_iter().enumerate() {
             push(&format!("{name} #{i}"), prog, lowering);
         }
@@ -450,7 +570,8 @@ pub(crate) fn group_families(target: &Target) -> Vec<Launch> {
             let cfg = GemmCfg { tile, warps, core: Core::Group, schedule: Schedule::ring(stages, false) };
             assert!(cfg.fits(target), "{cfg:?} fits the warpgroup core");
             let (m, n, k) = (tile[0] + 2, tile[1] - 3, 3 * tile[2]);
-            let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg };
+            let spec =
+                GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg: Admitted::assume(cfg) };
             (format!("group gemm {:?} {:?}", cfg.tile, cfg.warps), gemm::<BF16>(&spec), cfg.lowering(&planner.device))
         })
         .collect()
@@ -601,7 +722,14 @@ pub fn digested(target: &Target) -> Vec<Launch> {
             let deep = if m == 4096 { config::SHORTLIST } else { 8 };
             for cfg in config::distinct(&ranked).take(deep) {
                 let epilogue = Epilogue { gated, ..Epilogue::DEFAULT };
-                let spec = GemmSpec { m: 100, n: 96, k: cfg.tile[2] * 2, batch: Batch::Static(1), epilogue, cfg };
+                let spec = GemmSpec {
+                    m: 100,
+                    n: 96,
+                    k: cfg.tile[2] * 2,
+                    batch: Batch::Static(1),
+                    epilogue,
+                    cfg: Admitted::assume(cfg),
+                };
                 out.push((format!("gemm {m}x{n}x{k} g{gated} {cfg:?}"), gemm::<BF16>(&spec), cfg.lowering(&device)));
             }
         }
@@ -621,7 +749,7 @@ pub fn digested(target: &Target) -> Vec<Launch> {
                     cache: None,
                     packed: false,
                     scale: 0.125,
-                    cfg,
+                    cfg: Admitted::assume(cfg),
                 };
                 out.push((format!("fa d{d} t{t} {cfg:?}"), attention::<BF16>(&spec), cfg.lowering(&device)));
             }
@@ -665,7 +793,7 @@ pub fn digested(target: &Target) -> Vec<Launch> {
                 cache,
                 packed: false,
                 scale: 0.125,
-                cfg,
+                cfg: Admitted::assume(cfg),
             };
             out.push((format!("fa {name} {cfg:?}"), attention::<F16>(&spec), cfg.lowering(&device)));
         }
@@ -674,8 +802,13 @@ pub fn digested(target: &Target) -> Vec<Launch> {
         let g = yolo_geom(class);
         let [ho, wo] = g.out_hw();
         for c in conv_first_eight(&planner, 1, ho * wo, &g) {
-            let spec =
-                ConvSpec { batch: Batch::Static(1), geom: g, epilogue: Epilogue::DEFAULT, cfg: c.gemm, split: c.split };
+            let spec = ConvSpec {
+                batch: Batch::Static(1),
+                geom: g,
+                epilogue: Epilogue::DEFAULT,
+                cfg: Admitted::assume(c.gemm),
+                split: c.split,
+            };
             for (i, (prog, lowering)) in spec.programs::<F16>(&device).into_iter().enumerate() {
                 out.push((format!("conv {g:?} {c:?} #{i}"), prog, lowering));
             }

@@ -14,6 +14,7 @@ use super::{costs, first_eight, planner, self_join};
 use crate::atoms::{Core, Costs, Device, Fill, Target, sm86};
 use crate::build::BF16 as BF16T;
 use crate::ir::Schedule;
+use crate::kernels::Admitted;
 use crate::kernels::Batch;
 use crate::kernels::attention::{FaCfg, Forms, WARP_ROWS, narrowest_warp_rows};
 use crate::kernels::conv::ConvCfg;
@@ -1237,7 +1238,14 @@ fn an_unscaled_epilogue_keeps_its_tune_key() {
     assert_eq!(format!("{plain:?}"), "Epilogue { bias: true, act: None, gated: false, residual: true }");
     let half = Epilogue { scale: Some(Scale::new(0.5)), ..plain };
     assert_eq!(format!("{half:?}"), "Epilogue { bias: true, act: None, gated: false, residual: true, scale: 0.5 }");
-    let spec = |epilogue| GemmSpec { m: 64, n: 64, k: 64, batch: Batch::Static(1), epilogue, cfg: BIG_MEASURED };
+    let spec = |epilogue| GemmSpec {
+        m: 64,
+        n: 64,
+        k: 64,
+        batch: Batch::Static(1),
+        epilogue,
+        cfg: Admitted::assume(BIG_MEASURED),
+    };
     assert_ne!(gemm::<BF16T>(&spec(plain)), gemm::<BF16T>(&spec(half)));
 }
 

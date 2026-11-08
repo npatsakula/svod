@@ -10,6 +10,7 @@ use proptest::prelude::*;
 
 use crate::atoms::{Costs, Device, Target};
 use crate::build::BF16;
+use crate::kernels::Admitted;
 use crate::kernels::attention::{AttnMask, AttnSpec, FaCfg, attention};
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
 use crate::kernels::{Act, Batch};
@@ -139,9 +140,14 @@ fn cost_model_probe() {
     for ((label, m, n, k, epilogue), (_, ranked, predicted)) in
         gemm_shapes().into_iter().filter(|s| wanted(s.0)).zip(gemms)
     {
-        let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue, cfg: super::device::BIG };
+        let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue, cfg: Admitted::assume(super::device::BIG) };
         let pick = super::device::device_gemms(&planner, &spec).1;
-        let build = |cfg| vec![(gemm::<BF16>(&GemmSpec { cfg, ..spec.clone() }), cfg.lowering(&planner.device))];
+        let build = |cfg| {
+            vec![(
+                gemm::<BF16>(&GemmSpec { cfg: Admitted::assume(cfg), ..spec.clone() }),
+                cfg.lowering(&planner.device),
+            )]
+        };
         let ranked = timing(&ranked);
         let (verdicts, ns) = timed(ranked, &[pick], build);
         report(label, ranked, &predicted, &verdicts, &ns, &pick);
@@ -152,7 +158,12 @@ fn cost_model_probe() {
         let mask = AttnMask { causal, ..AttnMask::default() };
         let spec = super::attention::probe_spec(batch, heads, t, t, d, mask);
         let pick = super::attention::device_attention(&planner, &spec).2;
-        let build = |cfg| vec![(attention::<BF16>(&AttnSpec { cfg, ..spec.clone() }), cfg.lowering(&planner.device))];
+        let build = |cfg| {
+            vec![(
+                attention::<BF16>(&AttnSpec { cfg: Admitted::assume(cfg), ..spec.clone() }),
+                cfg.lowering(&planner.device),
+            )]
+        };
         let ranked = timing(&ranked);
         let (verdicts, ns) = timed(ranked, &[pick], build);
         report(label, ranked, &predicted, &verdicts, &ns, &pick);

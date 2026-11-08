@@ -4,6 +4,7 @@ use test_case::test_case;
 use crate::atoms::{Core, Fill};
 use crate::interp::{round_to, run};
 use crate::ir::*;
+use crate::kernels::Admitted;
 use crate::schedule::expand;
 
 fn count(prog: &Program, pred: impl Fn(&Stmt) -> bool) -> usize {
@@ -210,7 +211,7 @@ fn staged_halves_keep_their_copys_scope() {
         cache: None,
         packed: false,
         scale: 0.125,
-        cfg,
+        cfg: Admitted::assume(cfg),
     };
     let mut prog = attention::<BF16>(&spec);
     expand(&mut prog, Fill::Staged, Core::Warp);

@@ -7,13 +7,14 @@ use svod_dtype::{DType, ScalarDType};
 use svod_ir::SInt;
 use svod_tensor::Tensor;
 
-use super::config::Planner;
+use super::config::{NearestProblem, Planner};
 use super::shape::{self, Fallback, bound_var, extent, shape_of};
 use super::{
     DtypeSnafu, GraphSnafu, LaunchSnafu, NoScoresSnafu, Result, ShapeSnafu, Tuner, UnboundSnafu, fmt_shape, output,
     typed,
 };
 use crate::ir::Var;
+use crate::kernels::Admitted;
 pub use crate::kernels::nearest::Metric;
 use crate::kernels::nearest::{
     Floors, Live, NearestCfg, NearestMergeSpec, NearestSpec, RescoreSpec, SelectSpec, nearest as kernel, nearest_merge,
@@ -241,7 +242,8 @@ pub fn k_nearest_reranked(
         return on_graph(Fallback::Dtype);
     };
     tracing::debug!(target: super::PLAN, op = OP, ?dtype, ?cfg, coarse, "reranked search");
-    let pick = |_: &Planner, _: &[NearestCfg], spec: NearestSpec| NearestSpec { cfg, ..spec };
+    let pick =
+        picking(move |planner, _, spec| NearestSpec { cfg: admit(planner, &problem(&spec, dtype), *cfg), ..spec });
     let (_, index) = match dtype {
         ScalarDType::Int8 => {
             let (x8, c8) = (x8()?, c8()?);
@@ -267,14 +269,14 @@ pub fn k_nearest_reranked(
 /// The search over `dtype` rows of `xs` against `cs` keeping `coarse` a
 /// row, where it has a kernel: the tuner's pick, its device ns where timed,
 /// and its predicted ns.
-fn searched(
-    planner: &Planner,
+fn searched<'t>(
+    planner: &'t Planner,
     dtype: ScalarDType,
     xs: &[SInt],
     cs: &[SInt],
     coarse: usize,
     opts: Nearest,
-) -> Option<(NearestCfg, Option<u64>, f64)> {
+) -> Option<(Admitted<'t, NearestCfg>, Option<u64>, f64)> {
     let ((x_ext, x_var), c_ext) = (extent(xs).unzip(), extent(cs).map(|(e, _)| e));
     let (metric, floors, groups) = (opts.metric, opts.floors(), opts.groups.is_some());
     let dtypes = [DType::Scalar(dtype), DType::Scalar(dtype)];
@@ -283,7 +285,8 @@ fn searched(
     let ([n, d], m) = (x_ext?.dims[..].try_into().ok()?, c_ext?.dims[0]);
     let live = Live { rows: live_rows(&x_var.flatten()), k: None };
     let d = planner.nearest_depth(d, dtype)?;
-    let spec = NearestSpec { n, m, d, metric, floors, groups, k: coarse, cfg: cfgs[0], live };
+    let p = NearestProblem { n, m, d, dtype, metric, floors, groups, k: coarse };
+    let spec = NearestSpec { n, m, d, metric, floors, groups, k: coarse, cfg: admit(planner, &p, cfgs[0]), live };
     let (spec, ns) = timed(TuneStore::global(), planner, DType::Scalar(dtype), &cfgs, spec);
     let cost = problem(&spec, dtype).admit(planner, &spec.cfg).map_or(f64::INFINITY, |(ns, _)| ns);
     Some((spec.cfg, ns, cost))
@@ -398,17 +401,21 @@ pub(crate) fn picked(
     k: impl Into<SInt>,
     opts: Nearest,
     scaled: Option<&Scaled>,
-    pick: impl FnOnce(&Planner, &[NearestCfg], NearestSpec) -> NearestSpec,
+    pick: impl for<'t> FnOnce(&'t Planner, &[NearestCfg], NearestSpec<'t>) -> NearestSpec<'t>,
 ) -> Result<(Tensor, Tensor)> {
     let mut pick = Some(pick);
-    let mut once = |planner: &Planner, ranked: &[NearestCfg], spec| {
-        pick.take().expect("a launch picks once")(planner, ranked, spec)
-    };
+    let mut once = picking(|planner, ranked, spec| pick.take().expect("a launch picks once")(planner, ranked, spec));
     launched(x, c, k.into(), opts, scaled, true, &mut once)
 }
 
+/// `f` as a [`Pick`]: its signature deduced from the one every planner's
+/// borrow fits.
+pub(crate) fn picking<F: for<'t> FnMut(&'t Planner, &[NearestCfg], NearestSpec<'t>) -> NearestSpec<'t>>(f: F) -> F {
+    f
+}
+
 /// What [`launched`] asks of its config: the tuner, or the first launch's.
-type Pick<'a> = dyn FnMut(&Planner, &[NearestCfg], NearestSpec) -> NearestSpec + 'a;
+type Pick<'a> = dyn for<'t> FnMut(&'t Planner, &[NearestCfg], NearestSpec<'t>) -> NearestSpec<'t> + 'a;
 
 /// Model: the longest a kernel launch is planned to run. Past it a query
 /// matrix goes in several launches: a queue shows progress only between
@@ -458,14 +465,17 @@ pub(crate) fn in_launches(
             }),
             None => None,
         };
-        let mut first = |planner: &Planner, ranked: &[NearestCfg], spec: NearestSpec| {
+        let mut first = picking(|planner, ranked, spec| {
             let spec = match cfg {
-                Some(cfg) => NearestSpec { cfg, ..spec },
+                Some(cfg) => {
+                    let dtype = row.dtype().scalar().expect("a kernel dtype");
+                    NearestSpec { cfg: admit(planner, &problem(&spec, dtype), cfg), ..spec }
+                }
                 None => pick(planner, ranked, spec),
             };
-            cfg = Some(spec.cfg);
+            cfg = Some(*spec.cfg);
             spec
-        };
+        });
         let (score, index) = launched(&row, c, k.clone(), opts, scaled.as_ref(), false, &mut first)?;
         Tensor::realize_batch([&score, &index]).context(graph_err())?;
         scores.push(score);
@@ -545,9 +555,10 @@ fn launched(
     let (row_floor, col_floor) = (opts.row_floor.map(f32), opts.col_floor.map(f32));
     let (row_group, col_group) = opts.groups.map(|(r, c)| (r.cast(DType::Int32), c.cast(DType::Int32))).unzip();
     let live = Live { rows: live_rows(&x_var), k: k_var.clone().filter(|_| top > 1) };
-    let spec = NearestSpec { n, m, d: depth, metric, floors, groups, k: top, cfg: cfgs[0], live };
+    let dtype = x.dtype().scalar().expect("planned");
+    let p = NearestProblem { n, m, d: depth, dtype, metric, floors, groups, k: top };
+    let spec = NearestSpec { n, m, d: depth, metric, floors, groups, k: top, cfg: admit(&planner, &p, cfgs[0]), live };
     if divide && x_var.is_none() && k_var.is_none() {
-        let p = problem(&spec, x.dtype().scalar().expect("planned"));
         let ns = planner.admit(&p, &cfgs[0]).map_or(0.0, |(ns, _)| ns);
         let block = cfgs.iter().map(|c| c.bq).max().expect("a config");
         let rows = rows_a_launch(ns, n, block);
@@ -604,12 +615,12 @@ fn merge_of(spec: &NearestSpec) -> NearestMergeSpec {
 }
 
 /// One block of a score matrix's launches ([`launches`]).
-struct Block {
+struct Block<'t> {
     /// Its first row and candidate.
     r0: usize,
     c0: usize,
     /// Its scores and each trip's least a row ([`kernel`]).
-    scores: NearestSpec,
+    scores: NearestSpec<'t>,
     /// The `k` least of those leasts, whose `k`-th bounds each row's
     /// ([`nearest_select`]), where they are many enough to pass over most.
     bound: Option<SelectSpec>,
@@ -628,7 +639,7 @@ const SELECT_FILL: usize = 8;
 /// past its first, if any. A filtered listing of a whole row (a share's
 /// list fills only from scores at most the bound) splits its steps into
 /// shares until its blocks fill the SMs [`SELECT_FILL`] deep.
-fn launches(spec: &NearestSpec, planner: &Planner) -> Vec<Block> {
+fn launches<'t>(spec: &NearestSpec<'t>, planner: &Planner) -> Vec<Block<'t>> {
     let NearestSpec { n, m, k, metric, cfg, .. } = *spec;
     let select = cfg.select.expect("a score matrix");
     let sms = planner.sms();
@@ -786,7 +797,7 @@ fn matrix(
 /// What keys a nearest tuning besides its shape: the metric, floors and
 /// groups, and where the rows or the list are live, which (the kernels take
 /// them at launch).
-pub(crate) struct Salt<'a>(pub(crate) &'a NearestSpec);
+pub(crate) struct Salt<'a>(pub(crate) &'a NearestSpec<'a>);
 
 impl std::fmt::Debug for Salt<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -802,35 +813,44 @@ impl std::fmt::Debug for Salt<'_> {
 /// `spec` under the config [`nearest`] launches for its shape: the tuner's
 /// pick among `ranked` (the shape gate's list), through `store`. Live rows
 /// and lists tune at their bounds, keyed apart.
-pub fn tuned(
+pub fn tuned<'t>(
     store: &TuneStore,
-    planner: &Planner,
+    planner: &'t Planner,
     dtype: DType,
     ranked: &[NearestCfg],
-    spec: NearestSpec,
-) -> NearestSpec {
+    spec: NearestSpec<'t>,
+) -> NearestSpec<'t> {
     timed(store, planner, dtype, ranked, spec).0
 }
 
 /// [`tuned`] with the pick's device ns as the tuner last timed it, where it
 /// did (not with tuning off).
-pub(crate) fn timed(
+pub(crate) fn timed<'t>(
     store: &TuneStore,
-    planner: &Planner,
+    planner: &'t Planner,
     dtype: DType,
     ranked: &[NearestCfg],
-    spec: NearestSpec,
-) -> (NearestSpec, Option<u64>) {
+    spec: NearestSpec<'t>,
+) -> (NearestSpec<'t>, Option<u64>) {
     // A row's least alone keys as it did before the lists existed.
     let shape = [spec.n, spec.m, spec.d, spec.k];
     let shape = if spec.k == 1 { &shape[..3] } else { &shape[..] };
-    let build = |cfg: NearestCfg| programs(planner, dtype.clone(), &NearestSpec { cfg, ..spec.clone() });
     let p = problem(&spec, dtype.scalar().expect("a kernel dtype"));
+    let build = |cfg: NearestCfg| {
+        programs(planner, dtype.clone(), &NearestSpec { cfg: admit(planner, &p, cfg), ..spec.clone() })
+    };
     let expand = |admitted: &[NearestCfg]| planner.nearest_splits(&p, admitted);
     let mut tuner = Tuner::new(store, &planner.device, dtype.clone(), shape, Salt(&spec), build)
         .floored(|cfg| planner.floor_of(&p, cfg));
     let (cfg, ns) = tuner.tuned_timed(OP, ranked, expand);
-    (NearestSpec { cfg, ..spec }, ns)
+    (NearestSpec { cfg: admit(planner, &p, cfg), ..spec }, ns)
+}
+
+/// A ranked config, or the tuner's split of one, as the planner admits it
+/// for `p`: the ranking admitted every one, so a refusal is the planner's
+/// own inconsistency.
+fn admit<'t>(planner: &'t Planner, p: &NearestProblem, cfg: NearestCfg) -> Admitted<'t, NearestCfg> {
+    p.admitted(planner, cfg).unwrap_or_else(|why| panic!("{cfg:?} ranked for {p:?} is refused: {why:?}"))
 }
 
 /// The programs `spec` launches in order: the kernel, and split, the merge

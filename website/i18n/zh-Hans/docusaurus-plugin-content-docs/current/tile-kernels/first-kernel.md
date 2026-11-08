@@ -101,27 +101,30 @@ fn gemm_nt(m: usize, n: usize, kk: usize, [bm, bn, bk]: [usize; 3], stages: usiz
 
 ## 在设备上运行 {#running-it-on-the-device}
 
-`launch::graph_launch` 按顺序为每个声明的参数接收一个张量，并以惰性 `Tensor` 的形式返回第一个输出。与任何图内核一样，内核在结果被实现（realize）时运行。库中的 GEMM 接收一个 `GemmCfg`，其 `lowering` 需要设备测得的代价。
+`launch::graph_launch` 按顺序为每个声明的参数接收一个张量，并以惰性 `Tensor` 的形式返回第一个输出。与任何图内核一样，内核在结果被实现（realize）时运行。库中的 GEMM 以 `Admitted<GemmCfg>` 接收其配置：只有规划器的准入（在目标上可行、在形状上有声明）才能铸造它，因此没有内核会从未经准入的配置构建；其 `lowering` 需要设备测得的代价。
 
 ```rust
 use svod_dtype::{DType, default_device::default_device};
 use svod_tensor::Tensor;
-use svod_tk::atoms::{Core, Device, Target};
+use svod_tk::atoms::{Device, Target};
 use svod_tk::build::BF16;
 use svod_tk::kernels::Batch;
-use svod_tk::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
+use svod_tk::kernels::gemm::{Epilogue, GemmSpec, gemm};
 use svod_tk::launch::graph_launch;
+use svod_tk::ops::config::{GemmProblem, Planner};
 
 let (m, n, k) = (1000, 512, 256);
 let target = Target::for_device(&default_device()).expect("a GPU target");
 let device = Device { costs: svod_tk::probe::costs(&target)?.costs, target };
-let cfg =
-    GemmCfg { tile: [64, 64, 32], stages: 2, warps: [2, 2], unroll: true, core: Core::Warp, crews: 1 };
+let planner = Planner::new(device).expect("a target with an SM count");
+let problem = GemmProblem { batches: 1, m, n, k, halves: 1, rope: None };
+let ranked = planner.gemm_ranked(1, m, n, k, false);
+let cfg = problem.admitted(&planner, ranked[0]).expect("the ranking admitted it");
 let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg };
 let a = Tensor::empty(&[m * k], DType::BFloat16);
 let b = Tensor::empty(&[n * k], DType::BFloat16);
 let c = Tensor::empty(&[m * n], DType::BFloat16);
-let c = graph_launch(gemm::<BF16>(&spec), &cfg.lowering(&device), &[&a, &b, &c])?;
+let c = graph_launch(gemm::<BF16>(&spec), &cfg.lowering(&planner.device), &[&a, &b, &c])?;
 c.realize()?;
 ```
 

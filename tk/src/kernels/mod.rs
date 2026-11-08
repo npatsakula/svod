@@ -10,9 +10,47 @@ pub mod rows;
 
 use std::f64::consts::{FRAC_1_SQRT_2, LOG2_E};
 use std::fmt;
+use std::marker::PhantomData;
+use std::ops::Deref;
 
 use crate::build::*;
 use crate::ir::*;
+
+/// A config the planner admitted for a problem on its device: feasible on
+/// the target for the problem's statics and claimed on its shape, the one
+/// admission path ([`Planner::admitted`](crate::ops::config::Planner)). A
+/// kernel spec takes its config as one, so a kernel is built from nothing
+/// the planner did not let through, and the checks the admission makes are
+/// not made again where the kernel is built. `'t` is the planner's borrow.
+/// Tests and sweeps build what no planner admitted with [`Admitted::assume`]
+/// (the `sweep` feature).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Admitted<'t, C>(C, PhantomData<&'t ()>);
+
+impl<C> Admitted<'_, C> {
+    pub(crate) fn mint(cfg: C) -> Self {
+        Self(cfg, PhantomData)
+    }
+
+    /// `cfg` taken as admitted: for a kernel built outside the op layer.
+    #[cfg(any(test, feature = "sweep"))]
+    pub fn assume(cfg: C) -> Self {
+        Self::mint(cfg)
+    }
+}
+
+impl<C> Deref for Admitted<'_, C> {
+    type Target = C;
+    fn deref(&self) -> &C {
+        &self.0
+    }
+}
+
+impl<C: fmt::Debug> fmt::Debug for Admitted<'_, C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
 
 /// The launch's batch axis, grid z.
 #[derive(Clone, PartialEq, Eq)]

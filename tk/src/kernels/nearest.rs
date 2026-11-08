@@ -14,8 +14,8 @@
 use svod_dtype::ScalarDType;
 
 use super::attention::WARP_ROWS;
-use super::bound;
 use super::gemm::{mainloop, tile_order};
+use super::{Admitted, bound};
 use crate::build::*;
 use crate::ir::*;
 
@@ -217,7 +217,7 @@ pub struct Floors {
 /// of the matrix core's depth (zero columns pad it exactly); a streamed
 /// config's last chunk may overhang it.
 #[derive(Clone, Debug, PartialEq)]
-pub struct NearestSpec {
+pub struct NearestSpec<'t> {
     pub n: usize,
     pub m: usize,
     pub d: usize,
@@ -228,7 +228,7 @@ pub struct NearestSpec {
     pub groups: bool,
     /// The least scores a row keeps, ascending; 1: its least alone.
     pub k: usize,
-    pub cfg: NearestCfg,
+    pub cfg: Admitted<'t, NearestCfg>,
     /// The rows and the list length a launch binds, where they vary: `n`
     /// and `k` are then their bounds.
     pub live: Live,
@@ -350,6 +350,7 @@ pub fn nearest<T: MmaIn>(spec: &NearestSpec) -> Program {
 
 fn nearest_body<'k, T: MmaIn>(k: &mut Kernel<'k>, spec: &NearestSpec) {
     let NearestSpec { n, m, d, metric, floors, groups, k: top, cfg, ref live } = *spec;
+    let cfg = *cfg;
     let NearestCfg { bq, bkv, splits, .. } = cfg;
     let stages = cfg.stages();
     let tiles = m.div_ceil(bkv);
@@ -359,9 +360,6 @@ fn nearest_body<'k, T: MmaIn>(k: &mut Kernel<'k>, spec: &NearestSpec) {
     // A fill zeroes the 16-byte chunks past an overhanging chunk's depth.
     let chunk = 16 / T::DTYPE.bytes();
     assert!(cfg.bk.is_none() || d.is_multiple_of(chunk), "a streamed depth {d} of whole 16-byte chunks");
-    if let Err(e) = cfg.lists(top) {
-        panic!("{e}");
-    }
     assert!(live.k.is_none() || top > 1, "a live list of more than one score");
     assert!(live.rows.is_none() || live.from() == 0 || cfg.select.is_some(), "a panel of a score matrix");
     let (held_rows, from) = (live.held(n), live.from());

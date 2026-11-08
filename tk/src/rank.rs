@@ -20,6 +20,7 @@
 //! screened, and the leading tiles' pipelines timed again; a stage's lookup
 //! missing (a wrong salt) hands the shape to the next hypothesis.
 
+use crate::kernels::Admitted;
 use std::collections::HashMap;
 use std::hash::Hasher;
 use std::path::Path;
@@ -955,7 +956,7 @@ fn nearest(lines: &mut Lines, planner: &Planner, dtype: ScalarDType, shape: &[us
                         floors,
                         groups,
                         k,
-                        cfg: NearestCfg::new(64, 64, 2),
+                        cfg: Admitted::assume(NearestCfg::new(64, 64, 2)),
                         live: live.clone(),
                     };
                     // The op layer's own salt, and the tuning probe's (a
@@ -1290,7 +1291,7 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
             k: cfg.tile[2] * 8,
             batch: Batch::Static(1),
             epilogue: Epilogue { act: Act::Gelu, ..Epilogue::DEFAULT },
-            cfg: GemmCfg { schedule: cfg.schedule.rolled(), ..cfg },
+            cfg: Admitted::assume(GemmCfg { schedule: cfg.schedule.rolled(), ..cfg }),
         };
         out.push((
             format!("gemm {:?}", cfg.tile),
@@ -1322,7 +1323,7 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
             cache: None,
             packed: false,
             scale: 0.125,
-            cfg: FaCfg { schedule: cfg.schedule.rolled(), ..cfg },
+            cfg: Admitted::assume(FaCfg { schedule: cfg.schedule.rolled(), ..cfg }),
         };
         out.push((
             format!("attention {}x{} {:?}", cfg.bq, cfg.bkv, cfg.core),
@@ -1353,7 +1354,7 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
         floors: Floors::default(),
         groups: false,
         k,
-        cfg: NearestCfg { schedule: cfg.schedule.rolled(), ..cfg },
+        cfg: Admitted::assume(NearestCfg { schedule: cfg.schedule.rolled(), ..cfg }),
         live: Live::default(),
     };
     let ranked = planner.nearest_ranked(problem(1));

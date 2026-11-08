@@ -2,7 +2,7 @@
 //! shared ring, the online-softmax state `(m, l, o)` carried.
 
 use super::rows::NormCfg;
-use super::{Batch, batch_offset, bound, load_f32};
+use super::{Admitted, Batch, batch_offset, bound, load_f32};
 use crate::atoms::{Core, Device};
 use crate::build::*;
 use crate::ir::*;
@@ -265,7 +265,7 @@ pub(crate) fn key_mask_stride(tk: usize) -> usize {
 /// `[batch, t, heads, d]` queries against `[batch, tk, kv_heads, d]` keys and
 /// values; query head `h` reads KV head `h / (heads / kv_heads)`.
 #[derive(Clone, Debug, PartialEq)]
-pub struct AttnSpec {
+pub struct AttnSpec<'t> {
     pub batch: Batch,
     pub t: usize,
     pub tk: usize,
@@ -280,10 +280,10 @@ pub struct AttnSpec {
     /// is `t`.
     pub packed: bool,
     pub scale: f32,
-    pub cfg: FaCfg,
+    pub cfg: Admitted<'t, FaCfg>,
 }
 
-impl AttnSpec {
+impl AttnSpec<'_> {
     /// Parameters after the outputs, in order.
     pub fn extra_params(&self) -> Vec<&'static str> {
         let AttnMask { key_lens, key_mask, seg_start, .. } = self.mask;
@@ -446,6 +446,7 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
 fn attention_body<'k, T: Half>(k: &mut Kernel<'k>, spec: &AttnSpec) {
     let AttnSpec { ref batch, t, tk, heads, kv_heads, d, mask, cache, packed, scale, cfg } = *spec;
     let AttnMask { causal, window, chunk, key_lens, key_mask, seg_start, bias } = mask;
+    let cfg = *cfg;
     let FaCfg { bq, bkv, splits, .. } = cfg;
     let stages = cfg.stages();
     let cap = batch.capacity();
@@ -490,9 +491,6 @@ fn attention_body<'k, T: Half>(k: &mut Kernel<'k>, spec: &AttnSpec) {
     let (gz, bb) = batch.axis(k);
     k.grid([Sc::from(t.div_ceil(bq) * splits), Sc::from(heads), gz]);
     let kw = cfg.key_warps;
-    if let Err(e) = cfg.shares_keys() {
-        panic!("{e}");
-    }
     k.warps(cfg.row_warps());
     k.lone_warps(cfg.warps());
     let k_s = k.ring::<T>("k_s", bkv * d, kw * stages);

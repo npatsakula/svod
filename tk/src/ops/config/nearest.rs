@@ -9,6 +9,7 @@ use svod_dtype::ScalarDType;
 
 use crate::atoms::{Fill, Target};
 use crate::ir::{Axis, Orient, Schedule, Shape};
+use crate::kernels::Admitted;
 use crate::kernels::attention::WARP_ROWS;
 use crate::kernels::gemm::GROUP_ROWS;
 use crate::kernels::nearest::{Floors, LANES, LaneQueue, Metric, NearestCfg, SelectCfg, select_runs};
@@ -194,21 +195,27 @@ const LIST_SLOT: f64 = 1.0;
 /// over emitted programs at bq 128, 16 rows a warp, rolled rings on
 /// sm_86, differencing `bkv`, `k`, the queue depth and a queued list out;
 /// see [`NearestProblem::listing_static`]).
+#[cfg(any(test, feature = "sweep"))]
 const ROUND_DEAL_I: f64 = 46.0;
 /// Model (static): the pass form's bodies a deal (it carries each deal's
 /// vote and branch the round form keeps in its loop).
+#[cfg(any(test, feature = "sweep"))]
 const PASS_DEAL_I: f64 = 60.0;
 /// Model (static): the list's merge network, an instruction a slot a stage.
+#[cfg(any(test, feature = "sweep"))]
 const LIST_STAGE_I: f64 = 12.0;
 /// Model (static): the lanes' queues' sort, an instruction a unit of
 /// `q·log2(q)·(log2(q)+1)/2` over the `q` a lane queue holds beside its
 /// row's list.
+#[cfg(any(test, feature = "sweep"))]
 const QUEUE_STAGE_I: f64 = 22.0;
 /// Model (static): a queued list's flush into the outputs, an instruction
 /// a slot of the queue held in registers.
+#[cfg(any(test, feature = "sweep"))]
 const FLUSH_SLOT_I: f64 = 175.0;
 /// Model (static): the listing's fixed code a warp: the state, the `k`-th,
 /// the pending test, the round's fixed body.
+#[cfg_attr(not(any(test, feature = "sweep")), allow(dead_code))]
 const LISTING_FIXED_I: f64 = 450.0;
 /// Search bound: the scores a lane queues of a row before the warp merges
 /// the queues into the lists.
@@ -315,6 +322,11 @@ pub struct NearestProblem {
 }
 
 impl NearestProblem {
+    /// `cfg` admitted for this problem ([`Admitted`]), or why it is not.
+    pub fn admitted<'t>(&self, planner: &'t Planner, cfg: NearestCfg) -> Result<Admitted<'t, NearestCfg>, Rejected> {
+        planner.admitted(self, cfg)
+    }
+
     /// What `cfg` costs here, as [`GemmProblem::admit`]: [`Planner::price`] of
     /// its [`Claim`](super::cost::Claim). A candidate trip pays every wave's
     /// read of the candidate tile, its fill (every block reads every
@@ -641,6 +653,7 @@ impl NearestProblem {
     /// structure — the stage laws [`Self::listing`] already prices — and
     /// the fitted units stand as the calibration of issue efficiency they
     /// are declared to be.
+    #[cfg(any(test, feature = "sweep"))]
     pub(crate) fn listing_static(&self, cfg: &NearestCfg) -> f64 {
         let LaneQueue { width, depth, passes } = cfg.lane_queue();
         let deals = (cfg.bkv / width) as f64;

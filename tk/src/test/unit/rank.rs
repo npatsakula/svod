@@ -2,6 +2,7 @@
 //! synthetic store replayed through the very keys the op layer writes —
 //! the digest assert holding, a drifted list refused and counted.
 
+use crate::kernels::Admitted;
 use test_case::test_case;
 
 use super::Scratch;
@@ -196,11 +197,17 @@ fn the_op_layers_tuning_reads_the_same_line() {
     let dir = Scratch::new("rank-op");
     let planner = store(&dir, |at| [900, 800, 700, 600][at]);
     let ranked = planner.gemm_ranked(1, 512, 512, 512, false);
-    let spec =
-        GemmSpec { m: 512, n: 512, k: 512, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg: ranked[0] };
+    let spec = GemmSpec {
+        m: 512,
+        n: 512,
+        k: 512,
+        batch: Batch::Static(1),
+        epilogue: Epilogue::DEFAULT,
+        cfg: Admitted::assume(ranked[0]),
+    };
     let pick =
         tuned::linear(&TuneStore::replay(dir.to_path_buf()), &planner, svod_dtype::DType::BFloat16, &ranked, spec).cfg;
-    assert_eq!(pick, representatives(&ranked)[3], "the line's fastest, at 600 ns");
+    assert_eq!(*pick, representatives(&ranked)[3], "the line's fastest, at 600 ns");
 }
 
 /// The claim diff's mappings that hold: a trip's matrix steps in the
@@ -305,7 +312,7 @@ fn the_listing_static_decomposition_maps_its_programs() {
             floors: Floors::default(),
             groups: false,
             k,
-            cfg,
+            cfg: Admitted::assume(cfg),
             live: Live::default(),
         };
         rank::counted(&crate::lower::standalone(nearest::<F16>(&spec), &lowering).ok()?.program).map(|c| c.valu)

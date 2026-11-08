@@ -2,8 +2,8 @@
 //! a gathered A operand. `M` is the output pixels, `N` the output channels
 //! and `K = kh·kw·cin` walked tap-major, one pipeline over every tap.
 
-use super::Batch;
 use super::gemm::{Epilogue, GemmCfg, GemmSpec, SplitMergeSpec, mainloop_gemm, split_merge};
+use super::{Admitted, Batch};
 use crate::atoms::Device;
 use crate::build::*;
 use crate::ir::*;
@@ -47,12 +47,12 @@ impl ConvGeom {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct ConvSpec {
+pub struct ConvSpec<'t> {
     /// A static batch folds into `M`; a bound one walks grid z.
     pub batch: Batch,
     pub geom: ConvGeom,
     pub epilogue: Epilogue,
-    pub cfg: GemmCfg,
+    pub cfg: Admitted<'t, GemmCfg>,
     /// Reduction splits over grid z (a static batch only): the kernel writes
     /// f32 partials and [`split_merge`] adds them under the epilogue.
     pub split: usize,
@@ -69,9 +69,9 @@ pub struct ConvCfg {
 /// one pick the lattice does not search.
 const MERGE_TILE: [usize; 2] = [32, 32];
 
-impl ConvSpec {
+impl<'t> ConvSpec<'t> {
     /// The GEMM this convolution is: rows, columns, reduction and grid batch.
-    pub fn gemm(&self) -> GemmSpec {
+    pub fn gemm(&self) -> GemmSpec<'t> {
         let [ho, wo] = self.geom.out_hw();
         let (m, batch) = match self.batch {
             Batch::Static(n) => (n * ho * wo, Batch::Static(1)),

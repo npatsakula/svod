@@ -12,9 +12,9 @@ use super::{
     output,
 };
 use crate::build::{BF16, F16};
-use crate::kernels::Batch;
 use crate::kernels::conv::{ConvCfg, ConvGeom, ConvSpec};
-use crate::kernels::gemm::{Epilogue, Scale};
+use crate::kernels::gemm::{Epilogue, GemmCfg, Scale};
+use crate::kernels::{Admitted, Batch};
 use crate::launch;
 use crate::tune::TuneStore;
 
@@ -129,9 +129,10 @@ pub fn conv2d(x: &Tensor, w: &Tensor, opts: Conv) -> Result<Tensor> {
         out_f32: out_dtype != x.dtype(),
         rope: None,
     };
-    let spec = ConvSpec { batch, geom, epilogue, cfg: cfgs[0].gemm, split: cfgs[0].split };
+    let problem = problem(&batch, &geom);
+    let spec = ConvSpec { batch, geom, epilogue, cfg: admit(&planner, &problem, cfgs[0].gemm), split: cfgs[0].split };
     let spec = tuned(TuneStore::global(), &planner, x.dtype(), &cfgs, spec);
-    super::ran(OP, "conv", ConvCfg { gemm: spec.cfg, split: spec.split });
+    super::ran(OP, "conv", ConvCfg { gemm: *spec.cfg, split: spec.split });
     let mut programs = programs(&spec, &x.dtype(), &planner).into_iter();
     let y = output(&[images, ho, wo, geom.cout], &var, out_dtype).context(GraphSnafu { op: OP })?;
     let (prog, lowering) = programs.next().expect("the convolution");
@@ -158,7 +159,13 @@ fn programs(spec: &ConvSpec, dtype: &DType, planner: &Planner) -> crate::tune::C
 /// `spec` under the config and split [`conv2d`] launches for its geometry,
 /// batch and epilogue: the tuner's pick among `ranked` and their splits,
 /// through `store`.
-pub fn tuned(store: &TuneStore, planner: &Planner, dtype: DType, ranked: &[ConvCfg], spec: ConvSpec) -> ConvSpec {
+pub fn tuned<'t>(
+    store: &TuneStore,
+    planner: &'t Planner,
+    dtype: DType,
+    ranked: &[ConvCfg],
+    spec: ConvSpec<'t>,
+) -> ConvSpec<'t> {
     let g = spec.geom;
     let images = spec.batch.capacity();
     let key = [
@@ -184,12 +191,29 @@ pub fn tuned(store: &TuneStore, planner: &Planner, dtype: DType, ranked: &[ConvC
         list.retain(|c| c.split == 1 || !bound);
         list
     };
-    let build = |c: ConvCfg| programs(&ConvSpec { cfg: c.gemm, split: c.split, ..spec.clone() }, &dtype, planner);
-    let problem = ConvProblem { gemm: GemmProblem { batches, m, n: g.cout, k: g.k(), halves: 1, rope: None }, geom: g };
+    let problem = problem(&spec.batch, &g);
+    let build = |c: ConvCfg| {
+        let spec = ConvSpec { cfg: admit(planner, &problem, c.gemm), split: c.split, ..spec.clone() };
+        programs(&spec, &dtype, planner)
+    };
     let cfg = Tuner::new(store, &planner.device, dtype.clone(), &key, (&spec.batch, spec.epilogue), build)
         .floored(|c| planner.claim_of(&problem, &c.gemm).ok().map(|claim| planner.floor(&claim)))
         .tuned(OP, ranked, expand);
-    ConvSpec { cfg: cfg.gemm, split: cfg.split, ..spec }
+    ConvSpec { cfg: admit(planner, &problem, cfg.gemm), split: cfg.split, ..spec }
+}
+
+/// The convolution problem of `batch` images of `g`.
+fn problem(batch: &Batch, g: &ConvGeom) -> ConvProblem {
+    let bound = matches!(batch, Batch::Var(_));
+    let (batches, m) = shape::conv_grid(&shape::Extent { dims: vec![batch.capacity()], var: bound }, g);
+    ConvProblem { gemm: GemmProblem { batches, m, n: g.cout, k: g.k(), halves: 1, rope: None }, geom: *g }
+}
+
+/// A ranked config's GEMM body, or the tuner's split of one, as the planner
+/// admits it for `problem`: the ranking admitted every one, so a refusal is
+/// the planner's own inconsistency.
+fn admit<'t>(planner: &'t Planner, problem: &ConvProblem, cfg: GemmCfg) -> Admitted<'t, GemmCfg> {
+    problem.admitted(planner, cfg).unwrap_or_else(|why| panic!("{cfg:?} ranked for {problem:?} is refused: {why:?}"))
 }
 
 /// The graph's convolution of the same op: NCHW views, the accumulator,

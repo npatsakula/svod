@@ -128,27 +128,32 @@ result is rounded once, at the cast before the store.
 
 `launch::graph_launch` takes one tensor per declared parameter, in order, and returns the first
 output as a lazy `Tensor`. The kernel runs when the result is realized, like any graph kernel.
-The library GEMM takes a `GemmCfg`, whose `lowering` needs the device's measured costs.
+The library GEMM takes its config as an `Admitted<GemmCfg>`: only the planner's admission (feasible on the
+target, claimed on the shape) mints one, so no kernel is built from a config nothing admitted; its `lowering`
+needs the device's measured costs.
 
 ```rust
 use svod_dtype::{DType, default_device::default_device};
 use svod_tensor::Tensor;
-use svod_tk::atoms::{Core, Device, Target};
+use svod_tk::atoms::{Device, Target};
 use svod_tk::build::BF16;
 use svod_tk::kernels::Batch;
-use svod_tk::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
+use svod_tk::kernels::gemm::{Epilogue, GemmSpec, gemm};
 use svod_tk::launch::graph_launch;
+use svod_tk::ops::config::{GemmProblem, Planner};
 
 let (m, n, k) = (1000, 512, 256);
 let target = Target::for_device(&default_device()).expect("a GPU target");
 let device = Device { costs: svod_tk::probe::costs(&target)?.costs, target };
-let cfg =
-    GemmCfg { tile: [64, 64, 32], stages: 2, warps: [2, 2], unroll: true, core: Core::Warp, crews: 1 };
+let planner = Planner::new(device).expect("a target with an SM count");
+let problem = GemmProblem { batches: 1, m, n, k, halves: 1, rope: None };
+let ranked = planner.gemm_ranked(1, m, n, k, false);
+let cfg = problem.admitted(&planner, ranked[0]).expect("the ranking admitted it");
 let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg };
 let a = Tensor::empty(&[m * k], DType::BFloat16);
 let b = Tensor::empty(&[n * k], DType::BFloat16);
 let c = Tensor::empty(&[m * n], DType::BFloat16);
-let c = graph_launch(gemm::<BF16>(&spec), &cfg.lowering(&device), &[&a, &b, &c])?;
+let c = graph_launch(gemm::<BF16>(&spec), &cfg.lowering(&planner.device), &[&a, &b, &c])?;
 c.realize()?;
 ```
 

@@ -10,6 +10,7 @@ use svod_tensor::Tensor;
 use svod_tk::atoms::{Core, Device, Target};
 use svod_tk::build::BF16;
 use svod_tk::ir::Schedule;
+use svod_tk::kernels::Admitted;
 use svod_tk::kernels::Batch;
 use svod_tk::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
 use svod_tk::launch::graph_launch;
@@ -85,7 +86,7 @@ fn tk_gemm_tuned_vs_pinned() {
 
         // tk at a pinned config.
         let mut pinned = |label: &str, c: GemmCfg| {
-            let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: epi, cfg: c };
+            let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: epi, cfg: Admitted::assume(c) };
             let out = Tensor::empty(&[m * n], DType::BFloat16);
             let mut params: Vec<&Tensor> = vec![&a, &b];
             if let Some(r) = &r {

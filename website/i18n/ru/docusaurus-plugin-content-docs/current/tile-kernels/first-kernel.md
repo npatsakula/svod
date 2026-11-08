@@ -131,28 +131,33 @@ fn gemm_nt(m: usize, n: usize, kk: usize, [bm, bn, bk]: [usize; 3], stages: usiz
 
 `launch::graph_launch` принимает по одному тензору на каждый объявленный параметр, по порядку,
 и возвращает первый выход как ленивый `Tensor`. Ядро выполняется при реализации результата,
-как любое ядро графа. Библиотечный GEMM принимает `GemmCfg`, чьему `lowering` нужны измеренные
+как любое ядро графа. Библиотечный GEMM принимает свою конфигурацию как `Admitted<GemmCfg>`: её выпускает только допуск планировщика
+(выполнима на цели, заявлена на форме), так что ни одно ядро не строится из конфигурации, которую никто не
+допустил; его `lowering` нужны измеренные
 стоимости устройства.
 
 ```rust
 use svod_dtype::{DType, default_device::default_device};
 use svod_tensor::Tensor;
-use svod_tk::atoms::{Core, Device, Target};
+use svod_tk::atoms::{Device, Target};
 use svod_tk::build::BF16;
 use svod_tk::kernels::Batch;
-use svod_tk::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
+use svod_tk::kernels::gemm::{Epilogue, GemmSpec, gemm};
 use svod_tk::launch::graph_launch;
+use svod_tk::ops::config::{GemmProblem, Planner};
 
 let (m, n, k) = (1000, 512, 256);
 let target = Target::for_device(&default_device()).expect("a GPU target");
 let device = Device { costs: svod_tk::probe::costs(&target)?.costs, target };
-let cfg =
-    GemmCfg { tile: [64, 64, 32], stages: 2, warps: [2, 2], unroll: true, core: Core::Warp, crews: 1 };
+let planner = Planner::new(device).expect("a target with an SM count");
+let problem = GemmProblem { batches: 1, m, n, k, halves: 1, rope: None };
+let ranked = planner.gemm_ranked(1, m, n, k, false);
+let cfg = problem.admitted(&planner, ranked[0]).expect("the ranking admitted it");
 let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg };
 let a = Tensor::empty(&[m * k], DType::BFloat16);
 let b = Tensor::empty(&[n * k], DType::BFloat16);
 let c = Tensor::empty(&[m * n], DType::BFloat16);
-let c = graph_launch(gemm::<BF16>(&spec), &cfg.lowering(&device), &[&a, &b, &c])?;
+let c = graph_launch(gemm::<BF16>(&spec), &cfg.lowering(&planner.device), &[&a, &b, &c])?;
 c.realize()?;
 ```
 

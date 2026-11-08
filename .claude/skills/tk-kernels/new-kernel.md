@@ -11,7 +11,10 @@ shape; the excerpts below are verbatim (trimmed) at 2e9d5edb.
   (`k.pipeline(extent, Schedule::ring(stages, unroll), …)`, or a slot count); the launch takes
   `Lowering::new(&device)`, or the config's `lowering` where it picks the core (`GemmCfg`, `FaCfg`: `Core::Group` →
   the warpgroup atom). A mainloop kernel reuses `gemm::mainloop` with `GemmCfg::ring()`.
-- `XSpec`: shapes, `batch: Batch`, options, `cfg: XCfg`. Size every param at `batch.capacity()`.
+- `XSpec<'t>`: shapes, `batch: Batch`, options, `cfg: Admitted<'t, XCfg>` (`kernels::Admitted`): only the planner mints
+  one (`XProblem::admitted(&planner, cfg)`, feasible + claim), so the kernel fn checks none of what admission checked;
+  tests and `sweep.rs` take a config as admitted with `Admitted::assume` (the `sweep` feature, `tk_digest`/`tk_rank`
+  need it). Size every param at `batch.capacity()`.
 - `pub fn x<T: Elem>(spec: &XSpec) -> Program` is `Kernel::record(name, |k| x_body::<T>(k, spec))` with
   `fn x_body<'k, T: Elem>(k: &mut Kernel<'k>, spec: &XSpec)`: every handle carries the kernel's brand `'k`, so a
   helper that takes or returns one names it (`fn at<'k, T: Elem, A: Access>(k: &mut Kernel<'k>, p: ParamRef<'k, T, A>,

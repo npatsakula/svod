@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use crate::atoms::{Fill, Target};
+use crate::kernels::Admitted;
 use crate::kernels::conv::{ConvCfg, ConvGeom};
 use crate::kernels::gemm::GemmCfg;
 
@@ -36,6 +37,12 @@ pub struct ConvProblem {
 }
 
 impl ConvProblem {
+    /// `cfg`'s GEMM body admitted for this convolution ([`Admitted`]), or
+    /// why it is not; its split is the tuner's.
+    pub fn admitted<'t>(&self, planner: &'t Planner, cfg: GemmCfg) -> Result<Admitted<'t, GemmCfg>, Rejected> {
+        planner.admitted(self, cfg)
+    }
+
     /// The GEMM body's claim with the convolution's own fill: each input
     /// pixel is read by every tap of every output pixel within a stride of
     /// it, so the stream's distinct bytes are the image's and the weight's —

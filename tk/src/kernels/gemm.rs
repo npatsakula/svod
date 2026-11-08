@@ -4,7 +4,7 @@
 
 use std::fmt;
 
-use super::{Act, Batch, batch_offset, bound, konst, load_f32};
+use super::{Act, Admitted, Batch, batch_offset, bound, konst, load_f32};
 use crate::atoms::{Core, Device};
 use crate::build::*;
 use crate::ir::*;
@@ -152,13 +152,13 @@ impl GemmCfg {
 
 /// `m` rows per batch; the batch, when there is one, walks grid z.
 #[derive(Clone, Debug, PartialEq)]
-pub struct GemmSpec {
+pub struct GemmSpec<'t> {
     pub m: usize,
     pub n: usize,
     pub k: usize,
     pub batch: Batch,
     pub epilogue: Epilogue,
-    pub cfg: GemmCfg,
+    pub cfg: Admitted<'t, GemmCfg>,
 }
 
 /// Parameters in order: `a [batch·m, k]`, `b [n, k]` (`[2n, k]` gated),
@@ -216,7 +216,6 @@ fn build<'k, T: MmaIn, U: Elem>(
 ) {
     let GemmSpec { m, n, k: kk, ref batch, epilogue, cfg } = *spec;
     let [bm, bn, bk] = cfg.tile;
-    assert!(kk.is_multiple_of(bk), "k is a multiple of bk");
     let trips = kk / bk;
     let partial = split > 1;
     assert!(!partial || (*batch == Batch::Static(1) && !epilogue.gated && trips.is_multiple_of(split)));
@@ -231,7 +230,6 @@ fn build<'k, T: MmaIn, U: Elem>(
     let rope = epi.rope.map(|rope| {
         let plain = Epilogue { bias: epi.bias, rope: epi.rope, ..Epilogue::DEFAULT };
         assert!(epi == plain && rope.heads * rope.head_dim <= n, "{epi:?} turns no more than a bias");
-        assert!(cfg.turns(rope.head_dim), "{cfg:?} holds no whole heads of {}", rope.head_dim);
         let table = rope.seq * rope.head_dim / 2;
         (rope, k.input::<T>("cos", table), k.input::<T>("sin", table))
     });

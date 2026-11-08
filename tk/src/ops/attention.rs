@@ -15,12 +15,12 @@ use super::{
 };
 use crate::ir::Var;
 use crate::kernels;
-use crate::kernels::Batch;
 pub use crate::kernels::attention::Chunk;
 use crate::kernels::attention::{
     AttnMask, AttnSpec, Bias, CombineSpec, FaCfg, Forms, attention as fa, combine, key_mask_stride,
 };
 use crate::kernels::rows::NormCfg;
+use crate::kernels::{Admitted, Batch};
 use crate::launch;
 use crate::lower::Lowering;
 use crate::tune::TuneStore;
@@ -228,6 +228,7 @@ fn attend(q: &Tensor, k: &Tensor, v: &Tensor, packed: Option<&Tensor>, opts: Att
     // `lens`, `bools` and `segs` are set below; the tuner reads the key lengths' presence.
     let mask = AttnMask { key_lens: lens.is_some(), bias: bias_rows, ..edges };
     let scale = opts.scale.unwrap_or(1.0 / (d as f32).sqrt());
+    let problem = problem(&batch, t, tk, heads, d, mask.causal, bias_rows.is_some());
     let spec = AttnSpec {
         batch: batch.clone(),
         t,
@@ -239,7 +240,7 @@ fn attend(q: &Tensor, k: &Tensor, v: &Tensor, packed: Option<&Tensor>, opts: Att
         cache,
         packed: packed.is_some(),
         scale,
-        cfg: cfgs[0],
+        cfg: admit(&planner, &problem, cfgs[0]),
     };
     let cfg = tuned(TuneStore::global(), &planner, q.dtype(), &cfgs, spec.clone(), opts.splits).cfg;
     super::ran(OP, "flash_attention", cfg);
@@ -322,19 +323,20 @@ pub(crate) fn merge(batch: Batch, t: usize, heads: usize, d: usize, splits: usiz
 /// what the tuner reads of it): the tuner's pick among `ranked` (the shape
 /// gate's list, the configs that hold `spec`'s appended rows), at the
 /// split count `splits` names or every one worth measuring, through `store`.
-pub fn tuned(
+pub fn tuned<'t>(
     store: &TuneStore,
-    planner: &Planner,
+    planner: &'t Planner,
     dtype: DType,
     ranked: &[FaCfg],
-    spec: AttnSpec,
+    spec: AttnSpec<'t>,
     splits: Option<usize>,
-) -> AttnSpec {
+) -> AttnSpec<'t> {
     let AttnSpec { t, tk, heads, d, cache, .. } = spec;
     let lens = spec.mask.key_lens;
     let edges =
         AttnMask { causal: spec.mask.causal, window: spec.mask.window, chunk: spec.mask.chunk, ..AttnMask::default() };
     let bias_rows = spec.mask.bias;
+    let problem = problem(&spec.batch, t, tk, heads, d, spec.mask.causal, bias_rows.is_some());
     // The configs are admitted at a given split count, else unsplit; then
     // each comes with every split count worth measuring, the unsplit first.
     let split = split_ranked(ranked, splits, tk);
@@ -373,6 +375,7 @@ pub fn tuned(
             app_lens: false,
             ..c
         });
+        let cfg = admit(planner, &problem, cfg);
         let spec = AttnSpec { batch: measured.clone(), mask: measured_mask, cache: plain, cfg, ..spec.clone() };
         // A packed operand holds its own keys, none below `tk`.
         let below = !spec.packed && (cache.is_some() || lens);
@@ -386,20 +389,25 @@ pub fn tuned(
         }
         programs
     };
-    let problem = AttentionProblem {
-        tiles: spec.batch.capacity() * heads,
-        t,
-        tk,
-        d,
-        causal: spec.mask.causal,
-        bias: bias_rows.is_some(),
-    };
     let mut tuner = Tuner::new(store, &planner.device, dtype.clone(), &shape, salt, build)
         .floored(|cfg| planner.floor_of(&problem, cfg));
     let op = if spec.packed { PACKED } else { OP };
     let cfg = tune(op, &mut tuner, &split, bias_rows.is_some(), expand);
     tracing::debug!(target: super::PLAN, op, ?shape, pick = ?cfg, "attention tuned");
-    AttnSpec { cfg, ..spec }
+    AttnSpec { cfg: admit(planner, &problem, cfg), ..spec }
+}
+
+/// The attention problem of `batch` lanes of `heads` heads, `t` queries over
+/// `tk` keys at head size `d`.
+fn problem(batch: &Batch, t: usize, tk: usize, heads: usize, d: usize, causal: bool, bias: bool) -> AttentionProblem {
+    AttentionProblem { tiles: batch.capacity() * heads, t, tk, d, causal, bias }
+}
+
+/// A ranked config, or the tuner's split or form of one, as the planner
+/// admits it for `problem`: the ranking admitted every one, so a refusal is
+/// the planner's own inconsistency.
+fn admit<'t>(planner: &'t Planner, problem: &AttentionProblem, cfg: FaCfg) -> Admitted<'t, FaCfg> {
+    problem.admitted(planner, cfg).unwrap_or_else(|why| panic!("{cfg:?} ranked for {problem:?} is refused: {why:?}"))
 }
 
 /// `cfgs` (ranked) at the split count the caller names, else unsplit. A

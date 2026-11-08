@@ -27,7 +27,7 @@ for host work, `SVOD_DEVICE=CUDA` / `AMD` (or `CUDA:0`, `AMD:1`) for device work
 | What would tk run on an H100 / MI300X I don't have? | `cargo run -p svod-tk --release --example tk_dump -- --card h100-sxm --op gemm --shape 4096x4096x4096` (see Offline) |
 | What did the tuner pick on that card? | the same with `--cfg tuned --store <its tune store>` (read-only replay) |
 | Main loop beside cuBLAS/TK/HK/AITER | the same with `--compare <.cubin/.co/.s/.sass> [--fun NAME]` |
-| Did a refactor change any emitted kernel? | `tk_digest --out A` at base and change, `tk_digest --diff A B` (see Performance-regression protocol) |
+| Did a refactor change any emitted kernel? | `tk_digest --out A` at base and change, `tk_digest --diff A B` (`--features sweep`) (see Performance-regression protocol) |
 | Kernel or graph for a shape, and why | `RUST_LOG=svod_tk::plan=debug` (`graph … why=Shape`, `ranking`, `ranked`, `compiled`, `admitted`, `choice`, `tuned`); after the call, `ops::chosen()` gives the last op's `Chosen` (family + pick's Debug text, or why graph) |
 | Emitted instruction list | `TK_DUMP_LIST=1` (stderr, every `emit` call); pin one config with `SVOD_TK_TUNE=0` or use `tk_dump` |
 | LLVM IR / AMDGCN as compiled on a device | `SVOD_DUMP_NVPTX_IR=<dir>` / `SVOD_DUMP_AMD_IR=<dir>` → `<arch>_<kernel>_<ir digest>.ll`, `SVOD_DUMP_AMD_ASM=<dir>` → `.s` |
@@ -244,7 +244,7 @@ two −16 %: its GEMM (31 TF tk, 26 hipBLASLt) is bound by memory, not the loop.
 
 For a change under `ops/config.rs`, `probe.rs`, `tune.rs`, `schedule.rs`, `layouts.rs`, `layout/`, `atoms.rs`, `lower/`:
 
-1. **What changed in the code emitted**: `cargo run -p svod-tk --release --example tk_digest -- --out <dir>` in a
+1. **What changed in the code emitted**: `cargo run -p svod-tk --release --features sweep --example tk_digest -- --out <dir>` in a
    worktree at the base and at the change (≈45 s each: ~600 kernels × ten targets, `sweep::digested` under the declared
    costs: families, shortlists, attention/conv/norm/heads/probe variants; `--targets sm_86,gfx942`, `--full` keeps the
    `.ll`), then `tk_digest --diff <a> <b>`: kernels changed/removed/added per target and whether `rankings.txt`

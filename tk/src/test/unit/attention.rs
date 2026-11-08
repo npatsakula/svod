@@ -11,6 +11,7 @@ use crate::build::BF16;
 use crate::interp::{round_to, run};
 use crate::ir::Program;
 use crate::ir::Schedule;
+use crate::kernels::Admitted;
 use crate::kernels::Batch;
 use crate::kernels::attention::{
     AttnMask, AttnSpec, Bias, CacheLayout, Chunk, CombineSpec, FaCfg, Forms, Invalid, WARP_ROWS, attention, combine,
@@ -30,7 +31,7 @@ fn flash_attention(spec: &AttnSpec) -> Program {
 const SEGMENT: usize = 40;
 
 struct Case {
-    spec: AttnSpec,
+    spec: AttnSpec<'static>,
     q: Vec<f64>,
     /// `[rows, tk, heads_total, d]`, the batch's own rows without a cache.
     k: Vec<f64>,
@@ -64,7 +65,7 @@ fn keys(spec: &AttnSpec) -> usize {
     spec.tk + appended(spec)
 }
 
-fn case(spec: AttnSpec, lens: &[i64]) -> Case {
+fn case(spec: AttnSpec<'static>, lens: &[i64]) -> Case {
     let mut seed = 5;
     let n = |elems: usize, seed: &mut u64| super::rounded(ScalarDType::BFloat16, elems, seed, |x| x);
     let batch = spec.batch.capacity();
@@ -228,12 +229,12 @@ fn combine_spec(s: &AttnSpec) -> CombineSpec {
     CombineSpec { batch: s.batch.clone(), t: s.t, heads: s.heads, d: s.d, splits: s.cfg.splits, cfg: NormCfg { br: 4 } }
 }
 
-fn spec(t: usize, tk: usize, d: usize, bq: usize, bkv: usize, causal: bool, key_lens: bool) -> AttnSpec {
+fn spec(t: usize, tk: usize, d: usize, bq: usize, bkv: usize, causal: bool, key_lens: bool) -> AttnSpec<'static> {
     let mask = AttnMask { causal, key_lens, ..AttnMask::default() };
     masked(t, tk, d, bq, bkv, mask)
 }
 
-fn masked(t: usize, tk: usize, d: usize, bq: usize, bkv: usize, mask: AttnMask) -> AttnSpec {
+fn masked(t: usize, tk: usize, d: usize, bq: usize, bkv: usize, mask: AttnMask) -> AttnSpec<'static> {
     AttnSpec {
         batch: Batch::var("b", 1, 2),
         t,
@@ -245,7 +246,7 @@ fn masked(t: usize, tk: usize, d: usize, bq: usize, bkv: usize, mask: AttnMask) 
         cache: None,
         packed: false,
         scale: 1.0 / (d as f32).sqrt(),
-        cfg: FaCfg::new(bq, bkv, 2),
+        cfg: Admitted::assume(FaCfg::new(bq, bkv, 2)),
     }
 }
 
@@ -281,7 +282,7 @@ const LENS_BIAS: AttnMask = AttnMask { key_lens: true, ..PER_BATCH };
 const EVERY_BIAS: AttnMask = AttnMask { bias: Some(Bias::Shared), ..EVERY };
 
 /// `spec` with its cache's scores biased per batch.
-fn biased(spec: AttnSpec) -> AttnSpec {
+fn biased<'t>(spec: AttnSpec<'t>) -> AttnSpec<'t> {
     AttnSpec { mask: AttnMask { bias: Some(Bias::PerBatch), ..spec.mask }, ..spec }
 }
 
@@ -309,13 +310,13 @@ const fn rows32(bq: usize, bkv: usize) -> FaCfg {
 }
 
 /// A scale of the caller's choosing, in place of `1/√d`.
-fn scaled(mut spec: AttnSpec, scale: f32) -> AttnSpec {
+fn scaled<'t>(mut spec: AttnSpec<'t>, scale: f32) -> AttnSpec<'t> {
     spec.scale = scale;
     spec
 }
 
-fn with(cfg: FaCfg, spec: AttnSpec) -> AttnSpec {
-    AttnSpec { cfg, ..spec }
+fn with(cfg: FaCfg, spec: AttnSpec) -> AttnSpec<'static> {
+    AttnSpec { cfg: Admitted::assume(cfg), ..spec }
 }
 
 /// The program in the interpreter against a direct f64 softmax, and on a
@@ -408,12 +409,15 @@ fn with(cfg: FaCfg, spec: AttnSpec) -> AttnSpec {
 #[test_case(with(wide(128, 64), masked(200, 130, 128, 0, 0, LENS_BIAS)), &[130, 99]; "wide core, bias with lengths")]
 #[test_case(with(wide(128, 32), masked(128, 128, 128, 64, 32, EVERY_BIAS)), &[128, 100]; "wide core, every mask and a bias")]
 #[test_case(with(FaCfg { splits: 2, ..wide(64, 32) }, masked(100, 300, 64, 0, 0, AttnMask::default())), &[100, 300]; "wide core, two splits")]
-fn attention_matches_a_direct_softmax(spec: AttnSpec, lens: &[i64]) {
+fn attention_matches_a_direct_softmax(spec: AttnSpec<'static>, lens: &[i64]) {
     matches_a_direct_softmax(&case(spec.clone(), lens));
     let Some(planner) = super::device_planner() else { return };
     let target = planner.device.target.clone();
     let spec = AttnSpec {
-        cfg: FaCfg { schedule: Schedule::ring(target.fill.stages(spec.cfg.stages()), spec.cfg.unroll()), ..spec.cfg },
+        cfg: Admitted::assume(FaCfg {
+            schedule: Schedule::ring(target.fill.stages(spec.cfg.stages()), spec.cfg.unroll()),
+            ..*spec.cfg
+        }),
         ..spec
     };
     let bias = spec.mask.bias.is_some();
@@ -462,18 +466,18 @@ fn cached(
     row_map: bool,
     appended: usize,
     splits: usize,
-) -> AttnSpec {
+) -> AttnSpec<'static> {
     let mut spec = masked(t, tk, d, 64, 32, AttnMask { key_lens: true, ..AttnMask::default() });
     spec.heads = heads;
     spec.kv_heads = kv_heads;
     let cache = CacheLayout { rows: 3, heads_total: 3 * kv_heads, row_map, appended, app_lens: false };
     spec.cache = Some(cache);
-    spec.cfg.splits = splits;
+    spec.cfg = Admitted::assume(FaCfg { splits, ..*spec.cfg });
     spec
 }
 
 /// `spec` with the visible appended rows counted per batch.
-fn counted(mut spec: AttnSpec) -> AttnSpec {
+fn counted<'t>(mut spec: AttnSpec<'t>) -> AttnSpec<'t> {
     spec.cache = spec.cache.map(|c| CacheLayout { app_lens: true, ..c });
     spec
 }
@@ -485,7 +489,7 @@ fn counted(mut spec: AttnSpec) -> AttnSpec {
 #[test_case(3; "three splits")]
 fn a_fully_masked_batch_is_zeros(splits: usize) {
     let spec = masked(128, 128, 64, 64, 32, KEY_MASK);
-    let spec = AttnSpec { cfg: FaCfg { splits, ..spec.cfg }, ..spec };
+    let spec = AttnSpec { cfg: Admitted::assume(FaCfg { splits, ..*spec.cfg }), ..spec };
     let mut c = case(spec.clone(), &[128, 128]);
     let stride = key_mask_stride(spec.tk);
     c.key_mask[stride..].fill(0);
@@ -523,7 +527,7 @@ fn two_atom_rows_match_one_on_the_device(causal: bool, bias: bool, d: usize, bq:
     let device = &planner.device;
     let mask = AttnMask { causal, key_lens: true, bias: bias.then_some(Bias::PerBatch), ..NONE };
     let one = masked(100, 150, d, bq, bkv, mask);
-    let two = AttnSpec { cfg: FaCfg { warp_rows: 2 * WARP_ROWS, ..one.cfg }, ..one.clone() };
+    let two = AttnSpec { cfg: Admitted::assume(FaCfg { warp_rows: 2 * WARP_ROWS, ..*one.cfg }), ..one.clone() };
     if ![&one, &two].iter().all(|s| s.cfg.fits(&device.target, d, bias)) {
         eprintln!("skipped: the tiles do not fit the target");
         return;
@@ -571,7 +575,10 @@ fn a_non_finite_unread_element_never_reaches_the_output(cfg: FaCfg) {
     let Some(target) = super::device_target() else { return };
     let spec = with(cfg, cached(1, 100, [4, 4, 64], true, 0, 1));
     let spec = AttnSpec {
-        cfg: FaCfg { schedule: Schedule::ring(target.fill.stages(spec.cfg.stages()), spec.cfg.unroll()), ..spec.cfg },
+        cfg: Admitted::assume(FaCfg {
+            schedule: Schedule::ring(target.fill.stages(spec.cfg.stages()), spec.cfg.unroll()),
+            ..*spec.cfg
+        }),
         ..spec
     };
     let mut c = case(spec, &[100, 37]);
@@ -584,7 +591,7 @@ fn a_non_finite_unread_element_never_reaches_the_output(cfg: FaCfg) {
 
 /// `spec`'s kernel on the device against the program in the interpreter
 /// (within 2e-2 of it), its bf16 output's bits returned.
-fn on_device(spec: &AttnSpec, lens: &[i64], target: Target) -> Vec<u16> {
+fn on_device(spec: &AttnSpec<'static>, lens: &[i64], target: Target) -> Vec<u16> {
     on_device_case(case(spec.clone(), lens), target)
 }
 
@@ -678,8 +685,8 @@ fn on_device_case(c: Case, target: Target) -> Vec<u16> {
 }
 
 /// `spec` on the warpgroup core.
-fn grouped(spec: AttnSpec) -> AttnSpec {
-    AttnSpec { cfg: FaCfg { core: Core::Group, ..spec.cfg }, ..spec }
+fn grouped<'t>(spec: AttnSpec<'t>) -> AttnSpec<'t> {
+    AttnSpec { cfg: Admitted::assume(FaCfg { core: Core::Group, ..*spec.cfg }), ..spec }
 }
 
 /// The warpgroup core's kernel (four row warps a group of 64 query rows,
@@ -716,12 +723,12 @@ fn grouped(spec: AttnSpec) -> AttnSpec {
 #[test_case(cached(1, 200, [4, 4, 64], true, 0, 4), &[200, 70]; "cache: row map, four splits")]
 #[test_case(cached(5, 96, [2, 2, 128], false, 0, 2), &[64, 96]; "cache: d 128, two splits")]
 #[test_case(biased(cached(1, 200, [4, 4, 64], false, 0, 4)), &[200, 70]; "cache biased: four splits")]
-fn warpgroup_kernel_matches_the_program(spec: AttnSpec, lens: &[i64]) {
+fn warpgroup_kernel_matches_the_program(spec: AttnSpec<'static>, lens: &[i64]) {
     let Some(target) = super::group_target() else { return };
     let spec = grouped(spec);
-    assert!(spec.cfg.fits(&target, spec.d, spec.mask.bias.is_some()), "{:?} does not fit", spec.cfg);
     let group = on_device(&spec, lens, target.clone());
-    let warp = on_device(&AttnSpec { cfg: FaCfg { core: Core::Warp, ..spec.cfg }, ..spec }, lens, target);
+    let warp =
+        on_device(&AttnSpec { cfg: Admitted::assume(FaCfg { core: Core::Warp, ..*spec.cfg }), ..spec }, lens, target);
     let equal = group.iter().zip(&warp).filter(|(g, w)| g == w).count();
     // Bits as a signed magnitude, so ±0 agree and a sign change counts its steps.
     let ordered = |b: u16| if b & 0x8000 == 0 { i32::from(b) } else { -i32::from(b & 0x7fff) };
@@ -778,7 +785,9 @@ pub(super) fn device_attention(planner: &Planner, spec: &AttnSpec) -> (Vec<FaCfg
     let AttnSpec { t, tk, heads, d, mask, .. } = *spec;
     let tiles = spec.batch.capacity() * heads;
     let ranked = planner.attention_ranked(tiles, t, tk, d, mask.causal, mask.bias.is_some());
-    let build = |cfg: FaCfg| vec![(flash_attention(&AttnSpec { cfg, ..spec.clone() }), cfg.lowering(&planner.device))];
+    let build = |cfg: FaCfg| {
+        vec![(flash_attention(&AttnSpec { cfg: Admitted::assume(cfg), ..spec.clone() }), cfg.lowering(&planner.device))]
+    };
     let shape = [spec.batch.capacity(), t, tk, heads, d];
     let mut tuner =
         crate::ops::Tuner::new(crate::tune::TuneStore::global(), &planner.device, DType::BFloat16, &shape, mask, build);
@@ -792,7 +801,14 @@ pub(super) fn device_attention(planner: &Planner, spec: &AttnSpec) -> (Vec<FaCfg
 }
 
 /// The probe's shape: `batch` lanes of `heads` heads over `t` queries and keys.
-pub(super) fn probe_spec(batch: usize, heads: usize, t: usize, tk: usize, d: usize, mask: AttnMask) -> AttnSpec {
+pub(super) fn probe_spec(
+    batch: usize,
+    heads: usize,
+    t: usize,
+    tk: usize,
+    d: usize,
+    mask: AttnMask,
+) -> AttnSpec<'static> {
     AttnSpec {
         batch: Batch::Static(batch),
         t,
@@ -804,7 +820,7 @@ pub(super) fn probe_spec(batch: usize, heads: usize, t: usize, tk: usize, d: usi
         cache: None,
         packed: false,
         scale: 1.0 / (d as f32).sqrt(),
-        cfg: FaCfg::new(64, 64, 2),
+        cfg: Admitted::assume(FaCfg::new(64, 64, 2)),
     }
 }
 
@@ -855,8 +871,12 @@ fn attention_throughput_probe() {
             if !timed.contains(&pick) {
                 timed.push(pick);
             }
-            let build =
-                |cfg: FaCfg| vec![(flash_attention(&AttnSpec { cfg, ..spec.clone() }), cfg.lowering(&planner.device))];
+            let build = |cfg: FaCfg| {
+                vec![(
+                    flash_attention(&AttnSpec { cfg: Admitted::assume(cfg), ..spec.clone() }),
+                    cfg.lowering(&planner.device),
+                )]
+            };
             let ns = super::measure(timed.iter().map(|&c| build(c)));
             let flops = 4.0 * (batch * heads * t * t * d) as f64 / if causal { 2.0 } else { 1.0 };
             eprintln!(
@@ -918,7 +938,7 @@ fn key_warp_resources_probe() {
     for (key_warps, bkv) in [(1, 16), (2, 16), (4, 16), (1, 32), (2, 32), (4, 32)] {
         let cfg = FaCfg { key_warps, ..FaCfg::new(16, bkv, 2) };
         let spec = probe_spec(5, 20, 1, 1500, 64, AttnMask::default());
-        let spec = AttnSpec { cfg, ..spec };
+        let spec = AttnSpec { cfg: Admitted::assume(cfg), ..spec };
         let lowering = cfg.lowering(&planner.device);
         let Some((plan, _)) = crate::tune::scratch_plan(flash_attention(&spec), &lowering, &pool) else {
             eprintln!("{}: does not compile", label(&cfg));
@@ -945,7 +965,7 @@ fn the_tuned_d128_attention_compiles_on_gfx1151() {
     let (_, candidates, formed) = device_attention(&planner, &spec);
     let pool = crate::tune::ScratchPool::default();
     let resources = |cfg: FaCfg| {
-        let prog = flash_attention(&AttnSpec { cfg, ..spec.clone() });
+        let prog = flash_attention(&AttnSpec { cfg: Admitted::assume(cfg), ..spec.clone() });
         let (plan, _) = crate::tune::scratch_plan(prog, &cfg.lowering(&planner.device), &pool).expect("compiles");
         crate::tune::resources(&plan)
     };
@@ -993,10 +1013,9 @@ fn attention_candidates_probe() {
             }
         }
         let flops = 4.0 * (batch * heads * t * tk * d) as f64 / if causal { 2.0 } else { 1.0 };
-        let ns = super::measure(
-            cfgs.iter()
-                .map(|&c| vec![(flash_attention(&AttnSpec { cfg: c, ..spec.clone() }), c.lowering(&planner.device))]),
-        );
+        let ns = super::measure(cfgs.iter().map(|&c| {
+            vec![(flash_attention(&AttnSpec { cfg: Admitted::assume(c), ..spec.clone() }), c.lowering(&planner.device))]
+        }));
         eprintln!(
             "== attention b{batch} h{heads} t{t} tk{tk} d{d} causal={causal} ({} shortlist, {} lattice)",
             shortlist.len(),
@@ -1111,12 +1130,4 @@ fn decode_throughput_probe() {
 fn the_kernel_refuses_key_warps_it_cannot_share(cfg: FaCfg, want: Result<(), Invalid>) {
     assert_eq!(cfg.shares_keys(), want);
     assert_eq!(cfg.shares_keys().is_ok(), cfg.fits(&crate::atoms::sm86(), 64, false));
-}
-
-/// The kernel panics on what [`FaCfg::shares_keys`] refuses, naming it.
-#[test]
-#[should_panic(expected = "2 key warps share a block of one row warp, not 32 rows")]
-fn key_warps_over_two_row_warps_are_refused_by_the_kernel() {
-    let cfg = FaCfg { key_warps: 2, ..FaCfg::new(32, 16, 2) };
-    flash_attention(&AttnSpec { cfg, ..probe_spec(1, 1, 32, 64, 64, AttnMask::default()) });
 }

@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use crate::atoms::{Device, Fill, Target};
+use crate::kernels::Admitted;
 use crate::kernels::attention::FaCfg;
 use crate::kernels::conv::ConvCfg;
 use crate::kernels::gemm::GemmCfg;
@@ -215,6 +216,7 @@ pub(crate) enum Steps {
 
 impl Steps {
     /// The step count, in [`STEP`]-elements.
+    #[cfg(any(test, feature = "sweep"))]
     pub(crate) fn count(&self) -> f64 {
         match *self {
             Steps::F16(n) | Steps::Group(n) | Steps::Wide(n) | Steps::I8(n) => n,
@@ -459,6 +461,13 @@ impl Planner {
     pub(crate) fn claim_of<P: Family>(&self, problem: &P, cfg: &P::Cfg) -> Result<Claim, Rejected> {
         let regs = P::feasible(cfg, &self.device.target, &problem.statics())?;
         problem.claim(self, cfg, regs)
+    }
+
+    /// `cfg` as [admitted](Admitted) for `problem`: feasible for its statics
+    /// on the target and claimed on its shape ([`Self::claim_of`]), the one
+    /// way a kernel spec takes a config.
+    pub(crate) fn admitted<P: Family>(&self, problem: &P, cfg: P::Cfg) -> Result<Admitted<'_, P::Cfg>, Rejected> {
+        self.claim_of(problem, &cfg).map(|_| Admitted::mint(cfg))
     }
 
     /// What a feasible config costs the planner's device and the registers

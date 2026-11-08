@@ -302,6 +302,7 @@ pub(crate) trait Tiled: Copy + Eq + Hash + Send + Field {
 
     /// The config a [`code`](Self::code) holds; `None` where it is not the
     /// family's form.
+    #[cfg_attr(not(any(test, feature = "sweep")), allow(dead_code))]
     fn of_code(code: &str) -> Option<Self> {
         let mut fields = code.split(',').peekable();
         let cfg = Self::take(&mut fields)?;
@@ -310,12 +311,14 @@ pub(crate) trait Tiled: Copy + Eq + Hash + Send + Field {
 }
 
 /// A code's fields between its commas.
+#[cfg_attr(not(any(test, feature = "sweep")), allow(dead_code))]
 type Fields<'a> = std::iter::Peekable<std::str::Split<'a, char>>;
 
 /// A field of a config's code: the tokens it writes, and what it reads back
 /// from them (`None` where they are not its form).
 pub(crate) trait Field: Sized {
     fn put(&self, out: &mut Vec<String>);
+    #[cfg_attr(not(any(test, feature = "sweep")), allow(dead_code))]
     fn take(fields: &mut Fields<'_>) -> Option<Self>;
 }
 

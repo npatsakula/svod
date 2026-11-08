@@ -49,15 +49,15 @@ use svod_tk::atoms::{CARDS, Target};
 use svod_tk::build::{BF16, F16};
 use svod_tk::ir::Program;
 use svod_tk::isa;
-use svod_tk::kernels::attention::{AttnMask, AttnSpec, attention};
+use svod_tk::kernels::attention::{AttnMask, AttnSpec, FaCfg, attention};
 use svod_tk::kernels::conv::{ConvGeom, ConvSpec};
-use svod_tk::kernels::gemm::{Epilogue, GemmSpec, gemm};
+use svod_tk::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
 use svod_tk::kernels::heads::{HeadsSpec, Rope, heads};
-use svod_tk::kernels::nearest::{Floors, Metric, NearestSpec, nearest};
+use svod_tk::kernels::nearest::{Floors, Metric, NearestCfg, NearestSpec, nearest};
 use svod_tk::kernels::rows::{Norm, NormSpec, norm};
 use svod_tk::kernels::{Act, Batch};
 use svod_tk::lower::Lowering;
-use svod_tk::ops::config::{AttentionProblem, GemmProblem, NearestProblem, Planner, gemm_lattice};
+use svod_tk::ops::config::{AttentionProblem, ConvProblem, GemmProblem, NearestProblem, Planner, gemm_lattice};
 use svod_tk::ops::shape::{self, Extent, Plan};
 use svod_tk::ops::tuned;
 use svod_tk::probe::{self, Measured};
@@ -130,9 +130,10 @@ fn main() -> Result<()> {
                 .map_err(gate("linear"))?;
             let p = GemmProblem { batches: 1, m, n, k, halves: if gated { 2 } else { 1 }, ..GemmProblem::default() };
             report(&mut plan, top, &ranked, &gemm_lattice(&target), |c| p.admit(&planner, c));
-            let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue, cfg: ranked[0] };
+            let admit = |c: GemmCfg| p.admitted(&planner, c).map_err(|why| format!("{c:?}: {why:?}"));
+            let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue, cfg: admit(ranked[0])? };
             let spec = match pick {
-                Pick::Ranked(i) => GemmSpec { cfg: *ranked.get(i).ok_or("no such ranked config")?, ..spec },
+                Pick::Ranked(i) => GemmSpec { cfg: admit(*ranked.get(i).ok_or("no such ranked config")?)?, ..spec },
                 Pick::Tuned => {
                     let linear = |s: &TuneStore| tuned::linear(s, &planner, dtype.clone(), &ranked, spec.clone());
                     let probed = |s: &TuneStore| tuned::gemm_probe(s, &planner, dtype.clone(), &ranked, spec.clone());
@@ -155,7 +156,8 @@ fn main() -> Result<()> {
             report(&mut plan, top, &ranked, &a.lattice(&target), |c| a.admit(&planner, c));
             let mask = AttnMask { causal, ..AttnMask::default() };
             let scale = 1.0 / (d as f32).sqrt();
-            let cfg = ranked[0];
+            let admit = |c: FaCfg| a.admitted(&planner, c).map_err(|why| format!("{c:?}: {why:?}"));
+            let cfg = admit(ranked[0])?;
             let spec = AttnSpec {
                 batch: Batch::Static(b),
                 t,
@@ -170,7 +172,7 @@ fn main() -> Result<()> {
                 cfg,
             };
             let spec = match pick {
-                Pick::Ranked(i) => AttnSpec { cfg: *ranked.get(i).ok_or("no such ranked config")?, ..spec },
+                Pick::Ranked(i) => AttnSpec { cfg: admit(*ranked.get(i).ok_or("no such ranked config")?)?, ..spec },
                 Pick::Tuned => replayed(&store()?, "attention", |s| {
                     tuned::attention(s, &planner, dtype.clone(), &ranked, spec.clone(), None)
                 })?,
@@ -227,12 +229,14 @@ fn main() -> Result<()> {
             let p = GemmProblem { batches, m, n: cout, k: geom.k(), halves: 1, ..GemmProblem::default() };
             let gemms: Vec<_> = ranked.iter().map(|c| c.gemm).collect();
             report(&mut plan, top, &gemms, &[], |c| p.admit(&planner, c));
+            let cp = ConvProblem { gemm: p, geom };
+            let admit = |c: GemmCfg| cp.admitted(&planner, c).map_err(|why| format!("{c:?}: {why:?}"));
             let c = ranked[0];
-            let spec = ConvSpec { batch: Batch::Static(b), geom, epilogue, cfg: c.gemm, split: c.split };
+            let spec = ConvSpec { batch: Batch::Static(b), geom, epilogue, cfg: admit(c.gemm)?, split: c.split };
             let spec = match pick {
                 Pick::Ranked(i) => {
                     let c = *ranked.get(i).ok_or("no such ranked config")?;
-                    ConvSpec { cfg: c.gemm, split: c.split, ..spec }
+                    ConvSpec { cfg: admit(c.gemm)?, split: c.split, ..spec }
                 }
                 Pick::Tuned => {
                     replayed(&store()?, "conv2d", |s| tuned::conv(s, &planner, dtype.clone(), &ranked, spec.clone()))?
@@ -287,9 +291,11 @@ fn main() -> Result<()> {
             let d = planner.nearest_depth(d, scalar).ok_or("no matrix core")?;
             let p = NearestProblem { n, m, d, dtype: scalar, metric, floors, groups, k };
             report(&mut plan, top, &ranked, &p.lattice(&target), |c| p.admit(&planner, c));
-            let spec = NearestSpec { n, m, d, metric, floors, groups, k, cfg: ranked[0], live: Default::default() };
+            let admit = |c: NearestCfg| p.admitted(&planner, c).map_err(|why| format!("{c:?}: {why:?}"));
+            let spec =
+                NearestSpec { n, m, d, metric, floors, groups, k, cfg: admit(ranked[0])?, live: Default::default() };
             let spec = match pick {
-                Pick::Ranked(i) => NearestSpec { cfg: *ranked.get(i).ok_or("no such ranked config")?, ..spec },
+                Pick::Ranked(i) => NearestSpec { cfg: admit(*ranked.get(i).ok_or("no such ranked config")?)?, ..spec },
                 Pick::Tuned => replayed(&store()?, "nearest", |s| {
                     tuned::nearest(s, &planner, dtype.clone(), &ranked, spec.clone())
                 })?,

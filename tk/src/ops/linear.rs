@@ -15,6 +15,7 @@ use super::{
     typed,
 };
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Rope, Scale, gemm};
+use crate::kernels::{Admitted, Batch};
 use crate::launch;
 use crate::tune::TuneStore;
 
@@ -131,7 +132,9 @@ pub fn linear(x: &Tensor, w: &Tensor, opts: Linear) -> Result<Tensor> {
         out_f32: false,
         rope,
     };
-    let spec = GemmSpec { m, n, k, batch: batch_of(&var, 1), epilogue, cfg: cfgs[0] };
+    let batch = batch_of(&var, 1);
+    let problem = problem(m, n, k, &batch, epilogue);
+    let spec = GemmSpec { m, n, k, batch, epilogue, cfg: admit(&planner, &problem, cfgs[0]) };
     let spec = tuned(TuneStore::global(), &planner, x.dtype(), &cfgs, spec);
     super::ran(OP, "gemm", spec.cfg);
     let y = output(&[lead, &[n]].concat(), &var, x.dtype()).context(GraphSnafu { op: OP })?;
@@ -147,39 +150,60 @@ pub fn linear(x: &Tensor, w: &Tensor, opts: Linear) -> Result<Tensor> {
 
 /// `spec` under the config [`linear`] launches for its shape and epilogue:
 /// the tuner's pick among `ranked`, through `store`.
-pub fn tuned(store: &TuneStore, planner: &Planner, dtype: DType, ranked: &[GemmCfg], spec: GemmSpec) -> GemmSpec {
+pub fn tuned<'t>(
+    store: &TuneStore,
+    planner: &'t Planner,
+    dtype: DType,
+    ranked: &[GemmCfg],
+    spec: GemmSpec<'t>,
+) -> GemmSpec<'t> {
     let salt = (&spec.batch, spec.epilogue);
     tune(store, planner, dtype, ranked, (OP, salt), spec.clone())
 }
 
 /// [`tuned`] as the device tests and GEMM probes tune: under the kernel's
 /// name and [`DEVICE_TEST`].
-pub fn probed(store: &TuneStore, planner: &Planner, dtype: DType, ranked: &[GemmCfg], spec: GemmSpec) -> GemmSpec {
+pub fn probed<'t>(
+    store: &TuneStore,
+    planner: &'t Planner,
+    dtype: DType,
+    ranked: &[GemmCfg],
+    spec: GemmSpec<'t>,
+) -> GemmSpec<'t> {
     tune(store, planner, dtype, ranked, ("gemm", DEVICE_TEST), spec)
 }
 
-fn tune(
+fn tune<'t>(
     store: &TuneStore,
-    planner: &Planner,
+    planner: &'t Planner,
     dtype: DType,
     ranked: &[GemmCfg],
     (op, salt): (&'static str, impl Debug),
-    spec: GemmSpec,
-) -> GemmSpec {
+    spec: GemmSpec<'t>,
+) -> GemmSpec<'t> {
     let shape = [spec.batch.capacity(), spec.m, spec.n, spec.k];
-    let build = |cfg| vec![(typed!(dtype, gemm, &GemmSpec { cfg, ..spec.clone() }), cfg.lowering(&planner.device))];
-    let problem = GemmProblem {
-        batches: spec.batch.capacity().max(1),
-        m: spec.m,
-        n: spec.n,
-        k: spec.k,
-        halves: usize::from(spec.epilogue.gated) + 1,
-        rope: spec.epilogue.rope,
+    let problem = problem(spec.m, spec.n, spec.k, &spec.batch, spec.epilogue);
+    let build = |cfg: GemmCfg| {
+        let spec = GemmSpec { cfg: admit(planner, &problem, cfg), ..spec.clone() };
+        vec![(typed!(dtype, gemm, &spec), cfg.lowering(&planner.device))]
     };
     let cfg = Tuner::new(store, &planner.device, dtype.clone(), &shape, salt, build)
         .floored(|cfg| planner.floor_of(&problem, cfg))
         .tuned(op, ranked, <[_]>::to_vec);
-    GemmSpec { cfg, ..spec }
+    GemmSpec { cfg: admit(planner, &problem, cfg), ..spec }
+}
+
+/// The GEMM problem of a `[batch, m, k] · [n, k]ᵀ` under `epilogue`.
+fn problem(m: usize, n: usize, k: usize, batch: &Batch, epilogue: Epilogue) -> GemmProblem {
+    let halves = usize::from(epilogue.gated) + 1;
+    GemmProblem { batches: batch.capacity().max(1), m, n, k, halves, rope: epilogue.rope }
+}
+
+/// A ranked config, or the tuner's variant of one, as the planner admits it
+/// for `problem`: the ranking admitted every one, so a refusal is the
+/// planner's own inconsistency.
+fn admit<'t>(planner: &'t Planner, problem: &GemmProblem, cfg: GemmCfg) -> Admitted<'t, GemmCfg> {
+    problem.admitted(planner, cfg).unwrap_or_else(|why| panic!("{cfg:?} ranked for {problem:?} is refused: {why:?}"))
 }
 
 /// The generic graph of the same op; the input is materialized, since a lazy

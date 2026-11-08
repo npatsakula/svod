@@ -171,7 +171,10 @@ pub type Slotted<'k, 'r, T> = Tile<'k, Held<'r>, T>;
 /// returns) retires it, and a stale one is a compile error where a register
 /// tile would be read or carried on by mistake. `*acc` is the tile it holds
 /// now, for the operands of other ops; any register tile becomes one with
-/// `into`. The `_vec` forms of the loops carry plain register tiles.
+/// `into`, freely: `*acc` read before a product and made an accumulator
+/// again after it is the stale value the type otherwise refuses, so a
+/// conversion is a statement that the value is the one to carry. The `_vec`
+/// forms of the loops carry plain register tiles.
 pub struct Acc<'k, T>(pub Regs<'k, T>);
 
 impl<'k, T> From<Regs<'k, T>> for Acc<'k, T> {
