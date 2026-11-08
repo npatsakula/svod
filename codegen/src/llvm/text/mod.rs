@@ -161,7 +161,8 @@ impl Renderer for LlvmTextRenderer {
             };
             let source_name = format!("%data{}", arg.slot);
             if arg.addrspace.is_some() {
-                inner_params.push(format!("ptr noalias align 32 {source_name}"));
+                let readonly = if arg.readonly { " readonly" } else { "" };
+                inner_params.push(format!("ptr noalias{readonly} align 32 {source_name}"));
             } else {
                 inner_params.push(format!("{} {source_name}", ldt(&param.dtype())));
             }

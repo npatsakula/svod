@@ -425,7 +425,8 @@ fn a_fill_goes_in_whole_chunks_per_thread(rows: usize, cols: usize, fills: bool)
 
 /// The alias contract the LLVM text claims on a real program's buffers:
 /// every buffer parameter is `ptr noalias align 32` — each `ParamArg` a
-/// distinct buffer of the launch, a view an offset inside its own — while
+/// distinct buffer of the launch, a view an offset inside its own — an
+/// input `readonly` besides (no store of the kernel reaches it), while
 /// the one runtime scalar (a bound batch's count) carries nothing. What no
 /// access may carry beyond that (`align`, `!alias.scope`,
 /// `dereferenceable`) is the renderer's own pin, in codegen's
@@ -446,15 +447,17 @@ fn the_text_claims_exactly_the_aliasing_tk_knows(target: Target) {
     let text = crate::lower::render(norm::<BF16>(&spec), &Lowering::new(&super::declared(target))).unwrap();
     let define = text.lines().find(|l| l.starts_with("define ")).expect("a define line");
     let params = define.split('(').nth(1).expect("parameters").trim_end_matches(") #0 {");
-    let mut buffers = 0;
+    let (mut inputs, mut outputs) = (0, 0);
     for param in params.split(", ") {
-        if param.starts_with("ptr noalias align 32 %data") {
-            buffers += 1;
+        if param.starts_with("ptr noalias readonly align 32 %data") {
+            inputs += 1;
+        } else if param.starts_with("ptr noalias align 32 %data") {
+            outputs += 1;
         } else {
             assert_eq!(param, "i32 %data6", "the batch count alone is bare: {define}");
         }
     }
-    assert_eq!(buffers, 6, "x, residual, w, b, out, sum: {define}");
+    assert_eq!((inputs, outputs), (4, 2), "x, residual, w, b read-only; out, sum written: {define}");
 }
 
 /// The wide-load fold at a product's operands: where one wide load fills the

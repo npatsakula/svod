@@ -50,6 +50,7 @@ fn weak_param(addrspace: Option<AddrSpace>, min: i64, max: i64) -> Arc<UOp> {
         axis: None,
         device: None,
         volatile: false,
+        readonly: false,
     };
     UOp::new(Op::Param(ops::Param { shape, arg: arg.into() }), DType::WeakInt)
 }

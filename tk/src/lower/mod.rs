@@ -79,6 +79,12 @@ pub struct Lowered {
 /// `params` are the flat buffer UOps in `prog.params` order (placeholders on
 /// the graph path, `UOp::param`s on the direct one).
 pub fn lower(mut prog: Program, lowering: &Lowering, params: Vec<Arc<UOp>>, device: DeviceSpec) -> Result<Lowered> {
+    // An input is never stored to ([`crate::build::Kernel::input`]), which the backend may know.
+    let params = params
+        .iter()
+        .zip(&prog.params)
+        .map(|(u, p)| if p.kind == ParamKind::In { u.with_readonly() } else { u.clone() })
+        .collect();
     let grid = prog.warp_grid.count();
     let lone = prog.walk().any(|(_, s)| matches!(s, Stmt::Warps { .. }));
     ensure!(prog.warps.is_multiple_of(grid) && (prog.warps == grid || lone), GridSnafu { warps: prog.warps, grid });

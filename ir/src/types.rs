@@ -421,6 +421,8 @@ pub struct ParamArg {
     pub axis: Option<usize>,
     pub device: Option<DeviceSpec>,
     pub volatile: bool,
+    /// No store of the kernel reaches it: `readonly` to the backend.
+    pub readonly: bool,
 }
 
 impl ParamArg {
@@ -435,6 +437,7 @@ impl ParamArg {
             axis: None,
             device,
             volatile: false,
+            readonly: false,
         }
     }
 
@@ -449,6 +452,7 @@ impl ParamArg {
             axis: None,
             device: None,
             volatile: false,
+            readonly: false,
         }
     }
 
@@ -464,6 +468,7 @@ impl ParamArg {
             axis: None,
             device: None,
             volatile: false,
+            readonly: false,
         }
     }
 }

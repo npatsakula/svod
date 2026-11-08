@@ -279,6 +279,13 @@ impl UOp {
         Self::new(Op::Param(ops::Param { shape: shape.clone(), arg }), self.dtype())
     }
 
+    /// This PARAM declared read-only: no store of the kernel reaches it.
+    pub fn with_readonly(self: &Arc<Self>) -> Arc<Self> {
+        let Op::Param(ops::Param { shape, arg }) = self.op() else { panic!("a parameter's access") };
+        let arg = Box::new(crate::ParamArg { readonly: true, ..(**arg).clone() });
+        Self::new(Op::Param(ops::Param { shape: shape.clone(), arg }), self.dtype())
+    }
+
     /// This PARAM or BUFFER with the weak constants of its shape committed,
     /// as [`Self::linear_program`] commits them (itself when none are weak,
     /// or when it is neither): parameters committed before a program is
