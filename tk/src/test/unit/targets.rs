@@ -741,10 +741,10 @@ fn ranked_launches(planner: &Planner, shortlist_deep: bool) -> Vec<(Launch, (usi
     let mut launches = vec![];
     for (m, n, k) in [(4096, 4096, 4096), (704, 512, 512), (1500, 1280, 5120), (37, 96, 48)] {
         for gated in [false, true] {
-            let ranked = planner.gemm_ranked(1, m, n, k, gated);
+            let epilogue = Epilogue { gated, ..Epilogue::DEFAULT };
+            let ranked = planner.gemm_ranked(1, m, n, k, &epilogue);
             let deep = if m == 4096 && shortlist_deep { config::SHORTLIST } else { 8 };
             for cfg in config::distinct(&ranked).take(deep) {
-                let epilogue = Epilogue { gated, ..Epilogue::DEFAULT };
                 let spec = GemmSpec {
                     m: 100,
                     n: 96,
@@ -783,7 +783,7 @@ fn ranked_launches(planner: &Planner, shortlist_deep: bool) -> Vec<(Launch, (usi
     for class in super::conv::YOLO {
         let g = super::conv::yolo_geom(class);
         let [ho, wo] = g.out_hw();
-        for c in conv_first_eight(planner, 1, ho * wo, &g) {
+        for c in conv_first_eight(planner, 1, ho * wo, &g, &Epilogue::DEFAULT) {
             let spec = ConvSpec {
                 batch: Batch::Static(1),
                 geom: g,

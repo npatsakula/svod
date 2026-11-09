@@ -102,7 +102,7 @@ fn assert_valid(list: &[GemmCfg], target: &Target, k: usize, gated: bool) {
 #[test_case(sm86(), true; "sm_86 gated")]
 #[test_case(crate::test::unit::targets::amd(AmdArch::Gfx1201, 64), false; "gfx1201")]
 fn the_ranking_drops_what_a_lane_cannot_hold(target: Target, gated: bool) {
-    let ranked = planner(target.clone()).gemm_ranked(1, 704, 1536, 512, gated);
+    let ranked = planner(target.clone()).gemm_ranked(1, 704, 1536, 512, &Epilogue { gated, ..Epilogue::DEFAULT });
     let halves = if gated { 2 } else { 1 };
     assert!(ranked.iter().all(|c| {
         let (acc, live) = c.live_registers(&target, halves).unwrap();
@@ -129,7 +129,13 @@ fn the_ranking_drops_what_a_lane_cannot_hold(target: Target, gated: bool) {
 fn linear_plans(x: &[usize], n: usize, gated: bool, want: Result<(), Fallback>) {
     for smem in [sm86().smem_bytes, 48 << 10] {
         let target = Target { smem_bytes: smem, ..sm86() };
-        let plan = shape::linear(Some(&planner(target.clone())), &[BF16, BF16], Some(&ext(x)), n, gated);
+        let plan = shape::linear(
+            Some(&planner(target.clone())),
+            &[BF16, BF16],
+            Some(&ext(x)),
+            n,
+            &Epilogue { gated, ..Epilogue::DEFAULT },
+        );
         match plan {
             Plan::Kernel(list) => {
                 assert_eq!(want, Ok(()), "{smem} bytes: {list:?}");
@@ -141,7 +147,13 @@ fn linear_plans(x: &[usize], n: usize, gated: bool, want: Result<(), Fallback>) 
 }
 
 fn gemm_list(x: &Extent, n: usize, gated: bool) -> Arc<[GemmCfg]> {
-    kernel_plan(shape::linear(Some(&planner(sm86())), &[BF16, BF16], Some(x), n, gated))
+    kernel_plan(shape::linear(
+        Some(&planner(sm86())),
+        &[BF16, BF16],
+        Some(x),
+        n,
+        &Epilogue { gated, ..Epilogue::DEFAULT },
+    ))
 }
 
 /// Nemotron's projections (704 rows under a batch variable of capacity 1)
@@ -177,10 +189,11 @@ fn a_gated_gemm_is_a_double_width_problem() {
     let deep = gemm_cfg([128, 128, 64], 2, [2, 4], true);
     assert_eq!((eight.registers(&target, 2), half.registers(&target, 2)), (Some(216), Some(128)));
     assert!(deep.registers(&target, 2).is_some_and(|r| r > 256), "{:?}", deep.registers(&target, 2));
-    let gated = planner(target.clone()).gemm_ranked(1, 4096, 3072, 1024, true);
+    let gated =
+        planner(target.clone()).gemm_ranked(1, 4096, 3072, 1024, &Epilogue { gated: true, ..Epilogue::DEFAULT });
     assert_valid(&gated, &target, 1024, true);
     assert!(gated.iter().all(|c| c.tile[2] >= 32), "{gated:?}");
-    let p = config::GemmProblem { batches: 1, m: 4096, n: 3072, k: 1024, halves: 2, rope: None };
+    let p = config::GemmProblem::new(1, 4096, 3072, 1024, &Epilogue { gated: true, ..Epilogue::DEFAULT });
     assert!(deep.smem_bytes(true, 2) > target.smem_bytes && p.admit(&planner(target), &deep).is_err());
 }
 
@@ -283,7 +296,7 @@ fn an_sm_issues_its_share_of_blocks() {
 #[test_case(sm86(), 32, false; "sm86 three slots against one")]
 #[test_case(rdna3(), 32, true; "rdna3 two slots against one")]
 fn a_one_slot_ring_is_charged_its_own_trip(target: Target, bk: usize, cheap_wins: bool) {
-    let problem = config::GemmProblem { batches: 1, m: 4096, n: 4096, k: 4096, halves: 1, rope: None };
+    let problem = config::GemmProblem::new(1, 4096, 4096, 4096, &Epilogue::DEFAULT);
     // A small tile: its residency is bound by shared memory, not registers.
     let two = gemm_cfg([64, 64, bk], target.fill.stages(3), [2, 2], false);
     let one = GemmCfg { schedule: Schedule::ring(1, two.unroll()), ..two };
@@ -457,7 +470,7 @@ fn a_round_pays_the_latency_its_ring_leaves() {
 #[test]
 fn a_one_warp_tile_yields_to_four_at_one_wave_per_scheduler() {
     let cfg = |warps| gemm_cfg([64, 64, 32], 3, warps, false);
-    let p = config::GemmProblem { batches: 1, m: 64 * 28, n: 64 * 28, k: 4096, halves: 1, rope: None };
+    let p = config::GemmProblem::new(1, 64 * 28, 64 * 28, 4096, &Epilogue::DEFAULT);
     let ratio = |step_lone| {
         let planner = planned(Device { target: sm86(), costs: Costs { step_lone, ..costs() } });
         let cost = |c| p.admit(&planner, &c).expect("admitted").0;
@@ -539,7 +552,7 @@ fn blocks_in_flight_share_their_lines_past_the_cache() {
     assert!((planner.fill_byte(&stream(100.0 * mb, 0.75), 1e4 * mb) - (0.75 * 0.01 + 0.25 * streamed)).abs() < 1e-12);
     assert!((planner.fill_byte(&stream(100.0 * mb, 0.0), 1e4 * mb) - streamed).abs() < 1e-12);
     assert!(planner.fill_byte(&stream(mb, 0.5), 100.0 * mb) < planner.fill_byte(&stream(mb, 0.0), 100.0 * mb));
-    let p = config::GemmProblem { batches: 1, m: 4096, n: 4096, k: 4096, halves: 1, rope: None };
+    let p = config::GemmProblem::new(1, 4096, 4096, 4096, &Epilogue::DEFAULT);
     let cfg = gemm_cfg([128, 128, 32], 3, [2, 4], false);
     let dram = planned(Device { target: sm86(), costs: Costs { l2_bytes: 0.0, ..c } });
     let (cached, at_dram) = (p.admit(&planner, &cfg).unwrap().0, p.admit(&dram, &cfg).unwrap().0);
@@ -627,7 +640,7 @@ proptest::proptest! {
 #[test]
 fn under_latency_resident_blocks_halve_the_cost() {
     let slow = Costs { latency: 1e9, ..costs() };
-    let p = config::GemmProblem { batches: 112, m: 128, n: 128, k: 4096, halves: 1, rope: None };
+    let p = config::GemmProblem::new(112, 128, 128, 4096, &Epilogue::DEFAULT);
     let cfg = gemm_cfg([128, 128, 32], 3, [2, 4], false);
     let full = sm86();
     let starved = Target { occupancy: crate::atoms::Occupancy { waves: 2, ..full.occupancy }, ..sm86() };
@@ -645,7 +658,7 @@ fn under_latency_resident_blocks_halve_the_cost() {
 fn two_crews_are_ranked_only_where_the_target_interleaves_them(arch: AmdArch, some: bool) {
     let target = crate::test::unit::targets::amd(arch, 64);
     assert_eq!(target.crews >= 2, some);
-    let ranked = planner(target.clone()).gemm_ranked(1, 4096, 4096, 4096, false);
+    let ranked = planner(target.clone()).gemm_ranked(1, 4096, 4096, 4096, &Epilogue::DEFAULT);
     let crews: Vec<&GemmCfg> = ranked.iter().filter(|c| c.crews() == 2).collect();
     assert_eq!(!crews.is_empty(), some, "{ranked:?}");
     assert!(crews.iter().all(|c| c.core == Core::Warp
@@ -1020,7 +1033,7 @@ fn twins_are_judged_by_time_alone(spilled: &[usize], failed: &[usize], count: us
 #[test]
 fn a_gemm_tiles_twins_are_its_pipelines() {
     let planner = planner(sm86());
-    let ranked = planner.gemm_ranked(1, 704, 1536, 512, false);
+    let ranked = planner.gemm_ranked(1, 704, 1536, 512, &Epilogue::DEFAULT);
     let winner = ranked.iter().find(|c| c.tile[..2] == [64, 64] && c.warps == [2, 2]).copied().unwrap();
     let twins = winner.twins(&ranked);
     assert!(twins.contains(&winner));
@@ -1049,7 +1062,8 @@ fn a_cached_shape_is_timed_at_half_its_capacity_too(tk: usize, below: bool, spli
 #[test]
 fn variants_keep_their_variant_across_twins() {
     let planner = planner(sm86());
-    let ranked: Vec<ConvCfg> = planner.conv_ranked(1, 6400, &geom([80, 80], 64, 64, 3, 1, 1, 1)).to_vec();
+    let ranked: Vec<ConvCfg> =
+        planner.conv_ranked(1, 6400, &geom([80, 80], 64, 64, 3, 1, 1, 1), &Epilogue::DEFAULT).to_vec();
     let winner = ConvCfg { split: 3, ..ranked[0] };
     let twins = winner.twins(&ranked);
     assert!(twins.len() >= 2 && twins.iter().all(|c| c.split == 3 && c.gemm.tile() == winner.gemm.tile()), "{twins:?}");
@@ -1083,7 +1097,7 @@ fn a_split_convolutions_twins_divide_its_trips(target: Target) {
     let mut checked = 0;
     for (hw, cin, cout) in geometries {
         let g = geom(hw, cin, cout, 3, 1, 1, 1);
-        let ranked: Vec<ConvCfg> = planner.conv_ranked(1, hw[0] * hw[1], &g).to_vec();
+        let ranked: Vec<ConvCfg> = planner.conv_ranked(1, hw[0] * hw[1], &g, &Epilogue::DEFAULT).to_vec();
         for &cfg in &ranked {
             for split in [2, 3, 4, 6, 9] {
                 if !(g.k() / cfg.gemm.tile[2]).is_multiple_of(split) {
@@ -1161,7 +1175,7 @@ fn a_planner_over_a_zero_field_still_ranks() {
     let measured = crate::probe::Measured { costs: Costs { step: 0.0, ..costs() }, unmeasured: vec!["step"] };
     let planner = Planner::measured(sm86(), measured).expect("an SM count");
     assert_eq!(planner.unmeasured, ["step"]);
-    let p = config::GemmProblem { batches: 1, m: 704, n: 1536, k: 512, halves: 1, rope: None };
+    let p = config::GemmProblem::new(1, 704, 1536, 512, &Epilogue::DEFAULT);
     let ranked = p.ranked(&planner);
     assert!(!ranked.is_empty());
     assert!(ranked.iter().all(|c| p.admit(&planner, c).is_ok_and(|(cost, _)| cost.is_finite() && cost > 0.0)));
@@ -1173,7 +1187,7 @@ fn a_planner_over_a_zero_field_still_ranks() {
 #[test]
 fn a_ranking_at_zero_costs_is_finite() {
     let planner = planned(Device { target: sm86(), costs: Costs::default() });
-    let p = config::GemmProblem { batches: 1, m: 4096, n: 4096, k: 4096, halves: 1, rope: None };
+    let p = config::GemmProblem::new(1, 4096, 4096, 4096, &Epilogue::DEFAULT);
     let ranked = p.ranked(&planner);
     assert!(!ranked.is_empty());
     assert!(ranked.iter().all(|c| p.admit(&planner, c).is_ok_and(|(cost, _)| cost == 0.0)));
@@ -1189,7 +1203,13 @@ fn a_ranking_at_zero_costs_is_finite() {
 fn gated_linear_drops_a_stage_under_a_static_cap() {
     let target = Target { smem_bytes: 48 << 10, ..sm86() };
     let planner = planner(target.clone());
-    let list = kernel_plan(shape::linear(Some(&planner), &[BF16, BF16], Some(&ext(&[4096, 4096])), 4096, true));
+    let list = kernel_plan(shape::linear(
+        Some(&planner),
+        &[BF16, BF16],
+        Some(&ext(&[4096, 4096])),
+        4096,
+        &Epilogue { gated: true, ..Epilogue::DEFAULT },
+    ));
     assert_valid(&list, &target, 4096, true);
     assert!(!list.iter().any(|c| c.tile == [128, 128, 32] && c.stages() == 3), "{list:?}");
 }
@@ -1207,19 +1227,25 @@ fn every_op_falls_back_alike(target: Option<Target>, dtypes: &[DType], static_di
     let image = static_dims.then(|| ext(&[2, 20, 20, 64]));
     let planner = target.map(planner);
     let target = planner.as_ref();
-    assert_eq!(shape::linear(target, dtypes, x.as_ref(), 1024, false), Plan::Graph(why));
+    assert_eq!(shape::linear(target, dtypes, x.as_ref(), 1024, &Epilogue::DEFAULT), Plan::Graph(why));
     assert_eq!(shape::attention(target, dtypes, q.as_ref(), kv.as_ref(), false, false), Plan::Graph(why));
     assert_eq!(shape::norm(target, dtypes, x.as_ref()), Plan::Graph(why));
     assert_eq!(shape::heads(target, dtypes, x.as_ref(), 64), Plan::Graph(why));
     let g = conv_geom(20, 64, 64, 3, 1);
-    assert_eq!(shape::conv2d(target, dtypes, dtypes[0].clone(), None, image.as_ref(), &g, 1), Plan::Graph(why));
+    assert_eq!(
+        shape::conv2d(target, dtypes, dtypes[0].clone(), None, image.as_ref(), &g, 1, &Epilogue::DEFAULT),
+        Plan::Graph(why)
+    );
 }
 
 /// A bound variable that is the reduced dim itself is no batch.
 #[test]
 fn a_variable_reduced_dim_falls_back() {
     let x = Extent { dims: vec![64], var: true };
-    assert_eq!(shape::linear(Some(&planner(sm86())), &[BF16; 2], Some(&x), 64, false), Plan::Graph(Fallback::Symbolic));
+    assert_eq!(
+        shape::linear(Some(&planner(sm86())), &[BF16; 2], Some(&x), 64, &Epilogue::DEFAULT),
+        Plan::Graph(Fallback::Symbolic)
+    );
     let x = Extent { dims: vec![1024], var: true };
     assert_eq!(shape::norm(Some(&planner(sm86())), &[BF16; 2], Some(&x)), Plan::Graph(Fallback::Symbolic));
 }
@@ -1227,7 +1253,10 @@ fn a_variable_reduced_dim_falls_back() {
 #[test]
 fn f16_takes_the_kernels() {
     let f16 = [DType::Float16, DType::Float16];
-    assert!(matches!(shape::linear(Some(&planner(sm86())), &f16, Some(&ext(&[64, 64])), 64, false), Plan::Kernel(_)));
+    assert!(matches!(
+        shape::linear(Some(&planner(sm86())), &f16, Some(&ext(&[64, 64])), 64, &Epilogue::DEFAULT),
+        Plan::Kernel(_)
+    ));
 }
 
 /// The tune store keys a GEMM by its epilogue's text: without a scale it
@@ -1400,7 +1429,7 @@ fn gfx1151_attention_shortlists_hold_the_measured_tiles(d: usize, causal: bool, 
 #[test]
 fn gfx1151_gemm_ranking_leads_with_full_blocks() {
     let planner = planned(Device { target: gfx1151(), costs: super::gfx1151_costs() });
-    let list = first_eight(&planner.gemm_ranked(1, 4096, 4096, 4096, false));
+    let list = first_eight(&planner.gemm_ranked(1, 4096, 4096, 4096, &Epilogue::DEFAULT));
     let simds = planner.device.target.occupancy.simds;
     assert!(list.iter().all(|c| c.warps[0] * c.warps[1] >= simds), "{list:?}");
 }
@@ -2009,7 +2038,8 @@ fn conv_geom(hw: usize, cin: usize, cout: usize, k: usize, s: usize) -> crate::k
 /// an eighth (a body of 96 channels takes no 128-wide tile); a 48-channel
 /// body, whose steps would be one depth, takes the graph on the cp.async path.
 fn conv_plan(x: &[usize], g: crate::kernels::conv::ConvGeom, groups: usize) -> Result<usize, Fallback> {
-    let plan = shape::conv2d(Some(&planner(sm86())), &[F16; 3], F16, None, Some(&ext(x)), &g, groups);
+    let plan =
+        shape::conv2d(Some(&planner(sm86())), &[F16; 3], F16, None, Some(&ext(x)), &g, groups, &Epilogue::DEFAULT);
     first(plan).map(|c| c.gemm.tile[1])
 }
 
@@ -2042,7 +2072,16 @@ fn conv_plans(x: &[usize], g: crate::kernels::conv::ConvGeom, groups: usize, wan
 #[test_case(&[F16, BF16, F16], F16, None, false; "mixed operands")]
 fn conv_dtype_plans(dtypes: &[DType], out: DType, residual: Option<DType>, kernel: bool) {
     let g = conv_geom(80, 384, 96, 3, 1);
-    let plan = shape::conv2d(Some(&planner(sm86())), dtypes, out, residual, Some(&ext(&[1, 80, 80, 384])), &g, 1);
+    let plan = shape::conv2d(
+        Some(&planner(sm86())),
+        dtypes,
+        out,
+        residual,
+        Some(&ext(&[1, 80, 80, 384])),
+        &g,
+        1,
+        &Epilogue::DEFAULT,
+    );
     assert_eq!(matches!(plan, Plan::Kernel(_)), kernel, "{plan:?}");
     if !kernel {
         assert_eq!(plan, Plan::Graph(Fallback::Dtype));
@@ -2055,8 +2094,8 @@ fn conv_dtype_plans(dtypes: &[DType], out: DType, residual: Option<DType>, kerne
 fn a_bound_conv_batch_plans_per_image() {
     let g = conv_geom(80, 384, 384, 3, 2);
     let x = Extent { dims: vec![8, 80, 80, 384], var: true };
-    let plan = shape::conv2d(Some(&planner(sm86())), &[F16; 3], F16, None, Some(&x), &g, 1);
-    assert_eq!(plan, Plan::Kernel(planner(sm86()).conv_ranked(8, 1600, &g)));
+    let plan = shape::conv2d(Some(&planner(sm86())), &[F16; 3], F16, None, Some(&x), &g, 1, &Epilogue::DEFAULT);
+    assert_eq!(plan, Plan::Kernel(planner(sm86()).conv_ranked(8, 1600, &g, &Epilogue::DEFAULT)));
 }
 
 /// RDNA plans kernels from the lattice under its own facts: register-staged
@@ -2068,8 +2107,13 @@ fn a_bound_conv_batch_plans_per_image() {
 #[test]
 fn rdna_plans_register_staged_kernels() {
     let target = rdna3();
-    let gemms =
-        kernel_plan(shape::linear(Some(&planner(target.clone())), &[BF16; 2], Some(&ext(&[4096, 4096])), 4096, false));
+    let gemms = kernel_plan(shape::linear(
+        Some(&planner(target.clone())),
+        &[BF16; 2],
+        Some(&ext(&[4096, 4096])),
+        4096,
+        &Epilogue::DEFAULT,
+    ));
     assert_valid(&gemms, &target, 4096, false);
     assert!(first_eight(&gemms).iter().all(|c| c.unroll() == (c.stages() == 2) && c.fits(&target)), "{gemms:?}");
     for (d, t) in [(64, 1500), (64, 1)] {

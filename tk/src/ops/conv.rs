@@ -5,7 +5,7 @@ use svod_dtype::{DType, ScalarDType};
 use svod_ir::SInt;
 use svod_tensor::Tensor;
 
-use super::config::{ConvProblem, GemmProblem, Planner};
+use super::config::{ConvProblem, Planner};
 use super::shape::{self, extent, shape_of};
 use super::{
     Act, DtypeSnafu, GraphSnafu, LaunchSnafu, Linear, Result, ShapeSnafu, Tuner, batch_of, fmt_shape, kernel_buffer,
@@ -111,15 +111,6 @@ pub fn conv2d(x: &Tensor, w: &Tensor, opts: Conv) -> Result<Tensor> {
     let planner = super::planner(&x.device());
     let dtypes: Vec<DType> = [Some(x), Some(w), opts.bias].into_iter().flatten().map(Tensor::dtype).collect();
     let residual_dtype = opts.residual.map(Tensor::dtype);
-    let plan =
-        shape::conv2d(planner.as_deref(), &dtypes, out_dtype.clone(), residual_dtype, ext.as_ref(), &geom, groups);
-    let Some(cfgs) = super::kernel(OP, plan) else { return graph(x, w, opts).context(GraphSnafu { op: OP }) };
-    let (ext, var, planner) = (ext.expect("planned"), var.flatten(), planner.expect("planned"));
-    let images = ext.dims[0];
-    let batch = match var {
-        Some(_) => batch_of(&var, images),
-        None => Batch::Static(images),
-    };
     let epilogue = Epilogue {
         bias: opts.bias.is_some(),
         act: opts.act,
@@ -129,7 +120,24 @@ pub fn conv2d(x: &Tensor, w: &Tensor, opts: Conv) -> Result<Tensor> {
         out_f32: out_dtype != x.dtype(),
         rope: None,
     };
-    let problem = problem(&batch, &geom);
+    let plan = shape::conv2d(
+        planner.as_deref(),
+        &dtypes,
+        out_dtype.clone(),
+        residual_dtype,
+        ext.as_ref(),
+        &geom,
+        groups,
+        &epilogue,
+    );
+    let Some(cfgs) = super::kernel(OP, plan) else { return graph(x, w, opts).context(GraphSnafu { op: OP }) };
+    let (ext, var, planner) = (ext.expect("planned"), var.flatten(), planner.expect("planned"));
+    let images = ext.dims[0];
+    let batch = match var {
+        Some(_) => batch_of(&var, images),
+        None => Batch::Static(images),
+    };
+    let problem = problem(&batch, &geom, &epilogue);
     let spec = ConvSpec { batch, geom, epilogue, cfg: admit(&planner, &problem, cfgs[0].gemm), split: cfgs[0].split };
     let spec = tuned(TuneStore::global(), &planner, x.dtype(), &cfgs, spec);
     super::ran(OP, "conv", ConvCfg { gemm: *spec.cfg, split: spec.split });
@@ -191,7 +199,7 @@ pub fn tuned<'t>(
         list.retain(|c| c.split == 1 || !bound);
         list
     };
-    let problem = problem(&spec.batch, &g);
+    let problem = problem(&spec.batch, &g, &spec.epilogue);
     let build = |c: ConvCfg| {
         let spec = ConvSpec { cfg: admit(planner, &problem, c.gemm), split: c.split, ..spec.clone() };
         programs(&spec, &dtype, planner)
@@ -202,11 +210,11 @@ pub fn tuned<'t>(
     ConvSpec { cfg: admit(planner, &problem, cfg.gemm), split: cfg.split, ..spec }
 }
 
-/// The convolution problem of `batch` images of `g`.
-fn problem(batch: &Batch, g: &ConvGeom) -> ConvProblem {
+/// The convolution problem of `batch` images of `g` under `epilogue`.
+fn problem(batch: &Batch, g: &ConvGeom, epilogue: &Epilogue) -> ConvProblem {
     let bound = matches!(batch, Batch::Var(_));
     let (batches, m) = shape::conv_grid(&shape::Extent { dims: vec![batch.capacity()], var: bound }, g);
-    ConvProblem { gemm: GemmProblem { batches, m, n: g.cout, k: g.k(), halves: 1, rope: None }, geom: *g }
+    ConvProblem::new(batches, m, g, epilogue)
 }
 
 /// A ranked config's GEMM body, or the tuner's split of one, as the planner

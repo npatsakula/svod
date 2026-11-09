@@ -127,7 +127,7 @@ fn rx9070xt() -> Target {
 #[test_case(sm86(), sm86_costs(), 8192, 8192, 1024; "sm_86 a shallow product")]
 #[test_case(rx9070xt(), gfx1201_costs(), 16384, 16384, 4096; "gfx1201 a large square")]
 fn the_planner_keeps_the_default_raster(target: Target, costs: Costs, m: usize, n: usize, k: usize) {
-    let ranked = measured(target, costs).gemm_ranked(1, m, n, k, false);
+    let ranked = measured(target, costs).gemm_ranked(1, m, n, k, &Epilogue::DEFAULT);
     assert!(!ranked.is_empty());
     assert!(ranked.iter().all(|c| c.order == TileOrder::DEFAULT), "{m}x{n}x{k}: a raster off the default");
 }
@@ -137,6 +137,6 @@ fn the_planner_keeps_the_default_raster(target: Target, costs: Costs, m: usize, 
 #[test]
 fn a_convolution_walks_the_default() {
     let planner = measured(sm86(), sm86_costs());
-    let ranked = planner.conv_ranked(1, 160 * 160, &geom([160, 160], 64, 128, 3, 1, 1, 1));
+    let ranked = planner.conv_ranked(1, 160 * 160, &geom([160, 160], 64, 128, 3, 1, 1, 1), &Epilogue::DEFAULT);
     assert!(!ranked.is_empty() && ranked.iter().all(|c| c.gemm.order == TileOrder::DEFAULT));
 }

@@ -48,7 +48,7 @@ fn store(dir: &std::path::Path, ns: impl Fn(usize) -> u64) -> Planner {
     std::fs::write(&file, &text).expect("written");
     let measured = crate::probe::stored(dir, &target).expect("the file's costs");
     let planner = Planner::measured(target.clone(), measured).expect("an SM count");
-    let ranked = planner.gemm_ranked(1, 512, 512, 512, false);
+    let ranked = planner.gemm_ranked(1, 512, 512, 512, &Epilogue::DEFAULT);
     let reps = representatives(&ranked);
     let salt = format!("{:?}", (Batch::Static(1), Epilogue::DEFAULT));
     let keyed = |rule: &str, list: &[GemmCfg]| {
@@ -71,8 +71,8 @@ fn store(dir: &std::path::Path, ns: impl Fn(usize) -> u64) -> Planner {
 /// A 512³ GEMM's first four representatives — the store's candidates — and
 /// the ns the model says they cost.
 fn predicted(planner: &Planner) -> Vec<f64> {
-    let ranked = planner.gemm_ranked(1, 512, 512, 512, false);
-    let p = GemmProblem { batches: 1, m: 512, n: 512, k: 512, halves: 1, rope: None };
+    let ranked = planner.gemm_ranked(1, 512, 512, 512, &Epilogue::DEFAULT);
+    let p = GemmProblem::new(1, 512, 512, 512, &Epilogue::DEFAULT);
     representatives(&ranked).iter().take(4).map(|&c| p.admit(planner, &c).expect("ranked").0).collect()
 }
 
@@ -109,7 +109,7 @@ fn a_line_no_ranking_makes_replays_from_its_own_configs() {
     let planner = store(&dir, |at| 100 + at as u64);
     let file = TuneStore::at(Some(dir.to_path_buf())).file("sm_86-28sm").expect("a file");
     let text = std::fs::read_to_string(&file).expect("read");
-    let ranked = planner.gemm_ranked(1, 512, 512, 512, false);
+    let ranked = planner.gemm_ranked(1, 512, 512, 512, &Epilogue::DEFAULT);
     let drifted: Vec<GemmCfg> = representatives(&ranked).into_iter().skip(1).take(4).collect();
     let made = |key: u64| {
         format!(
@@ -196,7 +196,7 @@ fn the_epilogue_clusters_scale_their_own_constants() {
 fn the_op_layers_tuning_reads_the_same_line() {
     let dir = Scratch::new("rank-op");
     let planner = store(&dir, |at| [900, 800, 700, 600][at]);
-    let ranked = planner.gemm_ranked(1, 512, 512, 512, false);
+    let ranked = planner.gemm_ranked(1, 512, 512, 512, &Epilogue::DEFAULT);
     let spec = GemmSpec {
         m: 512,
         n: 512,
@@ -228,22 +228,25 @@ fn the_claimed_steps_and_smem_hold_their_programs(target: Target) {
     }
 }
 
-/// A GEMM's epilogue claim enters the ranking, and the diff's VALU row
-/// predicts a program's instruction mix from the claim itself: the gelu's
-/// forty tile operations an element. A staged ring's peeled loops repeat a
-/// trip's address arithmetic whatever the epilogue, which the claim doesn't
-/// count: 17 % over on gfx942's smallest tile.
-#[test_case(sm86(), 0.15; "sm86")]
-#[test_case(crate::sweep::amd(AmdArch::Gfx942, 304), 0.2; "gfx942")]
-#[test_case(crate::sweep::amd(AmdArch::Gfx1201, 96), 0.15; "gfx1201")]
-fn the_gemm_epilogue_claim_holds_its_program(target: Target, within: f64) {
-    for d in &rank::claims(&target).0 {
-        if !d.name.starts_with("gemm") {
-            continue;
-        }
+/// A GEMM's epilogue claim is the layer's: under every epilogue the models
+/// run, the diff's VALU row (an output element's operations) holds the
+/// program's past its last product within one (an activation lowers in one
+/// more on sm_86) and 15 % of the rest.
+#[test_case(sm86(); "sm86")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx942, 304); "gfx942")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1201, 96); "gfx1201")]
+fn the_gemm_epilogue_claim_holds_its_program(target: Target) {
+    let (diffed, _) = rank::claims(&target);
+    let gemms: Vec<_> = diffed.iter().filter(|d| d.name.starts_with("gemm")).collect();
+    assert!(gemms.len() >= 12, "{:?}", gemms.iter().map(|d| &d.name).collect::<Vec<_>>());
+    for d in gemms {
         let (_, predicted, program, _) =
             d.rows.iter().find(|(w, ..)| *w == "valu ops/trip").copied().expect("the valu row");
-        assert!((program - predicted).abs() <= within * predicted, "{}: {predicted} VALU against {program}", d.name);
+        assert!(
+            (program - predicted).abs() <= 1.0 + 0.15 * predicted,
+            "{}: {predicted} VALU against {program}",
+            d.name
+        );
     }
 }
 

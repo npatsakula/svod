@@ -216,7 +216,7 @@ fn conv_candidates_lower() {
     for class in YOLO {
         let g = yolo_geom(class);
         let [ho, wo] = g.out_hw();
-        let cands = conv_first_eight(&planner(target.clone()), 1, ho * wo, &g);
+        let cands = conv_first_eight(&planner(target.clone()), 1, ho * wo, &g, &Epilogue::DEFAULT);
         if g.cin == 48 {
             assert!(cands.is_empty(), "{g:?}");
             continue;
@@ -247,7 +247,7 @@ fn conv_candidates_pad_by_an_eighth_at_most(cin: usize, cout: usize, hw: usize, 
     let g = geom([hw, hw], cin, cout, 3, s, 1, 1);
     let [ho, wo] = g.out_hw();
     let (m, n) = (ho * wo, cout);
-    let cands = conv_first_eight(&planner(sm86()), 1, m, &g);
+    let cands = conv_first_eight(&planner(sm86()), 1, m, &g, &Epilogue::DEFAULT);
     assert!(!cands.is_empty(), "{g:?}");
     for c in &cands {
         let [bm, bn, _] = c.gemm.tile;
@@ -264,17 +264,17 @@ fn conv_candidates_pad_by_an_eighth_at_most(cin: usize, cout: usize, hw: usize, 
 fn the_48_channel_bodies_take_one_warp_blocks_or_the_graph() {
     let g = geom([160, 160], 48, 48, 3, 1, 1, 1);
     let rdna3 = Target { sms: Some(48), ..Target::for_arch(GpuArch::Amd(AmdArch::Gfx1100)) };
-    let cands = conv_first_eight(&planner(rdna3), 1, 160 * 160, &g);
+    let cands = conv_first_eight(&planner(rdna3), 1, 160 * 160, &g, &Epilogue::DEFAULT);
     assert!(!cands.is_empty());
     assert!(cands.iter().all(|c| c.gemm.tile[1..] == [48, 16] && c.gemm.warps == [1, 1]), "{cands:?}");
-    assert!(conv_first_eight(&planner(sm86()), 1, 160 * 160, &g).is_empty());
+    assert!(conv_first_eight(&planner(sm86()), 1, 160 * 160, &g, &Epilogue::DEFAULT).is_empty());
 }
 
 /// A starved grid (400 output pixels of 192 channels) has split candidates.
 #[test]
 fn a_starved_grid_splits_the_reduction() {
     let starved = geom([20, 20], 192, 192, 3, 1, 1, 1);
-    assert!(conv_first_eight(&planner(sm86()), 1, 400, &starved).iter().any(|c| c.split > 1));
+    assert!(conv_first_eight(&planner(sm86()), 1, 400, &starved, &Epilogue::DEFAULT).iter().any(|c| c.split > 1));
 }
 
 #[test_case(3; "rgb stem")]
@@ -282,7 +282,7 @@ fn a_starved_grid_splits_the_reduction() {
 #[test_case(40; "a multiple of 8 only")]
 fn too_few_channels_have_no_candidates(cin: usize) {
     let g = geom([80, 80], cin, 64, 3, 1, 1, 1);
-    assert!(conv_first_eight(&planner(sm86()), 1, 6400, &g).is_empty());
+    assert!(conv_first_eight(&planner(sm86()), 1, 6400, &g, &Epilogue::DEFAULT).is_empty());
 }
 
 // ---- on the device -----------------------------------------------------------------
@@ -481,7 +481,7 @@ fn device_candidates(planner: &Planner, g: &ConvGeom, epilogue: Epilogue) -> (Ve
         spec.programs::<F16>(&planner.device)
     };
     let shape = [g.cin, g.cout, g.h, g.w, g.stride[0]];
-    let ranked = planner.conv_ranked(1, ho * wo, g);
+    let ranked = planner.conv_ranked(1, ho * wo, g, &epilogue);
     let expand = |admitted: &[ConvCfg]| planner.conv_splits(1, ho * wo, g, admitted);
     super::tuned_on_device(planner, ("conv2d", DType::Float16, &shape, crate::ops::DEVICE_TEST), &ranked, expand, build)
 }

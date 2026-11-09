@@ -2309,7 +2309,7 @@ fn tuning_probe() {
         }
         for s in list("TUNE_GEMMS", "4096x4096x4096") {
             let [m, n, k] = s[..] else { panic!("MxNxK") };
-            let ranked = planner.gemm_ranked(1, m, n, k, false);
+            let ranked = planner.gemm_ranked(1, m, n, k, &Epilogue::DEFAULT);
             let spec = GemmSpec {
                 m,
                 n,
@@ -2321,7 +2321,7 @@ fn tuning_probe() {
             let build = |cfg: GemmCfg| {
                 vec![(gemm::<BF16>(&GemmSpec { cfg: assumed(cfg), ..spec.clone() }), cfg.lowering(&planner.device))]
             };
-            let p = GemmProblem { batches: 1, m, n, k, halves: 1, rope: None };
+            let p = GemmProblem::new(1, m, n, k, &Epilogue::DEFAULT);
             let work = 2.0 * (m * n * k) as f64;
             let key = ("gemm", &[1, m, n, k][..], crate::ops::DEVICE_TEST);
             report(

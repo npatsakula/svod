@@ -11,7 +11,7 @@ use super::config::{self, Planner};
 use crate::ir::Var;
 use crate::kernels::attention::FaCfg;
 use crate::kernels::conv::{ConvCfg, ConvGeom};
-use crate::kernels::gemm::GemmCfg;
+use crate::kernels::gemm::{Epilogue, GemmCfg};
 use crate::kernels::nearest::{Floors, MAX_CANDIDATES, Metric, NearestCfg};
 use crate::kernels::rows::NormCfg;
 
@@ -118,8 +118,15 @@ fn candidates<C>(list: Arc<[C]>, none: Fallback) -> Result<Arc<[C]>, Fallback> {
     if list.is_empty() { Err(none) } else { Ok(list) }
 }
 
-/// `x [lead..., k] · w [n·halves, k]ᵀ`; `dtypes` are those of every operand.
-pub fn linear(planner: Option<&Planner>, dtypes: &[DType], x: Option<&Extent>, n: usize, gated: bool) -> Plan<GemmCfg> {
+/// `x [lead..., k] · w [n·halves, k]ᵀ` under `epilogue` (its halves the
+/// weight's); `dtypes` are those of every operand.
+pub fn linear(
+    planner: Option<&Planner>,
+    dtypes: &[DType],
+    x: Option<&Extent>,
+    n: usize,
+    epilogue: &Epilogue,
+) -> Plan<GemmCfg> {
     plan(|| {
         let (planner, x) = (gate(planner, dtypes)?, x.ok_or(Fallback::Symbolic)?);
         let k = reduced(x)?;
@@ -130,13 +137,15 @@ pub fn linear(planner: Option<&Planner>, dtypes: &[DType], x: Option<&Extent>, n
         if !n.is_multiple_of(8) || rows * batches == 0 {
             return Err(Fallback::Shape);
         }
-        candidates(planner.gemm_ranked(batches, rows, n, k, gated), Fallback::Config)
+        candidates(planner.gemm_ranked(batches, rows, n, k, epilogue), Fallback::Config)
     })
 }
 
 /// `x [b, h, w, cin]` ⊛ `geom`'s weight; `dtypes` are those of `x`, `w` and
 /// the bias, `out` the output type and `residual` the residual's. A static
-/// batch folds into the GEMM rows, a bound one walks grid z.
+/// batch folds into the GEMM rows, a bound one walks grid z; the ranking
+/// prices `epilogue`.
+#[allow(clippy::too_many_arguments)]
 pub fn conv2d(
     planner: Option<&Planner>,
     dtypes: &[DType],
@@ -145,6 +154,7 @@ pub fn conv2d(
     x: Option<&Extent>,
     geom: &ConvGeom,
     groups: usize,
+    epilogue: &Epilogue,
 ) -> Plan<ConvCfg> {
     plan(|| {
         let (planner, x) = (gate(planner, dtypes)?, x.ok_or(Fallback::Symbolic)?);
@@ -162,7 +172,7 @@ pub fn conv2d(
             return Err(Fallback::Shape);
         }
         let (batches, m) = conv_grid(x, geom);
-        candidates(planner.conv_ranked(batches, m, geom), Fallback::Config)
+        candidates(planner.conv_ranked(batches, m, geom, epilogue), Fallback::Config)
     })
 }
 

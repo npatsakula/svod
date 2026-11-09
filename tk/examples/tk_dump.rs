@@ -126,9 +126,9 @@ fn main() -> Result<()> {
             let gated = flag("--gated");
             let epilogue = Epilogue { gated, ..epilogue };
             let operands = vec![dtype.clone(); 2 + usize::from(epilogue.bias) + usize::from(epilogue.residual)];
-            let ranked = kernel(shape::linear(Some(&planner), &operands, Some(&extent(&[m, k])), n, gated))
+            let ranked = kernel(shape::linear(Some(&planner), &operands, Some(&extent(&[m, k])), n, &epilogue))
                 .map_err(gate("linear"))?;
-            let p = GemmProblem { batches: 1, m, n, k, halves: if gated { 2 } else { 1 }, ..GemmProblem::default() };
+            let p = GemmProblem::new(1, m, n, k, &epilogue);
             report(&mut plan, top, &ranked, &gemm_lattice(&target), |c| p.admit(&planner, c));
             let admit = |c: GemmCfg| p.admitted(&planner, c).map_err(|why| format!("{c:?}: {why:?}"));
             let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue, cfg: admit(ranked[0])? };
@@ -223,13 +223,22 @@ fn main() -> Result<()> {
             let operands = vec![dtype.clone(); 2 + usize::from(epilogue.bias)];
             let residual = epilogue.residual.then(|| dtype.clone());
             let x = extent(&[b, h, w, cin]);
-            let ranked = kernel(shape::conv2d(Some(&planner), &operands, dtype.clone(), residual, Some(&x), &geom, 1))
-                .map_err(gate("conv2d"))?;
+            let ranked = kernel(shape::conv2d(
+                Some(&planner),
+                &operands,
+                dtype.clone(),
+                residual,
+                Some(&x),
+                &geom,
+                1,
+                &epilogue,
+            ))
+            .map_err(gate("conv2d"))?;
             let (batches, m) = shape::conv_grid(&x, &geom);
-            let p = GemmProblem { batches, m, n: cout, k: geom.k(), halves: 1, ..GemmProblem::default() };
+            let cp = ConvProblem::new(batches, m, &geom, &epilogue);
+            let p = cp.gemm;
             let gemms: Vec<_> = ranked.iter().map(|c| c.gemm).collect();
             report(&mut plan, top, &gemms, &[], |c| p.admit(&planner, c));
-            let cp = ConvProblem { gemm: p, geom };
             let admit = |c: GemmCfg| cp.admitted(&planner, c).map_err(|why| format!("{c:?}: {why:?}"));
             let c = ranked[0];
             let spec = ConvSpec { batch: Batch::Static(b), geom, epilogue, cfg: admit(c.gemm)?, split: c.split };

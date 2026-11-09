@@ -8,6 +8,7 @@ use svod_dtype::DType;
 use test_case::test_case;
 
 use crate::atoms::{CARDS, Core, Target};
+use crate::kernels::gemm::Epilogue;
 use crate::ops::config::{self, Planner};
 use crate::ops::shape::{self, Extent, Plan};
 use crate::probe::{self, Measured};
@@ -156,7 +157,9 @@ fn a_planner_plans_for_a_card_without_it() {
         .expect("an H100 has SMs");
     let bf16 = [DType::BFloat16; 2];
     let x = Extent { dims: vec![4096, 4096], var: false };
-    let Plan::Kernel(gemm) = shape::linear(Some(&planner), &bf16, Some(&x), 4096, false) else { panic!("no GEMM") };
+    let Plan::Kernel(gemm) = shape::linear(Some(&planner), &bf16, Some(&x), 4096, &Epilogue::DEFAULT) else {
+        panic!("no GEMM")
+    };
     assert_eq!(gemm[0].core, Core::Group, "{:?}", gemm[0]);
     let q = Extent { dims: vec![8, 1024, 16, 128], var: false };
     let Plan::Kernel(fa) = shape::attention(Some(&planner), &[DType::BFloat16; 3], Some(&q), Some(&q), true, false)

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use crate::atoms::{Fill, Target};
 use crate::kernels::Admitted;
 use crate::kernels::conv::{ConvCfg, ConvGeom};
-use crate::kernels::gemm::GemmCfg;
+use crate::kernels::gemm::{Epilogue, GemmCfg};
 
 use super::cost::ELEM;
 use super::cost::{Claim, Family, Feasible, Kept, Planner, cached};
@@ -37,6 +37,11 @@ pub struct ConvProblem {
 }
 
 impl ConvProblem {
+    /// `batches` grid batches of `m` output pixels of `g` under `epilogue`.
+    pub fn new(batches: usize, m: usize, g: &ConvGeom, epilogue: &Epilogue) -> Self {
+        Self { gemm: GemmProblem::new(batches, m, g.cout, g.k(), epilogue), geom: *g }
+    }
+
     /// `cfg`'s GEMM body admitted for this convolution ([`Admitted`]), or
     /// why it is not; its split is the tuner's.
     pub fn admitted<'t>(&self, planner: &'t Planner, cfg: GemmCfg) -> Result<Admitted<'t, GemmCfg>, Rejected> {
@@ -123,12 +128,13 @@ impl Family for ConvProblem {
 
 impl Planner {
     /// Unsplit convolution configs for `batches` grid batches of `m` output
-    /// pixels of `g`, [`ConvProblem::ranked`] cached per problem.
-    pub(crate) fn conv_ranked(&self, batches: usize, m: usize, g: &ConvGeom) -> Arc<[ConvCfg]> {
+    /// pixels of `g` under `epilogue`, [`ConvProblem::ranked`] cached per
+    /// problem.
+    pub(crate) fn conv_ranked(&self, batches: usize, m: usize, g: &ConvGeom, epilogue: &Epilogue) -> Arc<[ConvCfg]> {
         if batches * m * g.cout * g.k() == 0 {
             return Arc::new([]);
         }
-        let p = ConvProblem { gemm: GemmProblem { batches, m, n: g.cout, k: g.k(), halves: 1, rope: None }, geom: *g };
+        let p = ConvProblem::new(batches, m, g, epilogue);
         cached(&self.conv, p, || p.ranked(self))
     }
 
@@ -140,7 +146,7 @@ impl Planner {
     /// dividing the steps that keep at most 16 blocks per SM.
     pub(crate) fn conv_splits(&self, batches: usize, m: usize, g: &ConvGeom, admitted: &[ConvCfg]) -> Vec<ConvCfg> {
         let Some(&ConvCfg { gemm: base, .. }) = admitted.first() else { return vec![] };
-        let (p, k) = (GemmProblem { batches, m, n: g.cout, k: g.k(), halves: 1, rope: None }, g.k());
+        let (p, k) = (GemmProblem::new(batches, m, g.cout, g.k(), &Epilogue::DEFAULT), g.k());
         let mut out = admitted.to_vec();
         let sms = self.sms();
         let blocks = |c: &GemmCfg| p.blocks(c);

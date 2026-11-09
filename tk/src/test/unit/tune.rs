@@ -576,7 +576,7 @@ fn a_gemm_tunes_on_the_device() {
     let spec = svod_dtype::default_device::default_device();
     let device = &planner.device;
     let (m, n, k) = (704, 512, 512);
-    let cfgs = super::first_eight(&planner.gemm_ranked(1, m, n, k, false));
+    let cfgs = super::first_eight(&planner.gemm_ranked(1, m, n, k, &Epilogue::DEFAULT));
     let batch = Batch::var("b", 1, 1);
     let build = |cfg: GemmCfg| {
         let spec = GemmSpec { m, n, k, batch: batch.clone(), epilogue: Epilogue::default(), cfg: assumed(cfg) };
@@ -754,7 +754,7 @@ fn without_a_hopeless_factor_every_candidate_runs_whole() {
 fn a_scratch_plan_publishes_nothing() {
     let Some(planner) = super::device_planner() else { return };
     let device = &planner.device;
-    let cfg = super::first_eight(&planner.gemm_ranked(1, 704, 512, 512, false))[0];
+    let cfg = super::first_eight(&planner.gemm_ranked(1, 704, 512, 512, &Epilogue::DEFAULT))[0];
     let spec =
         GemmSpec { m: 704, n: 512, k: 512, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg: assumed(cfg) };
     let pool = ScratchPool::default();
@@ -1118,7 +1118,7 @@ fn timed_candidates_clear_their_physical_floor() {
             }
             "gemm" | "linear" => {
                 let &[cap, m, n, k] = shape else { return None };
-                let p = GemmProblem { batches: cap.max(1), m, n, k, halves: 1, rope: None };
+                let p = GemmProblem::new(cap.max(1), m, n, k, &Epilogue::DEFAULT);
                 planner.floor_of(&p, &Tiled::of_code(code)?)
             }
             "attention" => {
@@ -1157,10 +1157,7 @@ fn timed_candidates_clear_their_physical_floor() {
                     _ => return None,
                 };
                 let [ho, wo] = g.out_hw();
-                let p = ConvProblem {
-                    gemm: GemmProblem { batches: 1, m: images * ho * wo, n: g.cout, k: g.k(), halves: 1, rope: None },
-                    geom: g,
-                };
+                let p = ConvProblem::new(1, images * ho * wo, &g, &Epilogue::DEFAULT);
                 let c: crate::kernels::conv::ConvCfg = Tiled::of_code(code)?;
                 planner.claim_of(&p, &c.gemm).ok().map(|claim| planner.floor(&claim))
             }

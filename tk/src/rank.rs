@@ -789,25 +789,29 @@ fn stored<C: Tiled>(
 fn gemm(lines: &mut Lines, planner: &Planner, op: &'static str, dtype: ScalarDType, shape: &[usize]) -> Vec<Replay> {
     let [cap, m, n, k] = shape[..] else { return vec![] };
     let batches = |bound: bool| if bound { cap.max(1) } else { 1 };
-    let salts: Vec<(String, bool, bool)> = match op {
+    // The device tests' and probes' salt keeps no epilogue: theirs are plain.
+    let salts: Vec<(String, Epilogue, bool)> = match op {
         "gemm" => [false, true]
             .into_iter()
-            .flat_map(|gated| [false, true].map(move |bound| (format!("{DEVICE_TEST:?}"), gated, bound)))
+            .flat_map(|gated| {
+                let epi = Epilogue { gated, ..Epilogue::DEFAULT };
+                [false, true].map(move |bound| (format!("{DEVICE_TEST:?}"), epi, bound))
+            })
             .collect(),
         _ => batches_of(cap)
             .into_iter()
             .flat_map(|batch| {
                 let bound = matches!(batch, Batch::Var(_));
-                epilogues().into_iter().map(move |epi| (format!("{:?}", (&batch, epi)), epi.gated, bound))
+                epilogues().into_iter().map(move |epi| (format!("{:?}", (&batch, epi)), epi, bound))
             })
             .collect(),
     };
     let mut out = vec![];
     let mut problems: Vec<GemmProblem> = vec![];
-    for (salt, gated, bound) in salts {
+    for (salt, epi, bound) in salts {
         let keying = Keying::new(op, planner, dtype, shape, salt);
-        let p = GemmProblem { batches: batches(bound), m, n, k, halves: if gated { 2 } else { 1 }, rope: None };
-        let ranked = planner.gemm_ranked(p.batches, m, n, k, gated);
+        let p = GemmProblem::new(batches(bound), m, n, k, &epi);
+        let ranked = planner.gemm_ranked(p.batches, m, n, k, &epi);
         let configs = |list: Vec<GemmCfg>| Configs::Gemm { problem: p, list };
         out.extend(stages(lines, &keying, &ranked, <[_]>::to_vec, configs).into_iter().flatten());
         if !problems.contains(&p) {
@@ -994,24 +998,30 @@ fn nearest(lines: &mut Lines, planner: &Planner, dtype: ScalarDType, shape: &[us
 /// (the device tests' probes key its channel counts and side instead), the
 /// candidates the splits a starved grid breaks into.
 fn conv(lines: &mut Lines, planner: &Planner, dtype: ScalarDType, shape: &[usize]) -> Vec<Replay> {
-    let geoms: Vec<(ConvGeom, usize, String)> = match shape[..] {
+    // The device tests' salt keeps no epilogue: theirs run a SiLU over the
+    // bias (the graph check adds a residual's two operations).
+    let geoms: Vec<(ConvGeom, usize, Epilogue, String)> = match shape[..] {
         [cin, cout, h, w, stride] => {
             let g =
                 ConvGeom { h, w, cin, cout, kernel: [3, 3], stride: [stride, stride], pad: [1, 1], dilation: [1, 1] };
-            vec![(g, 1, format!("{DEVICE_TEST:?}"))]
+            let silu_bias = Epilogue { bias: true, act: Act::Silu, ..Epilogue::DEFAULT };
+            vec![(g, 1, silu_bias, format!("{DEVICE_TEST:?}"))]
         }
         [images, h, w, cin, cout, k0, k1, s0, s1, p0, p1, d0, d1] => {
             let g = ConvGeom { h, w, cin, cout, kernel: [k0, k1], stride: [s0, s1], pad: [p0, p1], dilation: [d0, d1] };
             batches_of(images)
                 .into_iter()
-                .flat_map(|batch| epilogues().into_iter().map(move |epi| (g, images, format!("{:?}", (&batch, epi)))))
+                .flat_map(|batch| {
+                    let plain = epilogues().into_iter().filter(|e| !e.gated);
+                    plain.map(move |epi| (g, images, epi, format!("{:?}", (&batch, epi))))
+                })
                 .collect()
         }
         _ => return vec![],
     };
     let mut out = vec![];
     let mut problems: Vec<ConvProblem> = vec![];
-    for (g, images, salt) in geoms {
+    for (g, images, epi, salt) in geoms {
         let [ho, wo] = g.out_hw();
         for bound in [false, true] {
             let salt = salt.clone();
@@ -1019,9 +1029,8 @@ fn conv(lines: &mut Lines, planner: &Planner, dtype: ScalarDType, shape: &[usize
                 false => (1, images * ho * wo),
                 true => (images, ho * wo),
             };
-            let ranked = planner.conv_ranked(batches, m, &g);
-            let p =
-                ConvProblem { gemm: GemmProblem { batches, m, n: g.cout, k: g.k(), halves: 1, rope: None }, geom: g };
+            let ranked = planner.conv_ranked(batches, m, &g, &epi);
+            let p = ConvProblem::new(batches, m, &g, &epi);
             if !problems.contains(&p) {
                 problems.push(p);
             }
@@ -1061,6 +1070,9 @@ pub struct Counted {
     pub steps: usize,
     /// VALU operations (arithmetic, logic, casts).
     pub valu: usize,
+    /// The VALU operations past the last matrix instruction: a GEMM's
+    /// epilogue.
+    pub epilogue: usize,
     /// The bytes of global memory the program's loads move.
     pub fill: usize,
     /// What the first innermost loop holding a product does: a staged ring
@@ -1130,7 +1142,8 @@ pub fn counted(program: &svod_ir::UOp) -> Option<Counted> {
         },
         _ => 1,
     };
-    let mut out = Counted { instructions: list.len(), smem, steps: 0, valu: 0, fill: 0, trip: Trip::default() };
+    let mut out =
+        Counted { instructions: list.len(), smem, steps: 0, valu: 0, epilogue: 0, fill: 0, trip: Trip::default() };
     // The loops the statement at hand sits in: the bytes a trip moves are
     // what a loop body loads — a block's once-over reads (its resident rows)
     // sit outside them, priced as the working set they join, not a trip's.
@@ -1139,9 +1152,13 @@ pub fn counted(program: &svod_ir::UOp) -> Option<Counted> {
         match u.op() {
             Op::Wmma(..) => {
                 out.steps += 1;
+                out.epilogue = 0;
                 loops.iter_mut().for_each(|l| l.steps += 1);
             }
-            Op::Unary(..) | Op::Binary(..) | Op::Ternary(..) | Op::Cast(..) | Op::BitCast(..) => out.valu += 1,
+            Op::Unary(..) | Op::Binary(..) | Op::Ternary(..) | Op::Cast(..) | Op::BitCast(..) => {
+                out.valu += 1;
+                out.epilogue += 1;
+            }
             Op::Range(..) => loops.push(Trip::default()),
             Op::End(ops::End { ranges, .. }) => {
                 for ended in loops.split_off(loops.len().saturating_sub(ranges.len())).into_iter().rev() {
@@ -1213,7 +1230,8 @@ pub struct Diffed {
 const HOLDS: f64 = 0.15;
 
 /// A sample of each family's configs emitted and counted against the
-/// model's predictions — the GEMM tiles of a 4096³ plan, two attention
+/// model's predictions — the GEMM tiles of a 4096³ plan under each
+/// epilogue the models run, two attention
 /// configs, nearest at `k = 1` resident and streamed, a register list at
 /// `k = 64` and a split at `k = 8` — on `target`'s planner under the
 /// declared guessed costs, rolled so a trip's counts sit in it once. The
@@ -1222,12 +1240,12 @@ const HOLDS: f64 = 0.15;
 /// family's own claim, the same construction the ranking prices. The VALU
 /// row's units stay each family's: a nearest or attention pair's bundle in
 /// score elements (the claim's counts folded at the epilogue's unit), a
-/// GEMM's epilogue un-amortized over its trips, its tile operations an
-/// instruction a lane.
+/// GEMM's epilogue an output element's operations against the program's
+/// past its last product.
 pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
     use crate::build::{BF16, F16};
     use crate::kernels::attention::{AttnMask, AttnSpec, attention};
-    use crate::kernels::gemm::{Epilogue, GemmSpec, gemm};
+    use crate::kernels::gemm::{Epilogue, GemmSpec, Scale, gemm};
     use crate::kernels::nearest::{Live, Metric, NearestSpec, nearest};
     use crate::kernels::{Act, Batch};
 
@@ -1241,9 +1259,14 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
     // The program's list is one warp's code, its loads one thread's: the
     // block's per-trip claim divides by the warps for the steps and the
     // VALU, and its fill bytes compare against the threads' loads together.
+    // A sample's predicted VALU, the program's count it holds against, and
+    // what turns a warp's count into the prediction's units (the block's
+    // warps unless given).
+    type Valu = (f64, fn(&Counted) -> usize, Option<f64>);
+    let whole: fn(&Counted) -> usize = |c| c.valu;
     let diff = |name: String,
                 claim: &config::Claim,
-                valu: f64,
+                (valu, of, per): Valu,
                 warps: usize,
                 prog: crate::ir::Program,
                 core|
@@ -1268,39 +1291,63 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
             rows: vec![
                 row("steps/trip", steps / warps as f64, counted.trip.steps as f64),
                 row("fill bytes/trip", fill as f64, counted.trip.fill as f64 * threads),
-                row("valu ops/trip", ops, counted.valu as f64 * warps as f64),
+                row("valu ops/trip", ops, of(&counted) as f64 * per.unwrap_or(warps as f64)),
                 row("smem", smem as f64, counted.smem as f64),
             ],
         })
     };
-    let mut out: Vec<(String, config::Claim, f64, usize, crate::ir::Program, Core)> = vec![];
+    // A sample's predicted VALU and the program's count it holds against.
+    let mut out: Vec<(String, config::Claim, Valu, usize, crate::ir::Program, Core)> = vec![];
     // The static decomposition rows (see the k64 list below): what the
     // program's listing adder holds against the counted parts.
     let mut statics: Vec<Diffed> = vec![];
-    // GEMM: the leading tiles of a 4096³ plan, emitted small, a gelu
-    // epilogue on the accumulator — the claim's own epilogue term, un-
-    // amortized over the trips and in the static-code units a program's
-    // instruction mix counts (the lane operations over a wave).
-    let p = GemmProblem { batches: 1, m: 4096, n: 4096, k: 4096, halves: 1, rope: None };
-    for cfg in config::distinct(&planner.gemm_ranked(1, 4096, 4096, 4096, false)).take(3) {
-        let claim = planner.claim_of(&p, &cfg).expect("ranked");
-        let valu = claim.ops.epilogue * (4096 / cfg.tile[2]) as f64 / target.wave as f64;
-        let spec = GemmSpec {
-            m: 130,
-            n: 192,
-            k: cfg.tile[2] * 8,
-            batch: Batch::Static(1),
-            epilogue: Epilogue { act: Act::Gelu, ..Epilogue::DEFAULT },
-            cfg: assumed(GemmCfg { schedule: cfg.schedule.rolled(), ..cfg }),
-        };
-        out.push((
-            format!("gemm {:?}", cfg.tile),
-            claim,
-            valu,
-            (cfg.warps[0] * cfg.warps[1]) as usize,
-            gemm::<BF16>(&spec),
-            Core::Warp,
-        ));
+    // GEMM: the leading tiles of a 4096³ plan under each epilogue the
+    // models run, emitted small — the claim's own epilogue term, un-
+    // amortized over the trips, against the program's operations past its
+    // last product (the lane operations over a wave).
+    let plain = Epilogue::DEFAULT;
+    let epilogues = [
+        ("plain", plain),
+        ("bias", Epilogue { bias: true, ..plain }),
+        ("residual", Epilogue { residual: true, ..plain }),
+        ("f32 residual", Epilogue { residual: true, out_f32: true, ..plain }),
+        ("scale", Epilogue { scale: Some(Scale::new(0.5)), ..plain }),
+        ("gelu", Epilogue { act: Act::Gelu, ..plain }),
+        ("silu", Epilogue { act: Act::Silu, ..plain }),
+        (
+            "bias gelu scale residual",
+            Epilogue { bias: true, act: Act::Gelu, scale: Some(Scale::new(0.5)), residual: true, ..plain },
+        ),
+        ("swiglu", Epilogue { act: Act::Silu, gated: true, ..plain }),
+        ("bias geglu", Epilogue { bias: true, act: Act::Gelu, gated: true, ..plain }),
+    ];
+    for (label, epilogue) in epilogues {
+        let p = GemmProblem::new(1, 4096, 4096, 4096, &epilogue);
+        let tiles = if epilogue.act == Act::Gelu && !epilogue.gated && !epilogue.bias { 3 } else { 1 };
+        for cfg in config::distinct(&planner.gemm_ranked(1, 4096, 4096, 4096, &epilogue)).take(tiles) {
+            let claim = planner.claim_of(&p, &cfg).expect("ranked");
+            // Both an output element's: the claim's over the trips, the
+            // program's warps' over the tile.
+            let elems = (cfg.tile[0] * cfg.tile[1]) as f64;
+            let valu = claim.ops.epilogue * (4096 / cfg.tile[2]) as f64 / elems;
+            let per = (cfg.warps[0] * cfg.warps[1]) as f64 * target.wave as f64 / elems;
+            let spec = GemmSpec {
+                m: 130,
+                n: 192,
+                k: cfg.tile[2] * 8,
+                batch: Batch::Static(1),
+                epilogue,
+                cfg: assumed(GemmCfg { schedule: cfg.schedule.rolled(), ..cfg }),
+            };
+            out.push((
+                format!("gemm {label} {:?}", cfg.tile),
+                claim,
+                (valu, |c| c.epilogue, Some(per)),
+                (cfg.warps[0] * cfg.warps[1]) as usize,
+                gemm::<BF16>(&spec),
+                Core::Warp,
+            ));
+        }
     }
     // Attention: two configs of a d64 causal plan, emitted small.
     let p = AttentionProblem { tiles: 8, t: 100, tk: 100, d: 64, causal: true, bias: false };
@@ -1328,7 +1375,7 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
         out.push((
             format!("attention {}x{} {:?}", cfg.bq, cfg.bkv, cfg.core),
             claim,
-            valu,
+            (valu, whole, None),
             cfg.warps() as usize,
             attention::<BF16>(&spec),
             cfg.core,
@@ -1368,7 +1415,7 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
         out.push((
             format!("nearest k1 {name} {}x{}", cfg.bq, cfg.bkv),
             claim,
-            valu,
+            (valu, whole, None),
             cfg.warps() as usize,
             nearest::<F16>(&spec(cfg, 1)),
             Core::Warp,
@@ -1406,7 +1453,7 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
         out.push((
             format!("nearest k64 list {}x{}", cfg.bq, cfg.bkv),
             claim,
-            valu,
+            (valu, whole, None),
             cfg.warps() as usize,
             nearest::<F16>(&spec(cfg, 64)),
             Core::Warp,
@@ -1423,7 +1470,7 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
         out.push((
             format!("nearest k8 split {} {}x{}", cfg.splits, cfg.bq, cfg.bkv),
             claim,
-            valu,
+            (valu, whole, None),
             cfg.warps() as usize,
             nearest::<F16>(&split_spec),
             Core::Warp,
@@ -1431,7 +1478,7 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
     }
     let diffed = out
         .into_iter()
-        .filter_map(|(name, claim, gelu_ops, warps, prog, core)| diff(name, &claim, gelu_ops, warps, prog, core))
+        .filter_map(|(name, claim, valu, warps, prog, core)| diff(name, &claim, valu, warps, prog, core))
         .collect();
     (diffed, statics)
 }

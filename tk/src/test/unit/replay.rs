@@ -87,7 +87,7 @@ fn a_replay_reads_a_keys_line_whatever_compiler_wrote_it(
 fn a_replay_writes_nothing() {
     let dir = Scratch::new("replay-writes");
     let planner = super::planner(sm86());
-    let ranked = planner.gemm_ranked(1, 256, 256, 256, false);
+    let ranked = planner.gemm_ranked(1, 256, 256, 256, &Epilogue::DEFAULT);
     let file = write(&dir, &key(), &[format!("{} 5", key().line(Kind::Value, 1))]);
     std::fs::create_dir_all(dir.join("emitted")).expect("emitted dir");
     let stale = dir.join("emitted/0000000000000000.txt");
@@ -120,7 +120,7 @@ fn a_replay_writes_nothing() {
 #[test_case(true; "the GEMM probes")]
 fn a_gemm_tuning_reads_the_key_the_op_layer_writes(probe: bool) {
     let planner = super::planner(sm86());
-    let ranked = planner.gemm_ranked(1, 512, 512, 512, false);
+    let ranked = planner.gemm_ranked(1, 512, 512, 512, &Epilogue::DEFAULT);
     let spec = GemmSpec {
         m: 512,
         n: 512,
@@ -159,7 +159,7 @@ fn a_batch_keys_as_it_did() {
 /// planner and its ranking's representatives.
 fn admitted_and_chosen(dir: &Path) -> (Planner, Arc<[GemmCfg]>, Vec<GemmCfg>) {
     let planner = super::planner(sm86());
-    let ranked = planner.gemm_ranked(1, 512, 512, 512, false);
+    let ranked = planner.gemm_ranked(1, 512, 512, 512, &Epilogue::DEFAULT);
     let reps = representatives(&ranked);
     let salt = format!("{:?}", (Batch::Static(1), Epilogue::DEFAULT));
     let at = |rule: &str, list: &[GemmCfg]| {

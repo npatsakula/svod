@@ -64,9 +64,15 @@ pub(crate) fn first_eight<C: crate::ops::config::Tiled>(ranked: &[C]) -> Vec<C> 
     crate::ops::config::distinct(ranked).take(8).collect()
 }
 
-/// The convolution candidates of a ranking's [`first_eight`].
-pub(crate) fn conv_first_eight(planner: &Planner, batches: usize, m: usize, g: &ConvGeom) -> Vec<ConvCfg> {
-    planner.conv_splits(batches, m, g, &first_eight(&planner.conv_ranked(batches, m, g)))
+/// The convolution candidates of a ranking's [`first_eight`] under `epilogue`.
+pub(crate) fn conv_first_eight(
+    planner: &Planner,
+    batches: usize,
+    m: usize,
+    g: &ConvGeom,
+    epilogue: &Epilogue,
+) -> Vec<ConvCfg> {
+    planner.conv_splits(batches, m, g, &first_eight(&planner.conv_ranked(batches, m, g, epilogue)))
 }
 
 /// One launch of a family: its name, program and lowering.
@@ -81,7 +87,7 @@ pub fn past_i32(target: &Target) -> Vec<Launch> {
     let device = &planner.device;
     let (m, n, k) = (50_001, 50_001, 50_048);
     for (batches, stages) in [(1, 1), (2, 1), (2, 2)] {
-        let base = planner.gemm_ranked(batches, m, n, k, false)[0];
+        let base = planner.gemm_ranked(batches, m, n, k, &Epilogue::DEFAULT)[0];
         let cfg = GemmCfg { schedule: Schedule::ring(stages, base.unroll()), ..base };
         let spec = GemmSpec { m, n, k, batch: Batch::Static(batches), epilogue: Epilogue::DEFAULT, cfg: assumed(cfg) };
         out.push((format!("gemm {batches} batches s{stages}"), gemm::<BF16>(&spec), cfg.lowering(device)));
@@ -168,11 +174,11 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
     // Shapes stay small for the interpreter; the tiles are those planned
     // for a large GEMM, so the biggest register tiles are lowered too.
     let gemm_spec = |m, n, k, epilogue: Epilogue| {
-        let cfg = planner.gemm_ranked(1, 4096, 4096, k, epilogue.gated)[0];
+        let cfg = planner.gemm_ranked(1, 4096, 4096, k, &epilogue)[0];
         GemmSpec { m, n, k, batch: Batch::Static(1), epilogue, cfg: assumed(cfg) }
     };
     let plain = gemm_spec(130, 192, 128, Epilogue::DEFAULT);
-    for (i, cfg) in first_eight(&planner.gemm_ranked(1, 4096, 4096, 4096, false)).into_iter().enumerate() {
+    for (i, cfg) in first_eight(&planner.gemm_ranked(1, 4096, 4096, 4096, &plain.epilogue)).into_iter().enumerate() {
         let spec = GemmSpec { cfg: assumed(cfg), ..plain.clone() };
         push(&format!("gemm #{i} {:?}x{}", cfg.tile, cfg.stages()), gemm::<BF16>(&spec), cfg.lowering(&planner.device));
     }
@@ -211,7 +217,7 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
     push("gemm swiglu", gemm::<F16>(&swiglu), swiglu.cfg.lowering(&planner.device));
     let half_step = Epilogue { residual: true, act: Act::Gelu, scale: Some(Scale::new(0.5)), ..Epilogue::DEFAULT };
     let half_step = GemmSpec {
-        cfg: assumed(planner.gemm_ranked(1, 300, 512, 256, false)[0]),
+        cfg: assumed(planner.gemm_ranked(1, 300, 512, 256, &half_step)[0]),
         ..gemm_spec(100, 96, 256, half_step)
     };
     push("gemm gelu scale residual", gemm::<BF16>(&half_step), half_step.cfg.lowering(&planner.device));
@@ -229,7 +235,7 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
     // A fused projection's queries and keys turned in its store, on the
     // planner's lead tile for ModernBERT's that turns heads of 64: six heads
     // of nine, positions wrapping every 50 rows.
-    let turning = planner.gemm_ranked(1, 4096, 2304, 768, false).iter().copied().find(|c| c.turns(64));
+    let turning = planner.gemm_ranked(1, 4096, 2304, 768, &Epilogue::DEFAULT).iter().copied().find(|c| c.turns(64));
     if let Some(cfg) = turning {
         let rope = crate::kernels::gemm::Rope { heads: 6, head_dim: 64, seq: 50 };
         let epilogue = Epilogue { rope: Some(rope), ..Epilogue::DEFAULT };
@@ -510,7 +516,7 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
         ("conv 3x3 stride 2 split", geom([16, 16], 128, 64, 3, 2, 1, 1), 1),
     ] {
         let [ho, wo] = g.out_hw();
-        let cfgs = conv_first_eight(&planner, 1, images * ho * wo, &g);
+        let cfgs = conv_first_eight(&planner, 1, images * ho * wo, &g, &silu_bias);
         let c = cfgs.iter().find(|c| (c.split > 1) == name.ends_with("split")).unwrap_or(&cfgs[0]);
         let spec = ConvSpec {
             batch: Batch::Static(images),
@@ -703,10 +709,10 @@ pub fn digested(target: &Target) -> Vec<Launch> {
     }
     for (m, n, k) in [(4096, 4096, 4096), (704, 512, 512), (1500, 1280, 5120), (37, 96, 48)] {
         for gated in [false, true] {
-            let ranked = planner.gemm_ranked(1, m, n, k, gated);
+            let epilogue = Epilogue { gated, ..Epilogue::DEFAULT };
+            let ranked = planner.gemm_ranked(1, m, n, k, &epilogue);
             let deep = if m == 4096 { config::SHORTLIST } else { 8 };
             for cfg in config::distinct(&ranked).take(deep) {
-                let epilogue = Epilogue { gated, ..Epilogue::DEFAULT };
                 let spec = GemmSpec {
                     m: 100,
                     n: 96,
@@ -788,7 +794,7 @@ pub fn digested(target: &Target) -> Vec<Launch> {
     for class in YOLO {
         let g = yolo_geom(class);
         let [ho, wo] = g.out_hw();
-        for c in conv_first_eight(&planner, 1, ho * wo, &g) {
+        for c in conv_first_eight(&planner, 1, ho * wo, &g, &Epilogue::DEFAULT) {
             let spec = ConvSpec {
                 batch: Batch::Static(1),
                 geom: g,
@@ -870,7 +876,8 @@ pub fn rankings(target: &Target) -> String {
     let mut s = String::new();
     for (m, n, k) in [(4096, 4096, 4096), (704, 512, 512), (1500, 1280, 5120), (37, 96, 48), (128, 4096, 1024)] {
         for gated in [false, true] {
-            s += &format!("gemm {m}x{n}x{k} {gated}: {:?}\n", &*planner.gemm_ranked(1, m, n, k, gated));
+            let epilogue = Epilogue { gated, ..Epilogue::DEFAULT };
+            s += &format!("gemm {m}x{n}x{k} {gated}: {:?}\n", &*planner.gemm_ranked(1, m, n, k, &epilogue));
         }
     }
     for d in [32, 64, 128] {
@@ -884,7 +891,7 @@ pub fn rankings(target: &Target) -> String {
     for class in YOLO {
         let g = yolo_geom(class);
         let [ho, wo] = g.out_hw();
-        let ranked = planner.conv_ranked(1, ho * wo, &g);
+        let ranked = planner.conv_ranked(1, ho * wo, &g, &Epilogue::DEFAULT);
         s += &format!("conv {g:?}: {:?}\n", &*ranked);
         s += &format!("splits: {:?}\n", planner.conv_splits(1, ho * wo, &g, &ranked[..ranked.len().min(8)]));
     }

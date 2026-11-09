@@ -9,8 +9,8 @@ use crate::atoms::{Core, Fill, Target};
 use std::num::NonZeroUsize;
 
 use crate::ir::{Axis, Schedule, Shape};
-use crate::kernels::Admitted;
-use crate::kernels::gemm::{GemmCfg, Rope, TailPlan, TailSpec, TailSplit, TileOrder};
+use crate::kernels::gemm::{Epilogue, GemmCfg, Rope, TailPlan, TailSpec, TailSplit, TileOrder};
+use crate::kernels::{Act, Admitted};
 use crate::layouts::{Issue, Swizzle, WarpGrid, chunked, fills_in_chunks};
 use crate::tune::SETTLED;
 
@@ -119,16 +119,32 @@ pub(crate) const fn gemm_cfg(tile: [usize; 3], stages: usize, warps: [u32; 2], u
     }
 }
 
-/// Model: a representative layer epilogue's tile operations an output
-/// element — a gelu's forty (the abs, three affines, the reciprocal, the
-/// polynomial's four multiplies and affines and its product, the square, the
-/// `exp2`'s affine and `exp2`, the two tails and the final affine), the
-/// claim diff's own ±0.7 % pin against a program's instruction mix. The
-/// ranking is epilogue-kind-blind (the epilogue varies by layer, the tune
-/// key's salt, not by tile): this bundle — the models' ff layers' — is what
-/// orders tiles by the epilogue work they carry, their total over a problem
-/// the same whatever the tile.
-pub(crate) const EPILOGUE_OPS: f64 = 40.0;
+/// Model: an activation's tile operations an element, as the targets lower
+/// it past the product (AMD's count; sm_86 lowers one more): a gelu's
+/// Abramowitz–Stegun erf (the abs, the affines, the reciprocal, the
+/// polynomial, the square, the `exp2` and the tails), a silu's sigmoid.
+pub(crate) fn act_ops(act: Act) -> u32 {
+    match act {
+        Act::None => 0,
+        Act::Gelu => 29,
+        Act::Silu => 4,
+    }
+}
+
+/// Model: a layer epilogue's tile operations an output element, each one a
+/// lane's: the accumulator's rounding to the stored type, a bias's add a
+/// half, the activation ([`act_ops`]), the gated product, the scale's
+/// multiply, and the residual's add behind its load's conversion. The claim
+/// diff pins each against the program's own operations past its last
+/// product (`the_gemm_epilogue_claim_holds_its_program`); a rope's turn is
+/// [`ROPE_OPS`] over its share, claimed apart.
+pub(crate) fn epilogue_ops(e: &Epilogue) -> u32 {
+    let round = u32::from(!e.out_f32);
+    let halves = u32::from(e.gated) + 1;
+    let bias = if e.bias { halves } else { 0 };
+    let residual = if e.residual { 1 + round } else { 0 };
+    round + bias + act_ops(e.act) + u32::from(e.gated) + u32::from(e.scale.is_some()) + residual
+}
 
 /// Model: a rotary turn's tile operations a turned output element — the two
 /// tables' casts, the sign's multiply, the element's own multiply feeding
@@ -217,7 +233,8 @@ pub fn gemm_lattice(target: &Target) -> Vec<GemmCfg> {
 /// (two halves: a gated weight, whose block stages a `2·bn`-wide B tile
 /// and holds two accumulators). With `rope`, the output's first heads turn
 /// in the kernel's store: only tiles that hold whole heads lower, and the
-/// turn's operations and table reads are claimed.
+/// turn's operations and table reads are claimed. Its `epilogue` is the
+/// layer's tile operations an output element ([`epilogue_ops`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct GemmProblem {
     pub batches: usize,
@@ -226,6 +243,7 @@ pub struct GemmProblem {
     pub k: usize,
     pub halves: usize,
     pub rope: Option<Rope>,
+    pub epilogue: u32,
 }
 
 /// One launch of a GEMM's plan: `tiles` output tiles of a batch's walk
@@ -240,6 +258,12 @@ struct Part {
 const F32: usize = 4;
 
 impl GemmProblem {
+    /// `batches` products of `m × k` by `k × n` under `epilogue`.
+    pub fn new(batches: usize, m: usize, n: usize, k: usize, epilogue: &Epilogue) -> Self {
+        let (halves, rope) = (usize::from(epilogue.gated) + 1, epilogue.rope);
+        Self { batches, m, n, k, halves, rope, epilogue: epilogue_ops(epilogue) }
+    }
+
     pub(super) fn blocks(&self, cfg: &GemmCfg) -> usize {
         self.batches * self.tiles(cfg)
     }
@@ -311,7 +335,7 @@ impl GemmProblem {
     /// registers](GemmCfg::live_registers) alone pass the lane's limit; why it
     /// is left out otherwise. A trip
     /// pays its fragment reads, fill, matrix-core steps (padding included),
-    /// the representative epilogue's tile operations and overhead. The
+    /// the layer epilogue's tile operations and overhead. The
     /// fill's bytes are the whole operands' distinct ones, the blocks in
     /// flight at once (one an SM at least) share the A rows and B columns of
     /// the raster's window whatever the cache holds of the whole, and the
@@ -423,7 +447,7 @@ impl GemmProblem {
         let fill = self.stream(planner, cfg, part);
         // The epilogue's operations over the tile's output elements, one a
         // lane's element each, paid over the trips that fold into one
-        // output: their whole is m·n·[`EPILOGUE_OPS`] of lane operations
+        // output: their whole is m·n·[`epilogue_ops`] of lane operations
         // whatever the tile, so what the term orders is a trip's balance of
         // steps against epilogue. A rope's turn covers the `turned` share of
         // the columns (the last block straddling them half-turned on
@@ -438,7 +462,7 @@ impl GemmProblem {
         // them, its bytes at DRAM's rate: the epilogue over the sum is the
         // plan's ([`Self::plan_price`]).
         let split = part.split > 1;
-        let epilogue = if split { 0.0 } else { EPILOGUE_OPS * (bm * bn) as f64 / trips as f64 };
+        let epilogue = if split { 0.0 } else { f64::from(self.epilogue) * (bm * bn) as f64 / trips as f64 };
         let (mut ops, mut side) = (epilogue, Stream::default());
         if let Some(rope) = self.rope.filter(|_| !split) {
             let (half, turned) = (rope.head_dim / 2, rope.heads * rope.head_dim);
@@ -524,11 +548,11 @@ impl GemmProblem {
     /// and [`LAUNCH`] for every launch past the first. `None` where the
     /// shape refuses the config.
     ///
-    /// The epilogue is the ranking's representative bundle
-    /// ([`EPILOGUE_OPS`]), not the layer's, so no plan earns from moving
-    /// it: the tail's tiles pay what the data-parallel run pays for them
-    /// past the waves', not a merge's spread of it under its bytes. On
-    /// MI300X, where a lane operation prices dearest, that spread ranked a
+    /// The epilogue is priced where the data-parallel run pays it, so no
+    /// plan earns from moving it: the tail's tiles pay what the
+    /// data-parallel run pays for them past the waves', not a merge's
+    /// spread of it under its bytes. On MI300X, where a lane operation
+    /// prices dearest, that spread of a forty-operation epilogue ranked a
     /// tail split first on 8192²×1024 and 12288×4096×4096, which the device
     /// ran 6 % and 7 % slower split (`gemm_tail_probe`, its plain epilogue).
     pub fn plan_price(&self, planner: &Planner, cfg: &GemmCfg, plan: &TailPlan) -> Option<f64> {
@@ -661,26 +685,13 @@ impl Planner {
     }
 
     /// Every GEMM config for `batches` GEMMs of `m` rows, `n` columns and
-    /// reduction dim `k`, the cheapest of the lattice first.
-    pub fn gemm_ranked(&self, batches: usize, m: usize, n: usize, k: usize, gated: bool) -> Arc<[GemmCfg]> {
-        self.gemm_ranked_rope(batches, m, n, k, gated, None)
-    }
-
-    /// [`Planner::gemm_ranked`] for a problem whose output `rope` turns in
-    /// the kernel's store: only tiles that hold whole heads of its head
-    /// width lower, their turn priced.
-    pub fn gemm_ranked_rope(
-        &self,
-        batches: usize,
-        m: usize,
-        n: usize,
-        k: usize,
-        gated: bool,
-        rope: Option<Rope>,
-    ) -> Arc<[GemmCfg]> {
+    /// reduction dim `k` under `epilogue`, the cheapest of the lattice
+    /// first. A rope turns in the kernel's store: only tiles that hold
+    /// whole heads of its head width lower, their turn priced.
+    pub fn gemm_ranked(&self, batches: usize, m: usize, n: usize, k: usize, epilogue: &Epilogue) -> Arc<[GemmCfg]> {
         if batches * m * n * k == 0 {
             return Arc::new([]);
         }
-        self.ranked(GemmProblem { batches, m, n, k, halves: if gated { 2 } else { 1 }, rope })
+        self.ranked(GemmProblem::new(batches, m, n, k, epilogue))
     }
 }

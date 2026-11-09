@@ -91,8 +91,18 @@ pub fn linear(x: &Tensor, w: &Tensor, opts: Linear) -> Result<Tensor> {
     let planner = super::planner(&x.device());
     let dtypes: Vec<_> =
         [Some(x), Some(w), opts.bias, opts.residual].into_iter().flatten().map(Tensor::dtype).collect();
+    // The rope joins once the tables' positions are known.
+    let epilogue = Epilogue {
+        bias: opts.bias.is_some(),
+        act: opts.act,
+        gated: opts.gated,
+        residual: opts.residual.is_some(),
+        scale: opts.scale.map(Scale::new),
+        out_f32: false,
+        rope: None,
+    };
     let plan = match n.as_const() {
-        Some(n) => shape::linear(planner.as_deref(), &dtypes, ext.as_ref(), n, opts.gated),
+        Some(n) => shape::linear(planner.as_deref(), &dtypes, ext.as_ref(), n, &epilogue),
         None => Plan::Graph(shape::Fallback::Symbolic),
     };
     let Some(cfgs) = super::kernel(OP, plan) else { return graph(x, w, opts).context(GraphSnafu { op: OP }) };
@@ -115,7 +125,7 @@ pub fn linear(x: &Tensor, w: &Tensor, opts: Linear) -> Result<Tensor> {
     let cfgs: Vec<GemmCfg> = match rope {
         Some(rope) => {
             let batches = if var.is_some() { lead[0] } else { 1 };
-            planner.gemm_ranked_rope(batches, m, n, k, opts.gated, Some(rope)).to_vec()
+            planner.gemm_ranked(batches, m, n, k, &Epilogue { rope: Some(rope), ..epilogue }).to_vec()
         }
         None => cfgs.to_vec(),
     };
@@ -130,17 +140,9 @@ pub fn linear(x: &Tensor, w: &Tensor, opts: Linear) -> Result<Tensor> {
         let y = linear(x, w, Linear { rope: None, ..opts })?;
         return turned(&y, r).context(GraphSnafu { op: OP });
     }
-    let epilogue = Epilogue {
-        bias: opts.bias.is_some(),
-        act: opts.act,
-        gated: opts.gated,
-        residual: opts.residual.is_some(),
-        scale: opts.scale.map(Scale::new),
-        out_f32: false,
-        rope,
-    };
+    let epilogue = Epilogue { rope, ..epilogue };
     let batch = batch_of(&var, 1);
-    let problem = problem(m, n, k, &batch, epilogue);
+    let problem = problem(m, n, k, &batch, &epilogue);
     let spec = GemmSpec { m, n, k, batch, epilogue, cfg: admit(&planner, &problem, cfgs[0]) };
     let spec = tuned(TuneStore::global(), &planner, x.dtype(), &cfgs, spec);
     super::ran(OP, "gemm", spec.cfg);
@@ -198,7 +200,7 @@ pub(crate) fn programs(spec: &GemmSpec, dtype: &DType, planner: &Planner) -> Can
 
 /// The tail split `spec`'s config runs, as the planner plans it for the shape.
 fn tail<'t>(spec: &GemmSpec<'t>, planner: &Planner) -> Option<TailSpec<'t>> {
-    let problem = problem(spec.m, spec.n, spec.k, &spec.batch, spec.epilogue);
+    let problem = problem(spec.m, spec.n, spec.k, &spec.batch, &spec.epilogue);
     spec.cfg.tail.filter(|_| spec.batch == Batch::Static(1))?;
     let plan = problem.tail_plan(planner, &spec.cfg).expect("an admitted tail split runs its problem");
     Some(TailSpec { gemm: spec.clone(), plan })
@@ -238,7 +240,7 @@ fn tune<'t>(
     spec: GemmSpec<'t>,
 ) -> GemmSpec<'t> {
     let shape = [spec.batch.capacity(), spec.m, spec.n, spec.k];
-    let problem = problem(spec.m, spec.n, spec.k, &spec.batch, spec.epilogue);
+    let problem = problem(spec.m, spec.n, spec.k, &spec.batch, &spec.epilogue);
     let build =
         |cfg: GemmCfg| programs(&GemmSpec { cfg: admit(planner, &problem, cfg), ..spec.clone() }, &dtype, planner);
     let cfg = Tuner::new(store, &planner.device, dtype.clone(), &shape, salt, build)
@@ -248,9 +250,8 @@ fn tune<'t>(
 }
 
 /// The GEMM problem of a `[batch, m, k] · [n, k]ᵀ` under `epilogue`.
-fn problem(m: usize, n: usize, k: usize, batch: &Batch, epilogue: Epilogue) -> GemmProblem {
-    let halves = usize::from(epilogue.gated) + 1;
-    GemmProblem { batches: batch.capacity().max(1), m, n, k, halves, rope: epilogue.rope }
+fn problem(m: usize, n: usize, k: usize, batch: &Batch, epilogue: &Epilogue) -> GemmProblem {
+    GemmProblem::new(batch.capacity().max(1), m, n, k, epilogue)
 }
 
 /// A ranked config, or the tuner's variant of one, as the planner admits it

@@ -217,8 +217,8 @@ fn mi300x() -> Planner {
 /// (`None` where it offers none), each with its cost and plan.
 #[allow(clippy::type_complexity)]
 fn lead(planner: &Planner, [m, n, k]: [usize; 3]) -> ((GemmCfg, f64), Option<(GemmCfg, f64, TailPlan)>) {
-    let p = GemmProblem { batches: 1, m, n, k, halves: 1, rope: None };
-    let ranked = planner.gemm_ranked(1, m, n, k, false);
+    let p = GemmProblem::new(1, m, n, k, &Epilogue::DEFAULT);
+    let ranked = planner.gemm_ranked(1, m, n, k, &Epilogue::DEFAULT);
     let lead = ranked[0];
     let split = ranked.iter().find(|c| c.tail.is_some() && c.tile() == lead.tile()).map(|&c| {
         let plan = p.tail_plan(planner, &c).unwrap_or_else(|| panic!("{c:?} plans no tail"));
@@ -238,12 +238,12 @@ fn a_partial_last_wave_is_split() {
     let [m, n, k] = [8192, 4096, 4096];
     let ((lead, cost), split) = lead(&planner, [m, n, k]);
     let (cfg, split_cost, plan) = split.unwrap_or_else(|| panic!("{lead:?} has no split twin"));
-    let p = GemmProblem { batches: 1, m, n, k, halves: 1, rope: None };
+    let p = GemmProblem::new(1, m, n, k, &Epilogue::DEFAULT);
     let wave = p.wave(&planner, &cfg).expect("a wave");
     assert!(lead.tail.is_none(), "{lead:?} leads split");
     assert_eq!(lead.tile[..2], [256, 256], "{lead:?}");
     assert_eq!((wave, plan.waves.map(Run::count), plan.tail), (304, Some(304), Run::new(304, 208).unwrap()));
-    let ranked = planner.gemm_ranked(1, m, n, k, false);
+    let ranked = planner.gemm_ranked(1, m, n, k, &Epilogue::DEFAULT);
     let unsplit = ranked.iter().filter(|c| c.tail.is_none()).map(|c| p.admit(&planner, c).expect("ranked").0);
     assert_eq!(unsplit.fold(f64::INFINITY, f64::min), cost, "the lead is the cheapest unsplit config");
     let whole = p.admit(&planner, &GemmCfg { tail: None, ..cfg }).expect("its unsplit form").0;
@@ -259,7 +259,7 @@ fn a_partial_last_wave_is_split() {
 fn whole_waves_run_unsplit(shape: [usize; 3]) {
     let planner = mi300x();
     let ((lead, cost), split) = lead(&planner, shape);
-    let p = GemmProblem { batches: 1, m: shape[0], n: shape[1], k: shape[2], halves: 1, rope: None };
+    let p = GemmProblem::new(1, shape[0], shape[1], shape[2], &Epilogue::DEFAULT);
     assert!(lead.tail.is_none() && p.tail_plan(&planner, &lead).is_none(), "{shape:?}: {lead:?} splits");
     if let Some((cfg, split_cost, plan)) = split {
         assert!(split_cost > cost, "{shape:?}: {cfg:?} {plan:?} priced at {split_cost} under {cost}");
@@ -280,8 +280,8 @@ fn whole_waves_run_unsplit(shape: [usize; 3]) {
 #[test_case(Target::card("h100-sxm").unwrap(), [8192, 8192, 1024])]
 fn every_ranked_split_divides_its_trips(target: Target, [m, n, k]: [usize; 3]) {
     let planner = planner(target);
-    let p = GemmProblem { batches: 1, m, n, k, halves: 1, rope: None };
-    let ranked = planner.gemm_ranked(1, m, n, k, false);
+    let p = GemmProblem::new(1, m, n, k, &Epilogue::DEFAULT);
+    let ranked = planner.gemm_ranked(1, m, n, k, &Epilogue::DEFAULT);
     for cfg in ranked.iter() {
         let tiles = m.div_ceil(cfg.tile[0]) * n.div_ceil(cfg.tile[1]);
         let wave = p.wave(&planner, cfg).expect("ranked");
@@ -293,7 +293,7 @@ fn every_ranked_split_divides_its_trips(target: Target, [m, n, k]: [usize; 3]) {
         assert!(!tiles.is_multiple_of(wave), "{cfg:?}: {tiles} tiles fill waves of {wave}");
     }
     for (batches, gated) in [(2, false), (1, true)] {
-        let ranked = planner.gemm_ranked(batches, m, n, k, gated);
+        let ranked = planner.gemm_ranked(batches, m, n, k, &Epilogue { gated, ..Epilogue::DEFAULT });
         assert!(ranked.iter().all(|c| c.tail.is_none()), "a batched or gated GEMM splits");
     }
 }
@@ -308,7 +308,7 @@ fn a_split_the_problem_cannot_run_is_refused() {
     let refused = Err(Rejected::Shape(ShapeRejected::Tail));
     let cfg = gemm_cfg([128, 128, 64], 1, [4, 2], false);
     let split = |s| GemmCfg { tail: TailSplit::new(s), ..cfg };
-    let p = GemmProblem { batches: 1, m: 8192, n: 4096, k: 4096, halves: 1, rope: None };
+    let p = GemmProblem::new(1, 8192, 4096, 4096, &Epilogue::DEFAULT);
     assert!(p.admit(&planner, &split(4)).is_ok());
     assert_eq!(p.admit(&planner, &split(3)).map(|_| ()), refused, "64 trips split three ways");
     let rope = Some(crate::kernels::gemm::Rope { heads: 4, head_dim: 64, seq: 8 });
@@ -342,8 +342,8 @@ fn a_split_runs_only_as_a_timed_twin(target: Target, costs: Costs, [m, n, k]: [u
     use crate::ops::config::{first_clean, representatives};
     use crate::tune::Compiled;
     let planner = Planner::new(Device { target, costs }).expect("an SM count");
-    let p = GemmProblem { batches: 1, m, n, k, halves: 1, rope: None };
-    let ranked = planner.gemm_ranked(1, m, n, k, false);
+    let p = GemmProblem::new(1, m, n, k, &Epilogue::DEFAULT);
+    let ranked = planner.gemm_ranked(1, m, n, k, &Epilogue::DEFAULT);
     let price = |c: &GemmCfg| p.admit(&planner, c).expect("ranked").0;
     let cheapest = ranked.iter().copied().min_by(|a, b| price(a).total_cmp(&price(b))).expect("a ranking");
     assert!(cheapest.tail.is_some(), "{cheapest:?}: the model prices no split cheapest");
@@ -450,8 +450,8 @@ const TIE: f64 = 1.01;
 
 /// The model orders a probed shape's plans — data-parallel, a whole
 /// split-K, a tail split, each at its probed count — as the device did,
-/// every pair the device told apart past [`TIE`], under the ranking's
-/// representative epilogue and under none (the probe's plain store). Each
+/// every pair the device told apart past [`TIE`], under the probe's own
+/// plain epilogue and under none. Each
 /// plan is priced as the probe timed it, its kernels' alone, without the
 /// [`LAUNCH`]es between them.
 #[test_case(Target::card("mi300x").expect("a card"), gfx942_costs(), mi300x_probed(); "mi300x")]
@@ -462,7 +462,7 @@ fn the_model_orders_the_probed_plans_as_the_device_did(target: Target, costs: Co
         let mut planner = Planner::new(Device { target: target.clone(), costs }).expect("an SM count");
         planner.weights.epilogue = epilogue;
         for Probed { shape: [m, n, k], cfg, dp, whole, tail } in &rows {
-            let p = GemmProblem { batches: 1, m: *m, n: *n, k: *k, halves: 1, rope: None };
+            let p = GemmProblem::new(1, *m, *n, *k, &Epilogue::DEFAULT);
             let (tiles, wave) =
                 (m.div_ceil(cfg.tile[0]) * n.div_ceil(cfg.tile[1]), p.wave(&planner, cfg).expect("a wave"));
             let kernels = |plan: TailPlan| {
@@ -505,7 +505,7 @@ fn the_model_orders_the_probed_plans_as_the_device_did(target: Target, costs: Co
 fn the_planner_offers_a_split_where_the_device_ran_one_faster(target: Target, costs: Costs, rows: Vec<Probed>) {
     let planner = Planner::new(Device { target, costs }).expect("an SM count");
     for Probed { shape: [m, n, k], cfg, dp, tail, .. } in &rows {
-        let ranked = planner.gemm_ranked(1, *m, *n, *k, false);
+        let ranked = planner.gemm_ranked(1, *m, *n, *k, &Epilogue::DEFAULT);
         let pipeline = |c: &&GemmCfg| GemmCfg { order: cfg.order, tail: None, ..**c } == *cfg;
         let first = ranked.iter().find(pipeline).unwrap_or_else(|| panic!("{m}x{n}x{k}: {cfg:?} unranked"));
         assert!(first.tail.is_none(), "{m}x{n}x{k}: {first:?} leads its pipeline split");

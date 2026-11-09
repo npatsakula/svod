@@ -28,7 +28,7 @@ fn plain_gemm(m: usize, n: usize, k: usize, cfg: GemmCfg) -> Program {
 /// admitted shortlist of the device's ranking) and its pick among them.
 pub(super) fn device_gemms(planner: &Planner, spec: &GemmSpec) -> (Vec<GemmCfg>, GemmCfg) {
     let GemmSpec { m, n, k, epilogue, .. } = *spec;
-    let ranked = planner.gemm_ranked(1, m, n, k, epilogue.gated);
+    let ranked = planner.gemm_ranked(1, m, n, k, &epilogue);
     let build = |cfg: GemmCfg| programs(&GemmSpec { cfg: assumed(cfg), ..spec.clone() }, &DType::BFloat16, planner);
     let shape = [spec.batch.capacity(), m, n, k];
     let (admitted, pick) = super::tuned_on_device(
@@ -191,7 +191,7 @@ fn check_gemm(device: &Device, m: usize, n: usize, k: usize, cfg: GemmCfg) -> Ve
 fn a_batch_past_i32_lands_at_its_stride() {
     let Some(planner) = super::device_planner() else { return };
     let (batches, m, n, k) = (2, 50_001, 50_001, 32);
-    let cfg = planner.gemm_ranked(batches, m, n, k, false)[0];
+    let cfg = planner.gemm_ranked(batches, m, n, k, &Epilogue::DEFAULT)[0];
     let spec = GemmSpec { m, n, k, batch: Batch::Static(batches), epilogue: Epilogue::default(), cfg: assumed(cfg) };
     let mut seed = 17;
     let mut draw = |len: usize| {
@@ -376,8 +376,8 @@ fn gemm_raster_probe() {
     for [m, n, k] in shapes {
         let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg: assumed(BIG) };
         let (_, pick) = device_gemms(&planner, &spec);
-        let first = planner.gemm_ranked(1, m, n, k, false)[0];
-        let p = GemmProblem { batches: 1, m, n, k, halves: 1, rope: None };
+        let first = planner.gemm_ranked(1, m, n, k, &Epilogue::DEFAULT)[0];
+        let p = GemmProblem::new(1, m, n, k, &Epilogue::DEFAULT);
         let flops = 2.0 * (m * n * k) as f64;
         for (what, cfg) in [("tuner's pick", pick), ("planner's first", first)] {
             if what == "planner's first" && (GemmCfg { order: pick.order, ..first }) == pick {
@@ -766,7 +766,7 @@ fn turning_gemms_match_the_interpreter() {
     let rope = Rope { heads: 6, head_dim: d, seq: 50 };
     let epilogue = Epilogue { rope: Some(rope), ..Epilogue::DEFAULT };
     let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue, cfg: assumed(BIG) };
-    let ranked: Vec<GemmCfg> = planner.gemm_ranked_rope(1, m, n, k, false, Some(rope)).to_vec();
+    let ranked: Vec<GemmCfg> = planner.gemm_ranked(1, m, n, k, &epilogue).to_vec();
     let build =
         |cfg| vec![(gemm::<BF16>(&GemmSpec { cfg: assumed(cfg), ..spec.clone() }), cfg.lowering(&planner.device))];
     let shape = [1, m, n, k];
@@ -874,8 +874,8 @@ fn gemm_tail_probe() {
         },
     );
     for [m, n, k] in shapes {
-        let p = GemmProblem { batches: 1, m, n, k, halves: 1, rope: None };
-        let ranked = planner.gemm_ranked(1, m, n, k, false);
+        let p = GemmProblem::new(1, m, n, k, &Epilogue::DEFAULT);
+        let ranked = planner.gemm_ranked(1, m, n, k, &Epilogue::DEFAULT);
         let cfg = ranked[0];
         let twin = ranked.iter().find(|c| c.tail.is_some() && c.tile() == cfg.tile()).copied();
         let tiles = m.div_ceil(cfg.tile[0]) * n.div_ceil(cfg.tile[1]);

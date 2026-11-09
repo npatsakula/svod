@@ -62,10 +62,9 @@ pub(crate) enum Kind {
     /// without the row's least, and its store's issue), a listed score's
     /// scan, a skipped step, a queue insert.
     Scan,
-    /// A tile epilogue's operations over the tile's elements (a gelu's
-    /// forty: the abs, the affines, the reciprocal, the polynomial's
-    /// multiplies, the square, the `exp2`, the tails), beside the steps in
-    /// every trip.
+    /// A tile epilogue's operations over the tile's elements (the layer's:
+    /// the store's rounding, a bias, an activation, a gate, a scale, a
+    /// residual), beside the steps in every trip.
     Epilogue,
 }
 
