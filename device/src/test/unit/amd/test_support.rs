@@ -31,6 +31,7 @@ pub(crate) enum MockAmdCall {
     TeardownRing { queue_id: u32 },
     WaitEvents { timeout_ms: u32 },
     PublicationCheckpoint { stage: PublicationStage },
+    HdpFlush,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -99,6 +100,7 @@ struct MockAmdState {
     transcript: Vec<MockAmdCall>,
     free_issues: Vec<MockFreeIssue>,
     queue_event_mailbox: Option<QueueEventMailbox>,
+    hdp_flush_register: bool,
 }
 
 /// Host-only AMD backend with page-aligned, stable allocations and explicit
@@ -137,6 +139,12 @@ impl MockAmdIface {
     /// Give the mock KFD's queue-completion mailbox, as a real event page does.
     pub(crate) fn set_queue_event_mailbox(&self, mailbox: QueueEventMailbox) {
         self.state.lock().queue_event_mailbox = Some(mailbox);
+    }
+
+    /// Give the mock KFD's MMIO remap page, whose HDP flush register the
+    /// queues write before each doorbell; without it the flush is skipped.
+    pub(crate) fn set_hdp_flush_register(&self) {
+        self.state.lock().hdp_flush_register = true;
     }
 
     pub(crate) fn script_wait(&self, outcome: Result<Option<Error>>) {
@@ -351,6 +359,13 @@ impl AmdIface for MockAmdIface {
 
     fn queue_event_mailbox(&self) -> Option<QueueEventMailbox> {
         self.state.lock().queue_event_mailbox
+    }
+
+    fn flush_hdp(&self) {
+        let mut state = self.state.lock();
+        if state.hdp_flush_register {
+            state.transcript.push(MockAmdCall::HdpFlush);
+        }
     }
 
     fn publication_checkpoint(&self, stage: PublicationStage) -> Result<()> {

@@ -32,6 +32,7 @@ fn main() {
         .allowlist_type("kfd_hsa_memory_exception_data")
         .allowlist_type("kfd_hsa_hw_exception_data")
         .allowlist_type("kfd_memory_exception_failure")
+        .allowlist_type("kfd_mmio_remap")
         .allowlist_type("__u\\d+")
         .allowlist_type("__s\\d+")
         .allowlist_var("KFD_IOC_.*")

@@ -134,23 +134,3 @@ fn event_write_partial_flush_shape() {
     assert_eq!(pkt[0], packet3(PACKET3_EVENT_WRITE, 0));
     assert_eq!(pkt[1], CS_PARTIAL_FLUSH | (EVENT_INDEX_PARTIAL_FLUSH << 8));
 }
-
-#[test]
-fn hdp_flush_register_handshake_shape() {
-    let pkt = hdp_flush();
-    // 7 dwords: header + info + reg_req + reg_done + value + mask + poll
-    assert_eq!(pkt.len(), 7);
-    assert_eq!(pkt[0], packet3(PACKET3_WAIT_REG_MEM, 5));
-    // info: mem_space=0 (register), operation=1, function=EQ, engine=0
-    let expected_info = wait_reg_mem_operation(1) | wait_reg_mem_function(WAIT_REG_MEM_FUNC_EQ);
-    assert_eq!(pkt[1], expected_info);
-    assert_eq!(pkt[2], HDP_FLUSH_REQ_ADDR);
-    assert_eq!(pkt[3], HDP_FLUSH_DONE_ADDR);
-    // One private channel, never all 32: a kernel MES/KIQ handshake on its
-    // own bit must not be able to starve this wait.
-    assert_eq!(pkt[4], HDP_FLUSH_CHANNEL);
-    assert_eq!(pkt[5], pkt[4]);
-    assert_eq!(pkt[4].count_ones(), 1);
-    assert!(pkt[4] >= 1 << 12, "bits 0..11 belong to the kernel's CP/SDMA rings");
-    assert_eq!(pkt[6], 0x20);
-}

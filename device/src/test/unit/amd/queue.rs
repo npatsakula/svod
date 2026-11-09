@@ -436,6 +436,57 @@ fn publication_fails_at(iface: &MockAmdIface, stage: usize, panicking: bool, sub
     assert_eq!(&iface.publication_stages()[reached..], &STAGES[..=stage]);
 }
 
+/// Every compute doorbell follows the host HDP flush when the backend has the
+/// flush register, and a backend without one publishes the same way.
+#[test_case::test_case(1, true; "pm4 flushes")]
+#[test_case::test_case(2, true; "aql flushes")]
+#[test_case::test_case(1, false; "pm4 without the register")]
+#[test_case::test_case(2, false; "aql without the register")]
+fn the_host_flushes_hdp_before_each_compute_doorbell(xccs: u32, register: bool) {
+    use super::test_support::MockAmdCall;
+
+    let (iface, allocator) = mock_device_with_signals(xccs);
+    if register {
+        iface.set_hdp_flush_register();
+    }
+    let pool = PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator).expect("pool queue");
+    let doorbell = |iface: &MockAmdIface| {
+        let mark = iface.transcript().len();
+        pool.queue().submit_hcq_dispatch(&pool, &compute_submission(), &[0; 16], &[], &[]).expect("submit");
+        iface.transcript()[mark..]
+            .iter()
+            .filter(|call| matches!(call, MockAmdCall::PublicationCheckpoint { .. } | MockAmdCall::HdpFlush))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let checkpoint = |stage| MockAmdCall::PublicationCheckpoint { stage };
+    let mut expected =
+        vec![checkpoint(PublicationStage::AfterReservation), checkpoint(PublicationStage::BeforeDoorbell)];
+    expected.extend(register.then_some(MockAmdCall::HdpFlush));
+    expected.push(checkpoint(PublicationStage::AfterDoorbell));
+    for _ in 0..2 {
+        assert_eq!(doorbell(&iface), expected, "xccs={xccs}");
+    }
+}
+
+/// SDMA reads host-written VRAM too, so its doorbell flushes HDP as well.
+#[test_case::test_case(true; "with the register")]
+#[test_case::test_case(false; "without the register")]
+fn the_host_flushes_hdp_before_each_copy_doorbell(register: bool) {
+    use super::test_support::MockAmdCall;
+
+    let (iface, allocator) = mock_device_with_signals(1);
+    if register {
+        iface.set_hdp_flush_register();
+    }
+    let queue = AmdCopyQueue::create(&allocator).expect("copy queue");
+    let mut copy = Submission::new(QueueKind::Copy(0));
+    copy.push(Command::Copy { dst: 0x1000, src: 0x2000, bytes: 4 });
+    queue.submit_hcq(&copy).expect("submit");
+    assert_ne!(queue.ring_write_idx(), 0, "the copy was published");
+    assert_eq!(iface.call_count(|call| *call == MockAmdCall::HdpFlush), usize::from(register));
+}
+
 fn compute_submission() -> Submission {
     let mut submission = Submission::new(QueueKind::Compute(0));
     submission.push(Command::MemoryBarrier).push(Command::Compute(ComputeDispatch {
@@ -592,26 +643,7 @@ fn hcq_pm4_command_goldens_concatenate_in_submission_order() {
             Command::Wait { signal_address: ADDRESS, value: 7 },
             &[0xc005_3c00, 0x15, 0x5566_7788, 0x1122_3344, 7, 0xffff_ffff, 4],
         ),
-        (
-            Command::MemoryBarrier,
-            &[
-                0xc005_3c00,
-                0x43,
-                0xe26,
-                0xe27,
-                0x1000,
-                0x1000,
-                0x20,
-                0xc006_5800,
-                0,
-                0xffff_ffff,
-                0xffff_ffff,
-                0,
-                0,
-                0,
-                0xc3f1,
-            ],
-        ),
+        (Command::MemoryBarrier, &[0xc006_5800, 0, 0xffff_ffff, 0xffff_ffff, 0, 0, 0, 0xc3f1]),
         (
             Command::Timestamp { dst: ADDRESS },
             &[
@@ -649,18 +681,62 @@ fn hcq_pm4_command_goldens_concatenate_in_submission_order() {
 
 /// Every `ACQUIRE_MEM` packet of a lowered PM4 stream.
 fn acquires(dwords: &[u32]) -> Vec<&[u32]> {
+    packets(dwords, crate::amd::sys::pm4::PACKET3_ACQUIRE_MEM)
+}
+
+/// Every type-3 packet with `opcode` in a lowered PM4 stream.
+fn packets(dwords: &[u32], opcode: u32) -> Vec<&[u32]> {
     let mut packets = Vec::new();
     let mut at = 0;
     while at < dwords.len() {
         let header = dwords[at];
         assert_eq!(header >> 30, 3, "a compute stream is type-3 packets: {header:#x} at {at}");
         let len = ((header >> 16) & 0x3fff) as usize + 2;
-        if (header >> 8) & 0xff == crate::amd::sys::pm4::PACKET3_ACQUIRE_MEM {
+        if (header >> 8) & 0xff == opcode {
             packets.push(&dwords[at..at + len]);
         }
         at += len;
     }
     packets
+}
+
+/// The host flushes HDP before the doorbell (`AmdIface::flush_hdp`), so a
+/// memory barrier keeps its full cache acquire but no register-space
+/// WAIT_REG_MEM: the CP's `GPU_HDP_FLUSH_REQ/DONE` bit is shared by every
+/// queue of every process, and concurrent requesters on it hang (gfx942).
+/// The timeline wait stays a memory-space poll.
+#[test_case::test_case(9, None; "gfx9 PM4")]
+#[test_case::test_case(11, None; "gfx11 PM4")]
+#[test_case::test_case(12, None; "gfx12 PM4")]
+#[test_case::test_case(9, Some(true); "multi-XCC AQL control")]
+#[test_case::test_case(9, Some(false); "single-XCC AQL control")]
+fn a_memory_barrier_flushes_caches_without_the_hdp_handshake(target_major: u32, aql: Option<bool>) {
+    use crate::amd::sys::pm4;
+
+    let dwords = match aql {
+        None => lower_hcq_pm4(
+            &compute_of([Command::Wait { signal_address: 0x2000, value: 7 }, Command::MemoryBarrier]),
+            Pm4LoweringState { target_major, ..pm4_state() },
+        )
+        .unwrap(),
+        Some(multi_xcc) => {
+            let submission = compute_of([Command::MemoryBarrier, Command::Compute(dispatch(0x1234_5600, 0x9000))]);
+            let finalized = finalize_hcq_aql_timeline_submission(&submission, 0x2000, 7, 8, None).unwrap();
+            let lowered = lower_hcq_aql_submission_program(
+                &finalized,
+                aql_control_state(multi_xcc),
+                crate::hcq::PatchSource::LinkAddress(0),
+            )
+            .unwrap();
+            replay_dwords(&lowered.control.bytes)
+        }
+    };
+
+    let waits = packets(&dwords, pm4::PACKET3_WAIT_REG_MEM);
+    assert_eq!(waits.len(), 1, "only the timeline wait remains");
+    assert_ne!(waits[0][1] & pm4::wait_reg_mem_mem_space(1), 0, "the wait polls memory, not a register pair");
+    let full: &[u32] = if target_major == 9 { &pm4::acquire_mem_gfx9() } else { &pm4::acquire_mem() };
+    assert_eq!(acquires(&dwords), [full], "the barrier keeps its full cache acquire");
 }
 
 /// A stamp writes the clock and touches no cache: an acquire after the start

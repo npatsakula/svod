@@ -36,7 +36,7 @@ pub(crate) const HUGE_PAGE: usize = 0x20_0000;
 
 /// Backend seam for the AMD device. Every KFD ioctl that `AmdDeviceCore` (and
 /// its allocator / queue / connector helpers) needs is funnelled through one
-/// of these methods — five required, three defaulted — so a second backend
+/// of these methods — five required, four defaulted — so a second backend
 /// (the userspace AM driver) can be dropped in without editing any call site.
 pub trait AmdIface: Send + Sync + std::fmt::Debug {
     /// Reserve a host VA, KFD-allocate `size` bytes per `kind`, optionally map
@@ -102,6 +102,13 @@ pub trait AmdIface: Send + Sync + std::fmt::Debug {
     fn update_queue_percentage(&self, _queue_id: u32, _ring_gpu: u64, _ring_size: u32, _percentage: u32) -> Result<()> {
         Ok(())
     }
+
+    /// Flush the host's writes to device-local memory out of HDP, the host
+    /// data path: queues call it between their last host write and the
+    /// doorbell, so the work the doorbell starts reads them (ROCr/CLR's
+    /// `HDP_MEM_FLUSH_CNTL` write before a dispatch that reads VRAM kernargs).
+    /// A no-op where the backend has no flush register.
+    fn flush_hdp(&self) {}
 }
 
 /// Address of a KFD event's mailbox slot plus the id written into it.
@@ -210,6 +217,8 @@ pub struct KfdIface {
     /// of recently-freed ranges, so a fault VA can be resolved to its owning
     /// (or stale, or nearest) allocation. See [`crate::amd::va_registry`].
     va: VaRegistry,
+    /// KFD's remap of the HDP flush registers, when the kernel provides one.
+    mmio_remap: Option<MmioRemapPage>,
     /// One-shot latch so the terminal fault is logged at `error` exactly once,
     /// even though `wait_events(0)` may re-observe the (non-auto-reset) fault
     /// event on subsequent poll-fault calls.
@@ -321,6 +330,7 @@ impl KfdIface {
             );
         }
 
+        let mmio_remap = MmioRemapPage::map(&kfd_fd, node.gpu_id);
         Ok(Self {
             kfd_fd,
             drm_fd,
@@ -334,6 +344,7 @@ impl KfdIface {
             mem_fault_event_id: mem_event.event_id,
             hw_fault_event_id: hw_event.event_id,
             va: VaRegistry::default(),
+            mmio_remap,
             fault_logged: AtomicBool::new(false),
         })
     }
@@ -341,9 +352,98 @@ impl KfdIface {
 
 impl Drop for KfdIface {
     fn drop(&mut self) {
+        if let Some(page) = self.mmio_remap.take() {
+            // SAFETY: the page was mapped by `MmioRemapPage::map`; queues that
+            // flushed through it hold this iface, so none outlives it.
+            unsafe { munmap(page.base.as_ptr().cast(), MMIO_REMAP_PAGE_BYTES) };
+            self.free_kfd(page.handle);
+        }
         for event_id in [self.queue_event_id, self.mem_fault_event_id, self.hw_fault_event_id] {
             let mut args = kfd::kfd_ioctl_destroy_event_args { event_id, pad: 0 };
             let _ = unsafe { ioctl::kfd_destroy_event(self.kfd_fd.as_raw_fd(), &mut args as *mut _) };
+        }
+    }
+}
+
+/// Size of KFD's MMIO-remap page; KFD offers it only on 4 KiB host pages.
+const MMIO_REMAP_PAGE_BYTES: usize = 0x1000;
+
+/// KFD's user mapping of the device's MMIO-remap page, which exposes the HDP
+/// flush registers (libhsakmt `map_mmio`, read by ROCr as `HDP_flush_`).
+///
+/// A write to `HDP_MEM_FLUSH_CNTL` flushes HDP from the host, without the CP's
+/// `GPU_HDP_FLUSH_REQ/DONE` handshake: that register pair is one channel per
+/// bit shared by every queue of every process, and its DONE bit toggles per
+/// request, so concurrent requesters on one bit can wait forever (four
+/// lanes on gfx942 stalled 14 of 14 runs and ended in a GPU reset).
+#[derive(Debug)]
+struct MmioRemapPage {
+    base: NonNull<u32>,
+    handle: u64,
+}
+
+// SAFETY: an MMIO mapping with no thread affinity; a flush is one register
+// write any thread may issue.
+unsafe impl Send for MmioRemapPage {}
+unsafe impl Sync for MmioRemapPage {}
+
+impl MmioRemapPage {
+    /// Allocate and map the remap page, or `None` where KFD has none to give
+    /// (larger host pages, a device without the remap BAR, an older KFD): the
+    /// host then skips the flush.
+    fn map(kfd_fd: &OwnedFd, gpu_id: u32) -> Option<Self> {
+        // SAFETY: sysconf has no preconditions.
+        if unsafe { libc::sysconf(libc::_SC_PAGESIZE) } != MMIO_REMAP_PAGE_BYTES as libc::c_long {
+            return None;
+        }
+        let va = reserve_va(MMIO_REMAP_PAGE_BYTES).ok()?;
+        let mut args = kfd::kfd_ioctl_alloc_memory_of_gpu_args {
+            va_addr: va as u64,
+            size: MMIO_REMAP_PAGE_BYTES as u64,
+            gpu_id,
+            flags: kfd::KFD_IOC_ALLOC_MEM_FLAGS_MMIO_REMAP
+                | kfd::KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE
+                | kfd::KFD_IOC_ALLOC_MEM_FLAGS_COHERENT,
+            ..Default::default()
+        };
+        // SAFETY: kfd_fd is open; args is well-typed for ALLOC_MEMORY_OF_GPU.
+        if let Err(errno) = unsafe { ioctl::kfd_alloc_memory_of_gpu(kfd_fd.as_raw_fd(), &mut args as *mut _) } {
+            unsafe { munmap(va, MMIO_REMAP_PAGE_BYTES) };
+            debug!(?errno, "no KFD MMIO remap page; the host skips HDP flushes");
+            return None;
+        }
+        // SAFETY: KFD hands out the remap page through /dev/kfd at `mmap_offset`.
+        let p = unsafe {
+            mmap(
+                va,
+                MMIO_REMAP_PAGE_BYTES,
+                PROT_READ | PROT_WRITE,
+                MAP_SHARED | MAP_FIXED,
+                kfd_fd.as_raw_fd(),
+                args.mmap_offset as i64,
+            )
+        };
+        if p == libc::MAP_FAILED {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            let mut free = kfd::kfd_ioctl_free_memory_of_gpu_args { handle: args.handle };
+            // SAFETY: the handle came from the allocation above.
+            let _ = unsafe { ioctl::kfd_free_memory_of_gpu(kfd_fd.as_raw_fd(), &mut free as *mut _) };
+            unsafe { munmap(va, MMIO_REMAP_PAGE_BYTES) };
+            tracing::warn!(errno, "mmap(KFD MMIO remap) failed; the host skips HDP flushes");
+            return None;
+        }
+        Some(Self { base: NonNull::new(p.cast())?, handle: args.handle })
+    }
+
+    /// Flush HDP: write `HDP_MEM_FLUSH_CNTL`, then read it back so the flush
+    /// has landed before the caller's doorbell write (CLR `rocvirtual.cpp`).
+    fn flush(&self) {
+        let offset = kfd::kfd_mmio_remap_KFD_MMIO_REMAP_HDP_MEM_FLUSH_CNTL as usize / 4;
+        // SAFETY: the register lies inside the mapped page.
+        unsafe {
+            let reg = self.base.as_ptr().add(offset);
+            std::ptr::write_volatile(reg, 1);
+            std::ptr::read_volatile(reg);
         }
     }
 }
@@ -372,6 +472,12 @@ impl Drop for EventGuard {
 }
 
 impl AmdIface for KfdIface {
+    fn flush_hdp(&self) {
+        if let Some(page) = &self.mmio_remap {
+            page.flush();
+        }
+    }
+
     fn queue_event_mailbox(&self) -> Option<QueueEventMailbox> {
         Some(QueueEventMailbox { address: self.queue_event_mailbox_ptr, event_id: self.queue_event_id })
     }

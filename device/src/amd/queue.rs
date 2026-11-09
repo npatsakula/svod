@@ -52,7 +52,7 @@ pub const COMPUTE_RING_BYTES: usize = 16 * 1024 * 1024;
 pub const COPY_RING_BYTES: usize = 16 * 1024 * 1024;
 
 /// Conservative upper bound on the dwords a single PM4 dispatch writes to the
-/// ring (wait, HDP flush, acquire_mem, the SET_SH_REG stream, DISPATCH_DIRECT,
+/// ring (wait, acquire_mem, the SET_SH_REG stream, DISPATCH_DIRECT,
 /// RELEASE_MEM — a typical dispatch is ~150). Bounds in-flight dispatches so
 /// the host can never lap the ring.
 const MAX_DISPATCH_DWORDS: usize = 1024;
@@ -512,8 +512,11 @@ pub fn lower_hcq_pm4(submission: &crate::hcq::Submission, state: Pm4LoweringStat
             crate::hcq::Command::Wait { signal_address, value } => {
                 q.extend_from_slice(&pm4::wait_reg_mem(*signal_address, value_u32("wait", *value)?, u32::MAX));
             }
+            // HDP is flushed by the host before each doorbell
+            // (`AmdIface::flush_hdp`), not here: the CP's REQ/DONE handshake
+            // is shared by every queue on the device and hangs under concurrent
+            // requesters.
             crate::hcq::Command::MemoryBarrier => {
-                q.extend_from_slice(&pm4::hdp_flush());
                 if is_gfx9 {
                     q.extend_from_slice(&pm4::acquire_mem_gfx9());
                 } else {
@@ -1003,6 +1006,8 @@ struct QueueInner {
     /// trap handler writes its exception code into `value` (`+8`) and halts the
     /// queue; reading it tells us WHY a wedge happened (e.g. `0x401`).
     qinactive_host: Option<NonNull<u8>>,
+    /// The backend, whose HDP flush precedes every doorbell.
+    iface: Arc<dyn crate::amd::iface::AmdIface>,
     /// Index of the next packet (in AQL_PACKET_BYTES-sized slots). For SDMA
     /// queues this is the next byte offset; type checks ensure callers don't
     /// confuse them.
@@ -1266,6 +1271,11 @@ impl QueueInner {
     /// the **last completed** slot (`write_idx - 1`); PM4 uses the **next**
     /// dword (`write_idx`).
     fn ring_doorbell(&self, is_pm4: bool) {
+        self.publish(if is_pm4 { self.write_idx } else { self.write_idx - 1 });
+    }
+
+    /// Publish `write_idx` to the GART wptr, flush HDP, then write `doorbell_value`.
+    fn publish(&self, doorbell_value: u64) {
         // GART wptr first: without it KFD sees the doorbell
         // change but reads a stale wptr.
         unsafe { std::ptr::write_volatile(self.write_ptr_host.as_ptr(), self.write_idx) };
@@ -1275,7 +1285,10 @@ impl QueueInner {
         // does. Without it the CP can observe the doorbell while the wptr /
         // ring packet / kernarg stores are still buffered (stale read → wedge).
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-        let doorbell_value = if is_pm4 { self.write_idx } else { self.write_idx - 1 };
+        // Host writes through the BAR into VRAM (kernargs, control IBs,
+        // host-visible buffers) can sit in HDP; the work this doorbell starts
+        // may read them.
+        self.iface.flush_hdp();
         // SAFETY: doorbell is mmapped MMIO; aligned 64-bit store.
         unsafe { std::ptr::write_volatile(self.doorbell.as_ptr(), doorbell_value) };
     }
@@ -1428,9 +1441,7 @@ impl Drop for CopyTimelineReservation<'_> {
 impl LinkedCopyPublication<'_> {
     pub(crate) fn publish(&mut self, replay: &crate::hcq::ReplayCommandBuffer) {
         push_sdma_bytes(&mut self.inner, replay.bytes());
-        unsafe { std::ptr::write_volatile(self.inner.write_ptr_host.as_ptr(), self.inner.write_idx) };
-        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-        unsafe { std::ptr::write_volatile(self.inner.doorbell.as_ptr(), self.inner.write_idx) };
+        self.inner.publish(self.inner.write_idx);
     }
 }
 
@@ -2381,9 +2392,7 @@ impl AmdCopyQueue {
         let mut g = self.inner.lock();
         wait_sdma_headroom(&g, dwords.len() * 4).inspect_err(|error| self.core.poison(&error.to_string()))?;
         push_sdma(&mut g, &dwords);
-        unsafe { std::ptr::write_volatile(g.write_ptr_host.as_ptr(), g.write_idx) };
-        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-        unsafe { std::ptr::write_volatile(g.doorbell.as_ptr(), g.write_idx) };
+        g.publish(g.write_idx);
         Ok(())
     }
 
@@ -2516,9 +2525,7 @@ impl AmdCopyQueue {
             // queue. SDMA doorbell + wptr are byte counters (= write_idx). Both
             // are written after the last abortable step, so an abandoned
             // submission never leaves an advertised wptr behind.
-            unsafe { std::ptr::write_volatile(ring.write_ptr_host.as_ptr(), ring.write_idx) };
-            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-            unsafe { std::ptr::write_volatile(ring.doorbell.as_ptr(), ring.write_idx) };
+            ring.publish(ring.write_idx);
             reservation.mark_published();
             ring.commit();
             self.core.publication_checkpoint(crate::amd::iface::PublicationStage::AfterDoorbell)?;
@@ -2809,6 +2816,7 @@ fn create_queue(
         queue_id,
         quarantined: false,
         qinactive_host,
+        iface: Arc::clone(dev.iface()),
         _ring_buf: ring_buf.into_inner(),
         _gart_buf: gart_buf.into_inner(),
         _eop_buf: eop_buf.map(AmdBufferGuard::into_inner),

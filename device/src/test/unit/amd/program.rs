@@ -246,8 +246,8 @@ fn graph_capture_emits_one_memory_barrier_for_the_whole_chain() {
     let dwords = replay_dwords(graph.linked_bytes());
     let runs = |needle: &[u32]| dwords.windows(needle.len()).filter(|run| *run == needle).count();
 
-    // One HDP flush + full acquire for the whole graph (tinygrad graph/hcq.py:157)...
-    assert_eq!(runs(&pm4::hdp_flush()), 1);
+    // One full acquire for the whole graph (tinygrad graph/hcq.py:157)...
+    assert_eq!(runs(&pm4::acquire_mem_gfx9()) + runs(&pm4::acquire_mem()), 1);
     // ...while every dispatch keeps its own CS_PARTIAL_FLUSH.
     assert_eq!(runs(&pm4::event_write(pm4::CS_PARTIAL_FLUSH, pm4::EVENT_INDEX_PARTIAL_FLUSH)), 3);
 }
