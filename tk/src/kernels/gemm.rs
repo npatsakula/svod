@@ -447,7 +447,8 @@ pub fn gemm_tail<T: MmaIn>(spec: &TailSpec) -> Vec<Program> {
 /// split `z` walks steps `z·trips/split..`, and the kernel writes its raw f32
 /// accumulator for [`split_merge`] to finish: to `c [split, m, n]` over the
 /// whole grid, to a `[bm, bn]` slot a tile of `c [split, count, bm, bn]`
-/// over a run of `count` tiles.
+/// over a run of `count` tiles: of a tile across the output's edge, only
+/// the slot's elements inside it.
 pub(crate) fn mainloop_gemm<T: MmaIn>(
     name: &str,
     spec: &GemmSpec,
@@ -552,6 +553,15 @@ struct Tile2<'k> {
     bounds: [Option<Sc<'k>>; 2],
 }
 
+impl<'k> Tile2<'k> {
+    /// The bounds measured from the tile's corner: the rows and columns of
+    /// its `[bm, bn]` that lie in the `[m, n]` output.
+    fn within(&self) -> [Option<Sc<'k>>; 2] {
+        let [rows, cols] = self.bounds.clone();
+        [rows.map(|b| b - self.row0.clone()), cols.map(|b| b - self.col0.clone())]
+    }
+}
+
 /// Where the epilogue stores a block's tile.
 enum Dest<'k, U> {
     /// Its window of the `[m, n]` output.
@@ -605,7 +615,7 @@ fn finish<'k, T: Elem, U: Elem>(
     let out = k.cast::<F32, U>(out);
     let c_view = match c {
         Dest::Tile(c) => tile(k, c, bb, t),
-        Dest::Slot(c, at) => k.view(c, at, [bn, 1], Shape::new(t.bm, bn), [None, None]),
+        Dest::Slot(c, at) => k.view(c, at, [bn, 1], Shape::new(t.bm, bn), t.within()),
     };
     k.store(c_view, out);
 }
@@ -750,15 +760,17 @@ fn merge_body<'k, T: Elem, U: Elem>(k: &mut Kernel<'k>, spec: &SplitMergeSpec) {
     let (sr, sc) = (sub.clone() / across, sub % across);
     let (row0, col0) = (tr * tm + sr.clone() * bm, tc * tn + sc.clone() * bn);
     let slot = local * (tm * tn) + sr * (bm * tn) + sc * bn;
+    // A merge tile past the edge lies in a GEMM tile across it: cut where
+    // those are, in the slots as in the output.
+    let tile = Tile2 { m, n, bm, bn, row0, col0, bounds: [bound(m, tm), bound(n, tn)] };
+    let within = tile.within();
     let zero = k.zeros::<F32>(Shape::new(bm, bn));
     let [sum] = k.loop_(split, [zero], |k, z, [acc]| {
         let at = slot.clone() + z * (run.count() * tm * tn);
-        let part = k.view(partial, at, [tn, 1], Shape::new(bm, bn), [None, None]);
+        let part = k.view(partial, at, [tn, 1], Shape::new(bm, bn), within.clone());
         let part = k.load(part);
         [k.binary(*acc, part, BinaryOp::Add).into()]
     });
-    // A merge tile past the edge lies in a GEMM tile across it: cut where those are.
-    let tile = Tile2 { m, n, bm, bn, row0, col0, bounds: [bound(m, tm), bound(n, tn)] };
     finish::<T, U>(k, vec![*sum], epi, bias, residual, None, Dest::Tile(c), &None, &tile);
 }
 

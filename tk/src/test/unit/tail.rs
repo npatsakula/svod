@@ -178,6 +178,17 @@ fn a_tail_split_computes_the_gemm(
     let mut parts = operands();
     parts.push(vec![f64::NAN; tail.partials()]);
     let parts = last(run(&partials, parts, &[]).unwrap());
+    // A slot holds its tile's elements inside the output and nothing past
+    // it, where a device's accumulator holds no defined value.
+    let ([bm, bn, _], gn) = (tile, n.div_ceil(tile[1]));
+    let walk = covered(m.div_ceil(bm), gn, rows, plan.tail);
+    for (e, v) in parts.iter().enumerate() {
+        let (slot, r, col) = (e / (bm * bn) % plan.tail.count(), e / bn % bm, e % bn);
+        let at = walk.iter().position(|&w| w == (plan.tail.first() + slot) as i64).expect("a tail tile");
+        let (tr, tc) = (at / gn, at % gn);
+        let inside = tr * bm + r < m && tc * bn + col < n;
+        assert_eq!(v.is_nan(), !inside, "{plan:?}: partial {e} of tile ({tr}, {tc}) at ({r}, {col})");
+    }
     let got = last(run(&programs.next().expect("the merge"), with(vec![parts], c), &[]).unwrap());
 
     for i in 0..m {
