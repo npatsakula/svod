@@ -13,7 +13,7 @@ use crate::atoms::Target;
 use crate::ir::Schedule;
 use crate::kernels::attention::{FaCfg, Forms, WARP_ROWS, narrowest_warp_rows};
 use crate::kernels::conv::ConvCfg;
-use crate::kernels::gemm::GemmCfg;
+use crate::kernels::gemm::{GemmCfg, TileOrder};
 use crate::kernels::nearest::{LaneQueue, NearestCfg, SelectCfg};
 use crate::kernels::rows::NormCfg;
 use crate::tune::Compiled;
@@ -420,6 +420,16 @@ impl Field for Schedule {
     }
 }
 
+/// `g` and the group's tile rows.
+impl Field for TileOrder {
+    fn put(&self, out: &mut Vec<String>) {
+        out.push(format!("g{}", self.rows()));
+    }
+    fn take(fields: &mut Fields<'_>) -> Option<Self> {
+        TileOrder::grouped(fields.next()?.strip_prefix('g')?.parse().ok()?)
+    }
+}
+
 /// A config's code: its fields in order, each a [`Field`]; the comment
 /// gives a code.
 macro_rules! coded {
@@ -439,11 +449,11 @@ coded!(SelectCfg { warps, queue, filter });
 coded!(LaneQueue { width, depth, passes });
 coded!(Forms { truncate_p, sum_after, skip_rescale, raw_max, bias_direct });
 coded!(
-    /// `w,128,256,64,2,4,r3u`
-    GemmCfg { core, tile, warps, schedule }
+    /// `w,128,256,64,2,4,r3u,g8`
+    GemmCfg { core, tile, warps, schedule, order }
 );
 coded!(
-    /// `w,64,64,32,2,2,r2,4`
+    /// `w,64,64,32,2,2,r2,g8,4`
     ConvCfg { gemm, split }
 );
 coded!(
@@ -464,9 +474,14 @@ pub(crate) fn representatives<C: Tiled>(ranked: &[C]) -> Vec<C> {
     ranked.iter().copied().filter(Tiled::represents).collect()
 }
 
+/// A tile's raster is a variant of it, as its pipelines are: the planner
+/// walks each tile at the raster it prices cheapest and offers the default
+/// beside it ([`GemmProblem::ranked`](super::GemmProblem)), timed only as a
+/// twin of a contender tile.
 impl Tiled for GemmCfg {
     fn tile(&self) -> Self {
-        GemmCfg { tile: [self.tile[0], self.tile[1], 0], schedule: self.schedule.tile(), ..*self }
+        let tile = [self.tile[0], self.tile[1], 0];
+        GemmCfg { tile, schedule: self.schedule.tile(), order: TileOrder::DEFAULT, ..*self }
     }
 
     fn twins(&self, ranked: &[Self]) -> Vec<Self> {

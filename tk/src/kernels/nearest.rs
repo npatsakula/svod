@@ -14,7 +14,7 @@
 use svod_dtype::ScalarDType;
 
 use super::attention::WARP_ROWS;
-use super::gemm::{mainloop, tile_order};
+use super::gemm::{TileOrder, mainloop};
 use super::{Admitted, bound};
 use crate::build::*;
 use crate::ir::*;
@@ -119,6 +119,12 @@ impl NearestCfg {
             return Err(Invalid::Lanes { lanes, bkv: self.bkv });
         }
         Ok(())
+    }
+
+    /// The raster a split kernel's blocks walk its query blocks (rows) and
+    /// shares (columns) in: the GEMM's default, which no lattice searches.
+    pub const fn order(&self) -> TileOrder {
+        TileOrder::DEFAULT
     }
 
     pub const fn new(bq: usize, bkv: usize, stages: usize) -> Self {
@@ -303,9 +309,9 @@ pub(crate) const MAX_CANDIDATES: usize = 1 << 24;
 /// takes an even share of the candidate tiles and the outputs are
 /// `score_part` and `index_part`, [`share_stride`] apart: each share's
 /// least in the units the scores are compared in and its first index, which
-/// [`nearest_merge`] folds; the blocks in flight walk groups of
-/// [`GROUP_ROWS`](super::gemm::GROUP_ROWS) query blocks over every share, as the GEMM's tiles, so
-/// they read the same query and candidate lines.
+/// [`nearest_merge`] folds; the blocks in flight walk the query blocks
+/// over every share in [`NearestCfg::order`], as the GEMM's tiles, so they
+/// read the same query and candidate lines.
 ///
 /// With `k > 1` a row keeps its `k` least scores (`score [n, k]`, `index
 /// [n, k]`, row-major), ascending, an equal score at the smaller index, the
@@ -395,7 +401,7 @@ fn nearest_body<'k, T: MmaIn>(k: &mut Kernel<'k>, spec: &NearestSpec) {
     // how many it takes.
     let (q_block, share) = match split {
         true => {
-            let (q_block, part) = tile_order(k, blocks.clone(), splits);
+            let (q_block, part) = cfg.order().tile(k, blocks.clone(), splits);
             let first = part.clone() * tiles / splits;
             let count = (part.clone() + 1) * tiles / splits - first.clone();
             (q_block, Some((part, first, count)))

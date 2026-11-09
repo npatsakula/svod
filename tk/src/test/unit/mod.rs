@@ -22,6 +22,7 @@ mod oracle;
 mod parts;
 mod probe;
 mod rank;
+mod raster;
 mod replay;
 mod rows;
 mod schedule;
@@ -361,12 +362,19 @@ fn gemm_nt(m: usize, n: usize, k: usize, bm: usize, bn: usize, bk: usize, stages
 
 /// A plain bf16 `c = a·bᵀ` program for two crews: a 2×4 warp grid over one slot.
 fn gemm_nt_crews(m: usize, n: usize, k: usize, tile: [usize; 3]) -> Program {
-    let cfg = GemmCfg { tile, warps: [2, 4], core: Core::Warp, schedule: Schedule::ping_pong(16) };
+    let cfg =
+        GemmCfg { tile, warps: [2, 4], core: Core::Warp, schedule: Schedule::ping_pong(16), order: Default::default() };
     gemm::<BF16>(&GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg: assumed(cfg) })
 }
 
 fn gemm_nt_batched(m: usize, n: usize, k: usize, tile: [usize; 3], stages: usize, batch: Batch) -> Program {
-    let cfg = GemmCfg { core: Core::Warp, tile, warps: [2, 4], schedule: Schedule::ring(stages, true) };
+    let cfg = GemmCfg {
+        core: Core::Warp,
+        tile,
+        warps: [2, 4],
+        schedule: Schedule::ring(stages, true),
+        order: Default::default(),
+    };
     gemm::<BF16>(&GemmSpec { m, n, k, batch, epilogue: Epilogue::default(), cfg: assumed(cfg) })
 }
 

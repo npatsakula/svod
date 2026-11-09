@@ -9,11 +9,14 @@ use std::num::NonZeroUsize;
 
 use crate::ir::{Axis, Schedule, Shape};
 use crate::kernels::Admitted;
-use crate::kernels::gemm::{GROUP_ROWS, GemmCfg, Rope};
+use crate::kernels::gemm::{GemmCfg, Rope, TileOrder};
 use crate::layouts::{Issue, Swizzle, WarpGrid, chunked, fills_in_chunks};
+use crate::tune::SETTLED;
 
-use super::cost::{Claim, ELEM, Family, Feasible, Kept, Kind, Ops, Planner, STEP, Spread, Steps, Stream, cached};
-use super::search::{Rejected, ShapeRejected, TargetRejected, sorted, spread};
+use super::cost::{
+    Claim, ELEM, Family, Feasible, Kept, Kind, Ops, Planner, Reach, STEP, Spread, Steps, Stream, cached,
+};
+use super::search::{Rejected, ShapeRejected, TargetRejected, Tiled, sorted, spread};
 
 impl GemmCfg {
     /// The operand layouts of the tile's product on `target`, over the
@@ -105,7 +108,7 @@ impl GemmCfg {
 }
 
 pub(crate) const fn gemm_cfg(tile: [usize; 3], stages: usize, warps: [u32; 2], unroll: bool) -> GemmCfg {
-    GemmCfg { core: Core::Warp, tile, warps, schedule: Schedule::ring(stages, unroll) }
+    GemmCfg { core: Core::Warp, tile, warps, schedule: Schedule::ring(stages, unroll), order: TileOrder::DEFAULT }
 }
 
 /// Model: a representative layer epilogue's tile operations an output
@@ -207,7 +210,68 @@ pub struct GemmProblem {
 
 impl GemmProblem {
     pub(super) fn blocks(&self, cfg: &GemmCfg) -> usize {
-        self.batches * self.m.div_ceil(cfg.tile[0]) * self.n.div_ceil(cfg.tile[1])
+        let (gm, gn) = self.grid(cfg);
+        self.batches * gm * gn
+    }
+
+    /// A batch's grid of `cfg`'s output tiles, `[rows, cols]`.
+    fn grid(&self, cfg: &GemmCfg) -> (usize, usize) {
+        (self.m.div_ceil(cfg.tile[0]), self.n.div_ceil(cfg.tile[1]))
+    }
+
+    /// The tile rows and columns `blocks` consecutive blocks of `cfg`'s
+    /// raster span in a batch's grid: down a group's rows a column at a
+    /// time, every column of a group before the next group's.
+    fn window(&self, cfg: &GemmCfg, blocks: usize) -> (usize, usize) {
+        let (gm, gn) = self.grid(cfg);
+        let (group, blocks) = (cfg.order.group(gm), blocks.clamp(1, gm * gn));
+        (group.min(blocks).max(blocks.div_ceil(gn)), blocks.div_ceil(group).min(gn))
+    }
+
+    /// The ring's fill under `cfg`'s raster, in a batch's grid: a trip's
+    /// bytes, the operands' distinct ones, the share the blocks in flight
+    /// at once (one an SM) read of one another's lines — a window's A rows
+    /// and B columns ([`Self::window`]) — and the reach of the rest's
+    /// re-reads. A B panel (`bn × k`) returns a group later, after the
+    /// group's A panels and the whole of B have streamed; every other
+    /// re-read (an A panel a column of its group later, a B panel within
+    /// its group) after the panels of the blocks in flight, or of the
+    /// group's rows where those are more.
+    fn stream(&self, planner: &Planner, cfg: &GemmCfg) -> Stream {
+        let ([bm, bn, bk], halves) = (cfg.tile, self.halves);
+        let (gm, gn) = self.grid(cfg);
+        let (group, wide) = (cfg.order.group(gm), bn * halves);
+        let flight = planner.sms().min(self.blocks(cfg)).max(1).min(gm * gn);
+        let (rows, cols) = self.window(cfg, flight);
+        let shared = 1.0 - (rows * bm + cols * wide) as f64 / (flight * (bm + wide)) as f64;
+        let panel = (self.k * ELEM) as f64;
+        let (rows, cols) = self.window(cfg, flight.max(group));
+        let near = (rows * bm + cols * wide) as f64 * panel;
+        let far = (group * bm + gn * wide) as f64 * panel;
+        // In tile rows of a batch: the bytes the blocks in flight do not
+        // share, past each panel's first read, and B's a group later.
+        let unshared = (gm * gn * (bm + wide)) as f64 * (1.0 - shared);
+        let rereads = unshared - (gm * bm + gn * wide) as f64;
+        let later = (gn * wide * (gm.div_ceil(group) - 1)) as f64;
+        let late = if rereads > 0.0 { (later / rereads).min(1.0) } else { 0.0 };
+        Stream {
+            bytes: ((bm + wide) * bk * ELEM) as f64,
+            unique: (self.batches * (self.m + self.n * halves) * self.k * ELEM) as f64,
+            shared,
+            reach: [Reach { share: 1.0 - late, set: near }, Reach { share: late, set: far }],
+        }
+    }
+
+    /// The rasters the planner prices `cfg` at on this problem: the
+    /// default, then groups of one tile row, two, four, … below the grid's
+    /// rows and the grid's rows whole (column-major), each a group height
+    /// the default does not already walk.
+    fn orders(&self, cfg: &GemmCfg) -> impl Iterator<Item = TileOrder> {
+        let gm = self.grid(cfg).0;
+        let default = TileOrder::DEFAULT.group(gm);
+        let heights = (0..usize::BITS).map(|b| 1usize << b).take_while(move |&g| g < gm).chain([gm]);
+        let others = heights.filter(move |&g| g != default).filter_map(TileOrder::grouped);
+        std::iter::once(TileOrder::DEFAULT).chain(others)
     }
 
     /// The share of the tiles' area past `m × n`.
@@ -226,9 +290,11 @@ impl GemmProblem {
     /// is left out otherwise. A trip
     /// pays its fragment reads, fill, matrix-core steps (padding included),
     /// the representative epilogue's tile operations and overhead. The
-    /// fill's bytes are the whole operands' distinct ones,
-    /// and the blocks in flight at once (one an SM at least) share a group's
-    /// A rows and their B columns whatever the cache holds of the whole. Two
+    /// fill's bytes are the whole operands' distinct ones, the blocks in
+    /// flight at once (one an SM at least) share the A rows and B columns of
+    /// the raster's window whatever the cache holds of the whole, and the
+    /// rest's re-reads come back through the working sets the raster
+    /// reaches them over ([`Self::stream`]). Two
     /// crews are priced as the one-crew pipeline of their tile: the overlap
     /// of one crew's products with the other's loads has no term, since
     /// only CDNA runs them ([`Target::crews`]) and no CDNA card has measured
@@ -306,13 +372,9 @@ impl GemmProblem {
                 (bn * halves / wc / n, 0)
             }
         };
-        let (fill, steps) = ((bm + bn * halves) * bk * ELEM, (bm * bn * halves * bk / STEP) as f64);
+        let steps = (bm * bn * halves * bk / STEP) as f64;
         let (blocks, trips, stages) = (self.blocks(cfg), self.k / bk, cfg.stages());
-        let unique = (self.batches * (self.m + self.n * halves) * self.k * ELEM) as f64;
-        let flight = planner.sms().min(blocks).max(1);
-        let group = GROUP_ROWS.min(flight);
-        let distinct = group * bm + flight.div_ceil(group) * bn * halves;
-        let shared = 1.0 - distinct as f64 / (flight * (bm + bn * halves)) as f64;
+        let fill = self.stream(planner, cfg);
         // The epilogue's operations over the tile's output elements, one a
         // lane's element each, paid over the trips that fold into one
         // output: their whole is m·n·[`EPILOGUE_OPS`] of lane operations
@@ -334,7 +396,8 @@ impl GemmProblem {
             side = Stream {
                 bytes: 2.0 * (bm * half) as f64 * ELEM as f64 * reading / trips as f64,
                 unique: (2 * rope.seq * half * ELEM) as f64,
-                shared,
+                shared: fill.shared,
+                ..Stream::default()
             };
         }
         Ok(Claim {
@@ -351,7 +414,7 @@ impl GemmProblem {
             trips,
             reads: fragments as f64,
             ops: Ops::of(Kind::Epilogue, ops),
-            fill: Stream { bytes: fill as f64, unique, shared },
+            fill,
             side,
             stores: 0.0,
             ring: stages,
@@ -368,10 +431,52 @@ impl GemmProblem {
     /// ([`shortlist`](super::search::shortlist)).
     pub(crate) fn ranked(&self, planner: &Planner) -> Vec<GemmCfg> {
         let feasible = planner.feasible(self);
-        let priced = |f: &Feasible<GemmCfg>| planner.price_of(self, f).map(|(cost, regs)| (cost, regs, f.cfg));
-        let admitted: Vec<(f64, u32, GemmCfg)> = feasible.iter().filter_map(priced).collect();
-        let ranked = sorted(self, admitted, feasible.len());
+        let planned: Vec<_> = feasible.iter().filter_map(|f| self.planned(planner, f)).collect();
+        let mut admitted: Vec<(f64, u32, GemmCfg)> = planned.iter().map(|(best, _)| *best).collect();
+        // One alternative a tile: its cheapest pipeline at the default
+        // raster, where the model walks it otherwise unsure ([`Self::planned`]).
+        let mut order: Vec<usize> = (0..planned.len()).collect();
+        order.sort_by(|&a, &b| planned[a].0.0.total_cmp(&planned[b].0.0));
+        let mut tiles = std::collections::HashSet::new();
+        let alternatives = order.into_iter().filter(|&i| tiles.insert(planned[i].0.2.tile()));
+        admitted.extend(alternatives.filter_map(|i| planned[i].1));
+        let spanned = feasible.len() + admitted.len() - planned.len();
+        let ranked = sorted(self, admitted, spanned);
         spread(ranked.into_iter().map(|(cost, _, c)| (cost, c)).collect(), |c| [c.tile[0], c.tile[1]])
+    }
+
+    /// A feasible config at the raster the model prices cheapest on this
+    /// problem ([`Self::orders`], the default on a tie), its cost and
+    /// registers, and the default raster's beside it where the model is
+    /// unsure of the departure; `None` where the shape leaves it out. The
+    /// raster moves only the fill's price: without a cache ladder every
+    /// raster prices the same and the default stands.
+    ///
+    /// The model weighs the blocks in flight sharing B columns (a taller
+    /// group) against the reach of the re-reads ([`Self::stream`]): a group
+    /// whose A panels and the window's B panels outgrow the cache sends
+    /// them back to DRAM between columns. Unsure: the default priced within
+    /// [`SETTLED`] of the pick, a gap the tuner's own rounds do not resolve
+    /// either. The term is priced by the ladder alone, never fitted to a
+    /// raster's measured time, while every store so far timed the default,
+    /// so there the tuner times the default too (one pipeline a tile, as a
+    /// twin of the tile: [`Tiled::twins`]).
+    #[allow(clippy::type_complexity)]
+    fn planned(
+        &self,
+        planner: &Planner,
+        f: &Feasible<GemmCfg>,
+    ) -> Option<((f64, u32, GemmCfg), Option<(f64, u32, GemmCfg)>)> {
+        let price = |order| {
+            let cfg = GemmCfg { order, ..f.cfg };
+            planner.price_of(self, &Feasible { cfg, regs: f.regs }).map(|(cost, regs)| (cost, regs, cfg))
+        };
+        let default = price(TileOrder::DEFAULT)?;
+        if planner.device.costs.l2_bytes <= 0.0 {
+            return Some((default, None));
+        }
+        let best = self.orders(&f.cfg).skip(1).filter_map(price).fold(default, |a, b| if b.0 < a.0 { b } else { a });
+        Some((best, (best.2.order != TileOrder::DEFAULT && default.0 <= best.0 * SETTLED).then_some(default)))
     }
 }
 

@@ -267,7 +267,7 @@ fn gemm_throughput_probe() {
         cfgs.push(pick);
     }
     for cfg in cfgs {
-        let GemmCfg { tile: [bm, bn, bk], warps: [wr, wc], core, schedule } = cfg;
+        let GemmCfg { tile: [bm, bn, bk], warps: [wr, wc], core, schedule, .. } = cfg;
         let (stages, unroll) = (schedule.stages(), schedule.unroll());
         let crews = cfg.crews();
         let (prog, lowering) = (plain_gemm(m, n, k, cfg), cfg.lowering(&planner.device));
@@ -349,6 +349,79 @@ fn gemm_candidates_probe() {
             cfgs[i].unroll(),
             tflops(t)
         );
+    }
+}
+
+/// Every raster ([`TileOrder`]: groups of one tile row, two, four, … and
+/// the grid's rows whole) of the tuner's pick and of the planner's first
+/// config, timed side by side on GEMM shapes whose operands outgrow the L2
+/// (4096³, a 1024-column weight, a shallow 8192² product; `RASTER_SHAPES`
+/// = `MxNxK;…` instead): per raster the device µs, TFLOP/s, the time
+/// against the default's and the model's price against its price of the
+/// default, the planner's raster and the default marked. Two passes in
+/// opposite orders, each raster's best kept, so clock drift favours none.
+/// Prints and never asserts.
+#[test]
+#[ignore = "perf probe: needs a GPU"]
+fn gemm_raster_probe() {
+    use crate::kernels::gemm::TileOrder;
+    use crate::ops::config::GemmProblem;
+    let Some(planner) = super::device_planner() else { return };
+    let shapes: Vec<[usize; 3]> = std::env::var("RASTER_SHAPES").map_or_else(
+        |_| vec![[4096, 4096, 4096], [4096, 1024, 4096], [8192, 8192, 1024]],
+        |text| {
+            let dims = |s: &str| s.split('x').map(|d| d.trim().parse().expect("a dimension")).collect::<Vec<_>>();
+            text.split(';').map(|s| dims(s).try_into().expect("MxNxK")).collect()
+        },
+    );
+    for [m, n, k] in shapes {
+        let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg: assumed(BIG) };
+        let (_, pick) = device_gemms(&planner, &spec);
+        let first = planner.gemm_ranked(1, m, n, k, false)[0];
+        let p = GemmProblem { batches: 1, m, n, k, halves: 1, rope: None };
+        let flops = 2.0 * (m * n * k) as f64;
+        for (what, cfg) in [("tuner's pick", pick), ("planner's first", first)] {
+            if what == "planner's first" && (GemmCfg { order: pick.order, ..first }) == pick {
+                continue;
+            }
+            let gm = m.div_ceil(cfg.tile[0]);
+            let heights = (0..).map(|b| 1usize << b).take_while(|&g| g < gm).chain([gm]);
+            let orders: Vec<TileOrder> = heights.filter_map(TileOrder::grouped).collect();
+            let build = |order| vec![(plain_gemm(m, n, k, GemmCfg { order, ..cfg }), cfg.lowering(&planner.device))];
+            let mut ns = super::measure(orders.iter().map(|&o| build(o)));
+            let back = super::measure(orders.iter().rev().map(|&o| build(o)));
+            for (t, b) in ns.iter_mut().zip(back.into_iter().rev()) {
+                *t = match (*t, b) {
+                    (Some(t), Some(b)) => Some(t.min(b)),
+                    (t, b) => t.or(b),
+                };
+            }
+            let at = |order| orders.iter().position(|&o| o == order).and_then(|i| ns[i]);
+            let base = TileOrder::grouped(TileOrder::DEFAULT.group(gm)).and_then(at);
+            let priced = |order| p.admit(&planner, &GemmCfg { order, ..cfg }).map_or(f64::NAN, |(ns, _)| ns);
+            let model = priced(TileOrder::DEFAULT);
+            eprintln!(
+                "== {m}x{n}x{k} {what}: {:?} s{} {:?} unroll={} ({gm} tile rows)",
+                cfg.tile,
+                cfg.stages(),
+                cfg.warps,
+                cfg.unroll()
+            );
+            for (order, t) in orders.iter().zip(&ns) {
+                let mark =
+                    match (order.group(gm) == cfg.order.group(gm), order.group(gm) == TileOrder::DEFAULT.group(gm)) {
+                        (true, true) => " planned, default",
+                        (true, false) => " planned",
+                        (false, true) => " default",
+                        _ => "",
+                    };
+                let measured = t.map_or("failed".into(), |t| {
+                    let against = base.map_or(f64::NAN, |b| t as f64 / b as f64);
+                    format!("{:8.1} us {:6.1} TFLOP/s x{against:.3}", t as f64 / 1e3, flops / t as f64 / 1e3)
+                });
+                eprintln!("  g{:<5} {measured}  model x{:.3}{mark}", order.rows(), priced(*order) / model);
+            }
+        }
     }
 }
 

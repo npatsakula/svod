@@ -18,7 +18,7 @@ use std::num::NonZeroUsize;
 use crate::ir::{Program, Schedule, Var};
 use crate::kernels::attention::{AttnMask, AttnSpec, Bias, CacheLayout, Chunk, CombineSpec, FaCfg, attention, combine};
 use crate::kernels::conv::{ConvCfg, ConvGeom, ConvSpec};
-use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Scale, gemm};
+use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Scale, TileOrder, gemm};
 use crate::kernels::heads::{HeadsSpec, Rope, heads};
 use crate::kernels::nearest::{
     Floors, Live, Metric, NearestCfg, NearestMergeSpec, NearestSpec, RescoreSpec, SelectCfg, SelectSpec, nearest,
@@ -177,6 +177,14 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
     // One slot holds a tile twice as deep in the same shared memory.
     let one_slot = GemmSpec { cfg: assumed(config::gemm_cfg([64, 64, 64], 1, [2, 2], false)), ..plain.clone() };
     push("gemm one slot", gemm::<BF16>(&one_slot), one_slot.cfg.lowering(&planner.device));
+    // Rasters besides the default: row-major, and groups of three tile rows
+    // over seven, the last group one row.
+    for rows in [1, 3] {
+        let order = TileOrder::grouped(rows).expect("a group of rows");
+        let cfg = GemmCfg { order, ..config::gemm_cfg([32, 64, 64], 2, [1, 2], false) };
+        let spec = GemmSpec { m: 200, n: 192, k: 128, cfg: assumed(cfg), ..plain.clone() };
+        push(&format!("gemm raster {rows}"), gemm::<BF16>(&spec), cfg.lowering(&planner.device));
+    }
     if let Some(kslice) = target.kslice().and_then(NonZeroUsize::new) {
         let schedule = Schedule::PingPong { kslice };
         let cfg = GemmCfg { schedule, ..config::gemm_cfg([64, 64, 64], 1, [2, 4], false) };
@@ -525,7 +533,13 @@ pub(crate) fn group_families(target: &Target) -> Vec<Launch> {
     tiles
         .into_iter()
         .map(|(tile, warps, stages)| {
-            let cfg = GemmCfg { tile, warps, core: Core::Group, schedule: Schedule::ring(stages, false) };
+            let cfg = GemmCfg {
+                tile,
+                warps,
+                core: Core::Group,
+                schedule: Schedule::ring(stages, false),
+                order: TileOrder::DEFAULT,
+            };
             assert!(cfg.fits(target), "{cfg:?} fits the warpgroup core");
             let (m, n, k) = (tile[0] + 2, tile[1] - 3, 3 * tile[2]);
             let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg: assumed(cfg) };

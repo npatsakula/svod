@@ -37,11 +37,15 @@ the matrix product runs on the f32 accumulator, and the result is rounded once a
 | `out_f32` | f32 output and residual, the accumulator stored unrounded |
 | `rope` | `Rope { heads, head_dim, seq }`: the first `heads` heads of `head_dim` columns rotated by `[seq, head_dim/2]` cos and sin tables (output row `m` at position `m % seq`), the columns after them stored as they are; with a bias alone, on a tile whose warps hold whole heads (`GemmCfg::turns`) |
 
-`GemmCfg { tile: [bm, bn, bk], warps: [rows, cols], core, schedule }`. Rows
+`GemmCfg { tile: [bm, bn, bk], warps: [rows, cols], core, schedule, order }`. Rows
 past `m` and columns past `n` are bounded views, so `m` and `n` are free. `k` must be a multiple
 of `bk`. `core: Core::Group` issues the products on `wgmma` (sm_90); `schedule: Schedule::ping_pong(k)` runs the two
 warp rows in ping-pong over one slot (CDNA). The blocks walk the output tiles in groups of
-8 tile rows (`gemm::GROUP_ROWS`), so blocks resident together read the same B tiles.
+`order` tile rows (`gemm::TileOrder`, 8 by default; one row is row-major, the grid's rows
+column-major), so blocks resident together read the same B tiles. The planner prices each
+config at every group height by the cache ladder (B tiles shared in flight against the working
+set a group's A rows return through) and keeps the cheapest; where that is not the default,
+the tuner times the default beside it.
 
 The rotation reads each element's partner half a head along through a column `flip`. When a
 warp's columns hold whole heads, a lane holds both halves, and the flip is a register

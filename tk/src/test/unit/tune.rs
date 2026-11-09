@@ -18,7 +18,7 @@ use test_case::test_case;
 use crate::atoms::{Device, sm86};
 use crate::build::BF16;
 use crate::kernels::Batch;
-use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
+use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, TileOrder, gemm};
 use crate::tune::{self, Bench, Entry, FORMAT, Kind, Pass, ScratchPool, TuneKey, TuneStore, fingerprint};
 
 /// A host key: no device, so no compiler digest.
@@ -62,7 +62,11 @@ fn every_familys_config_code_round_trips() {
     let planner = super::planner(target.clone());
     let mut gemm = gemm_lattice(&target);
     gemm.push(GemmCfg { core: Core::Group, ..gemm_cfg([128, 256, 32], 4, [4, 4], false) });
+    // Every raster's group height, the default's and past it.
+    let rasters = [1, 3, 8, 64, usize::MAX].map(|rows| TileOrder::grouped(rows).expect("a group of rows"));
+    gemm.extend(rasters.map(|order| GemmCfg { order, ..gemm[0] }));
     round(&gemm);
+    assert_eq!(gemm_cfg([128, 256, 64], 3, [2, 4], true).code(), "w,128,256,64,2,4,r3u,g8");
     let mut conv: Vec<ConvCfg> = gemm.iter().map(|g| ConvCfg { gemm: *g, split: 4 }).collect();
     conv.push(ConvCfg { gemm: gemm[0], split: 1 });
     round(&conv);
@@ -99,6 +103,11 @@ fn every_familys_config_code_round_trips() {
     });
     round(&nearest);
     // A code that is not the family's form holds no config.
+    // A raster of no rows, one without its mark, a code without its raster.
+    for bad in ["w,128,128,32,2,2,r2,g0", "w,128,128,32,2,2,r2,8", "w,128,128,32,2,2,r2", "w,128,128,32,2,2,r2,g"] {
+        assert!(GemmCfg::of_code(bad).is_none(), "{bad}");
+        assert!(ConvCfg::of_code(&format!("{bad},1")).is_none(), "{bad},1");
+    }
     for bad in ["", "x", "w,1", "w,a,b,c,d,e,f,g,h", "64,64,2,0", "w,1,2,3,4,5,6,7,8,9,10"] {
         assert!(GemmCfg::of_code(bad).is_none());
         assert!(FaCfg::of_code(bad).is_none());

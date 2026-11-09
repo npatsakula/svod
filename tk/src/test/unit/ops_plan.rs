@@ -229,7 +229,7 @@ impl Planner {
             trips: g.trips,
             reads: reads / costs.smem_byte,
             ops: config::Ops::of(config::Kind::Epilogue, epilogue / unit),
-            fill: config::Stream { bytes: fill / costs.global_byte, unique: 0.0, shared: 0.0 },
+            fill: config::Stream { bytes: fill / costs.global_byte, ..config::Stream::default() },
             side: config::Stream::default(),
             stores: 0.0,
             ring: g.stages,
@@ -500,10 +500,10 @@ fn a_fill_is_priced_by_where_its_bytes_come_from() {
     let rungs = [(1 << 20, 0.01), (2 << 20, 0.011), (4 << 20, 0.03), (8 << 20, 0.06), (16 << 20, 0.075)];
     let cached = planned(Device { target: sm86(), costs: ladder(&rungs, 0.08) });
     let none = planned(Device { target: sm86(), costs: Costs { global_byte: 0.08, ..costs() } });
-    assert_eq!(none.fill_byte(mb, 100.0 * mb, 0.0), 0.08);
+    assert_eq!(none.fill_byte(&stream(mb, 0.0), 100.0 * mb), 0.08);
     // 1 MB read 100 times over: one byte in a hundred from DRAM, the rest at
     // the smallest rung's rate.
-    assert!((cached.fill_byte(mb, 100.0 * mb, 0.0) - (0.01 * 0.99 + 0.08 * 0.01)).abs() < 1e-12);
+    assert!((cached.fill_byte(&stream(mb, 0.0), 100.0 * mb) - (0.01 * 0.99 + 0.08 * 0.01)).abs() < 1e-12);
     // Between two rungs the rate interpolates on the log of both axes, and it
     // never falls as the working set grows.
     let edge: Vec<f64> =
@@ -518,7 +518,7 @@ fn a_fill_is_priced_by_where_its_bytes_come_from() {
     let want = share * 0.01 + (1.0 - share) * 0.08;
     assert!((edge[7] - want).abs() < 1e-12, "{} of {want}", edge[7]);
     // A fill that reads each byte once pays DRAM whatever the cache.
-    assert_eq!(cached.fill_byte(5.0 * mb, 5.0 * mb, 0.0), 0.08);
+    assert_eq!(cached.fill_byte(&stream(5.0 * mb, 0.0), 5.0 * mb), 0.08);
 }
 
 /// Where the whole operands overflow the cache, the blocks in flight at
@@ -534,10 +534,10 @@ fn blocks_in_flight_share_their_lines_past_the_cache() {
     let c = ladder(&rungs, 0.08);
     let planner = planned(Device { target: sm86(), costs: c });
     let rate = planner.device.costs.rate(100.0 * mb);
-    let stream = 0.99 * rate + 0.01 * 0.08;
-    assert!((planner.fill_byte(100.0 * mb, 1e4 * mb, 0.75) - (0.75 * 0.01 + 0.25 * stream)).abs() < 1e-12);
-    assert!((planner.fill_byte(100.0 * mb, 1e4 * mb, 0.0) - stream).abs() < 1e-12);
-    assert!(planner.fill_byte(mb, 100.0 * mb, 0.5) < planner.fill_byte(mb, 100.0 * mb, 0.0));
+    let streamed = 0.99 * rate + 0.01 * 0.08;
+    assert!((planner.fill_byte(&stream(100.0 * mb, 0.75), 1e4 * mb) - (0.75 * 0.01 + 0.25 * streamed)).abs() < 1e-12);
+    assert!((planner.fill_byte(&stream(100.0 * mb, 0.0), 1e4 * mb) - streamed).abs() < 1e-12);
+    assert!(planner.fill_byte(&stream(mb, 0.5), 100.0 * mb) < planner.fill_byte(&stream(mb, 0.0), 100.0 * mb));
     let p = config::GemmProblem { batches: 1, m: 4096, n: 4096, k: 4096, halves: 1, rope: None };
     let cfg = gemm_cfg([128, 128, 32], 3, [2, 4], false);
     let dram = planned(Device { target: sm86(), costs: Costs { l2_bytes: 0.0, ..c } });
@@ -2189,4 +2189,10 @@ fn an_8_bit_search_is_priced_at_its_step(target: Target, costs: Costs, low: f64,
     };
     let ratio = best(ScalarDType::Int8) / best(ScalarDType::Float16);
     assert!((low..high).contains(&ratio), "8-bit over f16: {ratio:.3}");
+}
+
+/// A stream of `unique` distinct bytes, `shared` of it among the blocks in
+/// flight, its re-reads through the whole of it.
+fn stream(unique: f64, shared: f64) -> config::Stream {
+    config::Stream { unique, shared, ..config::Stream::default() }
 }

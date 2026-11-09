@@ -234,6 +234,18 @@ pub(crate) struct Stream {
     /// The share of a trip's bytes the blocks in flight re-read from the
     /// cache in front of DRAM (one another's lines).
     pub shared: f64,
+    /// Where the re-reads come back from: a share of them after the bytes
+    /// of each [`Reach`] streamed since their last read (a raster's reuse
+    /// distances), the rest after the whole of `unique`.
+    pub reach: [Reach; 2],
+}
+
+/// A share of a stream's re-reads and the working set they come back
+/// through: the bytes streamed between a line's read and its re-read.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Reach {
+    pub share: f64,
+    pub set: f64,
 }
 
 /// A whole-problem section beside the run's trips: a kernel of its own (a
@@ -538,20 +550,12 @@ impl Planner {
         let (reads, epilogue) =
             (claim.reads * costs.smem_byte, claim.ops.fold(pair_op(&self.device), costs.score, &self.weights));
         let fill = claim.fill.bytes
-            * self.fill_byte(
-                claim.fill.unique,
-                (claim.blocks * claim.trips) as f64 * claim.fill.bytes,
-                claim.fill.shared,
-            )
+            * self.fill_byte(&claim.fill, (claim.blocks * claim.trips) as f64 * claim.fill.bytes)
             + claim.stores * costs.global_byte;
         // A side read's bytes at the ladder of the working set they name,
         // through the epilogue's pipe: see [`Claim::side`].
-        let side = claim.side.bytes
-            * self.fill_byte(
-                claim.side.unique,
-                (claim.blocks * claim.trips) as f64 * claim.side.bytes,
-                claim.side.shared,
-            );
+        let side =
+            claim.side.bytes * self.fill_byte(&claim.side, (claim.blocks * claim.trips) as f64 * claim.side.bytes);
         let trip = costs.trip(target.fill, claim.ring, claim.unroll);
         // The run the claim describes: `blocks` blocks of `waves` waves,
         // `trips` trips through a ring `stages` deep, a trip's issue down
@@ -628,22 +632,27 @@ impl Planner {
         bytes * self.device.costs.rate(bytes) / (self.sms() as f64 * FLOOR)
     }
 
-    /// What a byte of a fill costs when `fill` bytes stream `unique`
-    /// distinct ones, of which the blocks in flight at once re-read a
-    /// `shared` part from one another's lines. Those come from the cache in
-    /// front of DRAM at its measured rate; of the rest, each distinct byte
-    /// comes from DRAM once and its re-reads at the cache ladder's measured
-    /// rate for a working set of `unique` bytes — the rate a stream of that
-    /// size runs at, whichever cache levels answer it (RDNA4's L2 and
-    /// Infinity Cache alike) and wherever its knee sits, no hand share of
-    /// the cache assumed. DRAM's rate where no ladder was measured.
-    pub(crate) fn fill_byte(&self, unique: f64, fill: f64, shared: f64) -> f64 {
+    /// What a byte of `stream` costs when it streams `fill` bytes in all.
+    /// The blocks in flight at once re-read a [`Stream::shared`] part from
+    /// one another's lines, which come from the cache in front of DRAM at
+    /// its measured rate; of the rest, each distinct byte comes from DRAM
+    /// once and its re-reads at the cache ladder's measured rate for the
+    /// working set they come back through ([`Stream::reach`], else the
+    /// whole `unique` bytes) — the rate a stream of that size runs at,
+    /// whichever cache levels answer it (RDNA4's L2 and Infinity Cache
+    /// alike) and wherever its knee sits, no hand share of the cache
+    /// assumed. DRAM's rate where no ladder was measured.
+    pub(crate) fn fill_byte(&self, stream: &Stream, fill: f64) -> f64 {
         let c = &self.device.costs;
         if c.l2_bytes <= 0.0 || fill <= 0.0 {
             return c.global_byte;
         }
+        let Stream { unique, shared, reach, .. } = *stream;
         let (shared, reread) = (shared.clamp(0.0, 1.0), (1.0 - unique / fill).max(0.0));
-        let stream = reread * c.rate(unique) + (1.0 - reread) * c.global_byte;
+        let reached: f64 = reach.iter().map(|r| r.share.clamp(0.0, 1.0)).sum::<f64>().min(1.0);
+        let rate = reach.iter().map(|r| r.share.clamp(0.0, 1.0) * c.rate(r.set)).sum::<f64>()
+            + (1.0 - reached) * c.rate(unique);
+        let stream = reread * rate + (1.0 - reread) * c.global_byte;
         shared * c.l2_byte + (1.0 - shared) * stream
     }
 }

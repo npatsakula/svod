@@ -11,7 +11,6 @@ use crate::atoms::{Fill, Target};
 use crate::ir::{Axis, Orient, Schedule, Shape};
 use crate::kernels::Admitted;
 use crate::kernels::attention::WARP_ROWS;
-use crate::kernels::gemm::GROUP_ROWS;
 use crate::kernels::nearest::{Floors, LANES, LaneQueue, Metric, NearestCfg, SelectCfg, select_runs};
 use crate::layouts::{TileLayout, WarpGrid, chunked, fills_in_chunks};
 
@@ -433,11 +432,11 @@ impl NearestProblem {
         let unique = ((self.n + self.m) * d * elem) as f64;
         let flight = planner.sms().min(blocks).max(1);
         // The query blocks and shares the blocks in flight read: split, a
-        // group of query blocks walks every share ([`GROUP_ROWS`]).
+        // group of query blocks walks every share ([`NearestCfg::order`]).
         let (queries, shares) = match splits {
             1 => (flight, 1),
             _ => {
-                let group = self.n.div_ceil(bq).min(GROUP_ROWS);
+                let group = cfg.order().group(self.n.div_ceil(bq));
                 (flight.min(group), flight.div_ceil(group).min(splits))
             }
         };
@@ -492,7 +491,7 @@ impl NearestProblem {
             trips,
             reads: (read * depth * elem) as f64,
             ops,
-            fill: Stream { bytes: tile as f64, unique, shared },
+            fill: Stream { bytes: tile as f64, unique, shared, ..Stream::default() },
             side: Stream::default(),
             stores,
             ring: stages,
@@ -894,7 +893,7 @@ impl Planner {
     /// 0.63 of the whole tile, a 4-way one of 128 candidates at 0.77),
     /// enough that the blocks in flight (every SM's resident ones) span the
     /// query blocks they walk at once. Streamed, those are a group
-    /// of [`GROUP_ROWS`] (the grid's raster), so the blocks share their
+    /// of the config's raster ([`NearestCfg::order`]), so the blocks share their
     /// query and candidate lines as a GEMM's grouped tiles do: whole, a
     /// block's own query rows fall out of the cache between its candidate
     /// tiles (at depth 1024, 104 TFLOP/s whole and 129 split at 32768² rows
@@ -925,7 +924,7 @@ impl Planner {
             Some(_) => {
                 let regs = cfg.registers(target, d, p.k, p.dtype)?;
                 let resident = self.resident(cfg.smem_bytes(d, p.dtype), regs, cfg.warps() as usize);
-                (self.sms() * resident.max(1), blocks.min(GROUP_ROWS))
+                (self.sms() * resident.max(1), cfg.order().group(blocks))
             }
             None => (self.sms(), blocks),
         };

@@ -46,8 +46,10 @@ impl ConvProblem {
     /// The GEMM body's claim with the convolution's own fill: each input
     /// pixel is read by every tap of every output pixel within a stride of
     /// it, so the stream's distinct bytes are the image's and the weight's —
-    /// the working set the cache ladder prices the gathers' re-reads at —
-    /// while a trip still fills the expanded tile's.
+    /// the working set the cache ladder prices the gathers' re-reads at,
+    /// not the expanded panels a GEMM's raster reaches them through (the
+    /// convolution walks the default raster) — while a trip still fills the
+    /// expanded tile's.
     pub(crate) fn claim(&self, planner: &Planner, cfg: &GemmCfg, regs: u32) -> Result<Claim, Rejected> {
         let depth = match (planner.device.target.fill, planner.device.target.geometry()) {
             (Fill::CpAsync, Some(atom)) => 2 * atom.k as usize,
@@ -65,6 +67,7 @@ impl ConvProblem {
         let mut claim = self.gemm.claim(planner, cfg, regs)?;
         let ConvGeom { h, w, cin, cout, .. } = self.geom;
         claim.fill.unique = (self.gemm.batches * (h * w * cin + cout * self.geom.k()) * ELEM) as f64;
+        claim.fill.reach = Default::default();
         Ok(claim)
     }
 

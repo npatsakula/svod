@@ -330,9 +330,9 @@ fn a_side_stream_prices_alongside_the_epilogue() {
     let mut claim = planner.claim_of(&p, &cfg).expect("ranked");
     let (plain, floor) = (planner.price(&claim), planner.floor(&claim));
     assert_eq!((claim.side.bytes, claim.side.unique), (0.0, 0.0));
-    claim.side = Stream { bytes: 0.0, unique: 0.0, shared: 1.0 };
+    claim.side = Stream { bytes: 0.0, unique: 0.0, shared: 1.0, ..Stream::default() };
     assert_eq!((planner.price(&claim), planner.floor(&claim)), (plain, floor));
-    claim.side = Stream { bytes: (1 << 20) as f64, unique: (1 << 20) as f64, shared: 0.0 };
+    claim.side = Stream { bytes: (1 << 20) as f64, unique: (1 << 20) as f64, shared: 0.0, ..Stream::default() };
     let resident = (planner.price(&claim), planner.floor(&claim));
     assert!(resident.0 > plain, "{} against {plain}", resident.0);
     assert!(resident.1 > floor, "{} against {floor}", resident.1);

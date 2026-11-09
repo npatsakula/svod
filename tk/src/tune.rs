@@ -49,9 +49,10 @@ use crate::lower::Lowering;
 /// and now the line's own candidates replay ([`crate::rank`]). 5
 /// fingerprinted the emitted kernels, where 4 fingerprinted the programs
 /// and lowerings, targets and costs whole. 8 keys configs by their derived
-/// `Debug`, a ring a [`crate::ir::Schedule`].
-/// and lowerings, targets and costs whole.
-pub(crate) const FORMAT: u32 = 8;
+/// `Debug`, a ring a [`crate::ir::Schedule`]. 9 ends a GEMM's code in its
+/// raster (`g8`, [`crate::kernels::gemm::TileOrder`]), which its `Debug`
+/// names off the default only.
+pub(crate) const FORMAT: u32 = 9;
 /// Measurement: the rounds a contender is timed (the first over every
 /// candidate, the rest over the contenders), and the rounds the two leaders
 /// then run again ([`rounds`]).
@@ -88,7 +89,7 @@ pub(crate) const CONTENDER: f64 = 1.2;
 /// gfx1151 (nearest at depths 512–1024, the 4096³ GEMM, an attention; 27
 /// timed lists) under a cut at 1.02–1.08 moved no pick, and one at 1.05
 /// times a fourth fewer candidates.
-const SETTLED: f64 = 1.05;
+pub(crate) const SETTLED: f64 = 1.05;
 /// Search bound: a candidate whose first run takes this factor of the best
 /// time so far is timed no further, and no later round of a short list
 /// runs it: it cannot win. The first timed run follows an untimed one, and

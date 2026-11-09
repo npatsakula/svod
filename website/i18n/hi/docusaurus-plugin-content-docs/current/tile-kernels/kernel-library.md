@@ -36,11 +36,14 @@ runtime variable की live गिनती launch करता है, buffers
 | `residual` | `[batch·m, n]`, सबसे आख़िर में जोड़ा जाता है |
 | `out_f32` | f32 output और residual; accumulator बिना round किए store होता है |
 
-`GemmCfg { tile: [bm, bn, bk], stages, warps: [rows, cols], unroll, core, crews }`। `m` से
+`GemmCfg { tile: [bm, bn, bk], warps: [rows, cols], core, schedule, order }`। `m` से
 आगे की rows और `n` से आगे के columns bounded views हैं, इसलिए `m` और `n` मुक्त हैं। `k` का `bk` का
-गुणज होना ज़रूरी है। `core: Core::Group` products को `wgmma` (sm_90) पर issue करता है; `crews: 2` दोनों
-warp rows को एक slot पर ping-pong में चलाता है (CDNA)। Blocks output tiles पर 8 tile rows
-(`gemm::GROUP_ROWS`) के समूहों में चलते हैं, ताकि एक साथ resident blocks वही B tiles पढ़ें।
+गुणज होना ज़रूरी है। `core: Core::Group` products को `wgmma` (sm_90) पर issue करता है; `schedule: Schedule::ping_pong(k)` दोनों
+warp rows को एक slot पर ping-pong में चलाता है (CDNA)। Blocks output tiles पर `order` tile rows
+(`gemm::TileOrder`, default 8; एक row यानी row-major, grid की सभी rows यानी column-major) के समूहों
+में चलते हैं, ताकि एक साथ resident blocks वही B tiles पढ़ें। Planner हर config को हर group height पर
+cache ladder से price करता है (flight में shared B tiles बनाम वह working set जिससे group की A rows
+लौटती हैं) और सबसे सस्ता रखता है; अगर वह default नहीं है, तो tuner default को भी साथ में time करता है।
 
 कोई tile table नहीं है। `config::Planner::gemm_ranked` tiles, `bk`, warp grids, ring depths और
 unrolling गिनता है, वही रखता है जिसे lowering target पर चलाती है (atoms warp grid को tile करते हैं,

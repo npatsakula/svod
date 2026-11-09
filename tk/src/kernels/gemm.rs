@@ -3,6 +3,7 @@
 //! accumulator.
 
 use std::fmt;
+use std::num::NonZeroUsize;
 
 use super::{Act, Admitted, Batch, batch_offset, bound, konst, load_f32};
 use crate::atoms::{Core, Device};
@@ -89,9 +90,9 @@ impl fmt::Debug for Scale {
     }
 }
 
-/// The tune store keys by this text ([`Schedule`]'s included); every config
-/// walks [`GROUP_ROWS`] of tile rows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// The tune store keys by this text ([`Schedule`]'s included, the
+/// [`TileOrder`] only off its default).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GemmCfg {
     /// `[bm, bn, bk]`.
     pub tile: [usize; 3],
@@ -101,12 +102,78 @@ pub struct GemmCfg {
     /// The ring: one crew over `depth` slots, or the two warp rows as crews
     /// a cluster apart over one slot, the operands k-sliced a product deep.
     pub schedule: Schedule,
+    /// The raster the blocks walk the output tiles in.
+    pub order: TileOrder,
 }
 
-/// Search bound: the tile rows the blocks in flight walk together, so
-/// resident blocks share the other operand's lines in L2 (a GEMM's B, a
-/// split nearest kernel's candidate shares); one pick no lattice searches.
-pub(crate) const GROUP_ROWS: usize = 8;
+/// A config of the default raster prints as it did before the field
+/// existed, so a ranking's text moves only where its raster does.
+impl fmt::Debug for GemmCfg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut s = f.debug_struct("GemmCfg");
+        s.field("tile", &self.tile).field("warps", &self.warps).field("core", &self.core);
+        s.field("schedule", &self.schedule);
+        if self.order != TileOrder::DEFAULT {
+            s.field("order", &self.order);
+        }
+        s.finish()
+    }
+}
+
+/// The raster blocks walk the output tiles in: groups of `rows` tile rows,
+/// a group's blocks down its rows a column at a time, so the blocks in
+/// flight share their B tiles (a GEMM's weight, a split nearest kernel's
+/// candidate shares) and a group's A rows stay in the cache while it sweeps
+/// the columns. One row is row-major; the grid's rows or more,
+/// column-major.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TileOrder {
+    rows: NonZeroUsize,
+}
+
+impl TileOrder {
+    /// Groups of eight tile rows: every kernel's raster before the planner
+    /// chose one, the one the nearest kernels walk.
+    pub const DEFAULT: Self = Self::new(NonZeroUsize::new(8).unwrap());
+
+    pub const fn new(rows: NonZeroUsize) -> Self {
+        Self { rows }
+    }
+
+    /// Groups of `rows` tile rows; `None` for none.
+    pub const fn grouped(rows: usize) -> Option<Self> {
+        match NonZeroUsize::new(rows) {
+            Some(rows) => Some(Self::new(rows)),
+            None => None,
+        }
+    }
+
+    pub const fn rows(self) -> usize {
+        self.rows.get()
+    }
+
+    /// The rows a group spans in a grid of `gm` tile rows.
+    pub fn group(self, gm: usize) -> usize {
+        self.rows().min(gm)
+    }
+
+    /// The `(row, col)` tile of this block in a grid of `gm × gn` tiles
+    /// (grid x and y), walking groups of [`Self::rows`] tile rows.
+    pub(crate) fn tile<'k>(self, k: &mut Kernel<'k>, gm: impl Into<Sc<'k>>, gn: usize) -> (Sc<'k>, Sc<'k>) {
+        let (gm, group) = (gm.into(), self.rows());
+        let id = k.block(0) + k.block(1) * gm.clone();
+        let first_m = id.clone() / (group * gn) * group;
+        let rows = (gm - first_m.clone()).min(group);
+        let within = id % (group * gn);
+        (first_m + within.clone() % rows.clone(), within / rows)
+    }
+}
+
+impl Default for TileOrder {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
 
 impl GemmCfg {
     pub fn lowering(&self, device: &Device) -> Lowering {
@@ -239,7 +306,7 @@ fn build<'k, T: MmaIn, U: Elem>(
     k.grid([Sc::from(gm), Sc::from(gn), gz]);
     k.warps(WarpGrid { rows: cfg.warps[0], cols: cfg.warps[1] });
 
-    let (bx, by) = tile_order(k, gm, gn);
+    let (bx, by) = cfg.order.tile(k, gm, gn);
     let (row0, col0) = (bx * bm, by * bn);
     let n_bound = bound(n, bn);
     let a_tile = a_source(k, a, if partial { &None } else { &bb }, row0.clone());
@@ -426,16 +493,6 @@ fn merge_body<'k, T: Elem, U: Elem>(k: &mut Kernel<'k>, spec: &SplitMergeSpec) {
     });
     let tile = Tile2 { m, n, bm, bn, row0, col0 };
     finish::<T, U>(k, vec![*sum], epi, bias, residual, None, c, &None, &tile);
-}
-
-/// The `(row, col)` tile of this block, walking groups of [`GROUP_ROWS`] tile rows.
-pub(super) fn tile_order<'k>(k: &mut Kernel<'k>, gm: impl Into<Sc<'k>>, gn: usize) -> (Sc<'k>, Sc<'k>) {
-    let gm = gm.into();
-    let id = k.block(0) + k.block(1) * gm.clone();
-    let first_m = id.clone() / (GROUP_ROWS * gn) * GROUP_ROWS;
-    let rows = (gm - first_m.clone()).min(GROUP_ROWS);
-    let within = id % (GROUP_ROWS * gn);
-    (first_m + within.clone() % rows.clone(), within / rows)
 }
 
 /// The K-streaming pipeline: the `sa`-shaped A tile `a(step, step·bk)` and

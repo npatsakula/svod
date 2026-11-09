@@ -11,7 +11,7 @@ use svod_tk::atoms::{Core, Device, Target};
 use svod_tk::build::BF16;
 use svod_tk::ir::Schedule;
 use svod_tk::kernels::Batch;
-use svod_tk::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
+use svod_tk::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, TileOrder, gemm};
 use svod_tk::launch::graph_launch;
 use svod_tk::ops::config::{GemmProblem, Planner};
 use svod_tk::ops::{self, Act, Linear};
@@ -30,7 +30,7 @@ fn flat(n: usize, seed: &mut u64) -> Tensor {
 }
 
 const fn cfg(tile: [usize; 3], warps: [u32; 2], unroll: bool) -> GemmCfg {
-    GemmCfg { tile, warps, core: Core::Warp, schedule: Schedule::ring(2, unroll) }
+    GemmCfg { tile, warps, core: Core::Warp, schedule: Schedule::ring(2, unroll), order: TileOrder::DEFAULT }
 }
 
 #[test]
