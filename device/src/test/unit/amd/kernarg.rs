@@ -66,3 +66,30 @@ fn kernarg_arena_is_shared_by_every_lane_of_one_device() {
     drop(second);
     assert_eq!(iface.alloc_count_for_tag(AllocTag::Kernarg), 1);
 }
+
+/// Lanes that find the shared arena full at once wrap it once between them.
+/// Each wrapping on its own handed every one of them offset 0, so two lanes
+/// wrote their kernargs and AQL control programs over each other: a lane that
+/// ran another's control program stored that lane's timeline value instead of
+/// its own, and its next dispatch waited on the CP for a value nobody writes.
+#[test]
+fn concurrent_wraps_hand_out_disjoint_slots() {
+    use crate::sync::TimelineSignal;
+    const LANES: usize = 4;
+    const SLOT: usize = 256;
+    let (_iface, allocator) = mock_device_with_signals(1);
+    let pool = PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator).unwrap();
+    let arena = pool.arena();
+    arena.bump(arena.size - SLOT / 2, 1).unwrap();
+    // An in-flight dispatch holds the wrap's drain open until it retires, so
+    // every lane meets the full arena while the first wrap is still draining.
+    let in_flight = pool.next_pm4();
+    let mut slots = std::thread::scope(|scope| {
+        let lanes = (0..LANES).map(|_| scope.spawn(|| arena.bump(SLOT, 16).unwrap())).collect::<Vec<_>>();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        pool.pm4_signal().set(in_flight);
+        lanes.into_iter().map(|lane| lane.join().unwrap()).collect::<Vec<_>>()
+    });
+    slots.sort_unstable();
+    assert!(slots.windows(2).all(|pair| pair[0] + SLOT <= pair[1]), "overlapping kernarg slots {slots:?}");
+}

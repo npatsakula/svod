@@ -88,19 +88,18 @@ impl KernargArena {
         }
         let mut cur = self.cursor.lock();
         let aligned = (*cur).next_multiple_of(align);
-        if aligned + size > self.size {
-            // Wrap. Drop the cursor lock before the potentially multi-second
-            // drain so other threads aren't blocked; then re-take and reset.
-            drop(cur);
-            if let Some(core) = self.core.upgrade() {
-                core.synchronize_all()?;
-            }
-            let mut cur = self.cursor.lock();
-            *cur = size;
-            return Ok(0);
+        if aligned + size <= self.size {
+            *cur = aligned + size;
+            return Ok(aligned);
         }
-        *cur = aligned + size;
-        Ok(aligned)
+        // Wrap with the cursor held: a lane bumping during the drain finds
+        // the arena already restarted and takes the next slot. Released, every
+        // lane that met the full arena wrapped on its own and got offset 0.
+        if let Some(core) = self.core.upgrade() {
+            core.synchronize_all()?;
+        }
+        *cur = size;
+        Ok(0)
     }
 
     pub fn gpu_at(&self, offset: usize) -> u64 {

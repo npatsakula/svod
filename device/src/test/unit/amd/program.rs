@@ -833,3 +833,67 @@ attributes #0 = { alwaysinline nounwind "amdgpu-flat-work-group-size"="1,64" }
     assert_eq!(output.get(), 1.0);
     output.raw.free_amd_device_in_place();
 }
+
+/// Lanes dispatching at once while the shared kernarg arena wraps. Each thread
+/// counts its own dispatches into its own buffer through a kernarg pointer, and
+/// adds a filler reservation per round so the arena wraps every few rounds, as
+/// a long suite's traffic does. A slot handed to two lanes shows as counts
+/// moved between threads (PM4) or a timeline wait that never retires (AQL,
+/// whose control programs share the arena with the kernargs).
+///
+/// One thread per lane: the test build parks a lane acquisition for only 25 ms.
+///
+/// Run: `SVOD_DEVICE=AMD:0 [SVOD_AMD_HW_QUEUES=4] [SVOD_AMD_AQL=1] cargo test -p svod-device --release --lib
+/// concurrent_lanes_survive_kernarg_wraps -- --ignored --nocapture`
+#[test]
+#[ignore = "manual hardware probe; needs a real AMD GPU + clang, and four lanes (SVOD_AMD_HW_QUEUES=4 on single-XCC)"]
+fn concurrent_lanes_survive_kernarg_wraps_probe() {
+    const COUNT_IR: &str = r#"target triple = "amdgcn-amd-amdhsa"
+define amdgpu_kernel void @count(ptr noalias %buf0) #0 {
+  %old = atomicrmw add ptr %buf0, i32 1 monotonic
+  ret void
+}
+attributes #0 = { alwaysinline nounwind "amdgpu-flat-work-group-size"="1,64" }
+"#;
+    const THREADS: usize = 4;
+    const ROUNDS: usize = 400;
+    const BURST: usize = 32;
+    let Some(alloc) = amd_alloc_or_skip() else { return };
+    ensure_hw_signal_pool(&alloc);
+    let Some(bytes) = clang_amdgcn(COUNT_IR, alloc.dev.arch.mcpu()) else { return };
+    let program = AmdProgram::load(alloc.dev.clone(), &alloc, &bytes, "count", &global_f32_buffer_abi()).expect("load");
+    let counters = (0..THREADS).map(|_| ProbeBuffer::new(&alloc)).collect::<Vec<_>>();
+    counters.iter().for_each(|counter| counter.set(0.0));
+    let addresses = counters.iter().map(|counter| counter.gpu).collect::<Vec<_>>();
+    std::thread::scope(|scope| {
+        for &address in &addresses {
+            let (alloc, program) = (&alloc, &program);
+            scope.spawn(move || {
+                let context = program.new_exec_context().expect("context").expect("AMD context");
+                for _ in 0..ROUNDS {
+                    for _ in 0..BURST {
+                        unsafe {
+                            context.dispatch(
+                                program,
+                                &[address as *mut u8],
+                                &[],
+                                Some([1, 1, 1]),
+                                Some([1, 1, 1]),
+                                false,
+                            )
+                        }
+                        .expect("dispatch");
+                    }
+                    let arena = alloc.dev.core().kernarg_arena.lock().upgrade().expect("a lane holds the arena");
+                    arena.bump(arena.size / 8, 16).expect("filler");
+                    context.synchronize().expect("synchronize");
+                }
+            });
+        }
+    });
+    let counts = counters.iter().map(|counter| counter.get().to_bits()).collect::<Vec<_>>();
+    for counter in counters {
+        counter.raw.free_amd_device_in_place();
+    }
+    assert!(counts.iter().all(|&count| count == (ROUNDS * BURST) as u32), "per-thread dispatch counts {counts:?}");
+}
