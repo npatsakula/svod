@@ -489,10 +489,10 @@ pub(crate) fn representatives<C: Tiled>(ranked: &[C]) -> Vec<C> {
 }
 
 /// A tile's raster and tail split are variants of it, as its pipelines
-/// are: the planner walks every tile at the default raster, splits it where
-/// it prices that cheapest and offers one alternative beside it where it is
-/// unsure ([`GemmProblem::ranked`](super::GemmProblem)), timed only as a
-/// twin of a contender tile; a config read back from a code may carry
+/// are: the planner walks every tile at the default raster and offers a
+/// tile's split beside its unsplit pipelines where it prices the split
+/// cheaper or near ([`GemmProblem::ranked`](super::GemmProblem)), timed only
+/// as a twin of a contender tile; a config read back from a code may carry
 /// another raster.
 impl Tiled for GemmCfg {
     fn tile(&self) -> Self {
@@ -502,6 +502,12 @@ impl Tiled for GemmCfg {
 
     fn twins(&self, ranked: &[Self]) -> Vec<Self> {
         ranked.iter().filter(|c| c.tile() == self.tile()).copied().collect()
+    }
+
+    /// A split stands for no tile: it runs only where the tuner timed it
+    /// against its unsplit pipeline, never as the untuned first pick.
+    fn represents(&self) -> bool {
+        self.tail.is_none()
     }
 }
 

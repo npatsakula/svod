@@ -1,8 +1,9 @@
 //! The tail split ([`TailPlan`]): the whole waves' run and the tail's run
 //! cover every tile of a raster's walk once; the three programs compute the
-//! plain GEMM under its epilogue in the interpreter; the planner splits a
-//! partial last wave where the model prices it cheaper, never where the
-//! tiles fill whole waves or dwarf one, at counts that divide the trips;
+//! plain GEMM under its epilogue in the interpreter; the planner offers a
+//! partial last wave's split where the model prices it cheaper, never where
+//! the tiles fill whole waves or dwarf one, at counts that divide the
+//! trips, and only as a twin the tuner times beside its unsplit pipeline;
 //! the config's code holds the split.
 
 use proptest::prelude::*;
@@ -212,45 +213,57 @@ fn mi300x() -> Planner {
     planner(Target::card("mi300x").expect("a listed card"))
 }
 
-/// What the planner ranks first on a shape: the config, its cost and its
-/// plan.
-fn lead(planner: &Planner, [m, n, k]: [usize; 3]) -> (GemmCfg, f64, Option<TailPlan>) {
+/// What the planner ranks first on a shape and its tile's split twin
+/// (`None` where it offers none), each with its cost and plan.
+#[allow(clippy::type_complexity)]
+fn lead(planner: &Planner, [m, n, k]: [usize; 3]) -> ((GemmCfg, f64), Option<(GemmCfg, f64, TailPlan)>) {
     let p = GemmProblem { batches: 1, m, n, k, halves: 1, rope: None };
-    let lead = planner.gemm_ranked(1, m, n, k, false)[0];
-    (lead, p.admit(planner, &lead).expect("ranked").0, p.tail_plan(planner, &lead))
+    let ranked = planner.gemm_ranked(1, m, n, k, false);
+    let lead = ranked[0];
+    let split = ranked.iter().find(|c| c.tail.is_some() && c.tile() == lead.tile()).map(|&c| {
+        let plan = p.tail_plan(planner, &c).unwrap_or_else(|| panic!("{c:?} plans no tail"));
+        (c, p.admit(planner, &c).expect("ranked").0, plan)
+    });
+    ((lead, p.admit(planner, &lead).expect("ranked").0), split)
 }
 
 /// On a 304-CU card 8192×4096 at its 256² tiles is 512 tiles, a wave and
-/// 208: the planner runs a wave data-parallel and splits the 208 tiles'
-/// reduction, priced under every unsplit config's; its unsplit twin is
-/// priced dearer still by more than the tuner resolves, so none is offered.
+/// 208: the model prices the plan that runs a wave data-parallel and
+/// splits the 208 tiles' reduction under every unsplit config, by more
+/// than the tuner resolves, yet the ranking leads with the tile unsplit
+/// and offers the split as its twin, for the tuner to time against it.
 #[test]
 fn a_partial_last_wave_is_split() {
     let planner = mi300x();
     let [m, n, k] = [8192, 4096, 4096];
-    let (cfg, cost, plan) = lead(&planner, [m, n, k]);
-    let plan = plan.unwrap_or_else(|| panic!("{cfg:?} splits no tail"));
+    let ((lead, cost), split) = lead(&planner, [m, n, k]);
+    let (cfg, split_cost, plan) = split.unwrap_or_else(|| panic!("{lead:?} has no split twin"));
     let p = GemmProblem { batches: 1, m, n, k, halves: 1, rope: None };
     let wave = p.wave(&planner, &cfg).expect("a wave");
-    assert_eq!(cfg.tile[..2], [256, 256], "{cfg:?}");
+    assert!(lead.tail.is_none(), "{lead:?} leads split");
+    assert_eq!(lead.tile[..2], [256, 256], "{lead:?}");
     assert_eq!((wave, plan.waves.map(Run::count), plan.tail), (304, Some(304), Run::new(304, 208).unwrap()));
     let ranked = planner.gemm_ranked(1, m, n, k, false);
     let unsplit = ranked.iter().filter(|c| c.tail.is_none()).map(|c| p.admit(&planner, c).expect("ranked").0);
-    assert!(unsplit.fold(f64::INFINITY, f64::min) > cost, "an unsplit config is priced under the split lead");
+    assert_eq!(unsplit.fold(f64::INFINITY, f64::min), cost, "the lead is the cheapest unsplit config");
     let whole = p.admit(&planner, &GemmCfg { tail: None, ..cfg }).expect("its unsplit form").0;
-    assert!(whole > cost * crate::tune::SETTLED, "{whole} against {cost}: within the tuner's resolution");
+    assert!(whole > split_cost * crate::tune::SETTLED, "{whole} against {split_cost}: within the tuner's resolution");
 }
 
-/// The planner runs every tile data-parallel where they fill whole waves
-/// (4864×4096 at 256² tiles is 304 tiles, a wave) or dwarf one (65536×8192
-/// is 27 waves less 96 tiles: a split tail's partials and merge cost more
-/// than its idle share saves).
+/// Where the tiles fill whole waves (4864×4096 at 256² tiles is 304
+/// tiles, a wave) no split of the leading tile runs, and where they dwarf
+/// one (65536×8192 is 27 waves less 96 tiles) its split's partials and
+/// merge cost more than its idle share saves.
 #[test_case([4864, 4096, 4096]; "a whole wave")]
 #[test_case([65536, 8192, 1024]; "many waves")]
 fn whole_waves_run_unsplit(shape: [usize; 3]) {
     let planner = mi300x();
-    let (cfg, _, plan) = lead(&planner, shape);
-    assert!(cfg.tail.is_none() && plan.is_none(), "{shape:?}: {cfg:?} splits {plan:?}");
+    let ((lead, cost), split) = lead(&planner, shape);
+    let p = GemmProblem { batches: 1, m: shape[0], n: shape[1], k: shape[2], halves: 1, rope: None };
+    assert!(lead.tail.is_none() && p.tail_plan(&planner, &lead).is_none(), "{shape:?}: {lead:?} splits");
+    if let Some((cfg, split_cost, plan)) = split {
+        assert!(split_cost > cost, "{shape:?}: {cfg:?} {plan:?} priced at {split_cost} under {cost}");
+    }
 }
 
 /// Every split the planner ranks, on any card and shape, divides its
@@ -308,22 +321,60 @@ fn a_split_the_problem_cannot_run_is_refused() {
     assert_eq!(whole.admit(&planner, &split(4)).map(|_| ()), refused, "whole waves");
 }
 
-/// Where a split leads, the tuner times the unsplit config beside it: the
-/// split's model is fitted to a few probed shapes only. Under the guessed
-/// costs and under the cards' measured ones: on sm_86 4096³ splits a tail
-/// of eight tiles of 512 (the device ran it 2.3 % faster), on MI300X
-/// 6144×4096×8192 a tail of its last partial wave (19 % faster at 256²).
+/// Where the model prices a split cheapest, the ranking still leads
+/// unsplit and holds the split only as a twin of its unsplit pipeline: the
+/// split's model is fitted to a few probed shapes, and it ran 4–8 %
+/// optimistic on eleven MI300X shapes. Neither the untuned first pick
+/// (`SVOD_TK_TUNE=0`, or a store not yet written: the first clean
+/// representative, `first_clean` over `representatives`, whatever the
+/// compiler refuses or spills) nor the shortlist takes a split, a whole
+/// split-K of a grid short of a wave among them; the tuner's twins stage
+/// times the split beside its tile's pipelines. Under the guessed costs
+/// and under the cards' measured ones: on sm_86 4096³ splits a tail of
+/// eight tiles of 512 (the device ran it 2.3 % faster), on MI300X
+/// 6144×4096×8192 a tail of its last partial wave (19 % faster at 256²),
+/// and 128×4096×1024 splits whole.
 #[test_case(Target::card("mi300x").expect("a card"), costs(), [128, 4096, 1024]; "a short wide gemm on mi300x")]
 #[test_case(Target::card("mi300x").expect("a card"), costs(), [8192, 4096, 4096]; "a partial last wave on mi300x")]
 #[test_case(sm86(), sm86_costs(), [4096, 4096, 4096]; "a short tail on a measured sm_86")]
 #[test_case(Target::card("mi300x").expect("a card"), gfx942_costs(), [6144, 4096, 8192]; "a measured mi300x")]
-fn a_leading_split_has_an_unsplit_twin(target: Target, costs: Costs, [m, n, k]: [usize; 3]) {
+fn a_split_runs_only_as_a_timed_twin(target: Target, costs: Costs, [m, n, k]: [usize; 3]) {
+    use crate::ops::config::{first_clean, representatives};
+    use crate::tune::Compiled;
     let planner = Planner::new(Device { target, costs }).expect("an SM count");
+    let p = GemmProblem { batches: 1, m, n, k, halves: 1, rope: None };
     let ranked = planner.gemm_ranked(1, m, n, k, false);
-    let lead = ranked[0];
-    assert!(lead.tail.is_some(), "{lead:?} leads unsplit");
-    let twins = lead.twins(&ranked);
-    assert!(twins.iter().any(|c| c.tail.is_none()), "{lead:?} has no unsplit twin in {twins:?}");
+    let price = |c: &GemmCfg| p.admit(&planner, c).expect("ranked").0;
+    let cheapest = ranked.iter().copied().min_by(|a, b| price(a).total_cmp(&price(b))).expect("a ranking");
+    assert!(cheapest.tail.is_some(), "{cheapest:?}: the model prices no split cheapest");
+    assert!(ranked[0].tail.is_none(), "{:?} leads split", ranked[0]);
+    let reps = representatives(&ranked);
+    assert!(reps.iter().all(|c| c.tail.is_none()), "a split stands for its tile");
+    // The untuned pick: every compile clean, the first tiles refused, every
+    // one spilling.
+    let verdicts: [&dyn Fn(usize) -> Compiled; 3] =
+        [&|_| Compiled::Clean, &|at| if at < 3 { Compiled::Failed } else { Compiled::Clean }, &|_| Compiled::Spilled];
+    for verdict in verdicts {
+        let mut at = 0;
+        let first = first_clean(&reps, |batch| {
+            at += batch.len();
+            (at - batch.len()..at).map(verdict).collect()
+        });
+        let first = reps[first.expect("a config compiles")];
+        assert!(first.tail.is_none(), "the untuned pick {first:?} splits");
+    }
+    // The twins stage of the cheapest split's tile times it beside the
+    // tile's unsplit pipelines.
+    let leader = reps.iter().find(|c| c.tile() == cheapest.tile()).expect("the split's tile is represented");
+    let twins = leader.twins(&ranked);
+    assert!(twins.contains(&cheapest), "{cheapest:?} is no twin of {leader:?}: {twins:?}");
+    assert!(twins.iter().any(|c| c.tail.is_none()), "{leader:?} has no unsplit twin in {twins:?}");
+    for split in ranked.iter().filter(|c| c.tail.is_some()) {
+        let pipeline = GemmCfg { tail: None, ..*split };
+        let at = ranked.iter().position(|c| c == split).expect("ranked");
+        assert_eq!(ranked[at - 1], pipeline, "{split:?} does not follow the pipeline it splits");
+        assert!(price(split) <= price(&pipeline) * crate::tune::SETTLED, "{split:?} priced past its pipeline");
+    }
 }
 
 /// A row of `gemm_tail_probe`: a shape at the config the planner led with
@@ -445,22 +496,23 @@ fn the_model_orders_the_probed_plans_as_the_device_did(target: Target, costs: Co
     }
 }
 
-/// Where the device ran a probed shape's tile faster data-parallel than
-/// with its tail split (MI300X at 256² on all but 6144×4096×8192), the
-/// planner ranks that pipeline unsplit ahead of every split of it; where
-/// the split ran faster past [`TIE`], split.
+/// Where the device ran a probed shape's tile faster with its tail split
+/// than data-parallel past [`TIE`] (sm_86 at 4096³, MI300X at
+/// 6144×4096×8192), the ranking offers the tile's split for the tuner to
+/// time; every probed pipeline leads its tile unsplit.
 #[test_case(Target::card("mi300x").expect("a card"), gfx942_costs(), mi300x_probed(); "mi300x")]
 #[test_case(sm86(), sm86_costs(), sm86_probed(); "sm_86")]
-fn the_planner_splits_a_probed_tile_where_the_device_did(target: Target, costs: Costs, rows: Vec<Probed>) {
+fn the_planner_offers_a_split_where_the_device_ran_one_faster(target: Target, costs: Costs, rows: Vec<Probed>) {
     let planner = Planner::new(Device { target, costs }).expect("an SM count");
     for Probed { shape: [m, n, k], cfg, dp, tail, .. } in &rows {
-        let Some((_, us)) = *tail else { continue };
-        if us.max(*dp) <= us.min(*dp) * TIE {
-            continue;
-        }
         let ranked = planner.gemm_ranked(1, *m, *n, *k, false);
         let pipeline = |c: &&GemmCfg| GemmCfg { order: cfg.order, tail: None, ..**c } == *cfg;
         let first = ranked.iter().find(pipeline).unwrap_or_else(|| panic!("{m}x{n}x{k}: {cfg:?} unranked"));
-        assert_eq!(first.tail.is_some(), us < *dp, "{m}x{n}x{k}: {first:?} leads its pipeline");
+        assert!(first.tail.is_none(), "{m}x{n}x{k}: {first:?} leads its pipeline split");
+        let Some((_, us)) = *tail else { continue };
+        if us * TIE < *dp {
+            let split = ranked.iter().find(|c| c.tail.is_some() && c.tile() == cfg.tile());
+            assert!(split.is_some(), "{m}x{n}x{k}: no split of {cfg:?} to time, the device ran it faster");
+        }
     }
 }

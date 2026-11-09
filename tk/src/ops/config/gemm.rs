@@ -2,6 +2,7 @@
 //! lays a tile's operands into, and what a problem's products cost on a
 //! planner.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::atoms::{Core, Fill, Target};
@@ -559,53 +560,52 @@ impl GemmProblem {
     }
 
     /// The lattice's configs that run this problem on the planner's target,
-    /// every pipeline (depth, ring depth, unrolling) of every tile, cheapest
-    /// first (then by fewer registers) and [`spread`] over the block tiles
-    /// the cost band holds: the shortlist keeps a tile's first clean one
-    /// ([`shortlist`](super::search::shortlist)).
+    /// every pipeline (depth, ring depth, unrolling) of every tile unsplit,
+    /// cheapest first (then by fewer registers) and [`spread`] over the
+    /// block tiles the cost band holds: the shortlist keeps a tile's first
+    /// clean one ([`shortlist`](super::search::shortlist)). A tile the model
+    /// would split ([`Self::planned`]) carries one split right behind the
+    /// pipeline it splits, a twin the tuner times beside that pipeline
+    /// ([`Tiled::twins`]) and nothing else reaches: a split never stands
+    /// for its tile ([`Tiled::represents`]), so neither the shortlist nor
+    /// the untuned first pick takes one.
     pub(crate) fn ranked(&self, planner: &Planner) -> Vec<GemmCfg> {
         let feasible = planner.feasible(self);
         let planned: Vec<_> = feasible.iter().filter_map(|f| self.planned(planner, f)).collect();
-        let mut admitted: Vec<(f64, u32, GemmCfg)> = planned.iter().map(|(best, _)| *best).collect();
-        // One alternative a tile: its cheapest pipeline's, where the model
-        // is unsure of its split ([`Self::planned`]).
-        let mut order: Vec<usize> = (0..planned.len()).collect();
-        order.sort_by(|&a, &b| planned[a].0.0.total_cmp(&planned[b].0.0));
-        let mut tiles = std::collections::HashSet::new();
-        let paired: Vec<_> = order
-            .into_iter()
-            .filter(|&i| tiles.insert(planned[i].0.2.tile()))
-            .filter_map(|i| Some((planned[i].0.2, planned[i].1?)))
-            .collect();
-        admitted.extend(paired.iter().map(|&(_, alt)| alt));
-        let spanned = feasible.len() + admitted.len() - planned.len();
-        let mut ranked = sorted(self, admitted, spanned);
-        // A kept split's unsplit twin outlives the prune: however far past
-        // the split the model prices it, no split was ever measured.
-        let kept: Vec<GemmCfg> = ranked.iter().map(|&(.., c)| c).collect();
-        let twins = paired
-            .into_iter()
-            .filter(|(lead, alt)| lead.tail.is_some() && kept.contains(lead) && !kept.contains(&alt.2));
-        ranked.extend(twins.map(|(_, alt)| alt));
-        spread(ranked.into_iter().map(|(cost, _, c)| (cost, c)).collect(), |c| [c.tile[0], c.tile[1]])
+        let ranked = sorted(self, planned.iter().map(|&(unsplit, _)| unsplit).collect(), feasible.len());
+        // A tile's split: the cheapest of its kept pipelines' splits.
+        let kept: HashSet<GemmCfg> = ranked.iter().map(|&(.., c)| c).collect();
+        let mut splits: HashMap<GemmCfg, (f64, GemmCfg)> = HashMap::new();
+        for &((_, _, pipeline), split) in &planned {
+            let Some((cost, _, split)) = split.filter(|_| kept.contains(&pipeline)) else { continue };
+            let held = splits.entry(pipeline.tile()).or_insert((cost, split));
+            if cost < held.0 {
+                *held = (cost, split);
+            }
+        }
+        let twinned = ranked.into_iter().flat_map(|(cost, _, cfg)| {
+            let split = splits.get(&cfg.tile()).filter(|(_, s)| GemmCfg { tail: None, ..*s } == cfg);
+            [Some((cost, cfg)), split.map(|&(_, s)| (cost, s))].into_iter().flatten()
+        });
+        spread(twinned.collect(), |c| [c.tile[0], c.tile[1]])
     }
 
-    /// A feasible config at the tail split the model prices cheapest on
-    /// this problem ([`Self::tails`], every tile data-parallel on a tie),
-    /// its cost and registers, and one alternative beside it where the
-    /// model is unsure; `None` where the shape leaves it out. Every config
-    /// walks the default raster ([`TileOrder::DEFAULT`]): measured on
-    /// MI300X, sm_86 and gfx1201, groups of eight tile rows ran the tuner's
-    /// configs best or within 1–3 % of the best, where the fill's model
-    /// prices the other heights too flat to tell them apart.
+    /// A feasible config's cost and registers on this problem, unsplit,
+    /// and its tail split the model prices cheapest ([`Self::tails`]) where
+    /// that is under the unsplit price or within [`SETTLED`] of it; `None`
+    /// where the shape leaves the config out. Every config walks the
+    /// default raster ([`TileOrder::DEFAULT`]): measured on MI300X, sm_86
+    /// and gfx1201, groups of eight tile rows ran the tuner's configs best
+    /// or within 1–3 % of the best, where the fill's model prices the other
+    /// heights too flat to tell them apart.
     ///
     /// A tail split weighs the last wave's idle SMs against its partials'
-    /// bytes, their merge and its launches ([`Self::plan_price`]). Unsure:
-    /// where a split leads, always (the tuner times the cheapest unsplit
-    /// config of its tile beside it), and where an unsplit one leads, the
-    /// cheapest split priced within [`SETTLED`] of it, a gap the tuner's own
-    /// rounds do not resolve either (one pipeline a tile, as a twin of the
-    /// tile: [`Tiled::twins`]).
+    /// bytes, their merge and its launches ([`Self::plan_price`]), and only
+    /// the tuner's time settles it: on MI300X the model priced it 4–8 %
+    /// cheaper than the device ran it at 128² tiles (`gemm_tail_probe`,
+    /// eleven shapes), and on three of them the device ran the unsplit
+    /// pipeline faster. A grid short of a wave splits whole, by the same
+    /// rule.
     #[allow(clippy::type_complexity)]
     fn planned(
         &self,
@@ -615,14 +615,10 @@ impl GemmProblem {
         let price = |cfg: GemmCfg| {
             planner.price_of(self, &Feasible { cfg, regs: f.regs }).map(|(cost, regs)| (cost, regs, cfg))
         };
-        let cheaper = |a: (f64, u32, GemmCfg), b: (f64, u32, GemmCfg)| if b.0 < a.0 { b } else { a };
         let unsplit = price(f.cfg)?;
         let tails = self.tails(&f.cfg).map(|tail| GemmCfg { tail: Some(tail), ..f.cfg });
-        let Some(split) = tails.filter_map(price).reduce(cheaper) else { return Some((unsplit, None)) };
-        Some(match split.0 < unsplit.0 {
-            true => (split, Some(unsplit)),
-            false => (unsplit, (split.0 <= unsplit.0 * SETTLED).then_some(split)),
-        })
+        let split = tails.filter_map(price).min_by(|a, b| a.0.total_cmp(&b.0));
+        Some((unsplit, split.filter(|s| s.0 <= unsplit.0 * SETTLED)))
     }
 }
 
