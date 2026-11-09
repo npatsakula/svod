@@ -1500,6 +1500,10 @@ impl AmdComputeQueue {
     /// The caller's exclusive lane lease keeps PM4 counter reservation and ring
     /// publication ordered. The backend-local `inner` guard is uncontended.
     ///
+    /// `kernargs` go into one kernarg ring slot (on AQL together with the PM4
+    /// control program), reserved after the headroom waits and published with
+    /// the timeline value this dispatch signals.
+    ///
     /// Sequence (timestamps are present only when the submission requests them):
     /// `wait(counter, prev) → memory_barrier → [timestamp] → exec → [timestamp]
     /// → signal(counter, next)`.
@@ -1508,6 +1512,7 @@ impl AmdComputeQueue {
         &self,
         pool: &PoolQueue,
         submission: &crate::hcq::Submission,
+        kernargs: &[u8],
         pmc_start: &[u32],
         pmc_read: &[u32],
     ) -> Result<HcqDispatchResult> {
@@ -1546,6 +1551,16 @@ impl AmdComputeQueue {
                 timestamps.as_ref().map(|signal| (signal.start_ts_addr(), signal.end_ts_addr())),
             )?;
             push_queue_event_mailbox(&mut finalized, &self.core);
+            let compute = finalized
+                .commands
+                .iter()
+                .position(|command| matches!(command, crate::hcq::Command::Compute(_)))
+                .expect("an ordinary AQL dispatch holds one compute command");
+            finalized.bind(
+                compute,
+                crate::hcq::CommandField::ComputeKernargAddress,
+                crate::hcq::PatchSource::LinkAddress(1),
+            )?;
 
             let program = lower_hcq_aql_submission_program(
                 &finalized,
@@ -1558,31 +1573,31 @@ impl AmdComputeQueue {
                 },
                 crate::hcq::PatchSource::LinkAddress(0),
             )?;
-            let control_offset = pool.arena().bump(program.control.bytes.len(), 16)?;
-            let control_gpu = pool.arena().gpu_at(control_offset);
-            // SAFETY: the arena reservation covers the full resident PM4 control stream.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    program.control.bytes.as_ptr(),
-                    pool.arena().host_at(control_offset),
-                    program.control.bytes.len(),
-                );
-            }
+            let control = &program.control.bytes;
+            let kernarg_offset = control.len().next_multiple_of(crate::hcq::KERNARG_ALIGN);
+            let mut slot = pool.arena().reserve(kernarg_offset + kernargs.len(), crate::hcq::KERNARG_ALIGN)?;
+            let control_gpu = slot.gpu();
+            let host = slot.host();
+            host[..control.len()].copy_from_slice(control);
+            host[kernarg_offset..].copy_from_slice(kernargs);
             std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-            let linked = pool.link(&program.aql, &crate::hcq::LinkPatchValues(vec![control_gpu]))?;
-            self.publish_linked_aql_timeline(pool, &linked.replay_buffer(), next)?;
+            let links = crate::hcq::LinkPatchValues(vec![control_gpu, control_gpu + kernarg_offset as u64]);
+            let linked = pool.link(&program.aql, &links)?;
+            self.publish_linked_aql_timeline(pool, &linked.replay_buffer(), next, Some(slot))?;
             let finalizer = SubmissionFinalizer::timeline(Arc::clone(pool.pm4_signal()), next, timestamps.clone());
             return Ok(HcqDispatchResult { timestamps, finalizer });
         }
 
-        // The caller owns the lane across kernarg bump, write, and publication,
-        // so the PM4 counter and ring remain in the same order.
+        // The caller owns the lane across kernarg reservation, write, and
+        // publication, so the PM4 counter and ring remain in the same order.
         // Keep the PM4 counter < 2^32 (drain+reset at the watermark) before
         // reserving this dispatch's value.
         pool.ensure_pm4_headroom()?;
         // Ring back-pressure: block if too many dispatches are in flight, so an
         // async (`wait=false`) burst can't lap the ring. Outside the inner lock.
         self.wait_dispatch_headroom(pool)?;
+        let mut slot = pool.arena().reserve(kernargs.len(), crate::hcq::KERNARG_ALIGN)?;
+        slot.host().copy_from_slice(kernargs);
         let counter_addr = pool.pm4_signal().value_addr();
         let scratch_addr = pool.scratch_gpu_va();
         let tmpring_size = pool.tmpring_size();
@@ -1629,7 +1644,15 @@ impl AmdComputeQueue {
                     finalized.push(crate::hcq::Command::Wait { signal_address: start_addr + 4, value: 1 });
                 }
             }
-            finalized.push(command.clone());
+            match command {
+                crate::hcq::Command::Compute(dispatch) => {
+                    finalized.push(crate::hcq::Command::Compute(crate::hcq::ComputeDispatch {
+                        kernarg_address: slot.gpu(),
+                        ..dispatch.clone()
+                    }))
+                }
+                command => finalized.push(command.clone()),
+            };
             if matches!(command, crate::hcq::Command::Compute(_))
                 && let Some((_, end_addr)) = ts_addrs
             {
@@ -1695,6 +1718,7 @@ impl AmdComputeQueue {
         self.core.publication_checkpoint(crate::amd::iface::PublicationStage::BeforeDoorbell)?;
         ring.ring_doorbell(/*is_pm4=*/ true);
         reservation.mark_published();
+        slot.publish(pool.pm4_signal(), next);
         ring.commit();
         self.core.publication_checkpoint(crate::amd::iface::PublicationStage::AfterDoorbell)?;
         reservation.commit();
@@ -1811,7 +1835,7 @@ impl AmdComputeQueue {
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         linked.patch(replay, runtime, system)?;
         validate_aql_packet_count(replay.bytes().len() / AQL_PACKET_BYTES)?;
-        self.publish_linked_aql_timeline(pool, replay, next)?;
+        self.publish_linked_aql_timeline(pool, replay, next, None)?;
         Ok(SubmissionFinalizer::timeline(Arc::clone(pool.pm4_signal()), next, None))
     }
 
@@ -1869,6 +1893,7 @@ impl AmdComputeQueue {
         pool: &PoolQueue,
         replay: &crate::hcq::ReplayCommandBuffer,
         next: u64,
+        kernargs: Option<crate::amd::kernarg::KernargSlot<'_>>,
     ) -> Result<()> {
         if !replay.bytes().len().is_multiple_of(AQL_PACKET_BYTES) {
             return Err(Error::Runtime { message: "linked AQL stream is not packet aligned".into() });
@@ -1888,6 +1913,9 @@ impl AmdComputeQueue {
         self.core.publication_checkpoint(crate::amd::iface::PublicationStage::BeforeDoorbell)?;
         ring.ring_doorbell(/*is_pm4=*/ false);
         reservation.mark_published();
+        if let Some(slot) = kernargs {
+            slot.publish(pool.pm4_signal(), next);
+        }
         ring.commit();
         self.core.publication_checkpoint(crate::amd::iface::PublicationStage::AfterDoorbell)?;
         reservation.commit();

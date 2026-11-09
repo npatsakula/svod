@@ -460,22 +460,26 @@ fn compute_publication_rolls_back_before_the_doorbell_and_poisons_after(xccs: u3
     let pool = PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator).expect("pool queue");
     for (stage, panicking) in [(0, false), (1, false), (1, true)] {
         publication_fails_at(&iface, stage, panicking, || {
-            let _ = pool.queue().submit_hcq_dispatch(&pool, &submission, &[], &[]);
+            let _ = pool.queue().submit_hcq_dispatch(&pool, &submission, &[0; 16], &[], &[]);
         });
         // The rolled-back reservation is handed straight back out, so the ring
         // never advances across the three abandoned attempts.
         assert_eq!((pool.pm4_value(), pool.queue().ring_write_idx()), (1, 0), "xccs={xccs}, stage={stage}");
         assert!(!allocator.dev.is_poisoned(), "xccs={xccs}, stage={stage}");
+        // So is the kernarg slot: the GPU never saw it.
+        assert!(pool.arena().live_slots().iter().all(|(_, state)| *state == "done"), "xccs={xccs}, stage={stage}");
     }
 
     for panicking in [false, true] {
         let (iface, allocator) = mock_device_with_signals(xccs);
         let pool = PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator).expect("pool queue");
         publication_fails_at(&iface, 2, panicking, || {
-            let _ = pool.queue().submit_hcq_dispatch(&pool, &submission, &[], &[]);
+            let _ = pool.queue().submit_hcq_dispatch(&pool, &submission, &[0; 16], &[], &[]);
         });
         assert_eq!(pool.pm4_value(), 2, "xccs={xccs}, panicking={panicking}");
         assert!(allocator.dev.is_poisoned(), "xccs={xccs}, panicking={panicking}");
+        // The CP owns the packets, and with them the kernarg slot they read.
+        assert_eq!(pool.arena().live_slots(), [(0, "submitted")], "xccs={xccs}, panicking={panicking}");
         drop(pool);
         assert_eq!(iface.free_count(), 0, "poisoned resources must be quarantined");
     }

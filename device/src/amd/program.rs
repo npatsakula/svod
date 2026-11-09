@@ -577,9 +577,8 @@ impl std::fmt::Debug for AmdProgram {
 }
 
 impl AmdProgram {
-    /// Lane-scoped dispatch entry point. Reads the queue, kernarg arena, scratch,
-    /// and PM4 counter from the exclusively leased `PoolQueue`. The lease spans
-    /// kernarg bump, write, and publication, so kernarg order matches ring order.
+    /// Lane-scoped dispatch entry point. Reads the queue, kernarg ring, scratch,
+    /// and PM4 counter from the exclusively leased `PoolQueue`.
     /// Callers must size lane scratch before calling.
     ///
     /// # Safety
@@ -642,18 +641,11 @@ impl AmdProgram {
             });
         }
 
-        // The caller's non-clone QueueLease is the sole publication authority,
-        // so kernarg reservation order is queue submission order.
-        let arena = pool.arena();
-        let off = arena.bump(self.kernarg_size(), crate::hcq::KERNARG_ALIGN)?;
-        // SAFETY: arena returned a valid slot; the exclusive lane serializes
-        // writers, so no concurrent writer holds the same offset.
-        let host_base = unsafe { arena.host_at(off) };
+        // Packed here, placed in the kernarg ring by the queue: the ring slot
+        // is reserved and published within the one submission that reads it.
         let addresses: smallvec::SmallVec<[u64; 8]> = buffers.iter().map(|p| *p as u64).collect();
-        // SAFETY: arena returned a writable record of kernarg_size bytes.
-        let dst = unsafe { std::slice::from_raw_parts_mut(host_base, self.kernarg_size()) };
-        layout.pack(dst, &addresses, vals)?;
-        let kernarg_gpu = arena.gpu_at(off);
+        let mut kernargs = smallvec::SmallVec::<[u8; 256]>::from_elem(0, self.kernarg_size());
+        layout.pack(&mut kernargs, &addresses, vals)?;
 
         // 2. Submit sequence:
         //   PM4: wait(counter, prev) → memory_barrier → exec → signal(counter, next)
@@ -665,7 +657,7 @@ impl AmdProgram {
             let bufs_str: Vec<String> =
                 buffers.iter().enumerate().map(|(i, b)| format!("buf{}={:#x}", i, *b as u64)).collect();
             eprintln!(
-                "[dispatch tv={}] kernel={} grid=[{}, {}, {}] local=[{}, {}, {}] is_pm4={} kernarg_gpu={:#x} scratch={:#x} {}",
+                "[dispatch tv={}] kernel={} grid=[{}, {}, {}] local=[{}, {}, {}] is_pm4={} scratch={:#x} {}",
                 pool.pm4_value(),
                 self.name,
                 g[0],
@@ -675,7 +667,6 @@ impl AmdProgram {
                 l[1],
                 l[2],
                 pool.queue().is_pm4(),
-                kernarg_gpu,
                 pool.scratch_gpu_va(),
                 bufs_str.join(" "),
             );
@@ -706,7 +697,8 @@ impl AmdProgram {
             private_segment_size: self.kd.private_segment_fixed_size,
             group_segment_size: self.kd.group_segment_fixed_size,
             kernel_object: self.aql_prog_addr,
-            kernarg_address: kernarg_gpu,
+            // Placed by the queue once it reserves the kernarg ring slot.
+            kernarg_address: 0,
             // Native completion ownership is assigned by the queue finalizer.
             completion_signal: 0,
             barrier: true,
@@ -724,7 +716,7 @@ impl AmdProgram {
         if profile {
             submission.request_profile();
         }
-        let result = queue.submit_hcq_dispatch(pool, &submission, pmc_start, pmc_read)?;
+        let result = queue.submit_hcq_dispatch(pool, &submission, &kernargs, pmc_start, pmc_read)?;
         result.finalizer.retain_code(self.code_object());
         pool.register_inflight(Arc::clone(&result.finalizer));
         owner.set_newest(Arc::clone(&result.finalizer));

@@ -834,12 +834,12 @@ attributes #0 = { alwaysinline nounwind "amdgpu-flat-work-group-size"="1,64" }
     output.raw.free_amd_device_in_place();
 }
 
-/// Lanes dispatching at once while the shared kernarg arena wraps. Each thread
+/// Lanes dispatching at once while the shared kernarg ring wraps. Each thread
 /// counts its own dispatches into its own buffer through a kernarg pointer, and
-/// adds a filler reservation per round so the arena wraps every few rounds, as
-/// a long suite's traffic does. A slot handed to two lanes shows as counts
+/// abandons a filler reservation per round so the ring wraps every few rounds,
+/// as a long suite's traffic does. A slot reused while live shows as counts
 /// moved between threads (PM4) or a timeline wait that never retires (AQL,
-/// whose control programs share the arena with the kernargs).
+/// whose control programs share the ring with the kernargs).
 ///
 /// One thread per lane: the test build parks a lane acquisition for only 25 ms.
 ///
@@ -885,7 +885,7 @@ attributes #0 = { alwaysinline nounwind "amdgpu-flat-work-group-size"="1,64" }
                         .expect("dispatch");
                     }
                     let arena = alloc.dev.core().kernarg_arena.lock().upgrade().expect("a lane holds the arena");
-                    arena.bump(arena.size / 8, 16).expect("filler");
+                    drop(arena.reserve(arena.size / 8, 16).expect("filler"));
                     context.synchronize().expect("synchronize");
                 }
             });

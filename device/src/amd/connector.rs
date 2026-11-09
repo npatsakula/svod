@@ -1,7 +1,7 @@
 //! Exclusive AMD compute lanes and logical execution contexts.
 //!
 //! A `PoolQueue` bundles the dispatch state that backs a single KFD compute
-//! queue: the queue itself (ring + doorbell), a kernarg bump arena, the scratch
+//! queue: the queue itself (ring + doorbell), the device's kernarg ring, the scratch
 //! backing, the compute timeline counter, and linked-plan finalizers. A queue is
 //! published through only while a non-clone `QueueLease` owns its lane bit.
 //! Uncontended acquisition is one atomic compare-exchange; bounded contention
@@ -42,11 +42,10 @@ pub(crate) struct PoolQueue {
     /// The KFD compute queue: ring, doorbell, and GART. Its backend-local mutex
     /// is uncontended because publication requires the lane's unique lease.
     queue: Box<AmdComputeQueue>,
-    /// Kernel-argument bump arena (16 MiB GTT). One per DEVICE, shared by every
-    /// lane: the wrap path drains all of them through
-    /// `AmdDeviceCore::synchronize_all`, so a wrapped slot is provably free
-    /// whichever lane wrote it. Freed by `Drop for KernargArena` once the last
-    /// sharing queue drops, after `Drop for PoolQueue` has drained.
+    /// Kernel-argument ring (16 MiB GTT). One per DEVICE, shared by every
+    /// lane: each slot retires with the timeline point of the submission that
+    /// reads it, whichever lane that is. Freed by `Drop for KernargArena` once
+    /// the last sharing queue drops, after `Drop for PoolQueue` has drained.
     arena: Arc<KernargArena>,
     /// Scratch backing. Grown on demand by [`ensure_has_local_memory`](Self::ensure_has_local_memory)
     /// while the lane's exclusive lease is held.
@@ -572,6 +571,7 @@ impl PoolQueue {
     pub fn ensure_pm4_headroom(&self) -> Result<()> {
         if self.pm4_counter.current() > TIMELINE_WRAP_WATERMARK {
             self.drain_all()?;
+            self.arena.retire_timeline(self.pm4_signal());
             self.pm4_counter.reset_after_drain();
         }
         Ok(())
