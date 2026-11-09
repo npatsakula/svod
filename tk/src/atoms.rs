@@ -928,6 +928,23 @@ impl Costs {
         let lone = if stages <= 1 { self.trip_one_lone } else { self.trip_lone };
         trip.max(lone / (blocks.max(1) as f64).powi(TRIP_HIDING))
     }
+
+    /// The power of the blocks an SM runs at once by which they hide one
+    /// another's wait for a ring's loads, per block-trip: the power by which
+    /// the trip probes' `full` blocks of a full SM hid a lone block's trip
+    /// (`trip_lone / trip = full^power`; the one-slot pair where the ring is
+    /// a `serial` one-slot `cp.async` one), a lone block's trip being that
+    /// same wait at the barrier for its slot's loads. At least one: a round
+    /// of resident blocks waits once (measured on gfx1201, whose probes hide
+    /// less, 0.96); one where the lone trip is unmeasured. sm_86 hides at
+    /// 1.71 over two slots and 1.49 over one, gfx942 at 1.12, gfx1151 at 1.59.
+    pub fn wait_hiding(&self, serial: bool, full: usize) -> f64 {
+        let (lone, trip) = if serial { (self.trip_one_lone, self.trip_one) } else { (self.trip_lone, self.trip) };
+        if trip <= 0.0 || lone <= trip || full <= 1 {
+            return 1.0;
+        }
+        ((lone / trip).ln() / (full as f64).ln()).max(1.0)
+    }
 }
 
 /// Model: the power of the blocks an SM runs at once by which a lone

@@ -543,7 +543,15 @@ impl Planner {
     /// round of every trip pays the memory latency the ring cannot hide (it
     /// prefetches `stages - 1` trips ahead; a one-slot `cp.async` ring none,
     /// [`crate::atoms::Costs::latency_one`]) on top of its issue: measured on
-    /// both, the latency adds rather than hides under the issue. The
+    /// both, the latency adds rather than hides under the issue. The blocks
+    /// the SM runs at once hide that round's wait among themselves as far as
+    /// the trip probes measured a full SM hiding a lone block's trip — the
+    /// same wait at the barrier for a slot's loads — a block-trip's share
+    /// falling with the blocks to the card's
+    /// [`wait_hiding`](crate::atoms::Costs::wait_hiding) power (sm_86 1.71,
+    /// a round's wait once at power one): on sm_86 the Qwen3 gate-up ran at
+    /// 1.52 ms on 64×64×32 tiles three an SM and at 2.01 alone on 128×64×64,
+    /// which a round's whole wait priced within 0.1 % of each other. The
     /// busiest SM's blocks' output stores ([`Claim::out`]) add after their
     /// trips, not under the fill: measured on MI300X (`gemm_tail_probe`, a
     /// block alone on its CU, its plain epilogue), 8192×4096×4096 ran 1.174×
@@ -609,6 +617,8 @@ impl Planner {
             ..=1 if serial => costs.latency_one.max(costs.latency),
             s => costs.latency / s.saturating_sub(1).max(1) as f64,
         };
+        let hiding = costs.wait_hiding(serial, crate::probe::trip_blocks(target));
+        let wait = wait * (at_once as f64).powf(1.0 - hiding);
         let run = claim.trips as f64 * (issue.max(rounds as f64 * wave) + rounds as f64 * wait);
         let section = |s: &Spread| {
             let work = s.ops.fold(pair_op(&self.device), costs.score, &self.weights);

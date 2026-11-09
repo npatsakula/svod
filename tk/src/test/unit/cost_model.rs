@@ -290,10 +290,15 @@ fn causal_trips_of_one_sequence_are_half_the_keys(t: usize, bq: usize, bkv: usiz
 /// under that device's costs, the faster first (`cost_model_probe` on three
 /// fresh stores each, 2026-10-19), each a block alone on its SM against a
 /// tile the SM runs several of at once, under the layer's epilogue the
-/// probe ran: a lone block's trip waits out what
-/// other blocks' work hides ([`Costs::trip_at`]), and a lone one-slot
-/// `cp.async` block fills after its products. Before either term the model
-/// ranked every slow one first.
+/// probe ran: a lone block's trip waits out what other blocks' work hides
+/// ([`Costs::trip_at`]), a lone one-slot `cp.async` block fills after its
+/// products, and resident blocks hide one another's wait for their loads
+/// ([`Costs::wait_hiding`]). Before the first two terms the model ranked
+/// every slow one first; the gate-up's two-slot pair it priced within
+/// 0.1 % without the third.
+#[test_case::test_case(crate::test::unit::sm86_costs(), "rtx3060", [3072, 3072, 1024], SWIGLU,
+    gemm_cfg([64, 64, 32], 2, [4, 1], true), gemm_cfg([128, 64, 64], 2, [4, 2], false);
+    "sm86 Qwen3 gate-up: 1.52 ms at three an SM, 2.01 alone")]
 #[test_case::test_case(crate::test::unit::sm86_costs(), "rtx3060", [3072, 3072, 1024], SWIGLU,
     gemm_cfg([64, 64, 64], 1, [4, 1], false), gemm_cfg([64, 128, 64], 1, [4, 4], false);
     "sm86 Qwen3 gate-up one slot: 1.55 ms at two an SM, 2.23 alone")]
@@ -315,21 +320,50 @@ fn a_block_alone_ranks_behind_the_measured_faster_tile(
     assert!(cost(&fast) < cost(&slow), "{} against {}", cost(&fast), cost(&slow));
 }
 
-/// A pair the device told apart that the model prices as a tie: sm_86 ran
-/// the Qwen3 gate-up at 1.52 ms on 64×64×32 tiles three an SM and at 2.01
-/// alone on 128×64×64, which the model prices within 0.1 % of each other
-/// either way. The ranking ordered it only while it charged every layer a
-/// forty-operation epilogue, which the lone tile's last-round blocks paid
-/// 1.2 % more of; under the swiglu's own six the tie stands, so the
-/// device's 32 % is a term the model does not hold yet.
-#[test]
-fn the_gate_up_pair_alone_and_three_an_sm_prices_a_tie() {
-    let target = Target::card("rtx3060").expect("a listed card");
-    let planner = Planner::new(Device { target, costs: crate::test::unit::sm86_costs() }).expect("an SM count");
-    let p = GemmProblem::new(1, 3072, 3072, 1024, &SWIGLU);
-    let cost = |c: GemmCfg| p.admit(&planner, &c).expect("admitted").0;
-    let (fast, slow) = (cost(gemm_cfg([64, 64, 32], 2, [4, 1], true)), cost(gemm_cfg([128, 64, 64], 2, [4, 2], false)));
-    assert!((fast / slow - 1.0).abs() < 1e-3, "{fast} against {slow}");
+/// The residency term alone, at equal work: one claim priced a block alone
+/// on its SM and several at once (its shared memory alone setting how many
+/// an SM holds), less the same claim at no memory latency, leaves the run's
+/// waits — a round's wait a round alone, and at `n` blocks at once the
+/// rounds' waits times `n` to the power of one less the card's
+/// [`Costs::wait_hiding`], the power its trip probes measured a full SM
+/// hiding a lone block's trip by. Where that power is one (gfx1201, whose
+/// probes hid less; a lone trip unmeasured) the rounds wait as before.
+#[test_case::test_case(crate::atoms::sm86(), crate::test::unit::sm86_costs(), 2, 1.710; "sm86 two slots")]
+#[test_case::test_case(crate::atoms::sm86(), crate::test::unit::sm86_costs(), 1, 1.489; "sm86 one cp.async slot")]
+#[test_case::test_case(Target::card("mi300x").unwrap(), crate::test::unit::gfx942_costs(), 1, 1.118;
+    "gfx942 one register-staged slot, hidden as two")]
+#[test_case::test_case(Target::card("rx9070xt").unwrap(), crate::test::unit::gfx1201_costs(), 2, 1.0;
+    "gfx1201 at a round's wait")]
+#[test_case::test_case(crate::atoms::sm86(), Costs { trip_lone: 0.0, ..crate::test::unit::sm86_costs() }, 2, 1.0;
+    "a lone trip unmeasured")]
+fn resident_blocks_hide_one_anothers_waits(target: Target, costs: Costs, stages: usize, power: f64) {
+    let serial = stages <= 1 && target.fill == crate::atoms::Fill::CpAsync;
+    let hiding = costs.wait_hiding(serial, crate::probe::trip_blocks(&target));
+    assert!((hiding - power).abs() < 1e-3, "hiding {hiding}, expected {power}");
+    let planner = Planner::new(Device { target: target.clone(), costs }).expect("an SM count");
+    let still = Costs { latency: 0.0, latency_one: 0.0, ..costs };
+    let still = Planner::new(Device { target: target.clone(), costs: still }).expect("an SM count");
+    let p = GemmProblem::new(1, 4096, 4096, 1024, &Epilogue::DEFAULT);
+    let claim = planner.claim_of(&p, &gemm_cfg([64, 64, 32], stages, [2, 2], false)).expect("admitted");
+    let per_sm = claim.blocks.div_ceil(planner.sms());
+    // The run's waits of `claim` with `smem` a block, and its blocks at once.
+    let waits = |smem: usize| {
+        let c = crate::ops::config::Claim { smem, ..claim };
+        let at_once = planner.resident(smem, c.regs, c.waves).max(1).min(per_sm);
+        (planner.price(&c) - still.price(&c), at_once)
+    };
+    let (alone, one) = waits(target.smem_bytes);
+    let (resident, n) = waits(target.smem_bytes / 3);
+    assert_eq!(one, 1);
+    assert!(n >= 2, "{n} blocks at once");
+    // Alone, a block waits its round's whole wait every trip, whatever the card hides.
+    let wait = if serial { costs.latency_one.max(costs.latency) } else { costs.latency / (stages.max(2) - 1) as f64 };
+    let lone = (claim.trips * per_sm) as f64 * wait;
+    assert!((alone / lone - 1.0).abs() < 1e-9, "{alone} against {lone}");
+    let rounds = per_sm.div_ceil(n) as f64 / per_sm as f64;
+    let want = rounds * (n as f64).powf(1.0 - hiding);
+    assert!((resident / alone / want - 1.0).abs() < 1e-9, "{resident} / {alone} against {want}");
+    assert!(alone > resident, "{alone} against {resident}");
 }
 
 /// The side stream's contract: bytes of none price at nothing (a zero

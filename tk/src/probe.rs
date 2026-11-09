@@ -517,6 +517,13 @@ pub(crate) fn trips_at(
     Ok(p.trips(op, unroll, stages))
 }
 
+/// The blocks a full SM of `target` runs at once in the trip probes: every
+/// SIMD's wave slots, in blocks of [`WARPS`] ([`Costs::wait_hiding`]).
+pub(crate) fn trip_blocks(target: &Target) -> usize {
+    let o = target.occupancy;
+    (o.simds * o.waves / WARPS) as usize
+}
+
 /// The trip probes' i32 tile: a 16-byte chunk per thread, eight to a row.
 fn trip_tile(target: &Target) -> Shape {
     Shape::new((WARPS * target.wave) as usize / 8, 32)
