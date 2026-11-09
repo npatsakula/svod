@@ -99,7 +99,7 @@ Rules the code enforces:
 
 Tests live in `tk/src/test/unit/<topic>.rs` (never in-place; `test_case` tables, `proptest` shapes). Shared helpers in
 `mod.rs`: `device_target()`, `device_planner()`, `cp_async_target()`, `group_target()`, `tuned_on_device`, `measure`,
-`first_eight`, `costs()` (GUESSED, `step_group` 0), `gfx1151_costs()`, `declared`, `planner`, `rounded`, `decode`,
+`first_eight`, `costs()` (GUESSED, `step_group` 0), `gfx1151_costs()`, `sm86_costs()`, `gfx1201_costs()`, `gfx942_costs()` (measured), `declared`, `planner`, `rounded`, `decode`,
 `assert_rel_close`, `Scratch` (a temp directory a test drops, for a tune store), `self_join` (a nearest problem). Targets: `atoms::sm86()`, `targets::hopper()`, `targets::amd(AmdArch::Gfx1201, 64)`.
 
 | Level | Example |
@@ -111,6 +111,7 @@ Tests live in `tk/src/test/unit/<topic>.rs` (never in-place; `test_case` tables,
 | Every admitted config on device | `device::every_gemm_candidate_matches_the_interpreter` (via `tuned_on_device`) |
 | Op vs graph fallback | `ops::linear_matches_the_graph` (`untuned` = `tune::scoped(false, …)`, `assert_kernel(&y, "gemm")`) |
 | Plan per shape (host) | `ops_plan::linear_plans` (`want: Result<(), Fallback>`) |
+| Split plans vs probed device times (host) | `tail::the_model_orders_the_probed_plans_as_the_device_did` (`gemm_tail_probe` rows per card: add a card's rows there) |
 | Offline card planning | `offline::a_planner_plans_for_a_card_without_it`, `offline::costs_read_from_a_copied_store` |
 | Sync pass | `sync::shipped_kernels_need_no_barriers`, `sync::a_block_barrier_under_a_branch_on_the_warp_is_refused` |
 

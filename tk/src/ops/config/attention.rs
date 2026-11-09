@@ -267,6 +267,7 @@ impl AttentionProblem {
             fill: Stream { bytes: fill as f64, unique, shared, ..Stream::default() },
             side: Stream::default(),
             stores: parts,
+            out: 0.0,
             ring: stages,
             unroll: cfg.unroll(),
             waits: 0.0,

@@ -143,8 +143,9 @@ pub(crate) const TAIL_SPLITS: usize = 16;
 /// Model: what a launch costs beside its blocks' time, ns — the dispatch of
 /// its grid behind the kernel before it and the drain of that kernel's last
 /// blocks — paid by a tail split's launches past the first. No probe
-/// measures it, and the tuner's times (each program's own, summed) do not
-/// see it: a tail split is priced, not timed, past its kernels.
+/// measures it, and neither the tuner's times nor `gemm_tail_probe`'s (each
+/// program's own, summed) see it: a tail split is priced, not timed, past
+/// its kernels.
 pub(crate) const LAUNCH: f64 = 4000.0;
 
 /// Search bound: the output tile's rows, the first of the knobs a GEMM-shaped
@@ -383,8 +384,8 @@ impl GemmProblem {
     /// The claim of one launch of `cfg` over `part`: `part.tiles` tiles of
     /// a batch's walk each over `part.split` blocks a share of the
     /// reduction. A split part stores its raw f32 accumulator, a `[bm, bn]`
-    /// slot a block, and its merge — the epilogue over the slots' sum — is
-    /// a section beside it. A warpgroup product reads no fragments and
+    /// slot a block, and its merge — the slots' sum — is a section beside
+    /// it. A warpgroup product reads no fragments and
     /// holds one accumulator chain per instruction column block; its step
     /// is the group's.
     fn claim_part(&self, planner: &Planner, cfg: &GemmCfg, regs: u32, part: Part) -> Result<Claim, Rejected> {
@@ -429,10 +430,12 @@ impl GemmProblem {
         // its rows' positions of both tables — `half` distinct elements a
         // row each — the side stream: priced at the ladder of its own
         // working set through the epilogue's pipe, not folded into the
-        // ring's fill, its distinct bytes in the run's floor. A split part
-        // runs no epilogue: it stores its slot straight to DRAM, and its
-        // merge reads every split's slot of a tile row by row, adds them
-        // and runs the epilogue over the sum.
+        // ring's fill, its distinct bytes in the run's floor. A block
+        // stores its output tile once its trips are done ([`Claim::out`]);
+        // a split part runs no epilogue but stores its raw f32 slot, and
+        // its merge reads every split's slot of a tile row by row and adds
+        // them, its bytes at DRAM's rate: the epilogue over the sum is the
+        // plan's ([`Self::plan_price`]).
         let split = part.split > 1;
         let epilogue = if split { 0.0 } else { EPILOGUE_OPS * (bm * bn) as f64 / trips as f64 };
         let (mut ops, mut side) = (epilogue, Stream::default());
@@ -448,17 +451,14 @@ impl GemmProblem {
                 ..Stream::default()
             };
         }
-        let (stores, merge) = match split {
-            false => (0.0, Spread::default()),
-            true => (
-                (bm * bn * F32) as f64 / trips as f64,
-                Spread {
-                    rows: (part.tiles * bm) as f64,
-                    ops: Ops::of(Kind::Epilogue, (EPILOGUE_OPS + part.split as f64) * bn as f64),
-                    bytes: ((part.split * F32 + ELEM) * bn) as f64,
-                    waits: 0.0,
-                },
-            ),
+        let merge = match split {
+            false => Spread::default(),
+            true => Spread {
+                rows: (part.tiles * bm) as f64,
+                ops: Ops::of(Kind::Epilogue, (part.split * bn) as f64),
+                bytes: ((part.split * F32 + ELEM) * bn) as f64,
+                waits: 0.0,
+            },
         };
         Ok(Claim {
             blocks,
@@ -476,7 +476,8 @@ impl GemmProblem {
             ops: Ops::of(Kind::Epilogue, ops),
             fill,
             side,
-            stores,
+            stores: 0.0,
+            out: (bm * bn * if split { F32 } else { ELEM }) as f64,
             ring: stages,
             unroll: cfg.unroll(),
             waits: 0.0,
@@ -518,21 +519,36 @@ impl GemmProblem {
     /// What `plan` costs `cfg` (its tail split's, or any other: a whole
     /// split-K is one), ns: the whole waves' launch and the split tail's,
     /// each priced as the planner prices a run, the merge a section of the
-    /// tail's, and [`LAUNCH`] for every launch past the first. `None` where
-    /// the shape refuses the config.
+    /// tail's, the epilogue as the data-parallel run of every tile pays it,
+    /// and [`LAUNCH`] for every launch past the first. `None` where the
+    /// shape refuses the config.
+    ///
+    /// The epilogue is the ranking's representative bundle
+    /// ([`EPILOGUE_OPS`]), not the layer's, so no plan earns from moving
+    /// it: the tail's tiles pay what the data-parallel run pays for them
+    /// past the waves', not a merge's spread of it under its bytes. On
+    /// MI300X, where a lane operation prices dearest, that spread ranked a
+    /// tail split first on 8192²×1024 and 12288×4096×4096, which the device
+    /// ran 6 % and 7 % slower split (`gemm_tail_probe`, its plain epilogue).
     pub fn plan_price(&self, planner: &Planner, cfg: &GemmCfg, plan: &TailPlan) -> Option<f64> {
         if !(self.k / cfg.tile[2]).is_multiple_of(plan.split) {
             return None;
         }
         let regs = planner.claim_of(self, &GemmCfg { tail: None, ..*cfg }).ok()?.regs;
-        let price =
-            |tiles, split| self.claim_part(planner, cfg, regs, Part { tiles, split }).ok().map(|c| planner.price(&c));
-        let waves = match plan.waves {
-            Some(run) => price(run.count(), 1)?,
-            None => 0.0,
+        let claim = |tiles, split| self.claim_part(planner, cfg, regs, Part { tiles, split }).ok();
+        // A data-parallel run's price and the share of it its epilogue's operations make.
+        let priced = |c: Claim| {
+            let price = planner.price(&c);
+            (price, price - planner.price(&Claim { ops: Ops::default(), ..c }))
         };
+        let (_, epilogue) = priced(claim(self.tiles(cfg), 1)?);
+        let (waves, waves_epilogue) = match plan.waves {
+            Some(run) => priced(claim(run.count(), 1)?),
+            None => (0.0, 0.0),
+        };
+        let tail = planner.price(&claim(plan.tail.count(), plan.split)?);
         let launches = usize::from(plan.waves.is_some()) + 2;
-        Some(waves + price(plan.tail.count(), plan.split)? + (launches - 1) as f64 * LAUNCH)
+        Some(waves + tail + epilogue - waves_epilogue + (launches - 1) as f64 * LAUNCH)
     }
 
     /// The tail splits worth pricing `cfg` at on this problem: the counts up

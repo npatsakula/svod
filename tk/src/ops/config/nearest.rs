@@ -494,6 +494,7 @@ impl NearestProblem {
             fill: Stream { bytes: tile as f64, unique, shared, ..Stream::default() },
             side: Stream::default(),
             stores,
+            out: 0.0,
             ring: stages,
             unroll: cfg.unroll(),
             waits,

@@ -857,7 +857,8 @@ fn a_tail_split_matches_the_interpreter(wave: usize) {
 /// against its price of the data-parallel one, the planner's pick marked.
 /// Each split is the model's cheapest of the counts dividing the trips.
 /// Two passes in opposite orders, each plan's best kept. Prints and never
-/// asserts.
+/// asserts; its rows are replayed against the model on the host
+/// (`tail::the_model_orders_the_probed_plans_as_the_device_did`).
 #[test]
 #[ignore = "perf probe: needs a GPU"]
 fn gemm_tail_probe() {

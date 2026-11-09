@@ -337,6 +337,47 @@ pub(crate) fn gfx1201_costs() -> Costs {
     costs
 }
 
+/// gfx942's costs (MI300X, 304 CUs) as its tune store held them for
+/// v0.3.0 (`probe::stored`, format 10), the store the tail probe ran
+/// against: its L2 and Infinity Cache answering past half of 32 MB.
+pub(crate) fn gfx942_costs() -> Costs {
+    let rungs = [
+        (1 << 20, 15564.0),
+        (2 << 20, 16531.0),
+        (4 << 20, 15362.0),
+        (8 << 20, 35924.0),
+        (16 << 20, 45696.0),
+        (32 << 20, 47907.0),
+    ]
+    .map(|(f, fs)| (f, fs * 1e-6));
+    let mut costs = Costs {
+        smem_byte: 0.003769,
+        global_byte: 0.091913,
+        scatter: 4.549599,
+        step: 2.700043,
+        step_group: 0.0,
+        step_wide: 2.994041,
+        step_i8: 0.996552,
+        step_lone: 11.875,
+        step_lone_i8: 5.449219,
+        score: 0.277415,
+        trip: 14.852905,
+        trip_rolled: 14.172974,
+        trip_one: 15.253296,
+        trip_lone: 151.806641,
+        trip_one_lone: 183.876953,
+        lane_move: 0.115783,
+        smem_trip: 0.163875,
+        latency: 396.353078,
+        latency_one: 0.0,
+        l2_byte: 0.0,
+        l2_bytes: 0.0,
+        ladder: [(0, 0.0); crate::atoms::LADDER],
+    };
+    set_ladder(&mut costs, &rungs);
+    costs
+}
+
 /// A cost set's cache views from its ladder rungs, as measuring them would
 /// have left them.
 fn set_ladder(costs: &mut Costs, rungs: &[(usize, f64)]) {

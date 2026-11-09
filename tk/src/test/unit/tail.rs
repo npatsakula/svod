@@ -9,6 +9,8 @@ use proptest::prelude::*;
 use svod_dtype::ScalarDType;
 use test_case::test_case;
 
+use super::{costs, gfx942_costs, gfx1201_costs, sm86_costs};
+use crate::atoms::{Costs, Device};
 use crate::atoms::{Target, sm86};
 use crate::build::*;
 use crate::interp::{round_to, run};
@@ -17,7 +19,7 @@ use crate::kernels::gemm::{
     Epilogue, GemmCfg, GemmSpec, Run, Scale, TailPlan, TailSpec, TailSplit, TileOrder, Tiles, gemm, gemm_tail,
 };
 use crate::kernels::{Act, Batch};
-use crate::ops::config::{GemmProblem, Planner, TAIL_SPLITS, Tiled, gemm_cfg};
+use crate::ops::config::{GemmProblem, LAUNCH, Planner, TAIL_SPLITS, Tiled, gemm_cfg};
 use crate::sweep::{assumed, planner};
 
 /// The walk index each tile of a `gm × gn` grid takes under `run` of a
@@ -307,17 +309,158 @@ fn a_split_the_problem_cannot_run_is_refused() {
 }
 
 /// Where a split leads, the tuner times the unsplit config beside it: the
-/// split's model was never fitted to a measured time, and on small shapes
-/// it ranks a whole split-K far ahead (37×96×48 on sm_86 is one tile).
-#[test_case(sm86(), [37, 96, 48]; "one tile on sm_86")]
-#[test_case(sm86(), [704, 512, 512]; "a partial wave on sm_86")]
-#[test_case(Target::card("mi300x").expect("a card"), [128, 4096, 1024]; "a short wide gemm on mi300x")]
-#[test_case(Target::card("mi300x").expect("a card"), [8192, 4096, 4096]; "a partial last wave on mi300x")]
-fn a_leading_split_has_an_unsplit_twin(target: Target, [m, n, k]: [usize; 3]) {
-    let planner = planner(target);
+/// split's model is fitted to a few probed shapes only. Under the guessed
+/// costs and under the cards' measured ones: on sm_86 4096³ splits a tail
+/// of eight tiles of 512 (the device ran it 2.3 % faster), on MI300X
+/// 6144×4096×8192 a tail of its last partial wave (19 % faster at 256²).
+#[test_case(Target::card("mi300x").expect("a card"), costs(), [128, 4096, 1024]; "a short wide gemm on mi300x")]
+#[test_case(Target::card("mi300x").expect("a card"), costs(), [8192, 4096, 4096]; "a partial last wave on mi300x")]
+#[test_case(sm86(), sm86_costs(), [4096, 4096, 4096]; "a short tail on a measured sm_86")]
+#[test_case(Target::card("mi300x").expect("a card"), gfx942_costs(), [6144, 4096, 8192]; "a measured mi300x")]
+fn a_leading_split_has_an_unsplit_twin(target: Target, costs: Costs, [m, n, k]: [usize; 3]) {
+    let planner = Planner::new(Device { target, costs }).expect("an SM count");
     let ranked = planner.gemm_ranked(1, m, n, k, false);
     let lead = ranked[0];
     assert!(lead.tail.is_some(), "{lead:?} leads unsplit");
     let twins = lead.twins(&ranked);
     assert!(twins.iter().any(|c| c.tail.is_none()), "{lead:?} has no unsplit twin in {twins:?}");
+}
+
+/// A row of `gemm_tail_probe`: a shape at the config the planner led with
+/// on the card (its tile, ring, warps and raster), and the device µs of its
+/// data-parallel run, of a whole split-K and of a tail split, each at the
+/// count the model priced cheapest then (each plan's kernels' times summed,
+/// best of two passes in opposite orders, the plain epilogue). A tail
+/// split of a grid under a wave is the whole split-K, timed once.
+struct Probed {
+    shape: [usize; 3],
+    cfg: GemmCfg,
+    dp: f64,
+    whole: (usize, f64),
+    tail: Option<(usize, f64)>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn probed(
+    shape: [usize; 3],
+    tile: [usize; 3],
+    stages: usize,
+    warps: [u32; 2],
+    rows: usize,
+    dp: f64,
+    whole: (usize, f64),
+    tail: Option<(usize, f64)>,
+) -> Probed {
+    let order = TileOrder::grouped(rows).expect("a group of rows");
+    Probed { shape, cfg: GemmCfg { order, ..gemm_cfg(tile, stages, warps, false) }, dp, whole, tail }
+}
+
+/// MI300X (304 CUs), 2026-11-09, under [`gfx942_costs`]' store.
+fn mi300x_probed() -> Vec<Probed> {
+    let probed = |shape, rows, dp, whole, tail| probed(shape, [256, 256, 64], 1, [4, 4], rows, dp, whole, tail);
+    vec![
+        probed([8192, 4096, 4096], 8, 443.0, (4, 710.8), Some((4, 520.0))),
+        probed([4096, 4096, 4096], 8, 218.3, (2, 276.2), None),
+        probed([8192, 8192, 1024], 16, 340.9, (2, 578.0), Some((2, 361.3))),
+        probed([6144, 4096, 8192], 8, 1004.3, (2, 834.7), Some((8, 809.7))),
+        probed([4096, 8192, 4096], 16, 475.8, (4, 737.2), Some((4, 553.0))),
+        probed([12288, 4096, 4096], 1, 677.4, (4, 1111.4), Some((4, 721.4))),
+        probed([8192, 6144, 2048], 8, 439.1, (2, 623.2), Some((2, 490.0))),
+        probed([3072, 4096, 4096], 8, 217.6, (4, 292.0), None),
+    ]
+}
+
+/// RTX 3060 (28 SMs), 2026-11-09.
+fn sm86_probed() -> Vec<Probed> {
+    let probed = |shape, tile, rows, dp, whole, tail| probed(shape, tile, 2, [4, 4], rows, dp, whole, tail);
+    let (tall, wide) = ([256, 128, 64], [128, 256, 64]);
+    vec![
+        probed([8192, 4096, 4096], tall, 4, 12013.6, (2, 13061.1), Some((8, 11973.9))),
+        probed([4096, 4096, 4096], tall, 4, 6166.2, (2, 6518.4), Some((8, 6022.4))),
+        probed([8192, 8192, 1024], wide, 16, 6239.2, (2, 8582.1), Some((4, 6259.3))),
+        probed([6144, 4096, 8192], tall, 4, 18471.9, (2, 18430.9), Some((2, 18251.7))),
+    ]
+}
+
+/// RX 9070 XT (64 CUs), 2026-11-09: every grid whole waves, no tail.
+fn gfx1201_probed() -> Vec<Probed> {
+    let probed = |shape, rows, dp, whole| probed(shape, [256, 256, 64], 1, [4, 4], rows, dp, whole, None);
+    vec![
+        probed([8192, 4096, 4096], 8, 2535.4, (2, 3861.4)),
+        probed([4096, 4096, 4096], 8, 1238.0, (2, 1909.9)),
+        probed([8192, 8192, 1024], 8, 1208.7, (2, 4268.8)),
+        probed([6144, 4096, 8192], 1, 4976.8, (2, 5588.1)),
+    ]
+}
+
+/// Measurement: plans whose device times are this close are a tie the
+/// probe does not resolve (its two passes drift by as much).
+const TIE: f64 = 1.01;
+
+/// The model orders a probed shape's plans — data-parallel, a whole
+/// split-K, a tail split, each at its probed count — as the device did,
+/// every pair the device told apart past [`TIE`], under the ranking's
+/// representative epilogue and under none (the probe's plain store). Each
+/// plan is priced as the probe timed it, its kernels' alone, without the
+/// [`LAUNCH`]es between them.
+#[test_case(Target::card("mi300x").expect("a card"), gfx942_costs(), mi300x_probed(); "mi300x")]
+#[test_case(sm86(), sm86_costs(), sm86_probed(); "sm_86")]
+#[test_case(Target::card("rx9070xt").expect("a card"), gfx1201_costs(), gfx1201_probed(); "gfx1201")]
+fn the_model_orders_the_probed_plans_as_the_device_did(target: Target, costs: Costs, rows: Vec<Probed>) {
+    for epilogue in [1.0, 0.0] {
+        let mut planner = Planner::new(Device { target: target.clone(), costs }).expect("an SM count");
+        planner.weights.epilogue = epilogue;
+        for Probed { shape: [m, n, k], cfg, dp, whole, tail } in &rows {
+            let p = GemmProblem { batches: 1, m: *m, n: *n, k: *k, halves: 1, rope: None };
+            let (tiles, wave) =
+                (m.div_ceil(cfg.tile[0]) * n.div_ceil(cfg.tile[1]), p.wave(&planner, cfg).expect("a wave"));
+            let kernels = |plan: TailPlan| {
+                let launches = usize::from(plan.waves.is_some()) + 2;
+                p.plan_price(&planner, cfg, &plan).expect("priced") - (launches - 1) as f64 * LAUNCH
+            };
+            let mut plans = vec![("data-parallel", *dp, p.admit(&planner, cfg).expect("admitted").0)];
+            plans.push(("whole split-K", whole.1, kernels(TailPlan::whole(tiles, whole.0).expect("a plan"))));
+            if let Some((split, us)) = *tail {
+                let plan = TailPlan::new(tiles, wave, TailSplit::new(split).expect("a split")).expect("a tail");
+                assert!(plan.waves.is_some(), "{m}x{n}x{k}: {plan:?} runs no whole wave");
+                plans.push(("tail split", us, kernels(plan)));
+            }
+            let text: Vec<String> =
+                plans.iter().map(|(what, us, ns)| format!("{what} {:.3}/{:.3}", us / dp, ns / plans[0].2)).collect();
+            for (i, a) in plans.iter().enumerate() {
+                for b in &plans[i + 1..] {
+                    if a.1.max(b.1) <= a.1.min(b.1) * TIE {
+                        continue;
+                    }
+                    assert_eq!(
+                        a.1 < b.1,
+                        a.2 < b.2,
+                        "{m}x{n}x{k}, epilogue x{epilogue}: {} and {} (device/model x data-parallel: {text:?})",
+                        a.0,
+                        b.0
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Where the device ran a probed shape's tile faster data-parallel than
+/// with its tail split (MI300X at 256² on all but 6144×4096×8192), the
+/// planner ranks that pipeline unsplit ahead of every split of it; where
+/// the split ran faster past [`TIE`], split.
+#[test_case(Target::card("mi300x").expect("a card"), gfx942_costs(), mi300x_probed(); "mi300x")]
+#[test_case(sm86(), sm86_costs(), sm86_probed(); "sm_86")]
+fn the_planner_splits_a_probed_tile_where_the_device_did(target: Target, costs: Costs, rows: Vec<Probed>) {
+    let planner = Planner::new(Device { target, costs }).expect("an SM count");
+    for Probed { shape: [m, n, k], cfg, dp, tail, .. } in &rows {
+        let Some((_, us)) = *tail else { continue };
+        if us.max(*dp) <= us.min(*dp) * TIE {
+            continue;
+        }
+        let ranked = planner.gemm_ranked(1, *m, *n, *k, false);
+        let pipeline = |c: &&GemmCfg| GemmCfg { order: cfg.order, tail: None, ..**c } == *cfg;
+        let first = ranked.iter().find(pipeline).unwrap_or_else(|| panic!("{m}x{n}x{k}: {cfg:?} unranked"));
+        assert_eq!(first.tail.is_some(), us < *dp, "{m}x{n}x{k}: {first:?} leads its pipeline");
+    }
 }

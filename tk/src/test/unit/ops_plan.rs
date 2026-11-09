@@ -232,6 +232,7 @@ impl Planner {
             fill: config::Stream { bytes: fill / costs.global_byte, ..config::Stream::default() },
             side: config::Stream::default(),
             stores: 0.0,
+            out: 0.0,
             ring: g.stages,
             unroll: false,
             waits: 0.0,

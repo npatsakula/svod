@@ -313,6 +313,12 @@ pub(crate) struct Claim {
     /// The bytes a trip writes straight to DRAM (a score matrix's stores),
     /// priced at the global rate whatever the cache holds.
     pub stores: f64,
+    /// The bytes a block writes once its trips are done (a GEMM's output
+    /// tile, a split's f32 slot), straight to DRAM at the global rate after
+    /// its last trip: no trip of the block is left to hide the store
+    /// behind, and the SM's blocks store theirs one after another
+    /// ([`Planner::price`]).
+    pub out: f64,
     /// The ring's depth and unrolling: its trip overhead and how far its
     /// prefetch runs.
     pub ring: usize,
@@ -336,12 +342,14 @@ pub(crate) const FLOOR: f64 = 2.0;
 impl Claim {
     /// The bytes the kernel must move at least once: every distinct byte of
     /// its streams — the ring's and the side's alike — its straight-to-DRAM
-    /// stores and its whole-problem sections' — the work no config of the
-    /// problem can skip, whatever it caches or overlaps.
+    /// stores, its blocks' outputs and its whole-problem sections' — the
+    /// work no config of the problem can skip, whatever it caches or
+    /// overlaps.
     pub(crate) fn distinct(&self) -> f64 {
         self.fill.unique
             + self.side.unique
             + self.stores * self.trips as f64 * self.blocks as f64
+            + self.out * self.blocks as f64
             + self.sections.iter().map(|s| s.bytes * s.rows).sum::<f64>()
     }
 }
@@ -536,7 +544,14 @@ impl Planner {
     /// round of every trip pays the memory latency the ring cannot hide (it
     /// prefetches `stages - 1` trips ahead; a one-slot `cp.async` ring none,
     /// [`crate::atoms::Costs::latency_one`]) on top of its issue: measured on
-    /// both, the latency adds rather than hides under the issue.
+    /// both, the latency adds rather than hides under the issue. The
+    /// busiest SM's blocks' output stores ([`Claim::out`]) add after their
+    /// trips, not under the fill: measured on MI300X (`gemm_tail_probe`, a
+    /// block alone on its CU, its plain epilogue), 8192×4096×4096 ran 1.174×
+    /// its data-parallel time with its tail split four ways and 1.605× split
+    /// whole, which the model prices 1.156× and 1.515× with a split's f32
+    /// slots stored after its trips and 1.079× and 1.334× with them under
+    /// its fill.
     pub(crate) fn price(&self, claim: &Claim) -> f64 {
         let Device { target, costs } = &self.device;
         let hide = match claim.steps {
@@ -601,7 +616,8 @@ impl Planner {
             let bytes = s.bytes * costs.global_byte;
             (s.rows * work.max(bytes) / self.sms() as f64).max(s.waits * costs.latency)
         };
-        run + claim.waits * costs.latency + claim.sections.iter().map(section).sum::<f64>()
+        let out = per_sm as f64 * claim.out * costs.global_byte;
+        run + out + claim.waits * costs.latency + claim.sections.iter().map(section).sum::<f64>()
     }
 
     /// The blocks of `waves` waves an SM holds at once, each holding `smem`
