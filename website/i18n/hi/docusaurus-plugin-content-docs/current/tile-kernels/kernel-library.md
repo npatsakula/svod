@@ -41,9 +41,9 @@ runtime variable की live गिनती launch करता है, buffers
 गुणज होना ज़रूरी है। `core: Core::Group` products को `wgmma` (sm_90) पर issue करता है; `schedule: Schedule::ping_pong(k)` दोनों
 warp rows को एक slot पर ping-pong में चलाता है (CDNA)। Blocks output tiles पर `order` tile rows
 (`gemm::TileOrder`, default 8; एक row यानी row-major, grid की सभी rows यानी column-major) के समूहों
-में चलते हैं, ताकि एक साथ resident blocks वही B tiles पढ़ें। Planner हर config को हर group height पर
-cache ladder से price करता है (flight में shared B tiles बनाम वह working set जिससे group की A rows
-लौटती हैं) और सबसे सस्ता रखता है; अगर वह default नहीं है, तो tuner default को भी साथ में time करता है।
+में चलते हैं, ताकि एक साथ resident blocks वही B tiles पढ़ें। Planner हर config को default पर plan करता
+है, जो MI300X, sm_86 और gfx1201 पर मापने में सबसे तेज़ या सबसे तेज़ से कुछ प्रतिशत के भीतर रहा; कोई
+config दूसरी group height भी रख सकता है (उसके code का `g` field)।
 
 कोई tile table नहीं है। `config::Planner::gemm_ranked` tiles, `bk`, warp grids, ring depths और
 unrolling गिनता है, वही रखता है जिसे lowering target पर चलाती है (atoms warp grid को tile करते हैं,

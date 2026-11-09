@@ -42,10 +42,9 @@ past `m` and columns past `n` are bounded views, so `m` and `n` are free. `k` mu
 of `bk`. `core: Core::Group` issues the products on `wgmma` (sm_90); `schedule: Schedule::ping_pong(k)` runs the two
 warp rows in ping-pong over one slot (CDNA). The blocks walk the output tiles in groups of
 `order` tile rows (`gemm::TileOrder`, 8 by default; one row is row-major, the grid's rows
-column-major), so blocks resident together read the same B tiles. The planner prices each
-config at every group height by the cache ladder (B tiles shared in flight against the working
-set a group's A rows return through) and keeps the cheapest; where that is not the default,
-the tuner times the default beside it.
+column-major), so blocks resident together read the same B tiles. The planner plans every
+config at the default, which measured best or within a few percent of the best on MI300X,
+sm_86 and gfx1201; a config may carry another group height (the `g` field of its code).
 
 The rotation reads each element's partner half a head along through a column `flip`. When a
 warp's columns hold whole heads, a lane holds both halves, and the flip is a register

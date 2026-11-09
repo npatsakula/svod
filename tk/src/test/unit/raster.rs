@@ -1,24 +1,20 @@
 //! The GEMM raster ([`TileOrder`]): every block takes a distinct tile and
 //! every tile is taken, whatever the group height over ragged grids; a GEMM
-//! walking any raster computes its product; the planner walks each config
-//! at the raster the model prices cheapest, the default where nothing
-//! prices the cache, and offers the default beside a departure as one twin
-//! of the tile.
-
-use std::collections::HashMap;
+//! walking any raster computes its product; the planner plans every config
+//! at the default raster, whatever the cache.
 
 use proptest::prelude::*;
 use svod_dtype::ScalarDType;
 use test_case::test_case;
 
-use super::{gfx1201_costs, planner, sm86_costs};
+use super::{costs, gfx1201_costs, sm86_costs};
 use crate::atoms::{Costs, Device, Target, sm86};
 use crate::build::*;
 use crate::interp::{round_to, run};
 use crate::ir::Shape;
 use crate::kernels::Batch;
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, TileOrder, gemm};
-use crate::ops::config::{GemmProblem, Planner, Tiled, gemm_cfg};
+use crate::ops::config::{Planner, Tiled, gemm_cfg};
 use crate::sweep::{assumed, geom};
 
 /// The launch index (grid x fastest) of the block that takes each tile of a
@@ -120,86 +116,20 @@ fn rx9070xt() -> Target {
     Target::card("rx9070xt").expect("a listed card")
 }
 
-/// Without a cache ladder every raster prices the same: every config of
-/// every ranking walks the default, and none is offered twice.
-#[test_case(4096, 4096, 4096)]
-#[test_case(4096, 1024, 4096)]
-#[test_case(8192, 8192, 1024)]
-fn without_a_cache_ladder_every_config_walks_the_default(m: usize, n: usize, k: usize) {
-    for target in [sm86(), rx9070xt()] {
-        let ranked = planner(target).gemm_ranked(1, m, n, k, false);
-        assert!(ranked.iter().all(|c| c.order == TileOrder::DEFAULT), "{m}x{n}x{k}: a raster off the default");
-    }
-}
-
-/// Under a measured ladder each config walks the raster the model prices
-/// cheapest among the group heights the planner tries (one row to the
-/// grid's rows, powers of two between), the default on a tie; a pipeline
-/// is ranked at a second raster only as the default beside a departure the
-/// model is unsure of, that one pipeline a tile, and it is the tile's twin.
+/// The planner keeps groups of eight tile rows for every config of every
+/// ranking, unsplit or split, without a cache ladder and under a card's
+/// measured one, on the shapes where the model of a raster once departed
+/// from it (a weight of eight 128-column tiles on sm_86, a 16384² product
+/// on gfx1201).
+#[test_case(sm86(), costs(), 4096, 4096, 4096; "sm_86 without a ladder")]
+#[test_case(rx9070xt(), costs(), 8192, 8192, 1024; "gfx1201 without a ladder")]
 #[test_case(sm86(), sm86_costs(), 4096, 1024, 4096; "sm_86 a narrow weight")]
 #[test_case(sm86(), sm86_costs(), 8192, 8192, 1024; "sm_86 a shallow product")]
 #[test_case(rx9070xt(), gfx1201_costs(), 16384, 16384, 4096; "gfx1201 a large square")]
-fn each_config_walks_the_raster_priced_cheapest(target: Target, costs: Costs, m: usize, n: usize, k: usize) {
-    let planner = measured(target, costs);
-    let p = GemmProblem { batches: 1, m, n, k, halves: 1, rope: None };
-    let ranked = planner.gemm_ranked(1, m, n, k, false);
-    let price = |cfg: &GemmCfg| p.admit(&planner, cfg).expect("an admitted config").0;
-    let mut pipelines: HashMap<GemmCfg, Vec<TileOrder>> = HashMap::new();
-    for c in ranked.iter() {
-        pipelines.entry(GemmCfg { order: TileOrder::DEFAULT, ..*c }).or_default().push(c.order);
-    }
-    let mut doubled: HashMap<GemmCfg, usize> = HashMap::new();
-    for (pipeline, orders) in &pipelines {
-        let gm = m.div_ceil(pipeline.tile[0]);
-        let planned = GemmCfg { order: orders[0], ..*pipeline };
-        let heights = (0..).map(|b| 1 << b).take_while(|&g| g < gm).chain([gm]);
-        for order in heights.filter_map(TileOrder::grouped) {
-            let other = GemmCfg { order, ..*pipeline };
-            assert!(price(&planned) <= price(&other), "{planned:?} walks a raster dearer than {order:?}");
-        }
-        match orders[..] {
-            [_] => {}
-            [planned, alternative] => {
-                assert!(planned != TileOrder::DEFAULT && alternative == TileOrder::DEFAULT, "{pipeline:?}: {orders:?}");
-                *doubled.entry(pipeline.tile()).or_default() += 1;
-                let twins = GemmCfg { order: planned, ..*pipeline }.twins(&ranked);
-                assert!(twins.contains(pipeline), "{pipeline:?}: the default is no twin of its departure");
-            }
-            _ => panic!("{pipeline:?} ranked at {orders:?}"),
-        }
-    }
-    assert!(doubled.values().all(|&n| n == 1), "a tile offered the default twice: {doubled:?}");
-}
-
-/// Where the model says so the planner leaves the default: on sm_86 a
-/// weight of eight 128-column tiles is walked row-major (the blocks in
-/// flight span whole rows of it, every B tile shared), and on gfx1201 a
-/// 16384² product in groups taller than eight (its 64 CUs in flight),
-/// unsplit or with a split tail ([`crate::kernels::gemm::TailSplit`]).
-/// Each unsplit departure that leads its tile is within the tuner's
-/// resolution of the default, which is offered beside it; one behind a
-/// split lead of its tile is that lead's alternative.
-#[test_case(sm86(), sm86_costs(), 4096, 1024, 4096, |rows| rows == 1; "sm_86 row-major")]
-#[test_case(rx9070xt(), gfx1201_costs(), 16384, 16384, 4096, |rows| rows > 8; "gfx1201 taller groups")]
-fn the_planner_leaves_the_default_where_the_model_says_so(
-    target: Target,
-    costs: Costs,
-    m: usize,
-    n: usize,
-    k: usize,
-    want: fn(usize) -> bool,
-) {
+fn the_planner_keeps_the_default_raster(target: Target, costs: Costs, m: usize, n: usize, k: usize) {
     let ranked = measured(target, costs).gemm_ranked(1, m, n, k, false);
-    let lead = ranked[0];
-    assert!(want(lead.order.rows()), "{lead:?}");
-    let unsplit = *ranked.iter().find(|c| c.tail.is_none()).expect("an unsplit config");
-    assert!(want(unsplit.order.rows()), "{unsplit:?}");
-    let tile_lead = ranked.iter().find(|c| c.tile() == unsplit.tile()).expect("its tile");
-    if tile_lead.tail.is_none() {
-        let default = GemmCfg { order: TileOrder::DEFAULT, ..unsplit };
-        assert!(unsplit.twins(&ranked).contains(&default), "{unsplit:?}: no default twin");
-    }
+    assert!(!ranked.is_empty());
+    assert!(ranked.iter().all(|c| c.order == TileOrder::DEFAULT), "{m}x{n}x{k}: a raster off the default");
 }
 
 /// A convolution walks the default raster: its claim prices its re-reads by

@@ -294,18 +294,6 @@ impl GemmProblem {
         }
     }
 
-    /// The rasters the planner prices `cfg` at on this problem: the
-    /// default, then groups of one tile row, two, four, … below the grid's
-    /// rows and the grid's rows whole (column-major), each a group height
-    /// the default does not already walk.
-    fn orders(&self, cfg: &GemmCfg) -> impl Iterator<Item = TileOrder> {
-        let gm = self.grid(cfg).0;
-        let default = TileOrder::DEFAULT.group(gm);
-        let heights = (0..usize::BITS).map(|b| 1usize << b).take_while(move |&g| g < gm).chain([gm]);
-        let others = heights.filter(move |&g| g != default).filter_map(TileOrder::grouped);
-        std::iter::once(TileOrder::DEFAULT).chain(others)
-    }
-
     /// The share of the tiles' area past `m × n`.
     pub(super) fn padding(&self, cfg: &GemmCfg) -> f64 {
         let [bm, bn, _] = cfg.tile;
@@ -564,7 +552,7 @@ impl GemmProblem {
         let planned: Vec<_> = feasible.iter().filter_map(|f| self.planned(planner, f)).collect();
         let mut admitted: Vec<(f64, u32, GemmCfg)> = planned.iter().map(|(best, _)| *best).collect();
         // One alternative a tile: its cheapest pipeline's, where the model
-        // walks it otherwise unsure ([`Self::planned`]).
+        // is unsure of its split ([`Self::planned`]).
         let mut order: Vec<usize> = (0..planned.len()).collect();
         order.sort_by(|&a, &b| planned[a].0.0.total_cmp(&planned[b].0.0));
         let mut tiles = std::collections::HashSet::new();
@@ -586,28 +574,22 @@ impl GemmProblem {
         spread(ranked.into_iter().map(|(cost, _, c)| (cost, c)).collect(), |c| [c.tile[0], c.tile[1]])
     }
 
-    /// A feasible config at the raster and tail split the model prices
-    /// cheapest on this problem ([`Self::orders`], the default on a tie;
-    /// [`Self::tails`] at each, every tile data-parallel on a tie),
+    /// A feasible config at the tail split the model prices cheapest on
+    /// this problem ([`Self::tails`], every tile data-parallel on a tie),
     /// its cost and registers, and one alternative beside it where the
-    /// model is unsure of a departure; `None` where the shape leaves it out.
+    /// model is unsure; `None` where the shape leaves it out. Every config
+    /// walks the default raster ([`TileOrder::DEFAULT`]): measured on
+    /// MI300X, sm_86 and gfx1201, groups of eight tile rows ran the tuner's
+    /// configs best or within 1–3 % of the best, where the fill's model
+    /// prices the other heights too flat to tell them apart.
     ///
-    /// The raster moves only the fill's price: without a cache ladder every
-    /// raster prices the same and the default stands. The model weighs the
-    /// blocks in flight sharing B columns (a taller group) against the reach
-    /// of the re-reads ([`Self::stream`]): a group whose A panels and the
-    /// window's B panels outgrow the cache sends them back to DRAM between
-    /// columns. A tail split weighs the last wave's idle SMs against its
-    /// partials' bytes, their merge and its launches ([`Self::plan_price`]).
-    ///
-    /// Unsure: where a split leads, always (no split was ever timed against
-    /// its model); else the other side priced within [`SETTLED`] of the
-    /// pick, a gap the tuner's own rounds do not resolve either. Neither
-    /// term is fitted to a measured time, while every store so far timed
-    /// the default raster unsplit, so there the tuner times the other side
-    /// too (one pipeline a tile, as a twin of the tile: [`Tiled::twins`]):
-    /// the cheapest unsplit config where a split one leads, and where an
-    /// unsplit one leads the default raster before the cheapest split.
+    /// A tail split weighs the last wave's idle SMs against its partials'
+    /// bytes, their merge and its launches ([`Self::plan_price`]). Unsure:
+    /// where a split leads, always (the tuner times the cheapest unsplit
+    /// config of its tile beside it), and where an unsplit one leads, the
+    /// cheapest split priced within [`SETTLED`] of it, a gap the tuner's own
+    /// rounds do not resolve either (one pipeline a tile, as a twin of the
+    /// tile: [`Tiled::twins`]).
     #[allow(clippy::type_complexity)]
     fn planned(
         &self,
@@ -618,18 +600,12 @@ impl GemmProblem {
             planner.price_of(self, &Feasible { cfg, regs: f.regs }).map(|(cost, regs)| (cost, regs, cfg))
         };
         let cheaper = |a: (f64, u32, GemmCfg), b: (f64, u32, GemmCfg)| if b.0 < a.0 { b } else { a };
-        let default = GemmCfg { order: TileOrder::DEFAULT, ..f.cfg };
-        let ladder = planner.device.costs.l2_bytes > 0.0;
-        let others = self.orders(&f.cfg).skip(1).filter(|_| ladder).map(|order| GemmCfg { order, ..f.cfg });
-        let rasters: Vec<GemmCfg> = std::iter::once(default).chain(others).collect();
-        let first = price(default)?;
-        let best = rasters[1..].iter().filter_map(|&c| price(c)).fold(first, cheaper);
-        let raster = (best.2.order != TileOrder::DEFAULT && first.0 <= best.0 * SETTLED).then_some(first);
-        let tails = rasters.iter().flat_map(|&c| self.tails(&c).map(move |tail| GemmCfg { tail: Some(tail), ..c }));
-        let Some(split) = tails.filter_map(price).reduce(cheaper) else { return Some((best, raster)) };
-        Some(match split.0 < best.0 {
-            true => (split, Some(best)),
-            false => (best, raster.or((split.0 <= best.0 * SETTLED).then_some(split))),
+        let unsplit = price(f.cfg)?;
+        let tails = self.tails(&f.cfg).map(|tail| GemmCfg { tail: Some(tail), ..f.cfg });
+        let Some(split) = tails.filter_map(price).reduce(cheaper) else { return Some((unsplit, None)) };
+        Some(match split.0 < unsplit.0 {
+            true => (split, Some(unsplit)),
+            false => (unsplit, (split.0 <= unsplit.0 * SETTLED).then_some(split)),
         })
     }
 }

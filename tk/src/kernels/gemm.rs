@@ -102,7 +102,8 @@ pub struct GemmCfg {
     /// The ring: one crew over `depth` slots, or the two warp rows as crews
     /// a cluster apart over one slot, the operands k-sliced a product deep.
     pub schedule: Schedule,
-    /// The raster the blocks walk the output tiles in.
+    /// The raster the blocks walk the output tiles in: the planner plans
+    /// [`TileOrder::DEFAULT`], a config may carry another.
     pub order: TileOrder,
     /// The last, partial wave of tiles split along K ([`TailPlan`]); every
     /// tile data-parallel where `None`.
@@ -157,8 +158,8 @@ pub struct TileOrder {
 }
 
 impl TileOrder {
-    /// Groups of eight tile rows: every kernel's raster before the planner
-    /// chose one, the one the nearest kernels walk.
+    /// Groups of eight tile rows: the raster every planned GEMM and every
+    /// nearest kernel walks; another is a config's own (a hand-made code's).
     pub const DEFAULT: Self = Self::new(NonZeroUsize::new(8).unwrap());
 
     /// The tallest group, a column-major walk of any grid of fewer tile
