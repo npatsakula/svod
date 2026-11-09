@@ -4,7 +4,7 @@
 //! replayed through it reads the keys the op layer writes and follows its
 //! admission, choice and pipeline stages to the config they name.
 
-use crate::kernels::Admitted;
+use crate::sweep::assumed;
 use std::path::{Path, PathBuf};
 
 use super::Scratch;
@@ -101,7 +101,7 @@ fn a_replay_writes_nothing() {
         k: 256,
         batch: Batch::Static(1),
         epilogue: Epilogue::DEFAULT,
-        cfg: Admitted::assume(ranked[0]),
+        cfg: assumed(ranked[0]),
     };
     let store = TuneStore::replay(dir.to_path_buf());
     tuned::linear(&store, &planner, DType::BFloat16, &ranked, spec);
@@ -127,7 +127,7 @@ fn a_gemm_tuning_reads_the_key_the_op_layer_writes(probe: bool) {
         k: 512,
         batch: Batch::Static(1),
         epilogue: Epilogue::DEFAULT,
-        cfg: Admitted::assume(ranked[0]),
+        cfg: assumed(ranked[0]),
     };
     let dir = Scratch::new(&format!("replay-key-{probe}"));
     let store = TuneStore::replay(dir.to_path_buf());
@@ -180,14 +180,7 @@ fn admitted_and_chosen(dir: &Path) -> (Planner, Arc<[GemmCfg]>, Vec<GemmCfg>) {
 }
 
 fn spec(cfg: GemmCfg) -> GemmSpec<'static> {
-    GemmSpec {
-        m: 512,
-        n: 512,
-        k: 512,
-        batch: Batch::Static(1),
-        epilogue: Epilogue::DEFAULT,
-        cfg: Admitted::assume(cfg),
-    }
+    GemmSpec { m: 512, n: 512, k: 512, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg: assumed(cfg) }
 }
 
 /// A replayed tuning follows the stored stages: the admitted indices name

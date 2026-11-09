@@ -28,11 +28,9 @@ pub mod lower;
 pub mod ops;
 pub mod oracle;
 pub mod probe;
-#[cfg(any(test, feature = "sweep"))]
 pub mod rank;
 pub mod schedule;
 #[doc(hidden)]
-#[cfg(any(test, feature = "sweep"))]
 pub mod sweep;
 pub mod tune;
 

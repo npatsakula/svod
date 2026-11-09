@@ -17,7 +17,6 @@ use crate::atoms::{Core, Fill, Target};
 use crate::build::{BF16, F16};
 use crate::interp;
 use crate::ir::{Axis, ParamKind, Program, Schedule};
-use crate::kernels::Admitted;
 use crate::kernels::Batch;
 use crate::kernels::attention::{AttnMask, AttnSpec, Bias, CombineSpec, Forms, attention, combine};
 use crate::kernels::conv::ConvSpec;
@@ -28,6 +27,7 @@ use crate::launch::{self, aliasing, graph_launch_all};
 use crate::lower::sync::insert_barriers;
 use crate::lower::{Lowering, lower};
 use crate::ops::config::{self, NearestProblem, Planner};
+use crate::sweep::assumed;
 
 use super::{conv_first_eight, declared, first_eight, planner};
 use crate::sweep::device;
@@ -105,7 +105,7 @@ fn a_grid_takes_every_warp_or_whole_grids_run_alone(
             cache: None,
             packed: false,
             scale: 0.125,
-            cfg: Admitted::assume(cfg),
+            cfg: assumed(cfg),
         })
     } else {
         combine::<F16>(&CombineSpec { batch, t: 1, heads: 4, d: 64, splits: 2, cfg: NormCfg { br: warps as usize } })
@@ -171,7 +171,7 @@ fn every_group_attention_assembles_for_hopper() {
             cache: None,
             packed: false,
             scale: 0.125,
-            cfg: Admitted::assume(cfg),
+            cfg: assumed(cfg),
         };
         let name = format!("group attention bq {bq} bkv {bkv} d {d}");
         let ir = render(attention::<BF16>(&spec), &cfg.lowering(&device));
@@ -492,14 +492,8 @@ fn block_derived(prog: Program, lowering: &Lowering) -> Vec<Vec<String>> {
 #[test]
 fn the_block_index_is_renumbered_only_over_several_dies() {
     let cfg = config::gemm_cfg([64, 64, 32], 2, [2, 2], false);
-    let spec = GemmSpec {
-        m: 192,
-        n: 320,
-        k: 64,
-        batch: Batch::Static(3),
-        epilogue: Epilogue::default(),
-        cfg: Admitted::assume(cfg),
-    };
+    let spec =
+        GemmSpec { m: 192, n: 320, k: 64, batch: Batch::Static(3), epilogue: Epilogue::default(), cfg: assumed(cfg) };
     let lowering = |xcds: u32| {
         let target = Target { xcds, ..amd(AmdArch::Gfx942, 304) };
         cfg.lowering(&crate::atoms::Device { target, costs: super::costs() })
@@ -653,8 +647,7 @@ fn an_operand_read_twice_matches_the_interpreter_on_the_device() {
         schedule: planner.device.target.kslice().map_or(cfg.schedule, Schedule::ping_pong),
         ..cfg
     };
-    let spec =
-        GemmSpec { m, n: m, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg: Admitted::assume(cfg) };
+    let spec = GemmSpec { m, n: m, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg: assumed(cfg) };
     let prog = gemm::<BF16>(&spec);
     let mut seed = 5;
     let a = super::rounded(ScalarDType::BFloat16, m * k, &mut seed, |x| x);
@@ -678,14 +671,8 @@ fn an_operand_read_twice_matches_the_interpreter_on_the_device() {
 fn a_launch_refuses_an_output_sharing_storage() {
     let (m, k) = (64, 32);
     let cfg = config::gemm_cfg([64, 64, 32], 1, [2, 2], false);
-    let prog = gemm::<BF16>(&GemmSpec {
-        m,
-        n: m,
-        k,
-        batch: Batch::Static(1),
-        epilogue: Epilogue::DEFAULT,
-        cfg: Admitted::assume(cfg),
-    });
+    let prog =
+        gemm::<BF16>(&GemmSpec { m, n: m, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg: assumed(cfg) });
     let aliased = |tensors: &[&Tensor]| matches!(aliasing(&prog, tensors), Err(launch::Error::Aliased { .. }));
     let (a, b, out) = (
         Tensor::from_slice(vec![0.5f32; m * k]),
@@ -764,7 +751,7 @@ fn ranked_launches(planner: &Planner, shortlist_deep: bool) -> Vec<(Launch, (usi
                     k: cfg.tile[2] * 2,
                     batch: Batch::Static(1),
                     epilogue,
-                    cfg: Admitted::assume(cfg),
+                    cfg: assumed(cfg),
                 };
                 let launch =
                     (format!("{m}x{n}x{k} g{gated} {cfg:?}"), gemm::<BF16>(&spec), cfg.lowering(&planner.device));
@@ -786,7 +773,7 @@ fn ranked_launches(planner: &Planner, shortlist_deep: bool) -> Vec<(Launch, (usi
                     cache: None,
                     packed: false,
                     scale: 0.125,
-                    cfg: Admitted::assume(cfg),
+                    cfg: assumed(cfg),
                 };
                 let launch = (format!("d{d} t{t} {cfg:?}"), attention::<BF16>(&spec), cfg.lowering(&planner.device));
                 launches.push((launch, (cfg.smem_bytes(d, false), 0)));
@@ -801,7 +788,7 @@ fn ranked_launches(planner: &Planner, shortlist_deep: bool) -> Vec<(Launch, (usi
                 batch: Batch::Static(1),
                 geom: g,
                 epilogue: Epilogue::DEFAULT,
-                cfg: Admitted::assume(c.gemm),
+                cfg: assumed(c.gemm),
                 split: c.split,
             };
             for (i, (prog, lowering)) in spec.programs::<F16>(&planner.device).into_iter().enumerate() {
@@ -834,7 +821,7 @@ fn ranked_launches(planner: &Planner, shortlist_deep: bool) -> Vec<(Launch, (usi
                 floors,
                 groups,
                 k,
-                cfg: Admitted::assume(cfg),
+                cfg: assumed(cfg),
                 live: Default::default(),
             };
             let name = format!("nearest d{d} {metric:?} {floors:?} {groups} k{k} {cfg:?}");
@@ -917,7 +904,7 @@ fn attention_softmax_takes_the_declared_forms(
         cache: None,
         packed: false,
         scale: 0.125,
-        cfg: Admitted::assume(cfg),
+        cfg: assumed(cfg),
     };
     let prog = if f16 { attention::<F16>(&spec) } else { attention::<BF16>(&spec) };
     let casts = tile_ops(&prog.body, &|op| matches!(op, TileOp::Cast { round: Round::Zero, .. }));
@@ -999,7 +986,7 @@ fn register_staged_trips_are_fenced(arch: AmdArch, emitted: bool) {
             k: 128,
             batch: Batch::Static(1),
             epilogue: Epilogue::DEFAULT,
-            cfg: Admitted::assume(cfg),
+            cfg: assumed(cfg),
         };
         let tile = lowered_tile(gemm::<BF16>(&spec), &cfg.lowering(&device));
         assert_eq!(
@@ -1040,14 +1027,8 @@ fn a_load_crosses_a_barrier(asm: &str) -> bool {
 fn prefetch_loads_stay_in_flight_across_a_barrier(arch: AmdArch, rdna: bool) {
     let device = declared(amd(arch, 64));
     let cfg = config::gemm_cfg([64, 64, 32], 1, [2, 2], false);
-    let spec = GemmSpec {
-        m: 256,
-        n: 256,
-        k: 512,
-        batch: Batch::Static(1),
-        epilogue: Epilogue::DEFAULT,
-        cfg: Admitted::assume(cfg),
-    };
+    let spec =
+        GemmSpec { m: 256, n: 256, k: 512, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg: assumed(cfg) };
     let ir = render(gemm::<BF16>(&spec), &cfg.lowering(&device));
     let mmra = r#", !mmra !{!"amdgpu-synchronize-as", !"local"}"#;
     let fences = ir.matches("fence syncscope(\"workgroup\")").count();
@@ -1091,7 +1072,7 @@ fn attention_at(target: &Target, cfg: crate::kernels::attention::FaCfg, d: usize
         cache: None,
         packed: false,
         scale: 0.125,
-        cfg: Admitted::assume(cfg),
+        cfg: assumed(cfg),
     };
     let device = crate::atoms::Device { target: target.clone(), costs: crate::atoms::Costs::default() };
     (attention::<BF16>(&spec), cfg.lowering(&device))
@@ -1253,7 +1234,7 @@ fn the_next_steps_loads_stay_above_a_vote(arch: AmdArch) {
         floors: Floors::default(),
         groups: false,
         k: 1,
-        cfg: Admitted::assume(cfg),
+        cfg: assumed(cfg),
         live: Default::default(),
     };
     let ir = render(nearest::<BF16>(&spec), &Lowering::new(&device));
@@ -1300,7 +1281,7 @@ fn the_probabilities_reach_pv_through_the_lanes_on_a_no_feed_target(mask: AttnMa
         cache: None,
         packed: false,
         scale: 0.125,
-        cfg: Admitted::assume(cfg),
+        cfg: assumed(cfg),
     };
     let declared = shared_bytes(&linear(attention::<F16>(&spec), &cfg.lowering(&device)));
     assert_eq!(declared, cfg.smem_bytes(64, false), "its rings alone, at the target's whole 64 KB");

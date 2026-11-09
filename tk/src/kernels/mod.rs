@@ -22,8 +22,8 @@ use crate::ir::*;
 /// kernel spec takes its config as one, so a kernel is built from nothing
 /// the planner did not let through, and the checks the admission makes are
 /// not made again where the kernel is built. `'t` is the planner's borrow.
-/// Tests and sweeps build what no planner admitted with [`Admitted::assume`]
-/// (the `sweep` feature).
+/// A config no planner admitted is taken as one only through the `unsafe`
+/// [`Admitted::assume`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Admitted<'t, C>(C, PhantomData<&'t ()>);
 
@@ -33,8 +33,14 @@ impl<C> Admitted<'_, C> {
     }
 
     /// `cfg` taken as admitted: for a kernel built outside the op layer.
-    #[cfg(any(test, feature = "sweep"))]
-    pub fn assume(cfg: C) -> Self {
+    ///
+    /// # Safety
+    ///
+    /// The kernel built from it checks nothing admission checks: where `cfg`
+    /// is not feasible on the launch's target for the problem, or its
+    /// claim does not fit the problem's shape, the kernel may read or write
+    /// past its operands or compute the wrong values.
+    pub unsafe fn assume(cfg: C) -> Self {
         Self::mint(cfg)
     }
 }

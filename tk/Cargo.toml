@@ -28,14 +28,3 @@ proptest = "1.9"
 test-case = "3.3.1"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
-[features]
-# `Admitted::assume`: kernels built from configs no planner admitted (sweeps, tests).
-sweep = []
-
-[[example]]
-name = "tk_digest"
-required-features = ["sweep"]
-
-[[example]]
-name = "tk_rank"
-required-features = ["sweep"]

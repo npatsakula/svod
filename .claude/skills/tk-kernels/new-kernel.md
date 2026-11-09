@@ -13,8 +13,8 @@ shape; the excerpts below are verbatim (trimmed) at 2e9d5edb.
   the warpgroup atom). A mainloop kernel reuses `gemm::mainloop` with `GemmCfg::ring()`.
 - `XSpec<'t>`: shapes, `batch: Batch`, options, `cfg: Admitted<'t, XCfg>` (`kernels::Admitted`): only the planner mints
   one (`XProblem::admitted(&planner, cfg)`, feasible + claim), so the kernel fn checks none of what admission checked;
-  tests and `sweep.rs` take a config as admitted with `Admitted::assume` (the `sweep` feature, `tk_digest`/`tk_rank`
-  need it). Size every param at `batch.capacity()`.
+  a config no planner admitted is taken only through `unsafe Admitted::assume`; tests, `sweep.rs` and `rank.rs`
+  go through `sweep::assumed`. Size every param at `batch.capacity()`.
 - `pub fn x<T: Elem>(spec: &XSpec) -> Program` is `Kernel::record(name, |k| x_body::<T>(k, spec))` with
   `fn x_body<'k, T: Elem>(k: &mut Kernel<'k>, spec: &XSpec)`: every handle carries the kernel's brand `'k`, so a
   helper that takes or returns one names it (`fn at<'k, T: Elem, A: Access>(k: &mut Kernel<'k>, p: ParamRef<'k, T, A>,

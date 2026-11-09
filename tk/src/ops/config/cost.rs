@@ -216,7 +216,6 @@ pub(crate) enum Steps {
 
 impl Steps {
     /// The step count, in [`STEP`]-elements.
-    #[cfg(any(test, feature = "sweep"))]
     pub(crate) fn count(&self) -> f64 {
         match *self {
             Steps::F16(n) | Steps::Group(n) | Steps::Wide(n) | Steps::I8(n) => n,

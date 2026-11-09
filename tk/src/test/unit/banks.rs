@@ -9,13 +9,13 @@ use test_case::test_case;
 use crate::atoms::{SharedBanks, Target};
 use crate::build::BF16;
 use crate::ir::*;
-use crate::kernels::Admitted;
 use crate::kernels::Batch;
 use crate::kernels::attention::{AttnMask, AttnSpec, FaCfg, attention};
 use crate::kernels::gemm::{Epilogue, GemmSpec, gemm};
 use crate::layouts::SharedSwizzle;
 use crate::lower::{Lowered, Lowering, standalone};
 use crate::ops::config;
+use crate::sweep::assumed;
 use crate::sweep::{amd, declared};
 
 proptest! {
@@ -45,14 +45,8 @@ fn gemm_on(arch: AmdArch) -> Lowered {
         schedule: Schedule::ping_pong(16),
         ..config::gemm_cfg([256, 256, 64], 1, [2, 4], false)
     };
-    let spec = GemmSpec {
-        m: 512,
-        n: 512,
-        k: 256,
-        batch: Batch::Static(1),
-        epilogue: Epilogue::DEFAULT,
-        cfg: Admitted::assume(cfg),
-    };
+    let spec =
+        GemmSpec { m: 512, n: 512, k: 256, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg: assumed(cfg) };
     standalone(gemm::<BF16>(&spec), &cfg.lowering(&device)).unwrap()
 }
 
@@ -70,7 +64,7 @@ fn attention_on(arch: AmdArch, d: usize) -> Lowered {
         cache: None,
         packed: false,
         scale: 0.125,
-        cfg: Admitted::assume(cfg),
+        cfg: assumed(cfg),
     };
     standalone(attention::<BF16>(&spec), &Lowering::new(&device)).unwrap()
 }
@@ -153,7 +147,7 @@ fn gemm_text_on(target: Target, m: usize, n: usize, k: usize) -> String {
         schedule: Schedule::ping_pong(16),
         ..config::gemm_cfg([256, 256, 64], 1, [2, 4], false)
     };
-    let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg: Admitted::assume(cfg) };
+    let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg: assumed(cfg) };
     crate::lower::render(gemm::<BF16>(&spec), &cfg.lowering(&device)).unwrap()
 }
 
@@ -213,14 +207,8 @@ fn a_target_without_the_swizzle_stays_flat(arch: AmdArch) {
     assert_eq!(amd(arch, 304).cache_swizzle, None);
     let device = declared(amd(arch, 304));
     let cfg = config::gemm_cfg([64, 64, 32], 1, [2, 2], false);
-    let spec = GemmSpec {
-        m: 256,
-        n: 256,
-        k: 512,
-        batch: Batch::Static(1),
-        epilogue: Epilogue::DEFAULT,
-        cfg: Admitted::assume(cfg),
-    };
+    let spec =
+        GemmSpec { m: 256, n: 256, k: 512, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg: assumed(cfg) };
     assert!(!crate::lower::render(gemm::<BF16>(&spec), &cfg.lowering(&device)).unwrap().contains(FAT_POINTER))
 }
 

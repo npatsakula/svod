@@ -10,10 +10,10 @@ use svod_tensor::Tensor;
 use svod_tk::atoms::{Core, Device, Target};
 use svod_tk::build::BF16;
 use svod_tk::ir::Schedule;
-use svod_tk::kernels::Admitted;
 use svod_tk::kernels::Batch;
 use svod_tk::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
 use svod_tk::launch::graph_launch;
+use svod_tk::ops::config::{GemmProblem, Planner};
 use svod_tk::ops::{self, Act, Linear};
 
 fn lcg(seed: &mut u64) -> f32 {
@@ -45,6 +45,7 @@ fn tk_gemm_tuned_vs_pinned() {
     let measured = svod_tk::probe::costs(&target).expect("device costs");
     assert!(measured.unmeasured.is_empty(), "unmeasured: {:?}", measured.unmeasured);
     let device = Device { costs: measured.costs, target };
+    let planner = Planner::new(device.clone()).expect("a planner for the device");
     let plain = Epilogue::default();
     let residual = Epilogue { residual: true, ..plain };
     let swiglu = Epilogue { act: Act::Silu, gated: true, ..plain };
@@ -86,7 +87,9 @@ fn tk_gemm_tuned_vs_pinned() {
 
         // tk at a pinned config.
         let mut pinned = |label: &str, c: GemmCfg| {
-            let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: epi, cfg: Admitted::assume(c) };
+            let problem = GemmProblem { batches: 1, m, n, k, halves, rope: None };
+            let cfg = problem.admitted(&planner, c).unwrap_or_else(|why| panic!("{label} {c:?}: {why:?}"));
+            let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: epi, cfg };
             let out = Tensor::empty(&[m * n], DType::BFloat16);
             let mut params: Vec<&Tensor> = vec![&a, &b];
             if let Some(r) = &r {

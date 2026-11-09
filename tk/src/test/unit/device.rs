@@ -11,23 +11,16 @@ use crate::atoms::{Core, Device, Fill};
 use crate::build::*;
 use crate::interp::{round_to, run};
 use crate::ir::*;
-use crate::kernels::Admitted;
 use crate::kernels::Batch;
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Rope, gemm};
 use crate::launch::graph_launch;
 use crate::layouts::WarpGrid;
 use crate::lower::Lowering;
 use crate::ops::config::{Planner, gemm_cfg};
+use crate::sweep::assumed;
 
 fn plain_gemm(m: usize, n: usize, k: usize, cfg: GemmCfg) -> Program {
-    gemm::<BF16>(&GemmSpec {
-        m,
-        n,
-        k,
-        batch: Batch::Static(1),
-        epilogue: Epilogue::default(),
-        cfg: Admitted::assume(cfg),
-    })
+    gemm::<BF16>(&GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg: assumed(cfg) })
 }
 
 /// The GEMM configs the tuner times on the device for `spec`'s shape (its
@@ -36,7 +29,7 @@ pub(super) fn device_gemms(planner: &Planner, spec: &GemmSpec) -> (Vec<GemmCfg>,
     let GemmSpec { m, n, k, epilogue, .. } = *spec;
     let ranked = planner.gemm_ranked(1, m, n, k, epilogue.gated);
     let build = |cfg: GemmCfg| {
-        vec![(gemm::<BF16>(&GemmSpec { cfg: Admitted::assume(cfg), ..spec.clone() }), cfg.lowering(&planner.device))]
+        vec![(gemm::<BF16>(&GemmSpec { cfg: assumed(cfg), ..spec.clone() }), cfg.lowering(&planner.device))]
     };
     let shape = [spec.batch.capacity(), m, n, k];
     let (admitted, pick) = super::tuned_on_device(
@@ -86,8 +79,7 @@ fn every_gemm_candidate_matches_the_interpreter() {
     let Some(planner) = super::device_planner() else { return };
     let mut cfgs = vec![];
     for (m, n, k) in [(4096, 4096, 4096), (704, 512, 512)] {
-        let spec =
-            GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg: Admitted::assume(BIG) };
+        let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg: assumed(BIG) };
         cfgs.extend(device_gemms(&planner, &spec).0.into_iter().filter(|c| !cfgs.contains(c)).collect::<Vec<_>>());
     }
     for cfg in cfgs {
@@ -201,8 +193,7 @@ fn a_batch_past_i32_lands_at_its_stride() {
     let Some(planner) = super::device_planner() else { return };
     let (batches, m, n, k) = (2, 50_001, 50_001, 32);
     let cfg = planner.gemm_ranked(batches, m, n, k, false)[0];
-    let spec =
-        GemmSpec { m, n, k, batch: Batch::Static(batches), epilogue: Epilogue::default(), cfg: Admitted::assume(cfg) };
+    let spec = GemmSpec { m, n, k, batch: Batch::Static(batches), epilogue: Epilogue::default(), cfg: assumed(cfg) };
     let mut seed = 17;
     let mut draw = |len: usize| {
         (0..len).map(|_| round_to(ScalarDType::BFloat16, lcg(&mut seed) as f64) as f32).collect::<Vec<_>>()
@@ -244,7 +235,7 @@ fn gemm_throughput_probe() {
     // Static shared memory is capped at 48 KB on this path.
     let mut plans: Vec<(String, svod_runtime::ExecutionPlan)> = vec![];
     // The configs measured on sm_86; elsewhere the tuner's admitted ones.
-    let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg: Admitted::assume(BIG) };
+    let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg: assumed(BIG) };
     let (admitted, pick) = device_gemms(&planner, &spec);
     let mut cfgs: Vec<GemmCfg> = if target.fill == Fill::CpAsync {
         [
@@ -331,9 +322,9 @@ fn gemm_candidates_probe() {
     ] {
         let batch = if var { Batch::var("b", 1, 1) } else { Batch::Static(1) };
         let (cfgs, pick) =
-            device_gemms(&planner, &GemmSpec { m, n, k, batch: batch.clone(), epilogue, cfg: Admitted::assume(BIG) });
+            device_gemms(&planner, &GemmSpec { m, n, k, batch: batch.clone(), epilogue, cfg: assumed(BIG) });
         let build = |cfg| {
-            let spec = GemmSpec { m, n, k, batch: batch.clone(), epilogue, cfg: Admitted::assume(cfg) };
+            let spec = GemmSpec { m, n, k, batch: batch.clone(), epilogue, cfg: assumed(cfg) };
             vec![(gemm::<BF16>(&spec), cfg.lowering(&planner.device))]
         };
         let ns = super::measure(cfgs.iter().map(|&c| build(c)));
@@ -452,7 +443,7 @@ fn qwen3_gemm_candidates_probe() {
         ("down+residual", 4096, 1024, 3072, Epilogue { residual: true, ..plain }, 196.6),
     ];
     for (name, m, n, k, epilogue, tk1_us) in shapes {
-        let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue, cfg: Admitted::assume(BIG) };
+        let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue, cfg: assumed(BIG) };
         let shortlist = device_gemms(&planner, &spec).0;
         let mut lattice = vec![];
         for bm in [64, 128, 256] {
@@ -473,7 +464,7 @@ fn qwen3_gemm_candidates_probe() {
         let n_eff = if epilogue.gated { 2 * n } else { n };
         let tflops = |ns: u64| 2.0 * (m * n_eff * k) as f64 / ns as f64 / 1e3;
         let build = |cfg: GemmCfg| {
-            let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue, cfg: Admitted::assume(cfg) };
+            let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue, cfg: assumed(cfg) };
             vec![(gemm::<BF16>(&spec), cfg.lowering(&planner.device))]
         };
         let show = |set: &str, cfgs: &[GemmCfg], ns: &[Option<u64>]| -> Option<(u64, GemmCfg)> {
@@ -702,11 +693,10 @@ fn turning_gemms_match_the_interpreter() {
     let (m, n, k, d) = (200, 576, 128, 64);
     let rope = Rope { heads: 6, head_dim: d, seq: 50 };
     let epilogue = Epilogue { rope: Some(rope), ..Epilogue::DEFAULT };
-    let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue, cfg: Admitted::assume(BIG) };
+    let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue, cfg: assumed(BIG) };
     let ranked: Vec<GemmCfg> = planner.gemm_ranked_rope(1, m, n, k, false, Some(rope)).to_vec();
-    let build = |cfg| {
-        vec![(gemm::<BF16>(&GemmSpec { cfg: Admitted::assume(cfg), ..spec.clone() }), cfg.lowering(&planner.device))]
-    };
+    let build =
+        |cfg| vec![(gemm::<BF16>(&GemmSpec { cfg: assumed(cfg), ..spec.clone() }), cfg.lowering(&planner.device))];
     let shape = [1, m, n, k];
     let (mut cfgs, _) = super::tuned_on_device(
         &planner,
@@ -730,7 +720,7 @@ fn turning_gemms_match_the_interpreter() {
     let tensor = |v: &[f64]| Tensor::from_slice(v.iter().map(|&x| x as f32).collect::<Vec<_>>()).cast(DType::BFloat16);
     let (a_t, b_t, cos_t, sin_t) = (tensor(&a), tensor(&b), tensor(&cos), tensor(&sin));
     for cfg in &cfgs {
-        let prog = gemm::<BF16>(&GemmSpec { cfg: Admitted::assume(*cfg), ..spec.clone() });
+        let prog = gemm::<BF16>(&GemmSpec { cfg: assumed(*cfg), ..spec.clone() });
         let want = run(&prog, vec![a.clone(), b.clone(), cos.clone(), sin.clone(), vec![0.0; m * n]], &[]).unwrap();
         let c_t = Tensor::empty(&[m * n], DType::BFloat16);
         let got = graph_launch(prog, &cfg.lowering(&planner.device), &[&a_t, &b_t, &cos_t, &sin_t, &c_t]).unwrap();

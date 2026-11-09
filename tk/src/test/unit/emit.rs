@@ -12,12 +12,12 @@ use test_case::test_case;
 use crate::atoms::{Core, Costs, Device, Fill, Target};
 use crate::build::*;
 use crate::ir::*;
-use crate::kernels::Admitted;
 use crate::kernels::Batch;
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
 use crate::kernels::rows::{Norm, NormCfg, NormSpec, norm};
 use crate::lower::Lowering;
 use crate::lower::emit::minimum;
+use crate::sweep::assumed;
 
 use super::targets::{amd, families, linear};
 
@@ -351,7 +351,7 @@ fn the_segment_bounds_are_read_ahead_of_the_key_loop(group: bool) {
         cache: None,
         packed: false,
         scale: 0.125,
-        cfg: Admitted::assume(cfg),
+        cfg: assumed(cfg),
     };
     let prog = attention::<F16>(&spec);
     let slot = prog.params.iter().position(|p| p.name == "seg_start").expect("a segment parameter");
@@ -480,14 +480,8 @@ fn the_text_claims_exactly_the_aliasing_tk_knows(target: Target) {
 #[test_case(crate::atoms::sm86(); "sm_86 keeps its pairs")]
 fn a_products_operand_is_the_load_that_filled_it(target: Target) {
     let cfg = GemmCfg { tile: [64, 64, 32], warps: [2, 2], core: Core::Warp, schedule: Schedule::ring(2, false) };
-    let spec = GemmSpec {
-        m: 128,
-        n: 128,
-        k: 128,
-        batch: Batch::Static(1),
-        epilogue: Epilogue::default(),
-        cfg: Admitted::assume(cfg),
-    };
+    let spec =
+        GemmSpec { m: 128, n: 128, k: 128, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg: assumed(cfg) };
     let lowered =
         crate::lower::standalone(gemm::<BF16>(&spec), &Lowering::new(&super::declared(target.clone()))).unwrap();
     let (mut folded, mut stacked) = (0, 0);
@@ -569,7 +563,7 @@ fn a_constant_past_i32_keeps_its_value() {
         k: 50_048,
         batch: Batch::Static(2),
         epilogue: Epilogue::DEFAULT,
-        cfg: Admitted::assume(cfg),
+        cfg: assumed(cfg),
     };
     let target = amd(AmdArch::Gfx942, 304);
     let text = crate::lower::render(gemm::<BF16>(&spec), &cfg.lowering(&super::declared(target))).unwrap();

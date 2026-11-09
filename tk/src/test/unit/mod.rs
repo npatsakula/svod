@@ -41,11 +41,11 @@ use crate::build::BF16;
 use crate::interp::round_to;
 use crate::ir::Program;
 use crate::ir::Schedule;
-use crate::kernels::Admitted;
 use crate::kernels::Batch;
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
 use crate::kernels::nearest::{Floors, Metric};
 use crate::ops::config::{self, Planner, has_kernels};
+use crate::sweep::assumed;
 pub(crate) use crate::sweep::{conv_first_eight, costs, declared, first_eight, planner};
 
 /// The default device's target when tk has kernels for it, of any vendor:
@@ -362,19 +362,12 @@ fn gemm_nt(m: usize, n: usize, k: usize, bm: usize, bn: usize, bk: usize, stages
 /// A plain bf16 `c = a·bᵀ` program for two crews: a 2×4 warp grid over one slot.
 fn gemm_nt_crews(m: usize, n: usize, k: usize, tile: [usize; 3]) -> Program {
     let cfg = GemmCfg { tile, warps: [2, 4], core: Core::Warp, schedule: Schedule::ping_pong(16) };
-    gemm::<BF16>(&GemmSpec {
-        m,
-        n,
-        k,
-        batch: Batch::Static(1),
-        epilogue: Epilogue::default(),
-        cfg: Admitted::assume(cfg),
-    })
+    gemm::<BF16>(&GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg: assumed(cfg) })
 }
 
 fn gemm_nt_batched(m: usize, n: usize, k: usize, tile: [usize; 3], stages: usize, batch: Batch) -> Program {
     let cfg = GemmCfg { core: Core::Warp, tile, warps: [2, 4], schedule: Schedule::ring(stages, true) };
-    gemm::<BF16>(&GemmSpec { m, n, k, batch, epilogue: Epilogue::default(), cfg: Admitted::assume(cfg) })
+    gemm::<BF16>(&GemmSpec { m, n, k, batch, epilogue: Epilogue::default(), cfg: assumed(cfg) })
 }
 
 /// The next value of a 64-bit LCG stepping `seed`, uniform in `[-1, 1)`.

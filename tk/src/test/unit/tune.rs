@@ -6,8 +6,8 @@
 //! by what they are made of, and on the device a real GEMM tuning.
 
 use super::Scratch;
-use crate::kernels::Admitted;
 use crate::ops::config::{Tiled, gemm_cfg};
+use crate::sweep::assumed;
 use std::cell::Cell;
 use std::time::Duration;
 
@@ -279,14 +279,8 @@ fn concurrent_writers_of_one_file_lose_no_line() {
 
 /// A plain bf16 GEMM's programs under `cfg` on sm_86.
 fn gemm_programs(cfg: crate::kernels::gemm::GemmCfg) -> tune::Candidate {
-    let spec = GemmSpec {
-        m: 128,
-        n: 128,
-        k: 128,
-        batch: Batch::Static(1),
-        epilogue: Epilogue::default(),
-        cfg: Admitted::assume(cfg),
-    };
+    let spec =
+        GemmSpec { m: 128, n: 128, k: 128, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg: assumed(cfg) };
     vec![(gemm::<BF16>(&spec), cfg.lowering(&Device { target: sm86(), costs: super::costs() }))]
 }
 
@@ -417,7 +411,7 @@ fn candidates_share_scratch_buffers_without_aliasing_a_program() {
         k: 256,
         batch: Batch::Static(1),
         epilogue: Epilogue::default(),
-        cfg: Admitted::assume(gemm_cfg(tile, 2, [2, 2], true)),
+        cfg: assumed(gemm_cfg(tile, 2, [2, 2], true)),
     };
     let (first, second) = (gemm::<BF16>(&spec([64, 64, 32])), gemm::<BF16>(&spec([128, 64, 32])));
     let pool = ScratchPool::default();
@@ -572,8 +566,7 @@ fn a_gemm_tunes_on_the_device() {
     let cfgs = super::first_eight(&planner.gemm_ranked(1, m, n, k, false));
     let batch = Batch::var("b", 1, 1);
     let build = |cfg: GemmCfg| {
-        let spec =
-            GemmSpec { m, n, k, batch: batch.clone(), epilogue: Epilogue::default(), cfg: Admitted::assume(cfg) };
+        let spec = GemmSpec { m, n, k, batch: batch.clone(), epilogue: Epilogue::default(), cfg: assumed(cfg) };
         vec![(gemm::<BF16>(&spec), cfg.lowering(device))]
     };
     let key = TuneKey::new("gemm", &device.target, tune::compiler(&spec), ScalarDType::BFloat16, &[1, m, n, k], &cfgs);
@@ -749,14 +742,8 @@ fn a_scratch_plan_publishes_nothing() {
     let Some(planner) = super::device_planner() else { return };
     let device = &planner.device;
     let cfg = super::first_eight(&planner.gemm_ranked(1, 704, 512, 512, false))[0];
-    let spec = GemmSpec {
-        m: 704,
-        n: 512,
-        k: 512,
-        batch: Batch::Static(1),
-        epilogue: Epilogue::default(),
-        cfg: Admitted::assume(cfg),
-    };
+    let spec =
+        GemmSpec { m: 704, n: 512, k: 512, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg: assumed(cfg) };
     let pool = ScratchPool::default();
     let scratch = || tune::scratch_plan(gemm::<BF16>(&spec), &cfg.lowering(device), &pool).expect("a plan");
     let kernels = |plan: &svod_runtime::ExecutionPlan| plan.kernels().map(std::ptr::from_ref).collect::<Vec<_>>();
@@ -828,14 +815,8 @@ fn a_float_scratch_buffer_is_random_and_an_integer_one_is_zero() {
 /// A 4096³ GEMM candidate on the warp-level core for `target` under `costs`.
 fn gemm_candidate(target: crate::atoms::Target, costs: crate::atoms::Costs) -> tune::Candidate {
     let cfg = crate::ops::config::gemm_cfg([128, 128, 32], 2, [2, 4], true);
-    let spec = GemmSpec {
-        m: 4096,
-        n: 4096,
-        k: 4096,
-        batch: Batch::Static(1),
-        epilogue: Epilogue::DEFAULT,
-        cfg: Admitted::assume(cfg),
-    };
+    let spec =
+        GemmSpec { m: 4096, n: 4096, k: 4096, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg: assumed(cfg) };
     vec![(gemm::<BF16>(&spec), cfg.lowering(&Device { target, costs }))]
 }
 

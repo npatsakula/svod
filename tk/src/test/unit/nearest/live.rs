@@ -413,7 +413,7 @@ fn assert_live_op(
         let small = case.first(n);
         let (x, c, opts) = bound_operands(&small, dtype.clone(), None);
         let same = picks(|_, _, spec| match used {
-            Some(cfg) => NearestSpec { cfg: Admitted::assume(concrete_way(cfg, k)), ..spec },
+            Some(cfg) => NearestSpec { cfg: assumed(concrete_way(cfg, k)), ..spec },
             None => spec,
         });
         let (score, index) = tk::nearest::picked(&x, &c, k, options(&small, &opts), None, same).unwrap();
@@ -442,7 +442,7 @@ fn way(
         let mut ways =
             ranked.iter().chain(admitted).filter(|c| c.queue.is_some() == queue && c.select.is_some() == select);
         let cfg = *ways.next().expect("the way admitted");
-        NearestSpec { cfg: Admitted::assume(shared_out(NearestCfg { splits, ..cfg }, spec.m)), ..spec }
+        NearestSpec { cfg: assumed(shared_out(NearestCfg { splits, ..cfg }, spec.m)), ..spec }
     }
 }
 
@@ -610,7 +610,7 @@ fn live_tunings_key_apart_from_their_bounds() {
         floors: BOTH,
         groups: true,
         k: 16,
-        cfg: Admitted::assume(NearestCfg::new(32, 16, 2)),
+        cfg: assumed(NearestCfg::new(32, 16, 2)),
         live,
     };
     let concrete = spec(Live::default());
@@ -694,7 +694,7 @@ fn live_probe() {
                 // Rows bound at the count, under the concrete pick.
                 let at = Variable::new(ROWS, 1, n as i64).bind(n as i64).unwrap();
                 let same = picks(|_, _, spec| match pick.get() {
-                    Some(cfg) => NearestSpec { cfg: Admitted::assume(cfg), ..spec },
+                    Some(cfg) => NearestSpec { cfg: assumed(cfg), ..spec },
                     None => spec,
                 });
                 // Realized as the JIT hands a symbolic batch on: a view of a

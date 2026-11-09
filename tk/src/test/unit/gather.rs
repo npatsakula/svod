@@ -15,12 +15,12 @@ use crate::atoms::{Fill, Target, sm86};
 use crate::build::*;
 use crate::interp::run;
 use crate::ir::*;
-use crate::kernels::Admitted;
 use crate::kernels::Batch;
 use crate::kernels::conv::{ConvSpec, conv};
 use crate::launch::graph_launch;
 use crate::layouts::WarpGrid;
 use crate::lower::Lowering;
+use crate::sweep::assumed;
 
 fn data(n: usize, seed: &mut u64) -> Vec<f64> {
     super::rounded(ScalarDType::BFloat16, n, seed, |x| x)
@@ -210,13 +210,8 @@ const CONV: ([usize; 3], usize, [u32; 2]) = ([64, 64, 32], 3, [2, 2]);
 fn conv_3x3((tile, stages, warps): ([usize; 3], usize, [u32; 2])) -> Program {
     let cfg = crate::ops::config::gemm_cfg(tile, stages, warps, true);
     let geom = super::conv::geom([40, 40], 192, 192, 3, 1, 1, 1);
-    let spec = ConvSpec {
-        batch: Batch::Static(1),
-        geom,
-        epilogue: super::conv::SILU_BIAS,
-        cfg: Admitted::assume(cfg),
-        split: 1,
-    };
+    let spec =
+        ConvSpec { batch: Batch::Static(1), geom, epilogue: super::conv::SILU_BIAS, cfg: assumed(cfg), split: 1 };
     conv::<F16>(&spec)
 }
 

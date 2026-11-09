@@ -4,8 +4,8 @@ use test_case::test_case;
 use crate::atoms::{Core, Fill};
 use crate::interp::{round_to, run};
 use crate::ir::*;
-use crate::kernels::Admitted;
 use crate::schedule::expand;
+use crate::sweep::assumed;
 
 fn count<P: Phase>(prog: &Program<P>, pred: impl Fn(&Stmt<P>) -> bool) -> usize {
     prog.walk().filter(|(_, s)| pred(s)).count()
@@ -211,7 +211,7 @@ fn staged_halves_keep_their_copys_scope() {
         cache: None,
         packed: false,
         scale: 0.125,
-        cfg: Admitted::assume(cfg),
+        cfg: assumed(cfg),
     };
     let prog = expand(attention::<BF16>(&spec), Fill::Staged, Core::Warp);
     fn copies(block: &Block<Expanded>, inside: bool, out: &mut Vec<(bool, Scope, CopyMode)>) {

@@ -11,12 +11,12 @@ use crate::atoms::{Core, sm86};
 use crate::build::BF16;
 use crate::interp::{round_to, run};
 use crate::ir::*;
-use crate::kernels::Admitted;
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Scale, gemm};
 use crate::kernels::rows::{Norm, NormCfg, NormSpec, norm};
 use crate::kernels::{Act, Batch};
 use crate::launch::graph_launch_all;
 use crate::lower::Lowering;
+use crate::sweep::assumed;
 
 fn gemm_nt_epilogue(
     m: usize,
@@ -28,7 +28,7 @@ fn gemm_nt_epilogue(
     epi: Epilogue,
 ) -> Program {
     let cfg = GemmCfg { core: Core::Warp, tile, warps, schedule: Schedule::ring(stages, true) };
-    gemm::<BF16>(&GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: epi, cfg: Admitted::assume(cfg) })
+    gemm::<BF16>(&GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: epi, cfg: assumed(cfg) })
 }
 
 fn norm_rows(norm_: Norm, rows: usize, d: usize, br: usize, eps: f64, residual: bool, bias: bool) -> Program {

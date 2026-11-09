@@ -2,7 +2,7 @@
 //! synthetic store replayed through the very keys the op layer writes —
 //! the digest assert holding, a drifted list refused and counted.
 
-use crate::kernels::Admitted;
+use crate::sweep::assumed;
 use test_case::test_case;
 
 use super::Scratch;
@@ -203,7 +203,7 @@ fn the_op_layers_tuning_reads_the_same_line() {
         k: 512,
         batch: Batch::Static(1),
         epilogue: Epilogue::DEFAULT,
-        cfg: Admitted::assume(ranked[0]),
+        cfg: assumed(ranked[0]),
     };
     let pick =
         tuned::linear(&TuneStore::replay(dir.to_path_buf()), &planner, svod_dtype::DType::BFloat16, &ranked, spec).cfg;
@@ -312,7 +312,7 @@ fn the_listing_static_decomposition_maps_its_programs() {
             floors: Floors::default(),
             groups: false,
             k,
-            cfg: Admitted::assume(cfg),
+            cfg: assumed(cfg),
             live: Live::default(),
         };
         rank::counted(&crate::lower::standalone(nearest::<F16>(&spec), &lowering).ok()?.program).map(|c| c.valu)
