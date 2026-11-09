@@ -256,7 +256,7 @@ pub struct AmdDeviceCore {
     /// reaches its hardware cap rather than co-tenanting a mutable ring.
     queue_pool: crate::amd::connector::QueuePool,
     /// Max distinct KFD compute queues in the pool. Read once at open from
-    /// `SVOD_AMD_HW_QUEUES` (default 4 on multi-XCC, else 1; min 1). The per-process hardware budget
+    /// `SVOD_AMD_HW_QUEUES` (default 1; min 1). The per-process hardware budget
     /// is small (~24 user compute queues on CDNA; HIP's `GPU_MAX_HW_QUEUES`
     /// defaults to 4), so acquisition parks after reaching the cap.
     hw_queues: usize,
@@ -395,12 +395,14 @@ impl AmdDevice {
         debug!(node = node.node_id, gpu_id = node.gpu_id, arch = arch.mcpu(), backend = %backend, "AmdDevice opened");
 
         // Bounded exclusive-lane pool: at most `SVOD_AMD_HW_QUEUES` distinct
-        // KFD compute queues. The default is scheduler-aware, mirroring where
-        // the ROCm stack itself ships multi-queue:
-        //   - multi-XCC CDNA (MI300-class): 4 — queues are HWS/MEC-runlist
-        //     scheduled and concurrent AQL queues are the validated production
-        //     configuration (HIP's own GPU_MAX_HW_QUEUES default is 4);
-        //   - single-XCC gfx11+ (MES-scheduled, RDNA3/3.5/4): 1 — feeding
+        // KFD compute queues, one by default everywhere:
+        //   - multi-XCC CDNA (MI300X, gfx942 VF): four lanes submitting at once
+        //     hang the GPU: a queue stops retiring, preemption fails on every
+        //     XCC and the driver resets (2026-11-09: a four-lane dispatch probe
+        //     without kernarg wraps hung twice, one lane passed, and the whole tk
+        //     suite passed on one lane while it hung on four). The cause is not
+        //     found yet, so one lane until it is;
+        //   - single-XCC gfx11+ (MES-scheduled, RDNA3/3.5/4): feeding
         //     several PM4 user queues concurrently parks CP micro-engines in
         //     `WAIT_REG_MEM` spins that MES cannot preempt and wedges the
         //     firmware into an unrecoverable reset (reproduced on gfx1151;
@@ -411,7 +413,7 @@ impl AmdDevice {
         let hw_queues = std::env::var("SVOD_AMD_HW_QUEUES")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(if node.num_xcc.max(1) > 1 { 4 } else { 1 })
+            .unwrap_or(1)
             .clamp(1, u64::BITS as usize);
 
         let core = Arc::new(AmdDeviceCore {
@@ -600,8 +602,7 @@ impl AmdDeviceCore {
         self.signal_pool.get()
     }
 
-    /// The bounded queue-pool size (`SVOD_AMD_HW_QUEUES`; default 4 on
-    /// multi-XCC hardware, 1 otherwise).
+    /// The bounded queue-pool size (`SVOD_AMD_HW_QUEUES`; default 1).
     #[inline]
     pub fn hw_queues(&self) -> usize {
         self.hw_queues
