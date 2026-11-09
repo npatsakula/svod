@@ -18,7 +18,9 @@ use std::num::NonZeroUsize;
 use crate::ir::{Program, Schedule, Var};
 use crate::kernels::attention::{AttnMask, AttnSpec, Bias, CacheLayout, Chunk, CombineSpec, FaCfg, attention, combine};
 use crate::kernels::conv::{ConvCfg, ConvGeom, ConvSpec};
-use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Scale, TileOrder, gemm};
+use crate::kernels::gemm::{
+    Epilogue, GemmCfg, GemmSpec, Scale, TailPlan, TailSpec, TailSplit, TileOrder, gemm, gemm_tail,
+};
 use crate::kernels::heads::{HeadsSpec, Rope, heads};
 use crate::kernels::nearest::{
     Floors, Live, Metric, NearestCfg, NearestMergeSpec, NearestSpec, RescoreSpec, SelectCfg, SelectSpec, nearest,
@@ -184,6 +186,20 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
         let cfg = GemmCfg { order, ..config::gemm_cfg([32, 64, 64], 2, [1, 2], false) };
         let spec = GemmSpec { m: 200, n: 192, k: 128, cfg: assumed(cfg), ..plain.clone() };
         push(&format!("gemm raster {rows}"), gemm::<BF16>(&spec), cfg.lowering(&planner.device));
+    }
+    // A tail split under an epilogue over a ragged grid of four tile rows
+    // by three walked in groups of three, waves of five tiles: the waves'
+    // run, the tail's partials over a run of slots and their merge.
+    let tail = TailSplit::new(2).expect("a split");
+    let order = TileOrder::grouped(3).expect("a group of rows");
+    let cfg = GemmCfg { order, tail: Some(tail), ..config::gemm_cfg([64, 64, 64], 2, [2, 2], false) };
+    let epilogue = Epilogue { bias: true, residual: true, act: Act::Gelu, ..Epilogue::DEFAULT };
+    let spec = GemmSpec { m: 200, n: 160, k: 256, batch: Batch::Static(1), epilogue, cfg: assumed(cfg) };
+    let plan = TailPlan::new(12, 5, tail).expect("a tail");
+    let parts = ["waves", "partials", "merge"];
+    for (part, prog) in parts.into_iter().zip(gemm_tail::<BF16>(&TailSpec { gemm: spec, plan })) {
+        let lowering = if part == "merge" { Lowering::new(&planner.device) } else { cfg.lowering(&planner.device) };
+        push(&format!("gemm tail {part}"), prog, lowering);
     }
     if let Some(kslice) = target.kslice().and_then(NonZeroUsize::new) {
         let schedule = Schedule::PingPong { kslice };
@@ -539,6 +555,7 @@ pub(crate) fn group_families(target: &Target) -> Vec<Launch> {
                 core: Core::Group,
                 schedule: Schedule::ring(stages, false),
                 order: TileOrder::DEFAULT,
+                tail: None,
             };
             assert!(cfg.fits(target), "{cfg:?} fits the warpgroup core");
             let (m, n, k) = (tile[0] + 2, tile[1] - 3, 3 * tile[2]);
@@ -698,7 +715,9 @@ pub fn digested(target: &Target) -> Vec<Launch> {
                     epilogue,
                     cfg: assumed(cfg),
                 };
-                out.push((format!("gemm {m}x{n}x{k} g{gated} {cfg:?}"), gemm::<BF16>(&spec), cfg.lowering(&device)));
+                // A tail split's config names the kernel its tiles run whole.
+                let name = format!("gemm {m}x{n}x{k} g{gated} {:?}", GemmCfg { tail: None, ..cfg });
+                out.push((name, gemm::<BF16>(&spec), cfg.lowering(&device)));
             }
         }
     }

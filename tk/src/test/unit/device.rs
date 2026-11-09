@@ -17,6 +17,7 @@ use crate::launch::graph_launch;
 use crate::layouts::WarpGrid;
 use crate::lower::Lowering;
 use crate::ops::config::{Planner, gemm_cfg};
+use crate::ops::linear::programs;
 use crate::sweep::assumed;
 
 fn plain_gemm(m: usize, n: usize, k: usize, cfg: GemmCfg) -> Program {
@@ -28,9 +29,7 @@ fn plain_gemm(m: usize, n: usize, k: usize, cfg: GemmCfg) -> Program {
 pub(super) fn device_gemms(planner: &Planner, spec: &GemmSpec) -> (Vec<GemmCfg>, GemmCfg) {
     let GemmSpec { m, n, k, epilogue, .. } = *spec;
     let ranked = planner.gemm_ranked(1, m, n, k, epilogue.gated);
-    let build = |cfg: GemmCfg| {
-        vec![(gemm::<BF16>(&GemmSpec { cfg: assumed(cfg), ..spec.clone() }), cfg.lowering(&planner.device))]
-    };
+    let build = |cfg: GemmCfg| programs(&GemmSpec { cfg: assumed(cfg), ..spec.clone() }, &DType::BFloat16, planner);
     let shape = [spec.batch.capacity(), m, n, k];
     let (admitted, pick) = super::tuned_on_device(
         planner,
@@ -803,5 +802,135 @@ fn turning_gemms_match_the_interpreter() {
             assert!(diff <= 1.6e-2 * w.abs().max(1.0), "{cfg:?}: c[{}, {}] = {g}, interpreter {w}", i / n, i % n);
         }
         eprintln!("{cfg:?}: matches");
+    }
+}
+
+/// A tail split launched as the op layer launches it ([`launched_tail`]:
+/// the whole waves' GEMM into the output, the tail's partials, their merge
+/// into the rest) matches the interpreter's plain GEMM under a bias, gelu
+/// and residual epilogue, on a ragged grid of 4×3 tiles walked in groups of
+/// three, over waves of five tiles (two waves and a tail of two) and of
+/// sixteen (the whole grid split).
+#[test_case(5; "two waves and a tail")]
+#[test_case(16; "short of a wave")]
+fn a_tail_split_matches_the_interpreter(wave: usize) {
+    use crate::kernels::Act;
+    use crate::kernels::gemm::{TailPlan, TailSpec, TailSplit, TileOrder, gemm_tail};
+    use crate::ops::linear::launched_tail;
+    let Some(planner) = super::device_planner() else { return };
+    let (m, n, k) = (200, 160, 256);
+    let split = TailSplit::new(2).expect("a split");
+    let order = TileOrder::grouped(3).expect("a group of rows");
+    let stages = planner.device.target.fill.stages(2);
+    let cfg = GemmCfg { order, tail: Some(split), ..gemm_cfg([64, 64, 64], stages, [2, 2], false) };
+    let epilogue = Epilogue { bias: true, act: Act::Gelu, residual: true, ..Epilogue::DEFAULT };
+    let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue, cfg: assumed(cfg) };
+    let tail = TailSpec { gemm: spec.clone(), plan: TailPlan::new(12, wave, split).expect("a tail") };
+    let mut seed = 29;
+    let mut draw = |len: usize| (0..len).map(|_| round_to(ScalarDType::BFloat16, lcg(&mut seed) as f64)).collect();
+    let (a, b, bias, residual): (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) =
+        (draw(m * k), draw(n * k), draw(n), draw(m * n));
+    let params = vec![a.clone(), b.clone(), bias.clone(), residual.clone(), vec![0.0; m * n]];
+    let want = run(&gemm::<BF16>(&spec), params, &[]).unwrap().pop().expect("the output");
+    let tensor = |v: &[f64]| Tensor::from_slice(v.iter().map(|&x| x as f32).collect::<Vec<_>>()).cast(DType::BFloat16);
+    let (a, b, bias, residual) = (tensor(&a), tensor(&b), tensor(&bias), tensor(&residual));
+    let lowering = cfg.lowering(&planner.device);
+    let mut programs: Vec<_> = gemm_tail::<BF16>(&tail).into_iter().map(|p| (p, lowering.clone())).collect();
+    programs.last_mut().expect("the merge").1 = Lowering::new(&planner.device);
+    let y = Tensor::empty(&[m * n], DType::BFloat16);
+    let got = launched_tail(programs, &tail, [&a, &b], Some(&bias), Some(&residual), &y).unwrap();
+    let got: Vec<f32> = got.cast(DType::Float32).to_vec::<f32>().unwrap();
+    super::assert_rel_close(
+        &format!("{:?}", tail.plan),
+        &got,
+        &want.iter().map(|&w| w as f32).collect::<Vec<_>>(),
+        2e-2,
+    );
+}
+
+/// A GEMM data-parallel, split whole along K and with its last partial wave
+/// split, each forced at the planner's lead tile and pipeline, timed side
+/// by side on shapes whose tiles leave a partial wave on a 304-CU MI300X
+/// at 256² tiles (`TAIL_SHAPES` = `MxNxK;…` instead): per plan the device
+/// µs (its kernels' times summed, the launches' gaps not counted),
+/// TFLOP/s, the time against the data-parallel one's and the model's price
+/// against its price of the data-parallel one, the planner's pick marked.
+/// Each split is the model's cheapest of the counts dividing the trips.
+/// Two passes in opposite orders, each plan's best kept. Prints and never
+/// asserts.
+#[test]
+#[ignore = "perf probe: needs a GPU"]
+fn gemm_tail_probe() {
+    use crate::kernels::gemm::{TailPlan, TailSpec, gemm_tail};
+    use crate::ops::config::GemmProblem;
+    let Some(planner) = super::device_planner() else { return };
+    let shapes: Vec<[usize; 3]> = std::env::var("TAIL_SHAPES").map_or_else(
+        |_| vec![[8192, 4096, 4096], [4096, 4096, 4096], [8192, 8192, 1024], [6144, 4096, 8192]],
+        |text| {
+            let dims = |s: &str| s.split('x').map(|d| d.trim().parse().expect("a dimension")).collect::<Vec<_>>();
+            text.split(';').map(|s| dims(s).try_into().expect("MxNxK")).collect()
+        },
+    );
+    for [m, n, k] in shapes {
+        let p = GemmProblem { batches: 1, m, n, k, halves: 1, rope: None };
+        let pick = planner.gemm_ranked(1, m, n, k, false)[0];
+        let cfg = GemmCfg { tail: None, ..pick };
+        let tiles = m.div_ceil(cfg.tile[0]) * n.div_ceil(cfg.tile[1]);
+        let (trips, wave) = (k / cfg.tile[2], p.wave(&planner, &cfg).expect("a wave"));
+        let dp_price = p.admit(&planner, &cfg).expect("its unsplit form").0;
+        // The model's cheapest of the counts dividing the trips.
+        let cheapest = |plan: &dyn Fn(usize) -> Option<TailPlan>| {
+            (2..=trips.min(crate::ops::config::TAIL_SPLITS))
+                .filter(|s| trips.is_multiple_of(*s))
+                .filter_map(|s| {
+                    let plan = plan(s)?;
+                    Some((p.plan_price(&planner, &cfg, &plan)?, plan))
+                })
+                .min_by(|a, b| a.0.total_cmp(&b.0))
+        };
+        let whole = cheapest(&|s| TailPlan::whole(tiles, s));
+        let tailed = cheapest(&|s| TailPlan::new(tiles, wave, crate::kernels::gemm::TailSplit::new(s)?));
+        let planned = p.tail_plan(&planner, &pick);
+        let mut plans: Vec<(String, Option<TailPlan>, f64)> = vec![("data-parallel".into(), None, dp_price)];
+        plans.extend(whole.map(|(price, plan)| (format!("split-K x{}", plan.split), Some(plan), price)));
+        plans.extend(tailed.map(|(price, plan)| (format!("tail split x{}", plan.split), Some(plan), price)));
+        let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg: assumed(cfg) };
+        let lowering = cfg.lowering(&planner.device);
+        let build = |plan: &Option<TailPlan>| match plan {
+            None => vec![(gemm::<BF16>(&spec), lowering.clone())],
+            Some(plan) => {
+                let tail = TailSpec { gemm: spec.clone(), plan: *plan };
+                let mut programs: Vec<_> =
+                    gemm_tail::<BF16>(&tail).into_iter().map(|p| (p, lowering.clone())).collect();
+                programs.last_mut().expect("the merge").1 = Lowering::new(&planner.device);
+                programs
+            }
+        };
+        let mut ns = super::measure(plans.iter().map(|(_, plan, _)| build(plan)));
+        let back = super::measure(plans.iter().rev().map(|(_, plan, _)| build(plan)));
+        for (t, b) in ns.iter_mut().zip(back.into_iter().rev()) {
+            *t = match (*t, b) {
+                (Some(t), Some(b)) => Some(t.min(b)),
+                (t, b) => t.or(b),
+            };
+        }
+        let flops = 2.0 * (m * n * k) as f64;
+        eprintln!(
+            "== {m}x{n}x{k}: {:?} s{} {:?} unroll={} {:?}, {tiles} tiles, waves of {wave}; planner's pick {:?}",
+            cfg.tile,
+            cfg.stages(),
+            cfg.warps,
+            cfg.unroll(),
+            cfg.order,
+            pick.tail,
+        );
+        for ((what, plan, price), t) in plans.iter().zip(&ns) {
+            let mark = if *plan == planned { " planner's pick" } else { "" };
+            let measured = t.map_or("failed".into(), |t| {
+                let against = ns[0].map_or(f64::NAN, |b| t as f64 / b as f64);
+                format!("{:8.1} us {:6.1} TFLOP/s x{against:.3}", t as f64 / 1e3, flops / t as f64 / 1e3)
+            });
+            eprintln!("  {what:<16} {measured}  model x{:.3}  {plan:?}{mark}", price / dp_price);
+        }
     }
 }

@@ -18,7 +18,7 @@ use test_case::test_case;
 use crate::atoms::{Device, sm86};
 use crate::build::BF16;
 use crate::kernels::Batch;
-use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, TileOrder, gemm};
+use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, TailSplit, TileOrder, gemm};
 use crate::tune::{self, Bench, Entry, FORMAT, Kind, Pass, ScratchPool, TuneKey, TuneStore, fingerprint};
 
 /// A host key: no device, so no compiler digest.
@@ -65,8 +65,12 @@ fn every_familys_config_code_round_trips() {
     // Every raster's group height, the default's and past it.
     let rasters = [1, 3, 8, 64, usize::MAX].map(|rows| TileOrder::grouped(rows).expect("a group of rows"));
     gemm.extend(rasters.map(|order| GemmCfg { order, ..gemm[0] }));
+    // Tail splits, the least and past the planner's most.
+    gemm.extend([2, 3, 16, 64].map(|split| GemmCfg { tail: TailSplit::new(split), ..gemm[0] }));
     round(&gemm);
-    assert_eq!(gemm_cfg([128, 256, 64], 3, [2, 4], true).code(), "w,128,256,64,2,4,r3u,g8");
+    let cfg = gemm_cfg([128, 256, 64], 3, [2, 4], true);
+    assert_eq!(cfg.code(), "w,128,256,64,2,4,r3u,g8,~");
+    assert_eq!(GemmCfg { tail: TailSplit::new(4), ..cfg }.code(), "w,128,256,64,2,4,r3u,g8,t4");
     let mut conv: Vec<ConvCfg> = gemm.iter().map(|g| ConvCfg { gemm: *g, split: 4 }).collect();
     conv.push(ConvCfg { gemm: gemm[0], split: 1 });
     round(&conv);

@@ -104,10 +104,14 @@ pub struct GemmCfg {
     pub schedule: Schedule,
     /// The raster the blocks walk the output tiles in.
     pub order: TileOrder,
+    /// The last, partial wave of tiles split along K ([`TailPlan`]); every
+    /// tile data-parallel where `None`.
+    pub tail: Option<TailSplit>,
 }
 
-/// A config of the default raster prints as it did before the field
-/// existed, so a ranking's text moves only where its raster does.
+/// A config of the default raster and no tail split prints as it did
+/// before those fields existed, so a ranking's text moves only where they
+/// do.
 impl fmt::Debug for GemmCfg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut s = f.debug_struct("GemmCfg");
@@ -116,7 +120,28 @@ impl fmt::Debug for GemmCfg {
         if self.order != TileOrder::DEFAULT {
             s.field("order", &self.order);
         }
+        if let Some(tail) = self.tail {
+            s.field("tail", &tail);
+        }
         s.finish()
+    }
+}
+
+/// How a GEMM's last, partial wave of output tiles runs: each of its tiles
+/// over `split` blocks, a share of the reduction each ([`TailPlan`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TailSplit {
+    split: usize,
+}
+
+impl TailSplit {
+    /// A tail split over `split` blocks a tile; `None` below two.
+    pub const fn new(split: usize) -> Option<Self> {
+        if split >= 2 { Some(Self { split }) } else { None }
+    }
+
+    pub const fn split(self) -> usize {
+        self.split
     }
 }
 
@@ -136,8 +161,19 @@ impl TileOrder {
     /// chose one, the one the nearest kernels walk.
     pub const DEFAULT: Self = Self::new(NonZeroUsize::new(8).unwrap());
 
+    /// The tallest group, a column-major walk of any grid of fewer tile
+    /// rows: a taller one (a hand-made code's) is clamped to it, so a
+    /// group's span of tiles (`rows · gn`) stays far inside the scalars'
+    /// range.
+    pub const MOST_ROWS: usize = 1 << 15;
+
+    /// Groups of `rows` tile rows, at most [`Self::MOST_ROWS`].
     pub const fn new(rows: NonZeroUsize) -> Self {
-        Self { rows }
+        if rows.get() > Self::MOST_ROWS {
+            Self { rows: NonZeroUsize::new(Self::MOST_ROWS).unwrap() }
+        } else {
+            Self { rows }
+        }
     }
 
     /// Groups of `rows` tile rows; `None` for none.
@@ -160,12 +196,111 @@ impl TileOrder {
     /// The `(row, col)` tile of this block in a grid of `gm × gn` tiles
     /// (grid x and y), walking groups of [`Self::rows`] tile rows.
     pub(crate) fn tile<'k>(self, k: &mut Kernel<'k>, gm: impl Into<Sc<'k>>, gn: usize) -> (Sc<'k>, Sc<'k>) {
-        let (gm, group) = (gm.into(), self.rows());
+        let gm = gm.into();
         let id = k.block(0) + k.block(1) * gm.clone();
+        self.walk(id, gm, gn)
+    }
+
+    /// The `(row, col)` tile the walk of a `gm × gn` grid reaches `id`th.
+    pub(crate) fn walk<'k>(self, id: Sc<'k>, gm: Sc<'k>, gn: usize) -> (Sc<'k>, Sc<'k>) {
+        let group = self.rows();
         let first_m = id.clone() / (group * gn) * group;
         let rows = (gm - first_m.clone()).min(group);
         let within = id % (group * gn);
         (first_m + within.clone() % rows.clone(), within / rows)
+    }
+}
+
+/// A run of a raster's walk: `count` output tiles from the walk's `first`th,
+/// a block each down grid x.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Run {
+    first: usize,
+    count: NonZeroUsize,
+}
+
+impl Run {
+    /// `None` for no tiles.
+    pub const fn new(first: usize, count: usize) -> Option<Self> {
+        match NonZeroUsize::new(count) {
+            Some(count) => Some(Self { first, count }),
+            None => None,
+        }
+    }
+
+    pub const fn first(self) -> usize {
+        self.first
+    }
+
+    pub const fn count(self) -> usize {
+        self.count.get()
+    }
+
+    /// The walk's indices the run covers.
+    pub fn range(self) -> std::ops::Range<usize> {
+        self.first..self.first + self.count()
+    }
+}
+
+/// The output tiles a GEMM launch covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Tiles {
+    /// Every tile, a block each over grid x and y.
+    Grid,
+    /// A run of the raster's walk.
+    Run(Run),
+}
+
+impl Tiles {
+    /// Grid x and y over a `gm × gn` grid of tiles.
+    pub(crate) fn grid<'k>(self, gm: usize, gn: usize) -> [Sc<'k>; 2] {
+        match self {
+            Tiles::Grid => [Sc::from(gm), Sc::from(gn)],
+            Tiles::Run(run) => [Sc::from(run.count()), Sc::from(1)],
+        }
+    }
+
+    /// The `(row, col)` tile of this block under `order`.
+    pub(crate) fn tile<'k>(self, k: &mut Kernel<'k>, order: TileOrder, gm: usize, gn: usize) -> (Sc<'k>, Sc<'k>) {
+        match self {
+            Tiles::Grid => order.tile(k, gm, gn),
+            Tiles::Run(run) => {
+                let id = k.block(0) + run.first;
+                order.walk(id, Sc::from(gm), gn)
+            }
+        }
+    }
+}
+
+/// A GEMM of a single batch whose tiles take more than a wave of the blocks
+/// a device runs at once, in whole waves data-parallel and the rest — the
+/// last, partial wave — each tile over `split` blocks a share of the
+/// reduction long: the waves' GEMM, the tail's f32 partials
+/// (`[split, tail tiles, bm, bn]`, a tile's elements row-major) and their
+/// [`split_merge`] under the epilogue, three launches over runs of one
+/// raster's walk. Fewer tiles than a wave split whole.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TailPlan {
+    /// The whole waves' tiles, from the walk's first; `None` short of a wave.
+    pub waves: Option<Run>,
+    /// The rest of the walk.
+    pub tail: Run,
+    pub split: usize,
+}
+
+impl TailPlan {
+    /// The plan of `tiles` tiles on a device running `wave` blocks at once,
+    /// the tail `split`; `None` where whole waves leave no tail.
+    pub fn new(tiles: usize, wave: usize, split: TailSplit) -> Option<Self> {
+        let full = tiles / wave.max(1) * wave.max(1);
+        let tail = Run::new(full, tiles - full)?;
+        Some(Self { waves: Run::new(0, full), tail, split: split.split() })
+    }
+
+    /// The plan whose every tile splits: a whole-problem split-K over the
+    /// same launches.
+    pub fn whole(tiles: usize, split: usize) -> Option<Self> {
+        Some(Self { waves: None, tail: Run::new(0, tiles)?, split })
     }
 }
 
@@ -236,37 +371,98 @@ pub struct GemmSpec<'t> {
 /// f32 for the epilogue, which stores f32 (`out_f32`): exact while the sums
 /// stay below 2^24.
 pub fn gemm<T: MmaIn>(spec: &GemmSpec) -> Program {
+    gemm_over::<T>(spec, Tiles::Grid, 1)
+}
+
+/// [`gemm`] over `tiles`, split `split` ways along K as [`mainloop_gemm`]
+/// splits it.
+fn gemm_over<T: MmaIn>(spec: &GemmSpec, tiles: Tiles, split: usize) -> Program {
     let GemmSpec { m, k: kk, cfg, .. } = *spec;
     let [bm, _, bk] = cfg.tile;
-    mainloop_gemm::<T>("gemm", spec, m * kk, 1, |k, a, bb, row0| {
+    mainloop_gemm::<T>("gemm", spec, m * kk, tiles, split, |k, a, bb, row0| {
         let a_view = k.view(a, batch_offset(bb, m * kk), [kk, 1], Shape::new(bm, bk), [bound(m, bm), None]);
         let a_view = k.at(a_view, row0, 0);
         Box::new(move |k, _step, koff| k.at(a_view, 0, koff))
     })
 }
 
+/// A GEMM run under a [`TailPlan`]: the spec's config, raster and
+/// epilogue, a single static batch, neither gated nor turned.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TailSpec<'t> {
+    pub gemm: GemmSpec<'t>,
+    pub plan: TailPlan,
+}
+
+/// Search bound: the tile of a tail's merge, f32 rows in natural layouts:
+/// the conv merge's, a sub-tile of the GEMM's (whose columns are then a
+/// multiple of 32).
+const TAIL_MERGE: [usize; 2] = [32, 32];
+
+impl TailSpec<'_> {
+    /// Whether a GEMM of `m × n` over `cfg`'s tiles merges a tail: the
+    /// merge tile divides the GEMM's.
+    pub fn merges(cfg: &GemmCfg) -> bool {
+        cfg.tile[0].is_multiple_of(TAIL_MERGE[0]) && cfg.tile[1].is_multiple_of(TAIL_MERGE[1])
+    }
+
+    /// The f32 partials' elements: a `[bm, bn]` slot a tail tile a split.
+    pub fn partials(&self) -> usize {
+        let [bm, bn, _] = self.gemm.cfg.tile;
+        self.plan.split * self.plan.tail.count() * bm * bn
+    }
+
+    /// The merge of the tail's partials.
+    pub fn merge(&self) -> SplitMergeSpec {
+        let GemmSpec { m, n, epilogue, cfg, .. } = self.gemm;
+        let parts = Parts { order: cfg.order, tile: [cfg.tile[0], cfg.tile[1]], run: self.plan.tail };
+        SplitMergeSpec { m, n, split: self.plan.split, epilogue, tile: TAIL_MERGE, parts: Some(parts) }
+    }
+}
+
+/// A [`TailPlan`]'s programs in launch order: the whole waves' GEMM where
+/// there are any (parameters as [`gemm`]'s), the tail's partials (`a`,
+/// `b`, the f32 partials [`TailSpec::partials`] long) and their merge
+/// ([`split_merge`]'s parameters).
+pub fn gemm_tail<T: MmaIn>(spec: &TailSpec) -> Vec<Program> {
+    let TailSpec { gemm, plan } = spec;
+    let GemmSpec { batch, epilogue, cfg, k, .. } = gemm;
+    assert!(
+        *batch == Batch::Static(1) && !epilogue.gated && epilogue.rope.is_none(),
+        "{epilogue:?} over {batch:?} splits no tail"
+    );
+    assert!(plan.split > 1 && (k / cfg.tile[2]).is_multiple_of(plan.split), "{plan:?} divides the trips");
+    let waves = plan.waves.map(|run| gemm_over::<T>(gemm, Tiles::Run(run), 1));
+    let tail = gemm_over::<T>(gemm, Tiles::Run(plan.tail), plan.split);
+    waves.into_iter().chain([tail, split_merge::<T>(&spec.merge())]).collect()
+}
+
 /// The GEMM around an A operand of `a_elems` elements per batch whose
 /// K-step tiles `a` describes: given the kernel, the parameter, the batch
 /// index and the block's first row, it returns the source of the `[bm, bk]`
-/// tile at `(step, step·bk)`. The output dtype follows the epilogue.
+/// tile at `(step, step·bk)`, over the output `tiles`. The output dtype
+/// follows the epilogue.
 ///
 /// With `split > 1` (a single static batch) grid z splits the reduction:
 /// split `z` walks steps `z·trips/split..`, and the kernel writes its raw f32
-/// accumulator to `c [split, m, n]` for [`split_merge`] to finish.
+/// accumulator for [`split_merge`] to finish: to `c [split, m, n]` over the
+/// whole grid, to a `[bm, bn]` slot a tile of `c [split, count, bm, bn]`
+/// over a run of `count` tiles.
 pub(crate) fn mainloop_gemm<T: MmaIn>(
     name: &str,
     spec: &GemmSpec,
     a_elems: usize,
+    tiles: Tiles,
     split: usize,
     a: impl for<'k> FnOnce(&mut Kernel<'k>, ParamRef<'k, T, In>, &Option<Sc<'k>>, Sc<'k>) -> ASource<'k, T>,
 ) -> Program {
     assert!(T::DTYPE.bytes() == 2 || spec.epilogue.out_f32 || split > 1, "an 8-bit product stores f32");
     if split > 1 {
-        Kernel::record(name, |k| build::<T, F32>(k, spec, a_elems, split, a))
+        Kernel::record(name, |k| build::<T, F32>(k, spec, a_elems, tiles, split, a))
     } else if spec.epilogue.out_f32 {
-        Kernel::record(name, |k| build::<T, F32>(k, spec, a_elems, 1, a))
+        Kernel::record(name, |k| build::<T, F32>(k, spec, a_elems, tiles, 1, a))
     } else {
-        Kernel::record(name, |k| build::<T, T>(k, spec, a_elems, 1, a))
+        Kernel::record(name, |k| build::<T, T>(k, spec, a_elems, tiles, 1, a))
     }
 }
 
@@ -278,6 +474,7 @@ fn build<'k, T: MmaIn, U: Elem>(
     k: &mut Kernel<'k>,
     spec: &GemmSpec,
     a_elems: usize,
+    tiles: Tiles,
     split: usize,
     a_source: impl FnOnce(&mut Kernel<'k>, ParamRef<'k, T, In>, &Option<Sc<'k>>, Sc<'k>) -> ASource<'k, T>,
 ) {
@@ -300,13 +497,19 @@ fn build<'k, T: MmaIn, U: Elem>(
         let table = rope.seq * rope.head_dim / 2;
         (rope, k.input::<T>("cos", table), k.input::<T>("sin", table))
     });
-    let c = k.output::<U>("c", cap.max(split) * m * n);
+    // A run's partials take a slot a tile; the whole grid's, the output's shape.
+    let slots = match tiles {
+        Tiles::Run(run) if partial => Some(run.count()),
+        _ => None,
+    };
+    let c = k.output::<U>("c", slots.map_or(cap.max(split) * m * n, |count| split * count * bm * bn));
     let (gm, gn) = (m.div_ceil(bm), n.div_ceil(bn));
     let (gz, bb) = if partial { (Sc::from(split), Some(k.block(2))) } else { batch.axis(k) };
-    k.grid([Sc::from(gm), Sc::from(gn), gz]);
+    let [gx, gy] = tiles.grid(gm, gn);
+    k.grid([gx, gy, gz]);
     k.warps(WarpGrid { rows: cfg.warps[0], cols: cfg.warps[1] });
 
-    let (bx, by) = cfg.order.tile(k, gm, gn);
+    let (bx, by) = tiles.tile(k, cfg.order, gm, gn);
     let (row0, col0) = (bx * bm, by * bn);
     let n_bound = bound(n, bn);
     let a_tile = a_source(k, a, if partial { &None } else { &bb }, row0.clone());
@@ -325,11 +528,20 @@ fn build<'k, T: MmaIn, U: Elem>(
         Vec::from(mainloop(k, sa, &a_tile, whole, trips / split, schedule, bk, first_step, cfg.slices()))
     };
     let accs = accs.into_iter().map(|acc| T::widened(k, acc)).collect();
-    let tile = Tile2 { m, n, bm, bn, row0, col0 };
-    finish::<T, U>(k, accs, epi, bias, residual, rope, c, &bb, &tile);
+    let tile = Tile2 { m, n, bm, bn, row0, col0, bounds: [bound(m, bm), bound(n, bn)] };
+    let dest = match slots {
+        Some(count) => {
+            let slot = bb.clone().expect("the split index") * count + k.block(0);
+            Dest::Slot(c, slot * (bm * bn))
+        }
+        None => Dest::Tile(c),
+    };
+    finish::<T, U>(k, accs, epi, bias, residual, rope, dest, &bb, &tile);
 }
 
-/// Where a block's `[bm, bn]` output tile sits in an `[m, n]` output.
+/// Where a block's `[bm, bn]` output tile sits in an `[m, n]` output, and
+/// the bounds its rows and columns are cut at (none where no tile of its
+/// grid crosses the edge).
 struct Tile2<'k> {
     m: usize,
     n: usize,
@@ -337,6 +549,15 @@ struct Tile2<'k> {
     bn: usize,
     row0: Sc<'k>,
     col0: Sc<'k>,
+    bounds: [Option<Sc<'k>>; 2],
+}
+
+/// Where the epilogue stores a block's tile.
+enum Dest<'k, U> {
+    /// Its window of the `[m, n]` output.
+    Tile(ParamRef<'k, U, Out>),
+    /// A `[bm, bn]` slot of its own, row-major from this element.
+    Slot(ParamRef<'k, U, Out>, Sc<'k>),
 }
 
 /// The epilogue on the f32 accumulators (two when gated) and the store.
@@ -348,12 +569,12 @@ fn finish<'k, T: Elem, U: Elem>(
     bias: Option<ParamRef<'k, T, In>>,
     residual: Option<ParamRef<'k, U, In>>,
     rope: Option<Turn<'k, T>>,
-    c: ParamRef<'k, U, Out>,
+    c: Dest<'k, U>,
     bb: &Option<Sc<'k>>,
     t: &Tile2<'k>,
 ) {
-    let Tile2 { n, bn, ref col0, .. } = *t;
-    let n_bound = bound(n, bn);
+    let Tile2 { n, bn, ref col0, ref bounds, .. } = *t;
+    let n_bound = bounds[1].clone();
     let mut accs = accs.into_iter().enumerate().map(|(half, acc)| match bias {
         Some(bias) => {
             let v = k.view(bias, half * n, [0, 1], Shape::new(1, bn), [None, n_bound.clone()]);
@@ -382,7 +603,10 @@ fn finish<'k, T: Elem, U: Elem>(
         out = k.binary(out, r, BinaryOp::Add);
     }
     let out = k.cast::<F32, U>(out);
-    let c_view = tile(k, c, bb, t);
+    let c_view = match c {
+        Dest::Tile(c) => tile(k, c, bb, t),
+        Dest::Slot(c, at) => k.view(c, at, [bn, 1], Shape::new(t.bm, bn), [None, None]),
+    };
     k.store(c_view, out);
 }
 
@@ -393,8 +617,8 @@ fn tile<'k, U: Elem, A: Access>(
     bb: &Option<Sc<'k>>,
     t: &Tile2<'k>,
 ) -> Gmem<'k, U, A> {
-    let Tile2 { m, n, bm, bn, ref row0, ref col0 } = *t;
-    let v = k.view(p, batch_offset(bb, m * n), [n, 1], Shape::new(bm, bn), [bound(m, bm), bound(n, bn)]);
+    let Tile2 { m, n, bm, bn, ref row0, ref col0, ref bounds } = *t;
+    let v = k.view(p, batch_offset(bb, m * n), [n, 1], Shape::new(bm, bn), bounds.clone());
     k.at(v, row0.clone(), col0.clone())
 }
 
@@ -453,19 +677,33 @@ fn turn<'k, T: Elem>(
 }
 
 /// The second program of a split reduction: `c = epilogue(Σ_z partial[z])`
-/// over `partial [split, m, n]` f32, `bm × bn` tiles per block.
+/// over f32 partials, `bm × bn` tiles per block: over the whole output from
+/// `partial [split, m, n]`, or over the tiles of a GEMM's run ([`Parts`]).
 #[derive(Clone, Debug, PartialEq)]
 pub struct SplitMergeSpec {
     pub m: usize,
     pub n: usize,
     pub split: usize,
     pub epilogue: Epilogue,
-    /// `[bm, bn]`, powers of two.
+    /// `[bm, bn]`, powers of two (dividing the [`Parts`]' tile).
     pub tile: [usize; 2],
+    pub parts: Option<Parts>,
 }
 
-/// Parameters in order: `partial [split, m, n]` f32, `bias [n]` if any,
-/// `residual [m, n]` if any, `c [m, n]` (f32 when `out_f32`).
+/// The output tiles a run of a GEMM's raster partials holds, a
+/// `[tile]` slot of each per split: `partial [split, run count, tile]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Parts {
+    pub order: TileOrder,
+    /// The GEMM's `[bm, bn]`.
+    pub tile: [usize; 2],
+    pub run: Run,
+}
+
+/// Parameters in order: `partial` f32 (`[split, m, n]`, or a [`Parts`]'
+/// slots), `bias [n]` if any, `residual [m, n]` if any, `c [m, n]` (f32
+/// when `out_f32`). Over a run's parts only the run's tiles of `c` are
+/// written.
 pub fn split_merge<T: Elem>(spec: &SplitMergeSpec) -> Program {
     if spec.epilogue.out_f32 { merge::<T, F32>(spec) } else { merge::<T, T>(spec) }
 }
@@ -475,24 +713,53 @@ fn merge<T: Elem, U: Elem>(spec: &SplitMergeSpec) -> Program {
 }
 
 fn merge_body<'k, T: Elem, U: Elem>(k: &mut Kernel<'k>, spec: &SplitMergeSpec) {
-    let SplitMergeSpec { m, n, split, epilogue: epi, tile: [bm, bn] } = *spec;
+    let SplitMergeSpec { m, n, split, epilogue: epi, tile: [bm, bn], parts } = *spec;
     assert!(!epi.gated && epi.rope.is_none(), "a gated or turned output is not split");
-    let partial = k.input::<F32>("partial", split * m * n);
+    let elems = parts.map_or(m * n, |p| p.run.count() * p.tile[0] * p.tile[1]);
+    let partial = k.input::<F32>("partial", split * elems);
     let bias = epi.bias.then(|| k.input::<T>("bias", n));
     let residual = epi.residual.then(|| k.input::<U>("residual", m * n));
     let c = k.output::<U>("c", m * n);
-    k.grid([Sc::from(m.div_ceil(bm)), Sc::from(n.div_ceil(bn)), Sc::from(1)]);
+    let Some(Parts { order, tile: [tm, tn], run }) = parts else {
+        k.grid([Sc::from(m.div_ceil(bm)), Sc::from(n.div_ceil(bn)), Sc::from(1)]);
+        k.warps(4);
+        let (row0, col0) = (k.block(0) * bm, k.block(1) * bn);
+        let zero = k.zeros::<F32>(Shape::new(bm, bn));
+        let [sum] = k.loop_(split, [zero], |k, z, [acc]| {
+            let part = k.view(partial, z * (m * n), [n, 1], Shape::new(bm, bn), [bound(m, bm), bound(n, bn)]);
+            let part = k.at(part, row0.clone(), col0.clone());
+            let part = k.load(part);
+            [k.binary(*acc, part, BinaryOp::Add).into()]
+        });
+        let tile = Tile2 { m, n, bm, bn, row0, col0, bounds: [bound(m, bm), bound(n, bn)] };
+        finish::<T, U>(k, vec![*sum], epi, bias, residual, None, Dest::Tile(c), &None, &tile);
+        return;
+    };
+    assert!(
+        tm.is_multiple_of(bm) && tn.is_multiple_of(bn),
+        "a merge tile {:?} divides the GEMM's {:?}",
+        [bm, bn],
+        [tm, tn]
+    );
+    // Grid x: the run's tiles; grid y: a tile's merge tiles, row-major.
+    let across = tn / bn;
+    k.grid([Sc::from(run.count()), Sc::from(tm / bm * across), Sc::from(1)]);
     k.warps(4);
-    let (row0, col0) = (k.block(0) * bm, k.block(1) * bn);
+    let (local, sub) = (k.block(0), k.block(1));
+    let (tr, tc) = order.walk(local.clone() + run.first(), Sc::from(m.div_ceil(tm)), n.div_ceil(tn));
+    let (sr, sc) = (sub.clone() / across, sub % across);
+    let (row0, col0) = (tr * tm + sr.clone() * bm, tc * tn + sc.clone() * bn);
+    let slot = local * (tm * tn) + sr * (bm * tn) + sc * bn;
     let zero = k.zeros::<F32>(Shape::new(bm, bn));
     let [sum] = k.loop_(split, [zero], |k, z, [acc]| {
-        let part = k.view(partial, z * (m * n), [n, 1], Shape::new(bm, bn), [bound(m, bm), bound(n, bn)]);
-        let part = k.at(part, row0.clone(), col0.clone());
+        let at = slot.clone() + z * (run.count() * tm * tn);
+        let part = k.view(partial, at, [tn, 1], Shape::new(bm, bn), [None, None]);
         let part = k.load(part);
         [k.binary(*acc, part, BinaryOp::Add).into()]
     });
-    let tile = Tile2 { m, n, bm, bn, row0, col0 };
-    finish::<T, U>(k, vec![*sum], epi, bias, residual, None, c, &None, &tile);
+    // A merge tile past the edge lies in a GEMM tile across it: cut where those are.
+    let tile = Tile2 { m, n, bm, bn, row0, col0, bounds: [bound(m, tm), bound(n, tn)] };
+    finish::<T, U>(k, vec![*sum], epi, bias, residual, None, Dest::Tile(c), &None, &tile);
 }
 
 /// The K-streaming pipeline: the `sa`-shaped A tile `a(step, step·bk)` and

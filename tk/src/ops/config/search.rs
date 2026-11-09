@@ -13,7 +13,7 @@ use crate::atoms::Target;
 use crate::ir::Schedule;
 use crate::kernels::attention::{FaCfg, Forms, WARP_ROWS, narrowest_warp_rows};
 use crate::kernels::conv::ConvCfg;
-use crate::kernels::gemm::{GemmCfg, TileOrder};
+use crate::kernels::gemm::{GemmCfg, TailSplit, TileOrder};
 use crate::kernels::nearest::{LaneQueue, NearestCfg, SelectCfg};
 use crate::kernels::rows::NormCfg;
 use crate::tune::Compiled;
@@ -88,6 +88,10 @@ pub enum ShapeRejected {
     Divides,
     /// Its tiles pad the output past what a convolution bears.
     Padding,
+    /// Its tail split does not run the problem: a batched, gated or turned
+    /// GEMM (or a convolution), a tile the merge's does not divide, a split
+    /// that does not divide the trips, or whole waves that leave no tail.
+    Tail,
 }
 
 /// A ranking: its configs with their costs ([`Planner::price`] ns of SM
@@ -430,6 +434,16 @@ impl Field for TileOrder {
     }
 }
 
+/// `t` and the blocks a tail tile splits over.
+impl Field for TailSplit {
+    fn put(&self, out: &mut Vec<String>) {
+        out.push(format!("t{}", self.split()));
+    }
+    fn take(fields: &mut Fields<'_>) -> Option<Self> {
+        TailSplit::new(fields.next()?.strip_prefix('t')?.parse().ok()?)
+    }
+}
+
 /// A config's code: its fields in order, each a [`Field`]; the comment
 /// gives a code.
 macro_rules! coded {
@@ -449,11 +463,11 @@ coded!(SelectCfg { warps, queue, filter });
 coded!(LaneQueue { width, depth, passes });
 coded!(Forms { truncate_p, sum_after, skip_rescale, raw_max, bias_direct });
 coded!(
-    /// `w,128,256,64,2,4,r3u,g8`
-    GemmCfg { core, tile, warps, schedule, order }
+    /// `w,128,256,64,2,4,r3u,g8,~` (`t4` for a tail split four ways)
+    GemmCfg { core, tile, warps, schedule, order, tail }
 );
 coded!(
-    /// `w,64,64,32,2,2,r2,g8,4`
+    /// `w,64,64,32,2,2,r2,g8,~,4`
     ConvCfg { gemm, split }
 );
 coded!(
@@ -474,14 +488,15 @@ pub(crate) fn representatives<C: Tiled>(ranked: &[C]) -> Vec<C> {
     ranked.iter().copied().filter(Tiled::represents).collect()
 }
 
-/// A tile's raster is a variant of it, as its pipelines are: the planner
-/// walks each tile at the raster it prices cheapest and offers the default
-/// beside it ([`GemmProblem::ranked`](super::GemmProblem)), timed only as a
-/// twin of a contender tile.
+/// A tile's raster and tail split are variants of it, as its pipelines
+/// are: the planner walks each tile at the raster and split it prices
+/// cheapest and offers one alternative beside it where it is unsure
+/// ([`GemmProblem::ranked`](super::GemmProblem)), timed only as a twin of a
+/// contender tile.
 impl Tiled for GemmCfg {
     fn tile(&self) -> Self {
         let tile = [self.tile[0], self.tile[1], 0];
-        GemmCfg { tile, schedule: self.schedule.tile(), order: TileOrder::DEFAULT, ..*self }
+        GemmCfg { tile, schedule: self.schedule.tile(), order: TileOrder::DEFAULT, tail: None, ..*self }
     }
 
     fn twins(&self, ranked: &[Self]) -> Vec<Self> {

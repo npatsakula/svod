@@ -44,6 +44,8 @@ pub use self::search::{Rejected, ShapeRejected, TargetRejected, has_kernels};
 pub(crate) use self::cost::{Claim, STEP, Weights, pair_op};
 pub(crate) use self::facts::facts_of;
 
+#[cfg(test)]
+pub(crate) use self::gemm::TAIL_SPLITS;
 pub(crate) use self::gemm::gemm_cfg;
 pub(crate) use self::norm::heads_candidates;
 #[cfg(test)]

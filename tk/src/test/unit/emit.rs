@@ -485,6 +485,7 @@ fn a_products_operand_is_the_load_that_filled_it(target: Target) {
         core: Core::Warp,
         schedule: Schedule::ring(2, false),
         order: Default::default(),
+        tail: None,
     };
     let spec =
         GemmSpec { m: 128, n: 128, k: 128, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg: assumed(cfg) };

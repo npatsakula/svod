@@ -56,14 +56,19 @@ proptest! {
         prop_assert_eq!(ids, (0..(gm * gn) as i64).collect::<Vec<_>>());
     }
 
-    /// A config's code holds its raster whole: any group height round-trips.
+    /// A config's code holds its raster whole: any group height up to the
+    /// tallest round-trips, and a taller one (a hand-made code's) reads
+    /// back as the tallest.
     #[test]
     fn a_raster_round_trips_its_code(rows in 1usize.., stages in 1usize..=3) {
         let order = TileOrder::grouped(rows).expect("a group of rows");
+        prop_assert_eq!(order.rows(), rows.min(TileOrder::MOST_ROWS));
         let cfg = GemmCfg { order, ..gemm_cfg([128, 64, 32], stages, [2, 2], false) };
         let code = cfg.code();
-        prop_assert!(code.ends_with(&format!(",g{rows}")), "{}", code);
+        prop_assert!(code.ends_with(&format!(",g{},~", order.rows())), "{}", code);
         prop_assert_eq!(GemmCfg::of_code(&code), Some(cfg));
+        let hand = code.replace(&format!(",g{},", order.rows()), &format!(",g{rows},"));
+        prop_assert_eq!(GemmCfg::of_code(&hand), Some(cfg));
     }
 }
 
@@ -80,11 +85,14 @@ fn the_raster_walks_its_groups(gm: usize, gn: usize, rows: usize, id: fn(usize, 
 }
 
 /// The GEMM computes `a · bᵀ` whatever raster its blocks walk: a grid of
-/// seven tile rows by three columns, rows and columns past the operands.
+/// seven tile rows by three columns, rows and columns past the operands;
+/// a group past the tallest (a hand-made code's) is clamped, its span of
+/// tiles representable.
 #[test_case(1; "row-major")]
 #[test_case(3; "groups of three")]
 #[test_case(8; "the default")]
 #[test_case(7; "column-major")]
+#[test_case(usize::MAX; "past the tallest")]
 fn a_gemm_walking_any_raster_computes_its_product(rows: usize) {
     let (m, n, k) = (200, 150, 64);
     let order = TileOrder::grouped(rows).expect("a group of rows");
@@ -167,9 +175,11 @@ fn each_config_walks_the_raster_priced_cheapest(target: Target, costs: Costs, m:
 /// Where the model says so the planner leaves the default: on sm_86 a
 /// weight of eight 128-column tiles is walked row-major (the blocks in
 /// flight span whole rows of it, every B tile shared), and on gfx1201 a
-/// 16384² product in groups taller than eight (its 64 CUs in flight). Each
-/// departure is within the tuner's resolution of the default, which is
-/// offered beside it.
+/// 16384² product in groups taller than eight (its 64 CUs in flight),
+/// unsplit or with a split tail ([`crate::kernels::gemm::TailSplit`]).
+/// Each unsplit departure that leads its tile is within the tuner's
+/// resolution of the default, which is offered beside it; one behind a
+/// split lead of its tile is that lead's alternative.
 #[test_case(sm86(), sm86_costs(), 4096, 1024, 4096, |rows| rows == 1; "sm_86 row-major")]
 #[test_case(rx9070xt(), gfx1201_costs(), 16384, 16384, 4096, |rows| rows > 8; "gfx1201 taller groups")]
 fn the_planner_leaves_the_default_where_the_model_says_so(
@@ -183,7 +193,13 @@ fn the_planner_leaves_the_default_where_the_model_says_so(
     let ranked = measured(target, costs).gemm_ranked(1, m, n, k, false);
     let lead = ranked[0];
     assert!(want(lead.order.rows()), "{lead:?}");
-    assert!(lead.twins(&ranked).contains(&GemmCfg { order: TileOrder::DEFAULT, ..lead }), "{lead:?}: no default twin");
+    let unsplit = *ranked.iter().find(|c| c.tail.is_none()).expect("an unsplit config");
+    assert!(want(unsplit.order.rows()), "{unsplit:?}");
+    let tile_lead = ranked.iter().find(|c| c.tile() == unsplit.tile()).expect("its tile");
+    if tile_lead.tail.is_none() {
+        let default = GemmCfg { order: TileOrder::DEFAULT, ..unsplit };
+        assert!(unsplit.twins(&ranked).contains(&default), "{unsplit:?}: no default twin");
+    }
 }
 
 /// A convolution walks the default raster: its claim prices its re-reads by

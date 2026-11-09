@@ -27,8 +27,14 @@ fn gemm_nt_epilogue(
     warps: [u32; 2],
     epi: Epilogue,
 ) -> Program {
-    let cfg =
-        GemmCfg { core: Core::Warp, tile, warps, schedule: Schedule::ring(stages, true), order: Default::default() };
+    let cfg = GemmCfg {
+        core: Core::Warp,
+        tile,
+        warps,
+        schedule: Schedule::ring(stages, true),
+        order: Default::default(),
+        tail: None,
+    };
     gemm::<BF16>(&GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: epi, cfg: assumed(cfg) })
 }
 
@@ -181,6 +187,7 @@ fn epilogues_match_on_device(m: usize, n: usize, k: usize, tile: [usize; 3], sta
             warps: [wr, wc],
             schedule: Schedule::ring(stages, true),
             order: Default::default(),
+            tail: None,
         };
         let got = on_device(prog, &cfg.lowering(&declared(target.clone())), &params);
         let (got, interp) = (got.last().unwrap(), interp.last().unwrap());

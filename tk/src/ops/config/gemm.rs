@@ -9,7 +9,7 @@ use std::num::NonZeroUsize;
 
 use crate::ir::{Axis, Schedule, Shape};
 use crate::kernels::Admitted;
-use crate::kernels::gemm::{GemmCfg, Rope, TileOrder};
+use crate::kernels::gemm::{GemmCfg, Rope, TailPlan, TailSpec, TailSplit, TileOrder};
 use crate::layouts::{Issue, Swizzle, WarpGrid, chunked, fills_in_chunks};
 use crate::tune::SETTLED;
 
@@ -108,7 +108,14 @@ impl GemmCfg {
 }
 
 pub(crate) const fn gemm_cfg(tile: [usize; 3], stages: usize, warps: [u32; 2], unroll: bool) -> GemmCfg {
-    GemmCfg { core: Core::Warp, tile, warps, schedule: Schedule::ring(stages, unroll), order: TileOrder::DEFAULT }
+    GemmCfg {
+        core: Core::Warp,
+        tile,
+        warps,
+        schedule: Schedule::ring(stages, unroll),
+        order: TileOrder::DEFAULT,
+        tail: None,
+    }
 }
 
 /// Model: a representative layer epilogue's tile operations an output
@@ -128,6 +135,17 @@ pub(crate) const EPILOGUE_OPS: f64 = 40.0;
 /// (the divides, compare and select over a `[1, bn]` tile) is shared over
 /// the tile's rows.
 pub(crate) const ROPE_OPS: f64 = 5.0;
+
+/// Search bound: the most blocks a tail tile splits over ([`TailSplit`]):
+/// past it the partials' bytes outgrow what a wave's quantisation can save.
+pub(crate) const TAIL_SPLITS: usize = 16;
+
+/// Model: what a launch costs beside its blocks' time, ns — the dispatch of
+/// its grid behind the kernel before it and the drain of that kernel's last
+/// blocks — paid by a tail split's launches past the first. No probe
+/// measures it, and the tuner's times (each program's own, summed) do not
+/// see it: a tail split is priced, not timed, past its kernels.
+pub(crate) const LAUNCH: f64 = 4000.0;
 
 /// Search bound: the output tile's rows, the first of the knobs a GEMM-shaped
 /// kernel is enumerated over.
@@ -208,10 +226,20 @@ pub struct GemmProblem {
     pub rope: Option<Rope>,
 }
 
+/// One launch of a GEMM's plan: `tiles` output tiles of a batch's walk
+/// (every batch's), each over `split` blocks a share of the reduction long.
+#[derive(Clone, Copy, Debug)]
+struct Part {
+    tiles: usize,
+    split: usize,
+}
+
+/// The bytes of a split's f32 partial.
+const F32: usize = 4;
+
 impl GemmProblem {
     pub(super) fn blocks(&self, cfg: &GemmCfg) -> usize {
-        let (gm, gn) = self.grid(cfg);
-        self.batches * gm * gn
+        self.batches * self.tiles(cfg)
     }
 
     /// A batch's grid of `cfg`'s output tiles, `[rows, cols]`.
@@ -228,35 +256,39 @@ impl GemmProblem {
         (group.min(blocks).max(blocks.div_ceil(gn)), blocks.div_ceil(group).min(gn))
     }
 
-    /// The ring's fill under `cfg`'s raster, in a batch's grid: a trip's
-    /// bytes, the operands' distinct ones, the share the blocks in flight
-    /// at once (one an SM) read of one another's lines — a window's A rows
-    /// and B columns ([`Self::window`]) — and the reach of the rest's
-    /// re-reads. A B panel (`bn × k`) returns a group later, after the
-    /// group's A panels and the whole of B have streamed; every other
-    /// re-read (an A panel a column of its group later, a B panel within
-    /// its group) after the panels of the blocks in flight, or of the
-    /// group's rows where those are more.
-    fn stream(&self, planner: &Planner, cfg: &GemmCfg) -> Stream {
+    /// The ring's fill under `cfg`'s raster over `part`'s tiles of a
+    /// batch's grid (a run of the walk from its first, the whole grid
+    /// alike): a trip's bytes, the operands' distinct ones the part's tiles
+    /// span, the share the blocks in flight at once (one an SM) read of one
+    /// another's lines — a window's A rows and B columns ([`Self::window`])
+    /// — and the reach of the rest's re-reads. A B panel (`bn × k`) returns
+    /// a group later, after the group's A panels and the whole of B have
+    /// streamed; every other re-read (an A panel a column of its group
+    /// later, a B panel within its group) after the panels of the blocks in
+    /// flight, or of the group's rows where those are more.
+    fn stream(&self, planner: &Planner, cfg: &GemmCfg, part: Part) -> Stream {
         let ([bm, bn, bk], halves) = (cfg.tile, self.halves);
         let (gm, gn) = self.grid(cfg);
         let (group, wide) = (cfg.order.group(gm), bn * halves);
-        let flight = planner.sms().min(self.blocks(cfg)).max(1).min(gm * gn);
+        let flight = planner.sms().min(self.batches * part.tiles * part.split).max(1).min(part.tiles);
         let (rows, cols) = self.window(cfg, flight);
         let shared = 1.0 - (rows * bm + cols * wide) as f64 / (flight * (bm + wide)) as f64;
         let panel = (self.k * ELEM) as f64;
         let (rows, cols) = self.window(cfg, flight.max(group));
         let near = (rows * bm + cols * wide) as f64 * panel;
         let far = (group * bm + gn * wide) as f64 * panel;
+        // The part's rows and columns: the grid's whole for every tile.
+        let (rows, cols) = self.window(cfg, part.tiles);
         // In tile rows of a batch: the bytes the blocks in flight do not
         // share, past each panel's first read, and B's a group later.
-        let unshared = (gm * gn * (bm + wide)) as f64 * (1.0 - shared);
-        let rereads = unshared - (gm * bm + gn * wide) as f64;
-        let later = (gn * wide * (gm.div_ceil(group) - 1)) as f64;
+        let unshared = (part.tiles * (bm + wide)) as f64 * (1.0 - shared);
+        let rereads = unshared - (rows * bm + cols * wide) as f64;
+        let later = (cols * wide * (rows.div_ceil(group) - 1)) as f64;
         let late = if rereads > 0.0 { (later / rereads).min(1.0) } else { 0.0 };
+        let spanned = (rows * bm).min(self.m) + (cols * wide).min(self.n * halves);
         Stream {
             bytes: ((bm + wide) * bk * ELEM) as f64,
-            unique: (self.batches * (self.m + self.n * halves) * self.k * ELEM) as f64,
+            unique: (self.batches * spanned * self.k * ELEM) as f64,
             shared,
             reach: [Reach { share: 1.0 - late, set: near }, Reach { share: late, set: far }],
         }
@@ -341,10 +373,33 @@ impl GemmProblem {
 
     /// A feasible config's [claim](super::cost::Claim) on this shape: its
     /// checks first — a step at least two matrix-core depths where the
-    /// reduction allows one, a step that divides it — then its resources. A
-    /// warpgroup product reads no fragments and holds one accumulator chain
-    /// per instruction column block; its step is the group's.
+    /// reduction allows one, a step that divides it, a tail split that runs
+    /// the problem ([`Self::tail_plan`]) — then its resources over the whole
+    /// grid, every tile data-parallel: a tail split's are its launches'
+    /// ([`Self::plan_price`]), its claim the floor's and the occupancy's.
     pub(crate) fn claim(&self, planner: &Planner, cfg: &GemmCfg, regs: u32) -> Result<Claim, Rejected> {
+        let whole = Part { tiles: self.tiles(cfg), split: 1 };
+        let Some(tail) = cfg.tail else { return self.claim_part(planner, cfg, regs, whole) };
+        let trips = self.k / cfg.tile[2];
+        let runs = self.batches == 1 && self.halves == 1 && self.rope.is_none() && TailSpec::merges(cfg);
+        if !runs || !trips.is_multiple_of(tail.split()) || trips < tail.split() {
+            return Err(ShapeRejected::Tail.into());
+        }
+        let claim = self.claim_part(planner, cfg, regs, whole)?;
+        match self.plan_of(planner, cfg, &claim) {
+            Some(_) => Ok(claim),
+            None => Err(ShapeRejected::Tail.into()),
+        }
+    }
+
+    /// The claim of one launch of `cfg` over `part`: `part.tiles` tiles of
+    /// a batch's walk each over `part.split` blocks a share of the
+    /// reduction. A split part stores its raw f32 accumulator, a `[bm, bn]`
+    /// slot a block, and its merge — the epilogue over the slots' sum — is
+    /// a section beside it. A warpgroup product reads no fragments and
+    /// holds one accumulator chain per instruction column block; its step
+    /// is the group's.
+    fn claim_part(&self, planner: &Planner, cfg: &GemmCfg, regs: u32, part: Part) -> Result<Claim, Rejected> {
         let target = &planner.device.target;
         let ([bm, bn, bk], [wr, wc]) = (cfg.tile, cfg.warps.map(|w| w as usize));
         let atom = target.geometry_on(cfg.core).ok_or(Rejected::Target(TargetRejected::Lowers))?;
@@ -373,8 +428,9 @@ impl GemmProblem {
             }
         };
         let steps = (bm * bn * halves * bk / STEP) as f64;
-        let (blocks, trips, stages) = (self.blocks(cfg), self.k / bk, cfg.stages());
-        let fill = self.stream(planner, cfg);
+        let blocks = self.batches * part.tiles * part.split;
+        let (trips, stages) = (self.k / bk / part.split, cfg.stages());
+        let fill = self.stream(planner, cfg, part);
         // The epilogue's operations over the tile's output elements, one a
         // lane's element each, paid over the trips that fold into one
         // output: their whole is m·n·[`EPILOGUE_OPS`] of lane operations
@@ -385,10 +441,14 @@ impl GemmProblem {
         // its rows' positions of both tables — `half` distinct elements a
         // row each — the side stream: priced at the ladder of its own
         // working set through the epilogue's pipe, not folded into the
-        // ring's fill, its distinct bytes in the run's floor.
-        let epilogue = EPILOGUE_OPS * (bm * bn) as f64 / trips as f64;
+        // ring's fill, its distinct bytes in the run's floor. A split part
+        // runs no epilogue: it stores its slot straight to DRAM, and its
+        // merge reads every split's slot of a tile row by row, adds them
+        // and runs the epilogue over the sum.
+        let split = part.split > 1;
+        let epilogue = if split { 0.0 } else { EPILOGUE_OPS * (bm * bn) as f64 / trips as f64 };
         let (mut ops, mut side) = (epilogue, Stream::default());
-        if let Some(rope) = self.rope {
+        if let Some(rope) = self.rope.filter(|_| !split) {
             let (half, turned) = (rope.head_dim / 2, rope.heads * rope.head_dim);
             let share = turned as f64 / self.n as f64;
             ops += ROPE_OPS * (bm * bn) as f64 * share / trips as f64;
@@ -400,6 +460,18 @@ impl GemmProblem {
                 ..Stream::default()
             };
         }
+        let (stores, merge) = match split {
+            false => (0.0, Spread::default()),
+            true => (
+                (bm * bn * F32) as f64 / trips as f64,
+                Spread {
+                    rows: (part.tiles * bm) as f64,
+                    ops: Ops::of(Kind::Epilogue, (EPILOGUE_OPS + part.split as f64) * bn as f64),
+                    bytes: ((part.split * F32 + ELEM) * bn) as f64,
+                    waits: 0.0,
+                },
+            ),
+        };
         Ok(Claim {
             blocks,
             smem,
@@ -416,12 +488,70 @@ impl GemmProblem {
             ops: Ops::of(Kind::Epilogue, ops),
             fill,
             side,
-            stores: 0.0,
+            stores,
             ring: stages,
             unroll: cfg.unroll(),
             waits: 0.0,
-            sections: [Spread::default(); 2],
+            sections: [merge, Spread::default()],
         })
+    }
+
+    /// A batch's output tiles under `cfg`.
+    fn tiles(&self, cfg: &GemmCfg) -> usize {
+        let (gm, gn) = self.grid(cfg);
+        gm * gn
+    }
+
+    /// The blocks of `cfg` the device runs at once on this problem
+    /// ([`Self::wave_of`]); `None` where the shape refuses it.
+    pub fn wave(&self, planner: &Planner, cfg: &GemmCfg) -> Option<usize> {
+        Some(self.wave_of(planner, &planner.claim_of(self, cfg).ok()?))
+    }
+
+    /// The blocks the device runs at once of `claim`'s: an SM's resident
+    /// blocks ([`Planner::resident`], by its shared memory, register file
+    /// and wave slots) on every SM — a wave of the grid.
+    fn wave_of(&self, planner: &Planner, claim: &Claim) -> usize {
+        planner.sms() * planner.resident(claim.smem, claim.regs, claim.waves).max(1)
+    }
+
+    /// The plan `cfg`'s tail split runs this problem as: its grid's whole
+    /// waves ([`Self::wave`]) data-parallel, the rest split; `None` for a
+    /// config without one, or one the problem refuses ([`Self::claim`]).
+    pub fn tail_plan(&self, planner: &Planner, cfg: &GemmCfg) -> Option<TailPlan> {
+        let claim = planner.claim_of(self, cfg).ok()?;
+        self.plan_of(planner, cfg, &claim)
+    }
+
+    fn plan_of(&self, planner: &Planner, cfg: &GemmCfg, claim: &Claim) -> Option<TailPlan> {
+        TailPlan::new(self.tiles(cfg), self.wave_of(planner, claim), cfg.tail?)
+    }
+
+    /// What `plan` costs `cfg` (its tail split's, or any other: a whole
+    /// split-K is one), ns: the whole waves' launch and the split tail's,
+    /// each priced as the planner prices a run, the merge a section of the
+    /// tail's, and [`LAUNCH`] for every launch past the first. `None` where
+    /// the shape refuses the config.
+    pub fn plan_price(&self, planner: &Planner, cfg: &GemmCfg, plan: &TailPlan) -> Option<f64> {
+        if !(self.k / cfg.tile[2]).is_multiple_of(plan.split) {
+            return None;
+        }
+        let regs = planner.claim_of(self, &GemmCfg { tail: None, ..*cfg }).ok()?.regs;
+        let price =
+            |tiles, split| self.claim_part(planner, cfg, regs, Part { tiles, split }).ok().map(|c| planner.price(&c));
+        let waves = match plan.waves {
+            Some(run) => price(run.count(), 1)?,
+            None => 0.0,
+        };
+        let launches = usize::from(plan.waves.is_some()) + 2;
+        Some(waves + price(plan.tail.count(), plan.split)? + (launches - 1) as f64 * LAUNCH)
+    }
+
+    /// The tail splits worth pricing `cfg` at on this problem: the counts up
+    /// to [`TAIL_SPLITS`] that divide its trips.
+    fn tails(&self, cfg: &GemmCfg) -> impl Iterator<Item = TailSplit> + use<> {
+        let trips = self.k / cfg.tile[2];
+        (2..=TAIL_SPLITS.min(trips)).filter(move |s| trips.is_multiple_of(*s)).filter_map(TailSplit::new)
     }
 
     /// The lattice's configs that run this problem on the planner's target,
@@ -433,50 +563,74 @@ impl GemmProblem {
         let feasible = planner.feasible(self);
         let planned: Vec<_> = feasible.iter().filter_map(|f| self.planned(planner, f)).collect();
         let mut admitted: Vec<(f64, u32, GemmCfg)> = planned.iter().map(|(best, _)| *best).collect();
-        // One alternative a tile: its cheapest pipeline at the default
-        // raster, where the model walks it otherwise unsure ([`Self::planned`]).
+        // One alternative a tile: its cheapest pipeline's, where the model
+        // walks it otherwise unsure ([`Self::planned`]).
         let mut order: Vec<usize> = (0..planned.len()).collect();
         order.sort_by(|&a, &b| planned[a].0.0.total_cmp(&planned[b].0.0));
         let mut tiles = std::collections::HashSet::new();
-        let alternatives = order.into_iter().filter(|&i| tiles.insert(planned[i].0.2.tile()));
-        admitted.extend(alternatives.filter_map(|i| planned[i].1));
+        let paired: Vec<_> = order
+            .into_iter()
+            .filter(|&i| tiles.insert(planned[i].0.2.tile()))
+            .filter_map(|i| Some((planned[i].0.2, planned[i].1?)))
+            .collect();
+        admitted.extend(paired.iter().map(|&(_, alt)| alt));
         let spanned = feasible.len() + admitted.len() - planned.len();
-        let ranked = sorted(self, admitted, spanned);
+        let mut ranked = sorted(self, admitted, spanned);
+        // A kept split's unsplit twin outlives the prune: however far past
+        // the split the model prices it, no split was ever measured.
+        let kept: Vec<GemmCfg> = ranked.iter().map(|&(.., c)| c).collect();
+        let twins = paired
+            .into_iter()
+            .filter(|(lead, alt)| lead.tail.is_some() && kept.contains(lead) && !kept.contains(&alt.2));
+        ranked.extend(twins.map(|(_, alt)| alt));
         spread(ranked.into_iter().map(|(cost, _, c)| (cost, c)).collect(), |c| [c.tile[0], c.tile[1]])
     }
 
-    /// A feasible config at the raster the model prices cheapest on this
-    /// problem ([`Self::orders`], the default on a tie), its cost and
-    /// registers, and the default raster's beside it where the model is
-    /// unsure of the departure; `None` where the shape leaves it out. The
-    /// raster moves only the fill's price: without a cache ladder every
-    /// raster prices the same and the default stands.
+    /// A feasible config at the raster and tail split the model prices
+    /// cheapest on this problem ([`Self::orders`], the default on a tie;
+    /// [`Self::tails`] at each, every tile data-parallel on a tie),
+    /// its cost and registers, and one alternative beside it where the
+    /// model is unsure of a departure; `None` where the shape leaves it out.
     ///
-    /// The model weighs the blocks in flight sharing B columns (a taller
-    /// group) against the reach of the re-reads ([`Self::stream`]): a group
-    /// whose A panels and the window's B panels outgrow the cache sends
-    /// them back to DRAM between columns. Unsure: the default priced within
-    /// [`SETTLED`] of the pick, a gap the tuner's own rounds do not resolve
-    /// either. The term is priced by the ladder alone, never fitted to a
-    /// raster's measured time, while every store so far timed the default,
-    /// so there the tuner times the default too (one pipeline a tile, as a
-    /// twin of the tile: [`Tiled::twins`]).
+    /// The raster moves only the fill's price: without a cache ladder every
+    /// raster prices the same and the default stands. The model weighs the
+    /// blocks in flight sharing B columns (a taller group) against the reach
+    /// of the re-reads ([`Self::stream`]): a group whose A panels and the
+    /// window's B panels outgrow the cache sends them back to DRAM between
+    /// columns. A tail split weighs the last wave's idle SMs against its
+    /// partials' bytes, their merge and its launches ([`Self::plan_price`]).
+    ///
+    /// Unsure: where a split leads, always (no split was ever timed against
+    /// its model); else the other side priced within [`SETTLED`] of the
+    /// pick, a gap the tuner's own rounds do not resolve either. Neither
+    /// term is fitted to a measured time, while every store so far timed
+    /// the default raster unsplit, so there the tuner times the other side
+    /// too (one pipeline a tile, as a twin of the tile: [`Tiled::twins`]):
+    /// the cheapest unsplit config where a split one leads, and where an
+    /// unsplit one leads the default raster before the cheapest split.
     #[allow(clippy::type_complexity)]
     fn planned(
         &self,
         planner: &Planner,
         f: &Feasible<GemmCfg>,
     ) -> Option<((f64, u32, GemmCfg), Option<(f64, u32, GemmCfg)>)> {
-        let price = |order| {
-            let cfg = GemmCfg { order, ..f.cfg };
+        let price = |cfg: GemmCfg| {
             planner.price_of(self, &Feasible { cfg, regs: f.regs }).map(|(cost, regs)| (cost, regs, cfg))
         };
-        let default = price(TileOrder::DEFAULT)?;
-        if planner.device.costs.l2_bytes <= 0.0 {
-            return Some((default, None));
-        }
-        let best = self.orders(&f.cfg).skip(1).filter_map(price).fold(default, |a, b| if b.0 < a.0 { b } else { a });
-        Some((best, (best.2.order != TileOrder::DEFAULT && default.0 <= best.0 * SETTLED).then_some(default)))
+        let cheaper = |a: (f64, u32, GemmCfg), b: (f64, u32, GemmCfg)| if b.0 < a.0 { b } else { a };
+        let default = GemmCfg { order: TileOrder::DEFAULT, ..f.cfg };
+        let ladder = planner.device.costs.l2_bytes > 0.0;
+        let others = self.orders(&f.cfg).skip(1).filter(|_| ladder).map(|order| GemmCfg { order, ..f.cfg });
+        let rasters: Vec<GemmCfg> = std::iter::once(default).chain(others).collect();
+        let first = price(default)?;
+        let best = rasters[1..].iter().filter_map(|&c| price(c)).fold(first, cheaper);
+        let raster = (best.2.order != TileOrder::DEFAULT && first.0 <= best.0 * SETTLED).then_some(first);
+        let tails = rasters.iter().flat_map(|&c| self.tails(&c).map(move |tail| GemmCfg { tail: Some(tail), ..c }));
+        let Some(split) = tails.filter_map(price).reduce(cheaper) else { return Some((best, raster)) };
+        Some(match split.0 < best.0 {
+            true => (split, Some(best)),
+            false => (best, raster.or((split.0 <= best.0 * SETTLED).then_some(split))),
+        })
     }
 }
 
@@ -502,6 +656,14 @@ impl Family for GemmProblem {
 
     fn claim(&self, planner: &Planner, cfg: &GemmCfg, regs: u32) -> Result<Claim, Rejected> {
         GemmProblem::claim(self, planner, cfg, regs)
+    }
+
+    /// A tail split's launches ([`GemmProblem::plan_price`]), else the claim's run.
+    fn price(&self, planner: &Planner, cfg: &GemmCfg, claim: &Claim) -> f64 {
+        match self.plan_of(planner, cfg, claim) {
+            Some(plan) => self.plan_price(planner, cfg, &plan).unwrap_or(f64::INFINITY),
+            None => planner.price(claim),
+        }
     }
 }
 

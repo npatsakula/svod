@@ -2,7 +2,7 @@
 //! a gathered A operand. `M` is the output pixels, `N` the output channels
 //! and `K = kh·kw·cin` walked tap-major, one pipeline over every tap.
 
-use super::gemm::{Epilogue, GemmCfg, GemmSpec, SplitMergeSpec, mainloop_gemm, split_merge};
+use super::gemm::{Epilogue, GemmCfg, GemmSpec, SplitMergeSpec, Tiles, mainloop_gemm, split_merge};
 use super::{Admitted, Batch};
 use crate::atoms::Device;
 use crate::build::*;
@@ -83,7 +83,14 @@ impl<'t> ConvSpec<'t> {
     /// The merge of a split convolution.
     pub fn merge(&self) -> SplitMergeSpec {
         let gemm = self.gemm();
-        SplitMergeSpec { m: gemm.m, n: gemm.n, split: self.split, epilogue: self.epilogue, tile: MERGE_TILE }
+        SplitMergeSpec {
+            m: gemm.m,
+            n: gemm.n,
+            split: self.split,
+            epilogue: self.epilogue,
+            tile: MERGE_TILE,
+            parts: None,
+        }
     }
 
     /// The programs to launch in order with their lowerings: the convolution,
@@ -113,7 +120,7 @@ pub fn conv<T: Half>(spec: &ConvSpec) -> Program {
         Batch::Var(_) => 1,
     };
     let (m, slices, shape) = (gemm.m, spec.cfg.slices(), Shape::new(spec.cfg.tile[0], bk));
-    mainloop_gemm::<T>("conv", &gemm, images * g.h * g.w * g.cin, spec.split, |_k, x, bb, row0| {
+    mainloop_gemm::<T>("conv", &gemm, images * g.h * g.w * g.cin, Tiles::Grid, spec.split, |_k, x, bb, row0| {
         let base = bb.clone().map_or(Sc::from(0), |b| b * (g.h * g.w * g.cin));
         Box::new(move |k, step: Sc<'_>, koff| {
             let v = im2col_view(k, x, &g, m, base.clone(), row0.clone(), step.clone(), shape);

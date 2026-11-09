@@ -30,7 +30,14 @@ fn flat(n: usize, seed: &mut u64) -> Tensor {
 }
 
 const fn cfg(tile: [usize; 3], warps: [u32; 2], unroll: bool) -> GemmCfg {
-    GemmCfg { tile, warps, core: Core::Warp, schedule: Schedule::ring(2, unroll), order: TileOrder::DEFAULT }
+    GemmCfg {
+        tile,
+        warps,
+        core: Core::Warp,
+        schedule: Schedule::ring(2, unroll),
+        order: TileOrder::DEFAULT,
+        tail: None,
+    }
 }
 
 #[test]

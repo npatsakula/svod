@@ -55,6 +55,9 @@ impl ConvProblem {
             (Fill::CpAsync, Some(atom)) => 2 * atom.k as usize,
             _ => 0,
         };
+        if cfg.tail.is_some() {
+            return Err(ShapeRejected::Tail.into());
+        }
         if !self.geom.cin.is_multiple_of(cfg.tile[2]) {
             return Err(ShapeRejected::Divides.into());
         }

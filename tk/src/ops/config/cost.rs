@@ -381,6 +381,13 @@ pub(crate) trait Family {
     /// it is left out, or what it uses; `regs` is what [`Self::feasible`]
     /// counted for it.
     fn claim(&self, planner: &Planner, cfg: &Self::Cfg, regs: u32) -> Result<Claim, Rejected>;
+
+    /// What a config whose resources are `claim` costs, ns of SM time: the
+    /// claim's run ([`Planner::price`]); a family whose config launches
+    /// several kernels prices each.
+    fn price(&self, planner: &Planner, _cfg: &Self::Cfg, claim: &Claim) -> f64 {
+        planner.price(claim)
+    }
 }
 
 /// A config feasible on the planner's target for a family's statics, with
@@ -486,7 +493,7 @@ impl Planner {
     /// [`Self::feasible`] settled; `None` where its shape leaves it out.
     pub(crate) fn price_of<P: Family>(&self, problem: &P, feasible: &Feasible<P::Cfg>) -> Option<(f64, u32)> {
         let claim = problem.claim(self, &feasible.cfg, feasible.regs).ok()?;
-        Some((self.price(&claim), claim.regs))
+        Some((problem.price(self, &feasible.cfg, &claim), claim.regs))
     }
 
     /// A planner over what the device's probes measured, as [`Self::new`].
@@ -613,7 +620,7 @@ impl Planner {
     pub(crate) fn admit<P: Family>(&self, problem: &P, cfg: &P::Cfg) -> Result<(f64, u32), Rejected> {
         let regs = P::feasible(cfg, &self.device.target, &problem.statics())?;
         let claim = problem.claim(self, cfg, regs)?;
-        Ok((self.price(&claim), claim.regs))
+        Ok((problem.price(self, cfg, &claim), claim.regs))
     }
 
     /// The least wall ns `cfg`'s kernel can honestly take

@@ -51,8 +51,9 @@ use crate::lower::Lowering;
 /// and lowerings, targets and costs whole. 8 keys configs by their derived
 /// `Debug`, a ring a [`crate::ir::Schedule`]. 9 ends a GEMM's code in its
 /// raster (`g8`, [`crate::kernels::gemm::TileOrder`]), which its `Debug`
-/// names off the default only.
-pub(crate) const FORMAT: u32 = 9;
+/// names off the default only. 10 ends it in its tail split (`~`, or `t4`
+/// for four ways, [`crate::kernels::gemm::TailSplit`]).
+pub(crate) const FORMAT: u32 = 10;
 /// Measurement: the rounds a contender is timed (the first over every
 /// candidate, the rest over the contenders), and the rounds the two leaders
 /// then run again ([`rounds`]).

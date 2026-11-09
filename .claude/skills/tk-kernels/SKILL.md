@@ -197,9 +197,9 @@ rocprof, or tk's probes). `llvm-mca` on AMDGPU is a one-wave, no-memory model an
 ## Tune store
 
 `$SVOD_TK_TUNE_DIR`, else `$XDG_CACHE_HOME/svod/tk_tune`, else `~/.cache/svod/tk_tune`; one file per device
-`<arch>_<sms>sm-v<crate version>.txt` (`sm_86_28sm-v0.2.0.txt`) under a `format 9` line (`tune::FORMAT`); lines
+`<arch>_<sms>sm-v<crate version>.txt` (`sm_86_28sm-v0.2.0.txt`) under a `format 10` line (`tune::FORMAT`); lines
 `choice|…` (`idx:code ns` pairs, fastest first, each candidate's config as its family's compact code —
-`Tiled::code`, a GEMM's `w,128,256,64,2,4,r3u,g8` ending in its raster), `admitted|…`/`first|…` (`idx:code`), `value|…` (one number; probes in femtoseconds) keyed by op,
+`Tiled::code`, a GEMM's `w,128,256,64,2,4,r3u,g8,~` ending in its raster and tail split, `~` or `t4`), `admitted|…`/`first|…` (`idx:code`), `value|…` (one number; probes in femtoseconds) keyed by op,
 device, dtype, shape, candidate digest, compiler digest and the
 fingerprint of the **emitted kernels** (lowered program + LLVM text), so only a change in what a kernel emits re-measures.
 The emitted fingerprints are memoized per build in `emitted/<build>.txt` (dropped after 7 days unused). A new FORMAT
@@ -217,6 +217,7 @@ The `#[ignore]` probes print and never assert; one at a time on an idle GPU:
 | `device::gemm_throughput_probe` | 4096³ bf16 TFLOP/s per config, the tuner's pick marked |
 | `device::gemm_candidates_probe`, `device::qwen3_gemm_candidates_probe` | every admitted candidate on Nemotron / Qwen3 shapes |
 | `device::gemm_raster_probe` | every raster (`TileOrder`, groups of 1, 2, 4, … tile rows and column-major) of the tuner's pick and the planner's first, µs and × the default's beside the model's ×, on 4096³, 4096×1024×4096, 8192²×1024 (`RASTER_SHAPES=MxNxK;…`) |
+| `device::gemm_tail_probe` | data-parallel vs the model's cheapest whole split-K vs its cheapest tail split (full waves data-parallel, the last partial wave split along K), µs, TFLOP/s and × DP beside the model's ×, two passes in opposite orders, the planner's pick marked; 8192×4096×4096, 4096³, 8192²×1024, 6144×4096×8192 (`TAIL_SHAPES=MxNxK;…`) |
 | `attention::{attention_throughput_probe, attention_candidates_probe, decode_throughput_probe}` | FA d64/d128 ± causal ± bias TFLOP/s; decoder step µs |
 | `conv::conv_throughput_probe`, `rows::norm_bandwidth_probe` | YOLO conv classes vs graph µs; norm GB/s |
 | `attention::key_warp_resources_probe` | registers/LDS/spill per key-warp config |
