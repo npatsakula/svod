@@ -506,6 +506,16 @@ impl ExecutionPlan {
         Ok(())
     }
 
+    /// Refuse to launch while a host write into any bound storage is live:
+    /// the GPU would read stores still in flight. One load per buffer, outside
+    /// the poisoning epoch, so the plan stays usable once the guard drops.
+    fn check_no_host_writes(&self) -> Result<()> {
+        for buffer in &self.buffers {
+            buffer.ensure_no_host_write("launch").context(ExecSnafu { context: "bind plan buffers" })?;
+        }
+        Ok(())
+    }
+
     fn poison_hcq<T>(&self, result: Result<T>) -> Result<T> {
         if let Err(error) = &result {
             let _ = self.hcq_poison.set(error.to_string());
@@ -1327,6 +1337,7 @@ impl ExecutionPlan {
     /// `test_execute_walks_op_levels_in_level_order`.
     pub fn execute(&self) -> Result<()> {
         self.check_hcq_poison()?;
+        self.check_no_host_writes()?;
         // One plan has one mutable replay epoch regardless of backend path.
         // Native, graph, direct, and profiled execution share this lock.
         let mut executor = self
@@ -1434,6 +1445,7 @@ impl ExecutionPlan {
     /// as one opaque submission and would report no counters at all.
     fn execute_profiled_inner(&self, per_dispatch: bool) -> Result<Vec<KernelProfile>> {
         self.check_hcq_poison()?;
+        self.check_no_host_writes()?;
         let mut finalizer = SubmissionProfileFinalizer::with_capacity(self.op_order.len());
         let mut executor = self
             .hcq_executor

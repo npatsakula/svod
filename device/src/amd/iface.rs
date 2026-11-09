@@ -117,9 +117,9 @@ pub trait AmdIface: Send + Sync + std::fmt::Debug {
 /// kernarg arena, graph and plan kernargs and command buffers), so a doorbell
 /// itself needs no flush. Host stores into VRAM are rare and explicit (code
 /// upload, CWSR headers, zero-fill, copy-in, host transfers): each flushes
-/// with [`Hdp::flush`] once its stores are done. A mutable host view of a VRAM
-/// buffer hands its stores to a caller that writes later, so it marks them
-/// [`Hdp::defer`]red and the device's next doorbell flushes them.
+/// with [`Hdp::flush`] once its stores are done. A [`crate::buffer::HostWrite`]
+/// into VRAM marks its stores [`Hdp::defer`]red when it drops, and the
+/// device's next doorbell flushes them once for every guard since the last.
 #[derive(Debug)]
 pub(crate) struct Hdp {
     iface: Arc<dyn AmdIface>,
@@ -138,14 +138,15 @@ impl Hdp {
         self.iface.flush_hdp();
     }
 
-    /// The host will store into VRAM after this call returns, with no point
-    /// of its own to flush at; the device's next doorbell flushes for it.
+    /// This thread's VRAM stores so far are done; the device's next doorbell
+    /// flushes them. The fence drains its write-combining buffers first.
     pub(crate) fn defer(&self) {
+        std::sync::atomic::fence(Ordering::SeqCst);
         self.deferred.store(true, Ordering::Release);
     }
 
-    /// Run by every doorbell after its SeqCst fence: flush stores a mutable
-    /// VRAM view may have made since the last doorbell.
+    /// Run by every doorbell after its SeqCst fence: flush the stores host
+    /// writes deferred since the last doorbell.
     pub(crate) fn flush_deferred(&self) {
         if self.deferred.load(Ordering::Relaxed) && self.deferred.swap(false, Ordering::AcqRel) {
             self.iface.flush_hdp();

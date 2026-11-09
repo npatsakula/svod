@@ -100,6 +100,8 @@ pub enum RawBuffer {
         size: usize,
         handle: u64,
         device: std::sync::Arc<crate::amd::AmdDevice>,
+        /// Device VRAM, whose host stores pass HDP; else uncached GTT.
+        vram: bool,
     },
     /// Metal buffer with `MTLResourceStorageModeShared` storage.
     ///
@@ -550,12 +552,15 @@ impl LruAllocator {
             // recycle ever routed here, a host memset through the read-only mmap
             // is impossible — surface it instead of panicking.
             RawBuffer::Mmap { .. } => UnsupportedSnafu { op: "zero-init read-only DISK mmap" }.fail(),
-            RawBuffer::AmdDevice { host_ptr: Some(ptr), size, gpu_addr, device, .. } => {
+            RawBuffer::AmdDevice { host_ptr: Some(ptr), size, gpu_addr, device, vram, .. } => {
                 // This VA was just recycled from the pool: wait its recorded
                 // producers (usually already retired via the pop fence) before
                 // the host memset, which isn't ordered on the GPU timeline.
                 device.core().wait_storage(*gpu_addr)?;
                 unsafe { std::ptr::write_bytes(ptr.as_ptr(), 0, *size) };
+                if *vram {
+                    device.core().hdp().flush();
+                }
                 Ok(true)
             }
             RawBuffer::AmdDevice { host_ptr: None, .. } => Ok(false),

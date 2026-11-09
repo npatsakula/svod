@@ -732,7 +732,7 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
     };
 
     // One `..._mut` per input/state slot (`(i)`-indexed for array slots) plus
-    // a typed write view for host-visible inputs.
+    // a typed host write guard for host-visible inputs.
     let slot_index_arm = |slot: &Slot, leaf_ident: &dyn Fn(usize) -> Ident| -> TokenStream {
         match slot.count {
             Some(_) => {
@@ -759,22 +759,22 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
     let input_accessor_impls = host_slots().map(|(slot, is_state)| {
         let (slot_name, label) = (&slot.name, slot.name.to_string());
         let accessor = format_ident!("{}_mut", slot_name);
-        let view_mut = format_ident!("{}_view_mut", slot_name);
+        let host_write = format_ident!("{}_host_write", slot_name);
         let params = if slot.count.is_some() {
             quote! { , index: usize }
         } else {
             quote! {}
         };
         let resolve = slot_index_arm(slot, &|i| format_ident!("{}_idx", slot.leaf(i)));
-        // State buffers have no host mapping, so no typed write view.
+        // State buffers have no host mapping, so no host write guard.
         let view = (!is_state).then(|| {
             quote! {
-                fn #view_mut<T: #rt::HasDType>(&mut self #params) -> #jit_path::Result<#rt::ArrayViewMutD<'_, T>> {
+                fn #host_write<T: #rt::HasDType + Copy>(&mut self #params) -> #jit_path::Result<#rt::HostWrite<'_, T>> {
                     #resolve
                     let buffer = self.plan
                         .buffer_at_mut(__jit_idx)
                         .ok_or(#jit_path::JitError::InputBufferNotFound { name: #label })?;
-                    #jit_path::view_mut::<T>(buffer)
+                    #jit_path::host_write::<T>(buffer)
                 }
             }
         });
@@ -907,7 +907,7 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
     for (slot, is_state) in host_slots() {
         let slot_name = &slot.name;
         let accessor = format_ident!("{}_mut", slot_name);
-        let view_mut = format_ident!("{}_view_mut", slot_name);
+        let host_write = format_ident!("{}_host_write", slot_name);
         let (params, arg) =
             if slot.count.is_some() { (quote! { , index: usize }, quote! { index }) } else { (quote! {}, quote! {}) };
         wrapper_api.push(forward(
@@ -918,9 +918,9 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
         if !is_state {
             wrapper_api.push(forward(
                 quote! {
-                    fn #view_mut<T: #rt::HasDType>(&mut self #params) -> #jit_path::Result<#rt::ArrayViewMutD<'_, T>>
+                    fn #host_write<T: #rt::HasDType + Copy>(&mut self #params) -> #jit_path::Result<#rt::HostWrite<'_, T>>
                 },
-                quote! { #view_mut::<T>(#arg) },
+                quote! { #host_write::<T>(#arg) },
                 true,
             ));
         }

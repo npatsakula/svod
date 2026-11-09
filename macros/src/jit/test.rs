@@ -155,10 +155,10 @@ fn state_slots_assign_back_and_stay_internal() {
     // State is a prepare parameter, allocated device-local …
     assert!(out.contains("h:::svod_tensor::jit::InputSpec"));
     assert!(out.contains("::svod_tensor::jit::rt::BufferSpec{cpu_access:false,..Default::default()}"));
-    // … an input the host can seed, but with no typed write view.
+    // … an input the host can seed, but with no host write guard.
     assert!(out.contains("pubfnh_mut(&mutself)"));
-    assert!(!out.contains("h_view_mut"));
-    assert!(out.contains("pubfnx_view_mut"));
+    assert!(!out.contains("h_host_write"));
+    assert!(out.contains("pubfnx_host_write"));
     // … whose new value is stored back into its own buffer.
     assert!(out.contains("let__jit_state_out_h={let__jit_out=::svod_tensor::Tensor::from_lazy(__jit_input_h.uop());"));
     assert!(out.contains("__jit_out.try_assign(&__jit_state_new_h)?;"));

@@ -202,11 +202,9 @@ impl WhisperAligner {
             lanes.push(Lane { text, token_probs, valid_text: tokens.len(), prompt_len });
         }
 
-        let bytes: &[u8] = bytemuck::cast_slice(&packed_tokens);
         let fence = jit.tokens_mut()?.clone();
-        copies.h2d("alignment_tokens", 1, bytes.len(), &fence, || -> Result<()> {
-            jit.tokens_mut()?.as_host_bytes_mut()?.copy_from_slice(bytes);
-            Ok(())
+        copies.h2d("alignment_tokens", 1, size_of_val(packed_tokens.as_slice()), &fence, || -> Result<()> {
+            Ok(jit.tokens_host_write::<i32>()?.copy_from(&packed_tokens)?)
         })?;
         let mut graph = GraphProfile::new(copies.enabled());
         graph.execute(

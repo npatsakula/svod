@@ -98,13 +98,13 @@ let plan = Tensor::prepare_batch(outputs.values())?;   // schedule + compile, on
 plan.execute()?;
 
 for batch in batches {
-    image.array_view_mut::<f32>()?.as_slice_mut().unwrap().copy_from_slice(&batch);
+    image.with_host_write::<f32, _>(|w| w.copy_from(&batch))?;
     plan.execute()?;                                   // replay: no tracing, no compilation
     let logits = outputs["output"].as_vec::<f32>()?;
 }
 ```
 
-`array_view_mut` इनपुट की host mapping पर एक zero-copy `ndarray` view है;
+`with_host_write` सीधे इनपुट की host mapping में लिखता है;
 `prepare_batch` हर output टेंसर को प्लान के बफ़र से जोड़ता है, इसलिए `as_vec` /
 `as_ndarray` नवीनतम रन का परिणाम पढ़ते हैं।
 
@@ -113,7 +113,7 @@ for batch in batches {
 `import(path)` वह प्रवेश बिंदु है जो weights को memory-map करता है और
 external data resolve करता है। इसके इनपुट placeholders हैं: उसी shape का मान `assign` करें
 और इनपुट को outputs से *पहले* realize करें। Placeholder सभी plans में एक ही बफ़र रखता है, इसलिए prepare किया गया
-प्लान बाद के `assign` + `realize` और `array_view_mut` से लिखा गया डेटा भी देखता है।
+प्लान बाद के `assign` + `realize` और `with_host_write` से लिखा गया डेटा भी देखता है।
 
 ```rust
 let OnnxModel { mut inputs, outputs, .. } = OnnxImporter::new().import("model.onnx", &[])?;
@@ -321,7 +321,7 @@ println!("variables: {:?}", model.variables);
 | पहलू | विवरण |
 |---|---|
 | **प्रवेश बिंदु** | `import(path, dims)`, `import_model_with_inputs(proto, inputs, dims)`, `import_model(proto, dims)` |
-| **रनटाइम इनपुट** | टेंसर बनाएँ, उन्हें `import_model_with_inputs` को दें, रनों के बीच `array_view_mut` के ज़रिए लिखें |
+| **रनटाइम इनपुट** | टेंसर बनाएँ, उन्हें `import_model_with_inputs` को दें, रनों के बीच `with_host_write` के ज़रिए लिखें |
 | **डायनामिक आयाम** | इम्पोर्ट पर बाँधें: `&[("batch", 8)]`; हर batch size के लिए एक इम्पोर्ट |
 | **ऑपरेटर** | 200 में से 162 ([पैरिटी तालिका](https://github.com/npatsakula/svod/blob/main/onnx/PARITY.md)) |
 | **अनुरूपता** | Clang और LLVM पर 1357 node टेस्ट; `SVOD_DEVICE` के ज़रिए AMD और CUDA |

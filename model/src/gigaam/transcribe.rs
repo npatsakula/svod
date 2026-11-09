@@ -408,7 +408,7 @@ impl svod_arch::pipelines::audio::Transcriber for GigaAmTranscriber {
                 self.mel.frame_into(windows[chunk_batch_start + bi], row);
             }
             self.mel_jit.framed_mut()?.copyin_at(0, bytemuck::cast_slice(&self.framed[..b * framed_len]))?;
-            pack_lengths_buffer(self.mel_jit.frames_view_mut::<i32>()?, &chunk_lengths);
+            pack_lengths_buffer(self.mel_jit.frames_host_write::<i32>()?, &chunk_lengths);
             self.mel_jit.execute()?;
             let batch_mels = self.mel_jit.output()?;
             t_mel += t_stage.elapsed();
@@ -419,7 +419,7 @@ impl svod_arch::pipelines::audio::Transcriber for GigaAmTranscriber {
                 HeadDecoder::Ctc { jit, decoder } => {
                     let t_pack = Instant::now();
                     jit.mel_mut()?.copy_from(batch_mels)?;
-                    pack_lengths_buffer(jit.lengths_view_mut::<i32>()?, &chunk_lengths);
+                    pack_lengths_buffer(jit.lengths_host_write::<i32>()?, &chunk_lengths);
                     t_mel += t_pack.elapsed();
 
                     let t_enc = Instant::now();
@@ -461,7 +461,7 @@ impl svod_arch::pipelines::audio::Transcriber for GigaAmTranscriber {
                     let enc_jit = self.encoder_jit.as_mut().expect("RN-T path has a standalone encoder JIT");
                     let t_pack = Instant::now();
                     enc_jit.mel_mut()?.copy_from(batch_mels)?;
-                    pack_lengths_buffer(enc_jit.lengths_view_mut::<i32>()?, &chunk_lengths);
+                    pack_lengths_buffer(enc_jit.lengths_host_write::<i32>()?, &chunk_lengths);
                     t_mel += t_pack.elapsed();
 
                     let t_enc = Instant::now();
@@ -558,8 +558,8 @@ impl svod_arch::pipelines::audio::Transcriber for GigaAmTranscriber {
 
 /// Pack per-chunk mel-frame counts into a JIT lengths input view `[max_batch]`,
 /// zero-padding unused entries.
-pub(crate) fn pack_lengths_buffer(mut view: ndarray::ArrayViewMutD<'_, i32>, chunk_lengths: &[usize]) {
-    let slice = view.as_slice_mut().expect("contiguous lengths buffer");
+pub(crate) fn pack_lengths_buffer(mut lengths: crate::jit::rt::HostWrite<'_, i32>, chunk_lengths: &[usize]) {
+    let slice = lengths.as_mut_slice();
     slice.fill(0);
     for (dst, &len) in slice.iter_mut().zip(chunk_lengths) {
         *dst = len as i32;

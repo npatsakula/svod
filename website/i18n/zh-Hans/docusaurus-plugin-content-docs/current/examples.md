@@ -57,10 +57,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `as_vec::<T>()`、`as_ndarray::<T>()` | 从不——未执行时返回 `NoBuffer` 错误 | 拥有所有权的副本 |
 | `to_vec::<T>()`、`to_ndarray::<T>()` | 按需 | 拥有所有权的副本 |
 | `item::<T>()` | 按需 | 唯一的那个元素 |
-| `array_view::<T>()`、`array_view_mut::<T>()` | 从不 | 借用的 `ndarray` 视图，零拷贝 |
+| `array_view::<T>()` | 从不 | 借用的 `ndarray` 视图，零拷贝 |
+| `with_host_write::<T, _>(f)` | 从不 | 独占的宿主写守卫，不是视图 |
 
 因此最短的写法是 `(&a + &b)?.to_vec::<f32>()?`。在隐式 realize 会构成 bug 的地方
-使用 `as_*` 系列。视图要求缓冲区可映射到宿主（CPU，或带宿主映射的 GPU 缓冲区），
+使用 `as_*` 系列。视图和写守卫要求缓冲区可映射到宿主（CPU，或带宿主映射的 GPU 缓冲区），
 并且张量要拥有自己的缓冲区而不是某个缓冲区的视图。
 
 ---
@@ -310,7 +311,7 @@ fn stream(frames: &[Vec<f32>]) -> Result<(), Box<dyn std::error::Error>> {
 
     let plan = energy.prepare()?;                          // schedule + compile, once
     for frame in frames {
-        input.array_view_mut::<f32>()?.as_slice_mut().unwrap().copy_from_slice(frame);
+        input.with_host_write::<f32, _>(|w| w.copy_from(frame))?;
         plan.execute()?;                                   // replay: no tracing, no compilation
         println!("{}", energy.item::<f32>()?);
     }

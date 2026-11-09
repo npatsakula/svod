@@ -95,20 +95,20 @@ let plan = Tensor::prepare_batch(outputs.values())?;   // schedule + compile, on
 plan.execute()?;
 
 for batch in batches {
-    image.array_view_mut::<f32>()?.as_slice_mut().unwrap().copy_from_slice(&batch);
+    image.with_host_write::<f32, _>(|w| w.copy_from(&batch))?;
     plan.execute()?;                                   // replay: no tracing, no compilation
     let logits = outputs["output"].as_vec::<f32>()?;
 }
 ```
 
-`array_view_mut` 是输入宿主映射上的零拷贝 `ndarray` 视图；`prepare_batch` 把每个输出
+`with_host_write` 直接写入输入的宿主映射；`prepare_batch` 把每个输出
 张量接到计划的缓冲区上，所以 `as_vec` / `as_ndarray` 读到的是最近一次运行的结果。
 
 ### 占位符输入
 
 `import(path)` 是会内存映射权重并解析外部数据的入口。它的输入是占位符：`assign`
 一个相同形状的值，并在输出*之前*先执行输入。占位符在所有计划之间保持同一个 buffer，
-因此已准备好的计划也能看到之后的 `assign` + `realize` 以及通过 `array_view_mut` 的写入。
+因此已准备好的计划也能看到之后的 `assign` + `realize` 以及通过 `with_host_write` 的写入。
 
 ```rust
 let OnnxModel { mut inputs, outputs, .. } = OnnxImporter::new().import("model.onnx", &[])?;
@@ -297,7 +297,7 @@ println!("variables: {:?}", model.variables);
 | 方面 | 细节 |
 |---|---|
 | **入口** | `import(path, dims)`、`import_model_with_inputs(proto, inputs, dims)`、`import_model(proto, dims)` |
-| **运行时输入** | 构建张量，传给 `import_model_with_inputs`，两次运行之间通过 `array_view_mut` 写入 |
+| **运行时输入** | 构建张量，传给 `import_model_with_inputs`，两次运行之间通过 `with_host_write` 写入 |
 | **动态维度** | 导入时绑定：`&[("batch", 8)]`；每种批大小导入一次 |
 | **算子** | 162 / 200（[覆盖表](https://github.com/npatsakula/svod/blob/main/onnx/PARITY.md)） |
 | **一致性** | 1357 个节点测试在 Clang 和 LLVM 上通过；AMD 和 CUDA 通过 `SVOD_DEVICE` |

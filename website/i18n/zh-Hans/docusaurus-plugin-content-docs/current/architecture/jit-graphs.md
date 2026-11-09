@@ -97,7 +97,7 @@ jit_wrapper! {
 }
 ```
 
-**`[Tensor; N]` 槽位**把 N 个缓冲区放在一个名字之下：`prepare` 接收 `[InputSpec; N]`，build 闭包接收 `[&Tensor; N]`，生成的访问器接收一个叶子索引——`jit.taps_view_mut::<f32>(1)?`。输出同样可以是数组。输入索引越界会返回 `JitError::InputBufferNotFound`；输出索引越界则会 panic。
+**`[Tensor; N]` 槽位**把 N 个缓冲区放在一个名字之下：`prepare` 接收 `[InputSpec; N]`，build 闭包接收 `[&Tensor; N]`，生成的访问器接收一个叶子索引——`jit.taps_host_write::<f32>(1)?`。输出同样可以是数组。输入索引越界会返回 `JitError::InputBufferNotFound`；输出索引越界则会 panic。
 
 **`batch_var b: (min, max)`** 声明一个符号变量，*并且*在占位张量实体化后把每个批处理输入的第 0 维收缩到它，从而让一个计划服务一系列批大小。`#[unbatched]` 让某个输入退出这一行为——例如共享的 bias，或首轴不是批维的表——而状态槽位从不收缩。每次调用通过生成的 `execute_bound(4)` 绑定它。
 
@@ -145,7 +145,7 @@ jit.execute_bound(batch as i64, time as i64)?;   // same thing, positionally
 | `prepare(input1: InputSpec, ..., state1: InputSpec, ...)` | 一次性 | 构建图、运行模式、编译内核、分配缓冲区；读取 `PrepareConfig::from_env()` |
 | `prepare_with_config(..., &PrepareConfig)` | 一次性 | 与 `prepare` 相同，但使用显式配置 |
 | `<input>_mut([i]) -> Result<&mut Buffer>` | 每步 | 每个声明的输入或状态槽位的原始缓冲区（数组槽位需 `i`） |
-| `<input>_view_mut::<T>([i]) -> Result<ArrayViewMutD<T>>` | 每步 | 输入缓冲区上的类型化写视图，带 dtype 检查 |
+| `<input>_host_write::<T>([i]) -> Result<HostWrite<T>>` | 每步 | 输入缓冲区上的独占类型化宿主写守卫，带 dtype 检查；drop 时发布写入 |
 | `output() -> Result<&Buffer>` | 每步 | 计划的第一个输出 |
 | `<output>([i])` / `<output>_shape()` / `_view::<T>()` / `_to_vec::<T>()` | 每步 | 具名输出缓冲区、其实时形状及读取，按当前变量绑定解析 |
 | `reset() -> Result<()>` | 每步 | 将每个 `state` 槽位清零（仅在有 `state` 时生成） |
@@ -224,9 +224,7 @@ impl InputSpec {
 ```rust
 jit.reset()?;                                    // zero the state, new sequence
 for chunk in chunks {
-    for (slot, v) in jit.x_view_mut::<f32>()?.iter_mut().zip(chunk) {
-        *slot = v;                               // per-step input, written in place
-    }
+    jit.x_host_write::<f32>()?.copy_from(&chunk)?; // per-step input, written in place
     jit.execute()?;                              // reads state, writes it back
     let frame = jit.emitted_to_vec::<f32>()?;    // only the emitted head crosses
 }
@@ -303,7 +301,7 @@ jit.prepare_with_config(
 )?;
 ```
 
-随后 `VadInference::probs` 以 `FEATURE_BATCH` 大小的派发遍历波形——打包 `chunks_view_mut::<f32>()`、`execute()`、对有效行执行 `copyout_prefix`——并把门值交给 `VadHead::scan`，这是一个以主机 CPU 所具备的最宽 SIMD 宽度向量化的 LSTM 加 sigmoid 头。这种拆分取代了原先每个窗口一次微小派发的路径，后者的往返延迟主导了整个模型。
+随后 `VadInference::probs` 以 `FEATURE_BATCH` 大小的派发遍历波形——打包 `chunks_host_write::<f32>()`、`execute()`、对有效行执行 `copyout_prefix`——并把门值交给 `VadHead::scan`，这是一个以主机 CPU 所具备的最宽 SIMD 宽度向量化的 LSTM 加 sigmoid 头。这种拆分取代了原先每个窗口一次微小派发的路径，后者的往返延迟主导了整个模型。
 
 ---
 

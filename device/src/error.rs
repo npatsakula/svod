@@ -44,6 +44,18 @@ pub enum Error {
     #[snafu(display("write to immutable buffer refused: {op} (storage id {storage})"))]
     ImmutableBuffer { op: &'static str, storage: u64 },
 
+    /// A `HostWrite` into the storage is live, so `op` would race its stores.
+    #[snafu(display("{op} refused: a host write into storage id {storage} is live"))]
+    HostWriteLive { op: &'static str, storage: u64 },
+
+    /// A `HostWrite::rows` row lies past the end of the buffer.
+    #[snafu(display("host write row {row} is out of bounds for {len} elements"))]
+    HostWriteRow { row: usize, len: usize },
+
+    /// A host write view is not aligned to its element type.
+    #[snafu(display("host write view at byte offset {offset} is not aligned to {align}"))]
+    MisalignedHostWrite { offset: usize, align: usize },
+
     /// Runtime execution error. Free-form catch-all; prefer the structured
     /// variants below when the data is structured.
     #[snafu(display("runtime error: {message}"))]

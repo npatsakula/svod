@@ -134,13 +134,13 @@ impl Qwen3Embedder {
                     pool_idx[r * slots + slot] = ((cursor - 1) % bucket) as i32;
                 }
             }
-            let fill = |mut view: ndarray::ArrayViewMutD<'_, i32>, data: &[i32]| {
-                view.iter_mut().zip(data).for_each(|(d, &s)| *d = s)
+            let write = |input: crate::jit::Result<crate::jit::rt::HostWrite<'_, i32>>, data: &[i32]| {
+                input?.copy_from(data).map_err(crate::jit::JitError::from)
             };
-            fill(jit.input_ids_view_mut::<i32>()?, &ids);
-            fill(jit.positions_view_mut::<i32>()?, &positions);
-            fill(jit.seg_start_view_mut::<i32>()?, &seg_start);
-            fill(jit.pool_idx_view_mut::<i32>()?, &pool_idx);
+            write(jit.input_ids_host_write::<i32>(), &ids)?;
+            write(jit.positions_host_write::<i32>(), &positions)?;
+            write(jit.seg_start_host_write::<i32>(), &seg_start)?;
+            write(jit.pool_idx_host_write::<i32>(), &pool_idx)?;
             let started = Instant::now();
             match profile.as_deref_mut() {
                 Some(profile) => {

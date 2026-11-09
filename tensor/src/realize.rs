@@ -160,7 +160,7 @@ fn realized_identity(old_uop: &Arc<UOp>, output_buf: Buffer) -> Result<(u64, Arc
 /// placeholder (`Tensor::empty`) carries none until first use; binding it in
 /// the global registry makes the identity mean one storage for every plan and
 /// tensor referencing it: a store realized through it is what later readers
-/// see, and a host write through `array_view_mut` reaches the plans prepared
+/// see, and a host write through `with_host_write` reaches the plans prepared
 /// from it. Matches Tinygrad, where a BUFFER uop owns its `Buffer`.
 fn bind_graph_buffers(sink: &Arc<UOp>) -> Result<()> {
     for node in sink.toposort() {

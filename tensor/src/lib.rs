@@ -296,7 +296,7 @@ impl Tensor {
     /// Only the BUFFER UOp is created; its storage is bound the first time a
     /// plan is prepared over it and is then shared by every graph that
     /// references the identity. Fill it with `assign()` + `realize()`, or
-    /// write through `array_view_mut` once a plan is prepared.
+    /// write through `with_host_write` once a plan is prepared.
     /// Matches Tinygrad's `Tensor.empty(*shape)`.
     #[track_caller]
     pub fn empty(shape: &[usize], dtype: DType) -> Self {

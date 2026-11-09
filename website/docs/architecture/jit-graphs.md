@@ -130,7 +130,7 @@ jit_wrapper! {
 
 **`[Tensor; N]` slots** put N buffers behind one name: `prepare` takes
 `[InputSpec; N]`, the build closure receives `[&Tensor; N]`, and the generated
-accessors take a leaf index — `jit.taps_view_mut::<f32>(1)?`. Outputs may be
+accessors take a leaf index — `jit.taps_host_write::<f32>(1)?`. Outputs may be
 arrays too. An input index out of range is `JitError::InputBufferNotFound`; an
 output index out of range panics.
 
@@ -206,7 +206,7 @@ The macro emits one method group per phase of the wrapper's life cycle:
 | `prepare(input1: InputSpec, ..., state1: InputSpec, ...)` | one-time | build graph, run patterns, compile kernels, allocate buffers; reads `PrepareConfig::from_env()` |
 | `prepare_with_config(..., &PrepareConfig)` | one-time | same as `prepare` with an explicit config |
 | `<input>_mut([i]) -> Result<&mut Buffer>` | per step | raw buffer for each declared input or state slot (`i` for array slots) |
-| `<input>_view_mut::<T>([i]) -> Result<ArrayViewMutD<T>>` | per step | typed write view over an input buffer, dtype-checked |
+| `<input>_host_write::<T>([i]) -> Result<HostWrite<T>>` | per step | exclusive typed host write guard over an input buffer, dtype-checked; published when dropped |
 | `output() -> Result<&Buffer>` | per step | the plan's first output |
 | `<output>([i])` / `<output>_shape()` / `_view::<T>()` / `_to_vec::<T>()` | per step | named output buffer, its live shape and reads, resolved against the current variable bindings |
 | `reset() -> Result<()>` | per step | zero every `state` slot (generated only with `state`) |
@@ -320,9 +320,7 @@ helper.
 ```rust
 jit.reset()?;                                    // zero the state, new sequence
 for chunk in chunks {
-    for (slot, v) in jit.x_view_mut::<f32>()?.iter_mut().zip(chunk) {
-        *slot = v;                               // per-step input, written in place
-    }
+    jit.x_host_write::<f32>()?.copy_from(&chunk)?; // per-step input, written in place
     jit.execute()?;                              // reads state, writes it back
     let frame = jit.emitted_to_vec::<f32>()?;    // only the emitted head crosses
 }
@@ -432,7 +430,7 @@ jit.prepare_with_config(
 ```
 
 `VadInference::probs` then walks the waveform in `FEATURE_BATCH`-sized
-dispatches — pack `chunks_view_mut::<f32>()`, `execute()`, `copyout_prefix` the
+dispatches — pack `chunks_host_write::<f32>()`, `execute()`, `copyout_prefix` the
 valid rows — and hands the gates to `VadHead::scan`, an LSTM plus sigmoid head
 vectorized at the widest SIMD width the host CPU has. That split replaced a
 one-tiny-dispatch-per-window path whose round-trip latency dominated the whole

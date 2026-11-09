@@ -117,8 +117,8 @@ jit_wrapper! {
 ### 零拷贝数据通路
 
 ONNX 初始化器和 `Tensor::from_path` 张量从磁盘按需延迟内存映射。设备缓冲区
-支持子视图。宿主代码通过借用的 `ndarray` 视图（`array_view`、`array_view_mut`）
-读写已实例化的张量，因此向已捕获的计划喂数据不产生任何拷贝。
+支持子视图。宿主代码通过借用的 `ndarray` 视图（`array_view`）读取已实例化的张量，
+通过直接写入缓冲区的宿主写守卫（`with_host_write`）写入，因此向已捕获的计划喂数据无需中转拷贝。
 
 ### 内核融合与归因
 
@@ -208,7 +208,7 @@ let plan = Tensor::prepare_batch(outputs.values())?; // compile once
 plan.execute()?;
 
 for batch in batches {
-    input.array_view_mut::<f32>()?.as_slice_mut().unwrap().copy_from_slice(&batch);
+    input.with_host_write::<f32, _>(|w| w.copy_from(&batch))?;
     plan.execute()?; // replay: no tracing, no compilation, no allocation
 }
 ```

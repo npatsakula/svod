@@ -223,7 +223,8 @@ pub fn cached_patterns(input: TokenStream) -> TokenStream {
 ///
 /// - `new(model)`, `with_<var>_bound` / `_min_bound` / `_fixed`
 /// - `prepare(<spec per slot>)` / `prepare_with_config(.., &PrepareConfig)`
-/// - `<input>_mut()` / `<input>_view_mut::<T>()` — buffer and typed write view
+/// - `<input>_mut()` / `<input>_host_write::<T>()` — buffer and typed host
+///   write guard (`HostWrite`)
 /// - `copy_output_to_<input>(out_pos, dst_off, src_off, len)`
 /// - `<output>()`, `<output>_shape()`, `<output>_view::<T>()`,
 ///   `<output>_to_vec::<T>()` — the shape and both reads follow the live

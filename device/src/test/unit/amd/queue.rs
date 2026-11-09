@@ -446,9 +446,42 @@ fn publication_calls(iface: &MockAmdIface, mark: usize) -> Vec<super::test_suppo
         .collect()
 }
 
-/// A host-mapped VRAM buffer of `bytes` on the mock device.
-fn host_vram_buffer(allocator: &crate::amd::AmdAllocator, bytes: usize) -> crate::buffer::Buffer {
-    let allocator: Arc<dyn crate::allocator::Allocator> = Arc::new(allocator.clone());
+/// Places every buffer in uncached GTT, as the kernarg arena, registered for
+/// scoped waits like the allocator's own buffers.
+#[derive(Debug)]
+struct GttAllocator(crate::amd::AmdAllocator);
+
+impl crate::allocator::Allocator for GttAllocator {
+    fn _alloc(
+        &self,
+        size: usize,
+        _: &crate::allocator::BufferSpec,
+        _: bool,
+    ) -> crate::Result<crate::allocator::RawBuffer> {
+        let raw = self.0.alloc_uncached(size)?;
+        if let crate::allocator::RawBuffer::AmdDevice { gpu_addr, .. } = &raw {
+            self.0.dev.core().register_storage(*gpu_addr);
+        }
+        Ok(raw)
+    }
+
+    fn _free(&self, buffer: crate::allocator::RawBuffer, options: &crate::allocator::BufferSpec) {
+        crate::allocator::Allocator::_free(&self.0, buffer, options)
+    }
+
+    fn name(&self) -> &str {
+        "AMD GTT"
+    }
+
+    fn device_spec(&self) -> svod_dtype::DeviceSpec {
+        crate::allocator::Allocator::device_spec(&self.0)
+    }
+}
+
+/// A host-mapped buffer of `bytes` on the mock device: VRAM, or GTT when `uncached`.
+fn host_buffer(allocator: &crate::amd::AmdAllocator, bytes: usize, uncached: bool) -> crate::buffer::Buffer {
+    let allocator: Arc<dyn crate::allocator::Allocator> =
+        if uncached { Arc::new(GttAllocator(allocator.clone())) } else { Arc::new(allocator.clone()) };
     let spec = crate::allocator::BufferSpec { cpu_access: true, ..Default::default() };
     let buffer = crate::buffer::Buffer::new(allocator, svod_dtype::DType::UInt8, vec![bytes], spec);
     buffer.ensure_allocated().expect("mock allocation");
@@ -456,18 +489,21 @@ fn host_vram_buffer(allocator: &crate::amd::AmdAllocator, bytes: usize) -> crate
 }
 
 /// A compute doorbell flushes no HDP of its own: the submission path writes
-/// only system memory. Stores through a mutable host view of VRAM are the one
-/// exception, with no point of their own to flush at, so exactly the next
-/// doorbell flushes them, between its last write and the doorbell.
-#[test_case::test_case(1; "pm4")]
-#[test_case::test_case(2; "aql")]
-fn a_compute_doorbell_flushes_hdp_only_for_a_mutable_vram_view(xccs: u32) {
+/// only system memory. A host write guard into VRAM is the one exception: once
+/// it drops, exactly the next doorbell flushes its stores, between its last
+/// write and the doorbell. While it lives nothing is flushed, and a guard
+/// into GTT never flushes.
+#[test_case::test_case(1, false; "pm4 vram")]
+#[test_case::test_case(2, false; "aql vram")]
+#[test_case::test_case(1, true; "pm4 gtt")]
+#[test_case::test_case(2, true; "aql gtt")]
+fn a_compute_doorbell_flushes_hdp_only_after_a_vram_host_write(xccs: u32, uncached: bool) {
     use super::test_support::MockAmdCall;
 
     let (iface, allocator) = mock_device_with_signals(xccs);
     iface.set_hdp_flush_register();
     let pool = PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator).expect("pool queue");
-    let buffer = host_vram_buffer(&allocator, 64);
+    let mut buffer = host_buffer(&allocator, 64, uncached);
     let doorbell = || {
         let mark = iface.transcript().len();
         pool.queue().submit_hcq_dispatch(&pool, &compute_submission(), &[0; 16], &[], &[]).expect("submit");
@@ -483,24 +519,29 @@ fn a_compute_doorbell_flushes_hdp_only_for_a_mutable_vram_view(xccs: u32) {
     }
 
     let mark = iface.transcript().len();
-    buffer.as_host_bytes_mut().expect("host view").fill(7);
-    assert!(!iface.transcript()[mark..].contains(&MockAmdCall::HdpFlush), "a view defers its flush");
-    assert_eq!(doorbell(), [reserved, before, MockAmdCall::HdpFlush, after], "xccs={xccs}");
+    let mut guard = buffer.host_write_bytes().expect("host write");
+    guard.fill(7);
+    assert_eq!(doorbell(), plain, "a live guard has nothing to flush yet");
+    drop(guard);
+    assert!(!iface.transcript()[mark..].contains(&MockAmdCall::HdpFlush), "a guard defers its flush");
+    let flushed = if uncached { plain.clone() } else { vec![reserved, before, MockAmdCall::HdpFlush, after] };
+    assert_eq!(doorbell(), flushed, "xccs={xccs} uncached={uncached}");
     assert_eq!(doorbell(), plain, "the deferred flush runs once");
     // Retire the mock timeline, so freeing the buffer drains at once.
     crate::sync::TimelineSignal::set(&**pool.pm4_signal(), pool.pm4_value());
 }
 
-/// SDMA doorbells follow the same contract: no flush of their own, the one
-/// deferred by a mutable VRAM view.
-#[test]
-fn a_copy_doorbell_flushes_hdp_only_for_a_mutable_vram_view() {
+/// SDMA doorbells follow the same contract: no flush of their own, one after
+/// a VRAM host write guard drops.
+#[test_case::test_case(false; "vram")]
+#[test_case::test_case(true; "gtt")]
+fn a_copy_doorbell_flushes_hdp_only_after_a_vram_host_write(uncached: bool) {
     use super::test_support::MockAmdCall;
 
     let (iface, allocator) = mock_device_with_signals(1);
     iface.set_hdp_flush_register();
     let queue = AmdCopyQueue::create(&allocator).expect("copy queue");
-    let buffer = host_vram_buffer(&allocator, 64);
+    let mut buffer = host_buffer(&allocator, 64, uncached);
     let mut copy = Submission::new(QueueKind::Copy(0));
     copy.push(Command::Copy { dst: 0x1000, src: 0x2000, bytes: 4 });
     let flushes = || iface.call_count(|call| *call == MockAmdCall::HdpFlush);
@@ -510,12 +551,18 @@ fn a_copy_doorbell_flushes_hdp_only_for_a_mutable_vram_view() {
     assert_ne!(queue.ring_write_idx(), 0, "the copy was published");
     assert_eq!(flushes(), before);
 
-    buffer.as_array_mut::<u8>().expect("host view").fill(7);
-    assert_eq!(flushes(), before, "a view defers its flush");
+    buffer
+        .with_host_write::<u8, _>(|guard| {
+            guard.fill(7);
+            Ok(())
+        })
+        .expect("host write");
+    assert_eq!(flushes(), before, "a guard defers its flush");
     queue.submit_hcq(&copy).expect("submit");
-    assert_eq!(flushes(), before + 1);
+    let after = before + usize::from(!uncached);
+    assert_eq!(flushes(), after, "uncached={uncached}");
     queue.submit_hcq(&copy).expect("submit");
-    assert_eq!(flushes(), before + 1, "the deferred flush runs once");
+    assert_eq!(flushes(), after, "the deferred flush runs once");
 }
 
 /// The CP reads a compute queue's CWSR headers on its first context save or

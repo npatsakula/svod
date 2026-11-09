@@ -450,13 +450,13 @@ impl GigaAmStreamer {
             flush[i] = usize::from(feed.flush);
         }
         self.mel_jit.framed_mut()?.copyin(bytemuck::cast_slice(&self.framed))?;
-        pack_lengths_buffer(self.mel_jit.frames_view_mut::<i32>()?, &valid);
+        pack_lengths_buffer(self.mel_jit.frames_host_write::<i32>()?, &valid);
         self.mel_jit.execute()?;
         self.jit.mel_mut()?.copy_from(self.mel_jit.output()?)?;
-        pack_lengths_buffer(self.jit.valid_view_mut::<i32>()?, &valid);
-        pack_lengths_buffer(self.jit.emitted_view_mut::<i32>()?, &emitted);
-        pack_lengths_buffer(self.jit.pending_len_view_mut::<i32>()?, &pending);
-        pack_lengths_buffer(self.jit.flush_view_mut::<i32>()?, &flush);
+        pack_lengths_buffer(self.jit.valid_host_write::<i32>()?, &valid);
+        pack_lengths_buffer(self.jit.emitted_host_write::<i32>()?, &emitted);
+        pack_lengths_buffer(self.jit.pending_len_host_write::<i32>()?, &pending);
+        pack_lengths_buffer(self.jit.flush_host_write::<i32>()?, &flush);
         self.jit.execute()?;
 
         let outs: Vec<usize> = feeds.iter().map(|f| f.out).collect();

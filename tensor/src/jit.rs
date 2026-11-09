@@ -16,8 +16,8 @@ use crate::{BoundVariable, Tensor};
 /// Every path the `jit_wrapper!` expansion mentions, re-exported from one
 /// place. An invoking crate needs `svod-tensor` and nothing else.
 pub mod rt {
-    pub use ndarray::{ArrayViewD, ArrayViewMutD};
-    pub use svod_device::{Buffer, BufferId, BufferSpec};
+    pub use ndarray::ArrayViewD;
+    pub use svod_device::{Buffer, BufferId, BufferSpec, HostWrite};
     pub use svod_dtype::ext::HasDType;
     pub use svod_ir::origin::OriginScope;
     pub use svod_runtime::{ExecutionPlan, KernelProfile, PreparedKernel, ProfileOptions};
@@ -230,10 +230,11 @@ pub fn view<'a, T: HasDType>(buffer: &'a rt::Buffer, shape: &[usize]) -> Result<
     Ok(rt::ArrayViewD::from_shape(ndarray::IxDyn(shape), &flat[..requested]).expect("prefix matches shape"))
 }
 
-/// Typed writable view over a host-visible input buffer, shaped as allocated.
-pub fn view_mut<T: HasDType>(buffer: &rt::Buffer) -> Result<rt::ArrayViewMutD<'_, T>> {
+/// Exclusive host write access to a host-visible input buffer as `[T]`
+/// (see [`rt::HostWrite`]); it publishes its stores when dropped.
+pub fn host_write<T: HasDType + Copy>(buffer: &mut rt::Buffer) -> Result<rt::HostWrite<'_, T>> {
     check_dtype::<T>(buffer)?;
-    Ok(buffer.as_array_mut::<T>()?)
+    Ok(buffer.host_write::<T>()?)
 }
 
 /// Read a buffer's first `numel` elements to the host. Works for device-local

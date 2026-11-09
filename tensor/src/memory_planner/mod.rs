@@ -108,7 +108,7 @@ fn round_up(size: usize, block_size: usize) -> usize {
 /// Buffer reuse is shape-agnostic: codegen reads logical shape from the UOp
 /// graph, runtime dispatch passes raw `*mut u8` pointers, and the planner
 /// skips output buffers (the only consumers of `Buffer::shape()` via
-/// `as_array`/`as_array_mut`). Two non-output buffers with the same
+/// `as_array`). Two non-output buffers with the same
 /// `(device, dtype, rounded_size)` are interchangeable storage regardless
 /// of their logical shapes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

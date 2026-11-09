@@ -130,9 +130,9 @@ jit_wrapper! {
 ### Пути данных без копирования
 
 Инициализаторы ONNX и тензоры `Tensor::from_path` лениво отображаются в память с диска. Буферы устройства
-поддерживают под-представления (sub-views). Хост-код читает и пишет реализованные тензоры через заимствованные
-представления `ndarray` (`array_view`, `array_view_mut`), так что подача данных в захваченный план
-ничего не копирует.
+поддерживают под-представления (sub-views). Хост-код читает реализованные тензоры через заимствованные
+представления `ndarray` (`array_view`) и пишет через guard записи с хоста (`with_host_write`), который
+пишет прямо в буфер, так что подаче данных в захваченный план не нужна промежуточная копия.
 
 ### Слияние ядер и атрибуция
 
@@ -225,7 +225,7 @@ let plan = Tensor::prepare_batch(outputs.values())?; // compile once
 plan.execute()?;
 
 for batch in batches {
-    input.array_view_mut::<f32>()?.as_slice_mut().unwrap().copy_from_slice(&batch);
+    input.with_host_write::<f32, _>(|w| w.copy_from(&batch))?;
     plan.execute()?; // replay: no tracing, no compilation, no allocation
 }
 ```

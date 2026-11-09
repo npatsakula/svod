@@ -120,18 +120,20 @@ impl Allocator for AmdAllocator {
 
     fn _copyin(&self, dest: &RawBuffer, dest_off: usize, src: &[u8]) -> Result<()> {
         match dest {
-            RawBuffer::AmdDevice { host_ptr: Some(ptr), gpu_addr, .. } => {
+            RawBuffer::AmdDevice { host_ptr: Some(ptr), gpu_addr, vram, .. } => {
                 // Wait this storage's recorded producers AND readers (a host
                 // overwrite is a WAR hazard against in-flight readers). Direct
                 // host writes aren't ordered on the GPU timeline.
                 self.dev.core().wait_storage(*gpu_addr)?;
-                // SAFETY: BAR-backed VRAM mapping valid for the buffer's lifetime;
+                // SAFETY: host mapping valid for the buffer's lifetime;
                 // scheduler exclusivity. `dest_off + src.len()` is bounded by the caller.
                 let dst = unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr().add(dest_off), src.len()) };
                 dst.copy_from_slice(src);
-                // The stores leave HDP here; the next compute dispatch reading
+                // VRAM stores leave HDP here; the next compute dispatch reading
                 // this VA does a full `acquire_mem` (L2 invalidate) in its prologue.
-                self.dev.core().hdp().flush();
+                if *vram {
+                    self.dev.core().hdp().flush();
+                }
                 Ok(())
             }
             RawBuffer::AmdDevice { host_ptr: None, gpu_addr, .. } => {
@@ -170,7 +172,7 @@ impl Allocator for AmdAllocator {
     fn _transfer(&self, dest: &RawBuffer, dest_off: usize, src: &RawBuffer, src_off: usize, sz: usize) -> Result<()> {
         match (dest, src) {
             (
-                RawBuffer::AmdDevice { host_ptr: Some(dst_ptr), gpu_addr: dst_gpu, .. },
+                RawBuffer::AmdDevice { host_ptr: Some(dst_ptr), gpu_addr: dst_gpu, vram, .. },
                 RawBuffer::AmdDevice { host_ptr: Some(src_ptr), gpu_addr: src_gpu, .. },
             ) => {
                 // Wait both storages' recorded work before the host memmove:
@@ -186,7 +188,9 @@ impl Allocator for AmdAllocator {
                     std::ptr::copy(src_ptr.as_ptr().add(src_off), dst_ptr.as_ptr().add(dest_off), sz);
                 }
                 // HDP flushed here, L2 by the consumer dispatch (cf. `_copyin`).
-                self.dev.core().hdp().flush();
+                if *vram {
+                    self.dev.core().hdp().flush();
+                }
                 Ok(())
             }
             (RawBuffer::AmdDevice { gpu_addr: dst_gpu, .. }, RawBuffer::AmdDevice { gpu_addr: src_gpu, .. }) => {
@@ -202,7 +206,7 @@ impl Allocator for AmdAllocator {
 
     fn _free(&self, buffer: RawBuffer, _options: &BufferSpec) {
         let (gpu_addr, host_ptr, size, handle, device) = match buffer {
-            RawBuffer::AmdDevice { gpu_addr, host_ptr, size, handle, device } => {
+            RawBuffer::AmdDevice { gpu_addr, host_ptr, size, handle, device, .. } => {
                 (gpu_addr, host_ptr, size, handle, device)
             }
             // Wrong-allocator-for-buffer-type would be a programming bug.
@@ -307,5 +311,6 @@ fn do_alloc_tagged(
         size: r.size,
         handle: r.handle,
         device: Arc::clone(dev),
+        vram: matches!(kind, AllocKind::DeviceVram { .. }),
     })
 }

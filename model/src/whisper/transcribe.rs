@@ -217,8 +217,8 @@ impl WhisperRecognizer {
         // these values without bounds checks, so every lane must hold a valid
         // one from the start. Zero is always in range; seeding and stepping
         // then overwrite the lanes in use.
-        step_jit.cross_cache_map_mut()?.as_host_bytes_mut()?.fill(0);
-        step_jit.self_key_lens_mut()?.as_host_bytes_mut()?.fill(0);
+        step_jit.cross_cache_map_host_write::<i32>()?.fill(0);
+        step_jit.self_key_lens_host_write::<i32>()?.fill(0);
 
         Ok(Self {
             mel_jit,

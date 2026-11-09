@@ -40,7 +40,7 @@ use svod_arch::pipelines::text::{Encoding, RunProfile};
 use svod_dtype::default_device::{default_device, with_default_device};
 use svod_dtype::{DType, DeviceSpec};
 use svod_runtime::{KernelProfile, StageProfile};
-use svod_tensor::jit::rt::ArrayViewMutD;
+use svod_tensor::jit::rt::HostWrite;
 use svod_tensor::{PrepareConfig, Tensor};
 
 use crate::hub::HubRepo;
@@ -316,8 +316,8 @@ pub(crate) trait HeadJit: Sized {
     type Model: Clone;
     fn new(model: Self::Model) -> Self;
     fn prepare_with_config(&mut self, ids: InputSpec, mask: InputSpec, config: &PrepareConfig) -> jit::Result<()>;
-    fn input_ids_view_mut(&mut self) -> jit::Result<ArrayViewMutD<'_, i64>>;
-    fn attention_mask_view_mut(&mut self) -> jit::Result<ArrayViewMutD<'_, i64>>;
+    fn input_ids_host_write(&mut self) -> jit::Result<HostWrite<'_, i64>>;
+    fn attention_mask_host_write(&mut self) -> jit::Result<HostWrite<'_, i64>>;
     fn execute(&mut self) -> jit::Result<()>;
     fn execute_profiled(&mut self) -> jit::Result<Vec<KernelProfile>>;
     /// The declared output, as f32.
@@ -341,11 +341,11 @@ macro_rules! head_jit {
             ) -> $crate::jit::Result<()> {
                 <$jit>::prepare_with_config(self, ids, mask, config)
             }
-            fn input_ids_view_mut(&mut self) -> $crate::jit::Result<$crate::jit::rt::ArrayViewMutD<'_, i64>> {
-                <$jit>::input_ids_view_mut(self)
+            fn input_ids_host_write(&mut self) -> $crate::jit::Result<$crate::jit::rt::HostWrite<'_, i64>> {
+                <$jit>::input_ids_host_write(self)
             }
-            fn attention_mask_view_mut(&mut self) -> $crate::jit::Result<$crate::jit::rt::ArrayViewMutD<'_, i64>> {
-                <$jit>::attention_mask_view_mut(self)
+            fn attention_mask_host_write(&mut self) -> $crate::jit::Result<$crate::jit::rt::HostWrite<'_, i64>> {
+                <$jit>::attention_mask_host_write(self)
             }
             fn execute(&mut self) -> $crate::jit::Result<()> {
                 <$jit>::execute(self)
@@ -480,17 +480,8 @@ impl<J: HeadJit> HeadPlans<J> {
             }
         };
 
-        pack_ids(
-            jit.input_ids_view_mut().context(JitSnafu)?.as_slice_mut().expect("contiguous ids"),
-            batch,
-            len,
-            pad_id,
-        );
-        pack_mask(
-            jit.attention_mask_view_mut().context(JitSnafu)?.as_slice_mut().expect("contiguous mask"),
-            batch,
-            len,
-        );
+        pack_ids(jit.input_ids_host_write().context(JitSnafu)?.as_mut_slice(), batch, len, pad_id);
+        pack_mask(jit.attention_mask_host_write().context(JitSnafu)?.as_mut_slice(), batch, len);
 
         let started = Instant::now();
         let profile = if profile {

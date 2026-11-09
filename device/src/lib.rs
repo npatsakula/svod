@@ -43,7 +43,7 @@ pub mod profile;
 pub mod registry;
 pub mod sync;
 
-pub use buffer::{Buffer, BufferId};
+pub use buffer::{Buffer, BufferId, HostWrite};
 pub use device::{
     CopyEndpoint, Graph, GraphFactory, GraphKernel, NativeReplayDecline, NativeReplayOutcome, PlanCall, PlanContext,
     Program,

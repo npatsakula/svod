@@ -129,9 +129,10 @@ See [Pattern system](https://svod.vpermilp.online/docs/architecture/optimization
 ### Zero-copy data paths
 
 ONNX initializers and `Tensor::from_path` tensors are memory-mapped lazily from disk. Device buffers
-support sub-views. Host code reads and writes realized tensors through borrowed
-`ndarray` views (`array_view`, `array_view_mut`), so feeding a captured plan
-copies nothing.
+support sub-views. Host code reads realized tensors through borrowed `ndarray` views
+(`array_view`) and writes them through a host write guard (`with_host_write`)
+that stores straight into the buffer, so feeding a captured plan needs no
+staging copy.
 
 ### Kernel fusion and attribution
 
@@ -222,7 +223,7 @@ let plan = Tensor::prepare_batch(outputs.values())?; // compile once
 plan.execute()?;
 
 for batch in batches {
-    input.array_view_mut::<f32>()?.as_slice_mut().unwrap().copy_from_slice(&batch);
+    input.with_host_write::<f32, _>(|w| w.copy_from(&batch))?;
     plan.execute()?; // replay: no tracing, no compilation, no allocation
 }
 ```

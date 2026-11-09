@@ -97,7 +97,7 @@ jit_wrapper! {
 }
 ```
 
-**`[Tensor; N]` slots** एक नाम के पीछे N buffers रखते हैं: `prepare` `[InputSpec; N]` लेता है, build closure को `[&Tensor; N]` मिलता है, और generated accessors एक leaf index लेते हैं — `jit.taps_view_mut::<f32>(1)?`। Outputs भी arrays हो सकते हैं। Range से बाहर input index `JitError::InputBufferNotFound` है; range से बाहर output index panic करता है।
+**`[Tensor; N]` slots** एक नाम के पीछे N buffers रखते हैं: `prepare` `[InputSpec; N]` लेता है, build closure को `[&Tensor; N]` मिलता है, और generated accessors एक leaf index लेते हैं — `jit.taps_host_write::<f32>(1)?`। Outputs भी arrays हो सकते हैं। Range से बाहर input index `JitError::InputBufferNotFound` है; range से बाहर output index panic करता है।
 
 **`batch_var b: (min, max)`** एक symbolic variable declare करता है *और* placeholders realize होते ही हर batched input के dim 0 को उस तक shrink कर देता है, ताकि एक plan batch sizes की पूरी range सँभाल सके। `#[unbatched]` किसी input को इससे बाहर रखता है — जैसे shared bias, या ऐसी table जिसकी leading axis batch नहीं है — और state slots कभी shrink नहीं होते। इसे हर call पर generated `execute_bound(4)` से bind करें।
 
@@ -145,7 +145,7 @@ Macro wrapper के life cycle के हर phase के लिए methods क
 | `prepare(input1: InputSpec, ..., state1: InputSpec, ...)` | एक बार | graph बनाना, patterns चलाना, kernels compile करना, buffers allocate करना; `PrepareConfig::from_env()` पढ़ता है |
 | `prepare_with_config(..., &PrepareConfig)` | एक बार | `prepare` जैसा ही, explicit config के साथ |
 | `<input>_mut([i]) -> Result<&mut Buffer>` | हर step | हर declared input या state slot का raw buffer (array slots के लिए `i`) |
-| `<input>_view_mut::<T>([i]) -> Result<ArrayViewMutD<T>>` | हर step | input buffer पर typed write view, dtype-checked |
+| `<input>_host_write::<T>([i]) -> Result<HostWrite<T>>` | हर step | input buffer पर exclusive typed host write guard, dtype-checked; drop होने पर publish होता है |
 | `output() -> Result<&Buffer>` | हर step | plan का पहला output |
 | `<output>([i])` / `<output>_shape()` / `_view::<T>()` / `_to_vec::<T>()` | हर step | named output buffer, उसकी live shape और reads, मौजूदा variable bindings के हिसाब से resolve |
 | `reset() -> Result<()>` | हर step | हर `state` slot को zero करता है (सिर्फ़ `state` होने पर generate) |
@@ -224,9 +224,7 @@ Recurrent model की state device पर ही रहती है: उसे
 ```rust
 jit.reset()?;                                    // zero the state, new sequence
 for chunk in chunks {
-    for (slot, v) in jit.x_view_mut::<f32>()?.iter_mut().zip(chunk) {
-        *slot = v;                               // per-step input, written in place
-    }
+    jit.x_host_write::<f32>()?.copy_from(&chunk)?; // per-step input, written in place
     jit.execute()?;                              // reads state, writes it back
     let frame = jit.emitted_to_vec::<f32>()?;    // only the emitted head crosses
 }
@@ -303,7 +301,7 @@ jit.prepare_with_config(
 )?;
 ```
 
-फिर `VadInference::probs` waveform पर `FEATURE_BATCH`-आकार के dispatches में चलता है — `chunks_view_mut::<f32>()` pack करना, `execute()`, valid rows का `copyout_prefix` — और gates को `VadHead::scan` को सौंप देता है, जो host CPU की सबसे चौड़ी SIMD width पर vectorized एक LSTM plus sigmoid head है। इस बँटवारे ने उस one-tiny-dispatch-per-window path की जगह ली जिसकी round-trip latency पूरे model पर हावी थी।
+फिर `VadInference::probs` waveform पर `FEATURE_BATCH`-आकार के dispatches में चलता है — `chunks_host_write::<f32>()` pack करना, `execute()`, valid rows का `copyout_prefix` — और gates को `VadHead::scan` को सौंप देता है, जो host CPU की सबसे चौड़ी SIMD width पर vectorized एक LSTM plus sigmoid head है। इस बँटवारे ने उस one-tiny-dispatch-per-window path की जगह ली जिसकी round-trip latency पूरे model पर हावी थी।
 
 ---
 

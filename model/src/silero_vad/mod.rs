@@ -337,11 +337,10 @@ impl VadInference {
         while done < n_chunks {
             let b = (n_chunks - done).min(FEATURE_BATCH);
             {
-                let mut view = self.jit.chunks_view_mut::<f32>()?;
-                let slice = view.as_slice_mut().expect("contiguous chunks");
+                let mut chunks = self.jit.chunks_host_write::<f32>()?;
                 for i in 0..b {
                     let start = (done + i) * NUM_SAMPLES;
-                    slice[i * CHUNK_LEN..(i + 1) * CHUNK_LEN].copy_from_slice(&padded[start..start + CHUNK_LEN]);
+                    chunks.copy_at(i * CHUNK_LEN, &padded[start..start + CHUNK_LEN])?;
                 }
             }
             self.jit.execute()?;

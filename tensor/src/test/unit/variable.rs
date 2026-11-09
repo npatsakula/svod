@@ -472,7 +472,7 @@ crate::codegen_tests! {
 
 crate::codegen_tests! {
     /// Production pattern: prepare once, execute in loop with different variable values.
-    /// Input data is written via array_view_mut, output read from plan buffer.
+    /// Input data is written via host_write, output read from plan buffer.
     fn test_prepare_execute_loop(config) {
         test_setup();
         let batch = Variable::new("N", 1, 16);
@@ -496,9 +496,8 @@ crate::codegen_tests! {
             (2, vec![100.0, 200.0], 300.0),
         ] {
             // Write new input data (same buffer the plan reads)
-            let buf = input.buffer().unwrap();
-            buf.as_array_mut::<f32>().unwrap().as_slice_mut().unwrap()[..data.len()]
-                .copy_from_slice(data);
+            let mut buf = input.buffer().unwrap();
+            buf.host_write::<f32>().unwrap().copy_at(0, data).unwrap();
 
             // Execute with new N — same compiled kernels, different variable
             let bound = batch.bind(n).unwrap();
@@ -598,7 +597,7 @@ crate::codegen_tests! {
         let plan_double = double.prepare_with(&config).unwrap();
         let plan_negate = negate.prepare_with(&config).unwrap();
 
-        x.array_view_mut::<f32>().unwrap().as_slice_mut().unwrap().copy_from_slice(&[1.5, -2.0]);
+        x.with_host_write::<f32, _>(|w| w.copy_from(&[1.5, -2.0])).unwrap();
         plan_double.execute().unwrap();
         plan_negate.execute().unwrap();
         assert_close_f32(&double.as_vec::<f32>().unwrap(), &[3.0, -4.0], 1e-6);

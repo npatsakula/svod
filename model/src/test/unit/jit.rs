@@ -228,16 +228,12 @@ fn test_jit_single_input_prepare_and_execute() {
 }
 
 #[test]
-fn test_jit_typed_input_view_writes_in_place() {
+fn test_jit_typed_input_host_write_writes_in_place() {
     let mut jit = AddJit::new(AddModel);
     jit.prepare(InputSpec::f32(&[3]), InputSpec::f32(&[3])).unwrap();
 
-    for (i, slot) in jit.x_view_mut::<f32>().unwrap().iter_mut().enumerate() {
-        *slot = (i + 1) as f32;
-    }
-    for (i, slot) in jit.y_view_mut::<f32>().unwrap().iter_mut().enumerate() {
-        *slot = 10.0 * (i + 1) as f32;
-    }
+    jit.x_host_write::<f32>().unwrap().copy_from(&[1.0, 2.0, 3.0]).unwrap();
+    jit.y_host_write::<f32>().unwrap().copy_from(&[10.0, 20.0, 30.0]).unwrap();
     jit.execute().unwrap();
 
     assert_eq!(read(jit.output().unwrap(), 3), vec![11.0, 22.0, 33.0]);

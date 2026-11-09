@@ -54,7 +54,7 @@ fn shared_weight_refuses_host_writes() {
     let buffer = shared_weight_buffer(key("w_frozen"), &bytes);
     let mut handle = (*buffer).clone();
     assert!(handle.copyin(&[0u8; 16]).is_err(), "copyin into sealed storage must fail");
-    assert!(handle.as_array_mut::<f32>().is_err(), "mutable view of sealed storage must fail");
+    assert!(handle.host_write_bytes().is_err(), "host write into sealed storage must fail");
     let mut out = [0u8; 16];
     buffer.copyout(&mut out).unwrap();
     assert_eq!(out, [2u8; 16], "reads stay legal and correct");

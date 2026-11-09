@@ -23,7 +23,7 @@ let energy = input.try_mul(&input)?.mean(())?;
 
 let plan = energy.prepare()?;      // schedule + compile, once
 for frame in frames {
-    input.array_view_mut::<f32>()?.as_slice_mut().unwrap().copy_from_slice(frame);
+    input.with_host_write::<f32, _>(|w| w.copy_from(frame))?;
     plan.execute()?;               // replay: no tracing, no compilation
     println!("{}", energy.item::<f32>()?);
 }
@@ -39,7 +39,8 @@ CPU kernel execution.
 |---|---|---|
 | `as_vec`, `as_ndarray` | never | owned copy |
 | `to_vec`, `to_ndarray`, `item` | on demand | owned copy / element |
-| `array_view`, `array_view_mut` | never | borrowed `ndarray` view, zero-copy |
+| `array_view` | never | borrowed `ndarray` view, zero-copy |
+| `with_host_write::<T, _>(f)` | never | exclusive host write guard, not a view |
 
 `Tensor::from_slice` and `Tensor::from_ndarray` copy the host data into a new
 buffer once.

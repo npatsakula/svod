@@ -125,29 +125,48 @@ fn test_array_view_dtype_mismatch() {
     assert!(t.array_view::<i32>().is_err());
 }
 
-// === array_view_mut ===
+// === with_host_write ===
 
 #[test]
-fn test_array_view_mut_write() {
+fn test_with_host_write_copy_at() {
     let t = Tensor::from_ndarray(&ndarray::Array2::<f32>::zeros((2, 3)));
-    t.array_view_mut::<f32>().unwrap()[[1, 2]] = 42.0;
+    t.with_host_write::<f32, _>(|w| w.copy_at(5, &[42.0])).unwrap();
     let view = t.array_view::<f32>().unwrap();
     assert_eq!(view[[1, 2]], 42.0);
     assert_eq!(view[[0, 0]], 0.0);
 }
 
 #[test]
-fn test_array_view_mut_fill() {
+fn test_with_host_write_fill() {
     let t = Tensor::from_slice([0.0f32; 4]);
-    t.array_view_mut::<f32>().unwrap().fill(7.0);
+    t.with_host_write::<f32, _>(|w| {
+        w.fill(7.0);
+        Ok(())
+    })
+    .unwrap();
     assert_eq!(t.array_view::<f32>().unwrap().as_slice().unwrap(), &[7.0; 4]);
 }
 
 #[test]
-fn test_array_view_mut_unrealized() {
+fn test_with_host_write_unrealized() {
     let a = Tensor::from_slice([1.0f32, 2.0]);
     let c = (&a + &a).unwrap();
-    assert!(c.array_view_mut::<f32>().is_err());
+    assert!(c.with_host_write::<f32, _>(|_| Ok(())).is_err());
+}
+
+#[test]
+fn test_with_host_write_dtype_mismatch() {
+    let t = Tensor::from_slice([0.0f32; 4]);
+    assert!(t.with_host_write::<i32, _>(|_| Ok(())).is_err());
+}
+
+#[test]
+fn test_with_host_write_refuses_reads_inside() {
+    // The closure's guard holds the storage; a read through the tensor races it.
+    let t = Tensor::from_slice([0.0f32; 4]);
+    let read = t.with_host_write::<f32, _>(|_| Ok(t.array_view::<f32>().is_err())).unwrap();
+    assert!(read, "a read while the guard lives is refused");
+    assert!(t.array_view::<f32>().is_ok(), "and allowed once it drops");
 }
 
 // === roundtrip ===
@@ -220,7 +239,7 @@ fn array_view_refuses_a_view_it_cannot_borrow_correctly() {
     // A zero-copy borrow can neither reorder nor subset the base buffer.
     let buffered = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
     assert!(buffered.try_permute(&[1, 0]).unwrap().array_view::<f32>().is_err());
-    assert!(buffered.try_shrink([(0, 1), (0, 3)]).unwrap().array_view_mut::<f32>().is_err());
+    assert!(buffered.try_shrink([(0, 1), (0, 3)]).unwrap().with_host_write::<f32, _>(|_| Ok(())).is_err());
     // The buffer identity it was built from stays viewable.
     assert_eq!(buffered.array_view::<f32>().unwrap().shape(), &[2, 3]);
 }

@@ -134,7 +134,7 @@ jit_wrapper! {
 
 **Слоты `[Tensor; N]`** размещают N буферов под одним именем: `prepare`
 принимает `[InputSpec; N]`, замыкание сборки получает `[&Tensor; N]`, а
-генерируемые аксессоры принимают индекс элемента — `jit.taps_view_mut::<f32>(1)?`.
+генерируемые аксессоры принимают индекс элемента — `jit.taps_host_write::<f32>(1)?`.
 Выходы тоже могут быть массивами. Индекс входа вне диапазона даёт
 `JitError::InputBufferNotFound`; индекс выхода вне диапазона вызывает панику.
 
@@ -215,7 +215,7 @@ jit.execute_bound(batch as i64, time as i64)?;   // same thing, positionally
 | `prepare(input1: InputSpec, ..., state1: InputSpec, ...)` | однократно | построить граф, применить паттерны, скомпилировать ядра, выделить буферы; читает `PrepareConfig::from_env()` |
 | `prepare_with_config(..., &PrepareConfig)` | однократно | то же, что `prepare`, с явной конфигурацией |
 | `<input>_mut([i]) -> Result<&mut Buffer>` | каждый шаг | сырой буфер для каждого объявленного слота входа или состояния (`i` для слотов-массивов) |
-| `<input>_view_mut::<T>([i]) -> Result<ArrayViewMutD<T>>` | каждый шаг | типизированное представление для записи во входной буфер с проверкой dtype |
+| `<input>_host_write::<T>([i]) -> Result<HostWrite<T>>` | каждый шаг | эксклюзивный типизированный guard записи с хоста во входной буфер с проверкой dtype; данные публикуются при его drop |
 | `output() -> Result<&Buffer>` | каждый шаг | первый выход плана |
 | `<output>([i])` / `<output>_shape()` / `_view::<T>()` / `_to_vec::<T>()` | каждый шаг | именованный выходной буфер, его актуальная форма и чтения, вычисленные по текущим привязкам переменных |
 | `reset() -> Result<()>` | каждый шаг | обнулить каждый слот `state` (генерируется только при наличии `state`) |
@@ -334,9 +334,7 @@ GPU; `wait` только в конце). `execute_profiled` использует
 ```rust
 jit.reset()?;                                    // zero the state, new sequence
 for chunk in chunks {
-    for (slot, v) in jit.x_view_mut::<f32>()?.iter_mut().zip(chunk) {
-        *slot = v;                               // per-step input, written in place
-    }
+    jit.x_host_write::<f32>()?.copy_from(&chunk)?; // per-step input, written in place
     jit.execute()?;                              // reads state, writes it back
     let frame = jit.emitted_to_vec::<f32>()?;    // only the emitted head crosses
 }
@@ -448,7 +446,7 @@ jit.prepare_with_config(
 ```
 
 Затем `VadInference::probs` проходит по сигналу запусками размером
-`FEATURE_BATCH` — упаковать `chunks_view_mut::<f32>()`, `execute()`,
+`FEATURE_BATCH` — упаковать `chunks_host_write::<f32>()`, `execute()`,
 `copyout_prefix` для валидных строк — и передаёт гейты в `VadHead::scan`, LSTM
 с сигмоидной головой, векторизованную на самую широкую SIMD-ширину,
 доступную CPU хоста. Такое разделение заменило путь с одним крошечным

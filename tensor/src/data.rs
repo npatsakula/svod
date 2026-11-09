@@ -404,30 +404,27 @@ impl Tensor {
         self.entry.buffer().ok_or_else(|| ErrorKind::NoBuffer.into())
     }
 
-    /// Typed mutable view into the buffer, shaped by the tensor's logical shape.
+    /// Run `f` under exclusive host write access to the tensor's buffer as a
+    /// flat `[T]` (see [`svod_device::HostWrite`]), published when `f`
+    /// returns. Same buffer-identity requirement as
+    /// [`array_view`](Self::array_view): writing through a view would land the
+    /// values at the wrong offsets in the base buffer.
     ///
     /// # Examples
     /// ```
     /// # use svod_tensor::Tensor;
     /// # use ndarray::array;
     /// let t = Tensor::from_ndarray(&array![[0.0f32, 0.0, 0.0], [0.0, 0.0, 0.0]]);
-    /// t.array_view_mut::<f32>().unwrap()[[1, 2]] = 42.0;
+    /// t.with_host_write::<f32, _>(|w| w.copy_at(5, &[42.0])).unwrap();
     /// assert_eq!(t.array_view::<f32>().unwrap()[[1, 2]], 42.0);
     /// ```
-    /// Writable counterpart of [`array_view`](Self::array_view), with the same
-    /// buffer-identity requirement — writing through a view would land the
-    /// values at the wrong offsets in the base buffer.
-    pub fn array_view_mut<T: HasDType>(&self) -> Result<ndarray::ArrayViewMutD<'_, T>> {
-        let flat = self.storage()?.as_array_mut::<T>().context(DeviceSnafu)?;
-        if let Ok(shape) = self.shape() {
-            let dims: Vec<usize> = shape.iter().filter_map(|d| d.as_const()).collect();
-            if dims.len() == shape.len() {
-                return flat
-                    .into_shape_with_order(ndarray::IxDyn(&dims))
-                    .context(NdarrayShapeSnafu)
-                    .map_err(Into::into);
-            }
-        }
-        Ok(flat)
+    pub fn with_host_write<T: HasDType + Copy, R>(
+        &self,
+        f: impl FnOnce(&mut svod_device::HostWrite<'_, T>) -> svod_device::Result<R>,
+    ) -> Result<R> {
+        // A fresh handle onto the shared storage: its writer flag, not the
+        // borrow, keeps every other handle out while `f` runs.
+        let mut buffer = Buffer::clone(self.storage()?);
+        buffer.with_host_write(f).context(DeviceSnafu).map_err(Into::into)
     }
 }

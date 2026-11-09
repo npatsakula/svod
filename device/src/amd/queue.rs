@@ -1006,7 +1006,7 @@ struct QueueInner {
     /// trap handler writes its exception code into `value` (`+8`) and halts the
     /// queue; reading it tells us WHY a wedge happened (e.g. `0x401`).
     qinactive_host: Option<NonNull<u8>>,
-    /// Flushes VRAM stores a mutable host view deferred to the next doorbell.
+    /// Flushes VRAM stores a `HostWrite` deferred to the next doorbell.
     hdp: Arc<crate::amd::iface::Hdp>,
     /// Index of the next packet (in AQL_PACKET_BYTES-sized slots). For SDMA
     /// queues this is the next byte offset; type checks ensure callers don't
@@ -1287,7 +1287,7 @@ impl QueueInner {
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         // Everything the submission path wrote is system memory and needs no
         // HDP flush; VRAM stores were flushed where they were made, except
-        // those of a mutable host view, which flush here.
+        // those of a dropped `HostWrite`, which flush here.
         self.hdp.flush_deferred();
         // SAFETY: doorbell is mmapped MMIO; aligned 64-bit store.
         unsafe { std::ptr::write_volatile(self.doorbell.as_ptr(), doorbell_value) };
