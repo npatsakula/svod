@@ -104,11 +104,53 @@ pub trait AmdIface: Send + Sync + std::fmt::Debug {
     }
 
     /// Flush the host's writes to device-local memory out of HDP, the host
-    /// data path: queues call it between their last host write and the
-    /// doorbell, so the work the doorbell starts reads them (ROCr/CLR's
-    /// `HDP_MEM_FLUSH_CNTL` write before a dispatch that reads VRAM kernargs).
-    /// A no-op where the backend has no flush register.
+    /// data path, and wait until the flush has landed (ROCr/CLR's
+    /// `HDP_MEM_FLUSH_CNTL` write). Called through [`Hdp`] only. A no-op
+    /// where the backend has no flush register.
     fn flush_hdp(&self) {}
+}
+
+/// HDP, the host data path: host stores into VRAM through the BAR may sit in
+/// it until it is flushed, so no GPU engine may read them before a flush.
+///
+/// The submission path writes only system memory (rings, GART, signals, the
+/// kernarg arena, graph and plan kernargs and command buffers), so a doorbell
+/// itself needs no flush. Host stores into VRAM are rare and explicit (code
+/// upload, CWSR headers, zero-fill, copy-in, host transfers): each flushes
+/// with [`Hdp::flush`] once its stores are done. A mutable host view of a VRAM
+/// buffer hands its stores to a caller that writes later, so it marks them
+/// [`Hdp::defer`]red and the device's next doorbell flushes them.
+#[derive(Debug)]
+pub(crate) struct Hdp {
+    iface: Arc<dyn AmdIface>,
+    deferred: AtomicBool,
+}
+
+impl Hdp {
+    pub(crate) fn new(iface: Arc<dyn AmdIface>) -> Self {
+        Self { iface, deferred: AtomicBool::new(false) }
+    }
+
+    /// Flush this thread's VRAM stores so far: drain its write-combining
+    /// buffers, then flush HDP and read the flush back.
+    pub(crate) fn flush(&self) {
+        std::sync::atomic::fence(Ordering::SeqCst);
+        self.iface.flush_hdp();
+    }
+
+    /// The host will store into VRAM after this call returns, with no point
+    /// of its own to flush at; the device's next doorbell flushes for it.
+    pub(crate) fn defer(&self) {
+        self.deferred.store(true, Ordering::Release);
+    }
+
+    /// Run by every doorbell after its SeqCst fence: flush stores a mutable
+    /// VRAM view may have made since the last doorbell.
+    pub(crate) fn flush_deferred(&self) {
+        if self.deferred.load(Ordering::Relaxed) && self.deferred.swap(false, Ordering::AcqRel) {
+            self.iface.flush_hdp();
+        }
+    }
 }
 
 /// Address of a KFD event's mailbox slot plus the id written into it.
@@ -134,13 +176,18 @@ pub enum QueueTeardown {
 }
 
 /// Allocation flavor — selects the KFD flag set built in [`AmdIface::alloc_raw`].
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AllocKind {
     /// Device VRAM. `executable` adds the EXECUTABLE bit (set for general
     /// buffers, cleared for scratch). PUBLIC is derived from `cpu_access`.
     DeviceVram { executable: bool },
-    /// GTT-pinned, host-visible, uncached system memory (rings, GART, signal
-    /// slots, the event page).
+    /// GTT-pinned, host-visible, uncached system memory: everything the host
+    /// writes per submission (rings, GART, signal slots, kernargs, command
+    /// buffers). The GPU reads it snooped, through no HDP, and `UNCACHED`
+    /// maps it MTYPE UC on every arch, so no GPU L2 keeps a stale copy of a
+    /// reused slot. `COHERENT` alone maps NC, cached in L2, on gfx12
+    /// (`gmc_v12_0_get_vm_pte`) and on a gfx942 APU, where each XCC's L2
+    /// would cache it apart.
     UncachedGtt,
 }
 

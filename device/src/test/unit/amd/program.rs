@@ -1,12 +1,14 @@
 use super::test_support::{
-    MockAmdIface, amd_alloc_or_skip, ensure_hw_signal_pool, install_signal_pool, mock_device, replay_dwords,
-    require_multi_xcc, require_single_xcc, scripted_error,
+    MockAmdCall, MockAmdIface, amd_alloc_or_skip, ensure_hw_signal_pool, install_signal_pool, mock_device,
+    replay_dwords, require_multi_xcc, require_single_xcc, scripted_error,
 };
 use crate::allocator::RawBuffer;
 use crate::amd::AmdAllocator;
 use crate::amd::device::AmdDevice;
 use crate::amd::graph::AmdGraph;
+use crate::amd::iface::AllocKind;
 use crate::amd::program::*;
+use crate::amd::va_registry::AllocTag;
 use crate::device::{AbiParamDescriptor, AbiParamKind, GraphKernel, Program};
 use crate::error::Error;
 use std::sync::Arc;
@@ -97,7 +99,12 @@ fn mock_program(ir: &str, name: &str, abi: &[AbiParamDescriptor], graph: bool) -
 }
 
 fn load_mock_program(bytes: &[u8], name: &str, abi: &[AbiParamDescriptor], graph: bool) -> MockProgram {
-    let (iface, allocator) = mock_device(1);
+    load_mock_program_on(1, bytes, name, abi, graph)
+}
+
+/// [`load_mock_program`] on an `xccs`-XCC device (more than one is AQL).
+fn load_mock_program_on(xccs: u32, bytes: &[u8], name: &str, abi: &[AbiParamDescriptor], graph: bool) -> MockProgram {
+    let (iface, allocator) = mock_device(xccs);
     let device = Arc::clone(&allocator.dev);
     if graph {
         install_signal_pool(&allocator);
@@ -145,6 +152,22 @@ attributes #0 = { nounwind "amdgpu-flat-work-group-size"="1,64" }
     let parsed = parse_kernel(&bytes, "read_table").expect("a PC-relative global address relocates");
     let table: Vec<u8> = [1515870810u32, 2, 3, 4].iter().flat_map(|v| v.to_le_bytes()).collect();
     assert!(parsed.image.windows(16).any(|w| w == table), "the global's bytes are in the image");
+}
+
+/// The host uploads a code object into VRAM through the BAR and flushes HDP
+/// once its stores are done, before any dispatch can fetch it.
+#[test]
+fn code_upload_flushes_hdp_after_its_stores() {
+    let Some(bytes) = clang_amdgcn(EMPTY_IR, "gfx1100") else { return };
+    let (iface, allocator) = mock_device(1);
+    iface.set_hdp_flush_register();
+    let _program = AmdProgram::load(Arc::clone(&allocator.dev), &allocator, &bytes, "empty", &[]).expect("load");
+    let transcript = iface.transcript();
+    assert!(
+        matches!(transcript[..], [MockAmdCall::Alloc { cpu_access: true, zero: false, .. }, MockAmdCall::HdpFlush]),
+        "{transcript:?}"
+    );
+    assert_eq!(iface.alloc_kinds_for_tag(AllocTag::Vram), [AllocKind::DeviceVram { executable: true }]);
 }
 
 #[test]
@@ -272,6 +295,57 @@ fn graph_capture_ends_on_the_completion_interrupt() {
     assert!(woken.ends_with(&interrupt), "{woken:x?}");
     assert_eq!(woken.len(), quiet.len() + interrupt.len());
     assert!(!quiet.windows(interrupt.len()).any(|run| run == interrupt));
+}
+
+/// A one-kernel linked plan on lane 0 of the mock device.
+fn one_kernel_semantic_plan() -> crate::hcq::SemanticLinkedPlan {
+    let lane = crate::hcq::LaneSubmission {
+        lane: crate::hcq::DeviceQueue {
+            device: svod_dtype::DeviceSpec::Amd { device_id: 0 },
+            queue: crate::hcq::QueueKind::Compute(0),
+        },
+        waits: Vec::new(),
+        commands: vec![crate::hcq::TopologyCommand { operation: 0, copy_leg: None }],
+        signal_value: 1,
+    };
+    crate::hcq::SemanticLinkedPlan::from_lane_submissions(vec![lane], |_| [0x1000, 0x1008]).unwrap()
+}
+
+/// Everything the host rewrites per replay lives in uncached system memory,
+/// so no doorbell needs an HDP flush: the device's kernarg arena (which also
+/// holds AQL control programs), graph and linked-plan kernargs, and their PM4
+/// IBs and AQL control programs.
+#[test_case::test_case(1; "pm4")]
+#[test_case::test_case(2; "aql")]
+fn replayed_kernargs_and_command_buffers_live_in_system_memory(xccs: u32) {
+    let Some(bytes) = clang_amdgcn(EMPTY_IR, "gfx1100") else { return };
+    let mock = load_mock_program_on(xccs, &bytes, "empty", &[], true);
+    let kinds = |tag| mock.iface.alloc_kinds_for_tag(tag);
+    let system = |count| vec![AllocKind::UncachedGtt; count];
+
+    let kernels = [graph_kernel(&mock.program, Vec::new(), Vec::new())];
+    let _graph = AmdGraph::capture_amd(&mock.allocator, &kernels).unwrap().expect("graph");
+    // The lane's arena, then the graph's kernargs; a command buffer for each
+    // of the plain and the profiled stream.
+    assert_eq!((kinds(AllocTag::Kernarg), kinds(AllocTag::CommandBuffer)), (system(2), system(2)));
+
+    let pool =
+        crate::amd::connector::PoolQueue::new_with_resources(Arc::clone(mock.device.core()), &mock.allocator).unwrap();
+    let owner = crate::amd::connector::OwnerCtx::new(Arc::clone(mock.device.core()), mock.allocator.clone());
+    let calls = [crate::device::PlanCall::Program {
+        program: &mock.program,
+        buffers: &[],
+        vals: &[],
+        global_size: Some([1, 1, 1]),
+        local_size: Some([1, 1, 1]),
+    }];
+    let plan = crate::amd::AmdLinkedPlan::capture(&owner, &pool, &one_kernel_semantic_plan(), &calls)
+        .unwrap()
+        .expect("linked plan");
+    // The plan's kernargs; on AQL, a control program per native submission.
+    let control_programs = if xccs > 1 { plan.submission_bytes().len() } else { 0 };
+    assert_eq!(kinds(AllocTag::Kernarg), system(3));
+    assert_eq!(kinds(AllocTag::CommandBuffer), system(2 + control_programs));
 }
 
 /// Every native submission of a linked plan ends on the completion interrupt:

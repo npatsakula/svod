@@ -427,7 +427,9 @@ impl Buffer {
     /// Get a mutable byte slice of the buffer data (CPU-accessible buffers only).
     ///
     /// # Safety contract (same as `as_host_bytes`)
-    /// Caller must ensure no kernels are executing concurrently.
+    /// Caller must ensure no kernels are executing concurrently, and finishes
+    /// its stores before the next submission that reads them: on AMD that
+    /// submission's doorbell flushes them out of HDP.
     ///
     /// # Errors
     /// - `NotAllocated` if buffer hasn't been allocated
@@ -459,6 +461,8 @@ impl Buffer {
                 // Async dispatch: drain before raw host access — host-pointer
                 // reads/writes aren't ordered on the GPU timeline.
                 device.core().wait_storage(*gpu_addr)?;
+                // The caller's VRAM stores leave HDP at the device's next doorbell.
+                device.core().hdp().defer();
                 let base = unsafe { ptr.as_ptr().add(self.offset) };
                 Ok(unsafe { std::slice::from_raw_parts_mut(base, self.size) })
             }
@@ -534,9 +538,8 @@ impl Buffer {
 
     /// Typed mutable view over CPU-accessible buffer memory.
     ///
-    /// Same as [`Self::as_array`] but allows writes. Caller must ensure no
-    /// kernels are executing concurrently (safety is the caller's
-    /// responsibility).
+    /// Same as [`Self::as_array`] but allows writes, under the contract of
+    /// [`Self::as_host_bytes_mut`].
     ///
     /// # Errors
     /// Same as [`Self::as_array`].
@@ -571,6 +574,8 @@ impl Buffer {
                 // Async dispatch: drain before raw host access — host-pointer
                 // reads/writes aren't ordered on the GPU timeline.
                 device.core().wait_storage(*gpu_addr)?;
+                // The caller's VRAM stores leave HDP at the device's next doorbell.
+                device.core().hdp().defer();
                 // SAFETY: BAR-backed VRAM mapping is valid for the buffer's
                 // lifetime; scheduler ensures no concurrent kernel writes.
                 let bytes_ptr = unsafe { ptr.as_ptr().add(self.offset) } as *mut T;

@@ -512,9 +512,9 @@ pub fn lower_hcq_pm4(submission: &crate::hcq::Submission, state: Pm4LoweringStat
             crate::hcq::Command::Wait { signal_address, value } => {
                 q.extend_from_slice(&pm4::wait_reg_mem(*signal_address, value_u32("wait", *value)?, u32::MAX));
             }
-            // HDP is flushed by the host before each doorbell
-            // (`AmdIface::flush_hdp`), not here: the CP's REQ/DONE handshake
-            // is shared by every queue on the device and hangs under concurrent
+            // HDP is flushed by the host where it stores into VRAM
+            // (`amd::iface::Hdp`), not here: the CP's REQ/DONE handshake is
+            // shared by every queue on the device and hangs under concurrent
             // requesters.
             crate::hcq::Command::MemoryBarrier => {
                 if is_gfx9 {
@@ -1006,8 +1006,8 @@ struct QueueInner {
     /// trap handler writes its exception code into `value` (`+8`) and halts the
     /// queue; reading it tells us WHY a wedge happened (e.g. `0x401`).
     qinactive_host: Option<NonNull<u8>>,
-    /// The backend, whose HDP flush precedes every doorbell.
-    iface: Arc<dyn crate::amd::iface::AmdIface>,
+    /// Flushes VRAM stores a mutable host view deferred to the next doorbell.
+    hdp: Arc<crate::amd::iface::Hdp>,
     /// Index of the next packet (in AQL_PACKET_BYTES-sized slots). For SDMA
     /// queues this is the next byte offset; type checks ensure callers don't
     /// confuse them.
@@ -1274,7 +1274,7 @@ impl QueueInner {
         self.publish(if is_pm4 { self.write_idx } else { self.write_idx - 1 });
     }
 
-    /// Publish `write_idx` to the GART wptr, flush HDP, then write `doorbell_value`.
+    /// Publish `write_idx` to the GART wptr, then write `doorbell_value`.
     fn publish(&self, doorbell_value: u64) {
         // GART wptr first: without it KFD sees the doorbell
         // change but reads a stale wptr.
@@ -1285,10 +1285,10 @@ impl QueueInner {
         // does. Without it the CP can observe the doorbell while the wptr /
         // ring packet / kernarg stores are still buffered (stale read → wedge).
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-        // Host writes through the BAR into VRAM (kernargs, control IBs,
-        // host-visible buffers) can sit in HDP; the work this doorbell starts
-        // may read them.
-        self.iface.flush_hdp();
+        // Everything the submission path wrote is system memory and needs no
+        // HDP flush; VRAM stores were flushed where they were made, except
+        // those of a mutable host view, which flush here.
+        self.hdp.flush_deferred();
         // SAFETY: doorbell is mmapped MMIO; aligned 64-bit store.
         unsafe { std::ptr::write_volatile(self.doorbell.as_ptr(), doorbell_value) };
     }
@@ -2621,8 +2621,8 @@ fn create_queue(
     needs_cwsr: bool,
 ) -> Result<QueueInner> {
     let dev = allocator.dev.core();
-    // Ring + GART are both VRAM with COHERENT | UNCACHED | PUBLIC flags
-    // (uncached + cpu-accessible). Using plain VRAM (no UNCACHED) makes
+    // Ring + GART are both GTT system memory with COHERENT | UNCACHED | PUBLIC
+    // flags (`AllocKind::UncachedGtt`). Using plain VRAM (no UNCACHED) makes
     // KFD reject the create_queue ioctl with EINVAL.
     let ring_buf =
         AmdBufferGuard::new(allocator.alloc_uncached_tagged(ring_size, crate::amd::va_registry::AllocTag::QueueRing)?);
@@ -2762,6 +2762,8 @@ fn create_queue(
                 std::ptr::write_volatile(hdr.add(20) as *mut u32, (debug_memory_size * xccs) as u32);
             }
         }
+        // The CP reads the headers on its first context save or restore.
+        dev.hdp().flush();
         (Some(eop_buf), Some(ctx_buf), eop_gpu, ctx_gpu, 0x1000u64, ctx_save_restore_size as u32, ctl_stack_size as u32)
     } else {
         (None, None, 0u64, 0u64, 0u64, 0u32, 0u32)
@@ -2816,7 +2818,7 @@ fn create_queue(
         queue_id,
         quarantined: false,
         qinactive_host,
-        iface: Arc::clone(dev.iface()),
+        hdp: Arc::clone(dev.hdp()),
         _ring_buf: ring_buf.into_inner(),
         _gart_buf: gart_buf.into_inner(),
         _eop_buf: eop_buf.map(AmdBufferGuard::into_inner),

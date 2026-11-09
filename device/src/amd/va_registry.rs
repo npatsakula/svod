@@ -30,7 +30,7 @@ use parking_lot::Mutex;
 /// culprit (see `amd-dispatch-lock-invariant`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AllocTag {
-    /// General device VRAM (tensor data, code, kernargs, EOP / ctx-save).
+    /// General device VRAM (tensor data, code, EOP / ctx-save).
     Vram,
     /// GTT-pinned host-visible control memory (queue ring, GART, signal slots).
     Gtt,
@@ -39,7 +39,12 @@ pub enum AllocTag {
     QueueGart,
     QueueInactive,
     Staging,
+    /// GTT kernargs: the device's arena (with AQL control programs) and the
+    /// kernargs graphs and linked plans own.
     Kernarg,
+    /// GTT command buffers graphs and linked plans own (PM4 IBs, AQL control
+    /// programs).
+    CommandBuffer,
     /// Register-spill scratch — GPU-only VRAM, realloc'd per kernel as private
     /// segment sizes grow.
     Scratch,
@@ -55,7 +60,8 @@ impl AllocTag {
             AllocTag::QueueGart => "GTT queue GART",
             AllocTag::QueueInactive => "GTT queue-inactive signal",
             AllocTag::Staging => "GTT SDMA staging",
-            AllocTag::Kernarg => "kernarg",
+            AllocTag::Kernarg => "GTT kernarg",
+            AllocTag::CommandBuffer => "GTT command buffer",
             AllocTag::Scratch => "scratch",
         }
     }

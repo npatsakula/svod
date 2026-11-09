@@ -76,6 +76,17 @@ fn kernarg_failed_retire_wait_poisons_and_hands_out_nothing() {
     assert_eq!(iface.free_count(), 0, "all hardware-referenced queue storage must remain quarantined");
 }
 
+/// The arena the host rewrites for every dispatch is uncached system memory,
+/// which the GPU reads without an HDP flush before the doorbell.
+#[test]
+fn kernarg_arena_lives_in_uncached_system_memory() {
+    let (iface, allocator) = mock_device(1);
+    iface.set_hdp_flush_register();
+    let _arena = KernargArena::new(&allocator, allocator.dev.core()).expect("arena");
+    assert_eq!(iface.alloc_kinds_for_tag(AllocTag::Kernarg), [crate::amd::iface::AllocKind::UncachedGtt]);
+    assert_eq!(iface.call_count(|call| *call == super::test_support::MockAmdCall::HdpFlush), 0);
+}
+
 /// Tinygrad allocates one kernarg buffer per device, not per lane.
 #[test]
 fn kernarg_arena_is_shared_by_every_lane_of_one_device() {

@@ -96,7 +96,7 @@ struct MockAmdState {
     teardown_script: VecDeque<Result<QueueTeardown>>,
     wait_script: VecDeque<Result<Option<Error>>>,
     publication_script: VecDeque<MockPublicationOutcome>,
-    alloc_tags: Vec<AllocTag>,
+    alloc_tags: Vec<(AllocTag, AllocKind)>,
     transcript: Vec<MockAmdCall>,
     free_issues: Vec<MockFreeIssue>,
     queue_event_mailbox: Option<QueueEventMailbox>,
@@ -141,8 +141,8 @@ impl MockAmdIface {
         self.state.lock().queue_event_mailbox = Some(mailbox);
     }
 
-    /// Give the mock KFD's MMIO remap page, whose HDP flush register the
-    /// queues write before each doorbell; without it the flush is skipped.
+    /// Give the mock KFD's MMIO remap page, whose HDP flush register the host
+    /// writes after its VRAM stores; without it the flush is skipped.
     pub(crate) fn set_hdp_flush_register(&self) {
         self.state.lock().hdp_flush_register = true;
     }
@@ -169,7 +169,12 @@ impl MockAmdIface {
 
     /// Successful allocations recorded for one [`AllocTag`], live or freed.
     pub(crate) fn alloc_count_for_tag(&self, tag: AllocTag) -> usize {
-        self.state.lock().alloc_tags.iter().filter(|recorded| **recorded == tag).count()
+        self.alloc_kinds_for_tag(tag).len()
+    }
+
+    /// The [`AllocKind`] of each successful allocation recorded for `tag`.
+    pub(crate) fn alloc_kinds_for_tag(&self, tag: AllocTag) -> Vec<AllocKind> {
+        self.state.lock().alloc_tags.iter().filter(|(recorded, _)| *recorded == tag).map(|(_, kind)| *kind).collect()
     }
 
     pub(crate) fn live_handle_count(&self) -> usize {
@@ -246,7 +251,7 @@ impl AmdIface for MockAmdIface {
     fn alloc_raw(
         &self,
         size: usize,
-        _kind: AllocKind,
+        kind: AllocKind,
         tag: AllocTag,
         cpu_access: bool,
         zero: bool,
@@ -269,7 +274,7 @@ impl AmdIface for MockAmdIface {
         let previous = state.live.insert(handle, MockLiveAllocation { _memory: memory, gpu_va, size });
         debug_assert!(previous.is_none());
         state.allocations += 1;
-        state.alloc_tags.push(tag);
+        state.alloc_tags.push((tag, kind));
         Ok(AllocResult { gpu_va, host_ptr, handle, size })
     }
 

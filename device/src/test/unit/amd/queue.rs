@@ -436,55 +436,110 @@ fn publication_fails_at(iface: &MockAmdIface, stage: usize, panicking: bool, sub
     assert_eq!(&iface.publication_stages()[reached..], &STAGES[..=stage]);
 }
 
-/// Every compute doorbell follows the host HDP flush when the backend has the
-/// flush register, and a backend without one publishes the same way.
-#[test_case::test_case(1, true; "pm4 flushes")]
-#[test_case::test_case(2, true; "aql flushes")]
-#[test_case::test_case(1, false; "pm4 without the register")]
-#[test_case::test_case(2, false; "aql without the register")]
-fn the_host_flushes_hdp_before_each_compute_doorbell(xccs: u32, register: bool) {
+/// The calls a publication makes from `mark` on: its checkpoints and HDP flushes.
+fn publication_calls(iface: &MockAmdIface, mark: usize) -> Vec<super::test_support::MockAmdCall> {
+    use super::test_support::MockAmdCall;
+    iface.transcript()[mark..]
+        .iter()
+        .filter(|call| matches!(call, MockAmdCall::PublicationCheckpoint { .. } | MockAmdCall::HdpFlush))
+        .cloned()
+        .collect()
+}
+
+/// A host-mapped VRAM buffer of `bytes` on the mock device.
+fn host_vram_buffer(allocator: &crate::amd::AmdAllocator, bytes: usize) -> crate::buffer::Buffer {
+    let allocator: Arc<dyn crate::allocator::Allocator> = Arc::new(allocator.clone());
+    let spec = crate::allocator::BufferSpec { cpu_access: true, ..Default::default() };
+    let buffer = crate::buffer::Buffer::new(allocator, svod_dtype::DType::UInt8, vec![bytes], spec);
+    buffer.ensure_allocated().expect("mock allocation");
+    buffer
+}
+
+/// A compute doorbell flushes no HDP of its own: the submission path writes
+/// only system memory. Stores through a mutable host view of VRAM are the one
+/// exception, with no point of their own to flush at, so exactly the next
+/// doorbell flushes them, between its last write and the doorbell.
+#[test_case::test_case(1; "pm4")]
+#[test_case::test_case(2; "aql")]
+fn a_compute_doorbell_flushes_hdp_only_for_a_mutable_vram_view(xccs: u32) {
     use super::test_support::MockAmdCall;
 
     let (iface, allocator) = mock_device_with_signals(xccs);
-    if register {
-        iface.set_hdp_flush_register();
-    }
+    iface.set_hdp_flush_register();
     let pool = PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator).expect("pool queue");
-    let doorbell = |iface: &MockAmdIface| {
+    let buffer = host_vram_buffer(&allocator, 64);
+    let doorbell = || {
         let mark = iface.transcript().len();
         pool.queue().submit_hcq_dispatch(&pool, &compute_submission(), &[0; 16], &[], &[]).expect("submit");
-        iface.transcript()[mark..]
-            .iter()
-            .filter(|call| matches!(call, MockAmdCall::PublicationCheckpoint { .. } | MockAmdCall::HdpFlush))
-            .cloned()
-            .collect::<Vec<_>>()
+        publication_calls(&iface, mark)
     };
     let checkpoint = |stage| MockAmdCall::PublicationCheckpoint { stage };
-    let mut expected =
-        vec![checkpoint(PublicationStage::AfterReservation), checkpoint(PublicationStage::BeforeDoorbell)];
-    expected.extend(register.then_some(MockAmdCall::HdpFlush));
-    expected.push(checkpoint(PublicationStage::AfterDoorbell));
+    let [reserved, before, after] =
+        [PublicationStage::AfterReservation, PublicationStage::BeforeDoorbell, PublicationStage::AfterDoorbell]
+            .map(checkpoint);
+    let plain = vec![reserved.clone(), before.clone(), after.clone()];
     for _ in 0..2 {
-        assert_eq!(doorbell(&iface), expected, "xccs={xccs}");
+        assert_eq!(doorbell(), plain, "xccs={xccs}");
     }
+
+    let mark = iface.transcript().len();
+    buffer.as_host_bytes_mut().expect("host view").fill(7);
+    assert!(!iface.transcript()[mark..].contains(&MockAmdCall::HdpFlush), "a view defers its flush");
+    assert_eq!(doorbell(), [reserved, before, MockAmdCall::HdpFlush, after], "xccs={xccs}");
+    assert_eq!(doorbell(), plain, "the deferred flush runs once");
+    // Retire the mock timeline, so freeing the buffer drains at once.
+    crate::sync::TimelineSignal::set(&**pool.pm4_signal(), pool.pm4_value());
 }
 
-/// SDMA reads host-written VRAM too, so its doorbell flushes HDP as well.
-#[test_case::test_case(true; "with the register")]
-#[test_case::test_case(false; "without the register")]
-fn the_host_flushes_hdp_before_each_copy_doorbell(register: bool) {
+/// SDMA doorbells follow the same contract: no flush of their own, the one
+/// deferred by a mutable VRAM view.
+#[test]
+fn a_copy_doorbell_flushes_hdp_only_for_a_mutable_vram_view() {
     use super::test_support::MockAmdCall;
 
     let (iface, allocator) = mock_device_with_signals(1);
-    if register {
-        iface.set_hdp_flush_register();
-    }
+    iface.set_hdp_flush_register();
     let queue = AmdCopyQueue::create(&allocator).expect("copy queue");
+    let buffer = host_vram_buffer(&allocator, 64);
     let mut copy = Submission::new(QueueKind::Copy(0));
     copy.push(Command::Copy { dst: 0x1000, src: 0x2000, bytes: 4 });
+    let flushes = || iface.call_count(|call| *call == MockAmdCall::HdpFlush);
+
+    let before = flushes();
     queue.submit_hcq(&copy).expect("submit");
     assert_ne!(queue.ring_write_idx(), 0, "the copy was published");
-    assert_eq!(iface.call_count(|call| *call == MockAmdCall::HdpFlush), usize::from(register));
+    assert_eq!(flushes(), before);
+
+    buffer.as_array_mut::<u8>().expect("host view").fill(7);
+    assert_eq!(flushes(), before, "a view defers its flush");
+    queue.submit_hcq(&copy).expect("submit");
+    assert_eq!(flushes(), before + 1);
+    queue.submit_hcq(&copy).expect("submit");
+    assert_eq!(flushes(), before + 1, "the deferred flush runs once");
+}
+
+/// The CP reads a compute queue's CWSR headers on its first context save or
+/// restore, which no doorbell orders: the host flushes them before KFD
+/// creates the queue.
+#[test_case::test_case(1; "pm4")]
+#[test_case::test_case(2; "aql")]
+fn cwsr_headers_are_flushed_before_the_queue_exists(xccs: u32) {
+    use super::test_support::MockAmdCall;
+
+    let (iface, allocator) = mock_device_with_signals(xccs);
+    iface.set_hdp_flush_register();
+    let mark = iface.transcript().len();
+    let _queue = AmdComputeQueue::create(&allocator).expect("compute queue");
+    let calls = &iface.transcript()[mark..];
+    let setup = calls.iter().position(|call| matches!(call, MockAmdCall::SetupRing { .. })).expect("queue setup");
+    // The zero-filled ctx-save buffer flushes, then the headers stored over it.
+    assert!(
+        matches!(
+            calls[..setup],
+            [.., MockAmdCall::Alloc { cpu_access: true, zero: true, .. }, MockAmdCall::HdpFlush, MockAmdCall::HdpFlush]
+        ),
+        "{calls:?}"
+    );
 }
 
 fn compute_submission() -> Submission {

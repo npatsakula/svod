@@ -323,6 +323,7 @@ impl AmdProgram {
         };
         // SAFETY: code_host points to size bytes we just mmapped exclusively.
         unsafe { std::ptr::copy_nonoverlapping(parsed.image.as_ptr(), code_host.as_ptr(), parsed.image.len()) };
+        device.core().hdp().flush();
 
         let aql_prog_addr = code_gpu + parsed.kd_offset;
 

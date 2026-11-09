@@ -128,3 +128,69 @@ fn user_buffer_free_failed_drain_poisons_and_quarantines_allocation() {
     drop(pool);
     assert_eq!(iface.free_count(), 0);
 }
+
+/// A host store into VRAM through the BAR.
+#[derive(Clone, Copy, Debug)]
+enum HostVramWrite {
+    ZeroFill,
+    CopyIn,
+    Transfer,
+}
+
+/// Each host store into a `cpu_access` VRAM buffer ends on an HDP flush, once
+/// its stores are done, and the next submission needs no flush of its own.
+#[test_case(HostVramWrite::ZeroFill; "zero-filled allocation")]
+#[test_case(HostVramWrite::CopyIn; "copy-in")]
+#[test_case(HostVramWrite::Transfer; "host transfer")]
+fn a_host_vram_write_is_flushed_before_the_next_submission(write: HostVramWrite) {
+    let (iface, alloc) = mock_device(1);
+    install_signal_pool(&alloc);
+    iface.set_hdp_flush_register();
+    let pool =
+        crate::amd::connector::PoolQueue::new_with_resources(Arc::clone(alloc.dev.core()), &alloc).expect("pool queue");
+    let opts = BufferSpec { cpu_access: true, ..Default::default() };
+    let src = alloc.alloc(64, &opts, false).expect("source");
+    let dst = alloc.alloc(64, &opts, false).expect("destination");
+
+    let mark = iface.transcript().len();
+    let zeroed = match write {
+        HostVramWrite::ZeroFill => Some(alloc.alloc(64, &opts, true).expect("zeroed")),
+        HostVramWrite::CopyIn => alloc._copyin(&dst, 8, &[7; 16]).map(|()| None).expect("copy-in"),
+        HostVramWrite::Transfer => alloc._transfer(&dst, 0, &src, 0, 64).map(|()| None).expect("transfer"),
+    };
+    let calls = &iface.transcript()[mark..];
+    assert_eq!(calls.last(), Some(&MockAmdCall::HdpFlush), "{write:?}: {calls:?}");
+    assert_eq!(calls.iter().filter(|call| **call == MockAmdCall::HdpFlush).count(), 1, "{write:?}: {calls:?}");
+
+    let mark = iface.transcript().len();
+    let mut submission = crate::hcq::Submission::new(crate::hcq::QueueKind::Compute(0));
+    submission.push(crate::hcq::Command::MemoryBarrier);
+    pool.queue().submit_hcq_dispatch(&pool, &submission, &[], &[], &[]).expect("submit");
+    assert!(!iface.transcript()[mark..].contains(&MockAmdCall::HdpFlush), "{write:?}");
+    // Retire the mock timeline, so the frees below drain at once.
+    crate::sync::TimelineSignal::set(&**pool.pm4_signal(), pool.pm4_value());
+
+    for buffer in [Some(src), Some(dst), zeroed].into_iter().flatten() {
+        alloc.free(buffer, 64, &opts);
+    }
+}
+
+/// Without SDMA every buffer is host-mapped VRAM, but one the host never
+/// stores into needs no flush; a backend without the flush register skips it.
+#[test_case(true; "with the register")]
+#[test_case(false; "without the register")]
+fn only_host_stores_into_vram_flush(register: bool) {
+    let (iface, alloc) = mock_device(1);
+    if register {
+        iface.set_hdp_flush_register();
+    }
+    let opts = BufferSpec { cpu_access: true, ..Default::default() };
+    let unwritten = alloc.alloc(64, &opts, false).expect("allocation");
+    let control = alloc.alloc_uncached(64).expect("system memory");
+    assert_eq!(iface.call_count(|call| *call == MockAmdCall::HdpFlush), 0);
+    let zeroed = alloc.alloc(64, &opts, true).expect("zeroed");
+    assert_eq!(iface.call_count(|call| *call == MockAmdCall::HdpFlush), usize::from(register));
+    for buffer in [unwritten, control, zeroed] {
+        alloc.free(buffer, 64, &opts);
+    }
+}

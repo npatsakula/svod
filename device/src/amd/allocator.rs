@@ -51,9 +51,10 @@ impl AmdAllocator {
     }
 
     /// Allocate GTT-pinned system memory with `COHERENT | UNCACHED | PUBLIC`
-    /// flags — host-visible, uncached, suitable for queue rings, GART pages,
-    /// and signal slots. The `uncached` branch sets **GTT**, not VRAM
-    /// (uncached and VRAM are mutually exclusive in the flag composition).
+    /// flags — host-visible, uncached, for everything the host writes per
+    /// submission: queue rings, GART pages, signal slots, kernargs and command
+    /// buffers. The `uncached` branch sets **GTT**, not VRAM (uncached and
+    /// VRAM are mutually exclusive in the flag composition).
     pub fn alloc_uncached(&self, size: usize) -> Result<RawBuffer> {
         do_alloc(&self.dev, size, AllocKind::UncachedGtt, /*cpu_accessible=*/ true, /*zero_init=*/ true)
     }
@@ -69,6 +70,8 @@ impl AmdAllocator {
         )
     }
 
+    /// Host-visible VRAM. Host stores into it go through HDP, so the writer
+    /// flushes them ([`crate::amd::iface::Hdp::flush`]) before a GPU reads them.
     pub(crate) fn alloc_host_visible_tagged(&self, size: usize, tag: AllocTag) -> Result<RawBuffer> {
         do_alloc_tagged(
             &self.dev,
@@ -126,9 +129,9 @@ impl Allocator for AmdAllocator {
                 // scheduler exclusivity. `dest_off + src.len()` is bounded by the caller.
                 let dst = unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr().add(dest_off), src.len()) };
                 dst.copy_from_slice(src);
-                // Coherence: the next compute dispatch reading this VA does a full
-                // `acquire_mem` (L2 invalidate) in its prologue, so the host write
-                // is visible without extra bookkeeping here.
+                // The stores leave HDP here; the next compute dispatch reading
+                // this VA does a full `acquire_mem` (L2 invalidate) in its prologue.
+                self.dev.core().hdp().flush();
                 Ok(())
             }
             RawBuffer::AmdDevice { host_ptr: None, gpu_addr, .. } => {
@@ -182,8 +185,8 @@ impl Allocator for AmdAllocator {
                 unsafe {
                     std::ptr::copy(src_ptr.as_ptr().add(src_off), dst_ptr.as_ptr().add(dest_off), sz);
                 }
-                // Coherence handled by the consumer dispatch's full L2 acquire
-                // prologue (cf. `_copyin`).
+                // HDP flushed here, L2 by the consumer dispatch (cf. `_copyin`).
+                self.dev.core().hdp().flush();
                 Ok(())
             }
             (RawBuffer::AmdDevice { gpu_addr: dst_gpu, .. }, RawBuffer::AmdDevice { gpu_addr: src_gpu, .. }) => {
@@ -293,6 +296,10 @@ fn do_alloc_tagged(
     let r = dev.core().iface().alloc_raw(size, kind, tag, cpu_accessible, zero_init)?;
     if matches!(kind, AllocKind::DeviceVram { .. }) {
         dev.core().register_storage(r.gpu_va);
+        if zero_init && r.host_ptr.is_some() {
+            // The host zero-filled VRAM through the BAR.
+            dev.core().hdp().flush();
+        }
     }
     Ok(RawBuffer::AmdDevice {
         gpu_addr: r.gpu_va,

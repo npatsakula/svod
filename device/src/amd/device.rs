@@ -201,6 +201,8 @@ pub struct AmdDeviceCore {
     pub arch: AmdArch,
     /// Backend implementation (KFD today). All ioctls route through this.
     iface: Arc<dyn crate::amd::iface::AmdIface>,
+    /// Flushes the host's VRAM stores out of HDP; shared with every queue.
+    hdp: Arc<crate::amd::iface::Hdp>,
     /// Whether an SDMA copy queue is available on this physical device. Set
     /// by the factory once it installs one (every AMD part unless
     /// `AMD_DISABLE_SDMA` is set or creation fails); while `false`, every
@@ -321,6 +323,7 @@ impl AmdDevice {
         let core = Arc::new(AmdDeviceCore {
             node,
             arch: AmdArch::Gfx1100,
+            hdp: Arc::new(crate::amd::iface::Hdp::new(Arc::clone(&iface))),
             iface,
             has_sdma_queue: AtomicBool::new(false),
             pm4_graph: AtomicBool::new(false),
@@ -420,6 +423,7 @@ impl AmdDevice {
         let core = Arc::new(AmdDeviceCore {
             node,
             arch,
+            hdp: Arc::new(crate::amd::iface::Hdp::new(Arc::clone(&iface))),
             iface,
             has_sdma_queue: AtomicBool::new(false),
             pm4_graph: AtomicBool::new(false),
@@ -573,6 +577,13 @@ impl AmdDeviceCore {
     #[inline]
     pub(crate) fn iface(&self) -> &Arc<dyn crate::amd::iface::AmdIface> {
         &self.iface
+    }
+
+    /// HDP, through which every host store into VRAM must be flushed before a
+    /// GPU engine reads it.
+    #[inline]
+    pub(crate) fn hdp(&self) -> &Arc<crate::amd::iface::Hdp> {
+        &self.hdp
     }
 
     /// The KFD queue-completion event mailbox, when the backend has one. A

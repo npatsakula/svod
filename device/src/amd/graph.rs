@@ -105,7 +105,8 @@ fn lower_graph_submission(
         build_pm4_indirect_buffer(0, lowered.bytes.len() / 4)?;
         let linked = lane.link(&lowered, &LinkPatchValues(links.to_vec()))?;
         let buffer = AmdBufferGuard::new(
-            allocator.alloc_host_visible_tagged(lowered.bytes.len().max(16), crate::amd::va_registry::AllocTag::Gtt)?,
+            allocator
+                .alloc_uncached_tagged(lowered.bytes.len().max(16), crate::amd::va_registry::AllocTag::CommandBuffer)?,
         );
         let (gpu, host) = match buffer.buffer() {
             RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(host), .. } => (*gpu_addr, host.as_ptr()),
@@ -117,10 +118,10 @@ fn lower_graph_submission(
     let control_link = links.len();
     let program = lower_hcq_aql_submission_program(submission, state, PatchSource::LinkAddress(control_link))?;
     validate_aql_packet_count(program.aql.bytes.len() / AQL_PACKET_BYTES)?;
-    let buffer = AmdBufferGuard::new(
-        allocator
-            .alloc_host_visible_tagged(program.control.bytes.len().max(16), crate::amd::va_registry::AllocTag::Gtt)?,
-    );
+    let buffer = AmdBufferGuard::new(allocator.alloc_uncached_tagged(
+        program.control.bytes.len().max(16),
+        crate::amd::va_registry::AllocTag::CommandBuffer,
+    )?);
     let (gpu, host) = match buffer.buffer() {
         RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(host), .. } => (*gpu_addr, host.as_ptr()),
         _ => return Err(Error::NotHostVisible { what: "AQL graph control program" }),
@@ -200,7 +201,7 @@ impl AmdGraph {
         let (offsets, bytes) =
             kernarg_offsets(programs.iter().map(|program| program.kernarg_record_size()), KERNARG_ALIGN);
         let kernargs_buf = AmdBufferGuard::new(
-            allocator.alloc_host_visible_tagged(bytes.max(16), crate::amd::va_registry::AllocTag::Kernarg)?,
+            allocator.alloc_uncached_tagged(bytes.max(16), crate::amd::va_registry::AllocTag::Kernarg)?,
         );
         let (kernargs_gpu, kernargs_host) = match kernargs_buf.buffer() {
             RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(host), .. } => (*gpu_addr, host.as_ptr()),
