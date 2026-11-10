@@ -229,8 +229,11 @@ impl AmdSignal {
         let mut prev = u64::MAX;
         let mut progress_values = vec![u64::MAX; progress.len()];
         let mut read_prev = None;
+        // One strong count per wait: concurrent waiters would otherwise
+        // contend on the core's count every poll.
+        let device = self.device.upgrade();
         loop {
-            if let Some(error) = self.device.upgrade().and_then(|device| device.poison_error()) {
+            if let Some(error) = device.as_ref().and_then(|device| device.poison_error()) {
                 return Err(error);
             }
             let v = self.load();
@@ -255,7 +258,7 @@ impl AmdSignal {
             if timeout_ms > 0 && quiet.elapsed().as_millis() as u64 >= timeout_ms {
                 // A hung kernel almost always raised a fault; surface it
                 // alongside the deadline.
-                let fault = self.device.upgrade().and_then(|d| d.poll_faults_nonblocking());
+                let fault = device.as_ref().and_then(|d| d.poll_faults_nonblocking());
                 return Err(fault.unwrap_or(Error::TimelineTimeout {
                     what,
                     target,
@@ -263,7 +266,7 @@ impl AmdSignal {
                     waited_ms: timeout_ms,
                 }));
             }
-            if let Some(fault) = self.spin_or_sleep(waiting, &mut age)? {
+            if let Some(fault) = Self::spin_or_sleep(device.as_deref(), waiting, &mut age)? {
                 return Err(fault);
             }
         }
@@ -310,10 +313,14 @@ impl AmdSignal {
     /// carries a reported GPU fault and `None` means a normal wake-up, timeout,
     /// dropped device, or the pure spin/yield path.
     #[inline]
-    fn spin_or_sleep(&self, waiting: std::time::Instant, age: &mut u64) -> Result<Option<Error>> {
+    fn spin_or_sleep(
+        device: Option<&AmdDeviceCore>,
+        waiting: std::time::Instant,
+        age: &mut u64,
+    ) -> Result<Option<Error>> {
         let elapsed = waiting.elapsed();
         if elapsed >= SPIN
-            && let Some(dev) = self.device.upgrade()
+            && let Some(dev) = device
         {
             return dev.wait_events(SLEEP_MS, age);
         }
