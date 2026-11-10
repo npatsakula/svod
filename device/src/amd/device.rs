@@ -910,10 +910,8 @@ pub(crate) fn alloc_scratch(
     arch: &AmdArch,
     private_segment_size: u32,
 ) -> Result<(u64, usize, u32, u32, u64, AqlScratchDesc)> {
-    const LANES_PER_WAVE: u32 = 64;
     const PAGE: usize = 0x1000;
-    // gfx9 (CDNA) scratch is 1024-byte aligned; gfx11/12 (RDNA) use 256.
-    let mem_alignment_size: u32 = if arch.is_cdna() { 1024 } else { 256 };
+    let mem_alignment_size = scratch_alignment(arch);
 
     let xccs = node.num_xcc.max(1);
     let simd_per_cu = node.simd_per_cu.max(1);
@@ -978,17 +976,35 @@ pub(crate) fn alloc_scratch(
     Ok((va, total, tmpring_size, size_per_thread, handle, aql_desc))
 }
 
-/// Pack `COMPUTE_TMPRING_SIZE`: WAVES in bits 0..12, WAVESIZE at bit 12 with an
-/// arch-specific field width — gfx9 13b, gfx11 15b, gfx12 18b.
-pub(crate) fn pack_tmpring(waves: u32, wave_scratch: u32, arch: &AmdArch) -> u32 {
-    let wavesize_mask: u32 = if arch.is_cdna() {
+/// Scratch lanes are laid out per wave64 on every arch.
+const LANES_PER_WAVE: u32 = 64;
+
+/// The unit of a wave's scratch: gfx9 (CDNA) 1024 bytes, gfx11/12 (RDNA) 256.
+fn scratch_alignment(arch: &AmdArch) -> u32 {
+    if arch.is_cdna() { 1024 } else { 256 }
+}
+
+/// `COMPUTE_TMPRING_SIZE.WAVESIZE`, in scratch units: gfx9 13 bits, gfx11 15,
+/// gfx12 18.
+fn wavesize_mask(arch: &AmdArch) -> u32 {
+    if arch.is_cdna() {
         0x1FFF
     } else if arch.is_rdna4() {
         0x3FFFF
     } else {
         0x7FFF
-    };
-    (waves & 0xFFF) | ((wave_scratch & wavesize_mask) << 12)
+    }
+}
+
+/// The largest per-thread scratch `COMPUTE_TMPRING_SIZE.WAVESIZE` describes.
+pub(crate) fn max_scratch_per_thread(arch: &AmdArch) -> u32 {
+    wavesize_mask(arch) * scratch_alignment(arch) / LANES_PER_WAVE
+}
+
+/// Pack `COMPUTE_TMPRING_SIZE`: WAVES in bits 0..12, WAVESIZE at bit 12 with an
+/// arch-specific field width — gfx9 13b, gfx11 15b, gfx12 18b.
+pub(crate) fn pack_tmpring(waves: u32, wave_scratch: u32, arch: &AmdArch) -> u32 {
+    (waves & 0xFFF) | ((wave_scratch & wavesize_mask(arch)) << 12)
 }
 
 pub(crate) fn open_owned(path: &str) -> Result<OwnedFd> {

@@ -29,6 +29,7 @@ pub(crate) enum MockAmdCall {
     Free { gpu_va: u64, size: usize, handle: u64 },
     SetupRing { ring_size: usize, queue_type: u32 },
     TeardownRing { queue_id: u32 },
+    UpdateQueue { queue_id: u32, percentage: u32 },
     WaitEvents { timeout_ms: u32 },
     PublicationCheckpoint { stage: PublicationStage },
     HdpFlush,
@@ -362,6 +363,11 @@ impl AmdIface for MockAmdIface {
         }
         state.queue_teardowns += 1;
         Ok(QueueTeardown::Complete)
+    }
+
+    fn update_queue_percentage(&self, queue_id: u32, _ring_gpu: u64, _ring_size: u32, percentage: u32) -> Result<()> {
+        self.state.lock().transcript.push(MockAmdCall::UpdateQueue { queue_id, percentage });
+        Ok(())
     }
 
     fn wait_events(&self, timeout_ms: u32, _age: &mut u64) -> Result<Option<Error>> {

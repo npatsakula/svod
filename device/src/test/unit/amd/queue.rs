@@ -362,6 +362,37 @@ fn scratch_growth_preserves_old_state_on_drain_or_allocation_failure() {
     assert!(iface.free_issues().is_empty());
 }
 
+/// Ever larger kernels grow scratch geometrically: each grow at least doubles
+/// the per-thread size, so on AQL, where a grow remaps the queue twice and
+/// each remap preempts every queue of the process, 64 growing requests remap
+/// four times. The registers' limit caps the doubling, never a request.
+#[test_case::test_case(1; "pm4")]
+#[test_case::test_case(2; "aql")]
+fn scratch_grows_geometrically_up_to_the_register_limit(xccs: u32) {
+    use super::test_support::MockAmdCall;
+    use crate::amd::va_registry::AllocTag;
+
+    let (iface, allocator) = mock_device_with_signals(xccs);
+    let pool = PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator).expect("pool queue");
+    let remaps = || iface.call_count(|call| matches!(call, MockAmdCall::UpdateQueue { .. }));
+    let aql = usize::from(xccs > 1);
+    assert_eq!((iface.alloc_count_for_tag(AllocTag::Scratch), remaps()), (1, 2 * aql), "the initial descriptor");
+    for size in (1..=64).map(|step| 2048 + step * 256) {
+        pool.ensure_has_local_memory(size).expect("scratch growth");
+    }
+    // 2048 → 4096 → 8192 → 16384 → 32768 covers the last request, 18432.
+    assert_eq!((iface.alloc_count_for_tag(AllocTag::Scratch), remaps()), (5, 10 * aql));
+    assert_eq!(iface.call_count(|call| *call == MockAmdCall::UpdateQueue { queue_id: 1, percentage: 0 }), 5 * aql);
+
+    // From half the limit on, doubling would overflow the 15-bit gfx11 WAVESIZE.
+    let limit = crate::amd::device::max_scratch_per_thread(&allocator.dev.arch);
+    pool.ensure_has_local_memory(limit / 2).expect("growth to half the limit");
+    pool.ensure_has_local_memory(limit / 2 + 4).expect("growth to the limit");
+    assert_eq!(pool.tmpring_size() >> 12, 0x7FFF, "the largest stride the register holds");
+    pool.ensure_has_local_memory(limit).expect("satisfied at the limit");
+    assert_eq!(iface.alloc_count_for_tag(AllocTag::Scratch), 7);
+}
+
 #[test]
 fn lane_acquisition_times_out_instead_of_parking_forever() {
     let (_iface, allocator) = mock_device_with_signals(1);

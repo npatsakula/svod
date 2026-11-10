@@ -630,17 +630,28 @@ impl PoolQueue {
     /// Ensure the queue's scratch backing has at least `private_segment_size`
     /// bytes per thread, growing it on demand. The old scratch buffer is freed
     /// (drain → unmap → munmap → free).
+    ///
+    /// A grow at least doubles the per-thread size, up to what the scratch
+    /// registers describe: on AQL each grow remaps the queue twice, and every
+    /// remap preempts every queue of the process on the device, so a run of
+    /// ever larger kernels (a fresh tuning store's spilling candidates) remaps
+    /// a logarithmic number of times rather than once per kernel.
     pub fn ensure_has_local_memory(&self, private_segment_size: u32) -> Result<()> {
         // One check is enough: `QueueLease` is the exclusive publication
         // authority for this lane, so no concurrent grow can land between the
         // read and the replacement below, and no publisher can enqueue the
         // stale scratch VA during the transaction.
-        if private_segment_size <= self.scratch_state.lock().size_per_thread {
+        let current = self.scratch_state.lock().size_per_thread;
+        if private_segment_size <= current {
             return Ok(());
         }
+        let grown = current
+            .saturating_mul(2)
+            .min(crate::amd::device::max_scratch_per_thread(&self.core.arch))
+            .max(private_segment_size);
         self.drain_all()?;
         let (va, size, tmpring, rounded, handle, aql_desc) =
-            alloc_scratch(self.core.iface(), &self.core.node, &self.core.arch, private_segment_size)?;
+            alloc_scratch(self.core.iface(), &self.core.node, &self.core.arch, grown)?;
         let old = {
             let mut state = self.scratch_state.lock();
             let old = (state.gpu_va, state.size, state.handle);

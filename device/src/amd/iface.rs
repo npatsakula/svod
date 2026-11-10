@@ -795,6 +795,7 @@ impl AmdIface for KfdIface {
     }
 
     fn update_queue_percentage(&self, queue_id: u32, ring_gpu: u64, ring_size: u32, percentage: u32) -> Result<()> {
+        tracing::debug!(queue_id, percentage, "AMDKFD_IOC_UPDATE_QUEUE");
         let mut args = kfd::kfd_ioctl_update_queue_args {
             ring_base_address: ring_gpu,
             queue_id,
