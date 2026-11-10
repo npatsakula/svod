@@ -1491,14 +1491,21 @@ fn a_covering_write_supersedes_the_accesses_beneath_it() {
     assert_eq!(hazards.record(3, std::slice::from_ref(&small), &[]), vec![2], "and then stands in for them");
 }
 
-/// Zero-length views touch no bytes, so they never conflict.
-#[test]
-fn empty_ranges_never_conflict() {
+/// Zero-length views touch no bytes, so they never conflict, wherever they
+/// sit against a live write, read or written.
+#[test_case::test_case(0, false; "a read at the start")]
+#[test_case::test_case(16, false; "a read inside")]
+#[test_case::test_case(32, false; "a read at the end")]
+#[test_case::test_case(16, true; "a write inside")]
+fn empty_ranges_never_conflict(offset: usize, write: bool) {
     let base = 0x3000usize;
-    let (live, empty) = (base..base + 32, base..base);
+    let (live, empty) = (base..base + 32, base + offset..base + offset);
     let mut hazards = GraphHazards::default();
     hazards.record(0, &[], std::slice::from_ref(&live));
-    assert!(hazards.record(1, std::slice::from_ref(&empty), &[]).is_empty());
+    let (reads, writes) =
+        if write { (&[][..], std::slice::from_ref(&empty)) } else { (std::slice::from_ref(&empty), &[][..]) };
+    assert!(hazards.record(1, reads, writes).is_empty());
+    assert_eq!(hazards.record(2, std::slice::from_ref(&live), &[]), vec![0], "the live write still orders a reader");
 }
 
 /// The storages a plan reports to scoped sync follow the buffers bound at
