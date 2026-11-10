@@ -31,6 +31,12 @@
 //!   chosen from); `--picks` times the picks alone, an A/B across builds.
 //! - `trips`: the trip probes at 1–48 blocks an SM, per block-trip and per
 //!   round ([`svod_tk::probe::trip_at`]): what `TRIP_HIDING` is fitted to.
+//! - `pin --cfg BMxBNxBK:S:WRxWC[:rolled],… [--shape MxNxK,…] [--residual]
+//!   [--gated]`: each pinned GEMM config on each shape (Whisper's fc2 by
+//!   default, a SwiGLU epilogue under `--gated`),
+//!   timed beside the model's price and that price with one term zeroed at
+//!   a time (the memory latency, the lone trip, the matrix step): what each
+//!   term holds of the config's time.
 //!
 //! `--rounds R` sets the timed rounds (default 20; `fit` 2).
 
@@ -43,8 +49,9 @@ use svod_dtype::{DType, ScalarDType};
 use svod_runtime::ExecutionPlan;
 use svod_runtime::benchmark::{CLOCK_WARMUP, round_robin_min, warm_clock};
 use svod_tensor::Tensor;
+use svod_tk::atoms::{Core, Costs, Device};
 use svod_tk::build::{BF16, F16};
-use svod_tk::ir::{ParamKind, Program};
+use svod_tk::ir::{ParamKind, Program, Schedule};
 use svod_tk::kernels::attention::{AttnMask, AttnSpec, Bias, attention};
 use svod_tk::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, TileOrder, gemm};
 use svod_tk::kernels::nearest::{Floors, Metric, NearestSpec, nearest};
@@ -57,7 +64,7 @@ use svod_tk::tune::TuneStore;
 
 type Result<T, E = Box<dyn std::error::Error>> = std::result::Result<T, E>;
 
-const USAGE: &str = "tk_bench <gemm|attention|nearest|rerank|raster|fit|trips> [options]; see the example's docs";
+const USAGE: &str = "tk_bench <gemm|attention|nearest|rerank|raster|fit|trips|pin> [options]; see the example's docs";
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -77,6 +84,7 @@ fn main() -> Result<()> {
         "raster" => raster_bench(&args),
         "fit" => fit_bench(&args),
         "trips" => trips_bench(),
+        "pin" => pin_bench(&args),
         other => Err(format!("{other}: {USAGE}").into()),
     }
 }
@@ -610,6 +618,68 @@ fn trips_bench() -> Result<()> {
                 ),
                 None => println!("residency|{op}|{per_sm}|unresolved"),
             }
+        }
+    }
+    Ok(())
+}
+
+/// A pinned config, `BMxBNxBK:S:WRxWC[:rolled]`, on the warp core in the
+/// default raster.
+fn pinned(code: &str) -> Result<GemmCfg> {
+    let dims = |s: &str| -> Result<Vec<usize>> { Ok(s.split('x').map(str::parse).collect::<Result<_, _>>()?) };
+    let parts: Vec<&str> = code.split(':').collect();
+    let (tile, stages, warps) = match parts[..] {
+        [tile, stages, warps] | [tile, stages, warps, "rolled"] => (dims(tile)?, stages.parse()?, dims(warps)?),
+        _ => return Err(format!("{code}: BMxBNxBK:S:WRxWC[:rolled]").into()),
+    };
+    let (&[bm, bn, bk], &[wr, wc]) = (&tile[..], &warps[..]) else {
+        return Err(format!("{code}: three tile dims, two warp dims").into());
+    };
+    Ok(GemmCfg {
+        tile: [bm, bn, bk],
+        warps: [wr as u32, wc as u32],
+        core: Core::Warp,
+        schedule: Schedule::ring(stages, parts.len() == 3),
+        order: TileOrder::DEFAULT,
+        tail: None,
+    })
+}
+
+fn pin_bench(args: &Args) -> Result<()> {
+    let rounds = args.rounds(20)?;
+    let planner = planner()?;
+    let gated = args.flag("--gated");
+    let act = if gated { Act::Silu } else { Act::None };
+    let epilogue = Epilogue { residual: args.flag("--residual"), gated, act, ..Epilogue::DEFAULT };
+    let cfgs = args.opt("--cfg").ok_or("--cfg BMxBNxBK:S:WRxWC[:rolled],…")?.split(',').map(pinned);
+    let cfgs = cfgs.collect::<Result<Vec<_>>>()?;
+    let (target, costs) = (&planner.device.target, planner.device.costs);
+    let zeroed = [
+        ("latency", Costs { latency: 0.0, latency_one: 0.0, ..costs }),
+        ("lone trip", Costs { trip_lone: 0.0, trip_one_lone: 0.0, ..costs }),
+        ("step", Costs { step: 0.0, ..costs }),
+    ];
+    let zeroed =
+        zeroed.map(|(term, costs)| (term, Planner::new(Device { target: target.clone(), costs }).expect("SMs")));
+    println!("costs|{costs:?}");
+    for [m, n, k] in args.shapes::<3>("1500x1280x5120")? {
+        let p = GemmProblem::new(1, m, n, k, &epilogue);
+        let mut buffers = Buffers::default();
+        let plans = cfgs
+            .iter()
+            .map(|&c| buffers.plan(gemm_program(&planner, [m, n, k], epilogue, c)?, &c.lowering(&planner.device)))
+            .collect::<Result<Vec<_>>>()?;
+        for (c, t) in cfgs.iter().zip(best_of(&plans, rounds)) {
+            let priced = |planner: &Planner| p.admit(planner, c).map_or(f64::NAN, |a| a.0);
+            let blocks = m.div_ceil(c.tile[0]) * n.div_ceil(c.tile[1]);
+            let less: Vec<String> = zeroed.iter().map(|(term, z)| format!("less {term} {:.0}", priced(z))).collect();
+            println!(
+                "pin|{m}x{n}x{k}|{}|blocks {blocks}|measured {}|model {:.0}|{}",
+                gemm_label(c),
+                t.map_or("failed".into(), |t| t.as_nanos().to_string()),
+                priced(&planner),
+                less.join("|")
+            );
         }
     }
     Ok(())
