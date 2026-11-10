@@ -194,21 +194,47 @@ impl<T> std::fmt::Debug for Acc<'_, T> {
     }
 }
 
-/// A scalar expression: built with ordinary operators, interned into the
-/// program's arena by the builder call that consumes it.
+/// A scalar expression: built from the kernel's scalars and integers with
+/// ordinary operators, interned into the program's arena by the builder call
+/// that consumes it. Opaque, as the arena's ids are: no scalar of one kernel
+/// is made one of another's,
+///
+/// ```compile_fail,E0423
+/// # use svod_tk::ir::ScalarId;
+/// let forged = ScalarId(0);
+/// ```
+///
+/// nor read out of its kernel as an id:
+///
+/// ```compile_fail,E0624
+/// # use svod_tk::build::Kernel;
+/// Kernel::record("leak", |k| {
+///     let b = k.block(0);
+///     let id = k.intern(b);
+/// });
+/// ```
+#[derive(Clone, PartialEq, Eq)]
+pub struct Sc<'k>(pub(crate) Term<'k>);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Sc<'k> {
+pub(crate) enum Term<'k> {
     Id(ScalarId, PhantomData<Brand<'k>>),
     Const(i64),
     Bin(BinOp, Rc<Sc<'k>>, Rc<Sc<'k>>),
 }
 
+impl std::fmt::Debug for Sc<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 impl<'k> Sc<'k> {
     pub(crate) fn id(id: ScalarId) -> Self {
-        Sc::Id(id, PhantomData)
+        Sc(Term::Id(id, PhantomData))
     }
     fn bin(self, op: BinOp, rhs: impl Into<Sc<'k>>) -> Sc<'k> {
-        Sc::Bin(op, Rc::new(self), Rc::new(rhs.into()))
+        Sc(Term::Bin(op, Rc::new(self), Rc::new(rhs.into())))
     }
     pub fn min(self, rhs: impl Into<Sc<'k>>) -> Sc<'k> {
         self.bin(BinOp::Min, rhs)
@@ -236,7 +262,7 @@ impl<'k> Sc<'k> {
 macro_rules! sc_from {
     ($($t:ty),*) => {$(impl From<$t> for Sc<'_> {
         fn from(v: $t) -> Self {
-            Sc::Const(v as i64)
+            Sc(Term::Const(v as i64))
         }
     })*};
 }
@@ -470,11 +496,11 @@ impl<'k> Kernel<'k> {
         Sc::id(self.push_scalar(s))
     }
 
-    pub fn intern(&mut self, sc: impl Into<Sc<'k>>) -> ScalarId {
-        match sc.into() {
-            Sc::Id(id, _) => id,
-            Sc::Const(v) => self.push_scalar(Scalar::Const(v)),
-            Sc::Bin(op, a, b) => {
+    pub(crate) fn intern(&mut self, sc: impl Into<Sc<'k>>) -> ScalarId {
+        match sc.into().0 {
+            Term::Id(id, _) => id,
+            Term::Const(v) => self.push_scalar(Scalar::Const(v)),
+            Term::Bin(op, a, b) => {
                 let (a, b) = (self.intern((*a).clone()), self.intern((*b).clone()));
                 self.push_scalar(Scalar::Bin(op, a, b))
             }
@@ -607,8 +633,8 @@ impl<'k> Kernel<'k> {
         let Place::Global { param, offset, stride, bounds, rows: map, period } = place else {
             unreachable!("global tier")
         };
-        assert!(map.is_none() || rows == Sc::Const(0), "a gathered view moves along its columns only");
-        assert!(period.is_none() || cols == Sc::Const(0), "a periodic view moves along its rows only");
+        assert!(map.is_none() || rows == Sc::from(0), "a gathered view moves along its columns only");
+        assert!(period.is_none() || cols == Sc::from(0), "a periodic view moves along its rows only");
         let moved = Sc::id(offset) + rows.clone() * Sc::id(stride[0]) + cols.clone() * Sc::id(stride[1]);
         let offset = self.intern(moved);
         let bounds = [(bounds[0], rows), (bounds[1], cols)].map(|(b, by)| b.map(|b| self.intern(Sc::id(b) - by)));

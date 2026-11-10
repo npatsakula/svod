@@ -139,7 +139,7 @@ pub struct Storage {
 macro_rules! id {
     ($($name:ident),*) => {$(
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-        pub struct $name(pub u32);
+        pub struct $name(pub(crate) u32);
         impl $name {
             pub fn index(self) -> usize {
                 self.0 as usize

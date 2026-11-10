@@ -1628,9 +1628,9 @@ fn pairs<'k>(tiles: &[Regs<'k, F32>]) -> Seq<'k> {
 
 /// The value of `sc` where it is arithmetic over constants.
 fn constant<'k>(sc: &Sc<'k>) -> Option<i64> {
-    match sc {
-        Sc::Const(v) => Some(*v),
-        Sc::Bin(op, a, b) => {
+    match &sc.0 {
+        Term::Const(v) => Some(*v),
+        Term::Bin(op, a, b) => {
             let (a, b) = (constant(a)?, constant(b)?);
             match op {
                 BinOp::Add => Some(a + b),
@@ -1639,7 +1639,7 @@ fn constant<'k>(sc: &Sc<'k>) -> Option<i64> {
                 _ => None,
             }
         }
-        Sc::Id(..) => None,
+        Term::Id(..) => None,
     }
 }
 
