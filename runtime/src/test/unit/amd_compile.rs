@@ -117,14 +117,18 @@ end:
 
 /// Machine sinking is off for every clang whose matrix instructions it may
 /// sink, read from its banner (ROCm's `AMD clang version 22.0.0git` included),
-/// and for one whose version it cannot read.
+/// and for one whose version it cannot read; only IR holding a matrix product
+/// loses it.
 #[test_case::test_case("AMD clang version 22.0.0git (https://github.com/RadeonOpenCompute/llvm-project roc-7.2.4 f58b06dc)" => true; "rocm 7.2")]
 #[test_case::test_case("Ubuntu clang version 22.1.8 (++20260714014902+ca7933e47d3a-1~exp1)" => true; "ubuntu 22")]
 #[test_case::test_case("clang version 23.1.4" => false; "llvm 23")]
 #[test_case::test_case("a vendor compiler, build 7" => true; "unreadable")]
 fn machine_sinking_is_off_where_it_sinks_a_matrix_product(version: &str) -> bool {
     let major = crate::clang::clang_major_version(version);
-    let flags = amd_object_flags("", AmdArch::Gfx1151, major);
-    assert_eq!(flags.iter().any(|flag| flag == "-disable-machine-sink"), amd_sinks_wmma(major));
+    let sinks = |ir| amd_object_flags(ir, AmdArch::Gfx1151, major).iter().any(|flag| flag == "-disable-machine-sink");
+    assert!(!sinks("define void @f() { ret void }"), "IR without a matrix product keeps machine sinking");
+    for product in ["@llvm.amdgcn.wmma.f32.16x16x16.f16", "@llvm.amdgcn.mfma.f32.16x16x16f16"] {
+        assert_eq!(sinks(product), amd_sinks_wmma(major), "{product}");
+    }
     amd_sinks_wmma(major)
 }

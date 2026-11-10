@@ -110,8 +110,8 @@ pub(crate) fn amd_sinks_wmma(major: Option<u32>) -> bool {
 /// object-cache key, so keying a flag off it keeps the key sound.
 ///
 /// Below [`AMD_CONVERGENT_WMMA_LLVM`] (or when the version is unreadable)
-/// machine sinking is off; see [`amd_sinks_wmma`]. The toolchain's version is
-/// part of the cache key too.
+/// machine sinking is off for IR holding a matrix product; see
+/// [`amd_sinks_wmma`]. The toolchain's version is part of the cache key too.
 pub(crate) fn amd_object_flags(ir: &str, arch: AmdArch, llvm_major: Option<u32>) -> Vec<String> {
     let mut flags: Vec<String> = vec![
         "-x".into(),
@@ -125,7 +125,7 @@ pub(crate) fn amd_object_flags(ir: &str, arch: AmdArch, llvm_major: Option<u32>)
         "-Wno-override-module".into(),
         "-fno-math-errno".into(),
     ];
-    if amd_sinks_wmma(llvm_major) {
+    if amd_sinks_wmma(llvm_major) && (ir.contains("@llvm.amdgcn.wmma") || ir.contains("@llvm.amdgcn.mfma")) {
         flags.extend(["-mllvm", "-disable-machine-sink"].map(str::to_string));
     }
     if !ir.contains("@__ocml_") {
