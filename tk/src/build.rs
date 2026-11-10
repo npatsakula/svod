@@ -31,6 +31,11 @@ macro_rules! elem {
 }
 elem!(BF16 = BFloat16, F16 = Float16, I8 = Int8, F32 = Float32, I32 = Int32, Bool = Bool);
 
+/// An integer element: one a scalar reads as the index it holds.
+pub trait Int: Elem {}
+impl Int for I8 {}
+impl Int for I32 {}
+
 /// An element a matrix core multiplies, and the element it accumulates into:
 /// f32 for 16-bit floats, i32 for 8-bit integers (exact, as their products
 /// and sums are).
@@ -453,7 +458,11 @@ impl<'k> Kernel<'k> {
     /// the same range.
     pub fn var(&mut self, name: impl Into<String>, min: i64, max: i64) -> Sc<'k> {
         let name = name.into();
-        assert!(max <= i64::from(i32::MAX), "variable {name} counts to {max}, past i32");
+        assert!(min <= max, "variable {name} is in the empty {min}..={max}");
+        assert!(
+            i64::from(i32::MIN) <= min && max <= i64::from(i32::MAX),
+            "variable {name} in {min}..={max} is past i32"
+        );
         match self.prog.vars.iter().find(|v| v.name == name) {
             Some(v) => assert!(v.min == min && v.max == max, "variable {name} is in {}..={}", v.min, v.max),
             None => self.prog.vars.push(Var { name: name.clone(), min, max }),
@@ -466,8 +475,10 @@ impl<'k> Kernel<'k> {
     }
 
     /// The block's warps and how a register tile spreads over them; a count
-    /// is a grid of one column.
+    /// is a grid of one column. Set before [`Self::lone_warps`], which it
+    /// would otherwise undo.
     pub fn warps(&mut self, grid: impl Into<WarpGrid>) {
+        assert_eq!(self.prog.warps, self.prog.warp_grid.count(), "the warp grid is set before the lone warps");
         let grid = grid.into();
         self.prog.warp_grid = grid;
         self.prog.warps = grid.count();
@@ -525,7 +536,15 @@ impl<'k> Kernel<'k> {
     ///     k.load_scalar(p, 0); // a parameter the kernel writes is not `In`
     /// });
     /// ```
-    pub fn load_scalar<T: Elem>(&mut self, param: ParamRef<'k, T, In>, index: impl Into<Sc<'k>>) -> Sc<'k> {
+    ///
+    /// ```compile_fail,E0277
+    /// use svod_tk::build::*;
+    /// Kernel::record("read", |k| {
+    ///     let p = k.input::<F32>("p", 4);
+    ///     k.load_scalar(p, 0); // a float is no index
+    /// });
+    /// ```
+    pub fn load_scalar<T: Int>(&mut self, param: ParamRef<'k, T, In>, index: impl Into<Sc<'k>>) -> Sc<'k> {
         let index = self.intern(index);
         self.scalar(Scalar::Load { param: param.0, index })
     }
@@ -1263,8 +1282,8 @@ impl<'k> Kernel<'k> {
 
     /// `where_(pred, then(k), otherwise)` for each pair of tiles, `then` run
     /// only by the warps holding some set element of `pred` ([`Scalar::Any`]):
-    /// work most warps skip where `pred` is mostly clear. `then` must hold
-    /// no block barrier.
+    /// work most warps skip where `pred` is mostly clear. A block barrier in
+    /// `then` fails the lowering ([`crate::lower::Error::DivergentBarrier`]).
     pub fn where_any<T: Elem, const N: usize>(
         &mut self,
         pred: Regs<'k, Bool>,
@@ -1289,8 +1308,8 @@ impl<'k> Kernel<'k> {
     /// ([`Scalar::Any`]), else `otherwise`; unlike [`Self::where_any`] nothing
     /// selects between them, so `then` must itself leave the program's results
     /// what `otherwise` leads to wherever `pred` is clear (a tile it changes
-    /// there may only feed work that changes nothing there). `then` must hold
-    /// no block barrier.
+    /// there may only feed work that changes nothing there). A block barrier
+    /// in `then` fails the lowering, as in [`Self::where_any`].
     ///
     /// The results hold `otherwise` before the branch (one move each), which
     /// `then`'s replace as the branch's merge: no path past it leaves them

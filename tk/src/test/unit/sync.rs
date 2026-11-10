@@ -509,6 +509,33 @@ fn a_block_barrier_under_a_vote_is_refused(shared: bool) -> Result<(), String> {
     insert_barriers(&mut prog).map_err(|e| e.to_string())
 }
 
+/// A barrier the kernel places itself is held to the same rule: under a vote
+/// some warps never reach it.
+#[test_case(true => Err("a barrier is a block barrier under a branch on the warp, which some warps skip".into()); "under a vote")]
+#[test_case(false => Ok(()); "before it")]
+fn an_explicit_barrier_under_a_vote_is_refused(voted: bool) -> Result<(), String> {
+    let mut prog = Kernel::record("voted", |k| {
+        let x = k.zeros::<F32>(Shape::new(16, 16));
+        let low = k.reduce(x, Axis::Row, ReduceOp::Min);
+        let zero = k.zeros::<F32>(Shape::new(16, 1));
+        let pred = k.compare(low, zero, CmpOp::Lt);
+        if !voted {
+            k.barrier();
+        }
+        k.if_any(
+            pred,
+            |k| {
+                if voted {
+                    k.barrier();
+                }
+                vec![k.reduce(x, Axis::Row, ReduceOp::Max)]
+            },
+            vec![low],
+        );
+    });
+    insert_barriers(&mut prog).map_err(|e| e.to_string())
+}
+
 /// A streamed nearest runs the depth pipeline once per candidate tile: the
 /// pass fences the ring where the next tile's first fill meets the last
 /// tile's reads of it, one barrier at the head of the pipeline in the loop,

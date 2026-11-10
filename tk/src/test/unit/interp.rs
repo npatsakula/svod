@@ -302,14 +302,15 @@ enum Access {
 #[test_case(Access::Read, 4 => Err("element 16 of x is accessed, which holds 16".to_string()); "a read past")]
 #[test_case(Access::Write, 4 => Err("element 16 of y is accessed, which holds 16".to_string()); "a write past")]
 #[test_case(Access::Scalar, 15 => Ok(()); "a scalar at the last element")]
-#[test_case(Access::Scalar, 16 => Err("element 16 of x is accessed, which holds 16".to_string()); "a scalar past")]
-#[test_case(Access::Scalar, -1 => Err("element -1 of x is accessed, which holds 16".to_string()); "a scalar before")]
+#[test_case(Access::Scalar, 16 => Err("element 16 of n is accessed, which holds 16".to_string()); "a scalar past")]
+#[test_case(Access::Scalar, -1 => Err("element -1 of n is accessed, which holds 16".to_string()); "a scalar before")]
 #[test_case(Access::Shared, 4 => Err("element 16 of s is accessed, which holds 16".to_string()); "a shared tile past")]
 fn an_access_past_the_capacity_is_an_error(access: Access, at: i64) -> Result<(), String> {
     let tile = Shape::new(4, 4);
     let prog = Kernel::record("oob", |k| {
         let x = k.input::<F32>("x", 16);
         let y = k.output::<F32>("y", 16);
+        let n = k.input::<I32>("n", 16);
         let rows = |of: Access| if std::mem::discriminant(&access) == std::mem::discriminant(&of) { at } else { 0 };
         let (read_at, write_at) = (rows(Access::Read) * 4, rows(Access::Write) * 4);
         let src = k.view(x, read_at, [tile.cols, 1], tile, [None, None]);
@@ -319,7 +320,7 @@ fn an_access_past_the_capacity_is_an_error(access: Access, at: i64) -> Result<()
         let over = k.load(over);
         v = k.binary(v, over, BinaryOp::Max);
         if let Access::Scalar = access {
-            let s = k.load_scalar(x, at);
+            let s = k.load_scalar(n, at);
             v = k.splat::<F32>(tile, s);
         }
         if let Access::Shared = access {
@@ -331,7 +332,7 @@ fn an_access_past_the_capacity_is_an_error(access: Access, at: i64) -> Result<()
         let dst = k.view(y, write_at, [tile.cols, 1], tile, [None, None]);
         k.store(dst, v);
     });
-    run(&prog, vec![vec![1.0; 16], vec![0.0; 16]], &[]).map(drop).map_err(|e| e.to_string())
+    run(&prog, vec![vec![1.0; 16], vec![0.0; 16], vec![1.0; 16]], &[]).map(drop).map_err(|e| e.to_string())
 }
 
 /// A shift moves every element one step on along its axis and fills the
