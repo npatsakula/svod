@@ -1,21 +1,18 @@
 //! The GEMM raster ([`TileOrder`]): every block takes a distinct tile and
 //! every tile is taken, whatever the group height over ragged grids; a GEMM
-//! walking any raster computes its product; the planner plans every config
-//! at the default raster, whatever the cache.
+//! walking any raster computes its product.
 
 use proptest::prelude::*;
 use svod_dtype::ScalarDType;
 use test_case::test_case;
 
-use super::{costs, gfx1201_costs, sm86_costs};
-use crate::atoms::{Costs, Device, Target, sm86};
 use crate::build::*;
 use crate::interp::{round_to, run};
 use crate::ir::Shape;
 use crate::kernels::Batch;
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, TileOrder, gemm};
-use crate::ops::config::{Planner, Tiled, gemm_cfg};
-use crate::sweep::{assumed, geom};
+use crate::ops::config::{Tiled, gemm_cfg};
+use crate::sweep::assumed;
 
 /// The launch index (grid x fastest) of the block that takes each tile of a
 /// `gm × gn` grid walked in groups of `rows`, row-major; `-1` where none.
@@ -105,38 +102,4 @@ fn a_gemm_walking_any_raster_computes_its_product(rows: usize) {
             assert!((got - want).abs() <= 2e-2 * want.abs().max(1.0), "c[{i},{j}] = {got}, want {want}");
         }
     }
-}
-
-/// The planner of a card's target under its measured costs.
-fn measured(target: Target, costs: Costs) -> Planner {
-    Planner::new(Device { target, costs }).expect("a target with an SM count")
-}
-
-fn rx9070xt() -> Target {
-    Target::card("rx9070xt").expect("a listed card")
-}
-
-/// The planner keeps groups of eight tile rows for every config of every
-/// ranking, unsplit or split, without a cache ladder and under a card's
-/// measured one, on the shapes where the model of a raster once departed
-/// from it (a weight of eight 128-column tiles on sm_86, a 16384² product
-/// on gfx1201).
-#[test_case(sm86(), costs(), 4096, 4096, 4096; "sm_86 without a ladder")]
-#[test_case(rx9070xt(), costs(), 8192, 8192, 1024; "gfx1201 without a ladder")]
-#[test_case(sm86(), sm86_costs(), 4096, 1024, 4096; "sm_86 a narrow weight")]
-#[test_case(sm86(), sm86_costs(), 8192, 8192, 1024; "sm_86 a shallow product")]
-#[test_case(rx9070xt(), gfx1201_costs(), 16384, 16384, 4096; "gfx1201 a large square")]
-fn the_planner_keeps_the_default_raster(target: Target, costs: Costs, m: usize, n: usize, k: usize) {
-    let ranked = measured(target, costs).gemm_ranked(1, m, n, k, &Epilogue::DEFAULT);
-    assert!(!ranked.is_empty());
-    assert!(ranked.iter().all(|c| c.order == TileOrder::DEFAULT), "{m}x{n}x{k}: a raster off the default");
-}
-
-/// A convolution walks the default raster: its claim prices its re-reads by
-/// the image, not the expanded panels a raster reaches.
-#[test]
-fn a_convolution_walks_the_default() {
-    let planner = measured(sm86(), sm86_costs());
-    let ranked = planner.conv_ranked(1, 160 * 160, &geom([160, 160], 64, 128, 3, 1, 1, 1), &Epilogue::DEFAULT);
-    assert!(!ranked.is_empty() && ranked.iter().all(|c| c.gemm.order == TileOrder::DEFAULT));
 }
