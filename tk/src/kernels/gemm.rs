@@ -399,7 +399,7 @@ pub struct TailSpec<'t> {
 /// Search bound: the tile of a tail's merge, f32 rows in natural layouts:
 /// the conv merge's, a sub-tile of the GEMM's (whose columns are then a
 /// multiple of 32).
-const TAIL_MERGE: [usize; 2] = [32, 32];
+pub(crate) const TAIL_MERGE: [usize; 2] = [32, 32];
 
 impl TailSpec<'_> {
     /// Whether a GEMM of `m × n` over `cfg`'s tiles merges a tail: the

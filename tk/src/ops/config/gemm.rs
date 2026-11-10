@@ -9,7 +9,7 @@ use crate::atoms::{Core, Fill, Target};
 use std::num::NonZeroUsize;
 
 use crate::ir::{Axis, Schedule, Shape};
-use crate::kernels::gemm::{Epilogue, GemmCfg, Rope, TailPlan, TailSpec, TailSplit, TileOrder};
+use crate::kernels::gemm::{Epilogue, GemmCfg, Rope, TAIL_MERGE, TailPlan, TailSpec, TailSplit, TileOrder};
 use crate::kernels::{Act, Admitted};
 use crate::layouts::{Issue, Swizzle, WarpGrid, chunked, fills_in_chunks};
 use crate::tune::SETTLED;
@@ -235,7 +235,10 @@ pub fn gemm_lattice(target: &Target) -> Vec<GemmCfg> {
 /// and holds two accumulators). With `rope`, the output's first heads turn
 /// in the kernel's store: only tiles that hold whole heads lower, and the
 /// turn's operations and table reads are claimed. Its `epilogue` is the
-/// layer's tile operations an output element ([`epilogue_ops`]).
+/// layer's tile operations an output element ([`epilogue_ops`]); `out`
+/// the bytes an output element moves once its sum is done (its store and a
+/// residual's read, each of the output's type) and `bias` a bias column's
+/// (none without one).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct GemmProblem {
     pub batches: usize,
@@ -245,6 +248,8 @@ pub struct GemmProblem {
     pub halves: usize,
     pub rope: Option<Rope>,
     pub epilogue: u32,
+    pub out: usize,
+    pub bias: usize,
 }
 
 /// One launch of a GEMM's plan: `tiles` output tiles of a batch's walk
@@ -269,7 +274,9 @@ impl GemmProblem {
     /// `batches` products of `m × k` by `k × n` under `epilogue`.
     pub fn new(batches: usize, m: usize, n: usize, k: usize, epilogue: &Epilogue) -> Self {
         let (halves, rope) = (usize::from(epilogue.gated) + 1, epilogue.rope);
-        Self { batches, m, n, k, halves, rope, epilogue: epilogue_ops(epilogue) }
+        let out = if epilogue.out_f32 { F32 } else { ELEM } * (1 + usize::from(epilogue.residual));
+        let bias = if epilogue.bias { halves * ELEM } else { 0 };
+        Self { batches, m, n, k, halves, rope, epilogue: epilogue_ops(epilogue), out, bias }
     }
 
     pub(super) fn blocks(&self, cfg: &GemmCfg) -> usize {
@@ -467,11 +474,13 @@ impl GemmProblem {
         // row each — the side stream: priced at the ladder of its own
         // working set through the epilogue's pipe, not folded into the
         // ring's fill, its distinct bytes in the run's floor. A block
-        // stores its output tile once its trips are done ([`Claim::out`]);
-        // a split part runs no epilogue but stores its raw f32 slot, and
-        // its merge reads every split's slot of a tile row by row and adds
-        // them, its bytes at DRAM's rate: the epilogue over the sum is the
-        // plan's ([`Self::plan_price`]).
+        // stores its output tile and reads its bias and residual once its
+        // trips are done ([`Claim::out`]); a split part runs no epilogue
+        // but stores its raw f32 slot, and its merge reads every split's
+        // slot of a tile row by row and adds them, then stores the row and
+        // reads its residual (a merge tile's bias once), its bytes at
+        // DRAM's rate: the epilogue over the sum is the plan's
+        // ([`Self::plan_price`]).
         let split = part.split > 1;
         let epilogue = if split { 0.0 } else { f64::from(self.epilogue) * (bm * bn) as f64 / trips as f64 };
         let (mut ops, mut side) = (epilogue, Stream::default());
@@ -492,7 +501,7 @@ impl GemmProblem {
             true => Spread {
                 rows: (part.tiles * bm) as f64,
                 ops: Ops::of(Kind::Epilogue, (part.split * bn) as f64),
-                bytes: ((part.split * F32 + ELEM) * bn) as f64,
+                bytes: ((part.split * F32 + self.out) * bn + bn * self.bias / TAIL_MERGE[0]) as f64,
                 waits: 0.0,
             },
         };
@@ -513,7 +522,7 @@ impl GemmProblem {
             fill,
             side,
             stores: 0.0,
-            out: (bm * bn * if split { F32 } else { ELEM }) as f64,
+            out: if split { bm * bn * F32 } else { bm * bn * self.out + bn * self.bias } as f64,
             ring: stages,
             unroll: cfg.unroll(),
             waits: 0.0,

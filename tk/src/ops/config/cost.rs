@@ -312,8 +312,9 @@ pub(crate) struct Claim {
     /// The bytes a trip writes straight to DRAM (a score matrix's stores),
     /// priced at the global rate whatever the cache holds.
     pub stores: f64,
-    /// The bytes a block writes once its trips are done (a GEMM's output
-    /// tile, a split's f32 slot), straight to DRAM at the global rate after
+    /// The bytes a block moves once its trips are done (a GEMM's output
+    /// tile with its epilogue's bias and residual, a split's f32 slot),
+    /// straight to DRAM at the global rate after
     /// its last trip: no trip of the block is left to hide the store
     /// behind, and the SM's blocks store theirs one after another
     /// ([`Planner::price`]).

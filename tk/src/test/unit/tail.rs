@@ -349,6 +349,39 @@ fn a_split_whose_partials_outgrow_the_memory_is_refused() {
     }
 }
 
+/// A block's output moves its type's bytes once its trips are done, with
+/// its residual's (of the output's type) and its bias columns' (both
+/// halves' where gated); a tail's merge stores and reads the same a row and
+/// its merge tile's bias once, beside the partials: between a plain
+/// epilogue and an f32 output over a residual and a bias, a tail split's
+/// price moves by exactly those bytes at DRAM's rate, its waves' blocks
+/// one after another on the busiest SM and its merge's rows over the SMs.
+#[test]
+fn an_output_moves_its_types_bytes_and_its_epilogues_reads() {
+    let wide = Epilogue { bias: true, residual: true, out_f32: true, ..Epilogue::DEFAULT };
+    let gated = Epilogue { bias: true, gated: true, ..Epilogue::DEFAULT };
+    let [m, n, k] = [8192, 4096, 4096];
+    let mut planner = mi300x();
+    planner.weights.epilogue = 0.0;
+    let unsplit = gemm_cfg([128, 128, 64], 1, [4, 2], false);
+    let out = |e: &Epilogue| planner.claim_of(&GemmProblem::new(1, m, n, k, e), &unsplit).expect("admitted").out;
+    assert_eq!(out(&Epilogue::DEFAULT), (128 * 128 * 2) as f64);
+    assert_eq!(out(&wide), (128 * 128 * 8 + 128 * 2) as f64);
+    assert_eq!(out(&gated), (128 * 128 * 2 + 128 * 4) as f64);
+    let cfg = GemmCfg { tail: TailSplit::new(4), ..unsplit };
+    let (plain, wide) = (GemmProblem::new(1, m, n, k, &Epilogue::DEFAULT), GemmProblem::new(1, m, n, k, &wide));
+    let plan = plain.tail_plan(&planner, &cfg).expect("a tail");
+    assert_eq!(wide.tail_plan(&planner, &cfg), Some(plan));
+    let waves = plan.waves.expect("whole waves").count().div_ceil(planner.sms());
+    let rows = plan.tail.count() * 128;
+    let (block, row) = (128 * 128 * 6 + 128 * 2, 128 * 6 + 128 * 2 / 32);
+    let global = planner.device.costs.global_byte;
+    let want = (waves * block) as f64 * global + (rows * row) as f64 * global / planner.sms() as f64;
+    let moved = wide.plan_price(&planner, &cfg, &plan).expect("priced")
+        - plain.plan_price(&planner, &cfg, &plan).expect("priced");
+    assert!((moved / want - 1.0).abs() < 1e-9, "{moved} against {want}");
+}
+
 /// Where the model prices a split cheapest, the ranking still leads
 /// unsplit and holds the split only as a twin of its unsplit pipeline: the
 /// split's model is fitted to a few probed shapes, and it ran 4–8 %
