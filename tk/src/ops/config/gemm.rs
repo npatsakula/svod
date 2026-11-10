@@ -265,7 +265,7 @@ const F32: usize = 4;
 
 /// The most bytes a tail split's f32 partials take, allocated at every call
 /// beside the operands: the share of device memory a score matrix's block
-/// takes ([`crate::kernels::nearest::scratch`]).
+/// takes, an eighth of it ([`crate::kernels::nearest::scratch`]).
 fn partials(planner: &Planner) -> usize {
     crate::kernels::nearest::scratch(planner.device.target.memory_bytes).saturating_mul(F32)
 }
@@ -346,9 +346,9 @@ impl GemmProblem {
     /// [`Claim`](super::cost::Claim), ns of
     /// SM time) and a lane's registers by the layout count, which over-counts
     /// what the lowering streams (the compiled kernel judges, [`shortlist`](super::search::shortlist));
-    /// `None` when it does not lower, or when its [live
-    /// registers](GemmCfg::live_registers) alone pass the lane's limit; why it
-    /// is left out otherwise. A trip
+    /// `Err` with why it is left out: it does not lower, its [live
+    /// registers](GemmCfg::live_registers) pass the lane's limit, or its shape
+    /// refuses it. A trip
     /// pays its fragment reads, fill, matrix-core steps (padding included),
     /// the layer epilogue's tile operations and overhead. The
     /// fill's bytes are the whole operands' distinct ones, the blocks in
@@ -358,8 +358,8 @@ impl GemmProblem {
     /// reaches them over ([`Self::stream`]). Two
     /// crews are priced as the one-crew pipeline of their tile: the overlap
     /// of one crew's products with the other's loads has no term, since
-    /// only CDNA runs them ([`Target::crews`]) and no CDNA card has measured
-    /// one; the tuner times them beside the rest.
+    /// only CDNA runs them ([`Target::crews`]) and no probe measures it; the
+    /// tuner times them beside the rest.
     pub fn admit(&self, planner: &Planner, cfg: &GemmCfg) -> Result<(f64, u32), Rejected> {
         planner.admit(self, cfg)
     }
@@ -566,10 +566,7 @@ impl GemmProblem {
     /// The epilogue is priced where the data-parallel run pays it, so no
     /// plan earns from moving it: the tail's tiles pay what the
     /// data-parallel run pays for them past the waves', not a merge's
-    /// spread of it under its bytes. On MI300X, where a lane operation
-    /// prices dearest, that spread of a forty-operation epilogue ranked a
-    /// tail split first on 8192²×1024 and 12288×4096×4096, which the device
-    /// ran 6 % and 7 % slower split (`gemm_tail_probe`, its plain epilogue).
+    /// spread of it under its bytes.
     pub fn plan_price(&self, planner: &Planner, cfg: &GemmCfg, plan: &TailPlan) -> Option<f64> {
         let regs = planner.claim_of(self, &GemmCfg { tail: None, ..*cfg }).ok()?.regs;
         self.priced_plan(planner, cfg, regs, plan)
@@ -638,17 +635,14 @@ impl GemmProblem {
     /// and its tail split the model prices cheapest ([`Self::tails`]) where
     /// that is under the unsplit price or within [`SETTLED`] of it; `None`
     /// where the shape leaves the config out. Every config walks the
-    /// default raster ([`TileOrder::DEFAULT`]): measured on MI300X, sm_86
-    /// and gfx1201, groups of eight tile rows ran the tuner's configs best
-    /// or within 1–3 % of the best, where the fill's model prices the other
-    /// heights too flat to tell them apart.
+    /// default raster ([`TileOrder::DEFAULT`]): the fill's model prices other
+    /// group heights too flat to tell them apart, and the default runs within
+    /// the tuner's drift of the best.
     ///
     /// A tail split weighs the last wave's idle SMs against its partials'
     /// bytes, their merge and its launches ([`Self::plan_price`]), and only
-    /// the tuner's time settles it: on MI300X the model priced it 4–8 %
-    /// cheaper than the device ran it at 128² tiles (`gemm_tail_probe`,
-    /// eleven shapes), and on three of them the device ran the unsplit
-    /// pipeline faster. A grid short of a wave splits whole, by the same
+    /// the tuner's time settles it: the model prices a split optimistically,
+    /// and the unsplit pipeline can run faster. A grid short of a wave splits whole, by the same
     /// rule.
     #[allow(clippy::type_complexity)]
     fn planned(

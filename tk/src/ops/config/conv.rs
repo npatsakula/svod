@@ -1,9 +1,7 @@
 //! Convolution configs over the GEMM lattice: which tiles a convolution
 //! body takes, the split counts a starved grid's reduction breaks into, and
 //! the convolution's own claim — the GEMM's with its fill's working set the
-//! image's, not the expanded matrix's. The norms and the heads merge
-//! (`norm_candidates`, `heads_candidates`) rank nothing: their kernels are
-//! one warp a row and the tuner times the candidate list as given.
+//! image's, not the expanded matrix's.
 
 use std::sync::Arc;
 

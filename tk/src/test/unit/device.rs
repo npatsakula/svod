@@ -215,8 +215,7 @@ fn a_batch_past_i32_lands_at_its_stride() {
 /// Throughput probe of tk GEMM configs at 4096³ bf16: the configs the
 /// tuner admits on the device (the sm_86 measured set on `cp.async`
 /// targets) and the tuner's pick; prints TFLOP/s and never asserts (run
-/// with `--ignored --nocapture`). tk1's `gemm_nt`, last measured here on
-/// the 3060 before its removal: 25.8 TFLOP/s.
+/// with `--ignored --nocapture`).
 #[test]
 #[ignore = "perf probe: needs a GPU"]
 fn gemm_throughput_probe() {
@@ -498,7 +497,7 @@ fn first_execution_probe() {
 /// the planner's shortlist, then the rest of a lattice of configs that pass
 /// the target's feasibility predicates, timed as the tune store times them;
 /// prints each and the best of either set. tk1's in-model means on gfx1201
-/// (`origin/main`, 2026-10-09) sit beside each shape, so a lattice win says
+/// sit beside each shape, so a lattice win says
 /// the shortlist is the gap and a tie says it is not.
 #[test]
 #[ignore = "perf probe: needs a GPU"]

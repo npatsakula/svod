@@ -469,7 +469,7 @@ impl<'k> Kernel<'k> {
 
     /// A symbolic variable in `min..=max` the launch binds by name, counting
     /// in `i32` as every range does; asked for again, the same variable over
-    /// the same range.
+    /// the same range. An empty range panics.
     pub fn var(&mut self, name: impl Into<String>, min: i64, max: i64) -> Sc<'k> {
         let name = name.into();
         assert!(min <= max, "variable {name} is in the empty {min}..={max}");
@@ -1393,7 +1393,9 @@ impl<'k> Kernel<'k> {
     }
 
     /// A barrier across the block's warps, and a fence of its shared memory;
-    /// block-wide even inside [`Self::each_warp`].
+    /// block-wide even inside [`Self::each_warp`]. Under a branch on the
+    /// warp, which some warps skip, it fails the lowering
+    /// ([`crate::lower::Error::DivergentBarrier`]).
     pub fn barrier(&mut self) {
         self.push(Stmt::Sync(Sync::Barrier { scope: Scope::Block }));
     }

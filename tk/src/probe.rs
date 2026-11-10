@@ -116,9 +116,8 @@ impl Resolved {
 
 /// `pairs` (`[baseline, probe]` timings of one compiled pair) resolved;
 /// `None` under [`RESOLVE_PAIRS`], where no spread can be judged. A probe that runs faster than its baseline adds
-/// nothing the baseline's work did not cost (sm_120's `cp.async` ring moves
-/// its bytes a few percent cheaper than the same bytes loaded into
-/// registers), so its value is the spread, the bound on what it adds.
+/// nothing the baseline's work did not cost (a ring can move its bytes
+/// cheaper than the same bytes loaded into registers), so its value is the spread, the bound on what it adds.
 pub(crate) fn resolved(pairs: &[(u64, u64)]) -> Option<Resolved> {
     if pairs.len() < RESOLVE_PAIRS {
         return None;
@@ -127,9 +126,8 @@ pub(crate) fn resolved(pairs: &[(u64, u64)]) -> Option<Resolved> {
     // The differences' range with its extremes trimmed (a first run below
     // the lifted clock is noise). A pair's two
     // programs run back to back, so a clock that drifts between pairs moves
-    // both sides and leaves the difference: on gfx1151 the sides' own
-    // ranges summed 5–40× the differences' (283 µs against 34 µs on a
-    // 226 µs trip) and called a clear trip unresolved.
+    // both sides and leaves the difference: the sides' own ranges are many
+    // times the differences' and would call a clear trip unresolved.
     let spread = {
         let mut d = diffs.clone();
         d.sort_by(f64::total_cmp);
@@ -374,10 +372,10 @@ fn timed(built: &mut [Built], per: f64) -> Result<(u64, u64, u64), String> {
     }
 }
 
-/// Measurement: the footprints the cache probes read [`STREAM`] bytes from,
-/// smallest first: from the size of a small cache to half the stream, past
-/// every device's cache (MI300X's Infinity Cache is 256 MB), so a probe
-/// still reads each byte of a footprint twice.
+/// Measurement: the footprints the cache probes read four times [`STREAM`]
+/// bytes from, smallest first: from the size of a small cache to half the
+/// stream (MI300X's Infinity Cache is 256 MB), so every byte of a footprint
+/// is read at least eight times.
 const FOOTPRINTS: [(&str, usize); 9] = [
     ("probe:cached_1m", 1 << 20),
     ("probe:cached_2m", 2 << 20),
@@ -458,8 +456,8 @@ pub(crate) fn held(rates: &[(usize, f64)], global_byte: f64) -> (f64, f64) {
 /// The tiles a cache probe's region of `footprint` bytes holds: the largest
 /// prime count of [`CACHE_TILE`]s that fits, so blocks any stride apart read
 /// distinct tiles whatever order a dispatcher deals them to its SMs (a
-/// power-of-two count against 64 CUs dealt in turn put every block of a CU
-/// on one tile, read from its own L0), and a sweep of any block count the
+/// power-of-two count against a power-of-two CU count dealt in turn would
+/// put every block of a CU on one tile, read from its own L0), and a sweep of any block count the
 /// prime does not divide reaches every tile.
 pub(crate) fn region_tiles(footprint: usize) -> usize {
     let most = footprint / (CACHE_TILE.elems() * 4);
@@ -892,8 +890,8 @@ impl<'a> Probes<'a> {
     ///   at L2 only behind a `cp.async.cg`, a plain global load behind a
     ///   register-staged fill) and held as the fill holds them (a 16-byte
     ///   load a lane, pinned: summed in the tile's natural layout a lane
-    ///   loads four separate words, which on gfx942 cost more than the ring
-    ///   itself and left the pair no signal);
+    ///   loads four separate words, which can cost more than the ring itself
+    ///   and leave the pair no signal);
     /// - the source is a region per SM, so no line is a hot spot every SM
     ///   shares (a region all blocks read made the ring's L2 traffic contend
     ///   against a baseline served by L1), and the regions stay where the
@@ -903,11 +901,9 @@ impl<'a> Probes<'a> {
     ///   waits out a load the other hides;
     /// - it reads a fragment back from a ring as deep as the probe's;
     /// - both sides take every trip's chunk, and the baseline its fragment's
-    ///   slot, from runtime data (`order`, zeros at run): with the chunk
-    ///   `step % region` and the slot `order % stages`, a one-slot baseline
-    ///   folded its slot to 0 and LLVM hoisted all sixteen of the region's
-    ///   loads out of the loop on gfx1201 and gfx1151, timing 1 % of its
-    ///   probe.
+    ///   slot, from runtime data (`order`, zeros at run), so no ring depth
+    ///   folds a slot to a constant and the compiler cannot hoist the region's
+    ///   loads out of the loop.
     ///
     /// The difference is then the trip itself: the ring's store, waits and
     /// barriers, and its slot arithmetic. A baseline under half its probe's

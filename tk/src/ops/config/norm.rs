@@ -1,5 +1,6 @@
 //! Row kernel configs: the rows a block of one-warp rows spans, for the
-//! norms and the heads merge.
+//! norms and the heads merge. They rank nothing: their kernels are one warp
+//! a row and the tuner times the candidate list as given.
 
 use crate::kernels::rows::NormCfg;
 

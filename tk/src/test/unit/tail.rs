@@ -384,17 +384,16 @@ fn an_output_moves_its_types_bytes_and_its_epilogues_reads() {
 
 /// Where the model prices a split cheapest, the ranking still leads
 /// unsplit and holds the split only as a twin of its unsplit pipeline: the
-/// split's model is fitted to a few probed shapes, and it ran 4–8 %
-/// optimistic on eleven MI300X shapes. Neither the untuned first pick
+/// split's model is fitted to a few probed shapes, and it prices a split
+/// optimistically. Neither the untuned first pick
 /// (`SVOD_TK_TUNE=0`, or a store not yet written: the first clean
 /// representative, `first_clean` over `representatives`, whatever the
 /// compiler refuses or spills) nor the shortlist takes a split, a whole
 /// split-K of a grid short of a wave among them; the tuner's twins stage
 /// times the split beside its tile's pipelines. Under the guessed costs
 /// and under the cards' measured ones: on sm_86 4096³ splits a tail of
-/// eight tiles of 512 (the device ran it 2.3 % faster), on MI300X
-/// 6144×4096×8192 a tail of its last partial wave (19 % faster at 256²),
-/// and 128×4096×1024 splits whole.
+/// eight tiles of 512, on MI300X 6144×4096×8192 a tail of its last
+/// partial wave, and 128×4096×1024 splits whole.
 #[test_case(Target::card("mi300x").expect("a card"), costs(), [128, 4096, 1024]; "a short wide gemm on mi300x")]
 #[test_case(Target::card("mi300x").expect("a card"), costs(), [8192, 4096, 4096]; "a partial last wave on mi300x")]
 #[test_case(sm86(), sm86_costs(), [4096, 4096, 4096]; "a short tail on a measured sm_86")]

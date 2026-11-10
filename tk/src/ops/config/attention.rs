@@ -139,7 +139,7 @@ impl AttentionProblem {
         self.tiles * self.t.div_ceil(cfg.bq) * cfg.splits
     }
 
-    /// What `cfg` costs here, as [`GemmProblem::admit`]: a key block's trip pays
+    /// What `cfg` costs here, as [`GemmProblem::admit`](super::GemmProblem::admit): a key block's trip pays
     /// both products' fragment reads, fills (priced by where their bytes
     /// come from, every tile's keys and values the distinct ones; a bias
     /// tile is filled and read once per trip like them, every one of its
@@ -156,21 +156,13 @@ impl AttentionProblem {
         planner.admit(self, cfg)
     }
 
-    /// The config's [claim](super::cost::Claim): its checks run first — a
-    /// config that lowers and fits the target's shared memory and register
-    /// files — then its resources. A warpgroup product reads no key or
-    /// value fragments and holds one chain per product. A split's blocks
-    /// each walk their share of the key blocks and write f32 partials a
-    /// row a split; the combine that folds them (a row the max of the
-    /// splits' maxima, each split's weighted sums, the normalizing divide)
-    /// is a section beside the run.
     /// Whether `cfg` runs heads `d` wide (with a `bias`) on `target`,
     /// whatever the shape: it lowers ([`FaCfg::fits`]), fits the shared
     /// memory and holds no more registers than a lane may (where the
     /// accumulators have a file of their own, the output's against it and
-    /// the rest against the vector registers; a warpgroup product past
-    /// `ptxas` beyond the block's share of the file); the registers it holds
-    /// by the layout count.
+    /// the rest against the vector registers; a warpgroup product no more
+    /// than the block's share of the file, past which `ptxas` spills); the
+    /// registers it holds by the layout count.
     pub(crate) fn feasible(
         cfg: &FaCfg,
         target: &Target,
@@ -198,6 +190,13 @@ impl AttentionProblem {
         Ok(regs)
     }
 
+    /// The config's [claim](super::cost::Claim) on this shape: its
+    /// resources. A warpgroup product reads no key or value fragments and
+    /// holds one chain per product. A split's blocks
+    /// each walk their share of the key blocks and write f32 partials a
+    /// row a split; the combine that folds them (a row the max of the
+    /// splits' maxima, each split's weighted sums, the normalizing divide)
+    /// is a section beside the run.
     pub(crate) fn claim(&self, planner: &Planner, cfg: &FaCfg, regs: u32) -> Result<Claim, Rejected> {
         let target = &planner.device.target;
         let (bq, bkv, d, kw) = (cfg.bq, cfg.bkv, self.d, cfg.key_warps);

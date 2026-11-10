@@ -1,26 +1,35 @@
 # A new tk kernel, end to end
 
 The norms are the smallest complete path: kernel `kernels/rows.rs`, gate `ops/shape.rs::norm`, candidates
-`ops/config.rs::norm_candidates`, entry `ops/norm.rs`, tests `test/unit/rows.rs` and `test/unit/ops.rs`. Copy their
-shape; the excerpts below are verbatim (trimmed) at 2e9d5edb.
+`ops/config/norm.rs::norm_candidates`, entry `ops/norm.rs`, tests `test/unit/rows.rs` and `test/unit/ops.rs`. Copy their
+shape; the excerpts below are trimmed from them. The norms rank nothing, so `NormSpec` carries its config; a ranked
+family's spec is admitted instead (below).
 
 ## 1. The kernel (`tk/src/kernels/x.rs`, `pub mod x;` in `kernels/mod.rs`)
 
 - `XCfg` (`Clone + Copy + Debug + PartialEq + Eq + Hash`): the knobs the tuner picks. The program states its warp
-  grid (`k.warps(br as u32)`, a column; `k.warps(WarpGrid { rows, cols })`) and each ring
-  (`k.pipeline(extent, Schedule::ring(stages, unroll), …)`, or a slot count); the launch takes
+  grid (`k.warps(br as u32)`, a column; `k.warps(WarpGrid { rows, cols })`, before any `lone_warps`) and each ring
+  (`let ring = k.ring::<T>(name, slot, Schedule::ring(stages, unroll))`, or a slot count: `schedule.stages()` slots;
+  `ring_runs` for one run of them per warp), and a pipeline runs as the ring it is handed says
+  (`k.pipeline(extent, ring, init, produce, consume)`; a second ring its stages reach holding fewer slots is
+  `lower::Error::SharedPast`); the launch takes
   `Lowering::new(&device)`, or the config's `lowering` where it picks the core (`GemmCfg`, `FaCfg`: `Core::Group` →
   the warpgroup atom). A mainloop kernel reuses `gemm::mainloop` with `GemmCfg::ring()`.
-- `XSpec<'t>`: shapes, `batch: Batch`, options, `cfg: Admitted<'t, XCfg>` (`kernels::Admitted`): only the planner mints
-  one (`XProblem::admitted(&planner, cfg)`, feasible + claim), so the kernel fn checks none of what admission checked;
-  a config no planner admitted is taken only through `unsafe Admitted::assume`; tests, `sweep.rs` and `rank.rs`
-  go through `sweep::assumed`. Size every param at `batch.capacity()`.
-- `pub fn x<T: Elem>(spec: &XSpec) -> Program` is `Kernel::record(name, |k| x_body::<T>(k, spec))` with
-  `fn x_body<'k, T: Elem>(k: &mut Kernel<'k>, spec: &XSpec)`: every handle carries the kernel's brand `'k`, so a
+- `XSpec`: shapes, `batch: Batch`, options, no config. A ranked family implements `kernels::Spec` (`type Cfg = XCfg`)
+  and the crate's `Admits` (`type Problem` = its `Family`, `fn problem(&self)` derived from the spec alone), plus
+  `pub fn admitted(self, planner: &Planner, cfg: XCfg) -> Result<Admitted<'_, Self>, Rejected>` (`self.admit(..)`:
+  feasible + claim). `Admitted<'t, XSpec>` owns the spec and its config, read-only (`Deref` to the spec,
+  `.cfg()`), so the kernel fn checks none of what admission checked; a config no planner admitted is taken only
+  through `unsafe Admitted::assume(spec, cfg)`; tests, `sweep.rs` and `rank.rs` go through `sweep::assumed`. The op
+  layer's `tuned`/`probed` take the `XSpec` and return the `Admitted` pick. Size every param at `batch.capacity()`.
+- `pub fn x<T: Elem>(spec: &Admitted<XSpec>) -> Program` is `Kernel::record(name, |k| x_body::<T>(k, spec))` with
+  `fn x_body<'k, T: Elem>(k: &mut Kernel<'k>, spec: &Admitted<XSpec>)` (`let cfg = spec.cfg();`; a fixed-list
+  family like the norms takes `&XSpec` with its `cfg` field): every handle carries the kernel's brand `'k`, so a
   helper that takes or returns one names it (`fn at<'k, T: Elem, A: Access>(k: &mut Kernel<'k>, p: ParamRef<'k, T, A>,
   …) -> Gmem<'k, T, A>`); a closure cannot (`|k: &mut Kernel<'_>|` is higher-ranked and rejects captured handles). The
-  name is what profiles, `assert_kernel`, the IR dump files and `.kd` descriptors show. Param order is the launch
-  order (inputs, then outputs).
+  name is what profiles, `assert_kernel`, the IR dump files and `.kd` descriptors show (`Program::name()`; a recorded
+  program is read-only outside the crate: `params()`, `body()`). Param order is the launch order (inputs, then
+  outputs).
 - Ragged edges are view bounds (`bound(len, tile)` from `kernels/mod.rs`); only a reduction dim must divide its step.
 
 ```rust
@@ -61,28 +70,28 @@ pub fn norm(planner: Option<&Planner>, dtypes: &[DType], x: Option<&Extent>) -> 
 Host-test it with a `test_case` table in `test/unit/ops_plan.rs` (`linear_plans` and `norm_plans` are the models:
 `want: Result<(), Fallback>` per shape, dtype and target: `sm86()`, `targets::amd(AmdArch::Gfx1201, 64)`, …).
 
-## 3. Candidates (`ops/config.rs`)
+## 3. Candidates (`ops/config/`)
 
 A fixed list when the cost model has nothing to rank:
 
 ```rust
 pub fn norm_candidates(d: usize) -> Vec<NormCfg> {
-    if !(d.is_power_of_two() && (256..=2048).contains(&d)) {
+    if !(d.is_multiple_of(256) && (256..=2048).contains(&d)) {
         return vec![];
     }
     ROW_WARPS.map(|br| NormCfg { br }).to_vec()      // search bound: [4, 8, 16]
 }
 ```
 
-A ranked lattice when it does: a key like `Problem`/`Attention` with
+A ranked lattice when it does: a problem like `GemmProblem`/`AttentionProblem` (a `Family`) with
 `admit(&self, &Planner, &cfg) -> Result<(f64, u32), Rejected>` (ns of SM time from `Costs`, layout registers; the
 `Rejected` reason otherwise) and a ranking cached per planner like `Planner::gemm_ranked` (`papaya::HashMap`), sorted
 through `sorted(..)` so it is logged under `svod_tk::plan`. Every config also needs `impl Tiled for XCfg`
 (`tile()` = the config minus its pipeline knobs, `twins(ranked)` = the ranked configs sharing that tile,
 `represents()` false for variants only the twins stage times). Name every new constant with its kind (model, search
 bound, measurement, numeric; `lib.rs` doc). Pin the ranking on the host in `ops_plan.rs` under declared costs
-(`costs()`, `gfx1151_costs()`): which tiles lead and why `admit` drops the rest. `tk_dump` shows the same ranking for
-any card (add an `--op` arm there if the kernel should be inspectable offline).
+(`costs()`, `sm86_costs()`, `gfx1201_costs()`, `gfx942_costs()`, `gfx1151_costs()`): which tiles lead and why `admit` drops
+the rest. `tk_dump` shows the same ranking for any card (add an `--op` arm there if the kernel should be inspectable offline).
 
 ## 4. The entry (`ops/x.rs`, re-exported from `ops/mod.rs`)
 
@@ -96,18 +105,27 @@ let Some(cfgs) = super::kernel(op, shape::norm(planner.as_deref(), &dtypes, ext.
     return graph(kind, x, residual, w, b, eps).context(GraphSnafu { op });   // `graph … why` is logged
 };
 // …
-let cfg = Tuner::new(&planner.device, x.dtype(), &shape, (&batch, kind, residual_, bias), |cfg| {
-    vec![(typed!(x.dtype(), kernel, &spec(cfg)), cfg.lowering(&planner.device))]
-})
-.tuned(op, &cfgs, <[_]>::to_vec);
+let spec = NormSpec { norm: kind, rows, d, batch, eps, residual: residual_, bias, cfg: cfgs[0] };
+let spec = tuned(TuneStore::global(), &planner, x.dtype(), &cfgs, spec);
 let out = output(&ext.dims, &var, x.dtype()).context(GraphSnafu { op })?;
 // …
-let mut outs = launch::graph_launch_all(typed!(x.dtype(), kernel, &spec), &cfg.lowering(&planner.device), &ins)
+let mut outs = launch::graph_launch_all(typed!(x.dtype(), kernel, &spec), &Lowering::new(&planner.device), &ins)
     .context(LaunchSnafu { op })?;
+
+// `tuned`, public for the tests and the sweep:
+pub fn tuned(store: &TuneStore, planner: &Planner, dtype: DType, ranked: &[NormCfg], spec: NormSpec) -> NormSpec {
+    let shape = [spec.batch.capacity(), spec.rows, spec.d];
+    let salt = (&spec.batch, spec.norm, spec.residual, spec.bias);
+    let build = |cfg| vec![(typed!(dtype, kernel, &NormSpec { cfg, ..spec.clone() }), Lowering::new(&planner.device))];
+    let cfg = Tuner::new(store, &planner.device, dtype.clone(), &shape, salt, build).tuned(op(spec.norm), ranked, <[_]>::to_vec);
+    NormSpec { cfg, ..spec }
+}
 ```
 
-- `Tuner::new(device, dtype, shape, salt, build)`: `shape` and `salt` (whatever else the programs vary with) key the
-  store; `build` returns a `tune::Candidate` (`Vec<(Program, Lowering)>`: several programs for a split + merge).
+- `Tuner::new(store, device, dtype, shape, salt, build)`: `shape` and `salt` (whatever else the programs vary with) key the
+  store; `build` returns a `tune::Candidate` (`Vec<(Program, Lowering)>`: several programs for a split + merge, timed
+  with a `LAUNCH` added per launch past the first, `tune::launched`). A ranked family's `build` admits each config
+  for its spec (`spec.clone().admit_ranked(planner, cfg)`), and its `tuned` returns `spec.admit_ranked(planner, pick)`.
 - `tuned(op, &ranked, expand)`: `expand` adds variants (key splits) to the admitted shortlist; `<[_]>::to_vec` adds none.
 - `output(..)` allocates at capacity with the live batch in dim 0, device-local (`kernel_buffer`).
 - Keep `fn graph(..)` `pub(crate)`: the ops tests compare against it.

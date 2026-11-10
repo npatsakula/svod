@@ -1,11 +1,11 @@
 //! The rank harness: a tune store replayed offline, correlating the order
 //! the model predicts a shape's timed candidates with the ns the device
-//! measured for them. The instrument that gates every later model change
-//! (the config rework's §7.1): a store's `choice|` line holds every timed
+//! measured for them. The instrument that gates every model change: a
+//! store's `choice|` line holds every timed
 //! candidate of a shape, fastest first, each with its config's own code
 //! beside its index — replay prices the line's own candidates, so a store
-//! reads whatever ranking code wrote it and whatever ranks since (a model
-//! change no longer orphans a measurement). The digest in the line's key
+//! reads whatever ranking code wrote it and whatever ranks after it (a
+//! model change orphans no measurement). The digest in the line's key
 //! stays the consistency check: where the ranking code at hand re-derives
 //! the very list a line timed, the line counts as derived; the rest replay
 //! from their codes under the problem of the hypothesis whose ranking
@@ -444,8 +444,8 @@ pub fn explained(device: &Device, family: &str, factor: f64) -> Vec<(&'static st
 /// the multiplier that orders the rest best read off a geometric grid
 /// around the prior, and the held-out line predicted under it and under the
 /// prior (the multiplier 1). The fit is accepted only where the mean
-/// held-out ρ beats the prior's; enabling it anywhere is the design's
-/// phase F, so this computes and reports, never plans.
+/// held-out ρ beats the prior's. Nothing plans with it: this computes and
+/// reports.
 pub struct Fitted {
     pub family: &'static str,
     /// The multiplier each held-out fold fitted, in its line's order.
@@ -455,8 +455,8 @@ pub struct Fitted {
     pub held_out: Option<f64>,
     pub prior: Option<f64>,
     /// The multiplier that orders every line best, the one a store would
-    /// keep (regularized: the grid point nearest 1 among those within a
-    /// hundredth of the best ρ).
+    /// keep (regularized: the grid point nearest 1 among those within five
+    /// hundredths of the best ρ).
     pub overall: f64,
 }
 
@@ -1474,6 +1474,5 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
 }
 
 /// How far a program's static listing adder may sit from the parts the
-/// decomposition counts: the grid the constants were measured on holds
-/// within 27 %, the diff's own sample within 7 %.
+/// decomposition counts.
 const HOLDS_STATIC: f64 = 0.30;

@@ -71,12 +71,10 @@ impl NearestCfg {
     /// fragments, accumulators and staged chunks). A streamed tile folds
     /// once its pipeline has drained, its fragments dead, and whether the
     /// columns it selects fit beside the scores is the compiler's call,
-    /// which the tuner's admission checks: on sm_86 32 rows by 128
-    /// candidates hold 236 registers, unspilled, where the estimate says 336.
-    /// A list of `k > 1` scores is live across the pipeline, and the
-    /// scores beside it across the deals, so a list counts it all either way
-    /// (gfx1151, 32 rows by 64 candidates streamed 32 deep, a list of 64:
-    /// estimated 252 so, 284 whole, 256 and spilled compiled).
+    /// which the tuner's admission checks (the layout count over-counts a
+    /// streamed tile). A list of `k > 1` scores is live across the pipeline,
+    /// and the scores beside it across the deals, so a list counts it all
+    /// either way.
     pub(crate) fn held(&self, target: &Target, d: usize, k: usize, dtype: ScalarDType) -> Option<u32> {
         let [operands, scores] = self.lane_parts(target, d, dtype)?;
         let listed = k > 1 && self.select().is_none();
@@ -94,8 +92,7 @@ impl NearestCfg {
     /// [Queued](Way::Queued), the queue's pairs and the
     /// [`FLUSH_TILES`] its merge into the outputs holds beside them. A
     /// register-staged ring unrolled over its slots holds a list's pairs and
-    /// the staged chunks once more (gfx1151, 16 rows by 32 candidates, a list
-    /// of 64 at depth 48: 226 registers rolled, 255 and spilled unrolled).
+    /// the staged chunks once more.
     fn list_registers(&self, target: &Target, d: usize, k: usize, dtype: ScalarDType) -> Option<u32> {
         if k == 1 || self.select().is_some() {
             return Some(0);
@@ -176,12 +173,8 @@ const PASS_DEALS: usize = 8;
 /// (a compare, a select and a minimum), its removal (a compare and a
 /// select) and the next least (a minimum), at half their count. The counts
 /// the code issues are twice these and the pushed deal's and the round's
-/// fixed work more again — a recount of them (phase E, 2026-10-26) was
-/// refuted standalone on the rank harness's own A/B: at the int8 rerank
-/// search (2000×31342, depth 128, `k` 16 + MARGIN) the dearer listing
-/// flipped the model's pick to a streamed, depth-2-queue config the device
-/// runs 4.3× behind the resident depth-4 one it kept (3.554 against
-/// 0.831 ms, fresh cold stores both sides), the fitted halves included.
+/// fixed work more again; the halves are fitted, and pricing the full
+/// recount flips the model to configs the device runs far behind.
 const ROUND_ELEM: f64 = 3.0;
 /// Model: a push's work an element a queue slot: its selects.
 const PUSH_ELEM: f64 = 1.3;
@@ -190,10 +183,9 @@ const LIST_SLOT: f64 = 1.0;
 
 /// Model (static): the listing's guarded bodies a deal, in instructions a
 /// warp's code holds — the round form's per-deal slope of the emitted
-/// program's VALU count (measured 2026-10-27 by [`crate::rank::counted`]
-/// over emitted programs at bq 128, 16 rows a warp, rolled rings on
-/// sm_86, differencing `bkv`, `k`, the queue depth and a queued list out;
-/// see [`NearestProblem::listing_static`]).
+/// program's VALU count (counted by [`crate::rank::counted`] over emitted
+/// programs, differencing `bkv`, `k`, the queue depth and a queued list
+/// out; see [`NearestProblem::listing_static`]).
 const ROUND_DEAL_I: f64 = 46.0;
 /// Model (static): the pass form's bodies a deal (it carries each deal's
 /// vote and branch the round form keeps in its loop).
@@ -214,15 +206,12 @@ const LISTING_FIXED_I: f64 = 450.0;
 /// the queues into the lists.
 const LANE_DEPTHS: [Pow2; 2] = [Pow2::of(2), Pow2::of(4)];
 /// Search bound: the deals a trip's scores are dealt in: each is a branch
-/// of the trip's code, twice over (the first pass and the later ones); 64
-/// of them (gfx1151, 128 candidates in pairs of lanes) built a program
-/// past the graph rewrite's depth.
+/// of the trip's code, twice over (the first pass and the later ones);
+/// past it a trip's program outgrows the graph rewrite's depth.
 const MOST_DEALS: usize = 16;
 /// Search bound: the most scores a row's register list keeps; a longer list
 /// is held in the outputs, a register queue merged into it
-/// ([`NearestCfg::queue`]), or listed from a score matrix
-/// ([`NearestCfg::select`]). At 16384² rows on sm_86 a register list of 48
-/// ran ahead of both (depths 128 and 768), one of 64 at depth 768.
+/// ([`Way::Queued`]), or listed from a score matrix ([`Way::Matrix`]).
 pub(crate) const REGISTER_K: usize = 64;
 /// Search bound: the shortest list ranked queued and through a score matrix
 /// as well.
@@ -259,9 +248,7 @@ const LINE: usize = 128;
 /// Model: the bytes a scattered store moves, a sector.
 const SECTOR: usize = 32;
 /// Search bound: the product tiles a score matrix's listing is ranked with:
-/// at 16384² and depth 768, 1024 scores, gfx1151 spilled the three cheapest
-/// (128 and 256 rows), and with no matrix admitted the tuner took a queued
-/// list at 0.8 Gpairs/s; the sixth is 64 rows by 128, which ran at 5.9.
+/// enough that a few spilling large tiles still leave one admitted.
 const MATRIX_TILES: usize = 6;
 /// Search bound: the rows a select block lists.
 const SELECT_WARPS: u32 = 4;
@@ -272,8 +259,7 @@ const FILTER_GROUPS: usize = 4;
 
 /// Search bound: the longest list a streamed split shares as a least's
 /// rereads do ([`Planner::nearest_split`]): past it every share fills a long
-/// list again (at 4096 queries by 2^20 candidates at depth 768 on gfx1201,
-/// 16 shares ran 14 % behind 2 for 64 scores and 24 % for 256).
+/// list again.
 const REREAD_K: usize = 32;
 /// Search bound: the fewest candidate tiles a share of a split nearest
 /// block walks ([`Planner::nearest_split`]).
@@ -289,8 +275,7 @@ const CANDIDATE_BLOCKS: [usize; 4] = [16, 32, 64, 128];
 /// Search bound: the query rows a warp owns.
 const NEAREST_WARP_ROWS: [usize; 2] = [WARP_ROWS, 2 * WARP_ROWS];
 /// Search bound: a register-staged nearest ring's slots, the GEMM's: one
-/// slot measured faster than two on gfx1151 (64 rows by 64 candidates,
-/// streamed at depth 768: +7 %).
+/// slot can run faster than two.
 const NEAREST_STAGED: [usize; 2] = [2, 1];
 /// Search bound: a nearest block's warps at most.
 const NEAREST_WARPS: usize = 8;
@@ -315,7 +300,7 @@ pub struct NearestProblem {
 }
 
 impl NearestProblem {
-    /// What `cfg` costs here, as [`GemmProblem::admit`]: [`Planner::price`] of
+    /// What `cfg` costs here, as [`GemmProblem::admit`](super::GemmProblem::admit): [`Planner::price`] of
     /// its [`Claim`](super::cost::Claim). A candidate trip pays every wave's
     /// read of the candidate tile, its fill (every block reads every
     /// candidate: the blocks in flight share the lines), the product's steps
@@ -330,7 +315,7 @@ impl NearestProblem {
     /// share the candidate chunk only), its pairs' epilogue shared out over
     /// them, and the ring, which prefetches within a tile only, starting
     /// empty at every tile: a memory latency a round of blocks waits
-    /// unhidden ([`Costs::latency`]). Its step is at least two matrix-core
+    /// unhidden ([`Costs::latency`](crate::atoms::Costs::latency)). Its step is at least two matrix-core
     /// depths where the depth allows one, as the GEMM's.
     ///
     /// A list of `k > 1` scores a row adds its deals, pushes and merges
@@ -343,12 +328,6 @@ impl NearestProblem {
         planner.admit(self, cfg)
     }
 
-    /// The config's [claim](super::cost::Claim): its checks run first — a
-    /// list a register list holds, a config that lowers and fits the
-    /// target's shared memory and the lane's register budget — then its
-    /// resources, the split shares the config asks counted whole. A wave's
-    /// independent accumulators are its atom rows times the trip's atom
-    /// columns.
     /// Whether `cfg` keeps `k` scores a row at depth `d` of `dtype` on `target`,
     /// whatever the rows and candidates: a list a register list holds
     /// ([`NearestCfg::lists`]), a config that lowers ([`NearestCfg::fits`]),
@@ -387,6 +366,11 @@ impl NearestProblem {
         Ok(regs)
     }
 
+    /// The config's [claim](super::cost::Claim) on this shape: a step at
+    /// least two matrix-core depths where the depth allows one and no deeper
+    /// than it, then its resources, the split shares the config asks
+    /// counted whole. A wave's independent accumulators are its atom rows
+    /// times the trip's atom columns.
     pub(crate) fn claim(&self, planner: &Planner, cfg: &NearestCfg, regs: u32) -> Result<Claim, Rejected> {
         let target = &planner.device.target;
         let (bq, bkv, d, k) = (cfg.bq, cfg.bkv, self.d, self.k);
@@ -624,24 +608,16 @@ impl NearestProblem {
     /// dearer ones), the list's merge network a slot a stage
     /// ([`LIST_STAGE_I`]), the queues' sort ([`QUEUE_STAGE_I`]), a queued
     /// list's flush a slot ([`FLUSH_SLOT_I`]), and the fixed state work
-    /// ([`LISTING_FIXED_I`]). What the claim diff holds a program to: the
-    /// parts sum to every register list of the measured grid within 27 %
-    /// and to the diff's own k64 sample within 7 %.
+    /// ([`LISTING_FIXED_I`]). What the claim diff holds a program to (within
+    /// [`crate::rank::HOLDS_STATIC`]).
     ///
-    /// Priced they are not, and the measurement that says so: the executed
-    /// work [`Self::listing`] gates is per *element* (a body's instructions
-    /// are mostly lane-local plumbing — the state, the `k`-th, the index —
-    /// beside its elementwise chain over the deal's columns), and pricing
-    /// the counted weights was measured against the phase-E fresh stores —
-    /// the list network's slot a stage at the merge's unit
-    /// ([`LIST_SLOT`] ×8) keeps every stored winner in the admit band
-    /// (worst 1.6× of the cheapest, the 2.5× band aside) but degrades the
-    /// int8 order monotonically, gfx1201 ρ 0.409 → 0.358 → 0.275 → 0.190 at
-    /// ×1, 2, 4, 8, and the deal terms dearer still is phase E's refuted
-    /// recount (a 4.3× starved winner). The decomposition pins the
-    /// structure — the stage laws [`Self::listing`] already prices — and
-    /// the fitted units stand as the calibration of issue efficiency they
-    /// are declared to be.
+    /// They are not priced: the executed work [`Self::listing`] gates is per
+    /// *element* (a body's instructions are mostly lane-local plumbing — the
+    /// state, the `k`-th, the index — beside its elementwise chain over the
+    /// deal's columns), and pricing the counted weights degrades the measured
+    /// order. The decomposition pins the structure — the stage laws
+    /// [`Self::listing`] already prices — and the fitted units stand as the
+    /// calibration of issue efficiency they are declared to be.
     pub(crate) fn listing_static(&self, cfg: &NearestCfg) -> f64 {
         let LaneQueue { width, depth, passes } = cfg.lane_queue();
         let (width, depth) = (width.get(), depth.get());
@@ -873,12 +849,8 @@ impl Planner {
     /// [`Self::nearest_ranked`] for `p`): each split its
     /// [`Self::nearest_split`] ways where it splits,
     /// else whole, and the first whole as well, so a shape no split serves
-    /// is timed (at 32768² rows and depth 768 on sm_86 every one of 36
-    /// tiles ran faster split, 1.05–2.7 times, and timing both took 2.7
-    /// times as long to tune; at 16384² rows and depths 512–1024 the best
-    /// whole tile ran 8–12 % behind the best split on gfx1201, its unrolled
-    /// pipeline included, 10–12 % on sm_86 (depth 768) and 18–34 % on
-    /// gfx1151).
+    /// is timed (timing every tile both ways would double the tuning for
+    /// little).
     pub(crate) fn nearest_splits(&self, p: &NearestProblem, admitted: &[NearestCfg]) -> Vec<NearestCfg> {
         let split = |c: &NearestCfg| self.nearest_split(p, c).map(|splits| NearestCfg { splits, ..*c });
         let whole = |i: usize, c: &NearestCfg, split: bool| (!split || i == 0).then_some(*c);
@@ -887,35 +859,28 @@ impl Planner {
 
     /// The shares a query block of `cfg` splits the candidates of `p` into, if
     /// any: a power of two, each share [`SPLIT_TILES`] candidate tiles at
-    /// least for each score a row keeps (every share fills its list again:
-    /// at 16384² and depth 128 on sm_86 a 16-way split of 16 scores ran at
-    /// 0.63 of the whole tile, a 4-way one of 128 candidates at 0.77),
+    /// least for each score a row keeps (every share fills its list again),
     /// enough that the blocks in flight (every SM's resident ones) span the
     /// query blocks they walk at once. Streamed, those are a group
     /// of the config's raster ([`NearestCfg::order`]), so the blocks share their
     /// query and candidate lines as a GEMM's grouped tiles do: whole, a
     /// block's own query rows fall out of the cache between its candidate
-    /// tiles (at depth 1024, 104 TFLOP/s whole and 129 split at 32768² rows
-    /// on gfx1201, 21 and 25 on sm_86, 20 and 31 at 16384² on gfx1151).
+    /// tiles.
     /// Resident, a block reads its rows once and only a grid of fewer blocks
-    /// than SMs splits, a block an SM (at depth 128 a split ran 5–18 %
-    /// behind whole on gfx1201).
+    /// than SMs splits, a block an SM.
     ///
     /// A score matrix splits as a least does, each share storing its own
     /// scores, where its query blocks are fewer than the SMs. A list of `k >
     /// 1` (in registers or queued) splits as the model prices cheapest
     /// ([`NearestProblem::admit`]: a few query blocks over many candidates leave SMs
     /// idle, against every share's list filled again and the merge of the
-    /// shares; at 256 queries by 2^20 candidates at depth 128 on sm_86 the
-    /// best of 4–64 shares measured 16–32 for 16 and 64 scores, 8 for 256,
-    /// 8 at 1024 queries, as the model's), streamed up to [`REREAD_K`] at
+    /// shares), streamed up to [`REREAD_K`] at
     /// least as the rereads split, which the model does not see.
     pub(crate) fn nearest_split(&self, p: &NearestProblem, cfg: &NearestCfg) -> Option<usize> {
         let (target, d) = (&self.device.target, p.d);
         let blocks = p.n.div_ceil(cfg.bq);
         // A score matrix splits only to fill SMs its query blocks leave
-        // idle: split over many rows its larger tiles priced cheapest
-        // spilled on gfx1151 (16384² at depth 768, 1024 scores).
+        // idle: split over many rows, its larger tiles spill.
         if cfg.select().is_some() && blocks >= self.sms() {
             return None;
         }

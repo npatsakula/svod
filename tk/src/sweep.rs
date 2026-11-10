@@ -4,7 +4,7 @@
 //! gate, the wider set of the planner's shortlists and the attention,
 //! convolution, norm, heads and probe variants ([`digested`]), all under
 //! the declared costs ([`costs`]) so a ranking is the same on any machine;
-//! the targets of the sweep ([`targets`]); their LLVM text ([`render`]);
+//! the targets of the sweep ([`targets`]); their LLVM text ([`try_render`]);
 //! and digests of it compared across builds ([`digest`], [`diff`]).
 //! Fixtures, not an API: hidden from the docs.
 
@@ -625,8 +625,8 @@ pub(crate) fn geom(hw: [usize; 2], cin: usize, cout: usize, k: usize, s: usize, 
     ConvGeom { h: hw[0], w: hw[1], cin, cout, kernel: [k, k], stride: [s, s], pad: [p, p], dilation: [d, d] }
 }
 
-/// `(cin, cout, k, [h, w], stride)` of the YOLO26x dense 3×3 classes at
-/// 640² (the memo's census), padded `k / 2`.
+/// `(cin, cout, k, [h, w], stride)` of the YOLO26x dense 3×3 convolution
+/// classes at 640², padded `k / 2`.
 pub(crate) const YOLO: [(usize, usize, usize, [usize; 2], usize); 9] = [
     (192, 192, 3, [40, 40], 1),
     (96, 96, 3, [80, 80], 1),
@@ -674,7 +674,7 @@ pub(crate) fn render(prog: Program, lowering: &Lowering) -> String {
     try_render(prog, lowering).unwrap_or_else(|e| panic!("{name}: {e}"))
 }
 
-/// [`render`], a renderer's error returned. Through [`lower::render`], so
+/// `render`, a renderer's error returned. Through [`crate::lower::render`], so
 /// the program's own rolled loops carry their hint.
 pub fn try_render(prog: Program, lowering: &Lowering) -> Result<String, svod_codegen::Error> {
     let name = prog.name.clone();

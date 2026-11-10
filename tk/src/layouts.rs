@@ -1244,10 +1244,9 @@ fn weighted(prog: &Program<Expanded>) -> Vec<(f64, &Stmt<Expanded>)> {
 /// product whose result a ring deals every trip keeps its rows over the
 /// fewest lanes (a deal renames registers only there,
 /// [`TileLayout::dealt`], which is how the op layer prices a list,
-/// [`crate::kernels::nearest::NearestCfg::sharing`]) where a count of each
-/// statement once let a list's merge loads outweigh its deals' lane moves
-/// (every tile of its state eight registers a lane instead of one: 400k
-/// instructions where the narrow way emits 60k, under gfx1201's costs).
+/// [`crate::kernels::nearest::NearestCfg::sharing`]), rather than letting a
+/// list's merge loads, counted once, outweigh its deals' lane moves, counted
+/// every trip.
 fn orient_products(
     prog: &Program<Expanded>,
     device: &Device,

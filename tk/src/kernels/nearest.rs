@@ -103,8 +103,7 @@ pub struct LaneQueue {
     /// A trip's scores offered a deal at a time in passes, each stopping
     /// at a deal some full queue would take another of; else in rounds of
     /// each lane's least not yet offered. Rounds vote less, but hold a
-    /// trip's deals as they go: on gfx1201 16 deals a trip at depth 768 held
-    /// 211–221 registers to the passes' 189–191, and ran 13 % behind them.
+    /// trip's deals as they go, so they hold more registers than passes.
     pub passes: bool,
 }
 
@@ -114,9 +113,10 @@ impl LaneQueue {
     pub const PORTABLE: Self = Self { width: Pow2::of(4), depth: Pow2::of(2), passes: false };
 }
 
-/// Why [`nearest`] refuses a config's lists, whatever the target: what its
-/// ranking leaves out as one that does not lower
-/// ([`crate::ops::config::Rejected::Lowers`]).
+/// The list configs [`nearest`] cannot build, whatever the target: the
+/// planner leaves them out as ones that do not lower
+/// ([`crate::ops::config::TargetRejected::Lowers`]), so no
+/// [`Admitted`] spec carries one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, snafu::Snafu)]
 pub enum Invalid {
     #[snafu(display("a queue of {queue:?} below a list of {k}: from 2"))]
@@ -403,7 +403,7 @@ pub(crate) const MAX_CANDIDATES: usize = 1 << 24;
 /// queue's length (the lower half of a bitonic merge of the run and the
 /// carried queue stored, the upper half carried on), and takes the new
 /// `k`-th.
-/// Under [`NearestCfg::select`] the outputs are `scores [n, m]`, each pair's
+/// As a [score matrix](Way::Matrix) the outputs are `scores [n, m]`, each pair's
 /// score in the units compared, and [filtered](SelectCfg::filter) `mins
 /// [n, ⌈m / bkv⌉]`, each row's least of every trip's candidates.
 ///
@@ -632,8 +632,7 @@ fn nearest_body<'k, T: MmaIn>(k: &mut Kernel<'k>, spec: &Admitted<NearestSpec>) 
         // resident the warps none of whose rows a trip lowers skip finding
         // where it is. Streamed, a tile folds once per depth pipeline, and
         // the branch costs the registers and the overlap of the next tile's
-        // fill it would save (on gfx1151 a 64-row tile of 64 candidates
-        // spills).
+        // fill it would save (enough to spill a streamed tile).
         match cfg.bk {
             None => {
                 let lower = k.compare(low, best, CmpOp::Lt);
@@ -1567,8 +1566,8 @@ fn network<'k>(k: &mut Kernel<'k>, seq: &mut [[Regs<'k, F32>; 2]], sizes: impl I
             } else {
                 for (t, x) in seq.iter_mut().enumerate() {
                     // Each tile's own: one predicate of a stage shared by
-                    // many tiles stayed an alloca on gfx1201 (clang 22), which
-                    // the backend then moved to LDS, needing a dispatch packet.
+                    // many tiles may stay an alloca, which the AMD backend
+                    // can promote to LDS.
                     let upper = bit(k, col, d);
                     // An element keeps the later of its pair where its bit
                     // `d` is set in an ascending block, clear in another.

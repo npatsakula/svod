@@ -4,7 +4,7 @@ use crate::atoms::Target;
 use crate::ops::config::Facts;
 
 /// The device's layer-0 facts equal the hand tables where they overlap: the
-/// tables still drive the planner (phase B captures only), so a disagreement
+/// tables drive the planner and the facts are only captured, so a disagreement
 /// is a finding about one of the two — reported loudly here, not absorbed.
 #[test]
 fn device_facts_match_the_hand_tables() {

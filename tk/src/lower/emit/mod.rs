@@ -190,7 +190,7 @@ struct Emit<'a> {
     async_products: bool,
     /// Whether the loop being emitted holds a product, innermost last: the
     /// ranges opened over one that does are the schedule's own decision to
-    /// stay rolled, carried to the renderer ([`Lowered::rolled`]).
+    /// stay rolled, carried to the renderer ([`crate::lower::Lowered::rolled`]).
     rolling: Vec<bool>,
     rolled: Vec<u64>,
     range_id: usize,
@@ -491,8 +491,10 @@ impl<'a> Emit<'a> {
 
     /// The block's index along grid `axis`: the hardware's, or on a target
     /// of several dies the index of the block that the hardware's linear
-    /// position lands on under [`die_order`], so the blocks a kernel places
-    /// next to each other (sharing a panel, a head's keys) share a die's L2.
+    /// position lands on when each die's share of the dispatch is laid end
+    /// to end (the first `total % dies` dies a block more), so the blocks a
+    /// kernel places next to each other (sharing a panel, a head's keys)
+    /// share a die's L2.
     /// Every axis is derived at once and kept, listed in the prologue.
     fn block_index(&mut self, axis: usize) -> Arc<UOp> {
         if let Some(b) = &self.blocks[axis] {

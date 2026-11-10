@@ -273,8 +273,8 @@ proptest! {
     }
 }
 
-/// Where queries and keys are one sequence the count is the one before
-/// the mask's alignment was counted: half the key blocks and the diagonal.
+/// Where queries and keys are one sequence the count is half the key
+/// blocks and the diagonal.
 #[test_case::test_case(2048, 64, 64; "d64 blocks")]
 #[test_case::test_case(1500, 128, 32; "whisper")]
 #[test_case::test_case(384, 16, 128; "qwen3")]
@@ -285,14 +285,12 @@ fn causal_trips_of_one_sequence_are_half_the_keys(t: usize, bq: usize, bkv: usiz
 
 /// Pairs of GEMM configs the model orders as the device measured them
 /// under that device's costs, the faster first (`cost_model_probe` on three
-/// fresh stores each, 2026-10-19), each a block alone on its SM against a
+/// fresh stores each), each a block alone on its SM against a
 /// tile the SM runs several of at once, under the layer's epilogue the
 /// probe ran: a lone block's trip waits out what other blocks' work hides
 /// ([`Costs::trip_at`]), a lone one-slot `cp.async` block fills after its
 /// products, and resident blocks hide one another's wait for their loads
-/// ([`Costs::wait_hiding`]). Before the first two terms the model ranked
-/// every slow one first; the gate-up's two-slot pair it priced within
-/// 0.1 % without the third.
+/// ([`Costs::wait_hiding`]).
 #[test_case::test_case(crate::test::unit::sm86_costs(), "rtx3060", [3072, 3072, 1024], SWIGLU,
     gemm_cfg([64, 64, 32], 2, [4, 1], true), gemm_cfg([128, 64, 64], 2, [4, 2], false);
     "sm86 Qwen3 gate-up: 1.52 ms at three an SM, 2.01 alone")]
@@ -324,7 +322,7 @@ fn a_block_alone_ranks_behind_the_measured_faster_tile(
 /// rounds' waits times `n` to the power of one less the card's
 /// [`Costs::wait_hiding`], the power its trip probes measured a full SM
 /// hiding a lone block's trip by. Where that power is one (gfx1201, whose
-/// probes hid less; a lone trip unmeasured) the rounds wait as before.
+/// probes hid less; a lone trip unmeasured) the rounds wait once each.
 #[test_case::test_case(crate::atoms::sm86(), crate::test::unit::sm86_costs(), 2, 1.710; "sm86 two slots")]
 #[test_case::test_case(crate::atoms::sm86(), crate::test::unit::sm86_costs(), 1, 1.489; "sm86 one cp.async slot")]
 #[test_case::test_case(Target::card("mi300x").unwrap(), crate::test::unit::gfx942_costs(), 1, 1.118;

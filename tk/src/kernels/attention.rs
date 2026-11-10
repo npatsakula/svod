@@ -90,9 +90,10 @@ pub(crate) fn narrowest_warp_rows(core: Core, rows: usize, bq: usize) -> usize {
     }
 }
 
-/// Why [`attention`] refuses a config, whatever the target: what its
-/// ranking leaves out as one that does not lower
-/// ([`crate::ops::config::Rejected::Lowers`]).
+/// The configs [`attention`] cannot build, whatever the target: the planner
+/// leaves them out as ones that do not lower
+/// ([`crate::ops::config::TargetRejected::Lowers`]), so no
+/// [`Admitted`] spec carries one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, snafu::Snafu)]
 pub enum Invalid {
     #[snafu(display("{key_warps} key warps share a block of one row warp, not {bq} rows"))]
@@ -181,10 +182,8 @@ impl FaCfg {
     /// where the core's accumulator cannot feed the P·V product (RDNA3), the
     /// probabilities' relayout is pinned to the lane exchange
     /// ([`crate::layouts::TileLayout::relayout`]), so a kernel of the config
-    /// declares no scratch for them. (A shared crossing, which the costs
-    /// could choose before, the card may refuse: the Strix Halo's "local
-    /// memory (73728) exceeds limit (65536)", a 32×128 block of head size 64
-    /// whose rings alone are its whole 64 KB.)
+    /// declares no scratch for them: a shared crossing would add to rings
+    /// that may already fill the block's shared memory.
     pub fn smem_bytes(&self, d: usize, bias: bool) -> usize {
         let slot = 2 * self.bkv * d + usize::from(self.bias_ring(bias)) * self.bq * self.bkv;
         self.key_warps * self.stages() * slot * 2
@@ -551,8 +550,8 @@ fn attention_body<'k, T: Half>(k: &mut Kernel<'k>, spec: &Admitted<AttnSpec>) {
     let kv_base = kv_row * (tk * kv_stride) + (kv_head.clone() + head_start) * d;
     let kv_bound = keys_masked.then(|| len.clone());
     // A packed operand's keys follow its queries, its values its keys; an
-    // unpacked one's K and V start where they always did, with no offset to
-    // add (a `+ 0` the emitted program would carry).
+    // unpacked one's K and V start at their own parameters' origin, with no
+    // offset to add (a `+ 0` the emitted program would carry).
     let (k_base, v_base) = match (k_first, v_first) {
         (0, 0) => (kv_base.clone(), kv_base),
         (k_first, v_first) => (kv_base.clone() + k_first * d, kv_base + v_first * d),

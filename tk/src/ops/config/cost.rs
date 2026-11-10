@@ -25,13 +25,10 @@ pub(crate) const STEP: usize = 16 * 16 * 16;
 pub(super) const ELEM: usize = 2;
 
 /// Model: how far past the cheapest config's cost the model cannot tell
-/// configs apart: on sm_86 the measured best of Nemotron's projections and of 4096³
-/// sat 12–31% behind the model's first.
+/// configs apart.
 pub(super) const BAND: f64 = 1.35;
-/// Model: the waves per SIMD past which a trip's pipes overlap no further
-/// (measured on gfx1201 and sm_86: sixteen waves per SIMD run a tile no
-/// better than four, and the ranking that counted them did put sixteen-warp
-/// blocks first on sm_86 where eight-warp ones run 7% faster).
+/// Model: the waves per SIMD past which a trip's pipes overlap no further:
+/// more waves run a tile no better.
 const OVERLAP_WAVES: f64 = 4.0;
 
 /// The closed ops vocabulary: the kinds of vector work a family may claim,
@@ -80,19 +77,12 @@ pub(crate) const PAIR_OPS: f64 = 5.0;
 /// added, a floor's maximum, the L2 clamp, a deal's least or vote, a merge's
 /// compare — in units of [`crate::atoms::Costs::score`], the whole
 /// [`crate::atoms::Costs::score`] a softmax element's bundle of them. A
-/// declared residual, not a hand value kept: two measured derivations were
-/// tried against the rank harness on fresh stores (16384² nearest at `k`
-/// 1, 16, 64, depths 128 and 768, three cards) and refuted — the score and
-/// step probes' ratio (`score/step`, sm_86 0.0097, gfx1201 0.0214 score
-/// units) prices the listing's chained work a fifth to a twentieth of its
-/// calibration, collapsing the queue-depth structure (gfx1151 prunes every
-/// 32-deep queue; a gfx1201 `k` 64 tune picks a queued list 7 % behind the
-/// register one) and dropping sm_86's fresh-store nearest ρ 0.415 → 0.381;
-/// the probe bundle's own counted op rate (`score/` its ~15 scalar
-/// operations) collapses it outright. The residual is the issue efficiency
-/// of chained vector work beside the matrix pipe, which no probe explains:
-/// the per-card fit from the store's own outcomes (the design's layer 2) is
-/// what replaces this value, regularized toward it.
+/// declared residual, not a probe-derived value: the issue efficiency of
+/// chained vector work beside the matrix pipe, which no probe explains (the
+/// score and step probes' ratio prices the listing's chained work far too
+/// low). A per-card fit from the store's own outcomes
+/// ([`crate::rank::fitted`]) is what would replace it, regularized toward
+/// it.
 pub(crate) fn pair_op(_: &Device) -> f64 {
     0.2
 }
@@ -100,7 +90,7 @@ pub(crate) fn pair_op(_: &Device) -> f64 {
 /// The ops kinds' multipliers, every one at its full weight by default: the
 /// tests and the rank harness perturb a kind alone (zeroed, to attribute
 /// the model's rank error to its cluster) and nothing else — the default of
-/// one everywhere is today's arithmetic exactly.
+/// one everywhere prices every kind at its full weight.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Weights {
     pub(crate) pair: f64,
@@ -111,7 +101,7 @@ pub(crate) struct Weights {
 }
 
 impl Weights {
-    /// Today's arithmetic: every kind at its full weight.
+    /// Every kind at its full weight.
     pub(crate) fn same() -> Self {
         Self { pair: 1.0, deal: 1.0, merge: 1.0, scan: 1.0, epilogue: 1.0 }
     }
@@ -331,11 +321,9 @@ pub(crate) struct Claim {
 }
 
 /// The safety divisor of [`Planner::floor`]: how many times below its bytes'
-/// measured pace a candidate may measure before the tuner refuses the number.
-/// Measured over every timed candidate of the three cards' stores and the
-/// local one on 2026-10-28 (23851 candidates): the least honest one reads
-/// 1.83x its floor, the k-nearest pick whose stamps landed off its kernel
-/// 0.20x — the floor sits between, half the bytes' pace.
+/// measured pace a candidate may measure before the tuner refuses the number:
+/// set between the least honest timed candidate's ratio to its floor and a
+/// lost-stamp reading's, half the bytes' pace.
 pub(crate) const FLOOR: f64 = 2.0;
 
 impl Claim {
@@ -358,7 +346,7 @@ impl Claim {
 /// beyond its configs' own tiles ([`Tiled`]), so that a family cannot price
 /// what the vocabulary does not carry: poisoning is closed at the type
 /// level, and a new family is an impl, not a cost-model change. Unstable:
-/// publication (external families) is the design's phase F. The planner's
+/// not yet published for external families. The planner's
 /// per-family caches and the op layer's dispatch stay concrete at the
 /// boundary — an op builds tensors around its family's types either way —
 /// and the norms rank nothing (a fixed candidate list the tuner times).
@@ -517,17 +505,17 @@ impl Planner {
     /// waits and the sections beside the run's trips.
     ///
     /// The pipelining: the busiest SM issues the work of `⌈blocks / sms⌉`
-    /// blocks, each taken up as another ends (measured on sm_86: a 64×64
-    /// GEMM's time steps with that count, not with whole rounds of resident
-    /// blocks), every block-trip paying a trip's fixed overhead at the
+    /// blocks, each taken up as another ends (a GEMM's time steps with that
+    /// count, not with whole rounds of resident blocks), every block-trip
+    /// paying a trip's fixed overhead at the
     /// blocks the SM runs at once ([`crate::atoms::Costs::trip_at`]: the
     /// trip probes measure it per block-trip, alone and with the SM full).
     /// A trip's pipes (the fragment reads, the matrix-core steps, the fill)
     /// overlap across the waves a SIMD holds: the longest is paid whole, the
     /// rest in a share of one over the waves per SIMD up to
     /// [`OVERLAP_WAVES`], the blocks the SM holds at once ([`Self::resident`])
-    /// pooling theirs (measured on gfx1201 and sm_86: a block at one wave per
-    /// SIMD pays about their sum, at four or more the longest); a one-slot
+    /// pooling theirs (a block at one wave per SIMD pays about their sum, at
+    /// [`OVERLAP_WAVES`] or more the longest); a one-slot
     /// `cp.async` ring copies, waits and only then computes, so a block alone
     /// on its SM overlaps nothing with its fill. A SIMD holding fewer waves
     /// than hide a matrix-core chain's latency (`step_lone / step` of them, a
@@ -536,23 +524,16 @@ impl Planner {
     /// (a block of fewer waves than SIMDs leaves the rest idle), and every
     /// round of every trip pays the memory latency the ring cannot hide (it
     /// prefetches `stages - 1` trips ahead; a one-slot `cp.async` ring none,
-    /// [`crate::atoms::Costs::latency_one`]) on top of its issue: measured on
-    /// both, the latency adds rather than hides under the issue. The blocks
+    /// [`crate::atoms::Costs::latency_one`]) on top of its issue: the latency
+    /// adds rather than hides under the issue. The blocks
     /// the SM runs at once hide that round's wait among themselves as far as
     /// the trip probes measured a full SM hiding a lone block's trip — the
     /// same wait at the barrier for a slot's loads — a block-trip's share
     /// falling with the blocks to the card's
-    /// [`wait_hiding`](crate::atoms::Costs::wait_hiding) power (sm_86 1.71,
-    /// a round's wait once at power one): on sm_86 the Qwen3 gate-up ran at
-    /// 1.52 ms on 64×64×32 tiles three an SM and at 2.01 alone on 128×64×64,
-    /// which a round's whole wait priced within 0.1 % of each other. The
-    /// busiest SM's blocks' output stores ([`Claim::out`]) add after their
-    /// trips, not under the fill: measured on MI300X (`gemm_tail_probe`, a
-    /// block alone on its CU, its plain epilogue), 8192×4096×4096 ran 1.174×
-    /// its data-parallel time with its tail split four ways and 1.605× split
-    /// whole, which the model prices 1.156× and 1.515× with a split's f32
-    /// slots stored after its trips and 1.079× and 1.334× with them under
-    /// its fill.
+    /// [`wait_hiding`](crate::atoms::Costs::wait_hiding) power (a round's
+    /// wait once at power one). The busiest SM's blocks' output stores
+    /// ([`Claim::out`]) add after their trips, not under the fill: a block's
+    /// last trip has nothing left to hide its store behind.
     pub(crate) fn price(&self, claim: &Claim) -> f64 {
         let Device { target, costs } = &self.device;
         let hide = match claim.steps {
@@ -638,7 +619,7 @@ impl Planner {
 
     /// What `cfg` costs the planner's device — ns of SM time — and a
     /// lane's registers by the layout count: the one admission path, a
-    /// [`Family`]'s claim priced; `None` with why the config is left out.
+    /// [`Family`]'s claim priced; `Err` with why the config is left out.
     pub(crate) fn admit<P: Family>(&self, problem: &P, cfg: &P::Cfg) -> Result<(f64, u32), Rejected> {
         let regs = P::feasible(cfg, &self.device.target, &problem.statics())?;
         let claim = problem.claim(self, cfg, regs)?;
@@ -646,7 +627,7 @@ impl Planner {
     }
 
     /// The least wall ns `cfg`'s kernel can honestly take
-    /// ([`Planner::floor_of`] of its claim): a measured time under it is a
+    /// ([`Self::floor`] of its claim): a measured time under it is a
     /// measurement that lied, never a fast kernel.
     pub(crate) fn floor_of<P: Family>(&self, problem: &P, cfg: &P::Cfg) -> Option<f64> {
         let regs = P::feasible(cfg, &self.device.target, &problem.statics()).ok()?;

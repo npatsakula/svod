@@ -51,8 +51,8 @@ pub struct Rope {
 /// A [`Rope`] with its cos and sin tables.
 type Turn<'k, T> = (Rope, ParamRef<'k, T, In>, ParamRef<'k, T, In>);
 
-/// The tune store keys by this text: an epilogue without a scale prints as
-/// it did before the field existed, so its stored choices still apply.
+/// The tune store keys by this text: the fields at their default (no scale,
+/// a 16-bit output, no rope) are left out.
 impl fmt::Debug for Epilogue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut s = f.debug_struct("Epilogue");
@@ -111,9 +111,9 @@ pub struct GemmCfg {
     pub tail: Option<TailSplit>,
 }
 
-/// A config of the default raster and no tail split prints as it did
-/// before those fields existed, so a ranking's text moves only where they
-/// do.
+/// The raster prints only off [`TileOrder::DEFAULT`] and the tail split
+/// only where there is one, so a ranking's text names them only where a
+/// config differs.
 impl fmt::Debug for GemmCfg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut s = f.debug_struct("GemmCfg");
@@ -814,9 +814,9 @@ fn summed<'k>(
 }
 
 /// The K-streaming pipeline: the `sa`-shaped A tile `a(step, step·bk)` and
-/// `N` B tiles per step into a `stages`-deep shared ring, each operand of a
-/// slot held as `slices` k-slices ([`GemmCfg::slices`]), one accumulator
-/// per B ([`MmaIn::Acc`]).
+/// `N` B tiles per step into shared rings run as `schedule` says, each
+/// operand of a slot held as `slices` k-slices ([`GemmCfg::slices`]), one
+/// accumulator per B ([`MmaIn::Acc`]).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn mainloop<'k, T: MmaIn, const N: usize>(
     k: &mut Kernel<'k>,

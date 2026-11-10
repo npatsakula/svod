@@ -161,8 +161,7 @@ impl Occupancy {
 
 /// Shared memory as `count` banks of `bytes` each, selected by the low address
 /// bits. A read keeps full bandwidth only while each `count` consecutive lanes
-/// reach `count` banks, half of it when they reach half of them (gfx942:
-/// 3.8 against 7.8 cycles per 64-lane read of a compute unit, 2026-11-05).
+/// reach `count` banks, half of it when they reach half of them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SharedBanks {
     pub count: u32,
@@ -170,8 +169,7 @@ pub struct SharedBanks {
 }
 
 /// Global memory through buffer descriptors with the cache-swizzle bit, which
-/// spreads rows a stride would pile into one L1 set (gfx942 4096³ GEMM: best
-/// 579 against 628 TF, 2026-11-06). The bit changes how L1 lays out a line's
+/// spreads rows a stride would pile into one L1 set. The bit changes how L1 lays out a line's
 /// 32-byte sectors: within one dispatch, a line read or stored under two
 /// mappings (flat and swizzled, or two strides) reads the wrong sector, so a
 /// kernel takes one mapping for all of them, whichever of its operands alias.
@@ -218,11 +216,12 @@ pub struct Target {
     /// a cluster so one crew's products overlap the other's loads: two where
     /// the matrix core runs beside the vector units and a lane's file holds
     /// two crews' accumulators (CDNA), one elsewhere
-    /// ([`crate::schedule::Schedule::PingPong`]).
+    /// ([`crate::ir::Schedule::PingPong`]).
     pub crews: u32,
     /// Dies a dispatch deals its blocks to round-robin, each with its own L2
     /// (CDNA3's XCDs): the lowering renumbers blocks so consecutive ones share
-    /// a die ([`crate::lower::emit::die_order`]). 1 where a device is one die.
+    /// a die, each die's share of a dispatch laid end to end. 1 where a device
+    /// is one die.
     pub xcds: u32,
     /// How shared memory serves a wave, where its reads depend on the address
     /// ([`SharedBanks`]).
@@ -289,8 +288,7 @@ pub struct SyncCaps {
     /// The machine scheduler moves a pipeline trip's global loads below its
     /// products, or its shared-memory commit above them, unless fenced
     /// (`Sync::Fence` → `sched_barrier`), leaving the block waiting on global
-    /// memory with no product in flight: RDNA (gfx1151 sank a two-slot
-    /// 128×128×64 GEMM trip's loads to its commit; gfx1201 hoisted a commit).
+    /// memory with no product in flight: RDNA.
     pub commit_fence: bool,
     /// A wave's issue priority is settable (`Sync::Prio` → `s_setprio`): AMD.
     pub priority: bool,
@@ -514,14 +512,11 @@ impl Target {
     /// past it the lowering refuses the program
     /// ([`crate::lower::Error::TooLarge`]) and the tuner rejects the config
     /// as one that fails to compile, before the backend's compiler is
-    /// handed it. The largest kernels the planner ranks (nearest lists at
-    /// depth 128, `k` 64–80, 16384² rows) emit 270k on sm_86 (a register
-    /// list of 64 over 8-bit rows, a three-slot ring unrolled; the NVPTX
-    /// backend folds a 211k one to 25k lines of PTX, 236 registers, no
-    /// spill) and 176k on gfx1201 (a queued list of 80 over 8-bit rows,
-    /// unrolled: 4 s of clang), where a queued list whose product the
-    /// inference issued the wide way round emitted 400k, which took clang
-    /// 100 s and 700 MB a config and a pool of them the RX 9070 XT's 60 GB.
+    /// handed it. The bound sits above the largest kernels the planner ranks
+    /// (deep nearest lists over 8-bit rows, their rings unrolled) and below
+    /// the size at which the backend's compile time and memory make a tuning
+    /// pool impractical; AMD's is the lower, as its compiler is the slower on
+    /// such programs.
     pub fn most_instructions(&self) -> usize {
         match self.arch {
             GpuArch::Amd(_) => 1 << 18,
@@ -729,7 +724,7 @@ const AMD_BARRIERS: u32 = 16;
 /// registers a lane (up to 256 vector and 256 accumulator ones a wave),
 /// lane moves through the LDS crossbar, two crews. RDNA: WMMA on wave32,
 /// two SIMD32s with 192 KB of registers each, DPP lane moves, the bf16 pair
-/// dot product; RDNA4 adds transposing loads and needs its commit fenced.
+/// dot product and a fenced commit; RDNA4 adds transposing loads.
 fn amd(a: AmdArch) -> Target {
     let cdna = a.is_cdna();
     let (operand, accumulator) = if cdna {
@@ -962,9 +957,8 @@ impl Costs {
     /// (`trip_lone / trip = full^power`; the one-slot pair where the ring is
     /// a `serial` one-slot `cp.async` one), a lone block's trip being that
     /// same wait at the barrier for its slot's loads. At least one: a round
-    /// of resident blocks waits once (measured on gfx1201, whose probes hide
-    /// less, 0.96); one where the lone trip is unmeasured. sm_86 hides at
-    /// 1.71 over two slots and 1.49 over one, gfx942 at 1.12, gfx1151 at 1.59.
+    /// of resident blocks waits at least once; one where the lone trip is
+    /// unmeasured.
     pub fn wait_hiding(&self, serial: bool, full: usize) -> f64 {
         let (lone, trip) = if serial { (self.trip_one_lone, self.trip_one) } else { (self.trip_lone, self.trip) };
         if trip <= 0.0 || lone <= trip || full <= 1 {
@@ -976,11 +970,7 @@ impl Costs {
 
 /// Model: the power of the blocks an SM runs at once by which a lone
 /// block's trip overhead shrinks per block-trip: the blocks overlap one
-/// another's waits and share out what a round still waits. Measured per
-/// block-trip at one to four blocks an SM, sm_86 falls 127, 41, 16, 3 ns
-/// (about the square) and gfx1201 65, 27, 17, 11 (about the blocks); the
-/// square ranks both cards' configs closer to their measured order than
-/// either card's own exponent.
+/// another's waits and share out what a round still waits.
 pub(crate) const TRIP_HIDING: i32 = 2;
 
 const fn sm(major: u8, minor: u8) -> GpuArch {

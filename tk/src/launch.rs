@@ -1,7 +1,7 @@
 //! Running a tile program as a lazy graph kernel: placeholders sized at
 //! capacity, the lowered PROGRAM as the call body. The first `Out`
 //! parameter is the call's output and every other parameter an input;
-//! results return in `prog.params` order.
+//! results return in `prog.params()` order.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -65,7 +65,7 @@ pub(crate) fn graph_launch_once(prog: Program, lowering: &Lowering, tensors: &[&
 
 /// [`graph_launch_all`] of `body`, `prog` lowered already for its target
 /// alone ([`lower::standalone`]), kept in no memo: its parameters are
-/// positional in `prog.params` order, so the call binds `tensors` in that
+/// positional in `prog.params()` order, so the call binds `tensors` in that
 /// order. Where this device or the tensors' placeholders are not the ones it
 /// was lowered over, `prog` is lowered again for them.
 pub(crate) fn graph_launch_lowered(
@@ -108,7 +108,7 @@ pub(crate) fn first_output(prog: &Program) -> usize {
 }
 
 /// [`graph_launch`] returning every parameter's tensor as it is after the
-/// kernel, in `prog.params` order, so programs with several outputs can be read.
+/// kernel, in `prog.params()` order, so programs with several outputs can be read.
 pub fn graph_launch_all(prog: Program, lowering: &Lowering, tensors: &[&Tensor]) -> Result<Vec<Tensor>> {
     launch_all(prog, lowering, tensors, true)
 }

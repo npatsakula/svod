@@ -1,17 +1,15 @@
 //! Tile config candidates per target and shape, most promising first. The
 //! device picks: the tune store times the first [`SHORTLIST`] tiles that
-//! compile clean, most of the lattice, and the ranking orders what is
+//! compile clean, and the ranking orders what is
 //! compiled and timed first and stands in for a measurement where there is
 //! no device (the first config runs untuned). GEMM-shaped kernels draw
 //! theirs from a lattice over the construct's knobs, kept to what the
 //! lowering runs and ranked in nanoseconds of SM time from the device's
-//! measured [`Costs`]: a round of resident blocks is bound by the SM's issue
+//! measured [`Costs`](crate::atoms::Costs): a round of resident blocks is bound by the SM's issue
 //! work or by one wave's own issue, plus the memory latency one pipeline
 //! stage ahead cannot hide ([`Planner::price`]). The model orders block
-//! tiles well enough to lead with them ([`spread`]) and warp grids less well
-//! (on sm_86 the measured best sat as deep as the 92nd of 109 tiles before
-//! a trip's pipes overlapped across a SIMD's waves), which is why the
-//! shortlist runs that deep. Registers admit nothing here: the
+//! tiles well enough to lead with them (`spread`) and warp grids less well,
+//! which is why the shortlist runs `SHORTLIST` tiles deep. Registers admit nothing here: the
 //! layout count over-counts, so the compiled kernel judges ([`shortlist`]).
 //! A [`Planner`] holds the rankings of one device. The other kernels' lists
 //! are small functions of the target.

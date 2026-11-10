@@ -47,10 +47,12 @@ use shape::{Fallback, Plan};
 pub const DEVICE_TEST: &str = "a device test";
 
 /// Each op's tuning off the tensors: the spec the op launches for a shape,
-/// given the configs its shape gate ranked ([`shape`]) and a spec of any
-/// config (the pick replaces it), with the choices read from and kept in a
-/// store: [`TuneStore::global`] as the op runs, a [`TuneStore::replay`] of
-/// a store copied from a card to read what was tuned there.
+/// given the configs its shape gate ranked ([`shape`]) and the spec, which
+/// it returns under the pick: [admitted](crate::kernels::Admitted) for a
+/// ranked family, its config replaced for the norms and the heads, whose
+/// specs carry one. The choices are read from and kept in a store:
+/// [`TuneStore::global`] as the op runs, a [`TuneStore::replay`] of a store
+/// copied from a card to read what was tuned there.
 pub mod tuned {
     pub use super::attention::tuned as attention;
     pub use super::conv::tuned as conv;
@@ -170,8 +172,8 @@ pub(crate) fn planner(device: &DeviceSpec) -> Option<Arc<Planner>> {
             let measured = crate::probe::costs(&target)
                 .inspect_err(|e| tracing::warn!("{}: no tk planner: {e}", target.arch.target_name()))
                 .ok()?;
-            // Its layer-0 facts are queried at the same time; no hand value
-            // reads them yet (capture-and-expose, phase B).
+            // Its layer-0 facts are queried at the same time and kept;
+            // nothing prices with them.
             config::facts_of(device);
             Planner::measured(target, measured).map(Arc::new)
         })

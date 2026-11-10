@@ -83,7 +83,7 @@ pub struct Lowered {
     pub rolled: Vec<u64>,
 }
 
-/// `params` are the flat buffer UOps in `prog.params` order (placeholders on
+/// `params` are the flat buffer UOps in `prog.params()` order (placeholders on
 /// the graph path, `UOp::param`s on the direct one).
 pub fn lower(mut prog: Program, lowering: &Lowering, params: Vec<Arc<UOp>>, device: DeviceSpec) -> Result<Lowered> {
     // An input is never stored to ([`crate::build::Kernel::input`]), which the backend may know.

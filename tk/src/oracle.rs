@@ -1,6 +1,6 @@
 //! The compile-probe oracle: instruction availability asked of the toolchain
 //! that compiles the kernels, per target, cached in the tune store like any
-//! probe. The [`Target`](crate::atoms::Target) booleans (`group_mma`,
+//! probe. The [`crate::atoms::Target`] booleans (`group_mma`,
 //! `ldmatrix`, `tr_load`, `dot2_bf16`, the int8 atoms) are the hand arch
 //! tables of [`crate::atoms`]; the oracle is what makes an unseen
 //! architecture self-describing — its verdict is the vendor assembler's own

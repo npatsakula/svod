@@ -61,8 +61,8 @@ impl From<ShapeRejected> for Rejected {
 pub enum TargetRejected {
     /// It does not lower on the target: no matrix core, a warp grid that
     /// does not tile the core's atoms, a fill that does not split into whole
-    /// 16-byte chunks per thread ([`fills_in_chunks`]), a ring depth the
-    /// fill does not run ([`Fill::runs`]), lists or key warps the kernel
+    /// 16-byte chunks per thread ([`fills_in_chunks`](crate::layouts::fills_in_chunks)), a ring depth the
+    /// fill does not run ([`Fill::runs`](crate::atoms::Fill::runs)), lists or key warps the kernel
     /// refuses ([`NearestCfg::lists`], [`FaCfg::shares_keys`]), or lane
     /// queues past the search's bounds.
     Lowers,
@@ -93,7 +93,7 @@ pub enum ShapeRejected {
     /// that does not divide the trips, or whole waves that leave no tail.
     Tail,
     /// Its tail split's f32 partials take more bytes than a call may
-    /// allocate beside its operands.
+    /// allocate beside its operands: an eighth of device memory.
     Partials { need: usize, most: usize },
 }
 
@@ -186,15 +186,8 @@ pub(crate) fn prune<C: Tiled>(ranked: &mut Vec<(f64, u32, C)>) {
 /// Search bound: the configs of a ranking logged with their costs.
 const LOGGED: usize = 16;
 /// Search bound: a config this factor past the cheapest one's cost cannot
-/// win. Over the shortlists sm_86 timed (GEMMs from 1024³ to 8192²×768,
-/// attention, nearest from 8192² to 16384² at depths 128–1024) the measured
-/// best was predicted within 1.19 of the cheapest, every config within the
-/// tuner's contender band ([`crate::tune::CONTENDER`]) within 1.63. On
-/// gfx1201 and gfx1151 (nearest at 16384², depths 256–1024, a 4096³ GEMM,
-/// attention) the best was predicted within 1.09, though the model errs
-/// wider there: a pruned config ran 1.23 times the best on gfx1201 and 1.08
-/// on gfx1151, never within the tuner's drift. Nearest's small candidate
-/// blocks run 3.5 to 6 times its best, seconds a launch at 65536² rows.
+/// win: the measured best and every config within the tuner's contender
+/// band ([`crate::tune::CONTENDER`]) sit well inside it.
 pub(crate) const PRUNED_PAST: f64 = 2.5;
 /// Search bound: the tiles a ranking keeps whatever their cost, so a shortlist
 /// whose cheapest tiles fail to compile clean still holds some to time.
@@ -241,41 +234,18 @@ pub(crate) fn spread<C: Tiled, K: Eq + Hash>(ranked: Vec<(f64, C)>, class: impl 
 
 /// Search bound: the tiles the tune store measures per shape, their
 /// pipelines compiled in parallel ([`Search`]): timing a tile costs about
-/// 20 ms once the device's clock is up and the ranking cannot be trusted
-/// to put the best within a few (see the module docs). 56, measured down
-/// from 64 (2026-10-27) by the winners the format-6 stores name: over
-/// every replayed choice line of the three cards' stores (162 lines — the
-/// phase-E fresh nearest stores, the local sm_86 store and the
-/// device-suite stores' gemm, attention and conv lines), the share whose
-/// measured winner's tile sits in the model's top N. At 56 that is 161 of
-/// 162 (99.4 %): every family and card whole — nearest (the expensive
-/// family, 16384² rows at depths 128–768) from 24 tiles on sm_86, gemm at
-/// 32, attention and conv at 16 — but one int8 line of gfx1151's six,
-/// whose winner sat at the 62nd tile. 48, tried first, holds only 95 %
-/// (five conv lines and a nearest line of sm_86's out at 49–54) and the
-/// battery refused it: the gelu GEMM's winner (704×2048×512, its tile at
-/// 54 — a warp grid the cheaper [2,2] form of the same tile hides from
-/// the tile count) fell out of the shortlist and the row read 4–5 % over
-/// four alternating tunes; at 56 the winner is timed again and picked by
-/// both (70.4–70.8 µs the base, 71.7–72.5 the tip, one tile — the runs'
-/// own noise). The rest of the battery at 48 was already same-or-better
-/// than 64 (every nearest, gemm, attention and rerank row on sm_86 and
-/// gfx1201, the conv classes within +1.9 %), and 56 sits between the two.
-/// The tuning wall-clock is unmoved on sm_86 at any of 48, 56 and 64
-/// (17.5–20.5 s at 16384² d128 k64 — the measurement discipline, the
-/// clock warm-up and the runs to a stable minimum, dominates the count)
-/// and 10–20 % less on gfx1201 (8.9–9.6 s at 48 against 11.5–11.6 at 64,
-/// whose clang compiles the shorter list does not pay), with 25–12 %
-/// fewer compiles in flight everywhere.
+/// a run budget ([`crate::tune::RUN_BUDGET`]) once the device's clock is
+/// up, and the ranking cannot be trusted
+/// to put the best within a few (see the module docs). Chosen so that the
+/// tiles of the stored winners of every family and card sit within the
+/// model's top [`SHORTLIST`].
 pub(crate) const SHORTLIST: usize = 56;
 /// Search bound: the most tiles of a timing whose other pipelines are
 /// timed after it, among those within the tuner's contender band
 /// ([`crate::tune::CONTENDER`]) of the leader: a tile enters the shortlist
-/// as its first clean pipeline, on gfx1201 the 4096³ GEMM's measured best
-/// entered 8 % behind its best and its standing drifts between fourth and
-/// tenth across runs while the top ten sit within 10 %, so a fixed depth
-/// cut it on some runs. Over three cards' exhaustive sweeps eight reaches
-/// every tile a deeper stage would.
+/// as its first clean pipeline, which may sit well behind its best one, and
+/// its standing drifts across runs, so a fixed depth would cut it on some
+/// runs.
 pub(crate) const TWIN_TILES: usize = 8;
 
 /// A config's tile: all of it but its pipeline (ring depth, unrolling),
@@ -633,9 +603,7 @@ pub(crate) fn distinct_configs<C: Tiled>(list: &[C]) -> Vec<C> {
 /// after them, within the [`SHORTLIST`], the tiles none of whose pipelines
 /// compiled clean, each by its first spilling one: the compiled kernel
 /// judges what it can and the time the rest (a spilling kernel still beats
-/// the graph's, and on gfx1201 the 16384² depth-768 nearest's best tile,
-/// 128 rows by 128 candidates at 32 rows a warp, spills 196 bytes a lane
-/// and runs 86.4 Gpairs/s to the clean pick's 84.7).
+/// the graph's, and may beat the clean pick).
 /// `compiles` is handed what the [`Search`] wants as soon as it wants it
 /// (the tuner compiles in parallel, in the order handed), each verdict
 /// taken as it lands, until nothing more is wanted. `None` when nothing

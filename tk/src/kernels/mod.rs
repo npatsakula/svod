@@ -1,5 +1,5 @@
 //! The kernels as tile programs: a spec (shapes, options) admitted with its
-//! tile config in, a [`Program`](crate::ir::Program) out, generic over the
+//! tile config in, a [`Program`] out, generic over the
 //! element type.
 
 pub mod attention;
@@ -164,8 +164,8 @@ pub enum Batch {
     Var(Var),
 }
 
-/// The tune store keys by this text: a bound batch prints as it did when
-/// the variable's fields were the variant's.
+/// The tune store keys by this text: a static batch prints its count, a
+/// bound one its variable (name and range).
 impl fmt::Debug for Batch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
