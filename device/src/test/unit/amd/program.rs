@@ -917,10 +917,10 @@ attributes #0 = { alwaysinline nounwind "amdgpu-flat-work-group-size"="1,64" }
 ///
 /// One thread per lane: the test build parks a lane acquisition for only 25 ms.
 ///
-/// Run: `SVOD_DEVICE=AMD:0 [SVOD_AMD_HW_QUEUES=4] [SVOD_AMD_AQL=1] cargo test -p svod-device --release --lib
+/// Run: `SVOD_DEVICE=AMD:0 [SVOD_AMD_AQL=1] cargo test -p svod-device --release --lib
 /// concurrent_lanes_survive_kernarg_wraps -- --ignored --nocapture`
 #[test]
-#[ignore = "manual hardware probe; needs a real AMD GPU + clang, and four lanes (SVOD_AMD_HW_QUEUES=4 on single-XCC)"]
+#[ignore = "manual hardware probe; needs a real AMD GPU + clang, and four lanes (the default)"]
 fn concurrent_lanes_survive_kernarg_wraps_probe() {
     const COUNT_IR: &str = r#"target triple = "amdgcn-amd-amdhsa"
 define amdgpu_kernel void @count(ptr noalias %buf0) #0 {

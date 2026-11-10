@@ -10,18 +10,19 @@
 //! The HCQ port is pinned to Tinygrad `8c8b43de62515abe6c820b1de5aa26b30f48e43a`.
 //! What the code cannot express on its own:
 //!
-//! - **MES-scheduled parts (gfx11/12, single XCC) run one hardware queue.**
-//!   Feeding several user compute queues concurrently parks CP micro-engines
-//!   in `WAIT_REG_MEM` spins MES cannot preempt; on gfx1151 this wedged MES
-//!   (`MES failed to respond to msg=MISC (WAIT_REG_MEM)`, then every
-//!   `REMOVE_QUEUE`) into an unrecoverable GPU reset three times — twice on
-//!   forced AQL, once on the PM4 default. The AMD barrier-value vendor AQL
-//!   packet is not a way out: gfx11 MEC firmware rejects it as an illegal
-//!   opcode (probed), and barrier-AND is decrement-to-zero only, so no packet
-//!   there expresses a monotonic timeline wait. Real RDNA multi-queue means
-//!   adopting ROCr's decrement-signal dependency model. CDNA keeps four
-//!   lanes on the strength of HWS/MEC-runlist scheduling and Tinygrad's
-//!   validated vendor-IB waits, not on hardware exercised here.
+//! - **Several user queues must not share an in-queue HDP flush.** Every
+//!   queue once flushed HDP with a `WAIT_REG_MEM` handshake on one
+//!   GPU_HDP_FLUSH_REQ/DONE bit (the kernel gives each ring its own; user
+//!   queues cannot know theirs). Concurrent queues stole one another's DONE
+//!   and spun forever: gfx1151 wedged MES (`MES failed to respond to
+//!   msg=MISC (WAIT_REG_MEM)`, then every `REMOVE_QUEUE`) into an
+//!   unrecoverable GPU reset, and gfx942 stalled its timelines. The host
+//!   flushes HDP through the KFD MMIO remap page instead, as ROCr does, and
+//!   four lanes pass the tk suite on gfx942, gfx1201 and gfx1151
+//!   (2026-11-10). Still true: gfx11 MEC firmware rejects the AMD
+//!   barrier-value vendor AQL packet as an illegal opcode (probed), and
+//!   barrier-AND is decrement-to-zero only, so no AQL packet there expresses
+//!   a monotonic timeline wait.
 //! - **Validated on gfx1151**: PM4 single lane through the full tensor, ONNX,
 //!   and model suites in parallel; forced AQL through the tensor suite
 //!   single-threaded. **Pending hardware gates**: multi-XCC AQL with XCC0

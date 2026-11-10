@@ -13,8 +13,7 @@ authority for a compute lane**.
 
 `AmdDeviceCore` owns a bounded `QueuePool`. Its slots are fixed `OnceLock`s and
 queues are created lazily up to `SVOD_AMD_HW_QUEUES`, which is clamped to 1
-through 64 and defaults to 4 on multi-XCC CDNA, 1 everywhere else. An atomic
-bitset tracks leases:
+through 64 and defaults to 4. An atomic bitset tracks leases:
 
 - claiming an initialized idle lane is an atomic compare-exchange;
 - queue creation is a cold serialized path;
@@ -186,7 +185,7 @@ is present, every completion store carries a KFD event-interrupt companion so
 |---|---|---|
 | `SVOD_DEVICE` | `CPU` (`METAL:0` on macOS) | Select default tensor device, for example `AMD:0` (`HIP` is an alias) |
 | `SVOD_AMD_BACKEND` | `kfd` | AMD backend; only `kfd` is currently accepted |
-| `SVOD_AMD_HW_QUEUES` | 4 on multi-XCC, else 1 | Bounded compute-lane count, clamped to 1 through 64 |
+| `SVOD_AMD_HW_QUEUES` | 4 | Bounded compute-lane count, clamped to 1 through 64 |
 | `SVOD_AMD_AQL` | unset | Any value other than `0` forces AQL on single-XCC hardware; read at each queue creation |
 | `SVOD_AMD_SCOPED_SYNC` | unset | `=0` replaces every storage-scoped host wait with a full device drain and stops producer recording; latched once per process |
 | `SVOD_PM4_GRAPH` | unset | `=1` enables PM4 graph capture; only `1` counts; read once at device creation |

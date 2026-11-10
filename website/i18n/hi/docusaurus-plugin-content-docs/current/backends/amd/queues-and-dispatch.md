@@ -12,7 +12,7 @@ scheduling और failure handling के लिए Rust ownership का उप
 
 `AmdDeviceCore` एक bounded `QueuePool` का मालिक है। उसके slots fixed `OnceLock`s हैं और queues
 `SVOD_AMD_HW_QUEUES` तक lazily बनाई जाती हैं, जिसे 1 से 64 के बीच clamp किया जाता है और जिसका
-default multi-XCC CDNA पर 4 है, बाक़ी हर जगह 1। एक atomic bitset leases को track करता है:
+default 4 है। एक atomic bitset leases को track करता है:
 
 - एक initialized idle lane claim करना एक atomic compare-exchange है;
 - queue creation एक cold serialized path है;
@@ -179,7 +179,7 @@ polling के जाग सके।
 |---|---|---|
 | `SVOD_DEVICE` | `CPU` (macOS पर `METAL:0`) | default tensor device चुनें, उदाहरण के लिए `AMD:0` (`HIP` एक alias है) |
 | `SVOD_AMD_BACKEND` | `kfd` | AMD बैकएंड; फ़िलहाल केवल `kfd` स्वीकार्य है |
-| `SVOD_AMD_HW_QUEUES` | multi-XCC पर 4, वरना 1 | Bounded compute-lane count, 1 से 64 तक clamp किया गया |
+| `SVOD_AMD_HW_QUEUES` | 4 | Bounded compute-lane count, 1 से 64 तक clamp किया गया |
 | `SVOD_AMD_AQL` | unset | `0` के अलावा कोई भी value single-XCC hardware पर AQL को force करती है; हर queue creation पर पढ़ा जाता है |
 | `SVOD_AMD_SCOPED_SYNC` | unset | `=0` हर storage-scoped host wait को पूरे device drain से बदल देता है और producer recording रोक देता है; प्रति process एक बार latch होता है |
 | `SVOD_PM4_GRAPH` | unset | `=1` PM4 graph capture enable करता है; केवल `1` गिना जाता है; device creation पर एक बार पढ़ा जाता है |

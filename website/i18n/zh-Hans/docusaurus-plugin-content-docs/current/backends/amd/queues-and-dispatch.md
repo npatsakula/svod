@@ -12,7 +12,7 @@ AMD 后端保留了 Tinygrad 已验证的 PM4、AQL 与 SDMA 数据包语义，
 
 `AmdDeviceCore` 拥有一个有界的 `QueuePool`。它的槽位是固定的 `OnceLock`，
 队列则按 `SVOD_AMD_HW_QUEUES` 惰性创建，该值被夹在 1 到 64 之间，
-在多 XCC 的 CDNA 上默认为 4，其余一切默认为 1。一个原子位集追踪租约：
+默认为 4。一个原子位集追踪租约：
 
 - 认领一条已初始化的空闲通道是一次原子 compare-exchange；
 - 队列创建是一条冷的串行化路径；
@@ -170,7 +170,7 @@ pub trait AmdIface: Send + Sync + std::fmt::Debug {
 |---|---|---|
 | `SVOD_DEVICE` | `CPU`（macOS 上为 `METAL:0`） | 选择默认的张量设备，例如 `AMD:0`（`HIP` 是其别名） |
 | `SVOD_AMD_BACKEND` | `kfd` | AMD 后端；目前只接受 `kfd` |
-| `SVOD_AMD_HW_QUEUES` | 多 XCC 上为 4，否则为 1 | 有界的计算通道数，夹在 1 到 64 之间 |
+| `SVOD_AMD_HW_QUEUES` | 4 | 有界的计算通道数，夹在 1 到 64 之间 |
 | `SVOD_AMD_AQL` | 未设置 | 除 `0` 以外的任何值都会在单 XCC 硬件上强制使用 AQL；在每次创建队列时读取 |
 | `SVOD_AMD_SCOPED_SYNC` | 未设置 | `=0` 把每一次以存储为范围的宿主等待都换成一次完整的设备排空，并停止生产者记录；每进程锁定一次 |
 | `SVOD_PM4_GRAPH` | 未设置 | `=1` 启用 PM4 图捕获；只有 `1` 算数；在设备创建时读取一次 |

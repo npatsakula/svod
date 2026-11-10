@@ -258,7 +258,7 @@ pub struct AmdDeviceCore {
     /// reaches its hardware cap rather than co-tenanting a mutable ring.
     queue_pool: crate::amd::connector::QueuePool,
     /// Max distinct KFD compute queues in the pool. Read once at open from
-    /// `SVOD_AMD_HW_QUEUES` (default 4 on multi-XCC, else 1; min 1). The per-process hardware budget
+    /// `SVOD_AMD_HW_QUEUES` (default 4; min 1). The per-process hardware budget
     /// is small (~24 user compute queues on CDNA; HIP's `GPU_MAX_HW_QUEUES`
     /// defaults to 4), so acquisition parks after reaching the cap.
     hw_queues: usize,
@@ -398,26 +398,15 @@ impl AmdDevice {
         debug!(node = node.node_id, gpu_id = node.gpu_id, arch = arch.mcpu(), backend = %backend, "AmdDevice opened");
 
         // Bounded exclusive-lane pool: at most `SVOD_AMD_HW_QUEUES` distinct
-        // KFD compute queues. The default is scheduler-aware, mirroring where
-        // the ROCm stack itself ships multi-queue:
-        //   - multi-XCC CDNA (MI300-class): 4 — queues are HWS/MEC-runlist
-        //     scheduled and concurrent AQL queues are the validated production
-        //     configuration (HIP's own GPU_MAX_HW_QUEUES default is 4). Four
-        //     lanes hung gfx942 while every queue flushed HDP on one shared
-        //     REQ/DONE bit; the host flushes it now (2026-11-09: the tk suite
-        //     passes on four lanes);
-        //   - single-XCC gfx11+ (MES-scheduled, RDNA3/3.5/4): 1 — feeding
-        //     several PM4 user queues concurrently parks CP micro-engines in
-        //     `WAIT_REG_MEM` spins that MES cannot preempt and wedges the
-        //     firmware into an unrecoverable reset (reproduced on gfx1151;
-        //     see the crate-level AMD notes), and gfx11 MEC firmware implements no
-        //     scheduler-visible timeline-wait packet to lower waits onto
-        //     (the AMD barrier-value vendor packet is an illegal opcode
-        //     there). The env override remains for validation experiments.
+        // KFD compute queues, 4 by default as HIP's `GPU_MAX_HW_QUEUES`. Four
+        // lanes hung gfx942 and wedged MES on gfx1151 while every queue
+        // flushed HDP through one shared REQ/DONE bit; the host flushes it
+        // now, and the tk suite passes on four lanes on gfx942, gfx1201 and
+        // gfx1151 (see the crate-level AMD notes).
         let hw_queues = std::env::var("SVOD_AMD_HW_QUEUES")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(if node.num_xcc.max(1) > 1 { 4 } else { 1 })
+            .unwrap_or(4)
             .clamp(1, u64::BITS as usize);
 
         let core = Arc::new(AmdDeviceCore {
@@ -614,8 +603,7 @@ impl AmdDeviceCore {
         self.signal_pool.get()
     }
 
-    /// The bounded queue-pool size (`SVOD_AMD_HW_QUEUES`; default 4 on
-    /// multi-XCC hardware, 1 otherwise).
+    /// The bounded queue-pool size (`SVOD_AMD_HW_QUEUES`; default 4).
     #[inline]
     pub fn hw_queues(&self) -> usize {
         self.hw_queues
