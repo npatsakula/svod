@@ -36,7 +36,8 @@ pub fn compile_ir_to_amd_asm(ir: &str, arch: AmdArch) -> crate::Result<Vec<u8>> 
 }
 
 fn compile_ir_to_amd_asm_with(toolchain: &ClangToolchain, ir: &str, arch: AmdArch) -> crate::Result<Vec<u8>> {
-    let flags = amd_object_flags(ir, arch).into_iter().map(|f| if f == "-c" { "-S".into() } else { f });
+    let flags =
+        amd_object_flags(ir, arch, toolchain.llvm_major()).into_iter().map(|f| if f == "-c" { "-S".into() } else { f });
     toolchain.compile_ir(&flags.collect::<Vec<_>>(), ir, &format!("amdgcn assembly (mcpu={})", arch.mcpu()))
 }
 
@@ -83,6 +84,21 @@ pub(crate) fn check_amd_clang(version: &str) -> crate::Result<()> {
     }
 }
 
+/// The first LLVM whose AMDGPU matrix instructions are convergent machine
+/// instructions (llvm-project #165602, and #178314 for the gfx11
+/// `V_WMMA_*_twoaddr` forms).
+pub(crate) const AMD_CONVERGENT_WMMA_LLVM: u32 = 23;
+
+/// Whether machine sinking may move a `v_wmma` into a divergent branch under
+/// a clang of LLVM `major`: below [`AMD_CONVERGENT_WMMA_LLVM`] (ROCm 7.2's
+/// clang 22.0git and Ubuntu's 22.1 included), or when the version is unknown.
+/// Inside the branch the lanes it skips never write the product's operands, so
+/// it reads garbage: split attention's gated `o_part` store came out NaN on
+/// gfx1151 with ROCm clang.
+pub(crate) fn amd_sinks_wmma(major: Option<u32>) -> bool {
+    major.is_none_or(|major| major < AMD_CONVERGENT_WMMA_LLVM)
+}
+
 /// Clang driver flags for one kernel.
 ///
 /// `-nogpulib` skips the ROCm device-library search entirely, the way tinygrad
@@ -92,7 +108,11 @@ pub(crate) fn check_amd_clang(version: &str) -> crate::Result<()> {
 /// when the IR still references the f64 `__ocml_*` entry points
 /// (`codegen/src/llvm/amd/ops.rs::render_float_unary`). The IR is part of the
 /// object-cache key, so keying a flag off it keeps the key sound.
-pub(crate) fn amd_object_flags(ir: &str, arch: AmdArch) -> Vec<String> {
+///
+/// Below [`AMD_CONVERGENT_WMMA_LLVM`] (or when the version is unreadable)
+/// machine sinking is off; see [`amd_sinks_wmma`]. The toolchain's version is
+/// part of the cache key too.
+pub(crate) fn amd_object_flags(ir: &str, arch: AmdArch, llvm_major: Option<u32>) -> Vec<String> {
     let mut flags: Vec<String> = vec![
         "-x".into(),
         "ir".into(),
@@ -105,6 +125,9 @@ pub(crate) fn amd_object_flags(ir: &str, arch: AmdArch) -> Vec<String> {
         "-Wno-override-module".into(),
         "-fno-math-errno".into(),
     ];
+    if amd_sinks_wmma(llvm_major) {
+        flags.extend(["-mllvm", "-disable-machine-sink"].map(str::to_string));
+    }
     if !ir.contains("@__ocml_") {
         flags.push("-nogpulib".into());
     }
@@ -126,7 +149,11 @@ pub(crate) fn compile_ir_to_amd_object_with(
         });
     }
     debug!(arch = arch.mcpu(), ir.length = ir.len(), "compiling amdgcn IR via clang");
-    toolchain.compile_ir(&amd_object_flags(ir, arch), ir, &format!("amdgcn (mcpu={})", arch.mcpu()))
+    toolchain.compile_ir(
+        &amd_object_flags(ir, arch, toolchain.llvm_major()),
+        ir,
+        &format!("amdgcn (mcpu={})", arch.mcpu()),
+    )
 }
 
 /// Validate both the generic ELF contract and the architecture encoded in

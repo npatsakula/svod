@@ -1014,11 +1014,21 @@ fn a_load_crosses_a_barrier(asm: &str) -> bool {
     false
 }
 
+/// Whether the `clang` on `PATH` is ROCm's fork (`AMD clang version …`).
+fn rocm_clang() -> bool {
+    std::process::Command::new("clang")
+        .arg("--version")
+        .output()
+        .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).starts_with("AMD clang"))
+}
+
 /// A tk barrier fences shared memory only, so the one-slot register-staged
 /// trip's barrier between its products and its commit leaves the next step's
 /// loads in flight. A plain workgroup release fence on RDNA would wait for
-/// them first (`s_wait_loadcnt 0x0` on gfx12, `vmcnt(0)` on gfx11); CDNA's
-/// fence never waited, and its code is unchanged.
+/// them first (`s_wait_loadcnt 0x0` on gfx12, `vmcnt(0)` on gfx11) under
+/// upstream LLVM; ROCm's clang (7.2) waits only for LDS there under
+/// `-mcumode`, so its plain fence leaves them in flight too. CDNA's fence
+/// never waited, and its code is unchanged.
 #[test_case(AmdArch::Gfx1201, true; "gfx1201")]
 #[test_case(AmdArch::Gfx1151, true; "gfx1151")]
 #[test_case(AmdArch::Gfx1100, true; "gfx1100")]
@@ -1044,7 +1054,12 @@ fn prefetch_loads_stay_in_flight_across_a_barrier(arch: AmdArch, rdna: bool) {
     };
     assert!(a_load_crosses_a_barrier(&local), "the next step's loads drain at the barrier:\n{local}");
     if rdna {
-        assert!(!a_load_crosses_a_barrier(&plain), "a plain workgroup fence no longer drains:\n{plain}");
+        let rocm = rocm_clang();
+        assert_eq!(
+            a_load_crosses_a_barrier(&plain),
+            rocm,
+            "a plain workgroup fence drains unless ROCm's clang (rocm={rocm}):\n{plain}"
+        );
     } else {
         assert_eq!(local, plain, "the LDS-only fence changed CDNA code");
     }

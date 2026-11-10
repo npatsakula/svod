@@ -125,7 +125,7 @@ pub fn create_amd_codegen(device_id: usize, arch: AmdArch) -> Result<(Arc<dyn Re
     // The per-kernel `-nogpulib` decision comes from the IR, which is already
     // part of every object-cache key; the persisted identity records the
     // arch-stable, ocml-free flag set.
-    let flags = crate::amd::compile::amd_object_flags("", arch);
+    let flags = crate::amd::compile::amd_object_flags("", arch, toolchain.llvm_major());
     let identity = CompilerIdentity {
         schema: OBJECT_CACHE_SCHEMA,
         backend: "amd-clang".into(),
