@@ -614,3 +614,69 @@ fn a_ring_shallower_than_its_pipeline_is_refused(depth: usize) -> Result<(), Str
     let lowering = Lowering::new(&super::declared(crate::atoms::sm86()));
     crate::lower::standalone(prog, &lowering).map(drop).map_err(|e| e.to_string())
 }
+
+/// A tile is read only where its definition dominates the read: one kept
+/// from a loop's body and read past the loop (its last trip's, or none), or
+/// one a branch defines and the kernel stores past it (undefined where the
+/// branch is not taken), is refused by the lowering, naming the scopes; a
+/// value handed on as the body's result or the branch's merge lowers.
+#[test_case(Escape::Loop => Err(("a loop's body", "the kernel")); "kept from a loop's body")]
+#[test_case(Escape::Branch => Err(("a branch's then", "the kernel")); "kept from a branch")]
+#[test_case(Escape::If => Err(("a branch's then", "the kernel")); "defined under an if alone")]
+#[test_case(Escape::Warps => Err(("the warps' body", "the kernel")); "kept from the warps' body")]
+#[test_case(Escape::None => Ok(()); "handed on")]
+fn a_tile_read_past_its_scope_is_refused(escape: Escape) -> Result<(), (&'static str, &'static str)> {
+    let tile = Shape::new(16, 32);
+    let prog = Kernel::record("escape", |k| {
+        k.warps(1);
+        k.grid([Sc::from(2), Sc::from(1), Sc::from(1)]);
+        let y = k.output::<F32>("y", 2 * tile.elems());
+        let zero = k.zeros::<F32>(tile);
+        let one = k.fill::<F32>(tile, Const::Float(1.0));
+        let mut leak = None;
+        let [sum] = k.loop_(4, [zero], |k, _, [s]| {
+            let t = k.binary(*s, one, BinaryOp::Add);
+            if let Escape::Loop = escape {
+                leak = Some(t);
+            }
+            [t.into()]
+        });
+        let pred = k.block(0).lt(1);
+        let [picked] = k.select_if(
+            pred,
+            |k| {
+                let t = k.binary(*sum, one, BinaryOp::Add);
+                if let Escape::Branch = escape {
+                    leak = Some(t);
+                }
+                [t]
+            },
+            |_| [*sum],
+        );
+        if let Escape::If = escape {
+            let pred = k.block(0).lt(1);
+            k.if_(pred, |k| leak = Some(k.fill::<F32>(tile, Const::Float(1.0))), |_| {});
+        }
+        if let Escape::Warps = escape {
+            k.each_warp(|k| leak = Some(k.fill::<F32>(tile, Const::Float(2.0))));
+        }
+        let at = k.block(0) * tile.elems();
+        let out = k.view(y, at, [tile.cols, 1], tile, [None, None]);
+        k.store(out, leak.unwrap_or(picked));
+    });
+    let lowering = Lowering::new(&super::declared(crate::atoms::sm86()));
+    match crate::lower::standalone(prog, &lowering) {
+        Ok(_) => Ok(()),
+        Err(crate::lower::Error::Escaped { defined, used, .. }) => Err((defined, used)),
+        Err(e) => panic!("{e}"),
+    }
+}
+
+#[derive(Debug)]
+enum Escape {
+    Loop,
+    Branch,
+    If,
+    Warps,
+    None,
+}

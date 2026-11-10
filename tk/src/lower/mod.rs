@@ -16,6 +16,7 @@ use crate::layouts;
 use crate::schedule;
 
 pub mod emit;
+mod scopes;
 pub mod sync;
 
 #[derive(Debug, Snafu)]
@@ -42,6 +43,8 @@ pub enum Error {
     ExtentPastI32 { name: String, extent: i64 },
     #[snafu(display("a view of {name} reaches elements {from}..{to}, which holds {held}"))]
     SharedPast { name: String, from: i64, to: i64, held: usize },
+    #[snafu(display("tile {value} of {defined} is read in {used}, which its definition does not dominate"))]
+    Escaped { value: usize, defined: &'static str, used: &'static str },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -92,6 +95,7 @@ pub fn lower(mut prog: Program, lowering: &Lowering, params: Vec<Arc<UOp>>, devi
     let grid = prog.warp_grid.count();
     let lone = prog.walk().any(|(_, s)| matches!(s, Stmt::Warps { .. }));
     ensure!(prog.warps.is_multiple_of(grid) && (prog.warps == grid || lone), GridSnafu { warps: prog.warps, grid });
+    scopes::check(&prog)?;
     within_shared(&prog)?;
     materialize_operands(&mut prog, lowering.core);
     sync::insert_barriers(&mut prog)?;
