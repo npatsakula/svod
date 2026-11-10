@@ -143,6 +143,6 @@ tk kernels अपने कर्नेल नामों (`gemm`, `conv`, `fla
 graph kernels के बगल में दिखते हैं, उसी तरह मापे हुए।
 
 :::tip[शांत GPU पर मापें]
-GPU पर कोई दूसरा process हर आँकड़े को बिगाड़ देता है। Probes और tune store पहले clock को warm करते हैं।
-Probes को `--test-threads=1` के साथ चलाएँ।
+GPU पर कोई दूसरा process हर आँकड़े को बिगाड़ देता है। `tk_bench`, probes और tune store पहले clock को warm करते हैं।
+एक बार में एक `tk_bench` command चलाएँ, और probe tests को `--test-threads=1` के साथ।
 :::

@@ -60,8 +60,9 @@ model code ──► svod_tk::ops          always a Tensor; picks a kernel and c
 
 Цель считается замеренной, только когда на ней проходит
 `targets::families_match_the_interpreter_on_the_device`. Чтобы узнать, чего достигает карта,
-запустите на ней `gemm_throughput_probe` и `attention_throughput_probe`
-([Тюнинг](./tuning#probe-tests)): они печатают выбор тюнера в TFLOP/s.
+запустите на ней команды `gemm` и `attention` из
+`cargo run --release -p svod-tk --example tk_bench`
+([Тюнинг](./tuning#benchmarks)): они печатают выбор тюнера в TFLOP/s.
 
 :::note[Не в этом релизе]
 Производители на Hopper TMA и mbarrier (sm_90 выполняет `wgmma`, питаемый через `cp.async`),

@@ -48,7 +48,7 @@ model code ──► svod_tk::ops          always a Tensor; picks a kernel and c
 | AMD CDNA3 / 4 | MFMA 16×16×16，注意力另有 32×32×8；wave64 | 寄存器，两个工作组乒乓交替 |
 | Apple | simdgroup 8×8×8 原子 | —（无内核） |
 
-只有当 `targets::families_match_the_interpreter_on_the_device` 在某个目标上通过后，该目标才算已测量。要了解某张卡能达到的性能，请在其上运行 `gemm_throughput_probe` 和 `attention_throughput_probe`（[调优](./tuning#probe-tests)）：它们以 TFLOP/s 打印调优器的选择。
+只有当 `targets::families_match_the_interpreter_on_the_device` 在某个目标上通过后，该目标才算已测量。要了解某张卡能达到的性能，请在其上运行 `cargo run --release -p svod-tk --example tk_bench` 的 `gemm` 和 `attention` 命令（[调优](./tuning#benchmarks)）：它们以 TFLOP/s 打印调优器的选择。
 
 :::note[本版本未包含]
 Hopper TMA 与 mbarrier 生产者（sm_90 运行由 `cp.async` 供数的 `wgmma`）、Blackwell `tcgen05`、GEMM 的 32×32 MFMA、Apple 内核、fp8、最近邻搜索之外的 int8、注意力反向传播，以及卷积的图像暂存形式。参见[可移植性](./portability#not-in-this-release)。

@@ -138,24 +138,26 @@ config को compile करने से क्या दिखा (verdict, re
 
 `tune::TuneStore::at(root)` किसी दूसरे root पर store बनाता है, या `None` के साथ सिर्फ़ memory में।
 
-## Probe tests {#probe-tests}
+## Benchmarks {#benchmarks}
 
-Probe tests `#[ignore]` tests हैं जो timings छापते हैं और कभी assert नहीं करते। वे device की probe की
-गई costs से rank करते हैं और tuner की admit की हुई shortlist को मापते हैं, tuner के चुनाव को चिह्नित करते
-हुए। इन्हें idle GPU पर एक-एक करके चलाएँ:
+`tk_bench` example default device (`SVOD_DEVICE`) पर tk के kernels का समय मापता है। हर config का
+समय clock के ऊपर उठ जाने के बाद उसका सबसे तेज़ profiled run है, यानी उसके kernels के device
+timestamps का योग; एक shape के configs बारी-बारी से (round-robin) मापे जाते हैं ताकि drift हर
+एक पर बराबर पड़े। यह सिर्फ़ छापता है, कभी assert नहीं करता। idle GPU पर एक बार में एक command चलाएँ:
 
 ```bash
-SVOD_DEVICE=CUDA cargo test -p svod-tk --release --lib gemm_candidates_probe -- --ignored --nocapture --test-threads=1
+SVOD_DEVICE=CUDA cargo run --release -p svod-tk --example tk_bench -- gemm --top 8
 ```
 
-| Probe | क्या छापता है |
+| Command | क्या छापता है |
 |---|---|
-| `gemm_throughput_probe` | 4096³ bf16 पर admit हुए GEMM configs, TFLOP/s, और tuner का चुनाव |
-| `gemm_candidates_probe` | Nemotron के projection shapes और 4096³ पर हर admit हुआ GEMM candidate: untuned चुनाव, सबसे तेज़ और tuner का चुनाव |
-| `qwen3_gemm_candidates_probe` | Qwen3-Embedding के projections: shortlist, फिर lattice का बाक़ी हिस्सा |
-| `attention_throughput_probe` | Flash attention (B 4, H 8, T 2048; d 64/128, causal और non-causal, bias के साथ d 64): हर admit हुआ config और tuner का चुनाव उसके softmax forms के साथ |
-| `attention_candidates_probe` | Lattice का हर attention config, admit हुई shortlist के ख़िलाफ़ |
-| `decode_throughput_probe` | Whisper large-v3 के decoder step का self और cross attention, tuned splits और बिना split |
-| `conv_throughput_probe` | हर YOLO26 class के लिए हर admit हुआ convolution candidate, graph convolution के ख़िलाफ़ |
-| `norm_bandwidth_probe` | 8192×1024 bf16 पर row kernels, GB/s में |
-| `first_execution_probe` | tk GEMM को build, lower और prepare करने की host cost, graph GEMM के ख़िलाफ़ |
+| `gemm [--shape MxNxK,…] [--top N]` | tuner के चुनाव (default 4096³) का bf16 GEMM TFLOP/s, चिह्नित, और planner के पहले `N` ranked configs का |
+| `attention [--shape BxHxTxD,…] [--causal] [--bias] [--top N]` | op जो launch करता है उसका और पहले `N` ranked configs का flash attention TFLOP/s; default में B 4, H 8, T 2048, d 64 पर (plain, causal, bias के साथ, दोनों) और d 128 पर (plain, causal) |
+| `nearest [--rows N] [--depths D,…] [--k K] [--metric M]` | nearest op से एक self-join, Gpairs/s और TFLOP/s में; default में 16 से 128 तक की depths पर 65536 rows: squared distances, वही 64 groups के साथ, दोनों floors के ऊपर L2 |
+| `rerank [--rows N] [--candidates M] [--depths D,…] [--ks K,…] [--metric M]` | `k_nearest_reranked` अपनी 8-bit और अपनी f16 search के साथ, plain f16 `k_nearest` के ख़िलाफ़ |
+| `raster [--shape MxNxK,…]` | tuner के GEMM चुनाव और planner के पहले config का हर raster order, default order के ख़िलाफ़, हर एक की cost model वाली कीमत के साथ |
+| `fit [--only LABEL,…] [--picks]` | device के ख़िलाफ़ cost model: कुछ GEMM, attention और nearest shapes पर हर ranked config का predicted और measured समय, tuner का चुनाव और tuner का wall time; `--picks` सिर्फ़ चुनावों को मापता है |
+| `trips` | प्रति SM 1 से 48 blocks पर pipeline-trip probes |
+
+`--metric` में `squared-l2`, `l2` या `neg-dot` दिया जाता है। हर command `--rounds R` लेता है, यानी
+मापे जाने वाले rounds (default 20, `fit` के लिए 2)।

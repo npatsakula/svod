@@ -119,11 +119,11 @@ from an issue-bound one.
 SVOD_DEVICE=CUDA:0 SVOD_PMC=1 cargo run --release -p svod-model --example gigaam_infer -- --profile ./audio.wav
 ```
 
-The tk throughput probes time the hand kernels alone. They read event timestamps, not
-counters:
+The `tk_bench` example times the hand kernels alone. It reads event timestamps, not
+counters ([Tuning](../../tile-kernels/tuning.md#benchmarks)):
 
 ```bash
-SVOD_DEVICE=CUDA:0 cargo test -p svod-tk --release --lib gemm_throughput_probe -- --ignored --nocapture
+SVOD_DEVICE=CUDA:0 cargo run --release -p svod-tk --example tk_bench -- gemm
 ```
 
 ### Privileges
