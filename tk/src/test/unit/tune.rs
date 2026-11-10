@@ -1294,3 +1294,27 @@ fn a_scratch_draw_repeats_its_run(elems: usize, most: usize) {
     assert!((run..elems).all(|i| got[i] == got[i - run]));
     assert!(got[..run].windows(2).any(|w| w[0] != w[1]));
 }
+
+/// A candidate's time is its programs' summed and a [`LAUNCH`] for every
+/// launch past the first: a tail split whose three kernels run 1 µs under
+/// the unsplit kernel alone loses to it once its two extra launches count,
+/// and a program that did not run fails the candidate.
+#[test]
+fn a_split_pays_its_launches() {
+    use crate::ops::config::LAUNCH;
+    let us = |t: u64| Some(Duration::from_micros(t));
+    let unsplit = [us(100)];
+    let split = [us(60), us(30), us(9)];
+    let summed = |programs: &[Option<Duration>]| programs.iter().flatten().sum::<Duration>();
+    assert!(summed(&split) < summed(&unsplit), "the split wins on its kernels alone");
+    let gaps = Duration::from_nanos(2 * LAUNCH as u64);
+    assert_eq!(tune::launched(unsplit), us(100));
+    assert_eq!(tune::launched(split), Some(summed(&split) + gaps));
+    let ns: Vec<Option<u64>> = [&unsplit[..], &split[..]]
+        .iter()
+        .map(|p| tune::launched(p.iter().copied()).map(|t| t.as_nanos() as u64))
+        .collect();
+    let order = tune::ordered(ns).expect("both ran");
+    assert_eq!(order.iter().map(|&(i, _)| i).collect::<Vec<_>>(), [0, 1], "the split leads: {order:?}");
+    assert_eq!(tune::launched([us(60), None, us(9)]), None);
+}

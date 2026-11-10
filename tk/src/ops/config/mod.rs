@@ -44,9 +44,9 @@ pub use self::search::{Rejected, ShapeRejected, TargetRejected, has_kernels};
 pub(crate) use self::cost::{Claim, STEP, Weights, pair_op};
 pub(crate) use self::facts::facts_of;
 
-pub(crate) use self::gemm::gemm_cfg;
 #[cfg(test)]
-pub(crate) use self::gemm::{LAUNCH, TAIL_SPLITS};
+pub(crate) use self::gemm::TAIL_SPLITS;
+pub(crate) use self::gemm::{LAUNCH, gemm_cfg};
 pub(crate) use self::norm::heads_candidates;
 #[cfg(test)]
 pub(crate) use self::search::Field;

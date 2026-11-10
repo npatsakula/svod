@@ -39,6 +39,7 @@ use crate::atoms::Target;
 use crate::ir::{Param, Program};
 use crate::launch;
 use crate::lower::Lowering;
+use crate::ops::config::LAUNCH;
 
 /// The store's line format, bumped when a line's meaning changes; a file of
 /// another format, or without the line, is dropped whole. 7 ends a GEMM's
@@ -52,8 +53,10 @@ use crate::lower::Lowering;
 /// `Debug`, a ring a [`crate::ir::Schedule`]. 9 ends a GEMM's code in its
 /// raster (`g8`, [`crate::kernels::gemm::TileOrder`]), which its `Debug`
 /// names off the default only. 10 ends it in its tail split (`~`, or `t4`
-/// for four ways, [`crate::kernels::gemm::TailSplit`]).
-pub(crate) const FORMAT: u32 = 10;
+/// for four ways, [`crate::kernels::gemm::TailSplit`]). 11 times a
+/// candidate of several programs with a [`LAUNCH`] between each two
+/// ([`launched`]), where 10 summed their kernels alone.
+pub(crate) const FORMAT: u32 = 11;
 /// Measurement: the rounds a contender is timed (the first over every
 /// candidate, the rest over the contenders), and the rounds the two leaders
 /// then run again ([`rounds`]).
@@ -1211,8 +1214,9 @@ fn compile_one(
 /// alike: two measurements sharing the device would time each other.
 static DEVICE: Mutex<()> = Mutex::new(());
 
-/// Each built candidate's best device time in ns, its programs' summed;
-/// `None` where one failed to build or run. The device runs them one at a
+/// Each built candidate's best device time in ns, its programs' summed
+/// with their launches ([`launched`]); `None` where one failed to build or
+/// run. The device runs them one at a
 /// time, after the clock is lifted, under the process's one timing lock.
 pub(crate) fn time(built: &mut [Built]) -> Vec<Option<u64>> {
     let mut slots: Vec<Option<&mut Built>> = built.iter_mut().map(Some).collect();
@@ -1253,7 +1257,7 @@ fn time_with<B: BorrowMut<Built>>(
             *last = Some(run(plan)?);
             *fresh = *last;
         }
-        let first: Duration = last.iter().flatten().sum();
+        let first = launched(last.iter().copied())?;
         if abort.is_some_and(|abort| first > abort) {
             return Some(first);
         }
@@ -1264,29 +1268,25 @@ fn time_with<B: BorrowMut<Built>>(
         if sustained {
             sustain(&plans, SUSTAIN, first);
         }
-        plans
-            .iter()
-            .zip(last.iter_mut())
-            .zip(fresh)
-            .map(|((plan, last), fresh)| {
-                // Unsustained, the first run is as good as the next ones.
-                let mut timed = vec![fresh.or_else(|| run(plan))?];
-                if sustained {
-                    // Run until the minimum is consistent: the budget's
-                    // runs the floor, three stable ones settle it.
-                    let (mut stable, mut least) = (0, timed[0]);
-                    while timed.len() < MOST_RUNS && (timed.len() < runs || stable < STABLE_RUNS) {
-                        let r = run(plan)?;
-                        stable = if r.as_secs_f64() < least.as_secs_f64() * STEADY { 0 } else { stable + 1 };
-                        least = least.min(r);
-                        timed.push(r);
-                    }
+        let timed = plans.iter().zip(last.iter_mut()).zip(fresh).map(|((plan, last), fresh)| {
+            // Unsustained, the first run is as good as the next ones.
+            let mut timed = vec![fresh.or_else(|| run(plan))?];
+            if sustained {
+                // Run until the minimum is consistent: the budget's
+                // runs the floor, three stable ones settle it.
+                let (mut stable, mut least) = (0, timed[0]);
+                while timed.len() < MOST_RUNS && (timed.len() < runs || stable < STABLE_RUNS) {
+                    let r = run(plan)?;
+                    stable = if r.as_secs_f64() < least.as_secs_f64() * STEADY { 0 } else { stable + 1 };
+                    least = least.min(r);
+                    timed.push(r);
                 }
-                let t = best(timed.into_iter().map(Some))?;
-                *last = Some(t);
-                Some(t)
-            })
-            .sum::<Option<Duration>>()
+            }
+            let t = best(timed.into_iter().map(Some))?;
+            *last = Some(t);
+            Some(t)
+        });
+        launched(timed)
     };
     rounds(count, hopeless, pass, &mut time).into_iter().map(|t| t.map(|t| t.as_nanos() as u64)).collect()
 }
@@ -1621,6 +1621,19 @@ pub(crate) fn best(runs: impl Iterator<Item = Option<Duration>>) -> Option<Durat
     runs.sort_unstable();
     let median = *runs.get(runs.len() / 2)?;
     runs.into_iter().find(|&run| 2 * run >= median)
+}
+
+/// A candidate's time from its programs' own (`None` where one did not
+/// run): their sum and [`LAUNCH`] for every launch past the first, the gap
+/// between kernels no device stamp sees. Without it a split, timed kernel
+/// by kernel, would win wherever its kernels' sum does.
+pub(crate) fn launched(programs: impl IntoIterator<Item = Option<Duration>>) -> Option<Duration> {
+    let (mut sum, mut launches) = (Duration::ZERO, 0u32);
+    for time in programs {
+        sum += time?;
+        launches += 1;
+    }
+    Some(sum + Duration::from_nanos(LAUNCH as u64) * launches.saturating_sub(1))
 }
 
 /// One run's device time, its kernels' summed: a candidate is a kernel plus

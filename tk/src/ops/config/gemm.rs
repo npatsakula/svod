@@ -159,10 +159,11 @@ pub(crate) const TAIL_SPLITS: usize = 16;
 
 /// Model: what a launch costs beside its blocks' time, ns — the dispatch of
 /// its grid behind the kernel before it and the drain of that kernel's last
-/// blocks — paid by a tail split's launches past the first. No probe
-/// measures it, and neither the tuner's times nor `gemm_tail_probe`'s (each
-/// program's own, summed) see it: a tail split is priced, not timed, past
-/// its kernels.
+/// blocks — paid by every launch of a split past its first. No probe
+/// measures it and no kernel's stamps see it: the planner prices a tail
+/// split's launches with it ([`GemmProblem::plan_price`]) and the tuner adds
+/// it to a candidate's summed kernel times ([`crate::tune::launched`]);
+/// `gemm_tail_probe` reports the kernels' sums alone.
 pub(crate) const LAUNCH: f64 = 4000.0;
 
 /// Search bound: the output tile's rows, the first of the knobs a GEMM-shaped
