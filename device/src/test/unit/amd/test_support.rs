@@ -101,6 +101,7 @@ struct MockAmdState {
     transcript: Vec<MockAmdCall>,
     free_issues: Vec<MockFreeIssue>,
     queue_event_mailbox: Option<QueueEventMailbox>,
+    ctx_save_areas: Vec<(u64, u32)>,
     hdp_flush_register: bool,
     during_hdp_flush: Option<Box<dyn FnOnce() + Send>>,
 }
@@ -198,6 +199,12 @@ impl MockAmdIface {
 
     pub(crate) fn live_queue_count(&self) -> usize {
         self.state.lock().queues.len()
+    }
+
+    /// Each compute queue's ctx-save area: its address (the mock GPU VA is the
+    /// host address) and per-XCC stride, in setup order.
+    pub(crate) fn ctx_save_areas(&self) -> Vec<(u64, u32)> {
+        self.state.lock().ctx_save_areas.clone()
     }
 
     pub(crate) fn transcript(&self) -> Vec<MockAmdCall> {
@@ -333,6 +340,9 @@ impl AmdIface for MockAmdIface {
         let queue_id = state.next_queue_id;
         state.next_queue_id += 1;
         state.queues.insert(queue_id, MockQueue { doorbell });
+        if desc.ctx_gpu != 0 {
+            state.ctx_save_areas.push((desc.ctx_gpu, desc.ctx_save_restore_size));
+        }
         state.queue_setups += 1;
         Ok(QueueHandle { queue_id, doorbell_base, doorbell: doorbell_ptr })
     }

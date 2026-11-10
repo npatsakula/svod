@@ -741,6 +741,18 @@ impl AmdDeviceCore {
             _ => None,
         }
     }
+
+    /// The first error a compute lane's queue reported, latched as the poison
+    /// (see `AmdComputeQueue::halt_error`). Both reports raise the queue event
+    /// and nothing else announces them, so a wait reads them as it wakes from
+    /// `WAIT_EVENTS` and as it times out.
+    pub(crate) fn queue_error(&self) -> Option<Error> {
+        // Upgraded outside the registry lock: the last strong count may drop here.
+        let lanes: Vec<_> = self.connectors.lock().iter().filter_map(Weak::upgrade).collect();
+        let error = lanes.iter().find_map(|lane| lane.queue().halt_error())?;
+        self.poison_error_message(&error);
+        Some(error)
+    }
 }
 
 /// Ensure the process-wide `/dev/kfd` handle is open and return a shared
@@ -924,7 +936,7 @@ pub(crate) fn alloc_scratch(
     // boundary; sizing from raw `cu_cnt` under-provisions on a harvested 8-XCC
     // part, so a high-occupancy dispatch traps with an insufficient-scratch
     // exception (0x401) and the CP HALTS the queue waiting on `queue_inactive_
-    // signal` — which we never service, so it hangs forever with no fault.
+    // signal` — which we never service, so the device is lost to that halt.
     let cu_slots = cu_cnt.next_multiple_of(se_cnt);
 
     // Round up to the per-lane alignment stride.

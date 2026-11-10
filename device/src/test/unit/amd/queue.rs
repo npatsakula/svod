@@ -132,7 +132,7 @@ fn amd_pm4(rsrc: [u32; 3], program_address: u64, workgroup_count: [u32; 3]) -> A
 
 #[test]
 fn compute_queue_construction_unwinds_every_allocation_stage() {
-    for (xccs, allocation_stages) in [(1, 4), (2, 5)] {
+    for (xccs, allocation_stages) in [(1, 5), (2, 5)] {
         for fail_at in 0..allocation_stages {
             let (iface, allocator) = mock_device(xccs);
             for _ in 0..fail_at {
@@ -153,19 +153,19 @@ fn compute_queue_setup_success_failure_and_active_rollback_are_owned() {
     let (iface, allocator) = mock_device(1);
     iface.script_setup(Err(scripted_error("setup")));
     assert!(AmdComputeQueue::create(&allocator).is_err());
-    assert_eq!((iface.allocation_count(), iface.free_count(), iface.live_handle_count()), (4, 4, 0));
+    assert_eq!((iface.allocation_count(), iface.free_count(), iface.live_handle_count()), (5, 5, 0));
 
     let queue = AmdComputeQueue::create(&allocator).expect("queue");
     assert_eq!(iface.live_queue_count(), 1);
     drop(queue);
-    assert_eq!((iface.allocation_count(), iface.free_count(), iface.live_handle_count()), (8, 8, 0));
+    assert_eq!((iface.allocation_count(), iface.free_count(), iface.live_handle_count()), (10, 10, 0));
     assert_eq!((iface.queue_setup_count(), iface.queue_teardown_count(), iface.live_queue_count()), (1, 1, 0));
 
     // A leaked doorbell still retires the queue and all of its backing.
     let queue = AmdComputeQueue::create(&allocator).expect("queue with leaked doorbell");
     iface.script_teardown(Ok(crate::amd::iface::QueueTeardown::DoorbellLeaked { errno: 12 }));
     drop(queue);
-    assert_eq!((iface.allocation_count(), iface.free_count(), iface.live_handle_count()), (12, 12, 0));
+    assert_eq!((iface.allocation_count(), iface.free_count(), iface.live_handle_count()), (15, 15, 0));
     assert_eq!(iface.live_queue_count(), 0);
     assert!(iface.free_issues().is_empty());
 
@@ -175,7 +175,7 @@ fn compute_queue_setup_success_failure_and_active_rollback_are_owned() {
     iface.script_setup(Err(Error::AmdQueueStillActive { queue_id: 77, cause: "scripted rollback failure".into() }));
     assert!(matches!(AmdComputeQueue::create(&allocator), Err(Error::AmdQueueStillActive { .. })));
     assert!(allocator.dev.is_poisoned());
-    assert_eq!((iface.allocation_count(), iface.free_count(), iface.live_handle_count()), (4, 0, 4));
+    assert_eq!((iface.allocation_count(), iface.free_count(), iface.live_handle_count()), (5, 0, 5));
 }
 
 #[test]
@@ -260,7 +260,7 @@ fn copy_queue_drains_registered_linked_finalizers_before_teardown() {
 fn pool_queue_construction_unwinds_queue_arena_and_scratch_stages() {
     let (iface, allocator) = mock_device_with_signals(1);
     let baseline = iface.allocation_count();
-    for fail_at in 0..6 {
+    for fail_at in 0..7 {
         let (allocations, frees) = (iface.allocation_count(), iface.free_count());
         for _ in 0..fail_at {
             iface.script_alloc(Ok(()));
@@ -275,8 +275,8 @@ fn pool_queue_construction_unwinds_queue_arena_and_scratch_stages() {
 
     let (allocations, frees) = (iface.allocation_count(), iface.free_count());
     drop(PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator).expect("pool queue"));
-    assert_eq!(iface.allocation_count() - allocations, 6);
-    assert_eq!(iface.free_count() - frees, 6);
+    assert_eq!(iface.allocation_count() - allocations, 7);
+    assert_eq!(iface.free_count() - frees, 7);
     assert_eq!(iface.live_handle_count(), baseline);
 }
 
@@ -291,7 +291,7 @@ fn quarantined_queue_leaks_its_backing_without_a_poisoned_device() {
     queue.quarantine();
     drop(queue);
     assert!(!allocator.dev.is_poisoned());
-    assert_eq!((iface.free_count(), iface.live_handle_count()), (0, baseline + 4));
+    assert_eq!((iface.free_count(), iface.live_handle_count()), (0, baseline + 5));
     assert_eq!((iface.queue_teardown_count(), iface.live_queue_count()), (0, 1));
 }
 
@@ -304,7 +304,7 @@ fn pool_failed_drain_and_panic_abandonment_quarantine_every_backing() {
     iface.script_wait(Err(scripted_error("drain")));
     drop(pool);
     assert!(allocator.dev.is_poisoned());
-    assert_eq!((iface.free_count(), iface.live_handle_count()), (0, baseline + 6));
+    assert_eq!((iface.free_count(), iface.live_handle_count()), (0, baseline + 7));
 
     // A panic unwind quarantines the lane it abandons but must NOT poison the
     // process-global core: tinygrad latches per-device error state on drain
@@ -317,7 +317,7 @@ fn pool_failed_drain_and_panic_abandonment_quarantine_every_backing() {
     }));
     assert!(result.is_err());
     assert!(!allocator.dev.is_poisoned());
-    assert_eq!((iface.free_count(), iface.live_handle_count()), (0, baseline + 6));
+    assert_eq!((iface.free_count(), iface.live_handle_count()), (0, baseline + 7));
     assert_eq!(iface.queue_teardown_count(), 0, "an abandoned queue is never destroyed");
 }
 
@@ -341,24 +341,24 @@ fn scratch_growth_preserves_old_state_on_drain_or_allocation_failure() {
     iface.script_alloc(Err(scripted_error("replacement scratch allocation")));
     assert!(pool.ensure_has_local_memory(4096).is_err());
     assert!(!allocator.dev.is_poisoned());
-    assert_eq!(iface.allocation_count(), baseline + 6);
+    assert_eq!(iface.allocation_count(), baseline + 7);
     assert_eq!(iface.free_count(), 0, "old scratch must survive replacement allocation failure");
     drop(pool);
-    assert_eq!(iface.free_count(), 6);
+    assert_eq!(iface.free_count(), 7);
 
     let (iface, allocator) = mock_device_with_signals(1);
     let baseline = iface.allocation_count();
     let pool = PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator).expect("pool queue");
     pool.ensure_has_local_memory(4096).expect("scratch growth");
-    assert_eq!(iface.allocation_count(), baseline + 7);
+    assert_eq!(iface.allocation_count(), baseline + 8);
     assert_eq!(iface.free_count(), 1, "successful publication frees exactly the drained old scratch");
     // Idempotent: an already-satisfied request neither drains nor reallocates.
     pool.ensure_has_local_memory(4096).expect("satisfied scratch request");
     pool.ensure_has_local_memory(1).expect("smaller scratch request");
     assert_eq!(iface.alloc_count_for_tag(crate::amd::va_registry::AllocTag::Scratch), 2);
-    assert_eq!(iface.allocation_count(), baseline + 7);
+    assert_eq!(iface.allocation_count(), baseline + 8);
     drop(pool);
-    assert_eq!(iface.free_count(), 7);
+    assert_eq!(iface.free_count(), 8);
     assert!(iface.free_issues().is_empty());
 }
 
@@ -1417,4 +1417,56 @@ fn set_aql_scratch_round_trips_through_gart() {
     assert_eq!(q.read_aql_scratch(), desc, "the GART descriptor must match what we wrote");
     assert_eq!((desc.backing_va, desc.tmpring_size), (va, tmpring));
     alloc.dev.core().iface().free_raw(va, size, handle);
+}
+
+// ------------------------------------------------------------ queue error words
+
+/// Both error words raise the queue event, as ROCr wires them: the AQL
+/// `queue_inactive_signal` carries the event's mailbox (`amd_signal_t` +16/+24)
+/// and every XCC's CWSR header names the `ErrorReason` word (+24) and the
+/// event (+32). A fresh queue reports nothing.
+#[test_case::test_case(1; "pm4")]
+#[test_case::test_case(2; "aql")]
+fn compute_queue_error_words_raise_the_queue_event(xccs: u32) {
+    let mailbox = crate::amd::iface::QueueEventMailbox { address: 0xfeed_0000, event_id: 9 };
+    let (iface, allocator) = mock_device(xccs);
+    iface.set_queue_event_mailbox(mailbox);
+    let queue = AmdComputeQueue::create(&allocator).expect("compute queue");
+    let (inactive, reason) = queue.error_word_ptrs();
+    // SAFETY: mock GPU VAs are host addresses of live allocations.
+    let word = |address: u64| unsafe { std::ptr::read_volatile(address as *const u64) };
+
+    let [(ctx, stride)] = iface.ctx_save_areas()[..] else { panic!("one ctx-save area") };
+    for xcc in 0..u64::from(xccs) {
+        let header = ctx + xcc * u64::from(stride);
+        assert_eq!(word(header + 24), reason as u64, "xcc {xcc}");
+        assert_eq!(word(header + 32) as u32, mailbox.event_id, "xcc {xcc}");
+    }
+    let signal = inactive as u64 - 8;
+    let armed = (word(signal + 16), word(signal + 24) as u32);
+    assert_eq!(armed, (mailbox.address, mailbox.event_id));
+    assert!(queue.halt_error().is_none());
+}
+
+#[test_case::test_case(0x401 => "insufficient scratch"; "scratch wave64")]
+#[test_case::test_case(0x400 => "insufficient scratch"; "scratch high bit alone")]
+#[test_case::test_case(0x8000_0000_0000_0401 => "insufficient scratch"; "scratch retry flag")]
+#[test_case::test_case(0x2 => "invalid dispatch dimensions"; "dimensions")]
+#[test_case::test_case(0x20 => "invalid packet format"; "generic format")]
+#[test_case::test_case(0x100 => "invalid packet format"; "vendor packet")]
+#[test_case::test_case(0x80 => "out of VGPRs"; "vgprs")]
+#[test_case::test_case(0x4000_0000 => "illegal instruction"; "illegal instruction")]
+#[test_case::test_case(0x10_0000 => "unknown halt code"; "unknown")]
+fn inactive_codes_decode_by_rocr_precedence(code: u64) -> &'static str {
+    inactive_cause(code)
+}
+
+#[test_case::test_case(1 << 3 => "illegal instruction"; "illegal instruction")]
+#[test_case::test_case(1 << 4 => "memory violation"; "memory violation")]
+#[test_case::test_case(1 << 17 => "invalid code object"; "code object")]
+#[test_case::test_case(1 << 29 => "preemption error"; "preemption")]
+#[test_case::test_case((1 << 29) | (1 << 1) => "wave trap"; "lowest code wins")]
+#[test_case::test_case(1 << 40 => "unknown exception"; "unknown")]
+fn error_reason_bits_decode_as_kfd_exception_codes(bits: u64) -> &'static str {
+    exception_cause(bits)
 }

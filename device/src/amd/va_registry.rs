@@ -37,6 +37,7 @@ pub enum AllocTag {
     SignalPool,
     QueueRing,
     QueueGart,
+    /// A compute queue's `queue_inactive_signal` and `ErrorReason` words.
     QueueInactive,
     Staging,
     /// GTT kernargs: the device's arena (with AQL control programs) and the

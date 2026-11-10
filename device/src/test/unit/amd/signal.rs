@@ -218,3 +218,87 @@ fn a_long_wait_sleeps_while_the_queue_moves() {
     mover.join().unwrap();
     assert!(wait_count(&iface) > sleeps, "a moving queue kept the wait polling");
 }
+
+/// Which error word a test plays the CP or KFD writing.
+#[derive(Clone, Copy, Debug)]
+enum QueueReport {
+    Inactive,
+    ErrorReason,
+}
+
+/// Write `code` into `lane`'s `report` word, as the CP or KFD does.
+fn report_queue_error(lane: &crate::amd::connector::PoolQueue, report: QueueReport, code: u64) {
+    let (inactive, reason) = lane.queue().error_word_ptrs();
+    let word = match report {
+        QueueReport::Inactive => inactive,
+        QueueReport::ErrorReason => reason,
+    };
+    // SAFETY: the word lives in the lane's error allocation, alive with `lane`.
+    unsafe { std::ptr::write_volatile(word, code) };
+}
+
+/// A wait sleeping in `WAIT_EVENTS` wakes on the queue event a stopped queue
+/// raises and fails at once with the decoded error, which poisons the device
+/// for every later wait.
+#[test_case::test_case(2, QueueReport::Inactive, 0x401, "queue_inactive_signal", "insufficient scratch"; "aql halt")]
+#[test_case::test_case(2, QueueReport::ErrorReason, 1 << 29, "ErrorReason", "preemption error"; "aql exception")]
+#[test_case::test_case(1, QueueReport::ErrorReason, 1 << 3, "ErrorReason", "illegal instruction"; "pm4 exception")]
+fn a_stopped_queue_fails_a_blocked_wait_at_once(
+    xccs: u32,
+    report: QueueReport,
+    code: u64,
+    expected_report: &str,
+    expected_cause: &str,
+) {
+    let (iface, allocator) = super::test_support::mock_device_with_signals(xccs);
+    let lane = crate::amd::connector::PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator)
+        .expect("pool queue");
+    let signal = Arc::clone(lane.pm4_signal());
+    let waiting = Arc::clone(&signal);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || tx.send(waiting.wait(1, 60_000)).unwrap());
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while wait_count(&iface) == 0 {
+        assert!(std::time::Instant::now() < deadline, "waiter never entered event polling");
+        std::thread::yield_now();
+    }
+    report_queue_error(&lane, report, code);
+    let error = rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("the stopped queue did not wake the waiter")
+        .expect_err("a stopped queue must fail the wait");
+    waiter.join().unwrap();
+    let Error::AmdQueueError { report, code: reported, cause, .. } = error else { panic!("{error:?}") };
+    assert_eq!((report, reported, cause), (expected_report, code, expected_cause));
+
+    assert!(allocator.dev.is_poisoned());
+    let later = signal.wait(1, 60_000).expect_err("the poison fails later waits");
+    assert!(matches!(later, Error::Runtime { message } if message.contains(expected_cause)));
+}
+
+/// A wait that runs out its deadline names the stopped queue rather than the
+/// deadline.
+#[test]
+fn a_timed_out_wait_names_the_stopped_queue() {
+    let (_iface, allocator) = super::test_support::mock_device_with_signals(2);
+    let lane = crate::amd::connector::PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator)
+        .expect("pool queue");
+    report_queue_error(&lane, QueueReport::Inactive, 0x80);
+    let error = lane.pm4_signal().wait(1, 1).expect_err("a stopped queue must fail the wait");
+    assert!(matches!(error, Error::AmdQueueError { cause: "out of VGPRs", .. }), "{error:?}");
+}
+
+/// Zeroed error words are no report: the wait sleeps and wakes in
+/// `WAIT_EVENTS` until its deadline and leaves the device usable.
+#[test_case::test_case(1; "pm4")]
+#[test_case::test_case(2; "aql")]
+fn quiet_error_words_leave_a_wait_to_its_deadline(xccs: u32) {
+    let (iface, allocator) = super::test_support::mock_device_with_signals(xccs);
+    let lane = crate::amd::connector::PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator)
+        .expect("pool queue");
+    let error = lane.pm4_signal().wait(1, 20).expect_err("nothing completes the wait");
+    assert!(matches!(error, Error::TimelineTimeout { .. }), "{error:?}");
+    assert!(wait_count(&iface) > 0, "the wait never slept, so never read the words on a wake");
+    assert!(!allocator.dev.is_poisoned());
+}

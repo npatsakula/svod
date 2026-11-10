@@ -723,19 +723,8 @@ impl AmdProgram {
         owner.set_newest(Arc::clone(&result.finalizer));
 
         if wait {
-            if is_pm4 {
-                owner.synchronize()?;
-            } else if let Err(e) = owner.synchronize() {
-                if let Some(code) = queue.inactive_exception() {
-                    return Err(Error::Runtime {
-                        message: format!(
-                            "AQL dispatch '{}' did not complete: queue halted with exception {code:#x}",
-                            self.name
-                        ),
-                    });
-                }
-                return Err(e);
-            }
+            // A halted queue surfaces here as a typed `AmdQueueError`.
+            owner.synchronize()?;
         }
 
         if is_pm4 {

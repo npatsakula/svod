@@ -87,6 +87,20 @@ const SIGNAL_END_TS_OFFSET: usize = 40;
 /// 100 MHz on AMD GPUs (10 ns per tick — tinygrad's `timestamp_divider=100`).
 const NS_PER_TICK: u64 = 10;
 
+/// Make the CP raise `mailbox`'s event whenever it writes the `amd_signal_t`
+/// at `base`: it stores `event_id` at `event_mailbox_ptr` and interrupts (ROCr
+/// `InterruptSignal`).
+///
+/// # Safety
+/// `base` must address a mapped, writable 64-byte `amd_signal_t`.
+pub(crate) unsafe fn raise_event_on_write(base: *mut u8, mailbox: crate::amd::iface::QueueEventMailbox) {
+    // SAFETY: the caller guarantees the 64-byte struct is mapped.
+    unsafe {
+        std::ptr::write_volatile(base.add(SIGNAL_EVENT_MAILBOX_OFFSET) as *mut u64, mailbox.address);
+        std::ptr::write_volatile(base.add(SIGNAL_EVENT_ID_OFFSET) as *mut u32, mailbox.event_id);
+    }
+}
+
 /// A pool-allocated AMD signal.
 ///
 /// The atomic counter the GPU writes to lives at `value_addr` (GPU VA) and
@@ -159,11 +173,7 @@ impl AmdSignal {
         self.countdown = true;
         if let Some(mailbox) = mailbox {
             // SAFETY: the full 64-byte slot is mapped; value lives at +8.
-            unsafe {
-                let base = (self.host_ptr.as_ptr() as *mut u8).sub(SIGNAL_VALUE_OFFSET);
-                std::ptr::write_volatile(base.add(SIGNAL_EVENT_MAILBOX_OFFSET) as *mut u64, mailbox.address);
-                std::ptr::write_volatile(base.add(SIGNAL_EVENT_ID_OFFSET) as *mut u32, mailbox.event_id);
-            }
+            unsafe { raise_event_on_write((self.host_ptr.as_ptr() as *mut u8).sub(SIGNAL_VALUE_OFFSET), mailbox) };
         }
         self
     }
@@ -214,7 +224,8 @@ impl AmdSignal {
 
     /// Wait until the value reaches `target`, `timeout_ms` passes with *no
     /// progress* (the value, `progress` or the queue's read index moving), or
-    /// KFD reports a GPU fault. Shared by the monotonic timeline waits.
+    /// KFD reports a GPU fault or a compute queue reports an error. Shared by
+    /// the monotonic timeline waits.
     ///
     /// Early-exit on fault is load-bearing for BEAM search: a bad kernel config
     /// may fault the GPU, and paying the full timeout per rejected candidate is
@@ -256,9 +267,9 @@ impl AmdSignal {
                 quiet = std::time::Instant::now();
             }
             if timeout_ms > 0 && quiet.elapsed().as_millis() as u64 >= timeout_ms {
-                // A hung kernel almost always raised a fault; surface it
-                // alongside the deadline.
-                let fault = device.as_ref().and_then(|d| d.poll_faults_nonblocking());
+                // A hung kernel almost always raised a fault or stopped its
+                // queue; surface that instead of the deadline.
+                let fault = device.as_ref().and_then(|d| d.poll_faults_nonblocking().or_else(|| d.queue_error()));
                 return Err(fault.unwrap_or(Error::TimelineTimeout {
                     what,
                     target,
@@ -306,12 +317,13 @@ impl AmdSignal {
 
     /// Tiered backoff by the wait's age: spin, then yield, then from [`SPIN`]
     /// on sleep in KFD `WAIT_EVENTS` for at most [`SLEEP_MS`]. The sleep wakes
-    /// on the queue event a completion raises and on the memory and hardware
-    /// fault events.
+    /// on the queue event a completion or a queue error raises and on the
+    /// memory and hardware fault events, so each wake also reads the queues'
+    /// error words.
     ///
     /// Returns the typed `WAIT_EVENTS` failure directly. Otherwise, `Some`
-    /// carries a reported GPU fault and `None` means a normal wake-up, timeout,
-    /// dropped device, or the pure spin/yield path.
+    /// carries a reported GPU fault or queue error and `None` means a normal
+    /// wake-up, timeout, dropped device, or the pure spin/yield path.
     #[inline]
     fn spin_or_sleep(
         device: Option<&AmdDeviceCore>,
@@ -322,7 +334,7 @@ impl AmdSignal {
         if elapsed >= SPIN
             && let Some(dev) = device
         {
-            return dev.wait_events(SLEEP_MS, age);
+            return Ok(dev.wait_events(SLEEP_MS, age)?.or_else(|| dev.queue_error()));
         }
         if elapsed < SPIN_HOT {
             std::hint::spin_loop();

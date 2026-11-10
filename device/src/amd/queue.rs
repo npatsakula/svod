@@ -928,6 +928,8 @@ pub struct AmdComputeQueue {
     /// it submits AQL packets (with PM4 wrapped in AQL vendor IB packets).
     /// Decided at queue creation from `num_xcc`, fixed for the queue's lifetime.
     is_pm4: bool,
+    /// Read without the ring lock: a waiter checks them while a lease publishes.
+    errors: QueueErrorWords,
 }
 
 /// Copy queue (SDMA). Stages host↔device and device↔device copies for
@@ -1003,10 +1005,8 @@ struct QueueInner {
     /// the scratch fields at fixed offsets are patched here when the
     /// connector's scratch buffer is (re)allocated; see `set_aql_scratch`.
     gart_host: NonNull<u8>,
-    /// Host base of the `queue_inactive_signal` amd_signal_t (AQL only). The CP
-    /// trap handler writes its exception code into `value` (`+8`) and halts the
-    /// queue; reading it tells us WHY a wedge happened (e.g. `0x401`).
-    qinactive_host: Option<NonNull<u8>>,
+    /// The compute queue's error words; `None` on the SDMA queue.
+    errors: Option<QueueErrorWords>,
     /// Flushes VRAM stores a `HostWrite` deferred to the next doorbell.
     hdp: Arc<crate::amd::iface::Hdp>,
     /// Index of the next packet (in AQL_PACKET_BYTES-sized slots). For SDMA
@@ -1030,7 +1030,7 @@ struct QueueInner {
     _gart_buf: crate::allocator::RawBuffer,
     _eop_buf: Option<crate::allocator::RawBuffer>,
     _ctx_buf: Option<crate::allocator::RawBuffer>,
-    _qinactive_buf: Option<crate::allocator::RawBuffer>,
+    _errors_buf: Option<crate::allocator::RawBuffer>,
 }
 
 // SAFETY: ring/doorbell access goes through Mutex; underlying buffers are
@@ -1114,8 +1114,8 @@ impl Drop for QueueInner {
         if let Some(ctx) = self._ctx_buf.as_ref() {
             ctx.free_amd_device_in_place();
         }
-        if let Some(qinactive) = self._qinactive_buf.as_ref() {
-            qinactive.free_amd_device_in_place();
+        if let Some(errors) = self._errors_buf.as_ref() {
+            errors.free_amd_device_in_place();
         }
     }
 }
@@ -1488,7 +1488,14 @@ impl AmdComputeQueue {
         let queue_type = if is_pm4 { kfd::KFD_IOC_QUEUE_TYPE_COMPUTE } else { kfd::KFD_IOC_QUEUE_TYPE_COMPUTE_AQL };
         let inner = create_queue(allocator, queue_type, COMPUTE_RING_BYTES, !is_pm4, /*needs_cwsr=*/ true)?;
         debug!(gpu_id = core.node.gpu_id, num_xcc = core.node.num_xcc, is_pm4 = is_pm4, "AmdComputeQueue created");
-        Ok(Box::new(Self { inner: Mutex::new(inner), state: QueueState::Active, core: Arc::clone(core), is_pm4 }))
+        let errors = inner.errors.expect("a compute queue has error words");
+        Ok(Box::new(Self {
+            inner: Mutex::new(inner),
+            state: QueueState::Active,
+            core: Arc::clone(core),
+            is_pm4,
+            errors,
+        }))
     }
 
     /// `true` when this queue submits raw PM4 dwords (single-XCC); `false`
@@ -2115,15 +2122,96 @@ impl AmdComputeQueue {
         unsafe { *(inner.ring_host.as_ptr().add(offset) as *const [u8; AQL_PACKET_BYTES]) }
     }
 
-    /// The CP exception code the trap handler wrote into `queue_inactive_signal`
-    /// when it halted the queue (e.g. `0x401` insufficient-scratch), or `None`
-    /// if no exception is recorded (value `0`) / on PM4 queues. Used to turn a
-    /// blind dispatch timeout into a diagnosable error.
-    pub(crate) fn inactive_exception(&self) -> Option<i64> {
-        let h = self.inner.lock().qinactive_host?;
-        // SAFETY: host-visible amd_signal_t; `value` is the i64 at +8.
-        let code = unsafe { std::ptr::read_volatile(h.as_ptr().add(8) as *const i64) };
-        (code != 0).then_some(code)
+    /// The error this queue reported, if any: the code the CP wrote into the
+    /// `queue_inactive_signal` as it halted the AQL queue (e.g. `0x401`,
+    /// insufficient scratch), else the exception bits KFD set in `ErrorReason`.
+    pub(crate) fn halt_error(&self) -> Option<Error> {
+        self.errors.error()
+    }
+
+    /// Host addresses of the `queue_inactive_signal` value and the
+    /// `ErrorReason` word, where a test plays the CP and KFD. Test-only.
+    #[cfg(test)]
+    pub(crate) fn error_word_ptrs(&self) -> (*mut u64, *mut u64) {
+        let base = self.errors.base.as_ptr();
+        // SAFETY: both offsets lie inside the QUEUE_ERROR_BYTES allocation.
+        unsafe { (base.add(8).cast(), base.add(QUEUE_ERROR_REASON_OFFSET).cast()) }
+    }
+}
+
+/// One GTT allocation per compute queue: the AQL `queue_inactive_signal`
+/// (`amd_signal_t`, value at +8), unused on PM4, and the CWSR header's
+/// `ErrorReason` word.
+const QUEUE_ERROR_BYTES: usize = 128;
+const QUEUE_ERROR_REASON_OFFSET: usize = 64;
+
+/// A compute queue's error words; see [`QUEUE_ERROR_BYTES`].
+#[derive(Clone, Copy, Debug)]
+struct QueueErrorWords {
+    queue_id: u32,
+    base: NonNull<u8>,
+}
+
+// SAFETY: `base` addresses the queue's error allocation, which the queue keeps
+// mapped (or leaks, when quarantined) for its whole life; it is only read.
+unsafe impl Send for QueueErrorWords {}
+unsafe impl Sync for QueueErrorWords {}
+
+impl QueueErrorWords {
+    fn error(self) -> Option<Error> {
+        // SAFETY: see the `Send` impl; the CP and KFD write the words, hence volatile.
+        let read = |offset| unsafe { std::ptr::read_volatile(self.base.as_ptr().add(offset) as *const u64) };
+        let (report, code, cause) = match (read(8), read(QUEUE_ERROR_REASON_OFFSET)) {
+            (0, 0) => return None,
+            (0, bits) => ("ErrorReason", bits, exception_cause(bits)),
+            (code, _) => ("queue_inactive_signal", code, inactive_cause(code)),
+        };
+        Some(Error::AmdQueueError { queue_id: self.queue_id, report, code, cause })
+    }
+}
+
+/// What a `queue_inactive_signal` code means, by ROCr's precedence
+/// (`AqlQueue::DynamicQueueEventsHandler`).
+pub(crate) fn inactive_cause(code: u64) -> &'static str {
+    const CAUSES: [(u64, &str); 11] = [
+        (0x401, "insufficient scratch"),
+        (0x2, "invalid dispatch dimensions"),
+        (0x4, "invalid group segment size"),
+        (0x8, "invalid code object"),
+        (0x120, "invalid packet format"),
+        (0x40, "workgroup too large"),
+        (0x80, "out of VGPRs"),
+        (0x200, "scratch reclaim requested"),
+        (0x2000_0000, "memory aperture violation"),
+        (0x4000_0000, "illegal instruction"),
+        (0x8000_0000, "debug trap"),
+    ];
+    CAUSES.iter().find(|(mask, _)| code & mask != 0).map_or("unknown halt code", |(_, cause)| cause)
+}
+
+/// What the lowest `KFD_EC_MASK(ec) = 1 << (ec - 1)` bit of an `ErrorReason`
+/// word means (`enum kfd_dbg_trap_exception_code`).
+pub(crate) fn exception_cause(bits: u64) -> &'static str {
+    match bits.trailing_zeros() + 1 {
+        1 => "wave abort",
+        2 => "wave trap",
+        3 => "wave math error",
+        4 => "illegal instruction",
+        5 => "memory violation",
+        6 => "aperture violation",
+        16 => "invalid dispatch dimensions",
+        17 => "invalid group segment size",
+        18 => "invalid code object",
+        19 => "reserved packet",
+        20 => "unsupported packet",
+        21 => "invalid workgroup size",
+        22 => "invalid register count",
+        23 => "unsupported vendor packet",
+        30 => "preemption error",
+        33 => "device memory violation",
+        34 => "RAS error",
+        35 => "fatal halt",
+        _ => "unknown exception",
     }
 }
 
@@ -2690,26 +2778,37 @@ fn create_queue(
         _ => return Err(Error::NotHostVisible { what: "GART page" }),
     };
 
-    let mut qinactive_buf: Option<AmdBufferGuard> = None;
-    let mut qinactive_host: Option<NonNull<u8>> = None;
-    if aql {
-        // A host-visible amd_signal_t the CP trap handler writes its exception
-        // code into (e.g. 0x401 insufficient-scratch) when it halts the queue.
-        // Without a real handle the CP can't report WHY it halted (silent wedge).
-        let qi_buf =
-            AmdBufferGuard::new(allocator.alloc_uncached_tagged(64, crate::amd::va_registry::AllocTag::QueueInactive)?);
-        let (qi_gpu, qi_host) = match qi_buf.buffer() {
-            crate::allocator::RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
-            _ => return Err(Error::NotHostVisible { what: "queue_inactive_signal" }),
-        };
-        // SAFETY: fresh 64-byte buffer. amd_signal_t: kind=USER@0, value=0@8.
+    // A compute queue's error words (see `QueueErrorWords`), both raising the
+    // queue event as ROCr wires them, so a sleeping waiter wakes on either.
+    let errors_buf = needs_cwsr
+        .then(|| {
+            allocator
+                .alloc_uncached_tagged(QUEUE_ERROR_BYTES, crate::amd::va_registry::AllocTag::QueueInactive)
+                .map(AmdBufferGuard::new)
+        })
+        .transpose()?;
+    let errors_mem = match errors_buf.as_ref().map(AmdBufferGuard::buffer) {
+        Some(crate::allocator::RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. }) => Some((*gpu_addr, *h)),
+        Some(_) => return Err(Error::NotHostVisible { what: "queue error words" }),
+        None => None,
+    };
+    let mailbox = dev.queue_event_mailbox();
+    if let Some((_, host)) = errors_mem {
+        // SAFETY: fresh QUEUE_ERROR_BYTES buffer. amd_signal_t: kind=USER@0,
+        // value=0@8; ErrorReason=0@QUEUE_ERROR_REASON_OFFSET.
         unsafe {
-            std::ptr::write_bytes(qi_host.as_ptr(), 0, 64);
+            std::ptr::write_bytes(host.as_ptr(), 0, QUEUE_ERROR_BYTES);
             std::ptr::write_volatile(
-                qi_host.as_ptr() as *mut i64,
+                host.as_ptr() as *mut i64,
                 crate::amd::sys::hsa::amd_signal_kind_t_AMD_SIGNAL_KIND_USER as i64,
             );
+            if let Some(mailbox) = mailbox {
+                crate::amd::signal::raise_event_on_write(host.as_ptr(), mailbox);
+            }
         }
+    }
+    if aql {
+        let (qi_gpu, _) = errors_mem.expect("an AQL queue is a compute queue");
         // Initialize the GART descriptor.
         // max_cu_id is total CUs across all XCCs - 1 (cu_cnt*xccs-1).
         let cu_cnt = dev.node.simd_count.max(1) / dev.node.simd_per_cu.max(1);
@@ -2734,8 +2833,6 @@ fn create_queue(
                 std::mem::size_of::<crate::amd::sys::hsa::amd_queue_t>(),
             );
         }
-        qinactive_buf = Some(qi_buf);
-        qinactive_host = Some(qi_host);
     }
 
     // Both AQL and plain COMPUTE queues use the same rptr/wptr offsets — the
@@ -2787,7 +2884,13 @@ fn create_queue(
             _ => return Err(Error::NotHostVisible { what: "ctx-save buffer" }),
         };
         // Per-XCC `HsaUserContextSaveAreaHeader` (40 bytes): DebugOffset@16,
-        // DebugSize@20 (ErrorReason@24 / ErrorEventId@32 stay 0 — no event).
+        // DebugSize@20, ErrorReason@24, ErrorEventId@32. KFD ORs a queue
+        // exception's `KFD_EC_MASK` bits into the word ErrorReason points at
+        // and sets the ErrorEventId event (`send_exception_work_handler`); the
+        // pointer is a host address, which our mappings share with the GPU VA.
+        let (errors_gpu, _) = errors_mem.expect("a CWSR queue is a compute queue");
+        let error_reason = errors_gpu + QUEUE_ERROR_REASON_OFFSET as u64;
+        let error_event = mailbox.map_or(0, |mailbox| mailbox.event_id);
         // SAFETY: ctx_host is the zeroed cwsr_buffer_size region; each header sits
         // at `i * ctx_save_restore_size`, well within the buffer.
         unsafe {
@@ -2795,6 +2898,8 @@ fn create_queue(
                 let hdr = ctx_host.as_ptr().add(i * ctx_save_restore_size);
                 std::ptr::write_volatile(hdr.add(16) as *mut u32, ((xccs - i) * ctx_save_restore_size) as u32);
                 std::ptr::write_volatile(hdr.add(20) as *mut u32, (debug_memory_size * xccs) as u32);
+                std::ptr::write_volatile(hdr.add(24) as *mut u64, error_reason);
+                std::ptr::write_volatile(hdr.add(32) as *mut u32, error_event);
             }
         }
         // The CP reads the headers on its first context save or restore.
@@ -2852,13 +2957,13 @@ fn create_queue(
         write_idx: 0,
         queue_id,
         quarantined: false,
-        qinactive_host,
+        errors: errors_mem.map(|(_, base)| QueueErrorWords { queue_id, base }),
         hdp: Arc::clone(dev.hdp()),
         _ring_buf: ring_buf.into_inner(),
         _gart_buf: gart_buf.into_inner(),
         _eop_buf: eop_buf.map(AmdBufferGuard::into_inner),
         _ctx_buf: ctx_buf.map(AmdBufferGuard::into_inner),
-        _qinactive_buf: qinactive_buf.map(AmdBufferGuard::into_inner),
+        _errors_buf: errors_buf.map(AmdBufferGuard::into_inner),
     })
 }
 

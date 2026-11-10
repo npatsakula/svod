@@ -103,7 +103,7 @@ fn kernarg_arena_is_shared_by_every_lane_of_one_device() {
     let frees = iface.free_count();
     let second = pools.pop().unwrap();
     drop(pools);
-    assert_eq!(iface.free_count(), frees + 5, "a shared arena outlives the first lane to drop");
+    assert_eq!(iface.free_count(), frees + 6, "a shared arena outlives the first lane to drop");
     drop(second);
     assert_eq!(iface.alloc_count_for_tag(AllocTag::Kernarg), 1);
 }

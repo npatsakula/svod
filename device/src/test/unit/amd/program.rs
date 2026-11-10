@@ -212,9 +212,9 @@ attributes #0 = { nounwind "amdgpu-flat-work-group-size"="1,1" }
 #[test]
 fn graph_capture_storage_unwinds_each_post_lane_allocation() {
     let Some(bytes) = clang_amdgcn(EMPTY_IR, "gfx1100") else { return };
-    // Stages 0..6 belong to the lane itself (covered by the pool-queue unwind
-    // test); 6..=8 are the graph's own kernarg and command-stream buffers.
-    for fail_at in 6..=8 {
+    // Stages 0..7 belong to the lane itself (covered by the pool-queue unwind
+    // test); 7..=9 are the graph's own kernarg and command-stream buffers.
+    for fail_at in 7..=9 {
         let mock = load_mock_program(&bytes, "empty", &[], true);
         let (allocations, frees) = (mock.iface.allocation_count(), mock.iface.free_count());
         for _ in 0..fail_at {
@@ -224,7 +224,7 @@ fn graph_capture_storage_unwinds_each_post_lane_allocation() {
         let kernels = [graph_kernel(&mock.program, Vec::new(), Vec::new())];
         assert!(AmdGraph::capture(&mock.allocator, &kernels).is_err(), "fail_at={fail_at}");
         assert_eq!(mock.iface.allocation_count() - allocations, fail_at, "fail_at={fail_at}");
-        assert_eq!(mock.iface.free_count() - frees, fail_at - 6, "fail_at={fail_at}");
+        assert_eq!(mock.iface.free_count() - frees, fail_at - 7, "fail_at={fail_at}");
         assert!(mock.iface.free_issues().is_empty());
     }
 }
@@ -235,7 +235,7 @@ fn graph_success_drop_frees_kernarg_and_both_resident_streams_once() {
     let allocations = mock.iface.allocation_count();
     let kernels = [graph_kernel(&mock.program, Vec::new(), Vec::new())];
     let graph = AmdGraph::capture(&mock.allocator, &kernels).unwrap().expect("graph");
-    assert_eq!(mock.iface.allocation_count() - allocations, 9);
+    assert_eq!(mock.iface.allocation_count() - allocations, 10);
     drop(graph);
     assert_eq!(mock.iface.free_count(), 3, "kernargs plus both resident streams");
     assert!(mock.iface.free_issues().is_empty());

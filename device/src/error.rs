@@ -143,6 +143,12 @@ pub enum Error {
     #[snafu(display("AMD queue {queue_id} remained active after setup rollback failed: {cause}"))]
     AmdQueueStillActive { queue_id: u32, cause: String },
 
+    /// An AMD compute queue reported an error: the code the CP wrote into the
+    /// AQL `queue_inactive_signal` as it halted the queue, or the exception
+    /// bits KFD set in the `ErrorReason` word its CWSR header names.
+    #[snafu(display("AMD compute queue {queue_id} stopped: {cause} ({report} {code:#x})"))]
+    AmdQueueError { queue_id: u32, report: &'static str, code: u64, cause: &'static str },
+
     /// AMD allocation failure (VRAM exhaustion, BAR-resize required, etc.).
     #[snafu(display("AMD allocation failed: {reason}"))]
     AmdAllocFailed { reason: String },
