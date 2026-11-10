@@ -17,7 +17,7 @@
 //!   and spun forever: gfx1151 wedged MES (`MES failed to respond to
 //!   msg=MISC (WAIT_REG_MEM)`, then every `REMOVE_QUEUE`) into an
 //!   unrecoverable GPU reset, and gfx942 stalled its timelines. The host
-//!   flushes HDP through the KFD MMIO remap page instead, as ROCr does, and
+//!   flushes HDP through the KFD MMIO remap page instead, as CLR does, and
 //!   four lanes pass the tk suite on gfx942, gfx1201 and gfx1151
 //!   (2026-11-10). Still true: gfx11 MEC firmware rejects the AMD
 //!   barrier-value vendor AQL packet as an illegal opcode (probed), and

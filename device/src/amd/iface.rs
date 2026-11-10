@@ -105,8 +105,9 @@ pub trait AmdIface: Send + Sync + std::fmt::Debug {
     }
 
     /// Flush the host's writes to device-local memory out of HDP, the host
-    /// data path, and wait until the flush has landed (ROCr/CLR's
-    /// `HDP_MEM_FLUSH_CNTL` write). Called through [`Hdp`] only. A no-op
+    /// data path, and wait until the flush has landed (CLR's
+    /// `HDP_MEM_FLUSH_CNTL` write; ROCr only exposes the register to its
+    /// clients as `HDP_flush_`). Called through [`Hdp`] only. A no-op
     /// where the backend has no flush register.
     fn flush_hdp(&self) {}
 }

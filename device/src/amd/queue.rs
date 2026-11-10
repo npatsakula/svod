@@ -2062,14 +2062,13 @@ impl AmdComputeQueue {
                 base.add(hsa::OFFSET_SCRATCH_WAVE64_LANE_BYTE_SIZE) as *mut u32,
                 desc.wave64_lane_byte_size,
             );
-            // Force the host writes through to the GART page before returning:
-            // the page is mapped write-combining, so a CPU `Release` fence alone
-            // does not guarantee the command processor sees the new descriptor on
-            // the next dispatch. A read-back drains the WC buffers (and serialises
-            // with the fence below). Without this, a mid-stream scratch grow
-            // intermittently leaves the CP reading the stale descriptor — which,
-            // once the old backing is freed, points at unmapped VRAM and wedges
-            // the queue with no fault event.
+            // The GART page is uncached GTT, which KFD maps CPU-cached (no
+            // `CPU_GTT_USWC`) and the GPU snoops, so these stores need no
+            // write-combining drain; the read-back and the fence below only
+            // order them before the remap that makes the CP re-read the
+            // descriptor. A CP still holding the stale one would, once the old
+            // backing is freed, address unmapped VRAM and wedge the queue with
+            // no fault event.
             std::ptr::read_volatile(base.add(hsa::OFFSET_COMPUTE_TMPRING_SIZE) as *const u32);
         }
         std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
