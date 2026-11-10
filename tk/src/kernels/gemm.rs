@@ -300,7 +300,8 @@ impl TailPlan {
 
     /// The plan whose every tile splits: a whole-problem split-K over the
     /// same launches.
-    pub fn whole(tiles: usize, split: usize) -> Option<Self> {
+    #[cfg(test)]
+    pub(crate) fn whole(tiles: usize, split: usize) -> Option<Self> {
         Some(Self { waves: None, tail: Run::new(0, tiles)?, split })
     }
 }
@@ -731,48 +732,62 @@ fn merge_body<'k, T: Elem, U: Elem>(k: &mut Kernel<'k>, spec: &SplitMergeSpec) {
     let bias = epi.bias.then(|| k.input::<T>("bias", n));
     let residual = epi.residual.then(|| k.input::<U>("residual", m * n));
     let c = k.output::<U>("c", m * n);
-    let Some(Parts { order, tile: [tm, tn], run }) = parts else {
-        k.grid([Sc::from(m.div_ceil(bm)), Sc::from(n.div_ceil(bn)), Sc::from(1)]);
-        k.warps(4);
-        let (row0, col0) = (k.block(0) * bm, k.block(1) * bn);
-        let zero = k.zeros::<F32>(Shape::new(bm, bn));
-        let [sum] = k.loop_(split, [zero], |k, z, [acc]| {
-            let part = k.view(partial, z * (m * n), [n, 1], Shape::new(bm, bn), [bound(m, bm), bound(n, bn)]);
-            let part = k.at(part, row0.clone(), col0.clone());
-            let part = k.load(part);
-            [k.binary(*acc, part, BinaryOp::Add).into()]
-        });
-        let tile = Tile2 { m, n, bm, bn, row0, col0, bounds: [bound(m, bm), bound(n, bn)] };
-        finish::<T, U>(k, vec![*sum], epi, bias, residual, None, Dest::Tile(c), &None, &tile);
-        return;
+    let shape = Shape::new(bm, bn);
+    let (sum, tile) = match parts {
+        None => {
+            k.grid([Sc::from(m.div_ceil(bm)), Sc::from(n.div_ceil(bn)), Sc::from(1)]);
+            k.warps(4);
+            let (row0, col0) = (k.block(0) * bm, k.block(1) * bn);
+            let bounds = [bound(m, bm), bound(n, bn)];
+            let sum = summed(k, split, shape, |k, z| {
+                let part = k.view(partial, z * (m * n), [n, 1], shape, bounds.clone());
+                k.at(part, row0.clone(), col0.clone())
+            });
+            (sum, Tile2 { m, n, bm, bn, row0, col0, bounds })
+        }
+        Some(Parts { order, tile: [tm, tn], run }) => {
+            assert!(
+                tm.is_multiple_of(bm) && tn.is_multiple_of(bn),
+                "a merge tile {:?} divides the GEMM's {:?}",
+                [bm, bn],
+                [tm, tn]
+            );
+            // Grid x: the run's tiles; grid y: a tile's merge tiles, row-major.
+            let across = tn / bn;
+            k.grid([Sc::from(run.count()), Sc::from(tm / bm * across), Sc::from(1)]);
+            k.warps(4);
+            let (local, sub) = (k.block(0), k.block(1));
+            let (tr, tc) = order.walk(local.clone() + run.first(), Sc::from(m.div_ceil(tm)), n.div_ceil(tn));
+            let (sr, sc) = (sub.clone() / across, sub % across);
+            let (row0, col0) = (tr * tm + sr.clone() * bm, tc * tn + sc.clone() * bn);
+            let slot = local * (tm * tn) + sr * (bm * tn) + sc * bn;
+            // A merge tile past the edge lies in a GEMM tile across it: cut
+            // where those are, in the slots as in the output.
+            let tile = Tile2 { m, n, bm, bn, row0, col0, bounds: [bound(m, tm), bound(n, tn)] };
+            let within = tile.within();
+            let sum = summed(k, split, shape, |k, z| {
+                k.view(partial, slot.clone() + z * (run.count() * tm * tn), [tn, 1], shape, within.clone())
+            });
+            (sum, tile)
+        }
     };
-    assert!(
-        tm.is_multiple_of(bm) && tn.is_multiple_of(bn),
-        "a merge tile {:?} divides the GEMM's {:?}",
-        [bm, bn],
-        [tm, tn]
-    );
-    // Grid x: the run's tiles; grid y: a tile's merge tiles, row-major.
-    let across = tn / bn;
-    k.grid([Sc::from(run.count()), Sc::from(tm / bm * across), Sc::from(1)]);
-    k.warps(4);
-    let (local, sub) = (k.block(0), k.block(1));
-    let (tr, tc) = order.walk(local.clone() + run.first(), Sc::from(m.div_ceil(tm)), n.div_ceil(tn));
-    let (sr, sc) = (sub.clone() / across, sub % across);
-    let (row0, col0) = (tr * tm + sr.clone() * bm, tc * tn + sc.clone() * bn);
-    let slot = local * (tm * tn) + sr * (bm * tn) + sc * bn;
-    // A merge tile past the edge lies in a GEMM tile across it: cut where
-    // those are, in the slots as in the output.
-    let tile = Tile2 { m, n, bm, bn, row0, col0, bounds: [bound(m, tm), bound(n, tn)] };
-    let within = tile.within();
-    let zero = k.zeros::<F32>(Shape::new(bm, bn));
+    finish::<T, U>(k, vec![sum], epi, bias, residual, None, Dest::Tile(c), &None, &tile);
+}
+
+/// The sum of the `split` f32 partials `part` views at each split.
+fn summed<'k>(
+    k: &mut Kernel<'k>,
+    split: usize,
+    shape: Shape,
+    part: impl Fn(&mut Kernel<'k>, Sc<'k>) -> Gmem<'k, F32>,
+) -> Regs<'k, F32> {
+    let zero = k.zeros::<F32>(shape);
     let [sum] = k.loop_(split, [zero], |k, z, [acc]| {
-        let at = slot.clone() + z * (run.count() * tm * tn);
-        let part = k.view(partial, at, [tn, 1], Shape::new(bm, bn), within.clone());
+        let part = part(k, z);
         let part = k.load(part);
         [k.binary(*acc, part, BinaryOp::Add).into()]
     });
-    finish::<T, U>(k, vec![*sum], epi, bias, residual, None, Dest::Tile(c), &None, &tile);
+    *sum
 }
 
 /// The K-streaming pipeline: the `sa`-shaped A tile `a(step, step·bk)` and

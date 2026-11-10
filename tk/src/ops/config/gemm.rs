@@ -396,7 +396,7 @@ impl GemmProblem {
         let Some(tail) = cfg.tail else { return self.claim_part(planner, cfg, regs, whole) };
         let trips = self.k / cfg.tile[2];
         let runs = self.batches == 1 && self.halves == 1 && self.rope.is_none() && TailSpec::merges(cfg);
-        if !runs || !trips.is_multiple_of(tail.split()) || trips < tail.split() {
+        if !runs || !trips.is_multiple_of(tail.split()) {
             return Err(ShapeRejected::Tail.into());
         }
         let claim = self.claim_part(planner, cfg, regs, whole)?;
@@ -556,10 +556,15 @@ impl GemmProblem {
     /// tail split first on 8192²×1024 and 12288×4096×4096, which the device
     /// ran 6 % and 7 % slower split (`gemm_tail_probe`, its plain epilogue).
     pub fn plan_price(&self, planner: &Planner, cfg: &GemmCfg, plan: &TailPlan) -> Option<f64> {
+        let regs = planner.claim_of(self, &GemmCfg { tail: None, ..*cfg }).ok()?.regs;
+        self.priced_plan(planner, cfg, regs, plan)
+    }
+
+    /// [`Self::plan_price`] of a config whose lane holds `regs` registers.
+    fn priced_plan(&self, planner: &Planner, cfg: &GemmCfg, regs: u32, plan: &TailPlan) -> Option<f64> {
         if !(self.k / cfg.tile[2]).is_multiple_of(plan.split) {
             return None;
         }
-        let regs = planner.claim_of(self, &GemmCfg { tail: None, ..*cfg }).ok()?.regs;
         let claim = |tiles, split| self.claim_part(planner, cfg, regs, Part { tiles, split }).ok();
         // A data-parallel run's price and the share of it its epilogue's operations make.
         let priced = |c: Claim| {
@@ -673,7 +678,7 @@ impl Family for GemmProblem {
     /// A tail split's launches ([`GemmProblem::plan_price`]), else the claim's run.
     fn price(&self, planner: &Planner, cfg: &GemmCfg, claim: &Claim) -> f64 {
         match self.plan_of(planner, cfg, claim) {
-            Some(plan) => self.plan_price(planner, cfg, &plan).unwrap_or(f64::INFINITY),
+            Some(plan) => self.priced_plan(planner, cfg, claim.regs, &plan).unwrap_or(f64::INFINITY),
             None => planner.price(claim),
         }
     }
