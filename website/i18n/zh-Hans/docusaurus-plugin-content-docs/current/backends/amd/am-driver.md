@@ -14,13 +14,13 @@ sidebar_label: AM 驱动
 `SVOD_AMD_BACKEND=am` 会被拒绝（`unknown SVOD_AMD_BACKEND=am (only 'kfd'
 supported)`，`device/src/amd/device.rs`）：`am/` 中没有任何部分实现
 [`AmdIface`](./overview.md) 接缝，因此 `AmdDevice` 无法使用它。这些代码只能通过
-独立的 `device/examples/am_*.rs` 程序访问。它最后一次功能性改动是在 2026 年 6 月；
-之后的提交都是清理。下面的状态描述的是那次提交实际运行到的内容，而不是持续性的
+独立的 `device/examples/am_*.rs` 程序访问。下面的状态描述的是
+它唯一一次硬件运行实际运行到的内容，而不是持续性的
 保证——它没有 CI 或硬件测试。
 :::
 
 该模块在每台 Unix 宿主上编译（`cfg(unix)`，与后端其余部分一样），因此它总会经过
-类型检查和 lint，其逻辑也有单元测试（`device/src/test/unit/amd/am/` 下约 40 个
+类型检查和 lint，其逻辑也有单元测试（`device/src/test/unit/amd/am/` 下的单元
 测试：页表、TLSF、内存管理器、寄存器表、discovery 解析器）。
 
 ---
@@ -83,8 +83,8 @@ tinygrad 是一个有时不存在的子模块，因此构建从不依赖它。
 
 ## 示例
 
-每个 `device/examples/am_*.rs` 程序都是一个独立的初始化验证工具。2026 年 6 月那次
-运行确认了以下结果：
+每个 `device/examples/am_*.rs` 程序都是一个独立的初始化验证工具。它唯一一次
+硬件运行确认了以下结果：
 
 | 示例 | 作用 | 结果 |
 |---|---|---|
@@ -118,10 +118,9 @@ aperture 基址。
 
 ## 为什么保留它
 
-动机来自内核调度器：在单 XCC 的 gfx11+ 部件上，激进的多队列派发可能让 CP 微引擎
-停在 MES 固件无法抢占的等待中，这正是 [通道池](./queues-and-dispatch.md) 保持保守
-的原因。独占 GPU 就能把内核从派发路径中移除。这一论点目前还不适用于 AM 所支持的
+动机来自内核调度器：在 KFD 下，每个用户队列都由内核和 MES/HWS 固件创建、映射和
+抢占，因此派发受限于它们所允许的范围。独占 GPU 就能把内核从派发路径中移除。这一论点目前还不适用于 AM 所支持的
 场景——在 VF 上，调度、world-switch 和 doorbell 仍归宿主所有——而要在裸机上做到，
 则需要在现有内容之上再加上 PSP、SMU、中断以及接缝实现。如今的设计价值在于接缝本身：
-如果某天 AM 后端真正落地，它实现的是与 `KfdIface` 相同的五个方法和三个钩子，接缝
+如果某天 AM 后端真正落地，它实现的是与 `KfdIface` 相同的五个方法和四个钩子，接缝
 之上的一切都无需改变。

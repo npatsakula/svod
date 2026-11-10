@@ -117,11 +117,12 @@ flowchart TD
 ```
 
 Everything that is *not* a kernel call — the 16 MiB command ring, the PM4/AQL
-packet construction, the kernarg bump arena, the timeline counter, the program
+packet construction, the kernarg slot ring, the timeline counter, the program
 loader — lives above the seam. The trait is deliberately tiny: **five required
 methods** (`alloc_raw`, `free_raw`, `setup_ring`, `teardown_ring`,
-`wait_events`) plus three hooks that default to a no-op
-(`queue_event_mailbox`, `publication_checkpoint`, `update_queue_percentage`).
+`wait_events`) plus four hooks that default to a no-op
+(`queue_event_mailbox`, `publication_checkpoint`, `update_queue_percentage`,
+`flush_hdp`).
 The key insight that keeps it small is that the ring, GART page, EOP buffer and
 MQD are *just GPU memory* — they get allocated above the seam via `alloc_raw`,
 and the only thing a driver genuinely has to do differently is **activate the
@@ -139,7 +140,7 @@ environment variable:
 :::caution[The AM driver is scaffolding]
 `device/src/amd/am/` holds an experimental userspace driver that talks to the
 GPU's PCI BARs directly. It implements no `AmdIface`, is not selectable, and
-has never executed a kernel: its bring-up was exercised once (June 2026) on a
+has never executed a kernel: its bring-up was exercised once on a
 CDNA3 SR-IOV virtual function up to GMC context programming, through the
 standalone `am_*` examples. See [The AM Driver](./am-driver.md) for exactly
 what exists.
@@ -152,8 +153,8 @@ what exists.
 At device-open the backend installs an **SDMA copy queue** (`AmdCopyQueue`) on
 every supported part, which flips `has_sdma_queue` true; a failure to create it
 logs a warning and leaves buffers host-visible, and `AMD_DISABLE_SDMA` (any
-value) skips the attempt. The queue used to be CDNA-only over an RDNA stability
-worry that traced back to the HDP flush handshake, since fixed. With it,
+value) skips the attempt.
+With it,
 intermediates can live in **device-only VRAM** (`cpu_access = false`) and
 host↔device copies go through asynchronous DMA: `_copyin`/`_copyout` stage
 through the SDMA queue, and `_transfer` is a device→device DMA when either side

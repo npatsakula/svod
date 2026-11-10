@@ -35,8 +35,10 @@ Svod поставляет четыре бэкенда, все в одном би
 | `CUDA[:N]`, `GPU[:N]` | `DeviceSpec::Cuda { device_id }` |
 | `METAL[:N]` | `DeviceSpec::Metal { device_id }` (существует только `0`) |
 
-`NAME` без номера — это устройство 0. `NV` отвергается намеренно — это имя
-зарезервировано для будущего userspace-драйвера NVIDIA. Если устройство ничем
+`NAME` без номера — это устройство 0. `NV` зарезервировано для будущего
+userspace-драйвера NVIDIA: `DeviceSpecExt::parse` его отвергает, а
+`SVOD_DEVICE` игнорирует, как и любое значение, которое не удаётся разобрать, и
+откатывается к платформенному значению по умолчанию. Если устройство ничем
 не выбрано, действует платформенное значение по умолчанию: **`METAL:0` на
 macOS, `CPU` везде остальном**. Полный порядок приоритета: область
 `with_default_device`, затем thread-local `set_default_device`, затем
@@ -55,10 +57,10 @@ macOS, `CPU` везде остальном**. Полный порядок при
 ## Регистрация, определяемая во время выполнения
 
 Каждый бэкенд компилируется на каждом хосте — нет cargo-фичи ни для AMD, ни для
-CUDA, ни для Metal (модули AMD, работающие с ядром ОС, и привязки Objective-C и
-драйверов для Metal/CUDA либо находятся под `cfg(unix)`, либо являются обычным
-Rust поверх `libloading`, поэтому `cargo check` на Linux или macOS проверяет
-типы во всех них). Будет ли бэкенд *доступен*, решается при первом обращении к
+CUDA, ни для Metal. Привязки CUDA и Metal — обычный Rust поверх `libloading`
+и компилируются везде; модули AMD, работающие с ядром ОС, находятся под
+`cfg(unix)`. Поэтому `cargo check` на Linux или macOS проверяет типы во всех
+них. Будет ли бэкенд *доступен*, решается при первом обращении к
 реестру фабрик устройств (`runtime/src/device_registry.rs`):
 
 ```rust
@@ -111,7 +113,7 @@ pub struct Device {
 | `RuntimeFactory` | — | загружает `CompiledSpec` в `Program`; `Device::new` оборачивает её так, чтобы идентичность стадии каждой спецификации сначала проверялась |
 | `Program` | `execute`, `name` | один запуск ядра; `execute_timed` (длительность по часам GPU для BEAM), `new_exec_context`, `resource_usage` и `as_any` опциональны |
 | `PlanContext` | `dispatch`, `synchronize` | состояние плана, создаваемое `Program::new_exec_context`: полосы, токены завершения, временные метки, счётчики (`set_pmc`), нативное связанное воспроизведение (`replay_linked_plan`) |
-| `Allocator` | `_alloc`, `name`, `device_spec` | `_copyin` / `_copyout` / `_transfer` / `_free` / `synchronize` / `supports_device_local` опциональны и по умолчанию имеют семантику памяти хоста |
+| `Allocator` | `_alloc`, `name`, `device_spec` | остальные опциональны: `_copyin` / `_copyout` / `_transfer` по умолчанию возвращают ошибку `Unsupported`, `_free` просто отпускает буфер, `synchronize` ничего не делает, а `supports_device_local` равно `false` |
 | `Graph` | `replay` | захваченная цепочка ядер, воспроизводимая одной отправкой; `completion_token`, `replay_profiled` опциональны |
 | `CompletionToken`, `TimelineSignal`, `DispatchTimestamps` | | дескрипторы синхронизации и профилирования, которые потребляет исполнитель (`device/src/sync.rs`) |
 

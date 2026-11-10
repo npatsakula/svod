@@ -111,10 +111,10 @@ flowchart TD
 ```
 
 जो कुछ भी kernel call *नहीं* है — 16 MiB command ring, PM4/AQL packet construction, kernarg
-bump arena, timeline counter, program loader — seam के ऊपर रहता है। trait जान-बूझकर बहुत छोटा
+slot ring, timeline counter, program loader — seam के ऊपर रहता है। trait जान-बूझकर बहुत छोटा
 है: **पाँच आवश्यक methods** (`alloc_raw`, `free_raw`, `setup_ring`, `teardown_ring`,
-`wait_events`) plus तीन hooks जो default रूप से no-op हैं (`queue_event_mailbox`,
-`publication_checkpoint`, `update_queue_percentage`)। इसे छोटा रखने वाली मुख्य अंतर्दृष्टि यह
+`wait_events`) plus चार hooks जो default रूप से no-op हैं (`queue_event_mailbox`,
+`publication_checkpoint`, `update_queue_percentage`, `flush_hdp`)। इसे छोटा रखने वाली मुख्य अंतर्दृष्टि यह
 है कि ring, GART page, EOP buffer और MQD *बस GPU memory* हैं — वे seam के ऊपर `alloc_raw` से
 allocate होते हैं, और driver को वास्तव में जो एकमात्र चीज़ अलग करनी होती है वह है **queue को
 activate करना** (doorbell map करना, scheduler को बताना कि ring मौजूद है): वही `setup_ring`
@@ -130,7 +130,7 @@ implementor device-open time पर `SVOD_AMD_BACKEND` environment variable स�
 :::caution[AM driver scaffolding है]
 `device/src/amd/am/` में एक experimental userspace driver है जो GPU के PCI BARs से सीधे बात
 करता है। यह कोई `AmdIface` implement नहीं करता, चुना नहीं जा सकता, और इसने कभी कोई कर्नेल
-execute नहीं किया: इसका bring-up एक बार (जून 2026) एक CDNA3 SR-IOV virtual function पर GMC
+execute नहीं किया: इसका bring-up एक बार एक CDNA3 SR-IOV virtual function पर GMC
 context programming तक, standalone `am_*` examples के माध्यम से परखा गया। ठीक-ठीक क्या मौजूद
 है, इसके लिए [AM Driver](./am-driver.md) देखें।
 :::
@@ -142,8 +142,8 @@ context programming तक, standalone `am_*` examples के माध्यम
 device-open पर बैकएंड हर supported part पर एक **SDMA copy queue** (`AmdCopyQueue`) install
 करता है, जो `has_sdma_queue` को true कर देता है; इसे बनाने में विफलता एक warning log करती है
 और buffers को host-visible छोड़ देती है, और `AMD_DISABLE_SDMA` (कोई भी value) प्रयास को skip
-करता है। queue पहले केवल CDNA पर थी, एक RDNA stability चिंता के कारण जो HDP flush handshake
-तक पहुँची, जो अब ठीक हो चुका है। इसके साथ, intermediates **device-only VRAM**
+करता है।
+इसके साथ, intermediates **device-only VRAM**
 (`cpu_access = false`) में रह सकते हैं और host↔device copies asynchronous DMA से होती हैं:
 `_copyin`/`_copyout` SDMA queue से stage होते हैं, और `_transfer` एक device→device DMA है जब
 कोई भी पक्ष device-only हो (दो host-mapped buffers एक host `memmove` हैं)। जब कोई copy queue

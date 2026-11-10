@@ -16,15 +16,14 @@ ever executed through it.
 `SVOD_AMD_BACKEND=am` is rejected (`unknown SVOD_AMD_BACKEND=am (only 'kfd'
 supported)`, `device/src/amd/device.rs`): nothing in `am/` implements the
 [`AmdIface`](./overview.md) seam, so `AmdDevice` cannot use it. The code is
-reachable only through the standalone `device/examples/am_*.rs` programs. Its
-last functional change is from June 2026; later commits are cleanups. The
-status statements below describe what that commit exercised, not an ongoing
-guarantee — there is no CI or hardware test for it.
+reachable only through the standalone `device/examples/am_*.rs` programs. The
+status statements below describe what its one hardware run exercised, not an
+ongoing guarantee — there is no CI or hardware test for it.
 :::
 
 The module compiles on every Unix host (`cfg(unix)`, like the rest of the
 backend), so it is always type-checked, linted, and its logic unit-tested
-(about 40 tests under `device/src/test/unit/amd/am/`: page tables, TLSF,
+(unit tests under `device/src/test/unit/amd/am/`: page tables, TLSF,
 memory manager, register tables, discovery parser).
 
 ---
@@ -95,7 +94,7 @@ the KFD path's hardware counters use (`amd/pmc.rs`).
 ## The examples
 
 Each `device/examples/am_*.rs` program is a standalone bring-up oracle. What
-the June 2026 run established:
+its one hardware run established:
 
 | Example | What it does | Outcome |
 |---|---|---|
@@ -130,13 +129,12 @@ reads registers back after writing them and logs rejected GC writes, and
 
 ## Why it is here
 
-The motivation is the kernel scheduler: on single-XCC gfx11+ parts, aggressive
-multi-queue dispatch can park CP micro-engines in waits the MES firmware cannot
-preempt, which is why the [lane pool](./queues-and-dispatch.md) stays
-conservative. Owning the GPU would take the kernel out of the dispatch path.
+The motivation is the kernel scheduler: under KFD the kernel and the MES/HWS
+firmware create, map and preempt every user queue, so dispatch is bounded by
+what they allow. Owning the GPU would take the kernel out of the dispatch path.
 That argument does not yet apply to what AM supports — on a VF the host still
 owns scheduling, world-switch and the doorbells — and reaching it on bare metal
 means PSP, SMU, interrupts and the seam implementation on top of what exists.
 The design value today is the seam itself: if an AM backend ever lands, it
-implements the same five methods and three hooks as `KfdIface`, and nothing
+implements the same five methods and four hooks as `KfdIface`, and nothing
 above the seam changes.

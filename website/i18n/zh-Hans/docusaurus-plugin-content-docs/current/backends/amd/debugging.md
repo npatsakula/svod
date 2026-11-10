@@ -47,16 +47,18 @@ GPU VA 范围映射回其所属的分配。它是纯记账——没有 GPU
 | 标签 | 涵盖 |
 |---|---|
 | `Vram` | 通用设备 VRAM——张量数据、code object、EOP/ctx-save |
-| `Gtt` | 宿主可见的控制内存——GTT，以及图 / 已链接 plan 的 IB 与控制缓冲区 |
+| `Gtt` | 其余位于 uncached GTT 的宿主可见控制内存（未显式打标签的 `UncachedGtt` 分配的默认标签） |
 | `Kernarg` | kernarg arena（多 XCC 部件上为 VRAM，其余为 uncached GTT）——每调度、图以及已链接 plan 的参数页 |
+| `CommandBuffer` | 图与已链接 plan 的命令缓冲区——PM4 IB 与 AQL 控制程序（多 XCC 部件上为 VRAM，其余为 uncached GTT） |
 | `SignalPool` | GTT 信号槽池 |
-| `QueueRing` / `QueueGart` / `QueueInactive` | 一个队列的环、GART 页与 queue-inactive 信号 |
+| `QueueRing` / `QueueGart` / `QueueInactive` | 一个队列的环、GART 页与错误字（AQL 的 `queue_inactive_signal` 与 `ErrorReason` 字） |
 | `Staging` | GTT 上的 SDMA 反弹缓冲区 |
-| `Scratch` | 寄存器溢出的 scratch——仅 GPU 的 VRAM，每内核重分配 |
+| `Scratch` | 寄存器溢出的 scratch——仅 GPU 的 VRAM，当某个内核需要的超过通道现有容量时重分配 |
+| `HdpReadback` | 当 KFD 不提供 MMIO-remap 页时，宿主为刷新 HDP 而回读的那个宿主可见 VRAM 字 |
 
 真正要紧的区别是 **scratch 与其他一切**：scratch 是
-唯一一个共享、仅 GPU、被动态重分配并释放的区域，也是历史上的
-`NotPresent` 元凶。每进程的 KFD 事件页在 `alloc_raw` 之外分配，
+唯一一个共享、仅 GPU、被动态重分配并释放的区域，因此也是
+`NotPresent` 故障的首要嫌疑。每进程的 KFD 事件页在 `alloc_raw` 之外分配，
 不被追踪：发生在那里的故障会被归类为未映射。
 
 ### 分类
@@ -105,10 +107,30 @@ Imprecise=false ErrorType=…) — va is at offset +0x40 within a LIVE scratch �
 故障——每次都记录会刷屏。它随后作为一个有类型的
 `Error::GpuFault` 返回，其 `Display` 就是上面那个字符串；poison 闩锁
 则会记录该文本，并在此后的每一个入口点把它重抛为 `Error::Runtime`（带有
-`runtime error: ` 前缀）。一次未遇故障而超时的等待则是另一个不同的错误
+`runtime error: ` 前缀）。一次既未遇故障也未遇队列错误而超时的等待则是另一个不同的错误
 `Error::TimelineTimeout`。
 （一个硬件异常事件，槽 `[2]`，改为报告
 `reset_type`/`reset_cause`/`memory_lost`——这些没有可分类的故障 VA。）
+
+### 队列错误
+
+计算队列也可能在没有内存故障的情况下停下。每个计算队列都有一个 GTT
+分配（`QueueInactive`），其中有两个字：
+
+- AQL 的 `queue_inactive_signal`：CP 停下该队列时在这里写入停机码
+  （例如 `0x401`，scratch 不足）；
+- 每个 CWSR 头都指向的 `ErrorReason` 字：KFD 在这里置上队列异常的位
+  （wave trap、抢占失败等）。
+
+PM4 队列只使用 `ErrorReason`。两个字都会触发设备的队列事件，因此睡在
+`WAIT_EVENTS` 中的等待者会被唤醒。一次等待在从 `WAIT_EVENTS` 醒来时以及
+超时时，都会读取每个通道的这些字。它找到的第一个错误会毒化设备，并作为
+`Error::AmdQueueError` 返回，携带队列 id、报告它的那个字、原始代码以及
+解码后的原因：
+
+```text
+AMD compute queue 3 stopped: insufficient scratch (queue_inactive_signal 0x401)
+```
 
 ---
 
@@ -123,7 +145,8 @@ Imprecise=false ErrorType=…) — va is at offset +0x40 within a LIVE scratch �
 - `is_poisoned()` 是热路径上的门；
 - `poison_error()` 在被毒化时返回已记录的 `Error::Runtime`；
 - `poll_faults_nonblocking()` 在一次信号等待到达其截止时间时（调度、复制与
-  通道获取均为 30 秒）发出 `wait_events(0)`，这样附到超时上的就是真实错误，
+  通道获取均为 30 秒）发出 `wait_events(0)`，该等待还会读取各队列的错误字，
+  这样附到超时上的就是真实错误，
   而不是一个光秃秃的截止时间。（自旋升级路径同样会在故障时提前跳出，
   但走的是一次短暂的*阻塞式* `wait_events`，而非这个 poll。）`poison()` 还会
   唤醒每一个停驻在通道池上的线程。
@@ -143,7 +166,8 @@ Imprecise=false ErrorType=…) — va is at offset +0x40 within a LIVE scratch �
   以及原始的 `rsrc1/2/3`。它会标出加载器*没有*填充的
   `kernel_code_properties` 位（那会让内核读到垃圾指针并故障）。
 - **`[dispatch tv=…]`**——每调度：内核名、`grid`、`local`、`is_pm4`、
-  kernarg 的 GPU VA、scratch VA，以及每个缓冲区的 VA。
+  scratch VA，以及每个缓冲区的 VA。（kernarg 要到提交内部才分得环槽，
+  因此转储中没有 kernarg VA。）
 
 这是看清一次故障调度究竟触碰了哪些 VA 的最快方式，以便
 与注册表的分类相互参照。
@@ -187,7 +211,7 @@ codegen 的追踪目标（`SVOD_DUMP_LLVM_IR`、`SVOD_DUMP_AMD_IR`、每阶段�
    且附近有活跃邻居则是一次越界（那个 gap 告诉你越了多少）。
 2. 设上 `SVOD_DEBUG_DISPATCH` 重跑，以看清那次故障调度的确切 VA，
    并设 `RUST_LOG=svod_device=debug` 以看到直到那一刻的 alloc/free 历史。
-3. 把故障 VA 与转储出来的 scratch/kernarg/缓冲区 VA 相互参照。
+3. 把故障 VA 与转储出来的 scratch 与缓冲区 VA 相互参照。
 
 `NotPresent` 的头号嫌犯是 **scratch**（按 `Scratch` 标签）——
 唯一一个共享、仅 GPU、被动态重分配并释放的区域，在那里一次
@@ -197,7 +221,6 @@ codegen 的追踪目标（`SVOD_DUMP_LLVM_IR`、`SVOD_DUMP_AMD_IR`、每阶段�
 
 ## 为什么这很重要
 
-在有注册表之前，一次故障只给你一个十六进制地址，别无其他。如今
 故障*消息本身*就说明该 VA 是活跃 scratch、一个已释放/陈旧的 VA，还是
 野指针——把一次盲目的追猎变成一次有方向的。配上 poison 闩锁
 （它干净地停下设备，而不是让损坏的状态扩散）

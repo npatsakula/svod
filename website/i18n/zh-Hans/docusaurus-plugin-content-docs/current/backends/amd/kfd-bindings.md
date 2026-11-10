@@ -24,7 +24,7 @@ KFD 的 ABI 是一个 C 头文件 `kfd_ioctl.h`，从内核原样 vendored 进
   `__uNN`/`__sNN` 别名）再加一个桩 `<drm/drm.h>`（残留——主体只用到
   `__u32 drm_fd` 字段）本身都被 vendored 在 `device/include/` 之下，
   而 `build.rs` 传入 `-I<crate>/include`，使 bindgen 解析它们而非
-  `/usr/include`。生成的文件包含 60 个结构体和 34 个常量。
+  `/usr/include`。
   （bindgen 需要 `libclang`，在 macOS 上它随 Xcode CLT 一同发布。）
 
   它用 allow-list 精确圈定后端所需的 KFD 类型与常量：
@@ -33,8 +33,9 @@ KFD 的 ABI 是一个 C 头文件 `kfd_ioctl.h`，从内核原样 vendored 进
   allowlist_type:  kfd_ioctl_.*_args, kfd_process_device_apertures,
                    kfd_event_data, kfd_hsa_signal_event_data,
                    kfd_hsa_memory_exception_data, kfd_hsa_hw_exception_data,
-                   kfd_memory_exception_failure, __u\d+, __s\d+
-  allowlist_var:   KFD_IOC_.*, KFD_MAX_QUEUE_PERCENTAGE, AMDKFD_IOC_.*
+                   kfd_memory_exception_failure, kfd_mmio_remap, __u\d+, __s\d+
+  allowlist_var:   KFD_IOC_.*, KFD_MAX_QUEUE_PERCENTAGE,
+                   KFD_RUNTIME_ENABLE_MODE_ENABLE_MASK, AMDKFD_IOC_.*
   ```
 
   （`AMDKFD_IOC_*` 请求码虽已列入 allow-list 却从不实体化：
@@ -84,11 +85,11 @@ KFD 的 ABI 是一个 C 头文件 `kfd_ioctl.h`，从内核原样 vendored 进
 | `kfd_destroy_event` | `0x09` | 在 `Drop` 时拆除这三个事件 |
 | `kfd_wait_events` | `0x0C` | `wait_events` — 在完成/故障事件上阻塞 |
 | `kfd_acquire_vm` | `0x15` | 将 DRM render fd 注册为本进程对该 GPU 的 VM |
-| `kfd_alloc_memory_of_gpu` | `0x16` | `alloc_raw` — 分配 VRAM/GTT |
+| `kfd_alloc_memory_of_gpu` | `0x16` | `alloc_raw` — 分配 VRAM/GTT；以及 MMIO-remap 页 |
 | `kfd_free_memory_of_gpu` | `0x17` | `free_raw` |
 | `kfd_map_memory_to_gpu` | `0x18` | 将一个分配绑定进 GPU 页表 |
 | `kfd_unmap_memory_from_gpu` | `0x19` | `free_raw` |
-| `kfd_runtime_enable` | `0x25` | 启用运行时（仅 KFD ABI ≥ 1.14） |
+| `kfd_runtime_enable` | `0x25` | 以启用位启用 KFD 运行时，每进程一次（仅 KFD ABI ≥ 1.14） |
 
 另有五个（`set_memory_policy`、`get_clock_counters`、
 `get_process_apertures`、`set_event`、`reset_event`）为完整性而声明，
@@ -104,17 +105,23 @@ flowchart TD
   A["open /dev/kfd (process-shared, one fd)"] --> B["open /dev/dri/renderD(minor) (per node — the DRM render fd)"]
   B --> C["GET_VERSION: capture ABI version"]
   C --> D["ACQUIRE_VM(drm_fd): register this fd as the process VM for the GPU"]
-  D --> E["RUNTIME_ENABLE: only if ABI is at least 1.14"]
+  D --> E["RUNTIME_ENABLE(ENABLE_MASK): once per process, only if ABI is at least 1.14"]
   E --> F["event page: alloc + bind once per process, map per device"]
   F --> G["CREATE_EVENT x 3: queue-signal, memory-fault, hw-exception"]
+  G --> H["HDP flush: ALLOC(MMIO_REMAP) + mmap from /dev/kfd, else a VRAM readback word"]
 ```
 
 这条链是严格有序的：`ACQUIRE_VM` 必须先于任何分配，而事件页
-必须在第一次 `CREATE_QUEUE` 之前完成绑定。
+必须在第一次 `CREATE_QUEUE` 之前完成绑定。`RUNTIME_ENABLE` 同样必须先于进程的
+第一个队列，之后 KFD 会拒绝它，因此由第一个打开的设备为进程启用运行时，后续设备
+会发现它已启用。
 
 DRM render fd 很有意思：这里**没有任何 DRM ioctl**。`drm_fd` 仅以
 两种方式使用——*按编号*传入 `ACQUIRE_VM`，以及作为宿主可见映射的
-`mmap` fd。相比之下，doorbell 则是从 KFD fd `mmap` 出来的。
+`mmap` fd。相比之下，doorbell 则是从 KFD fd `mmap` 出来的，KFD 的
+MMIO-remap 页也是如此：宿主写入其中的 `HDP_MEM_FLUSH_CNTL` 寄存器再读回，以刷新
+HDP。若 KFD 不提供该页（宿主页大于 4 KiB，或 KFD 拒绝该分配，例如在 SR-IOV VF
+上），设备改为保留一个宿主可见的 VRAM 字，通过写入再读回来刷新 HDP。
 
 ---
 
@@ -173,15 +180,16 @@ sysfs 根目录可用 **`SVOD_KFD_TOPOLOGY`** 覆盖，因此解析器可针对�
 
 | `AllocKind` | 标志 | 用于 |
 |---|---|---|
-| `DeviceVram { executable }` | `VRAM \| WRITABLE \| NO_SUBSTITUTE`（代码额外加 `EXECUTABLE`，宿主可见时额外加 `PUBLIC`） | 张量数据、code object、scratch；多 XCC 部件上的 kernarg 区（arena）以及 graph / linked-plan 控制缓冲区 |
+| `DeviceVram { executable }` | `VRAM \| WRITABLE \| NO_SUBSTITUTE`（代码额外加 `EXECUTABLE`，宿主可见时额外加 `PUBLIC`） | 张量数据、code object、scratch；多 XCC 部件上的 kernarg 区（arena）以及 graph / linked-plan 控制缓冲区；KFD 不提供 remap 页时的 HDP 读回字 |
 | `UncachedGtt` | `GTT \| WRITABLE \| EXECUTABLE \| NO_SUBSTITUTE \| PUBLIC \| COHERENT \| UNCACHED` | 命令环、GART 页、信号槽、SDMA 暂存缓冲区；其余部件上的 kernarg 区与控制缓冲区 |
 
 `UNCACHED | COHERENT` 的这种 GTT 变体很关键：命令环和信号
 槽必须在 CPU 与 GPU 之间立即可见，否则宿主会永远自旋
 等待一个卡在 GPU L2 中的完成值。KFD 会以 `EINVAL`
-拒绝对一个纯 VRAM 环执行 `CREATE_QUEUE`。唯一不经过 `alloc_raw` 的分配是
+拒绝对一个纯 VRAM 环执行 `CREATE_QUEUE`。有两个分配不经过 `alloc_raw`：
 每进程的事件页（`device.rs` 中的 `alloc_event_page`），它用原始 ioctl 组装
-同样的 uncached-GTT 标志，因此不在 [VA 注册表](./debugging.md) 中。
+同样的 uncached-GTT 标志；以及每设备的 MMIO-remap 页（`iface.rs` 中的
+`MmioRemapPage::map`）。两者都不在 [VA 注册表](./debugging.md) 中。
 
 ### `cpu_access` 跟随复制队列
 
@@ -193,10 +201,11 @@ SDMA 复制队列时（在所有型号上都是默认情形——见 [概览](./
 队列存在时，`has_sdma_queue()` 为 `false`，因此每个缓冲区都被强制为
 宿主可见，而复制回落到作用域化的 `wait_storage` 之后的普通宿主
 `memmove`。通用的 `LruAllocator`（`device/src/allocator.rs`）按
-`(size, BufferSpec)` 池化已释放的缓冲区；code object、EOP / CWSR 上下文保存缓冲区、
-环、GART 页、信号槽与 scratch 从不进入该池——它们直接调用
-`AmdAllocator`（`alloc_uncached_tagged` / `alloc_host_visible_tagged`
-/ `alloc_scratch`）并直达接缝。
+`(size, BufferSpec)` 池化已释放的缓冲区；code object、kernarg 区、graph / linked-plan 命令缓冲区、
+EOP / CWSR 上下文保存缓冲区、环、GART 页、队列错误字、信号槽与 scratch 从不进入
+该池。code object 通过带 `nolru` 的 `AmdAllocator::alloc` 分配；其余直接调用带标签的
+入口（`alloc_submission_tagged`、`alloc_uncached_tagged`、
+`alloc_host_visible_tagged`）或 `alloc_scratch`，直达接缝。
 
 :::note[进程共享状态]
 `/dev/kfd` 每进程只打开一次，并由所有设备共享（事件

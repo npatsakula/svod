@@ -33,12 +33,14 @@ GPU renderer), so the scheduler decomposes them before rendering: its
 `decompositor` is `svod_ir::decompositions::amd_decomposition_patterns()`,
 which lowers `exp`, `log`, `cos`, `tan` and `pow` to SLEEF-style polynomials
 over the native `exp2`/`log2` for `f16`/`f32`/`f64` — bf16, fp8 and integer
-operands are cast to f32 around the polynomial — and rewrites f32→bf16 casts
-into the integer round-to-nearest-even form; `sin` goes through the shared
+operands are cast to f32 around the polynomial; `sin` goes through the shared
 transcendental patterns for the same reason (`v_sin_f32` is only accurate for
 small arguments). Only `exp2`, `log2` and `sqrt` stay native `@llvm.*`
-intrinsics (~1 ulp on AMD hardware). The renderer-local `amd_extra_matcher()`
-runs last.
+intrinsics (~1 ulp on AMD hardware). Under a clang whose version cannot be
+read, the decompositor also rewrites f32→bf16 casts into the integer
+round-to-nearest-even form (`bf16_integer_cast_patterns`); a clang with a
+readable version is at least 22 here and narrows natively. The renderer-local
+`amd_extra_matcher()` runs last.
 
 ### Compiling
 
@@ -48,14 +50,26 @@ same in-memory style as the [CPU JIT loader](../jit-loader.md):
 
 ```text
 clang -x ir -c -O3 --target=amdgcn-amd-amdhsa -mcpu=<arch> \
-      -mcumode -nogpuinc -Wno-override-module -fno-math-errno [-nogpulib] - -o -
+      -mcumode -nogpuinc -Wno-override-module -fno-math-errno \
+      [-mllvm -disable-machine-sink] [-nogpulib] - -o -
 ```
 
 `-nogpulib` is added only when the IR references no `@__ocml_*` entry point:
 the renderer emits `@llvm.*` intrinsics for every float unary the AMDGPU backend
 can select, so the ROCm device libraries are needed only for f64 non-`sqrt`
-unaries. The IR is part of the object-cache key, so keying a flag off it stays
-sound. The result is validated (`validate_amd_object`: ELF64-LE, `EM_AMDGPU`,
+unaries.
+
+`-mllvm -disable-machine-sink` is added for IR that holds a matrix product
+(`@llvm.amdgcn.wmma` or `@llvm.amdgcn.mfma`) under a clang older than LLVM 23,
+or one whose version cannot be read. Those versions do not mark AMDGPU matrix
+instructions convergent, so machine sinking can move one into a lane-gated
+branch, where the lanes it skips never write its operands. Both flags follow
+the IR, and each kernel's object-cache key carries the flags that kernel
+compiles with (`amd_object_key`), so a change of flag policy never reuses an
+object built under another; the clang version is part of the key too. A clang
+older than 22 is refused for AMD code with a `JitCompilation` error.
+
+The result is validated (`validate_amd_object`: ELF64-LE, `EM_AMDGPU`,
 the arch in `e_flags`, a defined `<name>.kd`) before it is cached under the
 `amd-clang` identity or loaded.
 
@@ -108,26 +122,31 @@ leased `PoolQueue`. (The `Program::execute` trait method builds a throwaway
    lays the parameters out in ABI slot order with natural alignment (8-byte
    pointers, 4-byte scalars) and its `packed_size()` must not exceed the
    descriptor's `kernarg_size`.
-2. **Fills a kernarg slot** by bumping the device's 16 MiB kernarg arena
-   (shared by every lane, 16-byte aligned; a wrap drains all lanes first),
-   writing each buffer VA as 8 bytes and each scalar as a 4-byte `i32`. The
-   `i32` packing is deliberate — the renderer lowers `Index → i32`, so the
-   descriptor's `kernarg_size` reflects 4-byte vars; packing 8 bytes would
-   overflow into the next slot.
+2. **Packs the kernargs** into a local record, writing each buffer VA as 8
+   bytes and each scalar as a 4-byte `i32`. The `i32` packing is deliberate —
+   the renderer lowers `Index → i32`, so the descriptor's `kernarg_size`
+   reflects 4-byte vars; packing 8 bytes would overflow the record.
 3. **Builds a submission** — an `hcq::Submission` of `Compute`, carrying the
-   kernarg VA, the `rsrc` triple, and the PM4 program address, after a
+   `rsrc` triple and the PM4 program address (the queue fills in the kernarg
+   address), after a
    `MemoryBarrier` when the host or SDMA stored behind the lane's caches since
    its last one, on the lane's first dispatch, and on every timed dispatch.
 4. **Dispatches** through `queue.submit_hcq_dispatch(pool, &submission, …)`.
-   On a PM4 queue `lower_hcq_pm4` → `build_exec_pm4` emits raw dwords, and the
+   The queue reserves one slot in the device's 16 MiB kernarg ring (shared by
+   every lane, 16-byte aligned; VRAM on multi-XCC parts, uncached GTT
+   elsewhere), copies the record in, and publishes the slot with the point that
+   retires the submission. A reservation that reaches the oldest live slot
+   waits for that slot alone. On a PM4 queue `lower_hcq_pm4` → `build_exec_pm4` emits raw dwords, and the
    optional 4-dword scratch descriptor is prepended to `COMPUTE_USER_DATA_0`
    from the same `scratch_address` snapshot that is written into
    `COMPUTE_DISPATCH_SCRATCH_BASE` — so a concurrent scratch realloc can't make
    the descriptor and the register disagree. On an AQL queue
    `lower_hcq_aql_submission_program` emits the wait/barrier as vendor-IB PM4
    packets, the 64-byte dispatch packet (`build_dispatch_packet_barrier`) and a
-   vendor-IB timeline store, with the control bytes staged in the kernarg
-   arena.
+   vendor-IB timeline store. The control program and the kernargs share the
+   one slot, and their addresses are patched in at link time. The slot retires
+   on the lane's retirement count, not on XCC0's timeline store (see
+   [Queues & Dispatch](./queues-and-dispatch.md)).
 5. Retains the code object, registers the finalizer in flight and records it
    as the owner's newest completion. If `wait`, drains through the owner's
    `synchronize()`.
@@ -146,7 +165,8 @@ per-kernel `wait → barrier → exec → signal → doorbell` round-trip N time
 waste. `AmdGraph` (`device/src/amd/graph.rs`) — modelled on tinygrad's
 `HCQGraph`, but with one barrier and no inter-kernel signals — captures the
 whole chain into **one command stream** (PM4 or AQL, whichever the queue uses),
-binds it into a host-visible page, and replays it with **one doorbell**.
+binds it into a command buffer (VRAM on multi-XCC parts, uncached GTT
+elsewhere), and replays it with **one doorbell**.
 
 ### Structure
 
@@ -167,15 +187,17 @@ timeline ends, `System(ScratchAddress)`/`System(ScratchTmpring)` for PM4 scratch
 and `LinkAddress` entries for the program and kernarg pointers — all resolved at
 replay against the leased lane, so the graph composes with ordinary per-call
 dispatch and `synchronize`. Capture lays out one fixed kernarg slot per kernel in
-a dedicated `AllocTag::Kernarg` page — owning that page (rather than sharing the
-rolling kernarg arena, which concurrent per-call dispatch could lap into stale
-VAs) is what makes replay safe.
+a dedicated `AllocTag::Kernarg` page (VRAM on multi-XCC parts, uncached GTT
+elsewhere). The resident stream points at those fixed addresses on every
+replay, while an arena slot retires with the one submission that reserved it,
+so the graph owns its page and patches it in place.
 
 Replay (`Graph::replay`) serializes graph-owned mutable storage, waits its prior
 finalizer, acquires an exclusive compute lane, ensures lane scratch, patches the
 current kernargs and system fields, then publishes the resident PM4 IB or AQL
 submission program. Identical arguments skip the kernarg pack entirely. It
-returns asynchronously; the next replay waits before reusing that storage.
+returns asynchronously; the next replay waits before reusing that storage, on
+AQL until every XCC is done with the previous replay.
 `replay_profiled` runs a variant with a per-kernel `SystemField::Timestamp`
 slot and synchronizes before returning the stamps.
 

@@ -46,8 +46,13 @@ AQL = otherwise
 
 - PM4 队列发布原始 dword，并敲响下一个 dword 索引。
 - AQL 队列发布 64 字节数据包，并敲响最后写入的那个数据包的索引。
-- AQL 内核的 `completion_signal` 保持为零。厂商 IB 的 PM4 wait/store
+- AQL 内核数据包不带 `completion_signal`。厂商 IB 的 PM4 wait/store
   自行负责 timeline 完成，在多 XCC 硬件上配以 XCC0 的 `PRED_EXEC`。
+- XCC0 的 timeline 存储可能在其他 XCC 仍在读取容纳它的 IB 时就已落地，因此
+  AQL 通道还会统计已退役的提交：每次发布的最后一个数据包把该通道的退役信号
+  作为其 AQL `completion_signal`，CP 在该数据包于每个 XCC 上都退役后将其递减，
+  并同时触发队列事件。kernarg 槽、控制程序、图与已链接 plan 的内存以及通道
+  排空都等待这个计数。PM4 通道按其 timeline 退役。
 
 通道租约消除了计算侧的共租。`AmdComputeQueue.inner` 仍使用一个互斥锁
 作为 Rust 别名保护；在正常的计算路径上它是无竞争的。
@@ -79,6 +84,12 @@ PM4、AQL 与 SDMA 的发布在环回绕之前都会检查 KFD 读指针（AQL �
 读取的是一个单调值；PM4 指针是相对于队列的，其 epoch 由生产者索引重建）。
 普通调度还会额外为在飞的 timeline 值设界。PM4 的 timeline 值会在 2^31
 水位处排空并复位，因为硬件的 wait/store 数据包比较的是低 32 位。
+
+每次敲 doorbell 前先执行一次 SeqCst 栅栏，再由宿主刷新 HDP：若 kernarg 与命令
+缓冲区位于 VRAM（多 XCC 部件），则每次 doorbell 都刷新；其余情况下，仅当有被
+丢弃的 `HostWrite` 守卫推迟了一次尚未被已落地的刷新覆盖的刷新时才刷新。推迟会
+被计数，而 doorbell 只在自己的刷新落地之后才把它们记为已刷新，因此在另一次刷新
+进行期间敲下的 doorbell 也会刷新。
 
 ## 资源生命期
 
@@ -141,10 +152,10 @@ pub trait AmdIface: Send + Sync + std::fmt::Debug {
     fn free_raw(&self, gpu_va: u64, size: usize, handle: u64);
     fn setup_ring(&self, desc: &RingDesc) -> Result<QueueHandle>;
     fn teardown_ring(&self, queue_id: u32, doorbell_base: NonNull<u8>) -> Result<QueueTeardown>;
-    fn wait_events(&self, timeout_ms: u32) -> Result<Option<Error>>;
+    fn wait_events(&self, timeout_ms: u32, age: &mut u64) -> Result<Option<Error>>;
 
-    // Defaulted hooks. `KfdIface` overrides the first and the last; the
-    // test mock overrides `publication_checkpoint`.
+    // Defaulted hooks. `KfdIface` overrides all but `publication_checkpoint`,
+    // which only the test mock overrides.
     fn queue_event_mailbox(&self) -> Option<QueueEventMailbox> {
         None
     }
@@ -154,15 +165,29 @@ pub trait AmdIface: Send + Sync + std::fmt::Debug {
     fn update_queue_percentage(&self, _queue_id: u32, _ring_gpu: u64, _ring_size: u32, _percentage: u32) -> Result<()> {
         Ok(())
     }
+    fn flush_hdp(&self) {}
 }
 ```
 
-环、GART、EOP、上下文保存以及 inactive-signal 缓冲区都在这道接缝之上分配。
-`setup_ring` 激活这些资源并映射 doorbell。
+环、GART、EOP 与上下文保存缓冲区，以及每个计算队列的错误字，都在这道接缝之上
+分配。`setup_ring` 激活这些资源并映射 doorbell。
 `update_queue_percentage` 正是那个重新映射 AQL 队列、使 CP 固件重新读取其
 已缓存的 `amd_queue_t` scratch 描述符的东西——在通道创建时以及每当 scratch
-增长时都会这样做；一次失败的重新映射会毒化设备。当存在 `queue_event_mailbox` 时，
+增长时都会先解除映射再重新映射；一次失败的重新映射会毒化设备。每次重新映射都会
+抢占该进程在此设备上的所有队列，因此一次增长至少把每线程 scratch 大小翻倍
+（若请求更大则取请求值），上限为 `COMPUTE_TMPRING_SIZE.WAVESIZE` 所能描述的
+最大值。当存在 `queue_event_mailbox` 时，
 每一次完成存储都附带一个 KFD 事件中断伴随操作，使 `wait_events` 无需轮询即可被唤醒。
+
+计算队列的错误字是 AQL 的 `queue_inactive_signal`（CP 在停止队列时把一个代码
+写入其中）以及其 CWSR 头所指向的 `ErrorReason` 字（KFD 在其中置上队列异常的
+位）。两者都会触发队列事件。timeline 等待在从 `wait_events` 醒来时以及超时时
+读取所有通道的错误字，并以 `Error::AmdQueueError` 毒化设备，该错误给出解码后的
+原因（见[调试](./debugging.md)）。
+
+`flush_hdp` 把宿主写入 VRAM 的数据从 HDP 刷出，并等待刷新落地；`KfdIface` 写
+KFD 的 MMIO-remap 刷新寄存器，若 KFD 不提供 remap 页（SR-IOV VF），则写一个
+宿主可见的 VRAM 字再把它读回。
 
 ## 配置
 
@@ -176,7 +201,7 @@ pub trait AmdIface: Send + Sync + std::fmt::Debug {
 | `SVOD_PM4_GRAPH` | 未设置 | `=1` 启用 PM4 图捕获；只有 `1` 算数；在设备创建时读取一次 |
 | `AMD_DISABLE_SDMA` | 未设置 | 设成任何值都会跳过 SDMA 复制队列，强制使用宿主可见缓冲区 |
 | `SVOD_KFD_TOPOLOGY` | sysfs | 为测试覆盖 KFD 拓扑根目录 |
-| `SVOD_DEBUG_DISPATCH` | 未设置 | 设成任何值即打印程序加载以及调度的 grid、kernarg、scratch 与缓冲区地址 |
+| `SVOD_DEBUG_DISPATCH` | 未设置 | 设成任何值即打印每个程序的加载描述符，以及每次调度的 grid、scratch 与缓冲区地址 |
 | `SVOD_DUMP_AMD_IR` | 未设置 | 以 `<mcpu>_<module>_<digest>.ll` 形式接收每个内核的 AMD LLVM IR 的目录 |
 | `SVOD_DUMP_AMD_ASM` | 未设置 | 以 `<mcpu>_<module>_<digest>.s` 形式接收每个内核 AMDGCN 汇编的目录，与其 `.ll` 同名（每个内核多一次 clang 运行） |
 | `SVOD_OBJECT_CACHE`、`SVOD_OBJECT_CACHE_DIR`、`SVOD_OBJECT_CACHE_MAX_BYTES` | 开启 | 共享的磁盘 object 缓存，见 [CPU 页面](../cpu.md) |

@@ -75,7 +75,7 @@ Macro expansion के समय ही इन्हें reject कर दे�
 
 ## Array slots, batch variables और state {#array-slots-batch-variables-and-state}
 
-Declaration के block रूप तीन ऐसी चीज़ें जोड़ते हैं जिनकी streaming model को ज़रूरत होती है। तीनों optional हैं; पुराने flat रूप में लिखा wrapper बिना बदलाव के काम करता रहता है।
+Declaration के block रूप तीन ऐसी चीज़ें जोड़ते हैं जिनकी streaming model को ज़रूरत होती है। तीनों optional हैं, और ऊपर वाला flat रूप भी मान्य रहता है।
 
 ```rust
 jit_wrapper! {
@@ -145,7 +145,7 @@ Macro wrapper के life cycle के हर phase के लिए methods क
 | `prepare(input1: InputSpec, ..., state1: InputSpec, ...)` | एक बार | graph बनाना, patterns चलाना, kernels compile करना, buffers allocate करना; `PrepareConfig::from_env()` पढ़ता है |
 | `prepare_with_config(..., &PrepareConfig)` | एक बार | `prepare` जैसा ही, explicit config के साथ |
 | `<input>_mut([i]) -> Result<&mut Buffer>` | हर step | हर declared input या state slot का raw buffer (array slots के लिए `i`) |
-| `<input>_host_write::<T>([i]) -> Result<HostWrite<T>>` | हर step | input buffer पर exclusive typed host write guard, dtype-checked; drop होने पर publish होता है |
+| `<input>_host_write::<T>([i]) -> Result<HostWrite<T>>` | हर step | host-visible input buffer पर exclusive typed host write guard, dtype-checked; drop होने पर उसकी stores publish होती हैं, और जब तक वह जीवित है `execute*` fail होता है |
 | `output() -> Result<&Buffer>` | हर step | plan का पहला output |
 | `<output>([i])` / `<output>_shape()` / `_view::<T>()` / `_to_vec::<T>()` | हर step | named output buffer, उसकी live shape और reads, मौजूदा variable bindings के हिसाब से resolve |
 | `reset() -> Result<()>` | हर step | हर `state` slot को zero करता है (सिर्फ़ `state` होने पर generate) |
@@ -174,7 +174,7 @@ Macro wrapper के life cycle के हर phase के लिए methods क
 
 ## `InputSpec` {#inputspec}
 
-`InputSpec`, `JitError` और वे buffer helpers जिनमें macro expand होता है, `svod_tensor::jit` में रहते हैं, इसलिए `jit_wrapper!` रखने वाले crate को बस यही dependency चाहिए (`svod_model::jit` पुराने paths के लिए इन्हें re-export करता है)।
+`InputSpec`, `JitError` और वे buffer helpers जिनमें macro expand होता है, `svod_tensor::jit` में रहते हैं, इसलिए `jit_wrapper!` रखने वाले crate को बस यही dependency चाहिए (`svod_model::jit` इन्हें `crate::jit::…` paths के रूप में re-export करता है, जिनका उपयोग उसके अपने wrappers करते हैं)।
 
 `prepare()` हर declared input और state slot के लिए एक `InputSpec` लेता है — या हर array slot के लिए एक `[InputSpec; N]`:
 
@@ -208,12 +208,12 @@ Plan तभी capture होता है जब हर op plan के device �
 
 | Backend | Mechanism | Notes |
 |---|---|---|
-| CUDA | `cuGraphAddKernelNode` DAG, `cuGraphInstantiate`, `cuGraphLaunch` | default में चालू; `cuGraphExecKernelNodeSetParams` सिर्फ़ उन nodes को patch करता है जिनके arguments बदले; buffer-aliasing बदलने पर फिर से capture |
-| AMD | graph-owned kernarg storage वाली एक linked HCQ/PM4 command stream, एक ही doorbell से replay | AQL queues (multi-XCC parts, या `SVOD_AMD_AQL=1`) default में capture करती हैं; PM4 capture `SVOD_PM4_GRAPH=1` से opt-in है |
+| CUDA | `cuGraphAddKernelNode` DAG, `cuGraphInstantiate`, `cuGraphLaunch` | default में चालू; `cuGraphExecKernelNodeSetParams` सिर्फ़ उन nodes को patch करता है जिनके arguments बदले; जिस replay में buffers capture से अलग तरह alias करते हैं, वह DAG की जगह capture-order chain चलाता है |
+| AMD | graph-owned kernarg storage वाली एक linked HCQ command stream (AQL packets या PM4), एक ही doorbell से replay | AQL queues (multi-XCC parts, या `SVOD_AMD_AQL=1`) default में capture करती हैं; PM4 capture `SVOD_PM4_GRAPH=1` से opt-in है |
 | Metal | per-command barriers वाला `MTLIndirectCommandBuffer`, हर replay पर एक `executeCommandsInBuffer` | किसी kernel के scalar arguments लेने पर या virtualized GPU पर मना कर देता है; rebind से पहले पिछले replay का इंतज़ार करता है |
 | CPU | — | कोई graph factory नहीं; kernels सीधे call होते हैं |
 
-**Fallbacks.** जब कोई graph इस्तेमाल नहीं होता, तो AMD plans — dynamic-shape वाले भी — एक *linked plan* के रूप में capture होते हैं: एक command stream जिसके kernel arguments और launch dimensions हर replay पर फिर से pack किए जाते हैं। बाक़ी हर जगह plan अपने levels पर क्रम से चलता है और हर kernel को plan की अपनी queue में submit करता है (GPUs पर asynchronously; `wait` सिर्फ़ अंत में)। `execute_profiled` graph का profiled variant इस्तेमाल करता है अगर वह मौजूद हो, वरना per-dispatch timestamps।
+**Fallbacks.** जब कोई graph इस्तेमाल नहीं होता, तो AMD plan — dynamic-shape वाले भी — तब तक *linked plan* के रूप में replay होता है जब तक हर kernel argument और copy endpoint plan के device पर हो: एक command stream जिसके kernel arguments और launch dimensions हर replay पर फिर से pack किए जाते हैं। वरना plan अपने levels पर क्रम से चलता है और हर kernel को plan की अपनी queue में submit करता है (GPUs पर asynchronously; `wait` सिर्फ़ अंत में)। `execute_profiled` graph का profiled variant इस्तेमाल करता है अगर वह मौजूद हो, वरना per-dispatch timestamps।
 
 ---
 
@@ -301,7 +301,7 @@ jit.prepare_with_config(
 )?;
 ```
 
-फिर `VadInference::probs` waveform पर `FEATURE_BATCH`-आकार के dispatches में चलता है — `chunks_host_write::<f32>()` pack करना, `execute()`, valid rows का `copyout_prefix` — और gates को `VadHead::scan` को सौंप देता है, जो host CPU की सबसे चौड़ी SIMD width पर vectorized एक LSTM plus sigmoid head है। इस बँटवारे ने उस one-tiny-dispatch-per-window path की जगह ली जिसकी round-trip latency पूरे model पर हावी थी।
+फिर `VadInference::probs` waveform पर `FEATURE_BATCH`-आकार के dispatches में चलता है — `chunks_host_write::<f32>()` pack करना, `execute()`, valid rows का `copyout_prefix` — और gates को `VadHead::scan` को सौंप देता है, जो host CPU की सबसे चौड़ी SIMD width पर vectorized एक LSTM plus sigmoid head है।
 
 ---
 
@@ -331,12 +331,12 @@ Contract तोड़ने से दो में से एक failure mode �
 | `InputAliased` | कोई input किसी पराए plan buffer पर resolve हुआ — किसी concurrent `prepare` ने उसकी graph identity बिगाड़ दी |
 | `Build` | build closure ने `Err` लौटाया; अंदर का error `Box<dyn Error + Send + Sync>` के रूप में सुरक्षित रहता है |
 | `Tensor` | `prepare` के दौरान या build closure में tensor op fail हुआ |
-| `Device` | कोई device या buffer operation fail हुआ |
+| `Device` | कोई device या buffer operation fail हुआ — जैसे उसी storage पर दूसरे guard के लिए `HostWriteLive`, या device-local input पर `_host_write` के लिए `NotCpuAccessible` |
 | `OutputCountMismatch` | wrapper ने N output और state slots declare किए लेकिन compiled plan में अलग संख्या बची |
 | `DtypeMismatch` | किसी typed view या read ने ऐसा dtype माँगा जो buffer में नहीं है |
 | `ViewOutOfBounds` | live output shape को उसके buffer से ज़्यादा bytes चाहिए — bound variables उससे आगे हैं जिसके लिए plan compile हुआ था |
 | `InferredOutputDim` | किसी output shape में `-1` dimension थी, जिसकी जगह रखने के लिए कोई live value नहीं |
-| `Runtime` | kernel execution fail हुआ, या कोई variable अपने `[min, max]` के बाहर bind हुआ |
+| `Runtime` | kernel execution fail हुआ, कोई variable अपने `[min, max]` के बाहर bind हुआ, या plan buffer पर कोई host write guard अभी भी जीवित था |
 
 Symbolic-variable setters (`with_<var>_*`) पर configuration ग़लतियाँ error लौटाने की बजाय call site पर panic करती हैं, क्योंकि वे किसी plan के बनने से पहले होती हैं।
 

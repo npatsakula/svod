@@ -50,8 +50,15 @@ AQL = otherwise
 - PM4 queues publish raw dwords and ring the next dword index.
 - AQL queues publish 64-byte packets and ring the index of the last packet
   written.
-- AQL kernel `completion_signal` remains zero. Vendor-IB PM4 waits/stores own
-  timeline completion, with XCC0 `PRED_EXEC` on multi-XCC hardware.
+- AQL kernel packets carry no `completion_signal`. Vendor-IB PM4 waits/stores
+  own timeline completion, with XCC0 `PRED_EXEC` on multi-XCC hardware.
+- XCC0's timeline store can land while other XCCs still read the IB that holds
+  it, so an AQL lane also counts retired submissions: the last packet of each
+  publication names the lane's retirement signal as its AQL
+  `completion_signal`, which the CP decrements once that packet retired on
+  every XCC, raising the queue event. Kernarg slots, control programs, graph
+  and linked-plan memory, and lane drains wait on that count. PM4 lanes retire
+  on their timeline.
 
 The lane lease eliminates compute co-tenancy. `AmdComputeQueue.inner` still uses
 a mutex as a Rust aliasing guard; it is uncontended on the normal compute path.
@@ -88,6 +95,13 @@ queue-relative and its epoch is rebuilt from the producer index). Ordinary
 dispatch additionally bounds in-flight timeline values. PM4 timeline values
 drain and reset at the 2^31 watermark because hardware wait/store packets
 compare the low 32 bits.
+
+Every doorbell first runs a SeqCst fence, then flushes HDP from the host: on
+every doorbell where kernargs and command buffers live in VRAM (multi-XCC
+parts), elsewhere only when a dropped `HostWrite` guard deferred a flush that
+no landed flush covers yet. Deferrals are counted, and a doorbell marks them
+flushed only once its own flush has landed, so a doorbell that rings while
+another is still flushing flushes too.
 
 ## Resource lifetime
 
@@ -155,10 +169,10 @@ pub trait AmdIface: Send + Sync + std::fmt::Debug {
     fn free_raw(&self, gpu_va: u64, size: usize, handle: u64);
     fn setup_ring(&self, desc: &RingDesc) -> Result<QueueHandle>;
     fn teardown_ring(&self, queue_id: u32, doorbell_base: NonNull<u8>) -> Result<QueueTeardown>;
-    fn wait_events(&self, timeout_ms: u32) -> Result<Option<Error>>;
+    fn wait_events(&self, timeout_ms: u32, age: &mut u64) -> Result<Option<Error>>;
 
-    // Defaulted hooks. `KfdIface` overrides the first and the last; the
-    // test mock overrides `publication_checkpoint`.
+    // Defaulted hooks. `KfdIface` overrides all but `publication_checkpoint`,
+    // which only the test mock overrides.
     fn queue_event_mailbox(&self) -> Option<QueueEventMailbox> {
         None
     }
@@ -168,16 +182,34 @@ pub trait AmdIface: Send + Sync + std::fmt::Debug {
     fn update_queue_percentage(&self, _queue_id: u32, _ring_gpu: u64, _ring_size: u32, _percentage: u32) -> Result<()> {
         Ok(())
     }
+    fn flush_hdp(&self) {}
 }
 ```
 
-Ring, GART, EOP, context-save, and inactive-signal buffers are allocated above
-this seam. `setup_ring` activates those resources and maps the doorbell.
-`update_queue_percentage` is what re-maps an AQL queue so CP firmware re-reads
-its cached `amd_queue_t` scratch descriptor — at lane creation and whenever
-scratch grows; a failed remap poisons the device. When `queue_event_mailbox`
-is present, every completion store carries a KFD event-interrupt companion so
+Ring, GART, EOP and context-save buffers, and each compute queue's error
+words, are allocated above this seam. `setup_ring` activates those resources
+and maps the doorbell. `update_queue_percentage` is what re-maps an AQL queue
+so CP firmware re-reads its cached `amd_queue_t` scratch descriptor — an unmap
+and a remap at lane creation and whenever scratch grows; a failed remap
+poisons the device. Each remap preempts every queue of the process on the
+device, so a grow at least doubles the per-thread scratch size (or takes the
+request when that is larger), up to the largest size
+`COMPUTE_TMPRING_SIZE.WAVESIZE` describes. When `queue_event_mailbox` is
+present, every completion store carries a KFD event-interrupt companion so
 `wait_events` wakes without polling.
+
+A compute queue's error words are the AQL `queue_inactive_signal`, where the CP
+writes a code as it halts the queue, and the `ErrorReason` word its CWSR
+headers point at, where KFD sets the bits of a queue exception. Both raise the
+queue event. A timeline wait reads every lane's words when it wakes from
+`wait_events` and when it times out, and poisons the device with
+`Error::AmdQueueError`, which names the decoded cause (see
+[Debugging](./debugging.md)).
+
+`flush_hdp` flushes the host's VRAM stores out of HDP and waits for the flush
+to land. `KfdIface` writes KFD's MMIO-remap flush register or, where KFD gives
+no remap page (an SR-IOV VF), stores to a host-visible VRAM word and reads it
+back.
 
 ## Configuration
 
@@ -191,7 +223,7 @@ is present, every completion store carries a KFD event-interrupt companion so
 | `SVOD_PM4_GRAPH` | unset | `=1` enables PM4 graph capture; only `1` counts; read once at device creation |
 | `AMD_DISABLE_SDMA` | unset | Set to anything to skip the SDMA copy queue, forcing host-visible buffers |
 | `SVOD_KFD_TOPOLOGY` | sysfs | Override KFD topology root for tests |
-| `SVOD_DEBUG_DISPATCH` | unset | Set to anything to print program-load and dispatch grid, kernarg, scratch, and buffer addresses |
+| `SVOD_DEBUG_DISPATCH` | unset | Set to anything to print each program's load descriptor and each dispatch's grid, scratch and buffer addresses |
 | `SVOD_DUMP_AMD_IR` | unset | Directory receiving each kernel's AMD LLVM IR as `<mcpu>_<module>_<digest>.ll` |
 | `SVOD_DUMP_AMD_ASM` | unset | Directory receiving each kernel's AMDGCN assembly as `<mcpu>_<module>_<digest>.s`, the stem of its `.ll` (one more clang run per kernel) |
 | `SVOD_OBJECT_CACHE`, `SVOD_OBJECT_CACHE_DIR`, `SVOD_OBJECT_CACHE_MAX_BYTES` | on | The shared on-disk object cache, see the [CPU page](../cpu.md) |

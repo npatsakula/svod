@@ -33,7 +33,8 @@ graph。Svod 提供四个后端，全部位于同一个二进制文件中；给�
 | `CUDA[:N]`、`GPU[:N]` | `DeviceSpec::Cuda { device_id }` |
 | `METAL[:N]` | `DeviceSpec::Metal { device_id }`（只有 `0` 存在） |
 
-只写 `NAME` 即设备 0。`NV` 被刻意拒绝——这个名字保留给未来的用户态 NVIDIA 驱动。
+只写 `NAME` 即设备 0。`NV` 保留给未来的用户态 NVIDIA 驱动：`DeviceSpecExt::parse` 会拒绝它，而
+`SVOD_DEVICE` 会像对待任何无法解析的值一样忽略它，回退到平台默认值。
 没有任何东西选择设备时，采用平台默认值：**macOS 上为 `METAL:0`，其他地方为
 `CPU`**。完整的优先级依次是：`with_default_device` 作用域、线程局部的
 `set_default_device`、`SVOD_DEVICE`（每个进程读取一次）、平台默认值。GPU 架构
@@ -100,7 +101,7 @@ pub struct Device {
 | `RuntimeFactory` | — | 把 `CompiledSpec` 加载为 `Program`；`Device::new` 对它进行包装，使每个 spec 的阶段身份先被校验 |
 | `Program` | `execute`、`name` | 一次内核启动；`execute_timed`（供 BEAM 使用的 GPU 时钟时长）、`new_exec_context`、`resource_usage` 和 `as_any` 是可选的 |
 | `PlanContext` | `dispatch`、`synchronize` | 由 `Program::new_exec_context` 创建的每个计划的状态：通道、完成令牌、时间戳、计数器（`set_pmc`）、原生链接重放（`replay_linked_plan`） |
-| `Allocator` | `_alloc`、`name`、`device_spec` | `_copyin` / `_copyout` / `_transfer` / `_free` / `synchronize` / `supports_device_local` 是可选的，默认采用宿主内存语义 |
+| `Allocator` | `_alloc`、`name`、`device_spec` | 其余均可选：`_copyin` / `_copyout` / `_transfer` 默认返回 `Unsupported` 错误，`_free` 直接释放缓冲区，`synchronize` 不做任何事，`supports_device_local` 为 `false` |
 | `Graph` | `replay` | 以一次提交重放的已捕获内核链；`completion_token`、`replay_profiled` 可选 |
 | `CompletionToken`、`TimelineSignal`、`DispatchTimestamps` | | 执行器消费的同步与性能分析句柄（`device/src/sync.rs`） |
 

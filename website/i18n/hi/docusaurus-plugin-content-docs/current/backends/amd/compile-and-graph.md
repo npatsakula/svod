@@ -31,10 +31,12 @@ flowchart TD
 rendering से पहले decompose करता है: इसका `decompositor`
 `svod_ir::decompositions::amd_decomposition_patterns()` है, जो `f16`/`f32`/`f64` के लिए `exp`,
 `log`, `cos`, `tan` और `pow` को native `exp2`/`log2` के ऊपर SLEEF-style polynomials में lower
-करता है — bf16, fp8 और integer operands polynomial के इर्द-गिर्द f32 में cast किए जाते हैं — और
-f32→bf16 casts को integer round-to-nearest-even रूप में rewrite करता है; `sin` इसी कारण से
-साझा transcendental patterns से होकर जाता है (`v_sin_f32` केवल छोटे arguments के लिए सटीक है)।
-केवल `exp2`, `log2` और `sqrt` native `@llvm.*` intrinsics रहते हैं (AMD hardware पर ~1 ulp)।
+करता है — bf16, fp8 और integer operands polynomial के इर्द-गिर्द f32 में cast किए जाते हैं;
+`sin` इसी कारण से साझा transcendental patterns से होकर जाता है (`v_sin_f32` केवल छोटे
+arguments के लिए सटीक है)। केवल `exp2`, `log2` और `sqrt` native `@llvm.*` intrinsics रहते हैं
+(AMD hardware पर ~1 ulp)। जब clang का version पढ़ा न जा सके, तब decompositor f32→bf16 casts
+को integer round-to-nearest-even रूप में भी rewrite करता है (`bf16_integer_cast_patterns`);
+पढ़े जा सकने वाले version का clang यहाँ कम से कम 22 होता है और यह narrowing natively करता है।
 renderer-local `amd_extra_matcher()` सबसे अंत में चलता है।
 
 ### Compiling
@@ -45,13 +47,24 @@ in-memory style जो [CPU JIT लोडर](../jit-loader.md) का है:
 
 ```text
 clang -x ir -c -O3 --target=amdgcn-amd-amdhsa -mcpu=<arch> \
-      -mcumode -nogpuinc -Wno-override-module -fno-math-errno [-nogpulib] - -o -
+      -mcumode -nogpuinc -Wno-override-module -fno-math-errno \
+      [-mllvm -disable-machine-sink] [-nogpulib] - -o -
 ```
 
 `-nogpulib` केवल तभी जोड़ा जाता है जब IR किसी `@__ocml_*` entry point को reference न करता हो:
 renderer हर उस float unary के लिए `@llvm.*` intrinsics emit करता है जिसे AMDGPU backend select
-कर सकता है, इसलिए ROCm device libraries केवल f64 के गैर-`sqrt` unaries के लिए चाहिए। IR ख़ुद
-object-cache key का हिस्सा है, इसलिए उससे एक flag को key करना sound बना रहता है। परिणाम को
+कर सकता है, इसलिए ROCm device libraries केवल f64 के गैर-`sqrt` unaries के लिए चाहिए।
+
+`-mllvm -disable-machine-sink` उस IR के लिए जोड़ा जाता है जिसमें matrix product हो
+(`@llvm.amdgcn.wmma` या `@llvm.amdgcn.mfma`), जब clang का LLVM 23 से पुराना हो या उसका version
+पढ़ा न जा सके। ये versions AMDGPU matrix instructions को convergent mark नहीं करते, इसलिए
+machine sinking ऐसे instruction को lane-gated branch में move कर सकता है, जहाँ छोड़ी गई lanes
+उसके operands कभी नहीं लिखतीं। दोनों flags IR से तय होते हैं, और हर kernel की object-cache key
+में वे flags होते हैं जिनके साथ वह kernel compile होता है (`amd_object_key`), इसलिए flag policy
+बदलने पर दूसरी policy से बना object कभी reuse नहीं होता; clang version भी key का हिस्सा है। 22 से
+पुराना clang AMD code के लिए `JitCompilation` error के साथ refuse कर दिया जाता है।
+
+परिणाम को
 `amd-clang` identity के तहत cache या load किए जाने से पहले validate किया जाता है
 (`validate_amd_object`: ELF64-LE, `EM_AMDGPU`, `e_flags` में arch, एक defined `<name>.kd`)।
 
@@ -102,23 +115,28 @@ kernargs के साथ एक HSA dispatch packet चाहिए होग�
    packed kernarg layout फ़िट होता है: `ClikeKernargLayout::from_abi(abi)` parameters को ABI
    slot order में natural alignment (8-byte pointers, 4-byte scalars) के साथ lay out करता है,
    और उसका `packed_size()` descriptor के `kernarg_size` से अधिक नहीं होना चाहिए।
-2. device की 16 MiB kernarg arena (हर lane द्वारा साझा, 16-byte aligned; wrap होने पर पहले
-   सभी lanes drain होती हैं) को bump करके एक **kernarg slot भरता है**, हर buffer VA को 8 bytes
-   और हर scalar को एक 4-byte `i32` के रूप में लिखते हुए। `i32` packing जान-बूझकर है — renderer
-   `Index → i32` lower करता है, इसलिए descriptor का `kernarg_size` 4-byte vars को reflect
-   करता है; 8 bytes pack करना अगले slot में overflow कर जाता।
-3. एक **submission बनाता है** — `Compute` का एक `hcq::Submission`, जो kernarg VA,
-   `rsrc` triple, और PM4 program address साथ ले जाता है; उससे पहले `MemoryBarrier`
+2. kernargs को एक local record में **pack करता है**: हर buffer VA 8 bytes के रूप में और हर
+   scalar एक 4-byte `i32` के रूप में। `i32` packing जान-बूझकर है — renderer `Index → i32`
+   lower करता है, इसलिए descriptor का `kernarg_size` 4-byte vars को reflect करता है; 8 bytes
+   pack करना record से overflow कर जाता।
+3. एक **submission बनाता है** — `Compute` का एक `hcq::Submission`, जो `rsrc` triple और PM4
+   program address साथ ले जाता है (kernarg address queue भरती है); उससे पहले `MemoryBarrier`
    तभी आता है जब lane के पिछले barrier के बाद host या SDMA ने उसके caches को
    bypass करके लिखा हो, lane के पहले dispatch पर, और हर timed dispatch पर।
-4. `queue.submit_hcq_dispatch(pool, &submission, …)` के माध्यम से **dispatch करता है**। एक
+4. `queue.submit_hcq_dispatch(pool, &submission, …)` के माध्यम से **dispatch करता है**।
+   queue device की 16 MiB kernarg ring में एक slot reserve करती है (हर lane द्वारा साझा,
+   16-byte aligned; multi-XCC parts पर VRAM, बाक़ी पर uncached GTT), record उसमें copy करती
+   है और slot को उस point के साथ publish करती है जिस पर submission retire होता है। जो
+   reservation सबसे पुराने live slot तक पहुँचती है, वह केवल उसी slot का wait करती है। एक
    PM4 queue पर `lower_hcq_pm4` → `build_exec_pm4` raw dwords emit करता है, और optional
    4-dword scratch descriptor को `COMPUTE_USER_DATA_0` में उसी `scratch_address` snapshot से
    prepend किया जाता है जो `COMPUTE_DISPATCH_SCRATCH_BASE` में लिखा जाता है — ताकि एक
    concurrent scratch realloc descriptor और register को असहमत न बना सके। एक AQL queue पर
    `lower_hcq_aql_submission_program` wait/barrier को vendor-IB PM4 packets के रूप में, 64-byte
    dispatch packet (`build_dispatch_packet_barrier`) और एक vendor-IB timeline store emit करता
-   है, जिसमें control bytes kernarg arena में stage किए जाते हैं।
+   है। control program और kernargs उसी एक slot को share करते हैं, और उनके addresses link time
+   पर patch होते हैं। slot lane की retirement count पर retire होता है, XCC0 के timeline store
+   पर नहीं (देखें [Queues & Dispatch](./queues-and-dispatch.md))।
 5. code object को retain करता है, finalizer को in flight register करता है और उसे owner के
    सबसे नए completion के रूप में record करता है। यदि `wait`, तो owner के `synchronize()` के
    माध्यम से drain करता है।
@@ -136,8 +154,8 @@ epoch का wait करता है, एक lane lease करता है, �
 `wait → barrier → exec → signal → doorbell` round-trip N बार चुकाना बर्बादी है। `AmdGraph`
 (`device/src/amd/graph.rs`) — tinygrad के `HCQGraph` पर आधारित, पर एक barrier और बिना
 inter-kernel signals के — पूरी chain को **एक command
-stream** (PM4 या AQL, जो भी queue उपयोग करती हो) में capture करता है, उसे एक host-visible page
-में bind करता है, और उसे **एक doorbell** के साथ replay करता है।
+stream** (PM4 या AQL, जो भी queue उपयोग करती हो) में capture करता है, उसे एक command buffer
+(multi-XCC parts पर VRAM, बाक़ी पर uncached GTT) में bind करता है, और उसे **एक doorbell** के साथ replay करता है।
 
 ### Structure
 
@@ -157,16 +175,17 @@ timeline सिरों के लिए `System(SystemField::TimelineSignal/Ti
 `System(ScratchAddress)`/`System(ScratchTmpring)`, और program तथा kernarg pointers के लिए
 `LinkAddress` entries — ये सब replay पर leased lane के विरुद्ध resolve होते हैं, इसलिए graph
 सामान्य per-call dispatch और `synchronize` के साथ compose होता है। Capture प्रति kernel एक
-fixed kernarg slot को एक dedicated `AllocTag::Kernarg` page में lay out करता है — उस page का
-मालिक होना (न कि rolling kernarg arena को साझा करना, जिसमें concurrent per-call dispatch stale
-VAs में lap कर सकता है) ही replay को safe बनाता है।
+fixed kernarg slot को एक dedicated `AllocTag::Kernarg` page में lay out करता है (multi-XCC parts
+पर VRAM, बाक़ी पर uncached GTT)। resident stream हर replay पर इन्हीं fixed addresses की ओर point
+करता है, जबकि arena slot उसी एक submission के साथ retire होता है जिसने उसे reserve किया — इसलिए
+graph अपने page का मालिक है और उसे in place patch करता है।
 
 Replay (`Graph::replay`) graph-owned mutable storage को serialize करता है, अपने पिछले
 finalizer का wait करता है, एक exclusive compute lane acquire करता है, lane scratch सुनिश्चित
 करता है, मौजूदा kernargs और system fields को patch करता है, फिर resident PM4 IB या AQL
 submission program publish करता है। एक-जैसे arguments होने पर kernarg pack पूरी तरह skip हो
 जाता है। यह asynchronously return करता है; अगला replay उस storage को दोबारा उपयोग करने से
-पहले wait करता है। `replay_profiled` एक ऐसा variant चलाता है जिसमें प्रति kernel एक
+पहले wait करता है, AQL पर तब तक जब तक हर XCC पिछले replay से निपट न ले। `replay_profiled` एक ऐसा variant चलाता है जिसमें प्रति kernel एक
 `SystemField::Timestamp` slot होता है, और stamps return करने से पहले synchronize करता है।
 
 ### Capture कब होता है
