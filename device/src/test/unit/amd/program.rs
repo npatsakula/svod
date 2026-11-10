@@ -718,18 +718,6 @@ fn sleepy_graph(
     Some((graph, program, output))
 }
 
-/// CPU time the calling thread has used.
-fn thread_cpu() -> std::time::Duration {
-    // SAFETY: getrusage writes the struct it is given.
-    let usage = unsafe {
-        let mut usage = std::mem::zeroed::<libc::rusage>();
-        assert_eq!(libc::getrusage(libc::RUSAGE_THREAD, &mut usage), 0);
-        usage
-    };
-    let time = |t: libc::timeval| std::time::Duration::new(t.tv_sec as u64, t.tv_usec as u32 * 1000);
-    time(usage.ru_utime) + time(usage.ru_stime)
-}
-
 /// Two threads blocked on one graph replay both wake as it retires: the replay
 /// raises the completion interrupt, and each waiter's event age sees it though
 /// the queue event resets on the first wake. Lateness is wall time past the
@@ -775,75 +763,6 @@ fn graph_waiters_wake_as_the_replay_retires() {
     }
     drop(graph);
     output.raw.free_amd_device_in_place();
-}
-
-/// A long graph of short kernels: the waiting thread's CPU time against the
-/// wall time. A wait that sleeps uses a sliver of a core; one kept polling by
-/// progress (an AQL queue's read index) uses the whole wait. Prints only.
-///
-/// Run: `cargo test -p svod-device --release --lib long_graph_wait -- --ignored --nocapture --test-threads=1`
-#[test]
-#[ignore = "manual hardware probe; needs a real AMD GPU + clang"]
-fn long_graph_wait_cpu_probe() {
-    let Some(alloc) = amd_alloc_or_skip() else { return };
-    let _serial = PM4_GRAPH_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let _pm4 = Pm4GraphOverride::enable(alloc.dev.core());
-    ensure_hw_signal_pool(&alloc);
-    let Some((graph, _program, output)) = sleepy_graph(&alloc, 800, 400) else { return };
-    for trial in 0..3 {
-        output.set(-1.0);
-        let (wall, cpu) = (std::time::Instant::now(), thread_cpu());
-        graph.replay(&[], &[]).expect("replay");
-        alloc.dev.core().synchronize_all().expect("synchronize_all");
-        let (wall, cpu) = (wall.elapsed(), thread_cpu() - cpu);
-        assert_eq!(output.get(), 0.0);
-        println!(
-            "long-wait trial {trial}: wall {wall:?}, waiter CPU {cpu:?} ({:.1} %)",
-            100.0 * cpu.as_secs_f64() / wall.as_secs_f64()
-        );
-    }
-    drop(graph);
-    output.raw.free_amd_device_in_place();
-}
-
-/// Replay-to-wake latency of a short graph: mean wall time per replay and
-/// synchronize, which a wait's spin budget trades against CPU. Prints only.
-///
-/// Run: `cargo test -p svod-device --release --lib short_graph_wait -- --ignored --nocapture --test-threads=1`
-#[test]
-#[ignore = "manual hardware probe; needs a real AMD GPU + clang"]
-fn short_graph_wait_latency_probe() {
-    let Some(alloc) = amd_alloc_or_skip() else { return };
-    let _serial = PM4_GRAPH_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let _pm4 = Pm4GraphOverride::enable(alloc.dev.core());
-    ensure_hw_signal_pool(&alloc);
-    for iterations in [0, 30, 300] {
-        let Some((graph, _program, output)) = sleepy_graph(&alloc, iterations.max(1), 1) else { return };
-        let span = {
-            let timestamps = graph.replay_profiled(&[], &[]).expect("profiled replay").expect("profile support");
-            alloc.dev.core().synchronize_all().expect("synchronize_all");
-            let (start, end) = timestamps[0].timestamps_ns().expect("graph GPU timestamps");
-            std::time::Duration::from_nanos(end - start)
-        };
-        let mut walls = (0..300)
-            .map(|_| {
-                let wall = std::time::Instant::now();
-                graph.replay(&[], &[]).expect("replay");
-                alloc.dev.core().synchronize_all().expect("synchronize_all");
-                wall.elapsed()
-            })
-            .collect::<Vec<_>>();
-        walls.sort();
-        let cpu = thread_cpu();
-        println!(
-            "short-wait GPU {span:?}: median {:?}, p90 {:?}, max {:?} (thread CPU so far {cpu:?})",
-            walls[walls.len() / 2],
-            walls[walls.len() * 9 / 10],
-            walls[walls.len() - 1]
-        );
-        drop(graph);
-        output.raw.free_amd_device_in_place();
-    }
 }
 
 /// Dispatch one kernel through the per-plan `PlanContext` with `profile=true`,
@@ -1026,92 +945,6 @@ attributes #0 = { alwaysinline nounwind "amdgpu-flat-work-group-size"="1,64" }
         counter.raw.free_amd_device_in_place();
     }
     assert!(counts.iter().all(|&count| count == (ROUNDS * BURST) as u32), "per-thread dispatch counts {counts:?}");
-}
-
-/// Whether a host store into VRAM reaches the next dispatch: each round the
-/// host writes a fresh pattern into a host-visible VRAM buffer, flushes HDP
-/// (or not, `HDP_MODE=none`), and a kernel copies it into system memory the
-/// host then checks. Stale words mean HDP held the stores. Prints the count
-/// and the flush's cost.
-///
-/// Run: `SVOD_DEVICE=AMD:0 [HDP_MODE=none] [ROUNDS=…] [WORDS=…] cargo test -p svod-device --release --lib
-/// hdp_stale_write_probe -- --ignored --nocapture`
-#[test]
-#[ignore = "manual hardware probe; needs a real AMD GPU + clang"]
-fn hdp_stale_write_probe() {
-    const COPY_IR: &str = r#"target triple = "amdgcn-amd-amdhsa"
-declare i32 @llvm.amdgcn.workitem.id.x()
-declare i32 @llvm.amdgcn.workgroup.id.x()
-define amdgpu_kernel void @copy(ptr addrspace(1) noalias %src, ptr addrspace(1) noalias %dst) #0 {
-  %t = call i32 @llvm.amdgcn.workitem.id.x()
-  %g = call i32 @llvm.amdgcn.workgroup.id.x()
-  %b = shl i32 %g, 6
-  %i = add i32 %b, %t
-  %s = getelementptr i32, ptr addrspace(1) %src, i32 %i
-  %v = load volatile i32, ptr addrspace(1) %s
-  %d = getelementptr i32, ptr addrspace(1) %dst, i32 %i
-  store i32 %v, ptr addrspace(1) %d
-  ret void
-}
-attributes #0 = { nounwind "amdgpu-flat-work-group-size"="64,64" }
-"#;
-    let env = |key: &str, default: usize| std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default);
-    let (rounds, words) = (env("ROUNDS", 2000), env("WORDS", 1 << 16).next_multiple_of(64));
-    let flush = std::env::var("HDP_MODE").as_deref() != Ok("none");
-    let Some(alloc) = amd_alloc_or_skip() else { return };
-    ensure_hw_signal_pool(&alloc);
-    let Some(bytes) = clang_amdgcn(COPY_IR, alloc.dev.arch.mcpu()) else { return };
-    let abi = [0, 1].map(|slot| AbiParamDescriptor { slot, ..global_f32_buffer_abi()[0].clone() });
-    let program = AmdProgram::load(alloc.dev.clone(), &alloc, &bytes, "copy", &abi).expect("load");
-    let spec = crate::allocator::BufferSpec { cpu_access: true, ..Default::default() };
-    let src = crate::allocator::Allocator::alloc(&alloc, words * 4, &spec, false).expect("VRAM source");
-    let dst = alloc.alloc_uncached(words * 4).expect("GTT destination");
-    let (
-        RawBuffer::AmdDevice { gpu_addr: src_gpu, host_ptr: Some(src_host), vram: true, .. },
-        RawBuffer::AmdDevice { gpu_addr: dst_gpu, host_ptr: Some(dst_host), .. },
-    ) = (&src, &dst)
-    else {
-        panic!("a host-visible VRAM source and a mapped GTT destination")
-    };
-    let (src_host, dst_host) = (src_host.cast::<u32>().as_ptr(), dst_host.cast::<u32>().as_ptr());
-    let context = program.new_exec_context().expect("context").expect("AMD context");
-    let (mut stale_rounds, mut stale_words, mut flush_time) = (0usize, 0usize, std::time::Duration::ZERO);
-    for round in 1..=rounds as u32 {
-        for i in 0..words {
-            // SAFETY: both mappings hold `words` u32s; the GPU is idle here.
-            unsafe { std::ptr::write_volatile(src_host.add(i), round.wrapping_mul(0x9e37_79b9) ^ i as u32) };
-        }
-        if flush {
-            let t = std::time::Instant::now();
-            alloc.dev.core().hdp().flush();
-            flush_time += t.elapsed();
-        }
-        unsafe {
-            context.dispatch(
-                &program,
-                &[*src_gpu as *mut u8, *dst_gpu as *mut u8],
-                &[],
-                Some([words / 64, 1, 1]),
-                Some([64, 1, 1]),
-                false,
-            )
-        }
-        .expect("dispatch");
-        context.synchronize().expect("sync");
-        let stale = (0..words)
-            .filter(
-                |&i| unsafe { std::ptr::read_volatile(dst_host.add(i)) } != round.wrapping_mul(0x9e37_79b9) ^ i as u32,
-            )
-            .count();
-        stale_rounds += usize::from(stale > 0);
-        stale_words += stale;
-    }
-    println!(
-        "hdp-stale flush={flush} rounds={rounds} words={words}: stale rounds {stale_rounds}, stale words {stale_words}, flush {:.2} us/round",
-        flush_time.as_secs_f64() * 1e6 / rounds as f64
-    );
-    crate::allocator::Allocator::free(&alloc, src, words * 4, &spec);
-    dst.free_amd_device_in_place();
 }
 
 /// A dispatch invalidates its lane's caches with a full barrier only after

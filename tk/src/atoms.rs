@@ -970,7 +970,7 @@ impl Costs {
 
 /// Model: the power of the blocks an SM runs at once by which a lone
 /// block's trip overhead shrinks per block-trip: the blocks overlap one
-/// another's waits and share out what a round still waits.
+/// another's waits and share out what a round still waits (`tk_bench trips` measures it).
 pub(crate) const TRIP_HIDING: i32 = 2;
 
 const fn sm(major: u8, minor: u8) -> GpuArch {

@@ -752,11 +752,9 @@ fn combine_matches_the_program(t: usize, heads: usize, d: usize, splits: usize, 
     assert!(worst < 2e-2 && !got.iter().any(|g| g.is_nan()), "max abs diff {worst}, or an element left unwritten");
 }
 
-/// The attention configs the tuner admits on the device for `spec`'s shape
-/// in the plain forms (its shortlist of the device's ranking), the
-/// candidates of its last tile pass, and its pick, tuned as the op layer
-/// tunes ([`tune`]).
-pub(super) fn device_attention(planner: &Planner, spec: &AttnSpec) -> (Vec<FaCfg>, Vec<FaCfg>, FaCfg) {
+/// The candidates of the tuner's last tile pass on the device for `spec`'s
+/// shape and its pick, tuned as the op layer tunes ([`tune`]).
+fn device_attention(planner: &Planner, spec: &AttnSpec) -> (Vec<FaCfg>, FaCfg) {
     use crate::ops::attention::tune;
     let AttnSpec { t, tk, heads, d, mask, .. } = *spec;
     let tiles = spec.batch.capacity() * heads;
@@ -765,13 +763,12 @@ pub(super) fn device_attention(planner: &Planner, spec: &AttnSpec) -> (Vec<FaCfg
     let shape = [spec.batch.capacity(), t, tk, heads, d];
     let mut tuner =
         crate::ops::Tuner::new(crate::tune::TuneStore::global(), &planner.device, DType::BFloat16, &shape, mask, build);
-    let plain = tuner.admitted("attention", &crate::ops::config::representatives(&ranked));
     let formed = std::cell::RefCell::new(vec![]);
     let pick = tune("attention", &mut tuner, &ranked, mask.bias.is_some(), |admitted| {
         *formed.borrow_mut() = admitted.to_vec();
         admitted.to_vec()
     });
-    (plain, formed.into_inner(), pick)
+    (formed.into_inner(), pick)
 }
 
 /// The probe's shape: `batch` lanes of `heads` heads over `t` queries and keys.
@@ -799,107 +796,6 @@ fn label(c: &FaCfg) -> String {
     format!("bq{} bkv{} s{}{rows} unroll={} forms [{}]{core}", c.bq, c.bkv, c.stages(), c.unroll(), on.join(" "))
 }
 
-/// Flash attention throughput at B 4, H 8, T 2048 bf16, causal and plain,
-/// head dim 64 and 128, d 64 with a per-batch bias: every config the tuner
-/// admits on the device (its probed costs' ranking) timed as the tune store
-/// times them, and the tuner's pick with its softmax forms (run with
-/// `--ignored --nocapture --release`); never asserts. tk1's
-/// `flash_attention_with`, last measured on the 3060 before its removal, in
-/// TFLOP/s: d64 23.0, d64 causal 20.7, d128 22.3, d128 causal 16.5.
-#[test]
-#[ignore = "perf probe: needs a GPU"]
-fn attention_throughput_probe() {
-    let Some(planner) = super::device_planner() else { return };
-    crate::tune::scoped(true, || {
-        let (batch, heads, t) = (4usize, 8usize, 2048usize);
-        for (d, causal, bias) in [
-            (64, false, false),
-            (64, false, true),
-            (64, true, false),
-            (64, true, true),
-            (128, false, false),
-            (128, true, false),
-        ] {
-            let mask = AttnMask { causal, bias: bias.then_some(Bias::PerBatch), ..AttnMask::default() };
-            let spec = probe_spec(batch, heads, t, t, d, mask);
-            let (plain, admitted, pick) = device_attention(&planner, &spec);
-            let mut timed = admitted.clone();
-            if !timed.contains(&pick) {
-                timed.push(pick);
-            }
-            let build =
-                |cfg: FaCfg| vec![(flash_attention(&assumed(spec.clone(), cfg)), cfg.lowering(&planner.device))];
-            let ns = super::measure(timed.iter().map(|&c| build(c)));
-            let flops = 4.0 * (batch * heads * t * t * d) as f64 / if causal { 2.0 } else { 1.0 };
-            eprintln!(
-                "== attention d{d} causal={causal} bias={bias}: {} admitted plain, {} under the first forms",
-                plain.len(),
-                admitted.len()
-            );
-            for (c, ns) in timed.iter().zip(ns) {
-                let what = if *c == pick { " (tuner's pick)" } else { "" };
-                let time = ns.map_or("failed".into(), |ns| {
-                    format!("{:8.1} us {:5.1} TFLOP/s", ns as f64 / 1e3, flops / ns as f64 / 1e3)
-                });
-                eprintln!("  {}: {time}{what}", label(c));
-            }
-        }
-    });
-}
-
-/// What the op launches on the device, its merge timed with it: the tuner's
-/// pick among every split count against its pick unsplit. Prints TFLOP/s and
-/// never asserts (run with `--ignored --nocapture`).
-#[test]
-#[ignore = "perf probe: needs a GPU"]
-fn attention_splits_probe() {
-    let Some(planner) = super::device_planner() else { return };
-    crate::tune::scoped(true, || {
-        let (batch, heads, t) = (4usize, 8usize, 2048usize);
-        for (d, causal) in [(64, false), (64, true), (128, false), (128, true)] {
-            let spec = probe_spec(batch, heads, t, t, d, AttnMask { causal, ..AttnMask::default() });
-            let ranked = planner.attention_ranked(batch * heads, t, t, d, causal, false);
-            let flops = 4.0 * (batch * heads * t * t * d) as f64 / if causal { 2.0 } else { 1.0 };
-            for splits in [Some(1), Some(2), Some(4), None] {
-                let store = crate::tune::TuneStore::global();
-                let dtype = DType::BFloat16;
-                let tuned = crate::ops::attention::tuned(store, &planner, dtype, &ranked, spec.clone(), splits);
-                let cfg = tuned.cfg();
-                let mut programs = vec![(flash_attention(&tuned), cfg.lowering(&planner.device))];
-                if cfg.splits > 1 {
-                    let merge = crate::ops::attention::merge(spec.batch.clone(), t, heads, d, cfg.splits);
-                    programs.push((combine::<BF16>(&merge), crate::lower::Lowering::new(&planner.device)));
-                }
-                let ns = super::measure([programs]);
-                let time = ns[0].map_or("failed".into(), |ns| format!("{:6.1} TFLOP/s", flops / ns as f64 / 1e3));
-                eprintln!("d{d} causal={causal} splits={}: {time} {}", cfg.splits, label(&cfg));
-            }
-        }
-    });
-}
-
-/// What the backend allocates for a decoder step's key-warp configs on the
-/// device: registers, shared memory (the rings alone: the merged states
-/// reuse them) and any spill, printed (run with `--ignored --nocapture`);
-/// never asserts.
-#[test]
-#[ignore = "perf probe: needs a GPU"]
-fn key_warp_resources_probe() {
-    let Some(planner) = super::device_planner() else { return };
-    let pool = crate::tune::ScratchPool::default();
-    for (key_warps, bkv) in [(1, 16), (2, 16), (4, 16), (1, 32), (2, 32), (4, 32)] {
-        let cfg = FaCfg { key_warps, ..FaCfg::new(16, bkv, 2) };
-        let spec = probe_spec(5, 20, 1, 1500, 64, AttnMask::default());
-        let spec = assumed(spec, cfg);
-        let lowering = cfg.lowering(&planner.device);
-        let Some((plan, _)) = crate::tune::scratch_plan(flash_attention(&spec), &lowering, &pool) else {
-            eprintln!("{}: does not compile", label(&cfg));
-            continue;
-        };
-        eprintln!("{} ({} B static smem): {:?}", label(&cfg), cfg.smem_bytes(64, false), crate::tune::resources(&plan));
-    }
-}
-
 /// The tuner's d = 128 attention kernel on gfx1151 compiles, and where it
 /// spills it was timed beside a clean candidate and won: the shortlist
 /// times the tiles none of whose pipelines compile clean after the clean
@@ -914,7 +810,7 @@ fn the_tuned_d128_attention_compiles_on_gfx1151() {
         return;
     };
     let spec = probe_spec(4, 8, 2048, 2048, 128, AttnMask::default());
-    let (_, candidates, formed) = device_attention(&planner, &spec);
+    let (candidates, formed) = device_attention(&planner, &spec);
     let pool = crate::tune::ScratchPool::default();
     let resources = |cfg: FaCfg| {
         let prog = flash_attention(&assumed(spec.clone(), cfg));
@@ -928,148 +824,6 @@ fn the_tuned_d128_attention_compiles_on_gfx1151() {
         let clean = candidates.iter().filter(|&&c| c != formed).find(|&&c| !crate::tune::spilled(&resources(c)));
         assert!(clean.is_some(), "{formed:?} spills with no clean candidate timed beside it: {candidates:?}");
     }
-}
-
-/// Every attention config the construct spans against the tuner's admitted
-/// shortlist, timed on the device for the probe shapes and Qwen3's: prints
-/// each config's time, the shortlist's members marked (run with `--ignored
-/// --nocapture`); never asserts.
-#[test]
-#[ignore = "perf probe: needs a GPU"]
-fn attention_candidates_probe() {
-    let Some(planner) = super::device_planner() else { return };
-    let target = &planner.device.target;
-    for (batch, heads, t, d, causal) in [
-        (8usize, 16usize, 512usize, 128usize, false),
-        (4, 8, 2048, 64, false),
-        (4, 8, 2048, 64, true),
-        (4, 8, 2048, 128, false),
-        (4, 8, 2048, 128, true),
-        (5, 20, 1, 64, false),
-    ] {
-        let tk = if t == 1 { 1500 } else { t };
-        let spec = probe_spec(batch, heads, t, tk, d, AttnMask { causal, ..AttnMask::default() });
-        let (shortlist, ..) = device_attention(&planner, &spec);
-        let mut cfgs: Vec<FaCfg> = shortlist.clone();
-        for bq in [16, 32, 64, 128] {
-            for bkv in [16, 32, 64, 128] {
-                for unroll in [false, true] {
-                    let cfg = FaCfg { schedule: Schedule::ring(2, unroll), ..FaCfg::new(bq, bkv, 2) };
-                    if cfg.fits(target, d, false)
-                        && cfg.smem_bytes(d, false) <= target.smem_bytes
-                        && !cfgs.contains(&cfg)
-                    {
-                        cfgs.push(cfg);
-                    }
-                }
-            }
-        }
-        let flops = 4.0 * (batch * heads * t * tk * d) as f64 / if causal { 2.0 } else { 1.0 };
-        let ns = super::measure(
-            cfgs.iter().map(|&c| vec![(flash_attention(&assumed(spec.clone(), c)), c.lowering(&planner.device))]),
-        );
-        eprintln!(
-            "== attention b{batch} h{heads} t{t} tk{tk} d{d} causal={causal} ({} shortlist, {} lattice)",
-            shortlist.len(),
-            cfgs.len()
-        );
-        for (c, ns) in cfgs.iter().zip(ns) {
-            let set = if shortlist.contains(c) { "short" } else { "lattice" };
-            match ns {
-                Some(ns) => eprintln!(
-                    "  {set:7} bq{} bkv{} unroll={}: {:8.1} us {:6.1} TFLOP/s",
-                    c.bq,
-                    c.bkv,
-                    c.unroll(),
-                    ns as f64 / 1e3,
-                    flops / ns as f64 / 1e3
-                ),
-                None => eprintln!("  {set:7} bq{} bkv{} unroll={}: failed", c.bq, c.bkv, c.unroll()),
-            }
-        }
-    }
-}
-
-/// A Whisper large-v3 decoder step on the device: self attention over a
-/// layer-packed cache with the step's key appended, and cross attention
-/// over a shared 1500-key cache, tuned splits then unsplit. Prints
-/// microseconds per step and never asserts (run with `--ignored --nocapture`).
-/// tk1's single-query kernel under its split policy, last measured here on
-/// the 3060 before its removal: self 89.1 µs, cross 78.8 µs (636 µs unsplit).
-#[test]
-#[ignore = "perf probe: needs a GPU"]
-fn decode_throughput_probe() {
-    use crate::ops::{self as tk, Attn, Cache, KeyMask};
-    if super::device_target().is_none() {
-        return;
-    }
-    crate::tune::scoped(true, || {
-        let (b, heads, d, layers, layer) = (5usize, 20usize, 64usize, 32usize, 10usize);
-        let f16 = |shape: &[usize], seed: u64| {
-            let mut s = seed;
-            let n: usize = shape.iter().product();
-            let data: Vec<f32> = (0..n).map(|_| super::lcg(&mut s) as f32).collect();
-            let t =
-                Tensor::from_slice(&data).try_reshape(shape.iter().map(|&x| x as isize).collect::<Vec<_>>()).unwrap();
-            let t = t.cast(DType::Float16).contiguous();
-            t.realize().unwrap();
-            t
-        };
-        let ints = |v: Vec<i32>| {
-            let t = Tensor::from_slice(&v);
-            t.realize().unwrap();
-            t
-        };
-        let q = f16(&[b, 1, heads, d], 1);
-        let self_k = f16(&[b, 448, layers * heads, d], 2);
-        let self_v = f16(&[b, 448, layers * heads, d], 3);
-        let (k_app, v_app) = (f16(&[b, 1, heads, d], 4), f16(&[b, 1, heads, d], 5));
-        let lens = ints(vec![200; b]);
-        let cross_k = f16(&[1, 1500, layers * heads, d], 6);
-        let cross_v = f16(&[1, 1500, layers * heads, d], 7);
-        let map = ints(vec![0; b]);
-
-        let mut plans: Vec<(String, svod_runtime::ExecutionPlan)> = vec![];
-        for (name, splits) in [("tuned", None), ("unsplit", Some(1))] {
-            let cache = Cache {
-                head_start: layer * heads,
-                kv_heads: heads,
-                row_map: None,
-                appended: Some((&k_app, &v_app)),
-                app_lens: None,
-            };
-            let opts = Attn { keys: KeyMask::Lens(&lens), cache: Some(cache), splits, ..Attn::default() };
-            let o = tk::attention(&q, &self_k, &self_v, opts).unwrap();
-            plans.push((format!("tk self {name}"), o.prepare().unwrap()));
-            let cache = Cache {
-                head_start: layer * heads,
-                kv_heads: heads,
-                row_map: Some(&map),
-                appended: None,
-                app_lens: None,
-            };
-            let o =
-                tk::attention(&q, &cross_k, &cross_v, Attn { cache: Some(cache), splits, ..Attn::default() }).unwrap();
-            plans.push((format!("tk cross {name}"), o.prepare().unwrap()));
-        }
-        let warm = std::time::Instant::now();
-        while warm.elapsed().as_millis() < 500 {
-            plans[0].1.execute().unwrap();
-        }
-        let mut best = vec![f64::INFINITY; plans.len()];
-        for _ in 0..4 {
-            for (i, (_, plan)) in plans.iter().enumerate() {
-                for _ in 0..5 {
-                    if let Some(run) = crate::tune::run(plan) {
-                        best[i] = best[i].min(run.as_secs_f64() * 1e6);
-                    }
-                }
-            }
-        }
-        for ((label, _), us) in plans.iter().zip(&best) {
-            eprintln!("{label}: {us:.1} us");
-        }
-    });
 }
 
 /// What [`attention`] refuses of a config's key warps, whatever the target

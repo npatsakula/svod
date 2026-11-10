@@ -131,8 +131,8 @@ fn group_target() -> Option<Target> {
     group.then_some(target)
 }
 
-/// The crate's tracing under `RUST_LOG` on stderr, for the probes: the
-/// tuner's picks and round times at `svod_tk=debug`.
+/// The crate's tracing under `RUST_LOG` on stderr, for the device tests:
+/// the tuner's picks and round times at `svod_tk=debug`.
 fn traced() {
     use tracing_subscriber::EnvFilter;
     let _ = tracing_subscriber::fmt()
