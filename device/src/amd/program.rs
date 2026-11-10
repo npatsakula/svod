@@ -793,13 +793,7 @@ impl Program for AmdProgram {
         // filter).
         let _ = unsafe {
             crate::device::PlanContext::dispatch(
-                &owner,
-                self,
-                buffers,
-                vals,
-                global_size,
-                local_size,
-                /*profile=*/ false,
+                &owner, self, buffers, vals, global_size, local_size, /*profile=*/ false,
             )?
         };
         if wait {
@@ -847,13 +841,7 @@ impl Program for AmdProgram {
         // the probes write into scratch it owns. SAFETY: forwarded contract.
         let stamps = unsafe {
             crate::device::PlanContext::dispatch(
-                &owner,
-                self,
-                buffers,
-                vals,
-                global_size,
-                local_size,
-                /*profile=*/ true,
+                &owner, self, buffers, vals, global_size, local_size, /*profile=*/ true,
             )?
         };
         // Poisons the device and propagates on a faulting candidate, exactly as
