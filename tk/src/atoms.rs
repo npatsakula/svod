@@ -146,6 +146,10 @@ pub struct Occupancy {
     /// matrix core has a file of its own (CDNA's AGPRs); 0 where accumulators
     /// take vector registers.
     pub acc_file: u32,
+    /// Blocks an SM holds at once whatever their resources: CUDA's limit;
+    /// on AMD a CU's barriers, which a block of one wave does not take
+    /// ([`Target::blocks_per_sm`]).
+    pub blocks: u32,
 }
 
 impl Occupancy {
@@ -592,8 +596,22 @@ impl Target {
             if limits.max_threads_per_sm > 0 {
                 target.occupancy.waves = limits.max_threads_per_sm / lanes;
             }
+            if limits.max_blocks_per_sm > 0 {
+                target.occupancy.blocks = limits.max_blocks_per_sm;
+            }
         }
         Some(target)
+    }
+
+    /// The blocks of `waves` waves an SM holds at once whatever their
+    /// resources ([`Occupancy::blocks`]): on AMD a block of one wave takes
+    /// no barrier and only the wave slots bound it.
+    pub fn blocks_per_sm(&self, waves: usize) -> usize {
+        let o = self.occupancy;
+        match self.arch {
+            GpuArch::Amd(_) if waves <= 1 => (o.simds * o.waves) as usize,
+            _ => o.blocks as usize,
+        }
     }
 
     /// Registers one lane of a block of `waves` warps may hold: the lane's
@@ -669,6 +687,11 @@ impl Target {
 fn cuda(c: CudaArch) -> Target {
     let renderer = Renderer::for_cuda_arch(c);
     let waves = if (c.major == 8 && c.minor >= 6) || c.major == 12 { 12 } else { 16 };
+    let blocks = match (c.major, c.minor) {
+        (7, 5) | (8, 6) | (8, 7) => 16,
+        (8, 9) => 24,
+        _ => 32,
+    };
     let mut mma = mma_atoms(&renderer, (8, 16, 16), [frag::mma_sync_a(), frag::mma_sync_b(), frag::mma_sync_c()]);
     let bytes = [frag::mma_sync_a8(), frag::mma_sync_b8(), frag::mma_sync_c()];
     mma.extend(int8_atom(renderer.tensor_cores.iter(), renderer.device, (8, 16, 32), bytes));
@@ -689,12 +712,16 @@ fn cuda(c: CudaArch) -> Target {
         xcds: 1,
         shared_banks: None,
         cache_swizzle: None,
-        occupancy: Occupancy { simds: 4, file: 512, waves, registers: 255, acc_file: 0 },
+        occupancy: Occupancy { simds: 4, file: 512, waves, registers: 255, acc_file: 0, blocks },
         sync: SyncCaps { warp_barrier: true, commit_fence: false, priority: false },
         lane_move: LaneMove::Shuffle,
         hardware_exp2: false,
     }
 }
+
+/// The workgroups of more than one wave a CU holds at once: one barrier
+/// each, sixteen a CU.
+const AMD_BARRIERS: u32 = 16;
 
 /// An AMD part: register-staged fills into 64 KB of LDS a workgroup (160 KB
 /// on gfx950), the 16×16×16 core, settable issue priority and the hardware
@@ -740,9 +767,9 @@ fn amd(a: AmdArch) -> Target {
         vec![]
     };
     let occupancy = if cdna {
-        Occupancy { simds: 4, file: 512, waves: 8, registers: 256, acc_file: 256 }
+        Occupancy { simds: 4, file: 512, waves: 8, registers: 256, acc_file: 256, blocks: AMD_BARRIERS }
     } else {
-        Occupancy { simds: 2, file: 1536, waves: 16, registers: 256, acc_file: 0 }
+        Occupancy { simds: 2, file: 1536, waves: 16, registers: 256, acc_file: 0, blocks: AMD_BARRIERS }
     };
     Target {
         arch: GpuArch::Amd(a),
@@ -792,7 +819,7 @@ fn metal(f: MetalFamily) -> Target {
         xcds: 1,
         shared_banks: None,
         cache_swizzle: None,
-        occupancy: Occupancy { simds: 4, file: 1024, waves: 8, registers: 128, acc_file: 0 },
+        occupancy: Occupancy { simds: 4, file: 1024, waves: 8, registers: 128, acc_file: 0, blocks: 32 },
         sync: SyncCaps { warp_barrier: false, commit_fence: false, priority: false },
         lane_move: LaneMove::SimdShuffle,
         hardware_exp2: false,

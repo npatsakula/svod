@@ -393,3 +393,22 @@ fn a_side_stream_prices_alongside_the_epilogue() {
     let spilled = planner.price(&claim);
     assert!(spilled > resident.0, "a working set past the ladder priced dearer: {spilled} against {}", resident.0);
 }
+
+/// An SM holds no more blocks than its hardware takes whatever their
+/// resources: small blocks of one or two warps fill sm_86's wave slots
+/// (48) past its sixteen blocks and stop there, sm_120's at 32, while four
+/// warps stop at the wave slots first; an AMD block of one wave takes no
+/// barrier and fills the CU's wave slots, of two waves the slots and the
+/// sixteen barriers alike.
+#[test_case::test_case("rtx3060", 1 => 16; "sm_86 one warp")]
+#[test_case::test_case("rtx3060", 2 => 16; "sm_86 two warps")]
+#[test_case::test_case("rtx3060", 4 => 12; "sm_86 four warps")]
+#[test_case::test_case("rtx5090", 1 => 32; "sm_120 one warp")]
+#[test_case::test_case("rx9070xt", 1 => 32; "gfx1201 one wave")]
+#[test_case::test_case("rx9070xt", 2 => 16; "gfx1201 two waves")]
+#[test_case::test_case("mi300x", 1 => 32; "gfx942 one wave")]
+fn an_sm_holds_its_hardwares_blocks_at_most(card: &str, waves: usize) -> usize {
+    let target = Target::card(card).expect("a listed card");
+    let planner = Planner::new(Device { target, costs: crate::test::unit::costs() }).expect("an SM count");
+    planner.resident(16, 16, waves)
+}

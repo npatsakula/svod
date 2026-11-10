@@ -690,7 +690,7 @@ fn four_waves_of_256x256_hold_only_with_an_accumulator_file(arch: AmdArch, holds
 #[test_case(256, 257, 0 => false; "two files, accumulators over")]
 #[test_case(256, 0, 257 => false; "two files, vector over")]
 fn a_lane_holds_what_its_files_take(acc_file: u32, acc: u32, rest: u32) -> bool {
-    crate::atoms::Occupancy { simds: 4, file: 512, waves: 8, registers: 256, acc_file }.holds(acc, rest)
+    crate::atoms::Occupancy { simds: 4, file: 512, waves: 8, registers: 256, acc_file, blocks: 16 }.holds(acc, rest)
 }
 
 /// A ring of one stage or none waits what a one-slot ring leaves

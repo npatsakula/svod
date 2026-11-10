@@ -632,12 +632,15 @@ impl Planner {
 
     /// The blocks of `waves` waves an SM holds at once, each holding `smem`
     /// bytes of shared memory and `regs` registers a lane: by its shared
-    /// memory and by its SIMDs' register files and wave slots; none where a
-    /// block's registers by the layout count pass the SM's.
+    /// memory, by its SIMDs' register files and wave slots and by the
+    /// blocks it holds whatever their resources
+    /// ([`Target::blocks_per_sm`]); none where a block's registers by the
+    /// layout count pass the SM's.
     pub(crate) fn resident(&self, smem: usize, regs: u32, waves: usize) -> usize {
         let (target, o) = (&self.device.target, self.device.target.occupancy);
         let per_simd = o.waves.min(o.file / regs.max(1)) as usize;
-        (target.smem_bytes / smem.max(1)).min(o.simds as usize * per_simd / waves.max(1))
+        let held = (target.smem_bytes / smem.max(1)).min(o.simds as usize * per_simd / waves.max(1));
+        held.min(target.blocks_per_sm(waves))
     }
 
     /// What `cfg` costs the planner's device — ns of SM time — and a
