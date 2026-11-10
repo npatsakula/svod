@@ -15,9 +15,10 @@ use svod_dtype::ScalarDType;
 
 use super::attention::WARP_ROWS;
 use super::gemm::{TileOrder, mainloop};
-use super::{Admitted, bound};
+use super::{Admits, Admitted, Spec, bound};
 use crate::build::*;
 use crate::ir::*;
+use crate::ops::config::{NearestProblem, Planner, Rejected};
 
 /// The tune store keys by this text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -221,12 +222,16 @@ pub struct Floors {
 
 /// The rows of `x [n, d]` against the candidates `c [m, d]`, `d` a multiple
 /// of the matrix core's depth (zero columns pad it exactly); a streamed
-/// config's last chunk may overhang it.
+/// config's last chunk may overhang it. A kernel runs it under a config
+/// admitted for it ([`NearestSpec::admitted`]).
 #[derive(Clone, Debug, PartialEq)]
-pub struct NearestSpec<'t> {
+pub struct NearestSpec {
     pub n: usize,
     pub m: usize,
     pub d: usize,
+    /// The element type of `x` and `c`, the kernel's: 16-bit floats or
+    /// 8-bit integers.
+    pub dtype: ScalarDType,
     pub metric: Metric,
     pub floors: Floors,
     /// `[n]` and `[m]` i32 group ids: a pair of equal ids is skipped (a
@@ -234,10 +239,30 @@ pub struct NearestSpec<'t> {
     pub groups: bool,
     /// The least scores a row keeps, ascending; 1: its least alone.
     pub k: usize,
-    pub cfg: Admitted<'t, NearestCfg>,
     /// The rows and the list length a launch binds, where they vary: `n`
     /// and `k` are then their bounds.
     pub live: Live,
+}
+
+impl Spec for NearestSpec {
+    type Cfg = NearestCfg;
+}
+
+impl Admits for NearestSpec {
+    type Problem = NearestProblem;
+
+    fn problem(&self) -> NearestProblem {
+        let NearestSpec { n, m, d, dtype, metric, floors, groups, k, .. } = *self;
+        NearestProblem { n, m, d, dtype, metric, floors, groups, k }
+    }
+}
+
+impl NearestSpec {
+    /// `cfg` [admitted](Admitted) for this search on `planner`, or why it is
+    /// not.
+    pub fn admitted(self, planner: &Planner, cfg: NearestCfg) -> Result<Admitted<'_, Self>, Rejected> {
+        self.admit(planner, cfg)
+    }
 }
 
 /// What a launch binds by name where a dim varies: a symbolic dim's bound
@@ -350,13 +375,14 @@ pub(crate) const MAX_CANDIDATES: usize = 1 << 24;
 /// against halved floors; [`Metric::L2`] against its floors clamped at zero
 /// and squared, its square root taken once per row), which orders them as
 /// the metric's own.
-pub fn nearest<T: MmaIn>(spec: &NearestSpec) -> Program {
+pub fn nearest<T: MmaIn>(spec: &Admitted<NearestSpec>) -> Program {
+    assert_eq!(T::DTYPE, spec.dtype, "a nearest kernel runs over its spec's element type");
     Kernel::record("nearest", |k| nearest_body::<T>(k, spec))
 }
 
-fn nearest_body<'k, T: MmaIn>(k: &mut Kernel<'k>, spec: &NearestSpec) {
-    let NearestSpec { n, m, d, metric, floors, groups, k: top, cfg, ref live } = *spec;
-    let cfg = *cfg;
+fn nearest_body<'k, T: MmaIn>(k: &mut Kernel<'k>, spec: &Admitted<NearestSpec>) {
+    let NearestSpec { n, m, d, metric, floors, groups, k: top, ref live, .. } = **spec;
+    let cfg = spec.cfg();
     let NearestCfg { bq, bkv, splits, .. } = cfg;
     let stages = cfg.stages();
     let tiles = m.div_ceil(bkv);

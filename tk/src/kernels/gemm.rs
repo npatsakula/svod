@@ -5,11 +5,12 @@
 use std::fmt;
 use std::num::NonZeroUsize;
 
-use super::{Act, Admitted, Batch, batch_offset, bound, konst, load_f32};
+use super::{Act, Admits, Admitted, Batch, Spec, batch_offset, bound, konst, load_f32};
 use crate::atoms::{Core, Device};
 use crate::build::*;
 use crate::ir::*;
 use crate::lower::Lowering;
+use crate::ops::config::{GemmProblem, Planner, Rejected};
 
 /// What runs on the accumulator before the single rounding at the store.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -354,15 +355,34 @@ impl GemmCfg {
     }
 }
 
-/// `m` rows per batch; the batch, when there is one, walks grid z.
+/// `m` rows per batch; the batch, when there is one, walks grid z. A
+/// kernel runs it under a config admitted for it ([`GemmSpec::admitted`]).
 #[derive(Clone, Debug, PartialEq)]
-pub struct GemmSpec<'t> {
+pub struct GemmSpec {
     pub m: usize,
     pub n: usize,
     pub k: usize,
     pub batch: Batch,
     pub epilogue: Epilogue,
-    pub cfg: Admitted<'t, GemmCfg>,
+}
+
+impl Spec for GemmSpec {
+    type Cfg = GemmCfg;
+}
+
+impl Admits for GemmSpec {
+    type Problem = GemmProblem;
+
+    fn problem(&self) -> GemmProblem {
+        GemmProblem::new(self.batch.capacity().max(1), self.m, self.n, self.k, &self.epilogue)
+    }
+}
+
+impl GemmSpec {
+    /// `cfg` [admitted](Admitted) for this GEMM on `planner`, or why it is not.
+    pub fn admitted(self, planner: &Planner, cfg: GemmCfg) -> Result<Admitted<'_, Self>, Rejected> {
+        self.admit(planner, cfg)
+    }
 }
 
 /// Parameters in order: `a [batch·m, k]`, `b [n, k]` (`[2n, k]` gated),
@@ -372,15 +392,15 @@ pub struct GemmSpec<'t> {
 /// multiple of `bk`. Over 8-bit integers the i32 accumulator is widened to
 /// f32 for the epilogue, which stores f32 (`out_f32`): exact while the sums
 /// stay below 2^24.
-pub fn gemm<T: MmaIn>(spec: &GemmSpec) -> Program {
+pub fn gemm<T: MmaIn>(spec: &Admitted<GemmSpec>) -> Program {
     gemm_over::<T>(spec, Tiles::Grid, 1)
 }
 
 /// [`gemm`] over `tiles`, split `split` ways along K as [`mainloop_gemm`]
 /// splits it.
-fn gemm_over<T: MmaIn>(spec: &GemmSpec, tiles: Tiles, split: usize) -> Program {
-    let GemmSpec { m, k: kk, cfg, .. } = *spec;
-    let [bm, _, bk] = cfg.tile;
+fn gemm_over<T: MmaIn>(spec: &Admitted<GemmSpec>, tiles: Tiles, split: usize) -> Program {
+    let GemmSpec { m, k: kk, .. } = **spec;
+    let [bm, _, bk] = spec.cfg().tile;
     mainloop_gemm::<T>("gemm", spec, m * kk, tiles, split, |k, a, bb, row0| {
         let a_view = k.view(a, batch_offset(bb, m * kk), [kk, 1], Shape::new(bm, bk), [bound(m, bm), None]);
         let a_view = k.at(a_view, row0, 0);
@@ -392,7 +412,7 @@ fn gemm_over<T: MmaIn>(spec: &GemmSpec, tiles: Tiles, split: usize) -> Program {
 /// epilogue, a single static batch, neither gated nor turned.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TailSpec<'t> {
-    pub gemm: GemmSpec<'t>,
+    pub gemm: Admitted<'t, GemmSpec>,
     pub plan: TailPlan,
 }
 
@@ -410,13 +430,14 @@ impl TailSpec<'_> {
 
     /// The f32 partials' elements: a `[bm, bn]` slot a tail tile a split.
     pub fn partials(&self) -> usize {
-        let [bm, bn, _] = self.gemm.cfg.tile;
+        let [bm, bn, _] = self.gemm.cfg().tile;
         self.plan.split * self.plan.tail.count() * bm * bn
     }
 
     /// The merge of the tail's partials.
     pub fn merge(&self) -> SplitMergeSpec {
-        let GemmSpec { m, n, epilogue, cfg, .. } = self.gemm;
+        let GemmSpec { m, n, epilogue, .. } = *self.gemm;
+        let cfg = self.gemm.cfg();
         let parts = Parts { order: cfg.order, tile: [cfg.tile[0], cfg.tile[1]], run: self.plan.tail };
         SplitMergeSpec { m, n, split: self.plan.split, epilogue, tile: TAIL_MERGE, parts: Some(parts) }
     }
@@ -428,7 +449,8 @@ impl TailSpec<'_> {
 /// ([`split_merge`]'s parameters).
 pub fn gemm_tail<T: MmaIn>(spec: &TailSpec) -> Vec<Program> {
     let TailSpec { gemm, plan } = spec;
-    let GemmSpec { batch, epilogue, cfg, k, .. } = gemm;
+    let GemmSpec { ref batch, epilogue, k, .. } = **gemm;
+    let cfg = gemm.cfg();
     assert!(
         *batch == Batch::Static(1) && !epilogue.gated && epilogue.rope.is_none(),
         "{epilogue:?} over {batch:?} splits no tail"
@@ -453,7 +475,7 @@ pub fn gemm_tail<T: MmaIn>(spec: &TailSpec) -> Vec<Program> {
 /// the slot's elements inside it.
 pub(crate) fn mainloop_gemm<T: MmaIn>(
     name: &str,
-    spec: &GemmSpec,
+    spec: &Admitted<GemmSpec>,
     a_elems: usize,
     tiles: Tiles,
     split: usize,
@@ -475,13 +497,14 @@ pub(crate) type ASource<'k, T> = Box<dyn Fn(&mut Kernel<'k>, Sc<'k>, Sc<'k>) -> 
 
 fn build<'k, T: MmaIn, U: Elem>(
     k: &mut Kernel<'k>,
-    spec: &GemmSpec,
+    spec: &Admitted<GemmSpec>,
     a_elems: usize,
     tiles: Tiles,
     split: usize,
     a_source: impl FnOnce(&mut Kernel<'k>, ParamRef<'k, T, In>, &Option<Sc<'k>>, Sc<'k>) -> ASource<'k, T>,
 ) {
-    let GemmSpec { m, n, k: kk, ref batch, epilogue, cfg } = *spec;
+    let GemmSpec { m, n, k: kk, ref batch, epilogue } = **spec;
+    let cfg = spec.cfg();
     let [bm, bn, bk] = cfg.tile;
     let trips = kk / bk;
     let partial = split > 1;

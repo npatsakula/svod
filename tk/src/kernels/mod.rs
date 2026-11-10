@@ -1,5 +1,6 @@
-//! The kernels as tile programs: a spec (shapes, options, tile config) in, a
-//! [`Program`](crate::ir::Program) out, generic over the 16-bit element type.
+//! The kernels as tile programs: a spec (shapes, options) admitted with its
+//! tile config in, a [`Program`](crate::ir::Program) out, generic over the
+//! element type.
 
 pub mod attention;
 pub mod conv;
@@ -15,46 +16,142 @@ use std::ops::Deref;
 
 use crate::build::*;
 use crate::ir::*;
+use crate::ops::config::{Family, Planner, Rejected};
 
-/// A config the planner admitted for a problem on its device: feasible on
-/// the target for the problem's statics and claimed on its shape, the one
-/// admission path ([`Planner::admitted`](crate::ops::config::Planner)). A
-/// kernel spec takes its config as one, so a kernel is built from nothing
-/// the planner did not let through, and the checks the admission makes are
-/// not made again where the kernel is built. `'t` is the planner's borrow.
-/// A config no planner admitted is taken as one only through the `unsafe`
+/// A kernel spec and the config the planner admitted for it: the config is
+/// feasible on the planner's target for the problem the spec states and
+/// claimed on its shape, through the one admission path (each spec's
+/// `admitted`, which derives the problem from the spec itself). A kernel
+/// takes its spec as one, so a kernel is built from nothing the planner did
+/// not let through for that very spec, and the checks the admission makes
+/// are not made again where the kernel is built. `'t` is the planner's
+/// borrow. Neither half changes after admission: the spec is read through
+/// [`Deref`], the config through [`Admitted::cfg`]. A config no planner
+/// admitted for the spec is taken only through the `unsafe`
 /// [`Admitted::assume`].
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Admitted<'t, C>(C, PhantomData<&'t ()>);
+///
+/// A spec admitted for 4096³ does not run 40×40×72, nor a gated epilogue on
+/// a config admitted ungated: an admitted spec is read-only,
+///
+/// ```compile_fail,E0594
+/// # use svod_tk::kernels::{Admitted, gemm::GemmSpec};
+/// fn shrink(spec: &mut Admitted<'_, GemmSpec>) {
+///     spec.k = 72;
+/// }
+/// ```
+///
+/// is minted by admission alone,
+///
+/// ```compile_fail,E0451
+/// # use std::marker::PhantomData;
+/// # use svod_tk::kernels::{Admitted, gemm::GemmSpec};
+/// fn swap<'t>(admitted: Admitted<'t, GemmSpec>, other: GemmSpec) -> Admitted<'t, GemmSpec> {
+///     Admitted { spec: other, cfg: admitted.cfg(), planner: PhantomData }
+/// }
+/// ```
+///
+/// and is what a kernel takes:
+///
+/// ```compile_fail,E0308
+/// # use svod_tk::build::BF16;
+/// # use svod_tk::kernels::{Batch, gemm::{Epilogue, GemmSpec, gemm}};
+/// let spec = GemmSpec { m: 40, n: 40, k: 72, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT };
+/// gemm::<BF16>(&spec);
+/// ```
+///
+/// Taking a config as admitted without the planner is `unsafe`:
+///
+/// ```compile_fail,E0133
+/// # use svod_tk::kernels::{Admitted, gemm::{GemmCfg, GemmSpec}};
+/// fn forge(spec: GemmSpec, cfg: GemmCfg) -> Admitted<'static, GemmSpec> {
+///     Admitted::assume(spec, cfg)
+/// }
+/// ```
+#[derive(Clone, PartialEq)]
+pub struct Admitted<'t, S: Spec> {
+    spec: S,
+    cfg: S::Cfg,
+    planner: PhantomData<&'t ()>,
+}
 
-impl<C> Admitted<'_, C> {
-    pub(crate) fn mint(cfg: C) -> Self {
-        Self(cfg, PhantomData)
+/// A kernel's description: its shapes and options, everything but the
+/// config the planner admits for it ([`Admitted`]).
+pub trait Spec {
+    type Cfg: Copy + PartialEq + fmt::Debug;
+}
+
+/// A spec the planner admits: the problem it ranks and admits for it.
+pub(crate) trait Admits: Spec + Sized {
+    type Problem: Family<Cfg = Self::Cfg>;
+
+    fn problem(&self) -> Self::Problem;
+
+    /// `cfg` admitted for this spec on `planner`, or why it is not.
+    fn admit(self, planner: &Planner, cfg: Self::Cfg) -> Result<Admitted<'_, Self>, Rejected> {
+        planner.claim_of(&self.problem(), &cfg).map(|_| Admitted::mint(self, cfg))
     }
 
-    /// `cfg` taken as admitted: for a kernel built outside the op layer.
+    /// `cfg`, which `planner` ranked for this spec or the tuner derived from
+    /// one it ranked, admitted: a refusal is the planner's own inconsistency.
+    fn admit_ranked(self, planner: &Planner, cfg: Self::Cfg) -> Admitted<'_, Self>
+    where
+        Self: fmt::Debug,
+    {
+        let spec = format!("{self:?}");
+        self.admit(planner, cfg).unwrap_or_else(|why| panic!("{cfg:?} ranked for {spec} is refused: {why:?}"))
+    }
+}
+
+impl<'t, S: Spec> Admitted<'t, S> {
+    fn mint(spec: S, cfg: S::Cfg) -> Self {
+        Self { spec, cfg, planner: PhantomData }
+    }
+
+    /// `spec` with `cfg` taken as admitted: for a kernel built outside the
+    /// op layer.
     ///
     /// # Safety
     ///
     /// The kernel built from it checks nothing admission checks: where `cfg`
-    /// is not feasible on the launch's target for the problem, or its
-    /// claim does not fit the problem's shape, the kernel may read or write
+    /// is not feasible on the launch's target for `spec`'s problem, or its
+    /// claim does not fit the spec's shape, the kernel may read or write
     /// past its operands or compute the wrong values.
-    pub unsafe fn assume(cfg: C) -> Self {
-        Self::mint(cfg)
+    pub unsafe fn assume(spec: S, cfg: S::Cfg) -> Self {
+        Self::mint(spec, cfg)
+    }
+
+    /// The admitted config.
+    pub fn cfg(&self) -> S::Cfg {
+        self.cfg
+    }
+
+    /// The spec, its admission dropped.
+    pub fn into_spec(self) -> S {
+        self.spec
+    }
+
+    /// The spec `f` derives from this one, kept under its config: for the
+    /// op layer's own variants of an admitted spec (a measured batch, a
+    /// timed key length, a chunk of the rows), which the kernel runs within
+    /// what was admitted.
+    pub(crate) fn map<U: Spec<Cfg = S::Cfg>>(&self, f: impl FnOnce(S) -> U) -> Admitted<'t, U>
+    where
+        S: Clone,
+    {
+        Admitted::mint(f(self.spec.clone()), self.cfg)
     }
 }
 
-impl<C> Deref for Admitted<'_, C> {
-    type Target = C;
-    fn deref(&self) -> &C {
-        &self.0
+impl<S: Spec> Deref for Admitted<'_, S> {
+    type Target = S;
+    fn deref(&self) -> &S {
+        &self.spec
     }
 }
 
-impl<C: fmt::Debug> fmt::Debug for Admitted<'_, C> {
+impl<S: Spec + fmt::Debug> fmt::Debug for Admitted<'_, S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
+        f.debug_struct("Admitted").field("spec", &self.spec).field("cfg", &self.cfg).finish()
     }
 }
 

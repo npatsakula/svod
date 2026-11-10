@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use crate::atoms::{Core, Fill, GroupMmaAtom, Target};
 use crate::ir::{Axis, Schedule, Shape};
-use crate::kernels::Admitted;
 use crate::kernels::attention::{FaCfg, WARP_ROWS, narrowest_warp_rows};
 use crate::layouts::{Swizzle, WarpGrid, chunked, fills_in_chunks};
 
@@ -134,11 +133,6 @@ pub struct AttentionProblem {
 }
 
 impl AttentionProblem {
-    /// `cfg` admitted for this problem ([`Admitted`]), or why it is not.
-    pub fn admitted<'t>(&self, planner: &'t Planner, cfg: FaCfg) -> Result<Admitted<'t, FaCfg>, Rejected> {
-        planner.admitted(self, cfg)
-    }
-
     /// The blocks of the grid: a block a query tile, each of a split's key
     /// shares one.
     fn blocks(&self, cfg: &FaCfg) -> usize {

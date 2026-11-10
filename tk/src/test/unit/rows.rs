@@ -35,7 +35,7 @@ fn gemm_nt_epilogue(
         order: Default::default(),
         tail: None,
     };
-    gemm::<BF16>(&GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: epi, cfg: assumed(cfg) })
+    gemm::<BF16>(&assumed(GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: epi }, cfg))
 }
 
 fn norm_rows(norm_: Norm, rows: usize, d: usize, br: usize, eps: f64, residual: bool, bias: bool) -> Program {

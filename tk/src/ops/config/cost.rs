@@ -8,7 +8,6 @@
 use std::sync::Arc;
 
 use crate::atoms::{Device, Fill, Target};
-use crate::kernels::Admitted;
 use crate::kernels::attention::FaCfg;
 use crate::kernels::conv::ConvCfg;
 use crate::kernels::gemm::GemmCfg;
@@ -481,19 +480,13 @@ impl Planner {
         })
     }
 
-    /// A config's [claim](Claim) for `problem` through the one admission path:
-    /// feasible for the problem's statics ([`Family::feasible`]), then claimed on
-    /// its shape.
+    /// A config's [claim](Claim) for `problem` through the one admission path
+    /// (a spec's [`Admitted`](crate::kernels::Admitted) comes from it):
+    /// feasible for the problem's statics ([`Family::feasible`]), then
+    /// claimed on its shape.
     pub(crate) fn claim_of<P: Family>(&self, problem: &P, cfg: &P::Cfg) -> Result<Claim, Rejected> {
         let regs = P::feasible(cfg, &self.device.target, &problem.statics())?;
         problem.claim(self, cfg, regs)
-    }
-
-    /// `cfg` as [admitted](Admitted) for `problem`: feasible for its statics
-    /// on the target and claimed on its shape ([`Self::claim_of`]), the one
-    /// way a kernel spec takes a config.
-    pub(crate) fn admitted<P: Family>(&self, problem: &P, cfg: P::Cfg) -> Result<Admitted<'_, P::Cfg>, Rejected> {
-        self.claim_of(problem, &cfg).map(|_| Admitted::mint(cfg))
     }
 
     /// What a feasible config costs the planner's device and the registers

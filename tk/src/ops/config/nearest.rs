@@ -9,7 +9,6 @@ use svod_dtype::ScalarDType;
 
 use crate::atoms::{Fill, Target};
 use crate::ir::{Axis, Orient, Schedule, Shape};
-use crate::kernels::Admitted;
 use crate::kernels::attention::WARP_ROWS;
 use crate::kernels::nearest::{Floors, LANES, LaneQueue, Metric, NearestCfg, SelectCfg, select_runs};
 use crate::layouts::{TileLayout, WarpGrid, chunked, fills_in_chunks};
@@ -315,11 +314,6 @@ pub struct NearestProblem {
 }
 
 impl NearestProblem {
-    /// `cfg` admitted for this problem ([`Admitted`]), or why it is not.
-    pub fn admitted<'t>(&self, planner: &'t Planner, cfg: NearestCfg) -> Result<Admitted<'t, NearestCfg>, Rejected> {
-        planner.admitted(self, cfg)
-    }
-
     /// What `cfg` costs here, as [`GemmProblem::admit`]: [`Planner::price`] of
     /// its [`Claim`](super::cost::Claim). A candidate trip pays every wave's
     /// read of the candidate tile, its fill (every block reads every

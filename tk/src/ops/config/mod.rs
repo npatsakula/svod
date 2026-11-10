@@ -41,7 +41,7 @@ pub use self::nearest::NearestProblem;
 pub use self::norm::norm_candidates;
 pub use self::search::{Rejected, ShapeRejected, TargetRejected, has_kernels};
 
-pub(crate) use self::cost::{Claim, STEP, Weights, pair_op};
+pub(crate) use self::cost::{Claim, Family, STEP, Weights, pair_op};
 pub(crate) use self::facts::facts_of;
 
 #[cfg(test)]

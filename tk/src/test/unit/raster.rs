@@ -90,7 +90,7 @@ fn a_gemm_walking_any_raster_computes_its_product(rows: usize) {
     let (m, n, k) = (200, 150, 64);
     let order = TileOrder::grouped(rows).expect("a group of rows");
     let cfg = GemmCfg { order, ..gemm_cfg([32, 64, 32], 2, [1, 2], false) };
-    let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg: assumed(cfg) };
+    let spec = assumed(GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT }, cfg);
     let mut seed = 11;
     let a = super::rounded(ScalarDType::BFloat16, m * k, &mut seed, |x| x);
     let b = super::rounded(ScalarDType::BFloat16, n * k, &mut seed, |x| x);

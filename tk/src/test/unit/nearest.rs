@@ -18,6 +18,7 @@ use crate::kernels::nearest::{
     Floors, Invalid, LaneQueue, Metric, NearestCfg, NearestMergeSpec, NearestSpec, SCRATCH, SelectCfg, SelectSpec,
     nearest, nearest_merge, nearest_select, share_stride,
 };
+use crate::kernels::{Admits, Admitted};
 use crate::lower::Lowering;
 use crate::ops::config::{self, Planner};
 use crate::ops::{self as tk, Nearest};
@@ -216,9 +217,10 @@ impl Case {
         params
     }
 
-    fn spec(&self, depth: usize, cfg: NearestCfg, k: usize) -> NearestSpec<'static> {
+    fn spec(&self, depth: usize, cfg: NearestCfg, k: usize) -> Admitted<'static, NearestSpec> {
         let (n, m, metric, floors, groups) = (self.n, self.m, self.metric, self.floors(), self.groups.is_some());
-        NearestSpec { n, m, d: depth, metric, floors, groups, k, cfg: assumed(cfg), live: Default::default() }
+        let dtype = if self.f16 { ScalarDType::Float16 } else { ScalarDType::BFloat16 };
+        assumed(NearestSpec { n, m, d: depth, dtype, metric, floors, groups, k, live: Default::default() }, cfg)
     }
 
     /// The kernel of `k` scores a row under `cfg` at `depth`, in the case's type.
@@ -421,8 +423,16 @@ impl Case {
 
 /// `n` rows against `m` candidates at depth `d` under `metric`, `k` scores a
 /// row, neither floors nor groups, nothing live: the spec most tests launch.
-pub(super) fn plain(n: usize, m: usize, d: usize, metric: Metric, k: usize, cfg: NearestCfg) -> NearestSpec<'static> {
-    NearestSpec { n, m, d, metric, floors: NONE, groups: false, k, cfg: assumed(cfg), live: Default::default() }
+pub(super) fn plain(
+    n: usize,
+    m: usize,
+    d: usize,
+    metric: Metric,
+    k: usize,
+    dtype: ScalarDType,
+    cfg: NearestCfg,
+) -> Admitted<'static, NearestSpec> {
+    assumed(NearestSpec { n, m, d, dtype, metric, floors: NONE, groups: false, k, live: Default::default() }, cfg)
 }
 
 /// The interpreter's merge of a split kernel's shares.
@@ -1132,7 +1142,7 @@ fn split_too(planner: &Planner, case: &Case, depth: usize, k: usize, ranked: &[N
 #[test_case(crate::atoms::sm86(), "@llvm.nvvm.vote.any.sync("; "sm_86")]
 fn a_resident_trip_votes_before_it_places_its_least(target: Target, vote: &str) {
     let device = crate::sweep::declared(target);
-    let case = |cfg| plain(300, 500, 64, Metric::NegDot, 1, cfg);
+    let case = |cfg| plain(300, 500, 64, Metric::NegDot, 1, ScalarDType::BFloat16, cfg);
     for (cfg, votes) in [(NearestCfg::new(64, 32, 2), true), (NearestCfg::streamed(64, 32, 32, 2), false)] {
         let ir = crate::sweep::render(nearest::<BF16>(&case(cfg)), &Lowering::new(&device));
         assert_eq!(ir.contains(vote), votes, "{cfg:?}");
@@ -1259,7 +1269,7 @@ fn every_lane_queue_lists_its_least(order: Order) {
 #[test_case(crate::atoms::sm86(), "@llvm.nvvm.vote.any.sync("; "sm_86")]
 fn a_list_votes_before_its_rounds(target: Target, vote: &str) {
     let device = crate::sweep::declared(target);
-    let case = |cfg| plain(300, 500, 64, Metric::NegDot, 8, cfg);
+    let case = |cfg| plain(300, 500, 64, Metric::NegDot, 8, ScalarDType::BFloat16, cfg);
     for cfg in [NearestCfg::new(64, 32, 2), NearestCfg::streamed(64, 32, 32, 2)] {
         let ir = crate::sweep::render(nearest::<BF16>(&case(cfg)), &Lowering::new(&device));
         assert!(ir.contains(vote), "{cfg:?}");
@@ -1281,7 +1291,7 @@ fn a_list_is_held_beside_its_rows(target: Target) {
     for (cfg, k) in
         [(NearestCfg::new(64, 32, 2), 8), (NearestCfg::streamed(64, 64, 32, 2), 16), (NearestCfg::new(32, 16, 2), 3)]
     {
-        let spec = plain(300, 500, 64, Metric::SquaredL2, k, cfg);
+        let spec = plain(300, 500, 64, Metric::SquaredL2, k, ScalarDType::BFloat16, cfg);
         let laid = super::laid(nearest::<BF16>(&spec), &device).unwrap();
         let (mut lists, mut deals) = (0, 0);
         for (_, stmt) in laid.walk() {
@@ -1342,7 +1352,7 @@ fn a_list_is_dealt_in_lane_under_measured_costs(target: Target, costs: crate::at
                 .iter()
                 .filter(move |c| c.queue.is_some() && c.bkv == bkv)
                 .filter_map(|c| {
-                    let spec = plain(n, m, d, p.metric, k, *c);
+                    let spec = plain(n, m, d, p.metric, k, dtype, *c);
                     let prog = match dtype {
                         ScalarDType::Int8 => nearest::<I8>(&spec),
                         _ => nearest::<F16>(&spec),
@@ -1451,7 +1461,7 @@ fn nearest_matches_the_graph(n: usize, m: usize, d: usize, draw: Draw, self_join
         // Split, the ranking's first config, its candidates in `splits` shares.
         let split = tk::nearest::picking(|_, ranked, spec| {
             let cfg = shared_out(NearestCfg { splits, ..ranked[0] }, spec.m);
-            NearestSpec { cfg: assumed(cfg), ..spec }
+            assumed(spec.into_spec(), cfg)
         });
         let (score, index) = match splits {
             1 => tk::nearest(&x, &c, opts).unwrap(),
@@ -1525,7 +1535,7 @@ fn lists_match_the_graph(n: usize, m: usize, d: usize, draw: Draw, self_join: bo
             let split = tk::nearest::picking(|_, ranked, spec| {
                 let first = ranked.iter().find(|c| c.select.is_none()).expect("a way that splits");
                 let cfg = shared_out(NearestCfg { splits, ..*first }, spec.m);
-                NearestSpec { cfg: assumed(cfg), ..spec }
+                assumed(spec.into_spec(), cfg)
             });
             let (score, index) = match splits {
                 1 => tk::k_nearest(&x, &c, k, opts).unwrap(),
@@ -1539,11 +1549,11 @@ fn lists_match_the_graph(n: usize, m: usize, d: usize, draw: Draw, self_join: bo
             for matrix in (k > config::REGISTER_K).then_some([false, true]).into_iter().flatten() {
                 // The way's best ranked config, or where the ranking prunes it, its first admitted.
                 let way = tk::nearest::picking(|planner, ranked, spec| {
-                    let p = tk::nearest::problem(&spec, svod_dtype::ScalarDType::Float16);
+                    let p = spec.problem();
                     let lattice = p.lattice(&planner.device.target);
                     let admitted = lattice.iter().filter(|c| p.admit(planner, c).is_ok());
                     let mut ways = ranked.iter().chain(admitted).filter(|c| c.select.is_some() == matrix);
-                    NearestSpec { cfg: assumed(*ways.next().expect("a way of a long list")), ..spec }
+                    assumed(spec.into_spec(), *ways.next().expect("a way of a long list"))
                 });
                 let (score, index) = tk::nearest::picked(&x, &c, k, opts, None, way).unwrap();
                 super::ops::assert_kernel(&score, if matrix { "nearest_select" } else { "nearest" });
@@ -1570,7 +1580,7 @@ fn a_listing_share_past_the_last_step_lists_nothing() {
         let (x, c, opts) = operands(&case, DType::BFloat16, false);
         let select = Some(SelectCfg { warps: 4, queue: 2, filter: true });
         let cfg = NearestCfg { select, ..NearestCfg::new(16, 32, 2) };
-        let pick = tk::nearest::picking(|_, _, spec| NearestSpec { cfg: assumed(cfg), ..spec });
+        let pick = tk::nearest::picking(|_, _, spec| assumed(spec.into_spec(), cfg));
         let (score, index) = tk::nearest::picked(&x, &c, k, options(&case, &opts), None, pick).unwrap();
         super::ops::assert_kernel(&score, "nearest_select");
         case.check_list("shares", k, &host(&score), &host(&index), 1e-3, false);
@@ -1593,7 +1603,7 @@ fn a_filtered_score_matrix_keeps_the_lists(bk: Option<usize>, splits: usize) {
         let (x, c, opts) = operands(&case, DType::BFloat16, false);
         let select = Some(SelectCfg { warps: 4, queue: 2, filter: true });
         let cfg = NearestCfg { select, bk, splits, ..NearestCfg::new(64, 64, 2) };
-        let pick = tk::nearest::picking(|_, _, spec| NearestSpec { cfg: assumed(cfg), ..spec });
+        let pick = tk::nearest::picking(|_, _, spec| assumed(spec.into_spec(), cfg));
         let (score, index) = tk::nearest::picked(&x, &c, k, options(&case, &opts), None, pick).unwrap();
         super::ops::assert_kernel(&score, "nearest_select");
         case.check_list("filtered", k, &host(&score), &host(&index), 1e-3, false);
@@ -1807,7 +1817,11 @@ fn time_list(planner: &Planner, p: config::NearestProblem, dtype: DType) {
     if !timed.contains(&pick) {
         timed.push(pick);
     }
-    let spec = |cfg| NearestSpec { n, m: n, d, metric, floors, groups, k, cfg: assumed(cfg), live: Default::default() };
+    let scalar = dtype.scalar().expect("a kernel dtype");
+    let spec = |cfg| {
+        let live = Default::default();
+        assumed(NearestSpec { n, m: n, d, dtype: scalar, metric, floors, groups, k, live }, cfg)
+    };
     let ns = super::measure(timed.iter().map(|&cfg| tk::nearest::programs(planner, dtype.clone(), &spec(cfg))));
     eprintln!(
         "== nearest {n}x{n}x{d} k{k} {dtype:?} {metric:?} {floors:?} groups={groups}: {} admitted",
@@ -1864,7 +1878,7 @@ fn knn_probe() {
                             time_list(&planner, p, DType::Float16);
                         }
                         let (_, pick) = device_nearest(&planner, p, DType::Float16);
-                        let spec = plain(n, m, d, metric, k, pick);
+                        let spec = plain(n, m, d, metric, k, ScalarDType::Float16, pick);
                         let [ns] = super::measure([tk::nearest::programs(&planner, DType::Float16, &spec)])[..] else {
                             unreachable!("one candidate")
                         };
@@ -1927,7 +1941,7 @@ fn rerank_probe() {
                             return (None, None);
                         }
                         let (_, pick) = device_nearest(&planner, p, DType::Scalar(dtype));
-                        let spec = plain(n, m, d, metric, k, pick);
+                        let spec = plain(n, m, d, metric, k, dtype, pick);
                         let [ns] = super::measure([tk::nearest::programs(&planner, DType::Scalar(dtype), &spec)])[..]
                         else {
                             unreachable!("one candidate")
@@ -2067,11 +2081,10 @@ fn time_gemm(planner: &Planner, m: usize, n: usize, k: usize) {
     use crate::kernels::Batch;
     use crate::kernels::gemm::{Epilogue, GemmSpec, gemm};
     let spec =
-        GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg: assumed(super::device::BIG) };
+        assumed(GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default() }, super::device::BIG);
     let (_, cfg) = super::device::device_gemms(planner, &spec);
     let [ns] =
-        super::measure([vec![(gemm::<BF16>(&GemmSpec { cfg: assumed(cfg), ..spec }), cfg.lowering(&planner.device))]])
-            [..]
+        super::measure([vec![(gemm::<BF16>(&assumed(spec.into_spec(), cfg)), cfg.lowering(&planner.device))]])[..]
     else {
         unreachable!("one candidate")
     };
@@ -2085,9 +2098,12 @@ fn time_gemm(planner: &Planner, m: usize, n: usize, k: usize) {
 /// The configs the tuner admits for the self-join `p` on the device in
 /// `dtype`, and its pick.
 fn device_nearest(planner: &Planner, p: config::NearestProblem, dtype: DType) -> (Vec<NearestCfg>, NearestCfg) {
-    let config::NearestProblem { n, m, d, metric, floors, groups, k, .. } = p;
+    let config::NearestProblem { n, m, d, dtype: scalar, metric, floors, groups, k } = p;
     let ranked = planner.nearest_ranked(p);
-    let spec = |cfg| NearestSpec { n, m, d, metric, floors, groups, k, cfg: assumed(cfg), live: Default::default() };
+    let spec = |cfg| {
+        let live = Default::default();
+        assumed(NearestSpec { n, m, d, dtype: scalar, metric, floors, groups, k, live }, cfg)
+    };
     let build = |cfg: NearestCfg| tk::nearest::programs(planner, dtype.clone(), &spec(cfg));
     let shape = [n, m, d, k];
     let shape = if k == 1 { &shape[..3] } else { &shape[..] };
@@ -2158,7 +2174,7 @@ fn a_swapped_product_folds_a_row_in_lanes(target: Target, direct: usize, swapped
     let how = target.lane_move;
     let planner = super::planner(target.clone());
     let cfg = NearestCfg { warp_rows: 32, ..NearestCfg::new(128, 64, 2) };
-    let spec = plain(1000, 1000, 64, Metric::SquaredL2, 1, cfg);
+    let spec = plain(1000, 1000, 64, Metric::SquaredL2, 1, ScalarDType::BFloat16, cfg);
     fn pin(block: &mut Block, to: Orient) {
         for s in &mut block.0 {
             match s {
@@ -2218,7 +2234,7 @@ fn a_swapped_product_folds_a_row_in_lanes(target: Target, direct: usize, swapped
 #[ignore = "perf probe: needs a GPU"]
 fn tuning_probe() {
     use crate::kernels::Batch;
-    use crate::kernels::attention::{AttnMask, AttnSpec, FaCfg, attention};
+    use crate::kernels::attention::{AttnMask, FaCfg, attention};
     use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
     use crate::ops::config::{AttentionProblem, GemmProblem, NearestProblem};
     let var = |name| std::env::var(name).ok();
@@ -2281,16 +2297,9 @@ fn tuning_probe() {
                 k,
             };
             let ranked = planner.nearest_ranked(p);
-            let spec = |cfg| NearestSpec {
-                n,
-                m: n,
-                d,
-                metric,
-                floors,
-                groups: false,
-                k,
-                cfg: assumed(cfg),
-                live: Default::default(),
+            let spec = |cfg| {
+                let (dtype, live) = (ScalarDType::BFloat16, Default::default());
+                assumed(NearestSpec { n, m: n, d, dtype, metric, floors, groups: false, k, live }, cfg)
             };
             let build = |cfg: NearestCfg| tk::nearest::programs(&planner, DType::BFloat16, &spec(cfg));
             let salt = (crate::ops::DEVICE_TEST, metric, floors, false);
@@ -2310,17 +2319,8 @@ fn tuning_probe() {
         for s in list("TUNE_GEMMS", "4096x4096x4096") {
             let [m, n, k] = s[..] else { panic!("MxNxK") };
             let ranked = planner.gemm_ranked(1, m, n, k, &Epilogue::DEFAULT);
-            let spec = GemmSpec {
-                m,
-                n,
-                k,
-                batch: Batch::Static(1),
-                epilogue: Epilogue::default(),
-                cfg: assumed(super::device::BIG),
-            };
-            let build = |cfg: GemmCfg| {
-                vec![(gemm::<BF16>(&GemmSpec { cfg: assumed(cfg), ..spec.clone() }), cfg.lowering(&planner.device))]
-            };
+            let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default() };
+            let build = |cfg: GemmCfg| vec![(gemm::<BF16>(&assumed(spec.clone(), cfg)), cfg.lowering(&planner.device))];
             let p = GemmProblem::new(1, m, n, k, &Epilogue::DEFAULT);
             let work = 2.0 * (m * n * k) as f64;
             let key = ("gemm", &[1, m, n, k][..], crate::ops::DEVICE_TEST);
@@ -2339,12 +2339,8 @@ fn tuning_probe() {
             let mask = AttnMask { causal: causal == 1, ..AttnMask::default() };
             let spec = super::attention::probe_spec(batch, heads, t, t, d, mask);
             let ranked = planner.attention_ranked(batch * heads, t, t, d, mask.causal, false);
-            let build = |cfg: FaCfg| {
-                vec![(
-                    attention::<BF16>(&AttnSpec { cfg: assumed(cfg), ..spec.clone() }),
-                    cfg.lowering(&planner.device),
-                )]
-            };
+            let build =
+                |cfg: FaCfg| vec![(attention::<BF16>(&assumed(spec.clone(), cfg)), cfg.lowering(&planner.device))];
             let p = AttentionProblem { tiles: batch * heads, t, tk: t, d, causal: mask.causal, bias: false };
             let work = 4.0 * (batch * heads * t * t * d) as f64 / if mask.causal { 2.0 } else { 1.0 };
             let shape = [batch, t, t, heads, d];
@@ -2556,7 +2552,8 @@ fn list_ir_dump() {
             ..NearestCfg::new(v[0], v[1], v[2])
         };
         for &k in &ks {
-            let spec = plain(1 << 14, 1 << 14, 128, Metric::SquaredL2, k, cfg);
+            let dtype = if int8 { ScalarDType::Int8 } else { ScalarDType::Float16 };
+            let spec = plain(1 << 14, 1 << 14, 128, Metric::SquaredL2, k, dtype, cfg);
             let start = std::time::Instant::now();
             let prog = if int8 { nearest::<I8>(&spec) } else { nearest::<F16>(&spec) };
             let ir = crate::sweep::render(prog, &Lowering::new(&device));
@@ -2603,7 +2600,7 @@ fn list_time_probe() {
         })
         .collect();
     for &k in &ks {
-        let spec = |cfg| plain(n, m, d, Metric::SquaredL2, k, cfg);
+        let spec = |cfg| plain(n, m, d, Metric::SquaredL2, k, ScalarDType::Float16, cfg);
         for run in 0..runs {
             let ns =
                 super::measure(cfgs.iter().map(|&cfg| tk::nearest::programs(&planner, DType::Float16, &spec(cfg))));
@@ -2662,7 +2659,7 @@ fn cfg_time_probe() {
     let [n, m, d, k] = shape[..] else { panic!("CFG_SHAPE is n,m,d,k") };
     let runs: usize = var("CFG_RUNS").parse().unwrap_or(3);
     let cfgs: Vec<NearestCfg> = var("CFGS").split(';').map(parsed_cfg).collect();
-    let spec = |cfg| plain(n, m, d, Metric::NegDot, k, cfg);
+    let spec = |cfg| plain(n, m, d, Metric::NegDot, k, ScalarDType::Float16, cfg);
     for run in 0..runs {
         let ns = super::measure(cfgs.iter().map(|&cfg| tk::nearest::programs(&planner, DType::Float16, &spec(cfg))));
         for (cfg, ns) in cfgs.iter().zip(ns) {
@@ -2754,7 +2751,7 @@ fn a_long_dispatch_stamps_its_duration() {
         select: Some(SelectCfg { warps: 4, queue: 2, filter: true }),
         ..NearestCfg::streamed(128, 128, 32, 2)
     };
-    let spec = plain(256, 1 << 20, 768, Metric::NegDot, 64, cfg);
+    let spec = plain(256, 1 << 20, 768, Metric::NegDot, 64, ScalarDType::Float16, cfg);
     let prog = crate::ops::nearest::programs(&planner, DType::Float16, &spec).remove(0).0;
     let pool = crate::tune::ScratchPool::default();
     let (mut plan, vars) = crate::tune::scratch_plan(prog, &Lowering::new(&planner.device), &pool).expect("a plan");
@@ -2841,7 +2838,7 @@ fn assert_covered(pick: NearestCfg, n: usize, m: usize, d: usize, k: usize, metr
     let (x, c) = (x.cast(DType::Float16).contiguous(), c.cast(DType::Float16).contiguous());
     let opts = Nearest { metric, ..Nearest::default() };
     let (score, index) =
-        crate::ops::nearest::picked(&x, &c, k, opts, None, |_, _, spec| NearestSpec { cfg: assumed(pick), ..spec })
+        crate::ops::nearest::picked(&x, &c, k, opts, None, |_, _, spec| assumed(spec.into_spec(), pick))
             .expect("the pick runs");
     let (score, index) = (host(&score), host(&index));
     let checked = n.min(256).min((1usize << 33) / (m * d).max(1)).max(1);
@@ -2919,7 +2916,7 @@ fn rows_in_launches_list_what_one_launch_does(k: usize, metric: Metric, masks: b
         groups: masks.then_some((&row_group, &col_group)),
         ..Nearest::default()
     };
-    let cfg = tk::nearest::picking(|_, ranked, spec| NearestSpec { cfg: assumed(ranked[0]), ..spec });
+    let cfg = tk::nearest::picking(|_, ranked, spec| assumed(spec.into_spec(), ranked[0]));
     let (one_score, one_index) = tk::nearest::picked(&x, &c, k, opts, None, cfg).unwrap();
     let mut pick = cfg;
     let (score, index) = tk::nearest::in_launches(&x, &c, k.into(), opts, None, (n, rows), &mut pick).unwrap();
@@ -2938,7 +2935,7 @@ fn rows_in_launches_list_what_one_launch_does(k: usize, metric: Metric, masks: b
 fn a_parameter_past_i32_counts_in_i64(n: usize, wide: bool) {
     let target = super::targets::amd(AmdArch::Gfx942, 304);
     let cfg = NearestCfg { warp_rows: 32, bk: Some(32), ..NearestCfg::new(128, 128, 2) };
-    let spec = plain(n, 1024, 768, Metric::NegDot, 1, cfg);
+    let spec = plain(n, 1024, 768, Metric::NegDot, 1, ScalarDType::Float16, cfg);
     let lowering = Lowering::new(&super::declared(target));
     let text = crate::lower::render(nearest::<F16>(&spec), &lowering).unwrap();
     assert_eq!(text.lines().any(|l| l.contains("mul") && l.contains("i64")), wide);
@@ -2978,7 +2975,7 @@ fn a_live_list_past_a_launch_stays_lazy() {
     let cfg =
         NearestCfg { warp_rows: 16, bk: Some(32), lanes: Some(LaneQueue::PORTABLE), ..NearestCfg::new(128, 128, 2) };
     let (score, _) = crate::ops::nearest::picked(&x, &x, k.as_sint(), Nearest::default(), None, |_, _, spec| {
-        NearestSpec { cfg: assumed(cfg), ..spec }
+        assumed(spec.into_spec(), cfg)
     })
     .unwrap();
     super::ops::assert_kernel(&score, "nearest");
@@ -3010,7 +3007,7 @@ fn knn_past_i32_elements(n: usize, m: usize, k: usize) {
     let (score, index) = if n == m {
         tk::nearest::k_nearest(&x, &c, k, opts).expect("the op runs")
     } else {
-        crate::ops::nearest::picked(&x, &c, k, opts, None, |_, _, spec| NearestSpec { cfg: assumed(pick), ..spec })
+        crate::ops::nearest::picked(&x, &c, k, opts, None, |_, _, spec| assumed(spec.into_spec(), pick))
             .expect("the pick runs")
     };
     let (score, index) = (host(&score), host(&index));
@@ -3032,8 +3029,7 @@ fn a_static_plan_past_the_wait_limit_finishes() {
     let opts = Nearest { metric: Metric::NegDot, ..Nearest::default() };
     let pick = NearestCfg { warp_rows: 32, bk: Some(32), ..NearestCfg::new(128, 128, 2) };
     let run = |c: &Tensor, x: &Tensor| {
-        crate::ops::nearest::picked(x, c, 1, opts, None, |_, _, spec| NearestSpec { cfg: assumed(pick), ..spec })
-            .unwrap()
+        crate::ops::nearest::picked(x, c, 1, opts, None, |_, _, spec| assumed(spec.into_spec(), pick)).unwrap()
     };
     let draw = |rows: usize| {
         let device = svod_dtype::default_device::default_device();

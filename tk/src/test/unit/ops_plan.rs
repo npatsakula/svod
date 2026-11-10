@@ -1268,8 +1268,7 @@ fn an_unscaled_epilogue_keeps_its_tune_key() {
     assert_eq!(format!("{plain:?}"), "Epilogue { bias: true, act: None, gated: false, residual: true }");
     let half = Epilogue { scale: Some(Scale::new(0.5)), ..plain };
     assert_eq!(format!("{half:?}"), "Epilogue { bias: true, act: None, gated: false, residual: true, scale: 0.5 }");
-    let spec =
-        |epilogue| GemmSpec { m: 64, n: 64, k: 64, batch: Batch::Static(1), epilogue, cfg: assumed(BIG_MEASURED) };
+    let spec = |epilogue| assumed(GemmSpec { m: 64, n: 64, k: 64, batch: Batch::Static(1), epilogue }, BIG_MEASURED);
     assert_ne!(gemm::<BF16T>(&spec(plain)), gemm::<BF16T>(&spec(half)));
 }
 
@@ -2240,4 +2239,28 @@ fn an_8_bit_search_is_priced_at_its_step(target: Target, costs: Costs, low: f64,
 /// flight, its re-reads through the whole of it.
 fn stream(unique: f64, shared: f64) -> config::Stream {
     config::Stream { unique, shared, ..config::Stream::default() }
+}
+
+/// A config is admitted for the spec it runs, not for another: the lead of
+/// a 4096³ GEMM is refused for 40×40 over a K its step does not divide
+/// (built from the 4096³ admission, that kernel dropped the K tail), and
+/// some lead that holds an ungated weight is refused for the gated one,
+/// whose second ring of B tiles it has no room for.
+#[test]
+fn a_config_is_admitted_for_its_own_spec_alone() {
+    let planner = planner(sm86());
+    let spec = |m, n, k, gated| {
+        let epilogue = Epilogue { gated, ..Epilogue::DEFAULT };
+        GemmSpec { m, n, k, batch: Batch::Static(1), epilogue }
+    };
+    let ranked = planner.gemm_ranked(1, 4096, 4096, 4096, &Epilogue::DEFAULT);
+    let lead = ranked[0];
+    assert!(spec(4096, 4096, 4096, false).admitted(&planner, lead).is_ok());
+    let small = spec(40, 40, lead.tile[2] + 8, false).admitted(&planner, lead);
+    assert_eq!(small.err(), Some(config::Rejected::Shape(config::ShapeRejected::Divides)));
+    let overflows = |c: &GemmCfg| {
+        let why = spec(4096, 4096, 4096, true).admitted(&planner, *c).err();
+        matches!(why, Some(config::Rejected::Target(config::TargetRejected::Smem { .. })))
+    };
+    assert!(ranked.iter().any(overflows), "every lead holds a gated weight: {ranked:?}");
 }

@@ -3,11 +3,13 @@
 //! and `K = kh·kw·cin` walked tap-major, one pipeline over every tap.
 
 use super::gemm::{Epilogue, GemmCfg, GemmSpec, SplitMergeSpec, Tiles, mainloop_gemm, split_merge};
-use super::{Admitted, Batch};
+use super::{Admits, Admitted, Batch, Spec};
 use crate::atoms::Device;
 use crate::build::*;
 use crate::ir::*;
 use crate::lower::Lowering;
+use crate::ops::config::{ConvProblem, Planner, Rejected};
+use crate::ops::shape::{Extent, conv_grid};
 
 /// Shapes of one image's convolution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -46,13 +48,14 @@ impl ConvGeom {
     }
 }
 
+/// A convolution; a kernel runs it under its GEMM body's config admitted
+/// for it ([`ConvSpec::admitted`]).
 #[derive(Clone, Debug, PartialEq)]
-pub struct ConvSpec<'t> {
+pub struct ConvSpec {
     /// A static batch folds into `M`; a bound one walks grid z.
     pub batch: Batch,
     pub geom: ConvGeom,
     pub epilogue: Epilogue,
-    pub cfg: Admitted<'t, GemmCfg>,
     /// Reduction splits over grid z (a static batch only): the kernel writes
     /// f32 partials and [`split_merge`] adds them under the epilogue.
     pub split: usize,
@@ -69,15 +72,35 @@ pub struct ConvCfg {
 /// one pick the lattice does not search.
 const MERGE_TILE: [usize; 2] = [32, 32];
 
-impl<'t> ConvSpec<'t> {
+impl Spec for ConvSpec {
+    type Cfg = GemmCfg;
+}
+
+impl Admits for ConvSpec {
+    type Problem = ConvProblem;
+
+    fn problem(&self) -> ConvProblem {
+        let bound = matches!(self.batch, Batch::Var(_));
+        let (batches, m) = conv_grid(&Extent { dims: vec![self.batch.capacity()], var: bound }, &self.geom);
+        ConvProblem::new(batches, m, &self.geom, &self.epilogue)
+    }
+}
+
+impl ConvSpec {
+    /// `cfg`'s GEMM body [admitted](Admitted) for this convolution on
+    /// `planner`, or why it is not; its split is the tuner's.
+    pub fn admitted(self, planner: &Planner, cfg: GemmCfg) -> Result<Admitted<'_, Self>, Rejected> {
+        self.admit(planner, cfg)
+    }
+
     /// The GEMM this convolution is: rows, columns, reduction and grid batch.
-    pub fn gemm(&self) -> GemmSpec<'t> {
+    pub fn gemm(&self) -> GemmSpec {
         let [ho, wo] = self.geom.out_hw();
         let (m, batch) = match self.batch {
             Batch::Static(n) => (n * ho * wo, Batch::Static(1)),
             ref var => (ho * wo, var.clone()),
         };
-        GemmSpec { m, n: self.geom.cout, k: self.geom.k(), batch, epilogue: self.epilogue, cfg: self.cfg }
+        GemmSpec { m, n: self.geom.cout, k: self.geom.k(), batch, epilogue: self.epilogue }
     }
 
     /// The merge of a split convolution.
@@ -92,11 +115,18 @@ impl<'t> ConvSpec<'t> {
             parts: None,
         }
     }
+}
+
+impl<'t> Admitted<'t, ConvSpec> {
+    /// The GEMM this convolution is, under the convolution's config.
+    pub fn gemm(&self) -> Admitted<'t, GemmSpec> {
+        self.map(|conv| conv.gemm())
+    }
 
     /// The programs to launch in order with their lowerings: the convolution,
     /// or its partials and their merge.
     pub fn programs<T: Half>(&self, device: &Device) -> Vec<(Program, Lowering)> {
-        let mut out = vec![(conv::<T>(self), self.cfg.lowering(device))];
+        let mut out = vec![(conv::<T>(self), self.cfg().lowering(device))];
         if self.split > 1 {
             let merge = self.merge();
             out.push((split_merge::<T>(&merge), Lowering::new(device)));
@@ -110,16 +140,16 @@ impl<'t> ConvSpec<'t> {
 /// `y [batch, ho, wo, cout]`; split, only `x`, `w` and the f32 partials
 /// `[split, batch·ho·wo, cout]`. `cin` must be a multiple of `bk`, so a K
 /// step never straddles two taps.
-pub fn conv<T: Half>(spec: &ConvSpec) -> Program {
-    let g = spec.geom;
+pub fn conv<T: Half>(spec: &Admitted<ConvSpec>) -> Program {
+    let (g, cfg) = (spec.geom, spec.cfg());
     let gemm = spec.gemm();
-    let bk = spec.cfg.tile[2];
+    let bk = cfg.tile[2];
     assert!(g.cin.is_multiple_of(bk), "cin is a multiple of bk");
     let images = match spec.batch {
         Batch::Static(n) => n,
         Batch::Var(_) => 1,
     };
-    let (m, slices, shape) = (gemm.m, spec.cfg.slices(), Shape::new(spec.cfg.tile[0], bk));
+    let (m, slices, shape) = (gemm.m, cfg.slices(), Shape::new(cfg.tile[0], bk));
     mainloop_gemm::<T>("conv", &gemm, images * g.h * g.w * g.cin, Tiles::Grid, spec.split, |_k, x, bb, row0| {
         let base = bb.clone().map_or(Sc::from(0), |b| b * (g.h * g.w * g.cin));
         Box::new(move |k, step: Sc<'_>, koff| {

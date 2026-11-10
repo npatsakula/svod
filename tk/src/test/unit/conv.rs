@@ -12,6 +12,7 @@ use crate::atoms::{Target, sm86};
 use crate::build::F16;
 use crate::interp::{round_to, run};
 use crate::ir::Schedule;
+use crate::kernels::Admitted;
 use crate::kernels::conv::{ConvCfg, ConvGeom, ConvSpec, conv};
 use crate::kernels::gemm::{Epilogue, GemmCfg};
 use crate::kernels::{Act, Batch};
@@ -89,7 +90,7 @@ pub(super) fn tolerance(epi: Epilogue) -> f64 {
 
 fn check_interp(g: ConvGeom, batch: Batch, epi: Epilogue, c: GemmCfg) {
     let images = batch.capacity();
-    let prog = conv::<F16>(&ConvSpec { batch: batch.clone(), geom: g, epilogue: epi, cfg: assumed(c), split: 1 });
+    let prog = conv::<F16>(&assumed(ConvSpec { batch: batch.clone(), geom: g, epilogue: epi, split: 1 }, c));
     let params = inputs(&g, images, epi, 3);
     let want = reference(&g, images, epi, &params);
     let vars: Vec<(&str, i64)> = match &batch {
@@ -123,13 +124,10 @@ fn a_bound_batch_walks_grid_z() {
 #[test_case(9, Epilogue { out_f32: true, ..SILU_BIAS }; "a split per tap, f32 out")]
 fn split_conv_matches_the_direct_convolution(split: usize, epi: Epilogue) {
     let (g, images) = (geom([7, 6], 32, 40, 3, 1, 1, 1), 2);
-    let spec = ConvSpec {
-        batch: Batch::Static(images),
-        geom: g,
-        epilogue: epi,
-        cfg: assumed(gemm_cfg([32, 32, 32], 2, [2, 2], true)),
-        split,
-    };
+    let spec = assumed(
+        ConvSpec { batch: Batch::Static(images), geom: g, epilogue: epi, split },
+        gemm_cfg([32, 32, 32], 2, [2, 2], true),
+    );
     let params = inputs(&g, images, epi, 6);
     let want = reference(&g, images, epi, &params);
     let [ho, wo] = g.out_hw();
@@ -148,13 +146,10 @@ fn split_conv_matches_the_direct_convolution(split: usize, epi: Epilogue) {
 fn an_inf_reaches_only_the_windows_over_it() {
     let g = geom([6, 6], 16, 8, 3, 1, 1, 1);
     let epi = Epilogue::DEFAULT;
-    let prog = conv::<F16>(&ConvSpec {
-        batch: Batch::Static(1),
-        geom: g,
-        epilogue: epi,
-        cfg: assumed(gemm_cfg([32, 32, 16], 2, [2, 2], true)),
-        split: 1,
-    });
+    let prog = conv::<F16>(&assumed(
+        ConvSpec { batch: Batch::Static(1), geom: g, epilogue: epi, split: 1 },
+        gemm_cfg([32, 32, 16], 2, [2, 2], true),
+    ));
     let mut params = inputs(&g, 1, epi, 5);
     params[0][0] = f64::INFINITY;
     let y = run(&prog, params, &[]).unwrap().pop().unwrap();
@@ -327,7 +322,7 @@ fn graph_reference(g: &ConvGeom, images: usize, epi: Epilogue, p: &[Vec<f64>]) -
 }
 
 /// The kernel's output for `params` on the device, as f32.
-fn on_device(spec: &ConvSpec, target: &crate::atoms::Target, params: &[Vec<f64>]) -> Vec<f32> {
+fn on_device(spec: &Admitted<ConvSpec>, target: &crate::atoms::Target, params: &[Vec<f64>]) -> Vec<f32> {
     let out = if spec.epilogue.out_f32 { DType::Float32 } else { DType::Float16 };
     let n = params.len();
     let tensors: Vec<Tensor> = params
@@ -370,7 +365,7 @@ fn every_conv_candidate_matches_the_graph_on_yolo_shapes() {
         let want = graph_reference(&g, 1, RESIDUAL_SILU_BIAS, &params);
         for c in device_candidates(&planner, &g, RESIDUAL_SILU_BIAS).0 {
             let (epilogue, split) = (RESIDUAL_SILU_BIAS, c.split);
-            let spec = ConvSpec { batch: Batch::Static(1), geom: g, epilogue, cfg: assumed(c.gemm), split };
+            let spec = assumed(ConvSpec { batch: Batch::Static(1), geom: g, epilogue, split }, c.gemm);
             let got = on_device(&spec, target, &params);
             let worst = assert_rel_close(&format!("{g:?} {c:?}"), &got, &want, 2e-3);
             eprintln!("{}->{} {}x{} s{} {c:?}: max abs diff {worst:.2e}", g.cin, g.cout, g.h, g.w, g.stride[0]);
@@ -388,13 +383,10 @@ fn every_conv_candidate_matches_the_graph_on_yolo_shapes() {
 fn conv_matches_on_the_device(g: ConvGeom, images: usize, epi: Epilogue, tile: [usize; 3]) {
     let Some(target) = super::device_target() else { return };
     let warps = if tile[1] == 48 { [2, 1] } else { [2, 2] };
-    let spec = ConvSpec {
-        batch: Batch::Static(images),
-        geom: g,
-        epilogue: epi,
-        cfg: assumed(gemm_cfg(tile, target.fill.stages(3), warps, true)),
-        split: 1,
-    };
+    let spec = assumed(
+        ConvSpec { batch: Batch::Static(images), geom: g, epilogue: epi, split: 1 },
+        gemm_cfg(tile, target.fill.stages(3), warps, true),
+    );
     let params = inputs(&g, images, epi, 21);
     let got = on_device(&spec, &target, &params);
     assert_rel_close("y vs f64", &got, &reference(&g, images, epi, &params), tolerance(epi));
@@ -411,13 +403,10 @@ fn an_inf_gives_the_graphs_non_finite_set_on_the_device() {
     let epi = SILU_BIAS;
     let mut params = inputs(&g, 1, epi, 8);
     params[0][0] = f64::INFINITY;
-    let spec = ConvSpec {
-        batch: Batch::Static(1),
-        geom: g,
-        epilogue: epi,
-        cfg: assumed(gemm_cfg([64, 64, 32], target.fill.stages(3), [2, 2], true)),
-        split: 1,
-    };
+    let spec = assumed(
+        ConvSpec { batch: Batch::Static(1), geom: g, epilogue: epi, split: 1 },
+        gemm_cfg([64, 64, 32], target.fill.stages(3), [2, 2], true),
+    );
     let got = on_device(&spec, &target, &params);
     let want = graph_reference(&g, 1, epi, &params);
     let bad = |v: &[f32]| v.iter().enumerate().filter(|(_, x)| !x.is_finite()).map(|(i, _)| i).collect::<Vec<_>>();
@@ -433,17 +422,14 @@ fn a_bound_batch_runs_the_live_images_on_the_device() {
     let g = geom([12, 10], 32, 64, 3, 2, 1, 1);
     let [ho, wo] = g.out_hw();
     let (cap, live) = (3usize, 2usize);
-    let spec = ConvSpec {
-        batch: Batch::var("b", 1, cap as i64),
-        geom: g,
-        epilogue: RESIDUAL_SILU_BIAS,
-        cfg: assumed(gemm_cfg([64, 64, 32], target.fill.stages(3), [2, 2], true)),
-        split: 1,
-    };
+    let spec = assumed(
+        ConvSpec { batch: Batch::var("b", 1, cap as i64), geom: g, epilogue: RESIDUAL_SILU_BIAS, split: 1 },
+        gemm_cfg([64, 64, 32], target.fill.stages(3), [2, 2], true),
+    );
     let params = inputs(&g, cap, RESIDUAL_SILU_BIAS, 4);
     let tensors: Vec<Tensor> = params.iter().map(|p| upload(p, DType::Float16)).collect();
     let refs: Vec<&Tensor> = tensors.iter().collect();
-    let y = graph_launch(conv::<F16>(&spec), &spec.cfg.lowering(&declared(target)), &refs).unwrap();
+    let y = graph_launch(conv::<F16>(&spec), &spec.cfg().lowering(&declared(target)), &refs).unwrap();
     let mut plan = y.prepare().unwrap();
     plan.execute_with_vars(&[("b", live as i64)]).unwrap();
     let mut bytes = vec![0u8; live * ho * wo * g.cout * 2];
@@ -477,7 +463,7 @@ fn device_candidates(planner: &Planner, g: &ConvGeom, epilogue: Epilogue) -> (Ve
     let [ho, wo] = g.out_hw();
 
     let build = |c: ConvCfg| {
-        let spec = ConvSpec { batch: Batch::Static(1), geom: *g, epilogue, cfg: assumed(c.gemm), split: c.split };
+        let spec = assumed(ConvSpec { batch: Batch::Static(1), geom: *g, epilogue, split: c.split }, c.gemm);
         spec.programs::<F16>(&planner.device)
     };
     let shape = [g.cin, g.cout, g.h, g.w, g.stride[0]];
@@ -515,13 +501,8 @@ fn conv_throughput_probe() {
             cands.push(pick);
         }
         let build = |c: ConvCfg| {
-            let spec = ConvSpec {
-                batch: Batch::Static(1),
-                geom: g,
-                epilogue: SILU_BIAS,
-                cfg: assumed(c.gemm),
-                split: c.split,
-            };
+            let spec =
+                assumed(ConvSpec { batch: Batch::Static(1), geom: g, epilogue: SILU_BIAS, split: c.split }, c.gemm);
             spec.programs::<F16>(&planner.device)
         };
         let times = super::measure(cands.iter().map(|&c| build(c)));

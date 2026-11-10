@@ -8,14 +8,14 @@ use svod_dtype::DType;
 use svod_ir::SInt;
 use svod_tensor::Tensor;
 
-use super::config::{GemmProblem, Planner, distinct_configs};
+use super::config::{Planner, distinct_configs};
 use super::shape::{self, Plan, extent, shape_of};
 use super::{
     Act, DEVICE_TEST, DtypeSnafu, GraphSnafu, LaunchSnafu, Result, ShapeSnafu, Tuner, batch_of, fmt_shape,
     kernel_buffer, output, typed,
 };
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Rope, Scale, TailSpec, gemm, gemm_tail};
-use crate::kernels::{Admitted, Batch};
+use crate::kernels::{Admits, Admitted, Batch};
 use crate::launch;
 use crate::lower::Lowering;
 use crate::tune::{Candidate, TuneStore};
@@ -142,10 +142,8 @@ pub fn linear(x: &Tensor, w: &Tensor, opts: Linear) -> Result<Tensor> {
     }
     let epilogue = Epilogue { rope, ..epilogue };
     let batch = batch_of(&var, 1);
-    let problem = problem(m, n, k, &batch, &epilogue);
-    let spec = GemmSpec { m, n, k, batch, epilogue, cfg: admit(&planner, &problem, cfgs[0]) };
-    let spec = tuned(TuneStore::global(), &planner, x.dtype(), &cfgs, spec);
-    super::ran(OP, "gemm", spec.cfg);
+    let spec = tuned(TuneStore::global(), &planner, x.dtype(), &cfgs, GemmSpec { m, n, k, batch, epilogue });
+    super::ran(OP, "gemm", spec.cfg());
     let y = output(&[lead, &[n]].concat(), &var, x.dtype()).context(GraphSnafu { op: OP })?;
     // The tables bind only where the kernel turns: `epilogue.rope` is the
     // kernel's own word for it (`opts.rope` may have fallen back to the
@@ -190,8 +188,8 @@ pub(crate) fn launched_tail(
 
 /// The programs `spec` launches in order with their lowerings: its GEMM,
 /// or its tail split's ([`gemm_tail`]).
-pub(crate) fn programs(spec: &GemmSpec, dtype: &DType, planner: &Planner) -> Candidate {
-    let lowering = spec.cfg.lowering(&planner.device);
+pub(crate) fn programs(spec: &Admitted<GemmSpec>, dtype: &DType, planner: &Planner) -> Candidate {
+    let lowering = spec.cfg().lowering(&planner.device);
     let Some(tail) = tail(spec, planner) else { return vec![(typed!(dtype, gemm, spec), lowering)] };
     let mut programs: Vec<_> = typed!(dtype, gemm_tail, &tail).into_iter().map(|p| (p, lowering.clone())).collect();
     programs.last_mut().expect("the merge").1 = Lowering::new(&planner.device);
@@ -199,22 +197,23 @@ pub(crate) fn programs(spec: &GemmSpec, dtype: &DType, planner: &Planner) -> Can
 }
 
 /// The tail split `spec`'s config runs, as the planner plans it for the shape.
-fn tail<'t>(spec: &GemmSpec<'t>, planner: &Planner) -> Option<TailSpec<'t>> {
-    let problem = problem(spec.m, spec.n, spec.k, &spec.batch, &spec.epilogue);
-    spec.cfg.tail.filter(|_| spec.batch == Batch::Static(1))?;
-    let plan = problem.tail_plan(planner, &spec.cfg).expect("an admitted tail split runs its problem");
+fn tail<'t>(spec: &Admitted<'t, GemmSpec>, planner: &Planner) -> Option<TailSpec<'t>> {
+    let cfg = spec.cfg();
+    cfg.tail.filter(|_| spec.batch == Batch::Static(1))?;
+    let plan = spec.problem().tail_plan(planner, &cfg).expect("an admitted tail split runs its problem");
     Some(TailSpec { gemm: spec.clone(), plan })
 }
 
 /// `spec` under the config [`linear`] launches for its shape and epilogue:
-/// the tuner's pick among `ranked`, through `store`.
+/// the tuner's pick among `ranked` (the planner's ranking for `spec`),
+/// through `store`, admitted.
 pub fn tuned<'t>(
     store: &TuneStore,
     planner: &'t Planner,
     dtype: DType,
     ranked: &[GemmCfg],
-    spec: GemmSpec<'t>,
-) -> GemmSpec<'t> {
+    spec: GemmSpec,
+) -> Admitted<'t, GemmSpec> {
     let salt = (&spec.batch, spec.epilogue);
     tune(store, planner, dtype, ranked, (OP, salt), spec.clone())
 }
@@ -226,8 +225,8 @@ pub fn probed<'t>(
     planner: &'t Planner,
     dtype: DType,
     ranked: &[GemmCfg],
-    spec: GemmSpec<'t>,
-) -> GemmSpec<'t> {
+    spec: GemmSpec,
+) -> Admitted<'t, GemmSpec> {
     tune(store, planner, dtype, ranked, ("gemm", DEVICE_TEST), spec)
 }
 
@@ -237,28 +236,15 @@ fn tune<'t>(
     dtype: DType,
     ranked: &[GemmCfg],
     (op, salt): (&'static str, impl Debug),
-    spec: GemmSpec<'t>,
-) -> GemmSpec<'t> {
+    spec: GemmSpec,
+) -> Admitted<'t, GemmSpec> {
     let shape = [spec.batch.capacity(), spec.m, spec.n, spec.k];
-    let problem = problem(spec.m, spec.n, spec.k, &spec.batch, &spec.epilogue);
-    let build =
-        |cfg: GemmCfg| programs(&GemmSpec { cfg: admit(planner, &problem, cfg), ..spec.clone() }, &dtype, planner);
+    let problem = spec.problem();
+    let build = |cfg: GemmCfg| programs(&spec.clone().admit_ranked(planner, cfg), &dtype, planner);
     let cfg = Tuner::new(store, &planner.device, dtype.clone(), &shape, salt, build)
         .floored(|cfg| planner.floor_of(&problem, cfg))
         .tuned(op, ranked, <[_]>::to_vec);
-    GemmSpec { cfg: admit(planner, &problem, cfg), ..spec }
-}
-
-/// The GEMM problem of a `[batch, m, k] · [n, k]ᵀ` under `epilogue`.
-fn problem(m: usize, n: usize, k: usize, batch: &Batch, epilogue: &Epilogue) -> GemmProblem {
-    GemmProblem::new(batch.capacity().max(1), m, n, k, epilogue)
-}
-
-/// A ranked config, or the tuner's variant of one, as the planner admits it
-/// for `problem`: the ranking admitted every one, so a refusal is the
-/// planner's own inconsistency.
-fn admit<'t>(planner: &'t Planner, problem: &GemmProblem, cfg: GemmCfg) -> Admitted<'t, GemmCfg> {
-    problem.admitted(planner, cfg).unwrap_or_else(|why| panic!("{cfg:?} ranked for {problem:?} is refused: {why:?}"))
+    spec.admit_ranked(planner, cfg)
 }
 
 /// The generic graph of the same op; the input is materialized, since a lazy

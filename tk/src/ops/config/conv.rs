@@ -8,7 +8,6 @@
 use std::sync::Arc;
 
 use crate::atoms::{Fill, Target};
-use crate::kernels::Admitted;
 use crate::kernels::conv::{ConvCfg, ConvGeom};
 use crate::kernels::gemm::{Epilogue, GemmCfg};
 
@@ -40,12 +39,6 @@ impl ConvProblem {
     /// `batches` grid batches of `m` output pixels of `g` under `epilogue`.
     pub fn new(batches: usize, m: usize, g: &ConvGeom, epilogue: &Epilogue) -> Self {
         Self { gemm: GemmProblem::new(batches, m, g.cout, g.k(), epilogue), geom: *g }
-    }
-
-    /// `cfg`'s GEMM body admitted for this convolution ([`Admitted`]), or
-    /// why it is not; its split is the tuner's.
-    pub fn admitted<'t>(&self, planner: &'t Planner, cfg: GemmCfg) -> Result<Admitted<'t, GemmCfg>, Rejected> {
-        planner.admitted(self, cfg)
     }
 
     /// The GEMM body's claim with the convolution's own fill: each input

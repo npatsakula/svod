@@ -197,17 +197,11 @@ fn the_op_layers_tuning_reads_the_same_line() {
     let dir = Scratch::new("rank-op");
     let planner = store(&dir, |at| [900, 800, 700, 600][at]);
     let ranked = planner.gemm_ranked(1, 512, 512, 512, &Epilogue::DEFAULT);
-    let spec = GemmSpec {
-        m: 512,
-        n: 512,
-        k: 512,
-        batch: Batch::Static(1),
-        epilogue: Epilogue::DEFAULT,
-        cfg: assumed(ranked[0]),
-    };
+    let spec = GemmSpec { m: 512, n: 512, k: 512, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT };
     let pick =
-        tuned::linear(&TuneStore::replay(dir.to_path_buf()), &planner, svod_dtype::DType::BFloat16, &ranked, spec).cfg;
-    assert_eq!(*pick, representatives(&ranked)[3], "the line's fastest, at 600 ns");
+        tuned::linear(&TuneStore::replay(dir.to_path_buf()), &planner, svod_dtype::DType::BFloat16, &ranked, spec)
+            .cfg();
+    assert_eq!(pick, representatives(&ranked)[3], "the line's fastest, at 600 ns");
 }
 
 /// The claim diff's mappings that hold: a trip's matrix steps in the
@@ -307,17 +301,20 @@ fn the_listing_static_decomposition_maps_its_programs() {
         lanes,
     };
     let count = |k: usize, cfg: NearestCfg| {
-        let spec = NearestSpec {
-            n: 100,
-            m: 960,
-            d: 128,
-            metric: Metric::SquaredL2,
-            floors: Floors::default(),
-            groups: false,
-            k,
-            cfg: assumed(cfg),
-            live: Live::default(),
-        };
+        let spec = assumed(
+            NearestSpec {
+                n: 100,
+                m: 960,
+                d: 128,
+                metric: Metric::SquaredL2,
+                floors: Floors::default(),
+                groups: false,
+                k,
+                live: Live::default(),
+                dtype: ScalarDType::Float16,
+            },
+            cfg,
+        );
         rank::counted(&crate::lower::standalone(nearest::<F16>(&spec), &lowering).ok()?.program).map(|c| c.valu)
     };
     let rows = [

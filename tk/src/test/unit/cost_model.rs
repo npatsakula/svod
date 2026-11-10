@@ -10,7 +10,7 @@ use proptest::prelude::*;
 
 use crate::atoms::{Costs, Device, Target};
 use crate::build::BF16;
-use crate::kernels::attention::{AttnMask, AttnSpec, FaCfg, attention};
+use crate::kernels::attention::{AttnMask, FaCfg, attention};
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
 use crate::kernels::{Act, Batch};
 use crate::ops::config::{AttentionProblem, DIAGONAL, GemmProblem, Planner, gemm_cfg};
@@ -143,10 +143,9 @@ fn cost_model_probe() {
     for ((label, m, n, k, epilogue), (_, ranked, predicted)) in
         gemm_shapes().into_iter().filter(|s| wanted(s.0)).zip(gemms)
     {
-        let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue, cfg: assumed(super::device::BIG) };
+        let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue };
         let pick = super::device::device_gemms(&planner, &spec).1;
-        let build =
-            |cfg| vec![(gemm::<BF16>(&GemmSpec { cfg: assumed(cfg), ..spec.clone() }), cfg.lowering(&planner.device))];
+        let build = |cfg| vec![(gemm::<BF16>(&assumed(spec.clone(), cfg)), cfg.lowering(&planner.device))];
         let ranked = timing(&ranked);
         let (verdicts, ns) = timed(ranked, &[pick], build);
         report(label, ranked, &predicted, &verdicts, &ns, &pick);
@@ -157,9 +156,7 @@ fn cost_model_probe() {
         let mask = AttnMask { causal, ..AttnMask::default() };
         let spec = super::attention::probe_spec(batch, heads, t, t, d, mask);
         let pick = super::attention::device_attention(&planner, &spec).2;
-        let build = |cfg| {
-            vec![(attention::<BF16>(&AttnSpec { cfg: assumed(cfg), ..spec.clone() }), cfg.lowering(&planner.device))]
-        };
+        let build = |cfg| vec![(attention::<BF16>(&assumed(spec.clone(), cfg)), cfg.lowering(&planner.device))];
         let ranked = timing(&ranked);
         let (verdicts, ns) = timed(ranked, &[pick], build);
         report(label, ranked, &predicted, &verdicts, &ns, &pick);

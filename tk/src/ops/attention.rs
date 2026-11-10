@@ -6,7 +6,7 @@ use svod_ir::SInt;
 use svod_ir::origin::OriginScope;
 use svod_tensor::Tensor;
 
-use super::config::{AttentionProblem, Planner};
+use super::config::Planner;
 use super::shape::Fallback;
 use super::shape::{self, extent, shape_of};
 use super::{
@@ -20,7 +20,7 @@ use crate::kernels::attention::{
     AttnMask, AttnSpec, Bias, CombineSpec, FaCfg, Forms, attention as fa, combine, key_mask_stride,
 };
 use crate::kernels::rows::NormCfg;
-use crate::kernels::{Admitted, Batch};
+use crate::kernels::{Admits, Admitted, Batch};
 use crate::launch;
 use crate::lower::Lowering;
 use crate::tune::TuneStore;
@@ -228,21 +228,10 @@ fn attend(q: &Tensor, k: &Tensor, v: &Tensor, packed: Option<&Tensor>, opts: Att
     // `lens`, `bools` and `segs` are set below; the tuner reads the key lengths' presence.
     let mask = AttnMask { key_lens: lens.is_some(), bias: bias_rows, ..edges };
     let scale = opts.scale.unwrap_or(1.0 / (d as f32).sqrt());
-    let problem = problem(&batch, t, tk, heads, d, mask.causal, bias_rows.is_some());
-    let spec = AttnSpec {
-        batch: batch.clone(),
-        t,
-        tk,
-        heads,
-        kv_heads,
-        d,
-        mask,
-        cache,
-        packed: packed.is_some(),
-        scale,
-        cfg: admit(&planner, &problem, cfgs[0]),
-    };
-    let cfg = tuned(TuneStore::global(), &planner, q.dtype(), &cfgs, spec.clone(), opts.splits).cfg;
+    let spec =
+        AttnSpec { batch: batch.clone(), t, tk, heads, kv_heads, d, mask, cache, packed: packed.is_some(), scale };
+    let spec = tuned(TuneStore::global(), &planner, q.dtype(), &cfgs, spec, opts.splits);
+    let cfg = spec.cfg();
     super::ran(OP, "flash_attention", cfg);
     let i32 = |t: &Tensor| if t.dtype() == DType::Int32 { t.clone() } else { t.cast(DType::Int32) };
     let lens = lens.map(i32);
@@ -274,7 +263,7 @@ fn attend(q: &Tensor, k: &Tensor, v: &Tensor, packed: Option<&Tensor>, opts: Att
         bias: bias_rows,
         ..edges
     };
-    let spec = AttnSpec { mask, cfg, ..spec };
+    let spec = spec.map(|spec| AttnSpec { mask, ..spec });
     let lowering = cfg.lowering(&planner.device);
     let operands = packed.map_or(vec![q, k, v], |qkv| vec![qkv]);
     let extras = [
@@ -322,21 +311,22 @@ pub(crate) fn merge(batch: Batch, t: usize, heads: usize, d: usize, splits: usiz
 /// (`spec.mask` as launched: the key lengths' presence and the bias are
 /// what the tuner reads of it): the tuner's pick among `ranked` (the shape
 /// gate's list, the configs that hold `spec`'s appended rows), at the
-/// split count `splits` names or every one worth measuring, through `store`.
+/// split count `splits` names or every one worth measuring, through `store`,
+/// admitted.
 pub fn tuned<'t>(
     store: &TuneStore,
     planner: &'t Planner,
     dtype: DType,
     ranked: &[FaCfg],
-    spec: AttnSpec<'t>,
+    spec: AttnSpec,
     splits: Option<usize>,
-) -> AttnSpec<'t> {
+) -> Admitted<'t, AttnSpec> {
     let AttnSpec { t, tk, heads, d, cache, .. } = spec;
     let lens = spec.mask.key_lens;
     let edges =
         AttnMask { causal: spec.mask.causal, window: spec.mask.window, chunk: spec.mask.chunk, ..AttnMask::default() };
     let bias_rows = spec.mask.bias;
-    let problem = problem(&spec.batch, t, tk, heads, d, spec.mask.causal, bias_rows.is_some());
+    let problem = spec.problem();
     // The configs are admitted at a given split count, else unsplit; then
     // each comes with every split count worth measuring, the unsplit first.
     let split = split_ranked(ranked, splits, tk);
@@ -375,13 +365,18 @@ pub fn tuned<'t>(
             app_lens: false,
             ..c
         });
-        let cfg = admit(planner, &problem, cfg);
-        let spec = AttnSpec { batch: measured.clone(), mask: measured_mask, cache: plain, cfg, ..spec.clone() };
+        // Admitted for the launched shape; measured at the tuner's.
+        let spec = spec.clone().admit_ranked(planner, cfg).map(|spec| AttnSpec {
+            batch: measured.clone(),
+            mask: measured_mask,
+            cache: plain,
+            ..spec
+        });
         // A packed operand holds its own keys, none below `tk`.
         let below = !spec.packed && (cache.is_some() || lens);
         let mut programs = timed_keys(tk, below, &cfg)
             .into_iter()
-            .map(|tk| (typed!(dtype, fa, &AttnSpec { tk, ..spec.clone() }), cfg.lowering(&planner.device)))
+            .map(|tk| (typed!(dtype, fa, &spec.map(|spec| AttnSpec { tk, ..spec })), cfg.lowering(&planner.device)))
             .collect::<Vec<_>>();
         if cfg.splits > 1 {
             let merge = merge(spec.batch.clone(), t, heads, d, cfg.splits);
@@ -394,20 +389,7 @@ pub fn tuned<'t>(
     let op = if spec.packed { PACKED } else { OP };
     let cfg = tune(op, &mut tuner, &split, bias_rows.is_some(), expand);
     tracing::debug!(target: super::PLAN, op, ?shape, pick = ?cfg, "attention tuned");
-    AttnSpec { cfg: admit(planner, &problem, cfg), ..spec }
-}
-
-/// The attention problem of `batch` lanes of `heads` heads, `t` queries over
-/// `tk` keys at head size `d`.
-fn problem(batch: &Batch, t: usize, tk: usize, heads: usize, d: usize, causal: bool, bias: bool) -> AttentionProblem {
-    AttentionProblem { tiles: batch.capacity() * heads, t, tk, d, causal, bias }
-}
-
-/// A ranked config, or the tuner's split or form of one, as the planner
-/// admits it for `problem`: the ranking admitted every one, so a refusal is
-/// the planner's own inconsistency.
-fn admit<'t>(planner: &'t Planner, problem: &AttentionProblem, cfg: FaCfg) -> Admitted<'t, FaCfg> {
-    problem.admitted(planner, cfg).unwrap_or_else(|why| panic!("{cfg:?} ranked for {problem:?} is refused: {why:?}"))
+    spec.admit_ranked(planner, cfg)
 }
 
 /// `cfgs` (ranked) at the split count the caller names, else unsplit. A

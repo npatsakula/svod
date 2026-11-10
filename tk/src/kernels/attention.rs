@@ -2,11 +2,12 @@
 //! shared ring, the online-softmax state `(m, l, o)` carried.
 
 use super::rows::NormCfg;
-use super::{Admitted, Batch, batch_offset, bound, load_f32};
+use super::{Admits, Admitted, Batch, Spec, batch_offset, bound, load_f32};
 use crate::atoms::{Core, Device};
 use crate::build::*;
 use crate::ir::*;
 use crate::lower::Lowering;
+use crate::ops::config::{AttentionProblem, Planner, Rejected};
 
 /// The tune store keys by this text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -263,9 +264,10 @@ pub(crate) fn key_mask_stride(tk: usize) -> usize {
 }
 
 /// `[batch, t, heads, d]` queries against `[batch, tk, kv_heads, d]` keys and
-/// values; query head `h` reads KV head `h / (heads / kv_heads)`.
+/// values; query head `h` reads KV head `h / (heads / kv_heads)`. A kernel
+/// runs it under a config admitted for it ([`AttnSpec::admitted`]).
 #[derive(Clone, Debug, PartialEq)]
-pub struct AttnSpec<'t> {
+pub struct AttnSpec {
     pub batch: Batch,
     pub t: usize,
     pub tk: usize,
@@ -280,10 +282,29 @@ pub struct AttnSpec<'t> {
     /// is `t`.
     pub packed: bool,
     pub scale: f32,
-    pub cfg: Admitted<'t, FaCfg>,
 }
 
-impl AttnSpec<'_> {
+impl Spec for AttnSpec {
+    type Cfg = FaCfg;
+}
+
+impl Admits for AttnSpec {
+    type Problem = AttentionProblem;
+
+    fn problem(&self) -> AttentionProblem {
+        let AttnSpec { t, tk, d, mask, .. } = *self;
+        let (causal, bias) = (mask.causal, mask.bias.is_some());
+        AttentionProblem { tiles: self.batch.capacity() * self.heads, t, tk, d, causal, bias }
+    }
+}
+
+impl AttnSpec {
+    /// `cfg` [admitted](Admitted) for this attention on `planner`, or why it
+    /// is not.
+    pub fn admitted(self, planner: &Planner, cfg: FaCfg) -> Result<Admitted<'_, Self>, Rejected> {
+        self.admit(planner, cfg)
+    }
+
     /// Parameters after the outputs, in order.
     pub fn extra_params(&self) -> Vec<&'static str> {
         let AttnMask { key_lens, key_mask, seg_start, .. } = self.mask;
@@ -437,16 +458,16 @@ fn step<'k, T: Half, PK: Readable, PV: Readable>(
 /// skipped through the first block and the trip count, the rest shared
 /// evenly by the splits; only blocks a mask edge crosses pay for the mask,
 /// except under a key mask or a bias, which every block reads.
-pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
+pub fn attention<T: Half>(spec: &Admitted<AttnSpec>) -> Program {
     Kernel::record(if spec.packed { "flash_attention_packed" } else { "flash_attention" }, |k| {
         attention_body::<T>(k, spec)
     })
 }
 
-fn attention_body<'k, T: Half>(k: &mut Kernel<'k>, spec: &AttnSpec) {
-    let AttnSpec { ref batch, t, tk, heads, kv_heads, d, mask, cache, packed, scale, cfg } = *spec;
+fn attention_body<'k, T: Half>(k: &mut Kernel<'k>, spec: &Admitted<AttnSpec>) {
+    let AttnSpec { ref batch, t, tk, heads, kv_heads, d, mask, cache, packed, scale } = **spec;
     let AttnMask { causal, window, chunk, key_lens, key_mask, seg_start, bias } = mask;
-    let cfg = *cfg;
+    let cfg = spec.cfg();
     let FaCfg { bq, bkv, splits, .. } = cfg;
     let stages = cfg.stages();
     let cap = batch.capacity();

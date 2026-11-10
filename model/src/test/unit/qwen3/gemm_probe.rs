@@ -13,7 +13,7 @@ use svod_tk::ir::Schedule;
 use svod_tk::kernels::Batch;
 use svod_tk::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, TileOrder, gemm};
 use svod_tk::launch::graph_launch;
-use svod_tk::ops::config::{GemmProblem, Planner};
+use svod_tk::ops::config::Planner;
 use svod_tk::ops::{self, Act, Linear};
 
 fn lcg(seed: &mut u64) -> f32 {
@@ -94,9 +94,8 @@ fn tk_gemm_tuned_vs_pinned() {
 
         // tk at a pinned config.
         let mut pinned = |label: &str, c: GemmCfg| {
-            let problem = GemmProblem::new(1, m, n, k, &epi);
-            let cfg = problem.admitted(&planner, c).unwrap_or_else(|why| panic!("{label} {c:?}: {why:?}"));
-            let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: epi, cfg };
+            let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: epi };
+            let spec = spec.admitted(&planner, c).unwrap_or_else(|why| panic!("{label} {c:?}: {why:?}"));
             let out = Tensor::empty(&[m * n], DType::BFloat16);
             let mut params: Vec<&Tensor> = vec![&a, &b];
             if let Some(r) = &r {

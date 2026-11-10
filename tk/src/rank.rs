@@ -952,17 +952,7 @@ fn nearest(lines: &mut Lines, planner: &Planner, dtype: ScalarDType, shape: &[us
         ] {
             for groups in [false, true] {
                 for live in &lives {
-                    let spec = NearestSpec {
-                        n,
-                        m,
-                        d,
-                        metric,
-                        floors,
-                        groups,
-                        k,
-                        cfg: assumed(NearestCfg::new(64, 64, 2)),
-                        live: live.clone(),
-                    };
+                    let spec = NearestSpec { n, m, d, dtype, metric, floors, groups, k, live: live.clone() };
                     // The op layer's own salt, and the tuning probe's (a
                     // fresh store's cold tunes of these very shapes).
                     let salts =
@@ -1331,14 +1321,10 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
             let elems = (cfg.tile[0] * cfg.tile[1]) as f64;
             let valu = claim.ops.epilogue * (4096 / cfg.tile[2]) as f64 / elems;
             let per = (cfg.warps[0] * cfg.warps[1]) as f64 * target.wave as f64 / elems;
-            let spec = GemmSpec {
-                m: 130,
-                n: 192,
-                k: cfg.tile[2] * 8,
-                batch: Batch::Static(1),
-                epilogue,
-                cfg: assumed(GemmCfg { schedule: cfg.schedule.rolled(), ..cfg }),
-            };
+            let spec = assumed(
+                GemmSpec { m: 130, n: 192, k: cfg.tile[2] * 8, batch: Batch::Static(1), epilogue },
+                GemmCfg { schedule: cfg.schedule.rolled(), ..cfg },
+            );
             out.push((
                 format!("gemm {label} {:?}", cfg.tile),
                 claim,
@@ -1359,19 +1345,21 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
     for cfg in config::distinct(&planner.attention_ranked(8, 100, 100, 64, true, false)).take(2).chain(wide) {
         let claim = planner.claim_of(&p, &cfg).expect("ranked");
         let valu = claim.ops.fold(config::pair_op(&device), 1.0, &config::Weights::same());
-        let spec = AttnSpec {
-            batch: Batch::Static(2),
-            t: 100,
-            tk: 100,
-            heads: 4,
-            kv_heads: 2,
-            d: 64,
-            mask: AttnMask { causal: true, ..AttnMask::default() },
-            cache: None,
-            packed: false,
-            scale: 0.125,
-            cfg: assumed(FaCfg { schedule: cfg.schedule.rolled(), ..cfg }),
-        };
+        let spec = assumed(
+            AttnSpec {
+                batch: Batch::Static(2),
+                t: 100,
+                tk: 100,
+                heads: 4,
+                kv_heads: 2,
+                d: 64,
+                mask: AttnMask { causal: true, ..AttnMask::default() },
+                cache: None,
+                packed: false,
+                scale: 0.125,
+            },
+            FaCfg { schedule: cfg.schedule.rolled(), ..cfg },
+        );
         out.push((
             format!("attention {}x{} {:?}", cfg.bq, cfg.bkv, cfg.core),
             claim,
@@ -1393,16 +1381,19 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
         groups: false,
         k,
     };
-    let spec = |cfg: NearestCfg, k| NearestSpec {
-        n: 100,
-        m: 960,
-        d: 128,
-        metric: Metric::SquaredL2,
-        floors: Floors::default(),
-        groups: false,
-        k,
-        cfg: assumed(NearestCfg { schedule: cfg.schedule.rolled(), ..cfg }),
-        live: Live::default(),
+    let spec = |cfg: NearestCfg, k, m| {
+        let spec = NearestSpec {
+            n: 100,
+            m,
+            d: 128,
+            dtype: ScalarDType::Float16,
+            metric: Metric::SquaredL2,
+            floors: Floors::default(),
+            groups: false,
+            k,
+            live: Live::default(),
+        };
+        assumed(spec, NearestCfg { schedule: cfg.schedule.rolled(), ..cfg })
     };
     let ranked = planner.nearest_ranked(problem(1));
     for (name, way) in [
@@ -1417,7 +1408,7 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
             claim,
             (valu, whole, None),
             cfg.warps() as usize,
-            nearest::<F16>(&spec(cfg, 1)),
+            nearest::<F16>(&spec(cfg, 1, 960)),
             Core::Warp,
         ));
     }
@@ -1434,8 +1425,8 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
         let listing = |prog: crate::ir::Program| {
             counted(&crate::lower::standalone(prog, &lowering).ok()?.program).map(|c| c.valu as f64)
         };
-        if let Some(program) = listing(nearest::<F16>(&spec(cfg, 64)))
-            .zip(listing(nearest::<F16>(&spec(twin, 1))))
+        if let Some(program) = listing(nearest::<F16>(&spec(cfg, 64, 960)))
+            .zip(listing(nearest::<F16>(&spec(twin, 1, 960))))
             .map(|(whole, least)| whole - least)
         {
             let predicted = problem(64).listing_static(&cfg);
@@ -1455,7 +1446,7 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
             claim,
             (valu, whole, None),
             cfg.warps() as usize,
-            nearest::<F16>(&spec(cfg, 64)),
+            nearest::<F16>(&spec(cfg, 64, 960)),
             Core::Warp,
         ));
     }
@@ -1465,8 +1456,7 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
     if let Some(&cfg) = split.iter().find(|c| c.splits > 1 && c.splits <= 32) {
         let claim = planner.claim_of(&split_problem, &cfg).expect("ranked");
         let valu = claim.ops.fold(config::pair_op(&device), 1.0, &config::Weights::same());
-        let mut split_spec = spec(cfg, 8);
-        split_spec.m = cfg.splits * cfg.bkv * 2;
+        let split_spec = spec(cfg, 8, cfg.splits * cfg.bkv * 2);
         out.push((
             format!("nearest k8 split {} {}x{}", cfg.splits, cfg.bq, cfg.bkv),
             claim,

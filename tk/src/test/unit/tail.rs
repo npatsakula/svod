@@ -154,7 +154,7 @@ fn a_tail_split_computes_the_gemm(
     let order = TileOrder::grouped(rows).expect("a group of rows");
     let cfg = GemmCfg { order, tail: Some(split), ..gemm_cfg(tile, 2, warps, false) };
     assert!(TailSpec::merges(&cfg), "{cfg:?}: the merge tile divides the GEMM's");
-    let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue, cfg: assumed(cfg) };
+    let spec = assumed(GemmSpec { m, n, k, batch: Batch::Static(1), epilogue }, cfg);
     let plan = TailPlan::new(m.div_ceil(tile[0]) * n.div_ceil(tile[1]), wave, split).expect("a tail");
     let tail = TailSpec { gemm: spec.clone(), plan };
     let out = if epilogue.out_f32 { ScalarDType::Float32 } else { ScalarDType::BFloat16 };

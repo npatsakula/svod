@@ -88,19 +88,21 @@ fn warps_fence_their_own_effects_and_the_block_fences_theirs() {
 fn a_key_warps_state_over_its_ring_is_fenced_by_the_warp_then_the_block() {
     let cfg = FaCfg { key_warps: 4, ..FaCfg::new(16, 16, 2) };
     let mask = AttnMask::default();
-    let spec = AttnSpec {
-        batch: Batch::Static(1),
-        t: 1,
-        tk: 64,
-        heads: 1,
-        kv_heads: 1,
-        d: 64,
-        mask,
-        cache: None,
-        packed: false,
-        scale: 0.125,
-        cfg: assumed(cfg),
-    };
+    let spec = assumed(
+        AttnSpec {
+            batch: Batch::Static(1),
+            t: 1,
+            tk: 64,
+            heads: 1,
+            kv_heads: 1,
+            d: 64,
+            mask,
+            cache: None,
+            packed: false,
+            scale: 0.125,
+        },
+        cfg,
+    );
     let mut prog = attention::<BF16>(&spec);
     insert_barriers(&mut prog).unwrap();
     assert!(
@@ -403,29 +405,35 @@ fn a_consume_body_fences_its_own_tiles() {
 
 /// The shipped kernels keep their shared memory in pipeline rings, which
 /// their templates fence: the pass leaves them as they are.
-#[test_case(gemm::<BF16>(&GemmSpec {
-    m: 256, n: 256, k: 256, batch: Batch::Static(1), epilogue: Epilogue::default(),
-    cfg: assumed(GemmCfg { core: Core::Warp, tile: [128, 128, 32], warps: [2, 2], schedule: Schedule::ring(3, true), order: Default::default(), tail: None }),
-}); "gemm")]
-#[test_case(attention::<BF16>(&AttnSpec {
-    batch: Batch::var("b", 1, 2),
-    t: 4, tk: 200, heads: 4, kv_heads: 2, d: 64,
-    mask: AttnMask { causal: true, key_lens: true, key_mask: true, ..AttnMask::default() },
-    cache: Some(CacheLayout { rows: 3, heads_total: 6, row_map: true, appended: 4, app_lens: true }),
-    packed: false,
-    scale: 0.125,
-    cfg: assumed(FaCfg { splits: 2, ..FaCfg::new(16, 64, 3) }),
-}); "attention with every mask, a cache and splits")]
-#[test_case(crate::kernels::nearest::nearest::<BF16>(&crate::kernels::nearest::NearestSpec {
-    n: 100, m: 150, d: 32, metric: crate::kernels::nearest::Metric::L2,
-    floors: crate::kernels::nearest::Floors { row: true, col: true }, groups: true, k: 1,
-    cfg: assumed(crate::kernels::nearest::NearestCfg::new(32, 32, 3)), live: Default::default(),
-}); "nearest with floors and groups")]
-#[test_case(crate::kernels::nearest::nearest::<BF16>(&crate::kernels::nearest::NearestSpec {
-    n: 100, m: 150, d: 32, metric: crate::kernels::nearest::Metric::L2,
-    floors: crate::kernels::nearest::Floors { row: true, col: true }, groups: true, k: 8,
-    cfg: assumed(crate::kernels::nearest::NearestCfg::new(32, 32, 3)), live: Default::default(),
-}); "nearest lists with floors and groups")]
+#[test_case(gemm::<BF16>(&assumed(
+    GemmSpec { m: 256, n: 256, k: 256, batch: Batch::Static(1), epilogue: Epilogue::default() },
+    GemmCfg { core: Core::Warp, tile: [128, 128, 32], warps: [2, 2], schedule: Schedule::ring(3, true), order: Default::default(), tail: None },
+)); "gemm")]
+#[test_case(attention::<BF16>(&assumed(
+    AttnSpec {
+        batch: Batch::var("b", 1, 2),
+        t: 4, tk: 200, heads: 4, kv_heads: 2, d: 64,
+        mask: AttnMask { causal: true, key_lens: true, key_mask: true, ..AttnMask::default() },
+        cache: Some(CacheLayout { rows: 3, heads_total: 6, row_map: true, appended: 4, app_lens: true }),
+        packed: false,
+        scale: 0.125,
+    },
+    FaCfg { splits: 2, ..FaCfg::new(16, 64, 3) },
+)); "attention with every mask, a cache and splits")]
+#[test_case(crate::kernels::nearest::nearest::<BF16>(&assumed(
+    crate::kernels::nearest::NearestSpec {
+        n: 100, m: 150, d: 32, dtype: svod_dtype::ScalarDType::BFloat16, metric: crate::kernels::nearest::Metric::L2,
+        floors: crate::kernels::nearest::Floors { row: true, col: true }, groups: true, k: 1, live: Default::default(),
+    },
+    crate::kernels::nearest::NearestCfg::new(32, 32, 3),
+)); "nearest with floors and groups")]
+#[test_case(crate::kernels::nearest::nearest::<BF16>(&assumed(
+    crate::kernels::nearest::NearestSpec {
+        n: 100, m: 150, d: 32, dtype: svod_dtype::ScalarDType::BFloat16, metric: crate::kernels::nearest::Metric::L2,
+        floors: crate::kernels::nearest::Floors { row: true, col: true }, groups: true, k: 8, live: Default::default(),
+    },
+    crate::kernels::nearest::NearestCfg::new(32, 32, 3),
+)); "nearest lists with floors and groups")]
 fn shipped_kernels_need_no_barriers(prog: Program) {
     let mut fenced = prog.clone();
     insert_barriers(&mut fenced).unwrap();
@@ -509,17 +517,20 @@ fn a_block_barrier_under_a_vote_is_refused(shared: bool) -> Result<(), String> {
 fn a_ring_restarted_in_a_loop_is_fenced_at_its_head() {
     use crate::kernels::nearest::{Floors, Metric, NearestCfg, NearestSpec, nearest};
     let cfg = NearestCfg::streamed(32, 32, 32, 3);
-    let spec = NearestSpec {
-        n: 100,
-        m: 150,
-        d: 80,
-        metric: Metric::L2,
-        floors: Floors::default(),
-        groups: true,
-        k: 1,
-        cfg: assumed(cfg),
-        live: Default::default(),
-    };
+    let spec = assumed(
+        NearestSpec {
+            n: 100,
+            m: 150,
+            d: 80,
+            metric: Metric::L2,
+            floors: Floors::default(),
+            groups: true,
+            k: 1,
+            live: Default::default(),
+            dtype: svod_dtype::ScalarDType::BFloat16,
+        },
+        cfg,
+    );
     let prog = nearest::<BF16>(&spec);
     let mut fenced = prog.clone();
     insert_barriers(&mut fenced).unwrap();

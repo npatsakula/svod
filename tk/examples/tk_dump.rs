@@ -130,10 +130,10 @@ fn main() -> Result<()> {
                 .map_err(gate("linear"))?;
             let p = GemmProblem::new(1, m, n, k, &epilogue);
             report(&mut plan, top, &ranked, &gemm_lattice(&target), |c| p.admit(&planner, c));
-            let admit = |c: GemmCfg| p.admitted(&planner, c).map_err(|why| format!("{c:?}: {why:?}"));
-            let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue, cfg: admit(ranked[0])? };
+            let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue };
+            let admit = |c: GemmCfg| spec.clone().admitted(&planner, c).map_err(|why| format!("{c:?}: {why:?}"));
             let spec = match pick {
-                Pick::Ranked(i) => GemmSpec { cfg: admit(*ranked.get(i).ok_or("no such ranked config")?)?, ..spec },
+                Pick::Ranked(i) => admit(*ranked.get(i).ok_or("no such ranked config")?)?,
                 Pick::Tuned => {
                     let linear = |s: &TuneStore| tuned::linear(s, &planner, dtype.clone(), &ranked, spec.clone());
                     let probed = |s: &TuneStore| tuned::gemm_probe(s, &planner, dtype.clone(), &ranked, spec.clone());
@@ -143,8 +143,8 @@ fn main() -> Result<()> {
                     })?
                 }
             };
-            println!("emitting {:?}", spec.cfg);
-            vec![(if bf16 { gemm::<BF16>(&spec) } else { gemm::<F16>(&spec) }, spec.cfg.lowering(&planner.device))]
+            println!("emitting {:?}", spec.cfg());
+            vec![(if bf16 { gemm::<BF16>(&spec) } else { gemm::<F16>(&spec) }, spec.cfg().lowering(&planner.device))]
         }
         ("attention", &[b, h, t, d]) => {
             let causal = flag("--causal");
@@ -156,8 +156,6 @@ fn main() -> Result<()> {
             report(&mut plan, top, &ranked, &a.lattice(&target), |c| a.admit(&planner, c));
             let mask = AttnMask { causal, ..AttnMask::default() };
             let scale = 1.0 / (d as f32).sqrt();
-            let admit = |c: FaCfg| a.admitted(&planner, c).map_err(|why| format!("{c:?}: {why:?}"));
-            let cfg = admit(ranked[0])?;
             let spec = AttnSpec {
                 batch: Batch::Static(b),
                 t,
@@ -169,17 +167,17 @@ fn main() -> Result<()> {
                 cache: None,
                 packed: false,
                 scale,
-                cfg,
             };
+            let admit = |c: FaCfg| spec.clone().admitted(&planner, c).map_err(|why| format!("{c:?}: {why:?}"));
             let spec = match pick {
-                Pick::Ranked(i) => AttnSpec { cfg: admit(*ranked.get(i).ok_or("no such ranked config")?)?, ..spec },
+                Pick::Ranked(i) => admit(*ranked.get(i).ok_or("no such ranked config")?)?,
                 Pick::Tuned => replayed(&store()?, "attention", |s| {
                     tuned::attention(s, &planner, dtype.clone(), &ranked, spec.clone(), None)
                 })?,
             };
-            println!("emitting {:?}", spec.cfg);
+            println!("emitting {:?}", spec.cfg());
             let fa = if bf16 { attention::<BF16>(&spec) } else { attention::<F16>(&spec) };
-            vec![(fa, spec.cfg.lowering(&planner.device))]
+            vec![(fa, spec.cfg().lowering(&planner.device))]
         }
         ("norm", &[rows, d]) => {
             let kind = match opt("--norm").unwrap_or("rms") {
@@ -239,19 +237,18 @@ fn main() -> Result<()> {
             let p = cp.gemm;
             let gemms: Vec<_> = ranked.iter().map(|c| c.gemm).collect();
             report(&mut plan, top, &gemms, &[], |c| p.admit(&planner, c));
-            let admit = |c: GemmCfg| cp.admitted(&planner, c).map_err(|why| format!("{c:?}: {why:?}"));
-            let c = ranked[0];
-            let spec = ConvSpec { batch: Batch::Static(b), geom, epilogue, cfg: admit(c.gemm)?, split: c.split };
+            let spec = ConvSpec { batch: Batch::Static(b), geom, epilogue, split: 1 };
             let spec = match pick {
                 Pick::Ranked(i) => {
                     let c = *ranked.get(i).ok_or("no such ranked config")?;
-                    ConvSpec { cfg: admit(c.gemm)?, split: c.split, ..spec }
+                    let spec = ConvSpec { split: c.split, ..spec };
+                    spec.admitted(&planner, c.gemm).map_err(|why| format!("{c:?}: {why:?}"))?
                 }
                 Pick::Tuned => {
                     replayed(&store()?, "conv2d", |s| tuned::conv(s, &planner, dtype.clone(), &ranked, spec.clone()))?
                 }
             };
-            println!("emitting {:?} split {}", spec.cfg, spec.split);
+            println!("emitting {:?} split {}", spec.cfg(), spec.split);
             if bf16 { spec.programs::<BF16>(&planner.device) } else { spec.programs::<F16>(&planner.device) }
         }
         ("heads", &[b, t, heads_, kv_heads, d]) => {
@@ -300,16 +297,15 @@ fn main() -> Result<()> {
             let d = planner.nearest_depth(d, scalar).ok_or("no matrix core")?;
             let p = NearestProblem { n, m, d, dtype: scalar, metric, floors, groups, k };
             report(&mut plan, top, &ranked, &p.lattice(&target), |c| p.admit(&planner, c));
-            let admit = |c: NearestCfg| p.admitted(&planner, c).map_err(|why| format!("{c:?}: {why:?}"));
-            let spec =
-                NearestSpec { n, m, d, metric, floors, groups, k, cfg: admit(ranked[0])?, live: Default::default() };
+            let spec = NearestSpec { n, m, d, dtype: scalar, metric, floors, groups, k, live: Default::default() };
+            let admit = |c: NearestCfg| spec.clone().admitted(&planner, c).map_err(|why| format!("{c:?}: {why:?}"));
             let spec = match pick {
-                Pick::Ranked(i) => NearestSpec { cfg: admit(*ranked.get(i).ok_or("no such ranked config")?)?, ..spec },
+                Pick::Ranked(i) => admit(*ranked.get(i).ok_or("no such ranked config")?)?,
                 Pick::Tuned => replayed(&store()?, "nearest", |s| {
                     tuned::nearest(s, &planner, dtype.clone(), &ranked, spec.clone())
                 })?,
             };
-            println!("emitting {:?} at depth {d}", spec.cfg);
+            println!("emitting {:?} at depth {d}", spec.cfg());
             let prog = if bf16 { nearest::<BF16>(&spec) } else { nearest::<F16>(&spec) };
             vec![(prog, Lowering::new(&planner.device))]
         }

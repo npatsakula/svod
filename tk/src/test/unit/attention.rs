@@ -11,6 +11,7 @@ use crate::build::BF16;
 use crate::interp::{round_to, run};
 use crate::ir::Program;
 use crate::ir::Schedule;
+use crate::kernels::Admitted;
 use crate::kernels::Batch;
 use crate::kernels::attention::{
     AttnMask, AttnSpec, Bias, CacheLayout, Chunk, CombineSpec, FaCfg, Forms, Invalid, WARP_ROWS, attention, combine,
@@ -21,9 +22,9 @@ use crate::launch::graph_launch;
 use crate::launch::graph_launch_all;
 use crate::lower::Lowering;
 use crate::ops::config::Planner;
-use crate::sweep::assumed;
+use crate::sweep::{assumed, reassumed};
 
-fn flash_attention(spec: &AttnSpec) -> Program {
+fn flash_attention(spec: &Admitted<AttnSpec>) -> Program {
     attention::<BF16>(spec)
 }
 
@@ -31,7 +32,7 @@ fn flash_attention(spec: &AttnSpec) -> Program {
 const SEGMENT: usize = 40;
 
 struct Case {
-    spec: AttnSpec<'static>,
+    spec: Admitted<'static, AttnSpec>,
     q: Vec<f64>,
     /// `[rows, tk, heads_total, d]`, the batch's own rows without a cache.
     k: Vec<f64>,
@@ -65,7 +66,7 @@ fn keys(spec: &AttnSpec) -> usize {
     spec.tk + appended(spec)
 }
 
-fn case(spec: AttnSpec<'static>, lens: &[i64]) -> Case {
+fn case(spec: Admitted<'static, AttnSpec>, lens: &[i64]) -> Case {
     let mut seed = 5;
     let n = |elems: usize, seed: &mut u64| super::rounded(ScalarDType::BFloat16, elems, seed, |x| x);
     let batch = spec.batch.capacity();
@@ -200,7 +201,7 @@ fn extra_params(c: &Case) -> Vec<Vec<f64>> {
 /// Every parameter in order; partial outputs when the config splits.
 fn params(c: &Case) -> Vec<Vec<f64>> {
     let s = &c.spec;
-    let (cap, splits) = (s.batch.capacity(), s.cfg.splits);
+    let (cap, splits) = (s.batch.capacity(), s.cfg().splits);
     let mut p = vec![c.q.clone(), c.k.clone(), c.v.clone()];
     if splits == 1 {
         p.push(vec![0.0; cap * s.t * s.heads * s.d]);
@@ -216,7 +217,7 @@ fn params(c: &Case) -> Vec<Vec<f64>> {
 /// The output: `o`, or the partials merged by the combine program.
 fn output(c: &Case, got: Vec<Vec<f64>>, live: i64) -> Vec<f64> {
     let s = &c.spec;
-    if s.cfg.splits == 1 {
+    if s.cfg().splits == 1 {
         return got[3].clone();
     }
     let merge = combine_spec(s);
@@ -225,29 +226,46 @@ fn output(c: &Case, got: Vec<Vec<f64>>, live: i64) -> Vec<f64> {
     run(&combine::<BF16>(&merge), params, &[("b", live)]).unwrap().swap_remove(3)
 }
 
-fn combine_spec(s: &AttnSpec) -> CombineSpec {
-    CombineSpec { batch: s.batch.clone(), t: s.t, heads: s.heads, d: s.d, splits: s.cfg.splits, cfg: NormCfg { br: 4 } }
+fn combine_spec(s: &Admitted<AttnSpec>) -> CombineSpec {
+    CombineSpec {
+        batch: s.batch.clone(),
+        t: s.t,
+        heads: s.heads,
+        d: s.d,
+        splits: s.cfg().splits,
+        cfg: NormCfg { br: 4 },
+    }
 }
 
-fn spec(t: usize, tk: usize, d: usize, bq: usize, bkv: usize, causal: bool, key_lens: bool) -> AttnSpec<'static> {
+fn spec(
+    t: usize,
+    tk: usize,
+    d: usize,
+    bq: usize,
+    bkv: usize,
+    causal: bool,
+    key_lens: bool,
+) -> Admitted<'static, AttnSpec> {
     let mask = AttnMask { causal, key_lens, ..AttnMask::default() };
     masked(t, tk, d, bq, bkv, mask)
 }
 
-fn masked(t: usize, tk: usize, d: usize, bq: usize, bkv: usize, mask: AttnMask) -> AttnSpec<'static> {
-    AttnSpec {
-        batch: Batch::var("b", 1, 2),
-        t,
-        tk,
-        heads: 2,
-        kv_heads: 2,
-        d,
-        mask,
-        cache: None,
-        packed: false,
-        scale: 1.0 / (d as f32).sqrt(),
-        cfg: assumed(FaCfg::new(bq, bkv, 2)),
-    }
+fn masked(t: usize, tk: usize, d: usize, bq: usize, bkv: usize, mask: AttnMask) -> Admitted<'static, AttnSpec> {
+    assumed(
+        AttnSpec {
+            batch: Batch::var("b", 1, 2),
+            t,
+            tk,
+            heads: 2,
+            kv_heads: 2,
+            d,
+            mask,
+            cache: None,
+            packed: false,
+            scale: 1.0 / (d as f32).sqrt(),
+        },
+        FaCfg::new(bq, bkv, 2),
+    )
 }
 
 const NONE: AttnMask = AttnMask {
@@ -282,8 +300,8 @@ const LENS_BIAS: AttnMask = AttnMask { key_lens: true, ..PER_BATCH };
 const EVERY_BIAS: AttnMask = AttnMask { bias: Some(Bias::Shared), ..EVERY };
 
 /// `spec` with its cache's scores biased per batch.
-fn biased<'t>(spec: AttnSpec<'t>) -> AttnSpec<'t> {
-    AttnSpec { mask: AttnMask { bias: Some(Bias::PerBatch), ..spec.mask }, ..spec }
+fn biased<'t>(spec: Admitted<'t, AttnSpec>) -> Admitted<'t, AttnSpec> {
+    spec.map(|s| AttnSpec { mask: AttnMask { bias: Some(Bias::PerBatch), ..s.mask }, ..s })
 }
 
 /// The RDNA prefill forms: truncated probabilities, the rescale skipped and
@@ -310,13 +328,12 @@ const fn rows32(bq: usize, bkv: usize) -> FaCfg {
 }
 
 /// A scale of the caller's choosing, in place of `1/√d`.
-fn scaled<'t>(mut spec: AttnSpec<'t>, scale: f32) -> AttnSpec<'t> {
-    spec.scale = scale;
-    spec
+fn scaled<'t>(spec: Admitted<'t, AttnSpec>, scale: f32) -> Admitted<'t, AttnSpec> {
+    spec.map(|s| AttnSpec { scale, ..s })
 }
 
-fn with(cfg: FaCfg, spec: AttnSpec) -> AttnSpec<'static> {
-    AttnSpec { cfg: assumed(cfg), ..spec }
+fn with(cfg: FaCfg, spec: Admitted<AttnSpec>) -> Admitted<AttnSpec> {
+    assumed(spec.into_spec(), cfg)
 }
 
 /// The program in the interpreter against a direct f64 softmax, and on a
@@ -409,21 +426,15 @@ fn with(cfg: FaCfg, spec: AttnSpec) -> AttnSpec<'static> {
 #[test_case(with(wide(128, 64), masked(200, 130, 128, 0, 0, LENS_BIAS)), &[130, 99]; "wide core, bias with lengths")]
 #[test_case(with(wide(128, 32), masked(128, 128, 128, 64, 32, EVERY_BIAS)), &[128, 100]; "wide core, every mask and a bias")]
 #[test_case(with(FaCfg { splits: 2, ..wide(64, 32) }, masked(100, 300, 64, 0, 0, AttnMask::default())), &[100, 300]; "wide core, two splits")]
-fn attention_matches_a_direct_softmax(spec: AttnSpec<'static>, lens: &[i64]) {
+fn attention_matches_a_direct_softmax(spec: Admitted<'static, AttnSpec>, lens: &[i64]) {
     matches_a_direct_softmax(&case(spec.clone(), lens));
     let Some(planner) = super::device_planner() else { return };
     let target = planner.device.target.clone();
-    let spec = AttnSpec {
-        cfg: assumed(FaCfg {
-            schedule: Schedule::ring(target.fill.stages(spec.cfg.stages()), spec.cfg.unroll()),
-            ..*spec.cfg
-        }),
-        ..spec
-    };
+    let spec = reassumed(spec, |c| FaCfg { schedule: Schedule::ring(target.fill.stages(c.stages()), c.unroll()), ..c });
     let bias = spec.mask.bias.is_some();
-    let smem = spec.cfg.smem_bytes(spec.d, bias);
-    if !spec.cfg.fits(&target, spec.d, bias) || smem > target.smem_bytes {
-        return eprintln!("skipped on the device: {:?} does not fit {}", spec.cfg, target.arch.target_name());
+    let smem = spec.cfg().smem_bytes(spec.d, bias);
+    if !spec.cfg().fits(&target, spec.d, bias) || smem > target.smem_bytes {
+        return eprintln!("skipped on the device: {:?} does not fit {}", spec.cfg(), target.arch.target_name());
     }
     on_device(&spec, lens, target);
 }
@@ -466,20 +477,16 @@ fn cached(
     row_map: bool,
     appended: usize,
     splits: usize,
-) -> AttnSpec<'static> {
-    let mut spec = masked(t, tk, d, 64, 32, AttnMask { key_lens: true, ..AttnMask::default() });
-    spec.heads = heads;
-    spec.kv_heads = kv_heads;
+) -> Admitted<'static, AttnSpec> {
+    let spec = masked(t, tk, d, 64, 32, AttnMask { key_lens: true, ..AttnMask::default() });
     let cache = CacheLayout { rows: 3, heads_total: 3 * kv_heads, row_map, appended, app_lens: false };
-    spec.cache = Some(cache);
-    spec.cfg = assumed(FaCfg { splits, ..*spec.cfg });
-    spec
+    let spec = spec.map(|s| AttnSpec { heads, kv_heads, cache: Some(cache), ..s });
+    reassumed(spec, |c| FaCfg { splits, ..c })
 }
 
 /// `spec` with the visible appended rows counted per batch.
-fn counted<'t>(mut spec: AttnSpec<'t>) -> AttnSpec<'t> {
-    spec.cache = spec.cache.map(|c| CacheLayout { app_lens: true, ..c });
-    spec
+fn counted<'t>(spec: Admitted<'t, AttnSpec>) -> Admitted<'t, AttnSpec> {
+    spec.map(|s| AttnSpec { cache: s.cache.map(|c| CacheLayout { app_lens: true, ..c }), ..s })
 }
 
 /// A batch whose key mask hides every key attends to nothing: its rows come
@@ -489,7 +496,7 @@ fn counted<'t>(mut spec: AttnSpec<'t>) -> AttnSpec<'t> {
 #[test_case(3; "three splits")]
 fn a_fully_masked_batch_is_zeros(splits: usize) {
     let spec = masked(128, 128, 64, 64, 32, KEY_MASK);
-    let spec = AttnSpec { cfg: assumed(FaCfg { splits, ..*spec.cfg }), ..spec };
+    let spec = reassumed(spec, |c| FaCfg { splits, ..c });
     let mut c = case(spec.clone(), &[128, 128]);
     let stride = key_mask_stride(spec.tk);
     c.key_mask[stride..].fill(0);
@@ -527,8 +534,8 @@ fn two_atom_rows_match_one_on_the_device(causal: bool, bias: bool, d: usize, bq:
     let device = &planner.device;
     let mask = AttnMask { causal, key_lens: true, bias: bias.then_some(Bias::PerBatch), ..NONE };
     let one = masked(100, 150, d, bq, bkv, mask);
-    let two = AttnSpec { cfg: assumed(FaCfg { warp_rows: 2 * WARP_ROWS, ..*one.cfg }), ..one.clone() };
-    if ![&one, &two].iter().all(|s| s.cfg.fits(&device.target, d, bias)) {
+    let two = reassumed(one.clone(), |c| FaCfg { warp_rows: 2 * WARP_ROWS, ..c });
+    if ![&one, &two].iter().all(|s| s.cfg().fits(&device.target, d, bias)) {
         eprintln!("skipped: the tiles do not fit the target");
         return;
     }
@@ -545,11 +552,11 @@ fn two_atom_rows_match_one_on_the_device(causal: bool, bias: bool, d: usize, bq:
             _ => Tensor::from_slice(v.iter().map(|&x| x as i32).collect::<Vec<_>>()),
         })
         .collect();
-    let bits = |spec: &AttnSpec| -> Vec<u16> {
+    let bits = |spec: &Admitted<AttnSpec>| -> Vec<u16> {
         let o = Tensor::empty(&[elems], DType::BFloat16);
         let mut tensors = vec![&q, &k, &v, &o];
         tensors.extend(&extras);
-        let outs = graph_launch_all(flash_attention(spec), &spec.cfg.lowering(device), &tensors).unwrap();
+        let outs = graph_launch_all(flash_attention(spec), &spec.cfg().lowering(device), &tensors).unwrap();
         let mut plan = outs[3].prepare().unwrap();
         plan.execute_with_vars(&[("b", 2)]).unwrap();
         let mut bytes = vec![0u8; elems * 2];
@@ -574,13 +581,7 @@ fn two_atom_rows_match_one_on_the_device(causal: bool, bias: bool, d: usize, bq:
 fn a_non_finite_unread_element_never_reaches_the_output(cfg: FaCfg) {
     let Some(target) = super::device_target() else { return };
     let spec = with(cfg, cached(1, 100, [4, 4, 64], true, 0, 1));
-    let spec = AttnSpec {
-        cfg: assumed(FaCfg {
-            schedule: Schedule::ring(target.fill.stages(spec.cfg.stages()), spec.cfg.unroll()),
-            ..*spec.cfg
-        }),
-        ..spec
-    };
+    let spec = reassumed(spec, |c| FaCfg { schedule: Schedule::ring(target.fill.stages(c.stages()), c.unroll()), ..c });
     let mut c = case(spec, &[100, 37]);
     assert!(c.row_map.iter().all(|&r| r > 0), "no batch reads the cache's first row");
     c.v[0] = f64::INFINITY;
@@ -591,7 +592,7 @@ fn a_non_finite_unread_element_never_reaches_the_output(cfg: FaCfg) {
 
 /// `spec`'s kernel on the device against the program in the interpreter
 /// (within 2e-2 of it), its bf16 output's bits returned.
-fn on_device(spec: &AttnSpec<'static>, lens: &[i64], target: Target) -> Vec<u16> {
+fn on_device(spec: &Admitted<'static, AttnSpec>, lens: &[i64], target: Target) -> Vec<u16> {
     on_device_case(case(spec.clone(), lens), target)
 }
 
@@ -601,14 +602,14 @@ fn on_device_case(c: Case, target: Target) -> Vec<u16> {
     let batch = spec.batch.capacity();
     let raw = run(&flash_attention(&spec), params(&c), &[("b", batch as i64)]).unwrap();
     let want = output(&c, raw.clone(), batch as i64);
-    let lowering = spec.cfg.lowering(&declared(target.clone()));
+    let lowering = spec.cfg().lowering(&declared(target.clone()));
     let to_bf16 = |v: &[f64]| Tensor::from_slice(v.iter().map(|&x| x as f32).collect::<Vec<_>>()).cast(DType::BFloat16);
     let (q, k, v) = (to_bf16(&c.q), to_bf16(&c.k), to_bf16(&c.v));
     let elems = batch * spec.t * spec.heads * spec.d;
-    let outputs: Vec<Tensor> = if spec.cfg.splits == 1 {
+    let outputs: Vec<Tensor> = if spec.cfg().splits == 1 {
         vec![Tensor::empty(&[elems], DType::BFloat16)]
     } else {
-        let per = spec.cfg.splits * batch * spec.t * spec.heads;
+        let per = spec.cfg().splits * batch * spec.t * spec.heads;
         vec![
             Tensor::empty(&[per * spec.d], DType::Float32),
             Tensor::empty(&[per], DType::Float32),
@@ -631,7 +632,7 @@ fn on_device_case(c: Case, target: Target) -> Vec<u16> {
     // The partials themselves, before the merge: a bug the merge hides is
     // still one. Equal infinities (a split no key reaches) agree; a NaN never.
     for (i, name) in
-        ["o_part", "m_part", "l_part"].into_iter().enumerate().take(if spec.cfg.splits > 1 { 3 } else { 0 })
+        ["o_part", "m_part", "l_part"].into_iter().enumerate().take(if spec.cfg().splits > 1 { 3 } else { 0 })
     {
         let part = &outs[3 + i];
         let mut plan = part.prepare().unwrap();
@@ -646,7 +647,7 @@ fn on_device_case(c: Case, target: Target) -> Vec<u16> {
             panic!("{name}[{at}] = {}, the interpreter's {}", got[at], raw[3 + i][at]);
         }
     }
-    let out = if spec.cfg.splits == 1 {
+    let out = if spec.cfg().splits == 1 {
         outs[3].clone()
     } else {
         let merge = combine_spec(&spec);
@@ -685,8 +686,8 @@ fn on_device_case(c: Case, target: Target) -> Vec<u16> {
 }
 
 /// `spec` on the warpgroup core.
-fn grouped<'t>(spec: AttnSpec<'t>) -> AttnSpec<'t> {
-    AttnSpec { cfg: assumed(FaCfg { core: Core::Group, ..*spec.cfg }), ..spec }
+fn grouped<'t>(spec: Admitted<'t, AttnSpec>) -> Admitted<'t, AttnSpec> {
+    reassumed(spec, |c| FaCfg { core: Core::Group, ..c })
 }
 
 /// The warpgroup core's kernel (four row warps a group of 64 query rows,
@@ -723,11 +724,11 @@ fn grouped<'t>(spec: AttnSpec<'t>) -> AttnSpec<'t> {
 #[test_case(cached(1, 200, [4, 4, 64], true, 0, 4), &[200, 70]; "cache: row map, four splits")]
 #[test_case(cached(5, 96, [2, 2, 128], false, 0, 2), &[64, 96]; "cache: d 128, two splits")]
 #[test_case(biased(cached(1, 200, [4, 4, 64], false, 0, 4)), &[200, 70]; "cache biased: four splits")]
-fn warpgroup_kernel_matches_the_program(spec: AttnSpec<'static>, lens: &[i64]) {
+fn warpgroup_kernel_matches_the_program(spec: Admitted<'static, AttnSpec>, lens: &[i64]) {
     let Some(target) = super::group_target() else { return };
     let spec = grouped(spec);
     let group = on_device(&spec, lens, target.clone());
-    let warp = on_device(&AttnSpec { cfg: assumed(FaCfg { core: Core::Warp, ..*spec.cfg }), ..spec }, lens, target);
+    let warp = on_device(&reassumed(spec, |c| FaCfg { core: Core::Warp, ..c }), lens, target);
     let equal = group.iter().zip(&warp).filter(|(g, w)| g == w).count();
     // Bits as a signed magnitude, so ±0 agree and a sign change counts its steps.
     let ordered = |b: u16| if b & 0x8000 == 0 { i32::from(b) } else { -i32::from(b & 0x7fff) };
@@ -784,9 +785,7 @@ pub(super) fn device_attention(planner: &Planner, spec: &AttnSpec) -> (Vec<FaCfg
     let AttnSpec { t, tk, heads, d, mask, .. } = *spec;
     let tiles = spec.batch.capacity() * heads;
     let ranked = planner.attention_ranked(tiles, t, tk, d, mask.causal, mask.bias.is_some());
-    let build = |cfg: FaCfg| {
-        vec![(flash_attention(&AttnSpec { cfg: assumed(cfg), ..spec.clone() }), cfg.lowering(&planner.device))]
-    };
+    let build = |cfg: FaCfg| vec![(flash_attention(&assumed(spec.clone(), cfg)), cfg.lowering(&planner.device))];
     let shape = [spec.batch.capacity(), t, tk, heads, d];
     let mut tuner =
         crate::ops::Tuner::new(crate::tune::TuneStore::global(), &planner.device, DType::BFloat16, &shape, mask, build);
@@ -800,27 +799,9 @@ pub(super) fn device_attention(planner: &Planner, spec: &AttnSpec) -> (Vec<FaCfg
 }
 
 /// The probe's shape: `batch` lanes of `heads` heads over `t` queries and keys.
-pub(super) fn probe_spec(
-    batch: usize,
-    heads: usize,
-    t: usize,
-    tk: usize,
-    d: usize,
-    mask: AttnMask,
-) -> AttnSpec<'static> {
-    AttnSpec {
-        batch: Batch::Static(batch),
-        t,
-        tk,
-        heads,
-        kv_heads: heads,
-        d,
-        mask,
-        cache: None,
-        packed: false,
-        scale: 1.0 / (d as f32).sqrt(),
-        cfg: assumed(FaCfg::new(64, 64, 2)),
-    }
+pub(super) fn probe_spec(batch: usize, heads: usize, t: usize, tk: usize, d: usize, mask: AttnMask) -> AttnSpec {
+    let scale = 1.0 / (d as f32).sqrt();
+    AttnSpec { batch: Batch::Static(batch), t, tk, heads, kv_heads: heads, d, mask, cache: None, packed: false, scale }
 }
 
 fn label(c: &FaCfg) -> String {
@@ -870,9 +851,8 @@ fn attention_throughput_probe() {
             if !timed.contains(&pick) {
                 timed.push(pick);
             }
-            let build = |cfg: FaCfg| {
-                vec![(flash_attention(&AttnSpec { cfg: assumed(cfg), ..spec.clone() }), cfg.lowering(&planner.device))]
-            };
+            let build =
+                |cfg: FaCfg| vec![(flash_attention(&assumed(spec.clone(), cfg)), cfg.lowering(&planner.device))];
             let ns = super::measure(timed.iter().map(|&c| build(c)));
             let flops = 4.0 * (batch * heads * t * t * d) as f64 / if causal { 2.0 } else { 1.0 };
             eprintln!(
@@ -907,9 +887,9 @@ fn attention_splits_probe() {
             for splits in [Some(1), Some(2), Some(4), None] {
                 let store = crate::tune::TuneStore::global();
                 let dtype = DType::BFloat16;
-                let cfg = crate::ops::attention::tuned(store, &planner, dtype, &ranked, spec.clone(), splits).cfg;
-                let mut programs =
-                    vec![(flash_attention(&AttnSpec { cfg, ..spec.clone() }), cfg.lowering(&planner.device))];
+                let tuned = crate::ops::attention::tuned(store, &planner, dtype, &ranked, spec.clone(), splits);
+                let cfg = tuned.cfg();
+                let mut programs = vec![(flash_attention(&tuned), cfg.lowering(&planner.device))];
                 if cfg.splits > 1 {
                     let merge = crate::ops::attention::merge(spec.batch.clone(), t, heads, d, cfg.splits);
                     programs.push((combine::<BF16>(&merge), crate::lower::Lowering::new(&planner.device)));
@@ -934,7 +914,7 @@ fn key_warp_resources_probe() {
     for (key_warps, bkv) in [(1, 16), (2, 16), (4, 16), (1, 32), (2, 32), (4, 32)] {
         let cfg = FaCfg { key_warps, ..FaCfg::new(16, bkv, 2) };
         let spec = probe_spec(5, 20, 1, 1500, 64, AttnMask::default());
-        let spec = AttnSpec { cfg: assumed(cfg), ..spec };
+        let spec = assumed(spec, cfg);
         let lowering = cfg.lowering(&planner.device);
         let Some((plan, _)) = crate::tune::scratch_plan(flash_attention(&spec), &lowering, &pool) else {
             eprintln!("{}: does not compile", label(&cfg));
@@ -961,7 +941,7 @@ fn the_tuned_d128_attention_compiles_on_gfx1151() {
     let (_, candidates, formed) = device_attention(&planner, &spec);
     let pool = crate::tune::ScratchPool::default();
     let resources = |cfg: FaCfg| {
-        let prog = flash_attention(&AttnSpec { cfg: assumed(cfg), ..spec.clone() });
+        let prog = flash_attention(&assumed(spec.clone(), cfg));
         let (plan, _) = crate::tune::scratch_plan(prog, &cfg.lowering(&planner.device), &pool).expect("compiles");
         crate::tune::resources(&plan)
     };
@@ -1009,9 +989,9 @@ fn attention_candidates_probe() {
             }
         }
         let flops = 4.0 * (batch * heads * t * tk * d) as f64 / if causal { 2.0 } else { 1.0 };
-        let ns = super::measure(cfgs.iter().map(|&c| {
-            vec![(flash_attention(&AttnSpec { cfg: assumed(c), ..spec.clone() }), c.lowering(&planner.device))]
-        }));
+        let ns = super::measure(
+            cfgs.iter().map(|&c| vec![(flash_attention(&assumed(spec.clone(), c)), c.lowering(&planner.device))]),
+        );
         eprintln!(
             "== attention b{batch} h{heads} t{t} tk{tk} d{d} causal={causal} ({} shortlist, {} lattice)",
             shortlist.len(),

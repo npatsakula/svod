@@ -4,7 +4,6 @@
 //! replayed through it reads the keys the op layer writes and follows its
 //! admission, choice and pipeline stages to the config they name.
 
-use crate::sweep::assumed;
 use std::path::{Path, PathBuf};
 
 use super::Scratch;
@@ -95,14 +94,7 @@ fn a_replay_writes_nothing() {
     let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1);
     std::fs::File::options().write(true).open(&stale).and_then(|f| f.set_modified(old)).expect("aged");
     let before = tree(&dir);
-    let spec = GemmSpec {
-        m: 256,
-        n: 256,
-        k: 256,
-        batch: Batch::Static(1),
-        epilogue: Epilogue::DEFAULT,
-        cfg: assumed(ranked[0]),
-    };
+    let spec = GemmSpec { m: 256, n: 256, k: 256, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT };
     let store = TuneStore::replay(dir.to_path_buf());
     tuned::linear(&store, &planner, DType::BFloat16, &ranked, spec);
     assert!(store.lookups().iter().all(|l| matches!(l.found, Found::Missing { .. })), "{:?}", store.lookups());
@@ -121,14 +113,7 @@ fn a_replay_writes_nothing() {
 fn a_gemm_tuning_reads_the_key_the_op_layer_writes(probe: bool) {
     let planner = super::planner(sm86());
     let ranked = planner.gemm_ranked(1, 512, 512, 512, &Epilogue::DEFAULT);
-    let spec = GemmSpec {
-        m: 512,
-        n: 512,
-        k: 512,
-        batch: Batch::Static(1),
-        epilogue: Epilogue::DEFAULT,
-        cfg: assumed(ranked[0]),
-    };
+    let spec = GemmSpec { m: 512, n: 512, k: 512, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT };
     let dir = Scratch::new(&format!("replay-key-{probe}"));
     let store = TuneStore::replay(dir.to_path_buf());
     let reps = representatives(&ranked);
@@ -179,8 +164,8 @@ fn admitted_and_chosen(dir: &Path) -> (Planner, Arc<[GemmCfg]>, Vec<GemmCfg>) {
     (planner, ranked, reps)
 }
 
-fn spec(cfg: GemmCfg) -> GemmSpec<'static> {
-    GemmSpec { m: 512, n: 512, k: 512, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg: assumed(cfg) }
+fn spec() -> GemmSpec {
+    GemmSpec { m: 512, n: 512, k: 512, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT }
 }
 
 /// A replayed tuning follows the stored stages: the admitted indices name
@@ -192,8 +177,8 @@ fn a_replayed_gemm_follows_the_admission_and_the_choice() {
     let dir = Scratch::new("replay-chain");
     let (planner, ranked, reps) = admitted_and_chosen(&dir);
     let store = TuneStore::replay(dir.to_path_buf());
-    let pick = tuned::linear(&store, &planner, DType::BFloat16, &ranked, spec(ranked[0])).cfg;
-    assert_eq!(*pick, reps[1], "the choice's fastest, the second admitted");
+    let pick = tuned::linear(&store, &planner, DType::BFloat16, &ranked, spec()).cfg();
+    assert_eq!(pick, reps[1], "the choice's fastest, the second admitted");
     let lookups = store.lookups();
     let found: Vec<(Kind, Found)> = lookups.iter().map(|l| (l.kind, l.found)).collect();
     assert_eq!(found[..2], [(Kind::Admitted, Found::Built { lines: 1 }), (Kind::Choice, Found::Built { lines: 1 })]);
@@ -214,7 +199,7 @@ fn the_planner_log_names_the_admitted_and_chosen_configs() {
     if let Some(dir) = std::env::var_os(CHILD) {
         super::traced();
         let (planner, ranked, _) = admitted_and_chosen(Path::new(&dir));
-        tuned::linear(&TuneStore::replay(dir.into()), &planner, DType::BFloat16, &ranked, spec(ranked[0]));
+        tuned::linear(&TuneStore::replay(dir.into()), &planner, DType::BFloat16, &ranked, spec());
         return;
     }
     let dir = Scratch::new("replay-log");

@@ -9,8 +9,8 @@ use crate::atoms::{Core, Fill, Target};
 use std::num::NonZeroUsize;
 
 use crate::ir::{Axis, Schedule, Shape};
+use crate::kernels::Act;
 use crate::kernels::gemm::{Epilogue, GemmCfg, Rope, TAIL_MERGE, TailPlan, TailSpec, TailSplit, TileOrder};
-use crate::kernels::{Act, Admitted};
 use crate::layouts::{Issue, Swizzle, WarpGrid, chunked, fills_in_chunks};
 use crate::tune::SETTLED;
 
@@ -362,11 +362,6 @@ impl GemmProblem {
     /// one; the tuner times them beside the rest.
     pub fn admit(&self, planner: &Planner, cfg: &GemmCfg) -> Result<(f64, u32), Rejected> {
         planner.admit(self, cfg)
-    }
-
-    /// `cfg` admitted for this problem ([`Admitted`]), or why it is not.
-    pub fn admitted<'t>(&self, planner: &'t Planner, cfg: GemmCfg) -> Result<Admitted<'t, GemmCfg>, Rejected> {
-        planner.admitted(self, cfg)
     }
 
     /// Whether `cfg` runs `halves` halves on `target`, a `rope` turning the
