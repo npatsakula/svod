@@ -23,10 +23,9 @@ pub mod rt {
     pub use svod_runtime::{ExecutionPlan, KernelProfile, PreparedKernel, ProfileOptions};
 }
 
-/// Shape + dtype descriptor for a single JIT input. Used by
-/// `jit_wrapper!`-generated `prepare()` calls to allocate zero-initialized
-/// placeholder buffers internally — callers no longer construct fake
-/// `Tensor::zeros(..).realize()` placeholders.
+/// Shape + dtype descriptor for a single JIT input. `jit_wrapper!`-generated
+/// `prepare()` calls allocate zero-initialized placeholder buffers from it, so
+/// callers pass shapes, not realized tensors.
 #[derive(Clone, Debug)]
 pub struct InputSpec {
     pub shape: Vec<usize>,

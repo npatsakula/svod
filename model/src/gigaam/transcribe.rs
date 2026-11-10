@@ -303,10 +303,8 @@ impl GigaAmTranscriber {
             Head::Rnnt { runtime, .. } => {
                 let mut enc = GigaAmEncoderJit::new(model.clone());
                 // Device-local output: the [B, T_sub, d_model] readback goes
-                // over the SDMA copy queue instead of the ~21 MB/s host-mapped
-                // BAR (the old first-execute hang was tied to per-execute
-                // schedule re-instantiation under runtime vars; the plan is
-                // all-static now).
+                // over the SDMA copy queue instead of uncached reads through
+                // the host-mapped BAR.
                 let enc_config = PrepareConfig::device_local();
                 scoped("encoder", || enc.prepare_with_config(mel_spec, lengths_spec, &enc_config))?;
                 encoder_jit = Some(enc);

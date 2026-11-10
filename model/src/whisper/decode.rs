@@ -395,8 +395,8 @@ fn read_prefill_logits(
 
 /// Copy `count` floats from element `offset` of a device buffer over the copy
 /// engine. Reading a device-resident buffer through its host mapping faults
-/// the pages across one at a time, at a measured 0.32 GB/s; one bulk copy of
-/// the same range moves the same data as a single transfer.
+/// the pages across one at a time; one bulk copy of the same range moves the
+/// same data as a single transfer.
 pub(crate) fn read_f32(buffer: &Buffer, offset: usize, count: usize) -> Result<Vec<f32>> {
     let mut out = vec![0f32; count];
     let element = size_of::<f32>();

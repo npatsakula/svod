@@ -54,7 +54,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   can, compiles the kernels and runs them. A realized tensor stays behind a
   shared borrow.
 
-Reading data back:
+Reading data back (and writing it in place):
 
 | Method | Realizes? | Returns |
 |---|---|---|
@@ -62,7 +62,7 @@ Reading data back:
 | `to_vec::<T>()`, `to_ndarray::<T>()` | on demand | owned copy |
 | `item::<T>()` | on demand | the single element |
 | `array_view::<T>()` | never | borrowed `ndarray` view, zero-copy |
-| `with_host_write::<T, _>(f)` | never | exclusive host write guard, not a view |
+| `with_host_write::<T, _>(f)` | never | what `f` returns; `f` writes through an exclusive `HostWrite` guard, not a view |
 
 So the shortest form is `(&a + &b)?.to_vec::<f32>()?`. Use the `as_*` family
 where a hidden realize would be a bug. The view and the write guard need a

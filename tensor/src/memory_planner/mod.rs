@@ -345,7 +345,7 @@ fn exclusion_reason(
 /// runtime executor uses for `op_levels`. Keyed on `kernel.id` +
 /// `ScheduleItem.dependencies`; `levels[i]` is item `i`'s longest
 /// dependency-path length. Returns `Err` (loud) on a cyclic or unresolved-dep
-/// schedule, matching the runtime — the planner no longer silently skips.
+/// schedule, matching the runtime.
 ///
 /// Sharing one implementation guarantees these levels equal the runtime's
 /// per-op levels (so level-interval reuse decisions match real execution

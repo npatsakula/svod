@@ -33,14 +33,14 @@ for frame in frames {
 `SVOD_THREADS` (default: host parallelism) bounds both kernel compilation and
 CPU kernel execution.
 
-## Reading data
+## Reading and writing data
 
 | Method | Realizes? | Returns |
 |---|---|---|
 | `as_vec`, `as_ndarray` | never | owned copy |
 | `to_vec`, `to_ndarray`, `item` | on demand | owned copy / element |
 | `array_view` | never | borrowed `ndarray` view, zero-copy |
-| `with_host_write::<T, _>(f)` | never | exclusive host write guard, not a view |
+| `with_host_write::<T, _>(f)` | never | `f`'s result; `f` writes through an exclusive `HostWrite` guard, not a view |
 
 `Tensor::from_slice` and `Tensor::from_ndarray` copy the host data into a new
 buffer once.

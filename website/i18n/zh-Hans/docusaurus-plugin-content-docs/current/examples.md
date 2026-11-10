@@ -50,7 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - `realize(&self)` 调度张量背后的整个图，尽可能融合，编译内核并运行。已执行的
   张量可以继续放在共享借用之后。
 
-读回数据：
+读回数据（以及原地写入）：
 
 | 方法 | 是否触发 realize？ | 返回 |
 |---|---|---|
@@ -58,7 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `to_vec::<T>()`、`to_ndarray::<T>()` | 按需 | 拥有所有权的副本 |
 | `item::<T>()` | 按需 | 唯一的那个元素 |
 | `array_view::<T>()` | 从不 | 借用的 `ndarray` 视图，零拷贝 |
-| `with_host_write::<T, _>(f)` | 从不 | 独占的宿主写守卫，不是视图 |
+| `with_host_write::<T, _>(f)` | 从不 | `f` 的返回值；`f` 通过独占的 `HostWrite` 写守卫写入，而不是视图 |
 
 因此最短的写法是 `(&a + &b)?.to_vec::<f32>()?`。在隐式 realize 会构成 bug 的地方
 使用 `as_*` 系列。视图和写守卫要求缓冲区可映射到宿主（CPU，或带宿主映射的 GPU 缓冲区），

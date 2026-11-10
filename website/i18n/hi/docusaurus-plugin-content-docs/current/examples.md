@@ -54,7 +54,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   फ़्यूज़ करता है, कर्नेल कंपाइल करता है और उन्हें चलाता है। realize हुआ टेंसर shared borrow
   के पीछे ही रहता है।
 
-डेटा वापस पढ़ना:
+डेटा वापस पढ़ना (और उसी जगह लिखना):
 
 | मेथड | realize करता है? | लौटाता है |
 |---|---|---|
@@ -62,7 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `to_vec::<T>()`, `to_ndarray::<T>()` | ज़रूरत पड़ने पर | owned कॉपी |
 | `item::<T>()` | ज़रूरत पड़ने पर | एकमात्र एलिमेंट |
 | `array_view::<T>()` | कभी नहीं | उधार लिया `ndarray` view, zero-copy |
-| `with_host_write::<T, _>(f)` | कभी नहीं | exclusive host write guard, view नहीं |
+| `with_host_write::<T, _>(f)` | कभी नहीं | `f` जो लौटाए; `f` एक exclusive `HostWrite` guard से लिखता है, view से नहीं |
 
 इसलिए सबसे छोटा रूप `(&a + &b)?.to_vec::<f32>()?` है। जहाँ छिपा हुआ realize एक बग होगा,
 वहाँ `as_*` परिवार का उपयोग करें। view और write guard को host-mappable बफ़र चाहिए

@@ -5,10 +5,10 @@
 //!
 //! # Kernel Signature
 //!
-//! Generates a single function with direct typed parameters and `noalias align 32`
-//! buffer annotations:
+//! Generates a single function with direct typed parameters; buffers are
+//! `noalias align 32`, plus `readonly` where the kernel only reads them:
 //! ```llvm
-//! define void @kernel(ptr noalias align 32 %buf0, ..., i32 %N) #0 { ... }
+//! define void @kernel(ptr noalias readonly align 32 %data0, ptr noalias align 32 %data1, ..., i32 %N) #0 { ... }
 //! ```
 
 use std::sync::Arc;

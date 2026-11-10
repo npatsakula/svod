@@ -206,7 +206,7 @@ jit_wrapper! {
 /// Host-resident recurrent weights for the scan. The input projection
 /// (`W_ih`, biases) lives in the feature JIT ([`SileroVad::forward_gates`]);
 /// only the recurrence stays host-side — per-step work is too small for a
-/// GPU launch and measured 3x slower as a CPU-device JIT than 8-lane SIMD.
+/// GPU launch, and slower as a CPU-device JIT than the 8-lane SIMD loop.
 pub(crate) struct VadHead {
     pub(crate) w_hh: ndarray::Array2<f32>,    // [4H, H]
     pub(crate) final_w: ndarray::Array1<f32>, // [H]
