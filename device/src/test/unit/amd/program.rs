@@ -971,3 +971,89 @@ attributes #0 = { alwaysinline nounwind "amdgpu-flat-work-group-size"="1,64" }
     }
     assert!(counts.iter().all(|&count| count == (ROUNDS * BURST) as u32), "per-thread dispatch counts {counts:?}");
 }
+
+/// Whether a host store into VRAM reaches the next dispatch: each round the
+/// host writes a fresh pattern into a host-visible VRAM buffer, flushes HDP
+/// (or not, `HDP_MODE=none`), and a kernel copies it into system memory the
+/// host then checks. Stale words mean HDP held the stores. Prints the count
+/// and the flush's cost.
+///
+/// Run: `SVOD_DEVICE=AMD:0 [HDP_MODE=none] [ROUNDS=…] [WORDS=…] cargo test -p svod-device --release --lib
+/// hdp_stale_write_probe -- --ignored --nocapture`
+#[test]
+#[ignore = "manual hardware probe; needs a real AMD GPU + clang"]
+fn hdp_stale_write_probe() {
+    const COPY_IR: &str = r#"target triple = "amdgcn-amd-amdhsa"
+declare i32 @llvm.amdgcn.workitem.id.x()
+declare i32 @llvm.amdgcn.workgroup.id.x()
+define amdgpu_kernel void @copy(ptr addrspace(1) noalias %src, ptr addrspace(1) noalias %dst) #0 {
+  %t = call i32 @llvm.amdgcn.workitem.id.x()
+  %g = call i32 @llvm.amdgcn.workgroup.id.x()
+  %b = shl i32 %g, 6
+  %i = add i32 %b, %t
+  %s = getelementptr i32, ptr addrspace(1) %src, i32 %i
+  %v = load volatile i32, ptr addrspace(1) %s
+  %d = getelementptr i32, ptr addrspace(1) %dst, i32 %i
+  store i32 %v, ptr addrspace(1) %d
+  ret void
+}
+attributes #0 = { nounwind "amdgpu-flat-work-group-size"="64,64" }
+"#;
+    let env = |key: &str, default: usize| std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default);
+    let (rounds, words) = (env("ROUNDS", 2000), env("WORDS", 1 << 16).next_multiple_of(64));
+    let flush = std::env::var("HDP_MODE").as_deref() != Ok("none");
+    let Some(alloc) = amd_alloc_or_skip() else { return };
+    ensure_hw_signal_pool(&alloc);
+    let Some(bytes) = clang_amdgcn(COPY_IR, alloc.dev.arch.mcpu()) else { return };
+    let abi = [0, 1].map(|slot| AbiParamDescriptor { slot, ..global_f32_buffer_abi()[0].clone() });
+    let program = AmdProgram::load(alloc.dev.clone(), &alloc, &bytes, "copy", &abi).expect("load");
+    let spec = crate::allocator::BufferSpec { cpu_access: true, ..Default::default() };
+    let src = crate::allocator::Allocator::alloc(&alloc, words * 4, &spec, false).expect("VRAM source");
+    let dst = alloc.alloc_uncached(words * 4).expect("GTT destination");
+    let (
+        RawBuffer::AmdDevice { gpu_addr: src_gpu, host_ptr: Some(src_host), vram: true, .. },
+        RawBuffer::AmdDevice { gpu_addr: dst_gpu, host_ptr: Some(dst_host), .. },
+    ) = (&src, &dst)
+    else {
+        panic!("a host-visible VRAM source and a mapped GTT destination")
+    };
+    let (src_host, dst_host) = (src_host.cast::<u32>().as_ptr(), dst_host.cast::<u32>().as_ptr());
+    let context = program.new_exec_context().expect("context").expect("AMD context");
+    let (mut stale_rounds, mut stale_words, mut flush_time) = (0usize, 0usize, std::time::Duration::ZERO);
+    for round in 1..=rounds as u32 {
+        for i in 0..words {
+            // SAFETY: both mappings hold `words` u32s; the GPU is idle here.
+            unsafe { std::ptr::write_volatile(src_host.add(i), round.wrapping_mul(0x9e37_79b9) ^ i as u32) };
+        }
+        if flush {
+            let t = std::time::Instant::now();
+            alloc.dev.core().hdp().flush();
+            flush_time += t.elapsed();
+        }
+        unsafe {
+            context.dispatch(
+                &program,
+                &[*src_gpu as *mut u8, *dst_gpu as *mut u8],
+                &[],
+                Some([words / 64, 1, 1]),
+                Some([64, 1, 1]),
+                false,
+            )
+        }
+        .expect("dispatch");
+        context.synchronize().expect("sync");
+        let stale = (0..words)
+            .filter(
+                |&i| unsafe { std::ptr::read_volatile(dst_host.add(i)) } != round.wrapping_mul(0x9e37_79b9) ^ i as u32,
+            )
+            .count();
+        stale_rounds += usize::from(stale > 0);
+        stale_words += stale;
+    }
+    println!(
+        "hdp-stale flush={flush} rounds={rounds} words={words}: stale rounds {stale_rounds}, stale words {stale_words}, flush {:.2} us/round",
+        flush_time.as_secs_f64() * 1e6 / rounds as f64
+    );
+    crate::allocator::Allocator::free(&alloc, src, words * 4, &spec);
+    dst.free_amd_device_in_place();
+}

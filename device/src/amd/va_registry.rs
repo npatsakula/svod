@@ -48,6 +48,9 @@ pub enum AllocTag {
     /// Register-spill scratch — GPU-only VRAM, realloc'd per kernel as private
     /// segment sizes grow.
     Scratch,
+    /// The host-visible VRAM word the host reads back to flush HDP where KFD
+    /// gives no remap page.
+    HdpReadback,
 }
 
 impl AllocTag {
@@ -63,6 +66,7 @@ impl AllocTag {
             AllocTag::Kernarg => "GTT kernarg",
             AllocTag::CommandBuffer => "GTT command buffer",
             AllocTag::Scratch => "scratch",
+            AllocTag::HdpReadback => "HDP readback word",
         }
     }
 }
