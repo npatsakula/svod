@@ -282,8 +282,9 @@ fn do_alloc(
     zero_init: bool,
 ) -> Result<RawBuffer> {
     // Diagnostic tag for the VA registry: scratch is tagged at its own call
-    // site (`device::alloc_scratch`); everything routed through here is either a
-    // VRAM data/code/kernarg buffer or GTT control memory.
+    // site (`device::alloc_scratch`), kernargs and command buffers at theirs
+    // (`alloc_submission_tagged`); everything routed through here is either a
+    // VRAM data/code buffer or GTT control memory.
     let tag = match kind {
         AllocKind::DeviceVram { .. } => AllocTag::Vram,
         AllocKind::UncachedGtt => AllocTag::Gtt,
@@ -292,9 +293,8 @@ fn do_alloc(
 }
 
 /// A data buffer's bytes: a huge page or more takes whole huge pages. A partial
-/// last one costs the whole buffer's translation, and more the larger the tail
-/// (gfx942 GEMM over 4256×4096×4096 by 224×256×64 tiles, 208 against 587 TF;
-/// VA alignment alone leaves that, 2026-11-06).
+/// last one costs the whole buffer's translation, and more the larger the tail;
+/// aligning the VA alone does not avoid it.
 fn whole_huge_pages(size: usize) -> usize {
     if size >= HUGE_PAGE { size.next_multiple_of(HUGE_PAGE) } else { size }
 }

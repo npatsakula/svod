@@ -822,8 +822,8 @@ impl Program for AmdProgram {
     /// Without this a tuner times AMD on the host clock, which charges the
     /// kernel for the whole submit path: the PM4 stream rebuilt per call, the
     /// ring memcpy and doorbell, and — unboundedly — a scratch regrow in
-    /// `ensure_has_local_memory` or a kernarg-arena wrap that drains the
-    /// device. The first of those is driven by the candidate's own
+    /// `ensure_has_local_memory` or a kernarg reservation waiting for the
+    /// oldest live slot to retire. The first of those is driven by the candidate's own
     /// `private_segment_fixed_size`, so it lands on spilling candidates
     /// specifically and no amount of repetition averages it out.
     ///

@@ -1007,7 +1007,9 @@ struct QueueInner {
     gart_host: NonNull<u8>,
     /// The compute queue's error words; `None` on the SDMA queue.
     errors: Option<QueueErrorWords>,
-    /// Flushes VRAM stores a `HostWrite` deferred to the next doorbell.
+    /// Flushes HDP at each doorbell: always where kernargs and command buffers
+    /// live in VRAM, else only the stores a `HostWrite` deferred. Counts the
+    /// SDMA ring's stores behind the GPU caches.
     hdp: Arc<crate::amd::iface::Hdp>,
     /// Index of the next packet (in AQL_PACKET_BYTES-sized slots). For SDMA
     /// queues this is the next byte offset; type checks ensure callers don't
@@ -1255,7 +1257,7 @@ impl QueueInner {
         // LAST. On a host-visible device/large-BAR ring the packet processor can
         // otherwise latch a valid-typed packet over a torn body (stale grid_size /
         // kernarg_address / completion_signal) and stall the CP with no fault —
-        // rptr frozen on the packet, queue_inactive=0 (the exact wedge we see).
+        // rptr frozen on the packet, queue_inactive=0.
         unsafe {
             // dwords 1..16 (body) then dword 0 = INVALID header.
             std::ptr::copy_nonoverlapping(bytes.as_ptr().add(4), dst.add(4), AQL_PACKET_BYTES - 4);
@@ -1550,8 +1552,8 @@ impl AmdComputeQueue {
     /// retirement point instead.
     ///
     /// Sequence (timestamps are present only when the submission requests them):
-    /// `wait(counter, prev) → memory_barrier → [timestamp] → exec → [timestamp]
-    /// → signal(counter, next)`.
+    /// `wait(counter, prev) → [memory_barrier] → [timestamp] → exec → [timestamp]
+    /// → signal(counter, next)`; the barrier comes from the submission.
     /// Returns the counter value this dispatch signals.
     pub(crate) fn submit_hcq_dispatch(
         &self,
@@ -1662,11 +1664,11 @@ impl AmdComputeQueue {
 
         let mut finalized = crate::hcq::Submission::new(submission.queue);
         finalized.push(crate::hcq::Command::Wait { signal_address: counter_addr, value: prev });
-        // The stamp waits below are gfx11's, measured there (gfx1151, 2026-10-28):
-        // they hold both stamps to the compute they bracket. On gfx12 (gfx1201)
-        // the wait on a stamp wedges the queue, and on both a store fence in its
-        // place leaves probes unmeasured — its stamps are left as they were, the
-        // tuner's physical floor the guard on what they read.
+        // The stamp waits below are gfx11's: they hold both stamps to the
+        // compute they bracket. On gfx12 a wait on a stamp wedges the queue,
+        // and on both a store fence in its place leaves probes unmeasured, so
+        // gfx12's stamps stay unwaited and the tuner's physical floor guards
+        // what they read.
         let fenced = self.core.arch.gfx_major() == 11 && ts_addrs.is_some();
         for command in &submission.commands {
             if matches!(command, crate::hcq::Command::Compute(_))
@@ -1675,10 +1677,8 @@ impl AmdComputeQueue {
                 finalized.push(crate::hcq::Command::Timestamp { dst: start_addr });
                 // A bare end-of-pipe clock write retires with the CP's event
                 // queue, not with the packets around it: dispatched behind
-                // other events its landing drags past a following compute
-                // (a 270 ms dispatch's start stamp landed 4 ms before its
-                // end, gfx1151), and left to complete on its own it lands
-                // before one (the same dispatch stamped 1-3 us). Both stamps
+                // other events its landing drags past a following compute,
+                // and left to complete on its own it lands before one. Both stamps
                 // are therefore waited to land where the dispatch needs them:
                 // the start one (zeroed by `reset`) before the compute is
                 // forwarded, the end one behind the timeline-class store that
@@ -2903,8 +2903,8 @@ fn create_queue(
         // header (`HsaUserContextSaveAreaHeader`) the CP reads on every context
         // save/restore (MES preempts a busy queue as routine runlist scheduling).
         // Without the header, a restore reads garbage `DebugOffset`/`DebugSize`
-        // and the queue silently strands (rptr frozen, no fault) — the exact
-        // multi-XCC wedge. Mirrors libhsakmt `fill_cwsr_header`.
+        // and the queue silently strands (rptr frozen, no fault). Mirrors
+        // libhsakmt `fill_cwsr_header`.
         // KFD takes this buffer at its exact size.
         let ctx_buf = AmdBufferGuard::new(
             allocator.alloc_host_visible_tagged(cwsr_buffer_size, crate::amd::va_registry::AllocTag::Vram)?,

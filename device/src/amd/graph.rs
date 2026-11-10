@@ -218,9 +218,9 @@ impl AmdGraph {
         // `comp_queues[dev].memory_barrier()` at the head of a captured device
         // queue (`graph/hcq.py:157`). Per-dispatch coherence is the narrow
         // `acquire_mem` + `CS_PARTIAL_FLUSH` that `build_exec_pm4` already
-        // emits, and the AQL packets carry the header BARRIER bit; a full HDP
-        // flush plus full-invalidate acquire per kernel bought nothing. Morok
-        // keeps the barrier AFTER the timeline wait, matching its own
+        // emits, and the AQL packets carry the header BARRIER bit; a
+        // full-invalidate acquire per kernel buys nothing. Svod keeps the
+        // barrier AFTER the timeline wait, matching its own
         // `Wait -> MemoryBarrier -> Compute` per-call finalization.
         submission.push(Command::MemoryBarrier);
         let mut links = Vec::with_capacity(kernels.len() * 2);

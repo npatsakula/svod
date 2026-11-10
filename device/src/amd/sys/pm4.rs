@@ -401,7 +401,8 @@ pub fn acquire_mem_gfx9() -> [u32; 7] {
 /// Safe as a per-dispatch prologue because a PM4 queue has one XCC, whose L2
 /// every dispatch on the device reads through; memory written behind L2's back
 /// (host, SDMA) is acquired by a full `MemoryBarrier` (L2 invalidate; the host
-/// flushes HDP before every doorbell) before the dispatch that reads it — the
+/// has already flushed its VRAM stores out of HDP, see `Hdp`), which a lane
+/// takes before its next dispatch once such a store is counted — the
 /// full L2 invalidate here would be pure redundant stall.
 pub fn acquire_mem_gfx9_narrow() -> [u32; 7] {
     let cp_coher_cntl = COHER_SH_ICACHE_ACTION_ENA | COHER_SH_KCACHE_ACTION_ENA | COHER_TCL1_ACTION_ENA;

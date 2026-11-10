@@ -101,8 +101,9 @@ impl Drop for EventPageAllocation<'_> {
 pub(crate) struct ScratchState {
     /// GPU VA of the current scratch buffer.
     pub gpu_va: u64,
-    /// Bytes per thread (rounded up to 4-byte slot stride for wave64).
-    /// Equivalent to the kernel's `max_private_segment_size`.
+    /// Bytes per thread the backing holds, a multiple of the scratch unit's
+    /// per-lane stride (16 B on gfx9, 4 B on gfx11/12); at least the private
+    /// segment of every kernel the lane ran.
     pub size_per_thread: u32,
     /// Packed `COMPUTE_TMPRING_SIZE` register value.
     pub tmpring_size: u32,
@@ -209,9 +210,9 @@ pub struct AmdDeviceCore {
     /// buffer is forced host-visible.
     has_sdma_queue: AtomicBool,
     /// Opt-in for PM4 single-XCC graph capture (see `AmdGraph::capture`). Default
-    /// `false` (per-call dispatch) — capture is a measured regression on gfx1151
-    /// despite a bit-identical transcript, so it's exposed only for hardware that
-    /// benefits or future barrier-granularity work. Set by the device factory;
+    /// `false` (per-call dispatch) — capture has not paid off on the PM4 parts
+    /// measured, so it's exposed only for hardware that benefits or future
+    /// barrier-granularity work. Set by the device factory;
     /// a per-device flag (not an env var) so tests toggle it without a process-
     /// global env race and `=0` can't accidentally enable it.
     pm4_graph: AtomicBool,
@@ -245,8 +246,8 @@ pub struct AmdDeviceCore {
     /// Process-global signal pool, allocated once per physical device. Lazily
     /// installed by the device factory and shared across every `PoolQueue`
     /// (PM4 counter signal acquired here at queue construction) — pool access
-    /// is rare (slot alloc on queue build), and one pool covers many
-    /// queues at 4 KiB total VRAM.
+    /// is rare (slot alloc on queue build), and one pool (64-byte GTT slots,
+    /// sized by the factory) covers every queue.
     signal_pool: OnceLock<Arc<crate::amd::signal::SignalPool>>,
     /// Process-global SDMA copy queue, installed by the factory once the signal
     /// pool exists. Its presence is what flips `has_sdma_queue` true and so
@@ -398,11 +399,8 @@ impl AmdDevice {
         debug!(node = node.node_id, gpu_id = node.gpu_id, arch = arch.mcpu(), backend = %backend, "AmdDevice opened");
 
         // Bounded exclusive-lane pool: at most `SVOD_AMD_HW_QUEUES` distinct
-        // KFD compute queues, 4 by default as HIP's `GPU_MAX_HW_QUEUES`. Four
-        // lanes hung gfx942 and wedged MES on gfx1151 while every queue
-        // flushed HDP through one shared REQ/DONE bit; the host flushes it
-        // now, and the tk suite passes on four lanes on gfx942, gfx1201 and
-        // gfx1151 (see the crate-level AMD notes).
+        // KFD compute queues, 4 by default as HIP's `GPU_MAX_HW_QUEUES`.
+        // Lanes share no in-queue HDP flush (see the crate-level AMD notes).
         let hw_queues = std::env::var("SVOD_AMD_HW_QUEUES")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
@@ -936,7 +934,8 @@ pub(crate) fn alloc_scratch(
     // boundary; sizing from raw `cu_cnt` under-provisions on a harvested 8-XCC
     // part, so a high-occupancy dispatch traps with an insufficient-scratch
     // exception (0x401) and the CP HALTS the queue waiting on `queue_inactive_
-    // signal` — which we never service, so the device is lost to that halt.
+    // signal` — which we do not service: a waiter reports the halt as
+    // `AmdQueueError` and the device is lost to it.
     let cu_slots = cu_cnt.next_multiple_of(se_cnt);
 
     // Round up to the per-lane alignment stride.

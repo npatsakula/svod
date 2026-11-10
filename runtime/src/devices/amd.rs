@@ -35,15 +35,14 @@ pub fn create_amd_device(registry: &DeviceRegistry, device_id: usize, arch: AmdA
     // Build the per-device process-shared state: the signal pool (singleton
     // per physical AMD:N, lives on AmdDeviceCore). Each `ExecutionPlan` /
     // `AmdGraph` / per-call `Program::execute` leases a `PoolQueue` from the
-    // core's queue pool (own KFD ring + kernarg arena + scratch + timeline),
-    // so no compute-queue or arena is pre-built here.
+    // core's queue pool (own KFD ring + scratch + timeline, sharing the
+    // device's kernarg ring), so no compute queue or arena is pre-built here.
     let amd_alloc = AmdAllocator::new(device_id)?;
     let device_handle = Arc::clone(&amd_alloc.dev);
     // Signal-pool sizing: per-op AQL dispatch needs only a few slots, but a
     // captured DAG graph reserves one slot per kernel (low hundreds) for its
-    // lifetime, across several concurrent owners. 1024 slots (64 KiB GTT) covers
-    // that with headroom; the pool rounds up to whole 64-slot pages.
-    // Sized for the worst combination: a captured graph reserves a slot per
+    // lifetime, across several concurrent owners; the pool rounds up to whole
+    // 64-slot pages. Sized for the worst combination: a captured graph reserves a slot per
     // kernel for its lifetime while a profiled execution holds every
     // dispatch's signal until harvest. Slots are 64 B each — 4096 is 256 KiB
     // of GTT, cheap insurance against `SignalPool exhausted`.
@@ -52,13 +51,9 @@ pub fn create_amd_device(registry: &DeviceRegistry, device_id: usize, arch: AmdA
     // can acquire its PM4 counter signal.
     device_handle.core().install_signal_pool(signal_pool);
     // Bring up SDMA so buffers can be device-local. Without it every buffer is
-    // forced host-visible and each readback is a memcpy out of the VRAM BAR,
-    // whose uncached reads run at ~50 MB/s on a discrete card (GigaAM on an
-    // RX 9070 XT spent 11 s of a 13 s transcription there). The queue used to
-    // be CDNA-only over a stability worry on RDNA that traced back to the
-    // all-bits HDP flush handshake, fixed in `pm4::hdp_flush`; it now measures
-    // 48 GB/s each way on gfx1201. Must decide before any _alloc, which reads
-    // has_sdma_queue to select buffer visibility.
+    // forced host-visible and each readback is an uncached read through the
+    // VRAM BAR. Must decide before any _alloc, which reads has_sdma_queue to
+    // select buffer visibility.
     let copy_queue =
         if std::env::var_os("AMD_DISABLE_SDMA").is_some() { None } else { Some(AmdCopyQueue::create(&amd_alloc)) };
     match copy_queue {
@@ -71,11 +66,10 @@ pub fn create_amd_device(registry: &DeviceRegistry, device_id: usize, arch: AmdA
         }
         None => {}
     }
-    // PM4 graph capture is opt-in via `SVOD_PM4_GRAPH=1` (default OFF — it
-    // regresses on gfx1151). Parse the env ONCE here into the per-device flag so
-    // the capture path reads a plain bool: only "1" enables; "0"/empty/unset stay
-    // OFF (presence alone no longer enables it), and there is no per-capture env
-    // lookup to race with test toggles.
+    // PM4 graph capture is opt-in via `SVOD_PM4_GRAPH=1` (default OFF). Parse
+    // the env ONCE here into the per-device flag so the capture path reads a
+    // plain bool: only "1" enables; "0", empty or unset stay OFF, and there is
+    // no per-capture env lookup to race with test toggles.
     if std::env::var("SVOD_PM4_GRAPH").as_deref() == Ok("1") {
         device_handle.core().set_pm4_graph(true);
     }
@@ -195,7 +189,7 @@ impl Renderer for AmdRendererWrapper {
 
     fn decompositor(&self) -> Option<svod_ir::pattern::TypedPatternMatcher<()>> {
         // Target Exp2/Log2/Sin/Sqrt selection is centralized in the scheduler.
-        // This matcher handles Morok's additional transcendental ops, and the
+        // This matcher handles Svod's additional transcendental ops, and the
         // bf16 narrowing an old amdgcn backend cannot select.
         let patterns = svod_ir::decompositions::amd_decomposition_patterns();
         Some(if self.integer_bf16 {

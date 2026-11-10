@@ -90,11 +90,9 @@ pub(crate) fn check_amd_clang(version: &str) -> crate::Result<()> {
 pub(crate) const AMD_CONVERGENT_WMMA_LLVM: u32 = 23;
 
 /// Whether machine sinking may move a `v_wmma` into a divergent branch under
-/// a clang of LLVM `major`: below [`AMD_CONVERGENT_WMMA_LLVM`] (ROCm 7.2's
-/// clang 22.0git and Ubuntu's 22.1 included), or when the version is unknown.
-/// Inside the branch the lanes it skips never write the product's operands, so
-/// it reads garbage: split attention's gated `o_part` store came out NaN on
-/// gfx1151 with ROCm clang.
+/// a clang of LLVM `major`: below [`AMD_CONVERGENT_WMMA_LLVM`], or when the
+/// version is unknown. Inside the branch the lanes it skips never write the
+/// product's operands, so the product reads garbage.
 pub(crate) fn amd_sinks_wmma(major: Option<u32>) -> bool {
     major.is_none_or(|major| major < AMD_CONVERGENT_WMMA_LLVM)
 }
@@ -106,8 +104,8 @@ pub(crate) fn amd_sinks_wmma(major: Option<u32>) -> bool {
 /// links no device libs). The renderer emits `@llvm.*` intrinsics for every
 /// float unary the AMDGPU backend can select, so the libraries are only needed
 /// when the IR still references the f64 `__ocml_*` entry points
-/// (`codegen/src/llvm/amd/ops.rs::render_float_unary`). The IR is part of the
-/// object-cache key, so keying a flag off it keeps the key sound.
+/// (`codegen/src/llvm/amd/ops.rs::render_float_unary`). Each kernel's object
+/// key carries the flags its IR selects ([`amd_object_key`]).
 ///
 /// Below [`AMD_CONVERGENT_WMMA_LLVM`] (or when the version is unreadable)
 /// machine sinking is off for IR holding a matrix product; see

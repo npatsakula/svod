@@ -32,8 +32,9 @@ use crate::sync::TimelineSignal;
 /// One hardware compute lane, retained by [`QueuePool`] and published through
 /// only by its current [`QueueLease`].
 ///
-/// Owns: KFD compute queue, kernarg arena, scratch backing, PM4 completion
-/// counter, and lane-level linked-plan finalizers.
+/// Owns: KFD compute queue, scratch backing, PM4 completion counter, AQL
+/// retirement count, and lane-level linked-plan finalizers; shares the
+/// device's kernarg ring.
 #[derive(Debug)]
 pub(crate) struct PoolQueue {
     /// Shared immutable identity. Cloned across all queues backed by the same
@@ -42,9 +43,9 @@ pub(crate) struct PoolQueue {
     /// The KFD compute queue: ring, doorbell, and GART. Its backend-local mutex
     /// is uncontended because publication requires the lane's unique lease.
     queue: Box<AmdComputeQueue>,
-    /// Kernel-argument ring (16 MiB GTT). One per DEVICE, shared by every
-    /// lane: each slot retires with the timeline point of the submission that
-    /// reads it, whichever lane that is. Freed by `Drop for KernargArena` once
+    /// Kernel-argument ring (16 MiB; VRAM on multi-XCC parts, uncached GTT
+    /// elsewhere, see `Hdp`). One per DEVICE, shared by every lane: each slot
+    /// retires with the submission that reads it, whichever lane that is. Freed by `Drop for KernargArena` once
     /// the last sharing queue drops, after `Drop for PoolQueue` has drained.
     arena: Arc<KernargArena>,
     /// Scratch backing. Grown on demand by [`ensure_has_local_memory`](Self::ensure_has_local_memory)
@@ -427,8 +428,8 @@ impl PoolQueue {
         self.link_cache.lock().link_for_context(self as *const Self as u64, &device, lowered, values)
     }
 
-    /// Build a pool queue with its own KFD compute queue + kernarg arena +
-    /// pre-reserved scratch. The PM4 counter signal is acquired from the core's
+    /// Build a pool queue with its own KFD compute queue and pre-reserved
+    /// scratch, sharing the device's kernarg ring. The PM4 counter signal is acquired from the core's
     /// shared `SignalPool` (which the factory must have installed first —
     /// `AmdDeviceCore::install_signal_pool`).
     ///

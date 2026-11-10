@@ -1,16 +1,11 @@
 //! `AmdIface`: the device-backend seam.
 //!
-//! `AmdDeviceCore` no longer issues KFD ioctls directly — it routes every
-//! memory alloc/free, queue ring setup/teardown, and event wait through an
-//! `Arc<dyn AmdIface>`. The only implementor today is [`KfdIface`], a verbatim
-//! relocation of the KFD-direct path that previously lived inline across
-//! `allocator.rs`, `device.rs`, and `queue.rs`. KFD-specific state (the kfd /
-//! drm fds, KFD ABI version, event ids, and the per-process event page) lives
-//! on `KfdIface`, off the core. A future userspace AM driver becomes a second
-//! `AmdIface` implementor without touching any call site above the seam.
-//!
-//! This is a pure refactor: flag composition, ioctl argument layout, error
-//! mapping, and the fault-message strings are reproduced bit-for-bit.
+//! `AmdDeviceCore` routes every memory alloc/free, queue ring setup/teardown,
+//! event wait and HDP flush through an `Arc<dyn AmdIface>`. The only
+//! implementor is [`KfdIface`]; KFD-specific state (the kfd / drm fds, KFD ABI
+//! version, event ids, the per-process event page, the HDP flush path) lives
+//! on it, off the core. A userspace AM driver would be a second implementor
+//! without touching any call site above the seam.
 
 #![cfg(unix)]
 
@@ -80,7 +75,8 @@ pub trait AmdIface: Send + Sync + std::fmt::Debug {
     /// A completion packet that writes `event_id` there and raises an interrupt
     /// wakes a blocked `WAIT_EVENTS` immediately instead of leaving it to the
     /// poll tier (tinygrad `AMDComputeQueue.signal`, `ops_amd.py:391-393`).
-    /// `None` on backends with no KFD event page (AM, host mocks), which then
+    /// An AQL lane's retirement signal and each compute queue's error words
+    /// raise it too. `None` on backends with no KFD event page (AM, host mocks), which then
     /// rely on the coherent GTT slot alone.
     fn queue_event_mailbox(&self) -> Option<QueueEventMailbox> {
         None
@@ -230,9 +226,9 @@ pub enum AllocKind {
     /// Device VRAM. `executable` adds the EXECUTABLE bit (set for general
     /// buffers, cleared for scratch). PUBLIC is derived from `cpu_access`.
     DeviceVram { executable: bool },
-    /// GTT-pinned, host-visible, uncached system memory: everything the host
-    /// writes per submission (rings, GART, signal slots, kernargs, command
-    /// buffers). The GPU reads it snooped, through no HDP, and `UNCACHED`
+    /// GTT-pinned, host-visible, uncached system memory: rings, GART, signal
+    /// slots, and, off multi-XCC parts, kernargs and command buffers (see
+    /// `Hdp`). The GPU reads it snooped, through no HDP, and `UNCACHED`
     /// maps it MTYPE UC on every arch, so no GPU L2 keeps a stale copy of a
     /// reused slot. `COHERENT` alone maps NC, cached in L2, on gfx12
     /// (`gmc_v12_0_get_vm_pte`) and on a gfx942 APU, where each XCC's L2
@@ -288,8 +284,7 @@ pub struct QueueHandle {
 // crosses the trait.
 unsafe impl Send for QueueHandle {}
 
-/// KFD-direct backend. Owns the per-process/per-device KFD state that used to
-/// live on `AmdDeviceCore`.
+/// KFD-direct backend. Owns the per-process/per-device KFD state.
 #[derive(Debug)]
 pub struct KfdIface {
     /// Shared `/dev/kfd` handle (one per process).
@@ -325,8 +320,8 @@ pub struct KfdIface {
 
 impl KfdIface {
     /// Open `/dev/kfd` + the node's DRM render fd, acquire the VM, enable the
-    /// runtime, bind the event page, and create the three completion / fault
-    /// events. Verbatim move of the bring-up block from `AmdDevice::open_uncached`.
+    /// runtime (once per process), bind the event page, create the three
+    /// completion / fault events, and map the HDP flush path.
     pub fn open(node: &AmdNode) -> Result<Self> {
         let kfd_fd = crate::amd::device::ensure_global_kfd()?;
         let drm_path = format!("/dev/dri/renderD{}", node.drm_render_minor);
@@ -536,8 +531,7 @@ const MMIO_REMAP_PAGE_BYTES: usize = 0x1000;
 /// A write to `HDP_MEM_FLUSH_CNTL` flushes HDP from the host, without the CP's
 /// `GPU_HDP_FLUSH_REQ/DONE` handshake: that register pair is one channel per
 /// bit shared by every queue of every process, and its DONE bit toggles per
-/// request, so concurrent requesters on one bit can wait forever (four
-/// lanes on gfx942 stalled 14 of 14 runs and ended in a GPU reset).
+/// request, so concurrent requesters on one bit can wait forever.
 #[derive(Debug)]
 struct MmioRemapPage {
     base: NonNull<u32>,
@@ -992,8 +986,7 @@ impl KfdIface {
 }
 
 /// Compose the KFD `KFD_IOC_ALLOC_MEM_FLAGS_*` set for an allocation. This is
-/// the ONLY place the flags are built; it reproduces the four pre-refactor flag
-/// sets bit-for-bit (see the module doc / call sites).
+/// the ONLY place the flags are built.
 fn compose_flags(kind: AllocKind, cpu_access: bool) -> u32 {
     match kind {
         AllocKind::DeviceVram { executable } => {
@@ -1023,8 +1016,7 @@ fn compose_flags(kind: AllocKind, cpu_access: bool) -> u32 {
 /// Reserve `size` bytes of host VA so KFD can bind VRAM into it. A buffer of a
 /// huge page or more starts on one: an anonymous `mmap` aligns only lengths
 /// that are multiples of it (Linux ≥ 6.7, with THP on), and a VA off the
-/// physical alignment takes no large PTE fragments (gfx942 GEMM over
-/// 4128×4096×4096: 455 against 604 TF, 2026-11-06).
+/// physical alignment takes no large PTE fragments.
 pub(crate) fn reserve_va(size: usize) -> Result<*mut libc::c_void> {
     let align = if size >= HUGE_PAGE { HUGE_PAGE } else { 1 };
     let span = size + (align - 1);

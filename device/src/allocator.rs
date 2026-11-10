@@ -244,7 +244,7 @@ impl RawBuffer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "proptest", derive(proptest_derive::Arbitrary))]
 pub struct BufferSpec {
-    /// GTT-coherent uncached memory (signal/ring/kernarg). Distinct cache type
+    /// GTT-coherent uncached memory. Distinct cache type
     /// from VRAM — can't be reused as cached.
     pub uncached: bool,
     /// CPU-accessible mapping.

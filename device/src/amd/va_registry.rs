@@ -40,14 +40,15 @@ pub enum AllocTag {
     /// A compute queue's `queue_inactive_signal` and `ErrorReason` words.
     QueueInactive,
     Staging,
-    /// GTT kernargs: the device's arena (with AQL control programs) and the
-    /// kernargs graphs and linked plans own.
+    /// Kernargs: the device's arena (with AQL control programs) and the
+    /// kernargs graphs and linked plans own; VRAM on multi-XCC parts, uncached
+    /// GTT elsewhere (`Hdp`).
     Kernarg,
-    /// GTT command buffers graphs and linked plans own (PM4 IBs, AQL control
-    /// programs).
+    /// Command buffers graphs and linked plans own (PM4 IBs, AQL control
+    /// programs); placed as kernargs.
     CommandBuffer,
-    /// Register-spill scratch — GPU-only VRAM, realloc'd per kernel as private
-    /// segment sizes grow.
+    /// Register-spill scratch — GPU-only VRAM, reallocated, at least doubling,
+    /// when a kernel needs more than it holds.
     Scratch,
     /// The host-visible VRAM word the host reads back to flush HDP where KFD
     /// gives no remap page.
@@ -62,10 +63,10 @@ impl AllocTag {
             AllocTag::SignalPool => "GTT signal pool",
             AllocTag::QueueRing => "GTT queue ring",
             AllocTag::QueueGart => "GTT queue GART",
-            AllocTag::QueueInactive => "GTT queue-inactive signal",
+            AllocTag::QueueInactive => "GTT queue error words",
             AllocTag::Staging => "GTT SDMA staging",
-            AllocTag::Kernarg => "GTT kernarg",
-            AllocTag::CommandBuffer => "GTT command buffer",
+            AllocTag::Kernarg => "kernarg",
+            AllocTag::CommandBuffer => "command buffer",
             AllocTag::Scratch => "scratch",
             AllocTag::HdpReadback => "HDP readback word",
         }

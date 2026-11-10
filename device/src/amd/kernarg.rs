@@ -1,17 +1,18 @@
 //! `KernargArena`: ring allocator for AMDGPU kernel-argument buffers.
 //!
 //! 16 MiB, placed as [`crate::amd::iface::Hdp`] describes: VRAM on a
-//! multi-XCC part, uncached system memory elsewhere. **One per device**, shared by every lane (tinygrad allocates one
-//! `kernargs_buf` per `HCQCompiled`, `support/hcq.py` `HCQCompiled.__init__`).
-//! On AQL queues it also holds each dispatch's PM4 control program.
+//! multi-XCC part, uncached system memory elsewhere. **One per device**,
+//! shared by every lane (tinygrad allocates one `kernargs_buf` per
+//! `HCQCompiled`, `support/hcq.py` `HCQCompiled.__init__`). On AQL queues it
+//! also holds each dispatch's PM4 control program.
 //!
 //! A submission reserves everything it places here as one [`KernargSlot`],
 //! writes it, and publishes the slot with the point that retires the
 //! submission: its lane timeline point, or on AQL the lane's count of
-//! submissions every XCC is done with (`PoolQueue::retired`). Slots are handed out in ring order and reclaimed oldest
-//! first, so a reservation that meets the oldest live slot waits for exactly
-//! that slot: for its publication while its lane is still writing it, then for
-//! its timeline point. Neither a slot that is reserved but not yet submitted
+//! submissions every XCC is done with (`PoolQueue::retired`). Slots are handed
+//! out in ring order and reclaimed oldest first, so a reservation that meets
+//! the oldest live slot waits for exactly that slot: for its publication while
+//! its lane is still writing it, then for its retirement point. Neither a slot that is reserved but not yet submitted
 //! nor one the GPU may still read is handed out again, and no other lane's
 //! work is waited on.
 
