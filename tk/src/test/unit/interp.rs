@@ -114,7 +114,7 @@ fn an_inner_loops_result_is_the_outer_next_after_it_runs(pipelined: bool) {
                 let ring = k.ring::<F32>("ring", shape.elems(), 2);
                 return k.pipeline(
                     2,
-                    2,
+                    ring,
                     [acc],
                     |k, _, slot| {
                         let t = k.slot(ring, &slot, shape);

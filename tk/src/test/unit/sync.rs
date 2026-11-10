@@ -282,7 +282,7 @@ fn around_a_pipeline(
         let init = k.zeros::<F32>(Shape::new(16, 16));
         let [sum] = k.pipeline(
             4,
-            2,
+            ring,
             [init],
             |k, step, slot| {
                 let t = k.slot(ring, &slot, Shape::new(16, 16));
@@ -376,7 +376,7 @@ fn a_consume_body_fences_its_own_tiles() {
         let init = k.zeros::<BF16>(Shape::new(16, 16));
         let [last] = k.pipeline(
             4,
-            2,
+            ring,
             [init],
             |k, step, slot| {
                 let t = k.slot(ring, &slot, Shape::new(16, 16));

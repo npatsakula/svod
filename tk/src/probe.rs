@@ -1145,10 +1145,10 @@ fn ring_sum<'k>(
     view: impl FnOnce(&mut Kernel<'k>, Sc<'k>) -> Gmem<'k, I32>,
 ) -> Regs<'k, I32> {
     let (tile, schedule) = (k.shape(init), schedule.into());
-    let slots = k.ring::<I32>("ring", tile.elems(), schedule.stages());
+    let slots = k.ring::<I32>("ring", tile.elems(), schedule);
     let [sum] = k.pipeline(
         trips,
-        schedule,
+        slots,
         [init],
         |k, step, slot| {
             let v = view(k, step);

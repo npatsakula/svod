@@ -295,11 +295,20 @@ pub struct SmemRef<'k, T>(pub SmemId, PhantomData<(T, Brand<'k>)>);
 
 /// A shared allocation of slots of `slot` elements that only a pipeline's
 /// stages reach ([`Kernel::slot`]): its produce fills a slot, its consume
-/// reads one. Anything else over it is [`Kernel::ring_scratch`].
+/// reads one. It holds a run of its schedule's slots per warp, or one run;
+/// the pipeline it is handed ([`Kernel::pipeline`]) runs as its schedule
+/// says. Anything else over it is [`Kernel::ring_scratch`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ring<'k, T> {
     alloc: SmemRef<'k, T>,
     slot: usize,
+    schedule: Schedule,
+}
+
+impl<T> Ring<'_, T> {
+    pub fn schedule(&self) -> Schedule {
+        self.schedule
+    }
 }
 
 /// The slot a pipeline stage holds, branded by the stage so it cannot leave
@@ -704,9 +713,29 @@ impl<'k> Kernel<'k> {
         self.smem_view(alloc, slot.into() * shape.elems(), shape)
     }
 
-    /// A ring of `slots` slots of `slot` elements, for a pipeline's stages.
-    pub fn ring<T: Elem>(&mut self, name: impl Into<String>, slot: usize, slots: usize) -> Ring<'k, T> {
-        Ring { alloc: self.smem(name, slots * slot), slot }
+    /// A ring of slots of `slot` elements, as many as `schedule` runs, for
+    /// the stages of a pipeline run as it says.
+    pub fn ring<T: Elem>(
+        &mut self,
+        name: impl Into<String>,
+        slot: usize,
+        schedule: impl Into<Schedule>,
+    ) -> Ring<'k, T> {
+        self.ring_runs(name, slot, schedule, 1)
+    }
+
+    /// [`Self::ring`] with `runs` runs of `schedule`'s slots, a stage
+    /// reaching past the first ([`Filling::past`]): one per warp that runs a
+    /// pipeline of its own.
+    pub fn ring_runs<T: Elem>(
+        &mut self,
+        name: impl Into<String>,
+        slot: usize,
+        schedule: impl Into<Schedule>,
+        runs: usize,
+    ) -> Ring<'k, T> {
+        let schedule = schedule.into();
+        Ring { alloc: self.smem(name, runs * schedule.stages() * slot), slot, schedule }
     }
 
     /// The stage's slot of `ring` as one `shape` tile: written by a produce,
@@ -720,7 +749,7 @@ impl<'k> Kernel<'k> {
     ///     let v = k.view(p, 0, [4, 1], Shape::new(4, 4), [None, None]);
     ///     let ring = k.ring::<F32>("ring", 16, 2);
     ///     let zero = k.zeros::<F32>(Shape::new(4, 4));
-    ///     k.pipeline(1, 2, [zero], |k, _, slot| {
+    ///     k.pipeline(1, ring, [zero], |k, _, slot| {
     ///         let t = k.slot(ring, &slot, Shape::new(4, 4));
     ///         k.stage(t, v, CopyMode::Async);
     ///     }, |k, _, slot, [acc]| {
@@ -738,7 +767,7 @@ impl<'k> Kernel<'k> {
     ///     let ring = k.ring::<F32>("ring", 16, 2);
     ///     let zero = k.zeros::<F32>(Shape::new(4, 4));
     ///     let mut kept = None;
-    ///     k.pipeline(1, 2, [zero], |_, _, slot| kept = Some(slot), |_, _, _, c| c);
+    ///     k.pipeline(1, ring, [zero], |_, _, slot| kept = Some(slot), |_, _, _, c| c);
     ///     k.slot(ring, &kept.unwrap(), Shape::new(4, 4)); // a slot stays in its stage
     /// });
     /// ```
@@ -750,7 +779,7 @@ impl<'k> Kernel<'k> {
     ///     let ring = k.ring::<F32>("ring", 16, 2);
     ///     let zero = k.zeros::<F32>(Shape::new(4, 4));
     ///     let mut kept = None;
-    ///     k.pipeline(1, 2, [zero], |_, _, _| {}, |k, _, slot, c| {
+    ///     k.pipeline(1, ring, [zero], |_, _, _| {}, |k, _, slot, c| {
     ///         kept = Some(k.slot(ring, &slot, Shape::new(4, 4)));
     ///         c
     ///     });
@@ -1175,15 +1204,26 @@ impl<'k> Kernel<'k> {
         phi.into_iter().map(Tile::new).collect()
     }
 
-    /// A producer/consumer loop over `extent` steps with a ring of slots run
-    /// as `schedule` says ([`Schedule`]; a count of slots is a rolled ring).
-    /// `produce(k, step, slot)` stages step `step` into the slot it fills
-    /// ([`Kernel::slot`]); `consume(k, step, slot, carried)` computes from the
-    /// slot it reads. A slot is its stage's alone.
+    /// A producer/consumer loop over `extent` steps, run as `ring`'s
+    /// schedule says ([`Schedule`]): its slots are the pipeline's, and any
+    /// other ring its stages reach holds as many. `produce(k, step, slot)`
+    /// stages step `step` into the slot it fills ([`Kernel::slot`]);
+    /// `consume(k, step, slot, carried)` computes from the slot it reads. A
+    /// slot is its stage's alone. A view past its ring's slots fails the
+    /// lowering ([`crate::lower::Error::SharedPast`]).
+    ///
+    /// ```compile_fail,E0308
+    /// use svod_tk::build::*;
+    /// use svod_tk::ir::Shape;
+    /// Kernel::record("depth", |k| {
+    ///     let zero = k.zeros::<F32>(Shape::new(4, 4));
+    ///     k.pipeline(8, 3, [zero], |_, _, _| {}, |_, _, _, c| c); // a depth, not a ring
+    /// });
+    /// ```
     pub fn pipeline<T: Elem, I: Into<Acc<'k, T>>, const N: usize>(
         &mut self,
         extent: impl Into<Sc<'k>>,
-        schedule: impl Into<Schedule>,
+        ring: Ring<'k, impl Elem>,
         init: [I; N],
         produce: impl for<'r> FnOnce(&mut Self, Sc<'k>, Filling<'k, 'r>),
         consume: impl for<'r> FnOnce(&mut Self, Sc<'k>, Reading<'k, 'r>, [Acc<'k, T>; N]) -> [Acc<'k, T>; N],
@@ -1192,7 +1232,7 @@ impl<'k> Kernel<'k> {
         let consume = |k: &mut Self, step, slot: Reading<'k, '_>, phi: Vec<Regs<'k, T>>| {
             consume(k, step, slot, tiles(phi).map(Acc)).map(|a| a.0).to_vec()
         };
-        tiles(self.pipeline_vec(extent, schedule, init, produce, consume)).map(Acc)
+        tiles(self.pipeline_vec(extent, ring, init, produce, consume)).map(Acc)
     }
 
     /// [`Self::pipeline`] over as many tiles as `init` holds, carried as
@@ -1200,12 +1240,12 @@ impl<'k> Kernel<'k> {
     pub fn pipeline_vec<T: Elem>(
         &mut self,
         extent: impl Into<Sc<'k>>,
-        schedule: impl Into<Schedule>,
+        ring: Ring<'k, impl Elem>,
         init: Vec<Regs<'k, T>>,
         produce: impl for<'r> FnOnce(&mut Self, Sc<'k>, Filling<'k, 'r>),
         consume: impl for<'r> FnOnce(&mut Self, Sc<'k>, Reading<'k, 'r>, Vec<Regs<'k, T>>) -> Vec<Regs<'k, T>>,
     ) -> Vec<Regs<'k, T>> {
-        let schedule = schedule.into();
+        let schedule = ring.schedule;
         let extent = self.intern(extent);
         let [pstep, pslot, cstep, cslot] = [(); 4].map(|()| self.push_scalar(Scalar::Induction));
         let phi = self.carried(&init);

@@ -119,14 +119,14 @@ fn gathered_gemm(m: usize, n: usize, kk: usize, tile: [usize; 3], stages: usize,
         let i = row0.clone() + k.row();
         let start = i.clone() * 7 % m * kk;
         let valid = Sc::from(0).lt(i % 3);
-        let a_s = k.ring::<BF16>("a_s", bm * bk, stages);
-        let b_s = k.ring::<BF16>("b_s", bn * bk, stages);
+        let a_s = k.ring::<BF16>("a_s", bm * bk, Schedule::ring(stages, true));
+        let b_s = k.ring::<BF16>("b_s", bn * bk, Schedule::ring(stages, true));
         let b_view = k.view(b, 0, [kk, 1], Shape::new(bn, bk), [None, None]);
         let b_view = k.at(b_view, col0.clone(), 0);
         let init = k.zeros::<F32>(Shape::new(bm, bn));
         let [acc] = k.pipeline(
             kk / bk,
-            Schedule::ring(stages, true),
+            a_s,
             [init],
             |k, step, slot| {
                 let a_g = k.gather(a, step.clone() * bk, start.clone(), Some(valid.clone()), Shape::new(bm, bk), None);

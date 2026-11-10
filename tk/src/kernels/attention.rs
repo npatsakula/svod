@@ -514,11 +514,12 @@ fn attention_body<'k, T: Half>(k: &mut Kernel<'k>, spec: &Admitted<AttnSpec>) {
     let kw = cfg.key_warps;
     k.warps(cfg.row_warps());
     k.lone_warps(cfg.warps());
-    let k_s = k.ring::<T>("k_s", bkv * d, kw * stages);
-    let v_s = k.ring::<T>("v_s", bkv * d, kw * stages);
+    let ring = Schedule::ring(stages, cfg.unroll());
+    let k_s = k.ring_runs::<T>("k_s", bkv * d, ring, kw);
+    let v_s = k.ring_runs::<T>("v_s", bkv * d, ring, kw);
     // The bias streams through a ring of its own beside K and V, unless the
     // forms read its tiles directly.
-    let bias_s = cfg.bias_ring(bias.is_some()).then(|| k.ring::<T>("bias_s", bq * bkv, kw * stages));
+    let bias_s = cfg.bias_ring(bias.is_some()).then(|| k.ring_runs::<T>("bias_s", bq * bkv, ring, kw));
 
     let (order, split, hh) = (k.block(0) / splits, k.block(0) % splits, k.block(1));
     // Where later queries see more keys (a causal mask, chunks with every
@@ -767,7 +768,7 @@ fn attention_body<'k, T: Half>(k: &mut Kernel<'k>, spec: &Admitted<AttnSpec>) {
         };
         let [m, l, acc] = k.pipeline(
             w_blocks,
-            Schedule::ring(stages, cfg.unroll()),
+            k_s,
             [m0, l0, o0],
             |k, step, slot| {
                 let (kv_off, slot) = ((w_first.clone() + step) * bkv, slot.past(slot0.clone()));

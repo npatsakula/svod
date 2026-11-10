@@ -384,7 +384,6 @@ fn nearest_body<'k, T: MmaIn>(k: &mut Kernel<'k>, spec: &Admitted<NearestSpec>) 
     let NearestSpec { n, m, d, metric, floors, groups, k: top, ref live, .. } = **spec;
     let cfg = spec.cfg();
     let NearestCfg { bq, bkv, splits, .. } = cfg;
-    let stages = cfg.stages();
     let tiles = m.div_ceil(bkv);
     assert!(m <= MAX_CANDIDATES, "{m} candidates pass the f32 index's {MAX_CANDIDATES}");
     assert!(top >= 1, "a row keeps a score at least");
@@ -421,7 +420,7 @@ fn nearest_body<'k, T: MmaIn>(k: &mut Kernel<'k>, spec: &Admitted<NearestSpec>) 
     let blocks = launched(&rows_live, n, bq);
     k.grid([blocks.clone(), Sc::from(splits), Sc::from(1)]);
     k.warps(cfg.warps());
-    let c_s = cfg.bk.is_none().then(|| k.ring::<T>("c_s", bkv * d, stages));
+    let c_s = cfg.bk.is_none().then(|| k.ring::<T>("c_s", bkv * d, cfg.schedule));
 
     // The query block, and split, the first candidate tile of its share and
     // how many it takes.
@@ -1017,7 +1016,7 @@ fn nearest_body<'k, T: MmaIn>(k: &mut Kernel<'k>, spec: &Admitted<NearestSpec>) 
     let carried = match (q_r, c_s) {
         (Some(q_r), Some(c_s)) => k.pipeline_vec(
             count,
-            cfg.schedule,
+            c_s,
             init,
             |k, step, slot| {
                 let c_g = k.at(c_view, tile_start(step), 0);

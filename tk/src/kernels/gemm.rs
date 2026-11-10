@@ -831,13 +831,12 @@ pub(super) fn mainloop<'k, T: MmaIn, const N: usize>(
 ) -> [Acc<'k, T::Acc>; N] {
     let sb = k.shape(bs[0]);
     let (sa_s, sb_s) = (Shape::new(sa.rows, bk / slices), Shape::new(sb.rows, bk / slices));
-    let stages = schedule.stages();
-    let a_s = k.ring::<T>("a_s", sa.elems(), stages);
-    let b_s = [(); N].map(|()| k.ring::<T>("b_s", sb.elems(), stages));
+    let a_s = k.ring::<T>("a_s", sa.elems(), schedule);
+    let b_s = [(); N].map(|()| k.ring::<T>("b_s", sb.elems(), schedule));
     let init = [(); N].map(|()| k.zeros::<T::Acc>(Shape::new(sa.rows, sb.rows)));
     k.pipeline(
         trips,
-        schedule,
+        a_s,
         init,
         |k, step, slot| {
             let step = first_step.map_or(step.clone(), |s| s + step);

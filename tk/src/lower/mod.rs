@@ -40,6 +40,8 @@ pub enum Error {
     TooLarge { name: String, instructions: usize, most: usize },
     #[snafu(display("{name} counts to {extent}, past the i32 a range, grid or variable holds"))]
     ExtentPastI32 { name: String, extent: i64 },
+    #[snafu(display("a view of {name} reaches elements {from}..{to}, which holds {held}"))]
+    SharedPast { name: String, from: i64, to: i64, held: usize },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -90,6 +92,7 @@ pub fn lower(mut prog: Program, lowering: &Lowering, params: Vec<Arc<UOp>>, devi
     let grid = prog.warp_grid.count();
     let lone = prog.walk().any(|(_, s)| matches!(s, Stmt::Warps { .. }));
     ensure!(prog.warps.is_multiple_of(grid) && (prog.warps == grid || lone), GridSnafu { warps: prog.warps, grid });
+    within_shared(&prog)?;
     materialize_operands(&mut prog, lowering.core);
     sync::insert_barriers(&mut prog)?;
     let prog = schedule::expand(prog, lowering.device.target.fill, lowering.core);
@@ -98,6 +101,43 @@ pub fn lower(mut prog: Program, lowering: &Lowering, params: Vec<Arc<UOp>>, devi
     let (program, linear) = emit::emit(&laid, lowering, params, device)?;
     let rolled = emit::ROLLED.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
     Ok(Lowered { program, linear, tile: laid, rolled })
+}
+
+/// Every shared view within its allocation wherever its offset is bounded,
+/// a loop's induction over its trips and a pipeline's slot over its ring:
+/// a ring that holds fewer slots than its pipeline runs is refused here, not
+/// read past on the device.
+fn within_shared(prog: &Program) -> Result<()> {
+    let mut ranges = std::collections::HashMap::new();
+    for (_, stmt) in prog.walk() {
+        let trips = |extent| prog.bounds(extent, &|iv| ranges.get(&iv).copied()).filter(|&(_, hi)| hi > 0);
+        match stmt {
+            Stmt::Loop(l) => {
+                let start = prog.bounds(l.start, &|iv| ranges.get(&iv).copied());
+                if let (Some((lo, hi)), Some((_, n))) = (start, trips(l.extent)) {
+                    ranges.insert(l.iv, (lo, hi + n - 1));
+                }
+            }
+            Stmt::Pipeline(p) => {
+                if let Some((_, n)) = trips(p.extent) {
+                    ranges.extend([(p.produce.step, (0, n - 1)), (p.consume.step, (0, n - 1))]);
+                }
+                let last = p.schedule.stages() as i64 - 1;
+                ranges.extend([(p.produce.slot, (0, last)), (p.consume.slot, (0, last))]);
+            }
+            _ => {}
+        }
+    }
+    for v in &prog.values {
+        let Place::Smem { alloc, offset } = v.place else { continue };
+        let a = &prog.smem[alloc.index()];
+        let held = a.elems * a.dtype.bytes() / v.dtype.bytes();
+        if let Some((from, hi)) = prog.bounds(offset, &|iv| ranges.get(&iv).copied()) {
+            let to = hi + v.shape.elems() as i64;
+            ensure!(from >= 0 && to <= held as i64, SharedPastSnafu { name: a.name.clone(), from, to, held });
+        }
+    }
+    Ok(())
 }
 
 /// `prog` lowered for its lowering's target alone, its parameters declared

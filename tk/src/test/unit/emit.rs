@@ -574,3 +574,43 @@ fn a_constant_past_i32_keeps_its_value() {
     let text = crate::lower::render(gemm::<BF16>(&spec), &cfg.lowering(&super::declared(target))).unwrap();
     assert!(text.contains("2500100001") && !text.contains("-1794867295"));
 }
+
+/// A pipeline runs as its leading ring's schedule says; a second ring its
+/// stages reach that holds fewer slots is read past by every slot but its
+/// own, which the lowering refuses rather than leaving to the device.
+#[test_case(3 => Ok(()); "as deep as the pipeline")]
+#[test_case(1 => Err("a view of b reaches elements 0..1536, which holds 512".into()); "one slot short")]
+fn a_ring_shallower_than_its_pipeline_is_refused(depth: usize) -> Result<(), String> {
+    let tile = Shape::new(16, 32);
+    let prog = Kernel::record("ring", |k| {
+        k.warps(1);
+        let x = k.input::<F32>("x", 8 * tile.elems());
+        let y = k.output::<F32>("y", tile.elems());
+        let a = k.ring::<F32>("a", tile.elems(), Schedule::ring(3, false));
+        let b = k.ring::<F32>("b", tile.elems(), Schedule::ring(depth, false));
+        let v = k.view(x, 0, [tile.cols, 1], tile, [None, None]);
+        let zero = k.zeros::<F32>(tile);
+        let [s] = k.pipeline(
+            8,
+            a,
+            [zero],
+            |k, step, slot| {
+                let src = k.at(v, step * 16, 0);
+                for ring in [a, b] {
+                    let t = k.slot(ring, &slot, tile);
+                    k.stage(t, src, CopyMode::Async);
+                }
+            },
+            |k, _, slot, [s]| {
+                let (ta, tb) = (k.slot(a, &slot, tile), k.slot(b, &slot, tile));
+                let (la, lb) = (k.load(ta), k.load(tb));
+                let sum = k.binary(la, lb, BinaryOp::Add);
+                [k.binary(*s, sum, BinaryOp::Add).into()]
+            },
+        );
+        let out = k.view(y, 0, [tile.cols, 1], tile, [None, None]);
+        k.store(out, *s);
+    });
+    let lowering = Lowering::new(&super::declared(crate::atoms::sm86()));
+    crate::lower::standalone(prog, &lowering).map(drop).map_err(|e| e.to_string())
+}
