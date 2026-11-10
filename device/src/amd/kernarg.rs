@@ -1,9 +1,7 @@
 //! `KernargArena`: ring allocator for AMDGPU kernel-argument buffers.
 //!
-//! 16 MiB of uncached GTT system memory, as ROCr places kernargs by default:
-//! the host rewrites it for every dispatch, and a store to system memory
-//! reaches the GPU without the HDP flush a VRAM store needs before each
-//! doorbell. **One per device**, shared by every lane (tinygrad allocates one
+//! 16 MiB, placed as [`crate::amd::iface::Hdp`] describes: VRAM on a
+//! multi-XCC part, uncached system memory elsewhere. **One per device**, shared by every lane (tinygrad allocates one
 //! `kernargs_buf` per `HCQCompiled`, `support/hcq.py` `HCQCompiled.__init__`).
 //! On AQL queues it also holds each dispatch's PM4 control program.
 //!
@@ -118,7 +116,7 @@ impl Ring {
 }
 
 impl Drop for KernargArena {
-    /// Free the 16 MiB GTT backing. `RawBuffer` lacks a `Drop` (the
+    /// Free the 16 MiB backing. `RawBuffer` lacks a `Drop` (the
     /// allocator path consumes it by destructure), so the arena would otherwise
     /// leak its allocation. This runs when the LAST `PoolQueue` sharing the
     /// arena drops, after that queue's `Drop` has drained it; the core keeps
@@ -132,7 +130,7 @@ impl KernargArena {
     pub fn new(allocator: &AmdAllocator, core: &Arc<AmdDeviceCore>) -> Result<Arc<Self>> {
         // Queue publication fences these stores before ringing the doorbell.
         let buffer = AmdBufferGuard::new(
-            allocator.alloc_uncached_tagged(ARENA_BYTES, crate::amd::va_registry::AllocTag::Kernarg)?,
+            allocator.alloc_submission_tagged(ARENA_BYTES, crate::amd::va_registry::AllocTag::Kernarg)?,
         );
         let (base_gpu, base_host) = match buffer.buffer() {
             RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),

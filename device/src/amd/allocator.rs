@@ -51,9 +51,9 @@ impl AmdAllocator {
     }
 
     /// Allocate GTT-pinned system memory with `COHERENT | UNCACHED | PUBLIC`
-    /// flags — host-visible, uncached, for everything the host writes per
-    /// submission: queue rings, GART pages, signal slots, kernargs and command
-    /// buffers. The `uncached` branch sets **GTT**, not VRAM (uncached and
+    /// flags — host-visible, uncached, for what the host writes per submission
+    /// outside [`Self::alloc_submission_tagged`]: queue rings, GART pages and
+    /// signal slots. The `uncached` branch sets **GTT**, not VRAM (uncached and
     /// VRAM are mutually exclusive in the flag composition).
     pub fn alloc_uncached(&self, size: usize) -> Result<RawBuffer> {
         do_alloc(&self.dev, size, AllocKind::UncachedGtt, /*cpu_accessible=*/ true, /*zero_init=*/ true)
@@ -68,6 +68,16 @@ impl AmdAllocator {
             /*cpu_accessible=*/ true,
             /*zero_init=*/ true,
         )
+    }
+
+    /// Kernargs and command buffers: VRAM or uncached GTT, as
+    /// [`crate::amd::iface::Hdp`] places them.
+    pub(crate) fn alloc_submission_tagged(&self, size: usize, tag: AllocTag) -> Result<RawBuffer> {
+        if self.dev.hdp().submissions_in_vram() {
+            self.alloc_host_visible_tagged(size, tag)
+        } else {
+            self.alloc_uncached_tagged(size, tag)
+        }
     }
 
     /// Host-visible VRAM. Host stores into it go through HDP, so the writer

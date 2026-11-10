@@ -49,7 +49,7 @@ by the `alloc_*_tagged` call sites:
 |---|---|
 | `Vram` | General device VRAM — tensor data, code objects, EOP/ctx-save |
 | `Gtt` | Host-visible control memory — GTT, and the graph / linked-plan IB and control buffers |
-| `Kernarg` | Kernarg arenas (host-visible VRAM) — the per-dispatch, graph, and linked-plan argument pages |
+| `Kernarg` | Kernarg arenas (VRAM on multi-XCC parts, uncached GTT elsewhere) — the per-dispatch, graph, and linked-plan argument pages |
 | `SignalPool` | The GTT signal-slot pool |
 | `QueueRing` / `QueueGart` / `QueueInactive` | A queue's ring, GART page, and queue-inactive signal |
 | `Staging` | The GTT SDMA bounce buffer |

@@ -165,7 +165,7 @@ impl AmdLinkedPlan {
             offsets[operation] = Some(offset);
         }
         let kernargs = AmdBufferGuard::new(
-            allocator.alloc_uncached_tagged(bytes.max(16), crate::amd::va_registry::AllocTag::Kernarg)?,
+            allocator.alloc_submission_tagged(bytes.max(16), crate::amd::va_registry::AllocTag::Kernarg)?,
         );
         let (kernargs_gpu, kernargs_host) = match kernargs.buffer() {
             RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(host), .. } => (*gpu_addr, host.as_ptr()),
@@ -328,7 +328,7 @@ impl AmdLinkedPlan {
                         },
                         PatchSource::LinkAddress(control_link),
                     )?;
-                    let control_buffer = AmdBufferGuard::new(allocator.alloc_uncached_tagged(
+                    let control_buffer = AmdBufferGuard::new(allocator.alloc_submission_tagged(
                         program.control.bytes.len().max(16),
                         crate::amd::va_registry::AllocTag::CommandBuffer,
                     )?);

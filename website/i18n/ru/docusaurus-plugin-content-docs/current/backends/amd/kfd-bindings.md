@@ -187,8 +187,8 @@ GPU.
 
 | `AllocKind` | Флаги | Используется для |
 |---|---|---|
-| `DeviceVram { executable }` | `VRAM \| WRITABLE \| NO_SUBSTITUTE` (+ `EXECUTABLE` для кода, + `PUBLIC`, когда видимо хосту) | Данные тензоров, code object, scratch; видимые хосту арены kernarg и управляющие буферы графов / связанных планов |
-| `UncachedGtt` | `GTT \| WRITABLE \| EXECUTABLE \| NO_SUBSTITUTE \| PUBLIC \| COHERENT \| UNCACHED` | Командные кольца, GART-страницы, слоты сигналов, промежуточный буфер SDMA |
+| `DeviceVram { executable }` | `VRAM \| WRITABLE \| NO_SUBSTITUTE` (+ `EXECUTABLE` для кода, + `PUBLIC`, когда видимо хосту) | Данные тензоров, code object, scratch; на частях с несколькими XCC — арены kernarg и управляющие буферы графов / связанных планов |
+| `UncachedGtt` | `GTT \| WRITABLE \| EXECUTABLE \| NO_SUBSTITUTE \| PUBLIC \| COHERENT \| UNCACHED` | Командные кольца, GART-страницы, слоты сигналов, промежуточный буфер SDMA; на остальных — арены kernarg и управляющие буферы |
 
 Разновидность GTT `UNCACHED | COHERENT` важна: командное кольцо и слоты
 сигналов должны быть немедленно видимы и для CPU, и для GPU, иначе хост будет

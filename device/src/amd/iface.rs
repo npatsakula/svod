@@ -113,22 +113,34 @@ pub trait AmdIface: Send + Sync + std::fmt::Debug {
 /// HDP, the host data path: host stores into VRAM through the BAR may sit in
 /// it until it is flushed, so no GPU engine may read them before a flush.
 ///
-/// The submission path writes only system memory (rings, GART, signals, the
-/// kernarg arena, graph and plan kernargs and command buffers), so a doorbell
-/// itself needs no flush. Host stores into VRAM are rare and explicit (code
-/// upload, CWSR headers, zero-fill, copy-in, host transfers): each flushes
-/// with [`Hdp::flush`] once its stores are done. A [`crate::buffer::HostWrite`]
+/// Kernargs and command buffers (the kernarg arena, graph and plan kernargs,
+/// PM4 IBs and AQL control programs) live where the device reads them
+/// fastest, as CLR places them: VRAM on a multi-XCC part, where reads from
+/// system memory slow every kernel, and uncached system memory elsewhere,
+/// where draining the host's stores to VRAM costs more than it saves. With
+/// them in VRAM every doorbell flushes; otherwise the submission path writes
+/// only system memory and a doorbell flushes only what host writes deferred.
+///
+/// Other host stores into VRAM are rare and explicit (code upload, CWSR
+/// headers, zero-fill, copy-in, host transfers): each flushes with
+/// [`Hdp::flush`] once its stores are done. A [`crate::buffer::HostWrite`]
 /// into VRAM marks its stores [`Hdp::defer`]red when it drops, and the
 /// device's next doorbell flushes them once for every guard since the last.
 #[derive(Debug)]
 pub(crate) struct Hdp {
     iface: Arc<dyn AmdIface>,
     deferred: AtomicBool,
+    submissions_in_vram: bool,
 }
 
 impl Hdp {
-    pub(crate) fn new(iface: Arc<dyn AmdIface>) -> Self {
-        Self { iface, deferred: AtomicBool::new(false) }
+    pub(crate) fn new(iface: Arc<dyn AmdIface>, submissions_in_vram: bool) -> Self {
+        Self { iface, deferred: AtomicBool::new(false), submissions_in_vram }
+    }
+
+    /// Whether kernargs and command buffers live in VRAM.
+    pub(crate) fn submissions_in_vram(&self) -> bool {
+        self.submissions_in_vram
     }
 
     /// Flush this thread's VRAM stores so far: drain its write-combining
@@ -145,10 +157,14 @@ impl Hdp {
         self.deferred.store(true, Ordering::Release);
     }
 
-    /// Run by every doorbell after its SeqCst fence: flush the stores host
-    /// writes deferred since the last doorbell.
-    pub(crate) fn flush_deferred(&self) {
-        if self.deferred.load(Ordering::Relaxed) && self.deferred.swap(false, Ordering::AcqRel) {
+    /// Run by every doorbell after its SeqCst fence: flush the submission's
+    /// own stores when they went to VRAM, else the stores host writes
+    /// deferred since the last doorbell.
+    pub(crate) fn flush_for_doorbell(&self) {
+        if self.submissions_in_vram {
+            self.deferred.store(false, Ordering::Relaxed);
+            self.iface.flush_hdp();
+        } else if self.deferred.load(Ordering::Relaxed) && self.deferred.swap(false, Ordering::AcqRel) {
             self.iface.flush_hdp();
         }
     }

@@ -48,7 +48,7 @@ faulting `va`, failure flags (`NotPresent`, `ReadOnly`, `NoExecute`, `imprecise`
 |---|---|
 | `Vram` | General device VRAM — tensor data, code objects, EOP/ctx-save |
 | `Gtt` | Host-visible control memory — GTT, और graph / linked-plan IB तथा control buffers |
-| `Kernarg` | Kernarg arenas (host-visible VRAM) — per-dispatch, graph, और linked-plan argument pages |
+| `Kernarg` | Kernarg arenas (multi-XCC parts पर VRAM, बाकी पर uncached GTT) — per-dispatch, graph, और linked-plan argument pages |
 | `SignalPool` | GTT signal-slot pool |
 | `QueueRing` / `QueueGart` / `QueueInactive` | एक queue का ring, GART page, और queue-inactive signal |
 | `Staging` | GTT SDMA bounce buffer |

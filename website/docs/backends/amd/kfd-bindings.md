@@ -184,8 +184,8 @@ place those flags are composed:
 
 | `AllocKind` | Flags | Used for |
 |---|---|---|
-| `DeviceVram { executable }` | `VRAM \| WRITABLE \| NO_SUBSTITUTE` (+ `EXECUTABLE` for code, + `PUBLIC` when host-visible) | Tensor data, code objects, scratch; host-visible kernarg arenas and graph / linked-plan control buffers |
-| `UncachedGtt` | `GTT \| WRITABLE \| EXECUTABLE \| NO_SUBSTITUTE \| PUBLIC \| COHERENT \| UNCACHED` | Command rings, GART pages, signal slots, the SDMA staging buffer |
+| `DeviceVram { executable }` | `VRAM \| WRITABLE \| NO_SUBSTITUTE` (+ `EXECUTABLE` for code, + `PUBLIC` when host-visible) | Tensor data, code objects, scratch; on multi-XCC parts, kernarg arenas and graph / linked-plan control buffers |
+| `UncachedGtt` | `GTT \| WRITABLE \| EXECUTABLE \| NO_SUBSTITUTE \| PUBLIC \| COHERENT \| UNCACHED` | Command rings, GART pages, signal slots, the SDMA staging buffer; elsewhere, kernarg arenas and control buffers |
 
 The `UNCACHED | COHERENT` GTT flavor matters: the command ring and the signal
 slots must be immediately visible between CPU and GPU, or the host spins forever

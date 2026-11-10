@@ -311,17 +311,17 @@ fn one_kernel_semantic_plan() -> crate::hcq::SemanticLinkedPlan {
     crate::hcq::SemanticLinkedPlan::from_lane_submissions(vec![lane], |_| [0x1000, 0x1008]).unwrap()
 }
 
-/// Everything the host rewrites per replay lives in uncached system memory,
-/// so no doorbell needs an HDP flush: the device's kernarg arena (which also
-/// holds AQL control programs), graph and linked-plan kernargs, and their PM4
-/// IBs and AQL control programs.
-#[test_case::test_case(1; "pm4")]
-#[test_case::test_case(2; "aql")]
-fn replayed_kernargs_and_command_buffers_live_in_system_memory(xccs: u32) {
+/// Everything the host rewrites per replay shares one placement: the device's
+/// kernarg arena (which also holds AQL control programs), graph and
+/// linked-plan kernargs, and their PM4 IBs and AQL control programs live in
+/// VRAM on a multi-XCC part and in uncached system memory elsewhere.
+#[test_case::test_case(1, AllocKind::UncachedGtt; "pm4")]
+#[test_case::test_case(2, AllocKind::DeviceVram { executable: true }; "aql")]
+fn replayed_kernargs_and_command_buffers_share_one_placement(xccs: u32, kind: AllocKind) {
     let Some(bytes) = clang_amdgcn(EMPTY_IR, "gfx1100") else { return };
     let mock = load_mock_program_on(xccs, &bytes, "empty", &[], true);
     let kinds = |tag| mock.iface.alloc_kinds_for_tag(tag);
-    let system = |count| vec![AllocKind::UncachedGtt; count];
+    let system = |count| vec![kind; count];
 
     let kernels = [graph_kernel(&mock.program, Vec::new(), Vec::new())];
     let _graph = AmdGraph::capture_amd(&mock.allocator, &kernels).unwrap().expect("graph");

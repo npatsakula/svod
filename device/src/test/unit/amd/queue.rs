@@ -488,11 +488,12 @@ fn host_buffer(allocator: &crate::amd::AmdAllocator, bytes: usize, uncached: boo
     buffer
 }
 
-/// A compute doorbell flushes no HDP of its own: the submission path writes
-/// only system memory. A host write guard into VRAM is the one exception: once
-/// it drops, exactly the next doorbell flushes its stores, between its last
-/// write and the doorbell. While it lives nothing is flushed, and a guard
-/// into GTT never flushes.
+/// A compute doorbell on a multi-XCC part flushes HDP every time, its kernargs
+/// being in VRAM. Elsewhere the submission path writes only system memory, and
+/// a host write guard into VRAM is the one exception: once it drops, exactly
+/// the next doorbell flushes its stores, between its last write and the
+/// doorbell. While it lives nothing is flushed, and a guard into GTT never
+/// flushes.
 #[test_case::test_case(1, false; "pm4 vram")]
 #[test_case::test_case(2, false; "aql vram")]
 #[test_case::test_case(1, true; "pm4 gtt")]
@@ -513,19 +514,19 @@ fn a_compute_doorbell_flushes_hdp_only_after_a_vram_host_write(xccs: u32, uncach
     let [reserved, before, after] =
         [PublicationStage::AfterReservation, PublicationStage::BeforeDoorbell, PublicationStage::AfterDoorbell]
             .map(checkpoint);
-    let plain = vec![reserved.clone(), before.clone(), after.clone()];
+    let flushed = vec![reserved.clone(), before.clone(), MockAmdCall::HdpFlush, after.clone()];
+    let plain = if xccs > 1 { flushed.clone() } else { vec![reserved, before, after] };
     for _ in 0..2 {
         assert_eq!(doorbell(), plain, "xccs={xccs}");
     }
 
-    let mark = iface.transcript().len();
     let mut guard = buffer.host_write_bytes().expect("host write");
     guard.fill(7);
     assert_eq!(doorbell(), plain, "a live guard has nothing to flush yet");
+    let mark = iface.transcript().len();
     drop(guard);
     assert!(!iface.transcript()[mark..].contains(&MockAmdCall::HdpFlush), "a guard defers its flush");
-    let flushed = if uncached { plain.clone() } else { vec![reserved, before, MockAmdCall::HdpFlush, after] };
-    assert_eq!(doorbell(), flushed, "xccs={xccs} uncached={uncached}");
+    assert_eq!(doorbell(), if uncached { plain.clone() } else { flushed }, "xccs={xccs} uncached={uncached}");
     assert_eq!(doorbell(), plain, "the deferred flush runs once");
     // Retire the mock timeline, so freeing the buffer drains at once.
     crate::sync::TimelineSignal::set(&**pool.pm4_signal(), pool.pm4_value());

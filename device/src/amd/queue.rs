@@ -1285,10 +1285,9 @@ impl QueueInner {
         // does. Without it the CP can observe the doorbell while the wptr /
         // ring packet / kernarg stores are still buffered (stale read → wedge).
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-        // Everything the submission path wrote is system memory and needs no
-        // HDP flush; VRAM stores were flushed where they were made, except
-        // those of a dropped `HostWrite`, which flush here.
-        self.hdp.flush_deferred();
+        // Kernargs and command buffers in VRAM, and the stores of a dropped
+        // `HostWrite`, flush here; see `Hdp`.
+        self.hdp.flush_for_doorbell();
         // SAFETY: doorbell is mmapped MMIO; aligned 64-bit store.
         unsafe { std::ptr::write_volatile(self.doorbell.as_ptr(), doorbell_value) };
     }

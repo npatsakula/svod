@@ -48,7 +48,7 @@ GPU VA 范围映射回其所属的分配。它是纯记账——没有 GPU
 |---|---|
 | `Vram` | 通用设备 VRAM——张量数据、code object、EOP/ctx-save |
 | `Gtt` | 宿主可见的控制内存——GTT，以及图 / 已链接 plan 的 IB 与控制缓冲区 |
-| `Kernarg` | kernarg arena（宿主可见的 VRAM）——每调度、图以及已链接 plan 的参数页 |
+| `Kernarg` | kernarg arena（多 XCC 部件上为 VRAM，其余为 uncached GTT）——每调度、图以及已链接 plan 的参数页 |
 | `SignalPool` | GTT 信号槽池 |
 | `QueueRing` / `QueueGart` / `QueueInactive` | 一个队列的环、GART 页与 queue-inactive 信号 |
 | `Staging` | GTT 上的 SDMA 反弹缓冲区 |

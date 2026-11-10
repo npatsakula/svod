@@ -323,7 +323,7 @@ impl AmdDevice {
         let core = Arc::new(AmdDeviceCore {
             node,
             arch: AmdArch::Gfx1100,
-            hdp: Arc::new(crate::amd::iface::Hdp::new(Arc::clone(&iface))),
+            hdp: Arc::new(crate::amd::iface::Hdp::new(Arc::clone(&iface), num_xcc > 1)),
             iface,
             has_sdma_queue: AtomicBool::new(false),
             pm4_graph: AtomicBool::new(false),
@@ -409,10 +409,11 @@ impl AmdDevice {
             .unwrap_or(4)
             .clamp(1, u64::BITS as usize);
 
+        let hdp = Arc::new(crate::amd::iface::Hdp::new(Arc::clone(&iface), node.num_xcc > 1));
         let core = Arc::new(AmdDeviceCore {
             node,
             arch,
-            hdp: Arc::new(crate::amd::iface::Hdp::new(Arc::clone(&iface))),
+            hdp,
             iface,
             has_sdma_queue: AtomicBool::new(false),
             pm4_graph: AtomicBool::new(false),

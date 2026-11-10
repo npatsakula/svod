@@ -176,8 +176,8 @@ compose होते हैं:
 
 | `AllocKind` | Flags | किसके लिए उपयोग होता है |
 |---|---|---|
-| `DeviceVram { executable }` | `VRAM \| WRITABLE \| NO_SUBSTITUTE` (+ code के लिए `EXECUTABLE`, + host-visible होने पर `PUBLIC`) | Tensor data, code objects, scratch; host-visible kernarg arenas और graph / linked-plan control buffers |
-| `UncachedGtt` | `GTT \| WRITABLE \| EXECUTABLE \| NO_SUBSTITUTE \| PUBLIC \| COHERENT \| UNCACHED` | Command rings, GART pages, signal slots, SDMA staging buffer |
+| `DeviceVram { executable }` | `VRAM \| WRITABLE \| NO_SUBSTITUTE` (+ code के लिए `EXECUTABLE`, + host-visible होने पर `PUBLIC`) | Tensor data, code objects, scratch; multi-XCC parts पर kernarg arenas और graph / linked-plan control buffers |
+| `UncachedGtt` | `GTT \| WRITABLE \| EXECUTABLE \| NO_SUBSTITUTE \| PUBLIC \| COHERENT \| UNCACHED` | Command rings, GART pages, signal slots, SDMA staging buffer; बाकी parts पर kernarg arenas और control buffers |
 
 `UNCACHED | COHERENT` GTT flavor मायने रखता है: command ring और signal slots CPU और GPU के
 बीच तुरंत visible होने चाहिए, वरना host एक ऐसे completion value पर हमेशा के लिए spin करता

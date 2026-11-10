@@ -173,8 +173,8 @@ sysfs 根目录可用 **`SVOD_KFD_TOPOLOGY`** 覆盖，因此解析器可针对�
 
 | `AllocKind` | 标志 | 用于 |
 |---|---|---|
-| `DeviceVram { executable }` | `VRAM \| WRITABLE \| NO_SUBSTITUTE`（代码额外加 `EXECUTABLE`，宿主可见时额外加 `PUBLIC`） | 张量数据、code object、scratch；宿主可见的 kernarg 区（arena）以及 graph / linked-plan 控制缓冲区 |
-| `UncachedGtt` | `GTT \| WRITABLE \| EXECUTABLE \| NO_SUBSTITUTE \| PUBLIC \| COHERENT \| UNCACHED` | 命令环、GART 页、信号槽、SDMA 暂存缓冲区 |
+| `DeviceVram { executable }` | `VRAM \| WRITABLE \| NO_SUBSTITUTE`（代码额外加 `EXECUTABLE`，宿主可见时额外加 `PUBLIC`） | 张量数据、code object、scratch；多 XCC 部件上的 kernarg 区（arena）以及 graph / linked-plan 控制缓冲区 |
+| `UncachedGtt` | `GTT \| WRITABLE \| EXECUTABLE \| NO_SUBSTITUTE \| PUBLIC \| COHERENT \| UNCACHED` | 命令环、GART 页、信号槽、SDMA 暂存缓冲区；其余部件上的 kernarg 区与控制缓冲区 |
 
 `UNCACHED | COHERENT` 的这种 GTT 变体很关键：命令环和信号
 槽必须在 CPU 与 GPU 之间立即可见，否则宿主会永远自旋
