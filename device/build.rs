@@ -37,6 +37,7 @@ fn main() {
         .allowlist_type("__s\\d+")
         .allowlist_var("KFD_IOC_.*")
         .allowlist_var("KFD_MAX_QUEUE_PERCENTAGE")
+        .allowlist_var("KFD_RUNTIME_ENABLE_MODE_ENABLE_MASK")
         .allowlist_var("AMDKFD_IOC_.*")
         .derive_default(true)
         .layout_tests(false)

@@ -17,6 +17,7 @@
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::ptr::NonNull;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use libc::{
@@ -333,11 +334,24 @@ impl KfdIface {
         }
 
         // RUNTIME_ENABLE — only on KFD >= 1.14; older kernels reject the
-        // ioctl with ENOTTY.
+        // ioctl with ENOTTY. A mask without the enable bit disables instead.
+        // KFD enables a process once (EBUSY after) and only before its first
+        // queue (EEXIST after), so the first device to open enables it and
+        // a later one finding it enabled goes on.
         if kfd_version >= (1, 14) {
-            let mut rt = kfd::kfd_ioctl_runtime_enable_args { mode_mask: 0, ..Default::default() };
-            if let Err(e) = unsafe { ioctl::kfd_runtime_enable(kfd_fd.as_raw_fd(), &mut rt as *mut _) } {
-                return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_RUNTIME_ENABLE", errno: e as i32 });
+            static ENABLED: OnceLock<std::result::Result<(), nix::errno::Errno>> = OnceLock::new();
+            let enabled = ENABLED.get_or_init(|| {
+                let mut rt = kfd::kfd_ioctl_runtime_enable_args {
+                    mode_mask: kfd::KFD_RUNTIME_ENABLE_MODE_ENABLE_MASK,
+                    ..Default::default()
+                };
+                match unsafe { ioctl::kfd_runtime_enable(kfd_fd.as_raw_fd(), &mut rt as *mut _) } {
+                    Ok(_) | Err(nix::errno::Errno::EBUSY) => Ok(()),
+                    Err(e) => Err(e),
+                }
+            });
+            if let Err(e) = enabled {
+                return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_RUNTIME_ENABLE", errno: *e as i32 });
             }
         }
 
