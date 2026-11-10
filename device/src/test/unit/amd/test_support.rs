@@ -245,6 +245,17 @@ pub(crate) fn install_signal_pool(allocator: &AmdAllocator) {
     allocator.dev.core().install_signal_pool(crate::amd::signal::SignalPool::new(allocator, 64).expect("signal pool"));
 }
 
+/// Play the GPU retiring everything `lane` published: XCC0's timeline stores
+/// and, on AQL, the completion of each submission's last packet.
+pub(crate) fn retire_lane(lane: &crate::amd::connector::PoolQueue) {
+    crate::sync::TimelineSignal::set(&**lane.pm4_signal(), lane.pm4_value() - 1);
+    if let Some(retired) = lane.retired() {
+        while crate::sync::TimelineSignal::value(&**retired.signal()) + 1 < retired.current() {
+            retired.signal().complete_packet();
+        }
+    }
+}
+
 pub(crate) fn scripted_error(stage: &str) -> Error {
     Error::Runtime { message: format!("scripted {stage} failure") }
 }

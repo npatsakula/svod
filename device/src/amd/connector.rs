@@ -55,6 +55,14 @@ pub(crate) struct PoolQueue {
     /// has its own separate `Timeline`; this one is untouched by SDMA.) AQL
     /// carries this timeline's waits and stores through vendor IB packets.
     pm4_counter: Arc<Timeline>,
+    /// AQL lanes only: the submissions every XCC is done with. The timeline
+    /// store above runs on XCC0 from an IB in the submission's own memory,
+    /// which the other XCCs may still be reading when it lands, so that memory
+    /// is reused only once this counts the submission: its last packet names
+    /// the signal as its AQL completion signal, which the CP decrements once
+    /// the packet retired on every XCC (ROCr retires kernargs and IBs the same
+    /// way).
+    retired: Option<Arc<Timeline>>,
     /// Pool-level in-flight linked-plan finalizers (FIFO) for all owners.
     /// `synchronize_all` drains them via the core's `Weak<PoolQueue>` registry
     /// without touching the queue.
@@ -269,6 +277,9 @@ pub(crate) struct SubmissionFinalizer {
     value: u64,
     progress: Vec<Arc<AmdSignal>>,
     _timestamps: Option<Arc<AmdSignal>>,
+    /// Where an AQL submission's memory retires, past `value`; see
+    /// `PoolQueue::retired`.
+    retired: OnceLock<(Arc<AmdSignal>, u64)>,
     publication: Mutex<PublicationState>,
     publication_changed: Condvar,
     code: Mutex<Vec<Arc<crate::amd::program::CodeObject>>>,
@@ -288,6 +299,7 @@ impl SubmissionFinalizer {
             value,
             progress: Vec::new(),
             _timestamps: timestamps,
+            retired: OnceLock::new(),
             publication: Mutex::new(PublicationState::Published),
             publication_changed: Condvar::new(),
             code: Mutex::new(Vec::new()),
@@ -300,10 +312,16 @@ impl SubmissionFinalizer {
             value,
             progress,
             _timestamps: None,
+            retired: OnceLock::new(),
             publication: Mutex::new(PublicationState::Prepared),
             publication_changed: Condvar::new(),
             code: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Retire this submission only at `point` too. Set before it is published.
+    pub(crate) fn retire_at(&self, point: (Arc<AmdSignal>, u64)) {
+        self.retired.set(point).expect("a submission retires at one point");
     }
 
     pub(crate) fn mark_published(&self) {
@@ -348,8 +366,12 @@ impl SubmissionFinalizer {
                 drop(publication);
                 // Whatever the publication wait consumed comes off the signal
                 // wait's budget; never hand it 0, which means "no timeout".
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now()).as_millis() as u64;
-                self.signal.wait_signal_value_with_progress(self.value, remaining.max(1), &self.progress)
+                let remaining = || deadline.saturating_duration_since(std::time::Instant::now()).as_millis() as u64;
+                self.signal.wait_signal_value_with_progress(self.value, remaining().max(1), &self.progress)?;
+                match self.retired.get() {
+                    Some((signal, value)) => signal.wait_signal_value(*value, remaining().max(1)),
+                    None => Ok(()),
+                }
             }
             PublicationState::Failed => Err(Error::Runtime {
                 message: "AMD submission failed before its terminal timeline point was published".into(),
@@ -358,9 +380,18 @@ impl SubmissionFinalizer {
         }
     }
 
+    /// Play XCC0 storing this submission's timeline point. Test-only.
+    #[cfg(test)]
+    pub(crate) fn land_timeline(&self) {
+        self.signal.set(self.value);
+    }
+
     pub(crate) fn retired(&self) -> bool {
         match *self.publication.lock() {
-            PublicationState::Published => self.signal.value() >= self.value,
+            PublicationState::Published => {
+                self.signal.value() >= self.value
+                    && self.retired.get().is_none_or(|(signal, value)| signal.value() >= *value)
+            }
             PublicationState::Failed => true,
             PublicationState::Prepared => false,
         }
@@ -426,9 +457,15 @@ impl PoolQueue {
                 .into(),
         })?;
         let pm4_counter = Timeline::new(Arc::new(pool.acquire()?));
-        if let Some(read) = queue.aql_read_pointer() {
-            pm4_counter.signal().watch_queue(read);
-        }
+        let retired = match queue.aql_read_pointer() {
+            Some(read) => {
+                pm4_counter.signal().watch_queue(read);
+                let retired = pool.acquire()?.counting_down(core.queue_event_mailbox());
+                retired.watch_queue(read);
+                Some(Timeline::new(Arc::new(retired)))
+            }
+            None => None,
+        };
         // Pre-reserve a generous scratch buffer once (ROCr-style stable pool): the
         // mid-stream `set_aql_scratch` REALLOC (new VA + KFD-unmap of the old) on a
         // live multi-XCC queue silently wedges the CP. Pre-sizing here so no typical
@@ -447,6 +484,7 @@ impl PoolQueue {
                 size: scratch_size,
             }),
             pm4_counter,
+            retired,
             inflight: Mutex::new(VecDeque::new()),
             link_cache: Mutex::default(),
         });
@@ -499,6 +537,15 @@ impl PoolQueue {
         self.pm4_counter.rollback(reserved)
     }
 
+    /// The AQL retirement count; see the field.
+    pub(crate) fn retired(&self) -> Option<&Arc<Timeline>> {
+        self.retired.as_ref()
+    }
+
+    pub(crate) fn aql_retired(&self) -> &Arc<Timeline> {
+        self.retired().expect("an AQL lane counts its retired submissions")
+    }
+
     /// Highest submitted PM4 counter value (the value the next `signal` packet
     /// would write). A drain waits until the GPU has written `value - 1`.
     pub fn pm4_value(&self) -> u64 {
@@ -524,8 +571,11 @@ impl PoolQueue {
         if let Some(err) = self.core.poison_error() {
             return Err(err);
         }
-        // Drain the monotonic PM4 counter (PM4 / SDMA-style work)...
-        self.pm4_counter.drain(30_000).inspect_err(|e| self.core.poison(&e.to_string()))?;
+        // Drain the monotonic PM4 counter (PM4 / SDMA-style work) and, on AQL,
+        // until every XCC is done with what it ran...
+        for timeline in std::iter::once(&self.pm4_counter).chain(&self.retired) {
+            timeline.drain(30_000).inspect_err(|e| self.core.poison(&e.to_string()))?;
+        }
         // ...then every in-flight linked-plan timeline.
         // Snapshot under the lock, wait outside it, then drop the retired ones —
         // `retain` keeps any signal a concurrent dispatch armed after the
@@ -693,6 +743,12 @@ impl OwnerCtx {
     /// in the owner-local `synchronize`).
     pub fn set_newest(&self, finalizer: Arc<SubmissionFinalizer>) {
         *self.newest.lock() = Some(finalizer);
+    }
+
+    /// This owner's newest finalizer. Test-only.
+    #[cfg(test)]
+    pub(crate) fn newest(&self) -> Option<Arc<SubmissionFinalizer>> {
+        self.newest.lock().clone()
     }
 
     /// This owner's newest finalizer as a scoped-sync completion token. A new

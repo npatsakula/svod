@@ -17,6 +17,29 @@ fn wait_count(iface: &MockAmdIface) -> usize {
     iface.call_count(|call| matches!(call, MockAmdCall::WaitEvents { .. }))
 }
 
+/// A completion signal counts the CP's decrements from zero, and with a
+/// mailbox the decrement raises the queue event: the CP writes `event_id` to
+/// `event_mailbox_ptr` (`amd_signal_t` +16 / +24) and interrupts.
+#[test_case::test_case(None; "silent")]
+#[test_case::test_case(Some(crate::amd::iface::QueueEventMailbox { address: 0xfeed_0000, event_id: 9 }); "interrupting")]
+fn a_completion_signal_counts_decrements(mailbox: Option<crate::amd::iface::QueueEventMailbox>) {
+    let (_iface, allocator) = mock_device(1);
+    let pool = SignalPool::new(&allocator, 1).expect("mock signal pool");
+    let signal = pool.acquire().expect("mock signal").counting_down(mailbox);
+    // SAFETY: the mock GPU VA is the host address of the 64-byte slot.
+    let word = |offset: u64| unsafe { std::ptr::read_volatile((signal.handle() + offset) as *const u64) };
+    assert_eq!(signal.value_addr(), signal.handle() + 8);
+    assert_eq!(word(16), mailbox.map_or(0, |mailbox| mailbox.address));
+    assert_eq!(word(24) as u32, mailbox.map_or(0, |mailbox| mailbox.event_id));
+    assert_eq!(signal.value(), 0);
+    signal.complete_packet();
+    signal.complete_packet();
+    assert_eq!((signal.value(), word(8)), (2, (-2i64) as u64));
+    signal.wait_signal_value(2, 1).expect("two retired packets");
+    signal.reset(0);
+    assert_eq!(word(8), 0);
+}
+
 /// Live pool round-trip: concurrent slots are distinct, and a released slot is
 /// handed back out with its value zeroed.
 #[test]

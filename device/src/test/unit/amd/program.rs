@@ -1,6 +1,6 @@
 use super::test_support::{
     MockAmdCall, MockAmdIface, amd_alloc_or_skip, ensure_hw_signal_pool, install_signal_pool, mock_device,
-    replay_dwords, require_multi_xcc, require_single_xcc, scripted_error,
+    replay_dwords, require_multi_xcc, require_single_xcc, retire_lane, scripted_error,
 };
 use crate::allocator::RawBuffer;
 use crate::amd::AmdAllocator;
@@ -384,6 +384,70 @@ fn linked_plan_submissions_end_on_the_completion_interrupt() {
         assert!(dwords.ends_with(&interrupt), "{dwords:x?}");
         assert_eq!(dwords.windows(interrupt.len()).filter(|run| *run == interrupt).count(), 1);
     }
+}
+
+/// An AQL graph replay rewrites its control program, which holds XCC0's
+/// timeline store, only once every XCC is done with the previous replay; a
+/// PM4 replay rewrites at the timeline point.
+#[test_case::test_case(1; "pm4")]
+#[test_case::test_case(2; "aql")]
+fn graph_replay_rewrites_its_program_once_every_xcc_is_done(xccs: u32) {
+    let Some(bytes) = clang_amdgcn(EMPTY_IR, "gfx1100") else { return };
+    let mock = load_mock_program_on(xccs, &bytes, "empty", &[], true);
+    let kernels = [graph_kernel(&mock.program, Vec::new(), Vec::new())];
+    let graph = AmdGraph::capture(&mock.allocator, &kernels).unwrap().expect("graph");
+    let lane = || mock.device.core().lease_queue(&mock.allocator).expect("the one lane");
+    graph.replay(&[], &[]).expect("first replay");
+    let retired = {
+        let lane = lane();
+        crate::sync::TimelineSignal::set(&**lane.pm4_signal(), lane.pm4_value() - 1);
+        lane.retired().cloned()
+    };
+    std::thread::scope(|scope| {
+        let second = scope.spawn(|| graph.replay(&[], &[]));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(second.is_finished(), xccs == 1, "xccs={xccs}");
+        if let Some(retired) = &retired {
+            retired.signal().complete_packet();
+        }
+        second.join().unwrap().expect("second replay");
+    });
+    retire_lane(&lane());
+}
+
+/// A linked plan's replay retires, and the next one rewrites its control
+/// programs and kernargs, once the CP completed the last packet of each of its
+/// AQL submissions; on PM4 at the plan's final point.
+#[test_case::test_case(1; "pm4")]
+#[test_case::test_case(2; "aql")]
+fn linked_plan_replay_retires_once_every_xcc_is_done(xccs: u32) {
+    let Some(bytes) = clang_amdgcn(EMPTY_IR, "gfx1100") else { return };
+    let mock = load_mock_program_on(xccs, &bytes, "empty", &[], false);
+    install_signal_pool(&mock.allocator);
+    let pool =
+        crate::amd::connector::PoolQueue::new_with_resources(Arc::clone(mock.device.core()), &mock.allocator).unwrap();
+    let owner = crate::amd::connector::OwnerCtx::new(Arc::clone(mock.device.core()), mock.allocator.clone());
+    let calls = [crate::device::PlanCall::Program {
+        program: &mock.program,
+        buffers: &[],
+        vals: &[],
+        global_size: Some([1, 1, 1]),
+        local_size: Some([1, 1, 1]),
+    }];
+    let mut linked = crate::amd::AmdLinkedPlan::capture(&owner, &pool, &one_kernel_semantic_plan(), &calls)
+        .unwrap()
+        .expect("linked plan");
+    linked.replay(&owner, &pool, &calls).map_err(|failure| failure.error).expect("replay");
+    let finalizer = owner.newest().expect("the replay's finalizer");
+    finalizer.land_timeline();
+    assert_eq!(finalizer.retired(), xccs == 1, "xccs={xccs}");
+    if let Some(retired) = pool.retired() {
+        assert_eq!(retired.current() - 1, linked.submission_bytes().len() as u64, "one count per submission");
+        let last = pool.queue().ring_packet(pool.queue().ring_write_idx() - 1);
+        assert_eq!(last[56..], retired.signal().handle().to_le_bytes());
+        retire_lane(&pool);
+    }
+    assert!(finalizer.retired());
 }
 
 #[test]

@@ -528,8 +528,8 @@ fn a_compute_doorbell_flushes_hdp_only_after_a_vram_host_write(xccs: u32, uncach
     assert!(!iface.transcript()[mark..].contains(&MockAmdCall::HdpFlush), "a guard defers its flush");
     assert_eq!(doorbell(), if uncached { plain.clone() } else { flushed }, "xccs={xccs} uncached={uncached}");
     assert_eq!(doorbell(), plain, "the deferred flush runs once");
-    // Retire the mock timeline, so freeing the buffer drains at once.
-    crate::sync::TimelineSignal::set(&**pool.pm4_signal(), pool.pm4_value());
+    // Retire the mock lane, so freeing the buffer drains at once.
+    super::test_support::retire_lane(&pool);
 }
 
 /// SDMA doorbells follow the same contract: no flush of their own, one after
@@ -657,6 +657,38 @@ fn compute_publication_rolls_back_before_the_doorbell_and_poisons_after(xccs: u3
         drop(pool);
         assert_eq!(iface.free_count(), 0, "poisoned resources must be quarantined");
     }
+}
+
+/// On AQL, XCC0 stores a dispatch's timeline point from an IB inside its
+/// kernarg slot, which the other XCCs may still be reading when it lands. The
+/// dispatch's last packet names the lane's retirement signal, and the slot is
+/// reused and the dispatch retired only once the CP completed that packet,
+/// with no later submission needed. A PM4 lane retires at its timeline point.
+#[test_case::test_case(1; "pm4")]
+#[test_case::test_case(2; "aql")]
+fn a_dispatch_retires_once_every_xcc_is_done_with_its_memory(xccs: u32) {
+    let (_iface, allocator) = mock_device_with_signals(xccs);
+    let pool = PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator).expect("pool queue");
+    let dispatch = pool.queue().submit_hcq_dispatch(&pool, &compute_submission(), &[0; 16], &[], &[]).unwrap();
+    let arena = pool.arena();
+    assert_eq!(arena.live_slots(), [(0, "submitted")]);
+    dispatch.finalizer.land_timeline();
+    assert_eq!(dispatch.finalizer.retired(), xccs == 1, "xccs={xccs}");
+
+    let reused = std::thread::scope(|scope| {
+        let reuse = scope.spawn(|| arena.reserve(arena.size, 1).map(|slot| slot.offset()));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(reuse.is_finished(), xccs == 1, "xccs={xccs}");
+        if let Some(retired) = pool.retired() {
+            let last = pool.queue().ring_packet(pool.queue().ring_write_idx() - 1);
+            assert_eq!(last[56..], retired.signal().handle().to_le_bytes());
+            assert_eq!(pool.queue().ring_packet(0)[56..], [0; 8], "only the last packet completes");
+            retired.signal().complete_packet();
+        }
+        reuse.join().unwrap()
+    });
+    assert_eq!(reused.unwrap(), 0);
+    assert!(dispatch.finalizer.retired());
 }
 
 #[test]

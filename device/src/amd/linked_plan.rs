@@ -573,6 +573,7 @@ impl AmdLinkedPlan {
             let publication = newest
                 .as_ref()
                 .map(|finalizer| PreparedPublication::new(Arc::clone(finalizer), Arc::clone(owner.core())));
+            let mut retired = None;
             for submission in self.submissions.iter_mut() {
                 if !self.pm4
                     && matches!(submission.queue, QueueKind::Compute(_))
@@ -588,11 +589,18 @@ impl AmdLinkedPlan {
                     std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
                 }
                 match submission.queue {
-                    QueueKind::Compute(_) => compute_publication.as_mut().unwrap().publish(&submission.replay),
+                    QueueKind::Compute(_) => {
+                        retired = compute_publication.as_mut().unwrap().publish(lane, &submission.replay).or(retired);
+                    }
                     QueueKind::Copy(_) => copy_publication.as_mut().unwrap().publish(&submission.replay),
                 }
                 published = true;
                 owner.core().publication_checkpoint(crate::amd::iface::PublicationStage::AfterDoorbell)?;
+            }
+            // The next replay rewrites the control programs and kernargs once
+            // every XCC is done with them, not when XCC0 stored the final point.
+            if let (Some(finalizer), Some(point)) = (&newest, retired) {
+                finalizer.retire_at(point);
             }
             if let Some(publication) = publication {
                 publication.publish();

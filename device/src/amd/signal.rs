@@ -78,6 +78,10 @@ const SIGNAL_VALUE_OFFSET: usize = 8;
 /// AMD HCQ submission finalizers write these fields with explicit PM4 timestamp
 /// commands on both PM4 and AQL queues.
 const SIGNAL_START_TS_OFFSET: usize = 32;
+/// Byte offsets of `amd_signal_t.event_mailbox_ptr` / `.event_id`: the CP
+/// writes the id there and interrupts when it decrements the signal.
+const SIGNAL_EVENT_MAILBOX_OFFSET: usize = 16;
+const SIGNAL_EVENT_ID_OFFSET: usize = 24;
 const SIGNAL_END_TS_OFFSET: usize = 40;
 /// The GPU clock counter feeding the timestamps ticks at the architected
 /// 100 MHz on AMD GPUs (10 ns per tick — tinygrad's `timestamp_divider=100`).
@@ -103,6 +107,9 @@ pub struct AmdSignal {
     device: Weak<AmdDeviceCore>,
     /// The queue this signal is the timeline of, where it reports its reads.
     queue_read: OnceLock<QueueReadPointer>,
+    /// A completion signal the CP decrements from 0: its value counts the
+    /// decrements, read as the negated raw word.
+    countdown: bool,
 }
 
 // SAFETY: AtomicU64 covers all reads/writes; the host pointer comes from a
@@ -140,6 +147,40 @@ impl AmdSignal {
         self.device.upgrade().and_then(|device| device.poison_error())
     }
 
+    /// The `amd_signal_t` base, an AQL packet's `completion_signal` handle.
+    pub(crate) fn handle(&self) -> u64 {
+        self.base_gpu
+    }
+
+    /// Count the AQL packets that name this signal as their completion signal:
+    /// the CP decrements it as each retires on every XCC, and raises the
+    /// queue event as it does when `mailbox` is given (ROCr `InterruptSignal`).
+    pub(crate) fn counting_down(mut self, mailbox: Option<crate::amd::iface::QueueEventMailbox>) -> Self {
+        self.countdown = true;
+        if let Some(mailbox) = mailbox {
+            // SAFETY: the full 64-byte slot is mapped; value lives at +8.
+            unsafe {
+                let base = (self.host_ptr.as_ptr() as *mut u8).sub(SIGNAL_VALUE_OFFSET);
+                std::ptr::write_volatile(base.add(SIGNAL_EVENT_MAILBOX_OFFSET) as *mut u64, mailbox.address);
+                std::ptr::write_volatile(base.add(SIGNAL_EVENT_ID_OFFSET) as *mut u32, mailbox.event_id);
+            }
+        }
+        self
+    }
+
+    /// Decrement the raw value as the CP does on a packet's completion.
+    #[cfg(test)]
+    pub(crate) fn complete_packet(&self) {
+        // SAFETY: NonNull valid for the pool's lifetime.
+        unsafe { self.host_ptr.as_ref().fetch_sub(1, Ordering::AcqRel) };
+    }
+
+    /// The raw word as this signal counts it; its own inverse.
+    #[inline]
+    fn counted(&self, raw: u64) -> u64 {
+        if self.countdown { raw.wrapping_neg() } else { raw }
+    }
+
     /// Slot index inside the pool. Useful for debugging.
     pub fn slot(&self) -> u32 {
         self.slot
@@ -149,7 +190,7 @@ impl AmdSignal {
     #[inline]
     fn load(&self) -> u64 {
         // SAFETY: NonNull valid for the pool's lifetime; AtomicU64 is race-free.
-        unsafe { self.host_ptr.as_ref().load(Ordering::Acquire) }
+        self.counted(unsafe { self.host_ptr.as_ref().load(Ordering::Acquire) })
     }
 
     /// Reset a slot before assigning it to a timeline or timestamp probe.
@@ -162,7 +203,7 @@ impl AmdSignal {
             let base = (self.host_ptr.as_ptr() as *mut u8).sub(SIGNAL_VALUE_OFFSET);
             std::ptr::write_volatile(base.add(SIGNAL_START_TS_OFFSET) as *mut u64, 0);
             std::ptr::write_volatile(base.add(SIGNAL_END_TS_OFFSET) as *mut u64, 0);
-            self.host_ptr.as_ref().store(value, Ordering::Release);
+            self.host_ptr.as_ref().store(self.counted(value), Ordering::Release);
         }
     }
 
@@ -405,14 +446,13 @@ impl TimelineSignal for AmdSignal {
     }
 
     fn value(&self) -> u64 {
-        // SAFETY: NonNull is valid for the pool's lifetime; AtomicU64 reads
-        // are race-free.
-        unsafe { self.host_ptr.as_ref().load(Ordering::Acquire) }
+        self.load()
     }
 
     fn set(&self, value: u64) {
-        // SAFETY: same as `value`.
-        unsafe { self.host_ptr.as_ref().store(value, Ordering::Release) };
+        // SAFETY: NonNull is valid for the pool's lifetime; AtomicU64 stores
+        // are race-free.
+        unsafe { self.host_ptr.as_ref().store(self.counted(value), Ordering::Release) };
     }
 
     fn wait(&self, target: u64, timeout_ms: u64) -> Result<()> {
@@ -545,6 +585,7 @@ impl SignalPool {
             pool: Arc::downgrade(self),
             queue_read: OnceLock::new(),
             device: Arc::downgrade(&self.device),
+            countdown: false,
         })
     }
 

@@ -6,8 +6,9 @@
 //! On AQL queues it also holds each dispatch's PM4 control program.
 //!
 //! A submission reserves everything it places here as one [`KernargSlot`],
-//! writes it, and publishes the slot with the lane timeline point that retires
-//! the submission. Slots are handed out in ring order and reclaimed oldest
+//! writes it, and publishes the slot with the point that retires the
+//! submission: its lane timeline point, or on AQL the lane's count of
+//! submissions every XCC is done with (`PoolQueue::retired`). Slots are handed out in ring order and reclaimed oldest
 //! first, so a reservation that meets the oldest live slot waits for exactly
 //! that slot: for its publication while its lane is still writing it, then for
 //! its timeline point. Neither a slot that is reserved but not yet submitted
@@ -62,7 +63,7 @@ unsafe impl Sync for KernargArena {}
 enum Retire {
     /// Reserved, not yet submitted: its lane is still writing it.
     Pending,
-    /// Submitted: free once the lane's timeline reaches the value.
+    /// Submitted: free once the signal reaches the value.
     Timeline(Arc<AmdSignal>, u64),
     /// Abandoned before submission, or its lane's timeline drained.
     Done,
@@ -269,8 +270,8 @@ impl KernargSlot<'_> {
         unsafe { std::slice::from_raw_parts_mut(self.arena.base_host.as_ptr().add(self.offset), self.len) }
     }
 
-    /// Hand the slot to the submission that signals `value` on `signal`, as
-    /// soon as its doorbell has rung.
+    /// Hand the slot to the submission that retires once `signal` reaches
+    /// `value`, as soon as its doorbell has rung.
     pub fn publish(mut self, signal: &Arc<AmdSignal>, value: u64) {
         self.published = true;
         self.arena.settle(self.offset, Retire::Timeline(Arc::clone(signal), value));

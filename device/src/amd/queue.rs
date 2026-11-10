@@ -257,7 +257,8 @@ pub fn lower_hcq_aql(submission: &crate::hcq::Submission) -> Result<Vec<[u32; 16
 
 /// Wrap one ordinary AQL dispatch in the queue-owned timeline protocol.
 /// Kernel completion handles must remain unset; optional profiling uses PM4
-/// timestamp stores in the surrounding control runs.
+/// timestamp stores in the surrounding control runs. Publication gives the
+/// stream's last packet the lane's retirement signal (`PoolQueue::retired`).
 pub fn finalize_hcq_aql_timeline_submission(
     submission: &crate::hcq::Submission,
     counter_address: u64,
@@ -1267,6 +1268,19 @@ impl QueueInner {
         self.write_idx += 1;
     }
 
+    /// Write a packet-aligned AQL stream whose last packet names `completion`
+    /// as its AQL completion signal, which the CP decrements once that packet
+    /// retired on every XCC.
+    fn push_aql_stream(&mut self, bytes: &[u8], completion: &crate::amd::signal::AmdSignal) {
+        let (last, packets) = bytes.as_chunks::<AQL_PACKET_BYTES>().0.split_last().expect("a validated AQL stream");
+        for packet in packets {
+            self.push_aql(packet);
+        }
+        let mut last = *last;
+        last[56..].copy_from_slice(&completion.handle().to_le_bytes());
+        self.push_aql(&last);
+    }
+
     /// Publish the current `write_idx` to GART + ring the doorbell. AQL uses
     /// the **last completed** slot (`write_idx - 1`); PM4 uses the **next**
     /// dword (`write_idx`).
@@ -1299,15 +1313,22 @@ pub(crate) struct LinkedComputePublication<'a> {
 }
 
 impl LinkedComputePublication<'_> {
-    pub(crate) fn publish(&mut self, replay: &crate::hcq::ReplayCommandBuffer) {
+    /// Publish `replay` on `lane`. On AQL, returns the point of `lane`'s
+    /// retirement count at which its memory is free again.
+    pub(crate) fn publish(
+        &mut self,
+        lane: &PoolQueue,
+        replay: &crate::hcq::ReplayCommandBuffer,
+    ) -> Option<(Arc<crate::amd::signal::AmdSignal>, u64)> {
         if self.is_pm4 {
             self.inner.push_pm4_bytes(replay.bytes());
-        } else {
-            for packet in replay.bytes().as_chunks::<AQL_PACKET_BYTES>().0 {
-                self.inner.push_aql(packet);
-            }
+            self.inner.ring_doorbell(true);
+            return None;
         }
-        self.inner.ring_doorbell(self.is_pm4);
+        let retired = lane.aql_retired();
+        self.inner.push_aql_stream(replay.bytes(), retired.signal());
+        self.inner.ring_doorbell(false);
+        Some((Arc::clone(retired.signal()), retired.next()))
     }
 }
 
@@ -1512,7 +1533,8 @@ impl AmdComputeQueue {
     ///
     /// `kernargs` go into one kernarg ring slot (on AQL together with the PM4
     /// control program), reserved after the headroom waits and published with
-    /// the timeline value this dispatch signals.
+    /// the timeline value this dispatch signals, on AQL with the lane's
+    /// retirement point instead.
     ///
     /// Sequence (timestamps are present only when the submission requests them):
     /// `wait(counter, prev) → memory_barrier → [timestamp] → exec → [timestamp]
@@ -1593,8 +1615,8 @@ impl AmdComputeQueue {
             std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
             let links = crate::hcq::LinkPatchValues(vec![control_gpu, control_gpu + kernarg_offset as u64]);
             let linked = pool.link(&program.aql, &links)?;
-            self.publish_linked_aql_timeline(pool, &linked.replay_buffer(), next, Some(slot))?;
-            let finalizer = SubmissionFinalizer::timeline(Arc::clone(pool.pm4_signal()), next, timestamps.clone());
+            let finalizer =
+                self.publish_linked_aql_timeline(pool, &linked.replay_buffer(), next, Some(slot), timestamps.clone())?;
             return Ok(HcqDispatchResult { timestamps, finalizer });
         }
 
@@ -1814,7 +1836,9 @@ impl AmdComputeQueue {
 
     /// Patch and publish a linked AQL stream plus its resident PM4 control IBs
     /// through the queue-owned timeline. Kernel packets carry no completion;
-    /// the trailing control IB publishes `next` after all prior AQL packets.
+    /// the trailing control IB publishes `next` after all prior AQL packets,
+    /// and the finalizer retires once every XCC is done with that IB too, so
+    /// a replay rewrites `control_host` only then.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn replay_linked_aql_timeline(
         &self,
@@ -1845,8 +1869,7 @@ impl AmdComputeQueue {
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         linked.patch(replay, runtime, system)?;
         validate_aql_packet_count(replay.bytes().len() / AQL_PACKET_BYTES)?;
-        self.publish_linked_aql_timeline(pool, replay, next, None)?;
-        Ok(SubmissionFinalizer::timeline(Arc::clone(pool.pm4_signal()), next, None))
+        self.publish_linked_aql_timeline(pool, replay, next, None, None)
     }
 
     /// Lower and publish one complete HCQ command buffer with one doorbell.
@@ -1898,13 +1921,16 @@ impl AmdComputeQueue {
         self.submit_aql(&packets)
     }
 
+    /// Publish a linked AQL stream that stores `next` on the lane timeline. Its
+    /// memory, `kernargs` with it, retires on the lane's retirement count.
     fn publish_linked_aql_timeline(
         &self,
         pool: &PoolQueue,
         replay: &crate::hcq::ReplayCommandBuffer,
         next: u64,
         kernargs: Option<crate::amd::kernarg::KernargSlot<'_>>,
-    ) -> Result<()> {
+        timestamps: Option<Arc<crate::amd::signal::AmdSignal>>,
+    ) -> Result<Arc<SubmissionFinalizer>> {
         if !replay.bytes().len().is_multiple_of(AQL_PACKET_BYTES) {
             return Err(Error::Runtime { message: "linked AQL stream is not packet aligned".into() });
         }
@@ -1917,19 +1943,21 @@ impl AmdComputeQueue {
         debug_assert_eq!(reserved, next, "queue lease must serialize timeline reservation");
         let mut reservation = TimelineReservation::new(pool, &self.core, reserved);
         self.core.publication_checkpoint(crate::amd::iface::PublicationStage::AfterReservation)?;
-        for packet in replay.bytes().as_chunks::<AQL_PACKET_BYTES>().0 {
-            ring.push_aql(packet);
-        }
+        let retired = pool.aql_retired();
+        ring.push_aql_stream(replay.bytes(), retired.signal());
         self.core.publication_checkpoint(crate::amd::iface::PublicationStage::BeforeDoorbell)?;
         ring.ring_doorbell(/*is_pm4=*/ false);
         reservation.mark_published();
+        let point = retired.next();
         if let Some(slot) = kernargs {
-            slot.publish(pool.pm4_signal(), next);
+            slot.publish(retired.signal(), point);
         }
+        let finalizer = SubmissionFinalizer::timeline(Arc::clone(pool.pm4_signal()), next, timestamps);
+        finalizer.retire_at((Arc::clone(retired.signal()), point));
         ring.commit();
         self.core.publication_checkpoint(crate::amd::iface::PublicationStage::AfterDoorbell)?;
         reservation.commit();
-        Ok(())
+        Ok(finalizer)
     }
 
     /// Wait for linked-publication headroom WITHOUT pinning the queue lock
@@ -2072,10 +2100,6 @@ impl AmdComputeQueue {
         }
     }
 
-    /// The CP exception code the trap handler wrote into `queue_inactive_signal`
-    /// when it halted the queue (e.g. `0x401` insufficient-scratch), or `None`
-    /// if no exception is recorded (value `0`) / on PM4 queues. Used to turn a
-    /// blind dispatch timeout into a diagnosable error.
     /// Ring producer index. Test-only: proves an abandoned publication left no
     /// packets behind.
     #[cfg(test)]
@@ -2083,6 +2107,19 @@ impl AmdComputeQueue {
         self.inner.lock().write_idx
     }
 
+    /// The AQL packet at ring index `index`. Test-only.
+    #[cfg(test)]
+    pub(crate) fn ring_packet(&self, index: u64) -> [u8; AQL_PACKET_BYTES] {
+        let inner = self.inner.lock();
+        let offset = (index as usize * AQL_PACKET_BYTES) % inner.ring_size;
+        // SAFETY: the ring spans `ring_size` bytes, a whole number of packets.
+        unsafe { *(inner.ring_host.as_ptr().add(offset) as *const [u8; AQL_PACKET_BYTES]) }
+    }
+
+    /// The CP exception code the trap handler wrote into `queue_inactive_signal`
+    /// when it halted the queue (e.g. `0x401` insufficient-scratch), or `None`
+    /// if no exception is recorded (value `0`) / on PM4 queues. Used to turn a
+    /// blind dispatch timeout into a diagnosable error.
     pub(crate) fn inactive_exception(&self) -> Option<i64> {
         let h = self.inner.lock().qinactive_host?;
         // SAFETY: host-visible amd_signal_t; `value` is the i64 at +8.
