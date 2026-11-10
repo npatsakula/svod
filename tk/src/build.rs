@@ -171,15 +171,20 @@ pub type Periodic<'k, T> = Tile<'k, Period, T>;
 /// A ring slot as a pipeline's consume of stage `'r` sees it.
 pub type Slotted<'k, 'r, T> = Tile<'k, Held<'r>, T>;
 
-/// A register tile a loop carries or a product accumulates into: owned, not
-/// copied, so what consumes it ([`Kernel::mma`], the next a loop body
-/// returns) retires it, and a stale one is a compile error where a register
-/// tile would be read or carried on by mistake. `*acc` is the tile it holds
-/// now, for the operands of other ops; any register tile becomes one with
-/// `into`, freely: `*acc` read before a product and made an accumulator
-/// again after it is the stale value the type otherwise refuses, so a
-/// conversion is a statement that the value is the one to carry. The `_vec`
-/// forms of the loops carry plain register tiles.
+/// A register tile a loop carries or a product accumulates into: a lint, not
+/// an ownership guarantee.
+///
+/// It is not `Copy`, so the plain mistake of handing on the accumulator a
+/// product consumed ([`Kernel::mma`] takes it by value) instead of the
+/// product is a compile error. It guarantees nothing more: `*acc` is a
+/// register tile, which is `Copy`, and any register tile becomes an `Acc`
+/// with `into`, so a copy kept from before a product and made an
+/// accumulator again carries the stale value unrefused, as do the `_vec`
+/// forms of the loops, which carry plain register tiles. A conversion is the
+/// author's statement that the value is the one to carry. Nor does the
+/// lowering check it: a stale accumulator is a well-formed program that
+/// computes something else (a tile read past the scope that defines it is
+/// refused, [`crate::lower::Error::Escaped`], a stale one is not).
 pub struct Acc<'k, T>(pub Regs<'k, T>);
 
 impl<'k, T> From<Regs<'k, T>> for Acc<'k, T> {
