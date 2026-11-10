@@ -243,11 +243,17 @@ impl MockAmdIface {
     }
 }
 
-/// A synthetic `xccs`-XCC device (1 selects the PM4 path, >1 the AQL path) over
-/// a fresh mock backend.
+/// A synthetic `xccs`-XCC device over a fresh mock backend, with the queues a
+/// real one gets by default: PM4 on one XCC, AQL on more.
 pub(crate) fn mock_device(xccs: u32) -> (Arc<MockAmdIface>, AmdAllocator) {
+    mock_device_queues(xccs, xccs == 1)
+}
+
+/// [`mock_device`] with PM4 compute queues when `pm4`, else AQL ones, as
+/// `SVOD_AMD_AQL` forces on one XCC.
+pub(crate) fn mock_device_queues(xccs: u32, pm4: bool) -> (Arc<MockAmdIface>, AmdAllocator) {
     let iface = Arc::new(MockAmdIface::default());
-    let dev = AmdDevice::synthetic_with_xcc(Arc::clone(&iface) as Arc<dyn AmdIface>, xccs);
+    let dev = AmdDevice::synthetic(Arc::clone(&iface) as Arc<dyn AmdIface>, xccs, pm4);
     (iface, AmdAllocator { dev, device_id: 0 })
 }
 

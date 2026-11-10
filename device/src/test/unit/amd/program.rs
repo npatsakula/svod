@@ -562,6 +562,13 @@ impl ProbeBuffer {
         unsafe { std::ptr::write_volatile(self.host.as_ptr() as *mut f32, value) };
     }
 
+    /// Store `value` as the `index`-th 32-bit word.
+    fn set_word(&self, index: usize, value: u32) {
+        assert!(index < 16, "a 64-byte buffer holds 16 words");
+        // SAFETY: as above.
+        unsafe { std::ptr::write_volatile((self.host.as_ptr() as *mut u32).add(index), value) };
+    }
+
     fn get(&self) -> f32 {
         // SAFETY: as above.
         unsafe { std::ptr::read_volatile(self.host.as_ptr() as *const f32) }
@@ -676,64 +683,98 @@ fn pm4_graph_two_kernel_raw_dependency() {
     graph_two_kernel_raw_probe(&alloc, alloc.dev.arch.mcpu());
 }
 
-/// One work-item that sleeps `iterations` times (`s_sleep 127`, a few µs
-/// each), then stores 0.0.
-fn sleepy_ir(iterations: u32) -> String {
-    format!(
-        r#"target triple = "amdgcn-amd-amdhsa"
+/// One work-item that sleeps (`s_sleep 127`, a few µs each) as many times as
+/// the `u32` at `buf0 + 4` says, then stores 0.0 to `buf0`.
+const SLEEPY_IR: &str = r#"target triple = "amdgcn-amd-amdhsa"
 declare void @llvm.amdgcn.s.sleep(i32)
-define amdgpu_kernel void @sleepy(ptr noalias %buf0) #0 {{
+define amdgpu_kernel void @sleepy(ptr noalias %buf0) #0 {
 entry:
+  %count_ptr = getelementptr inbounds i32, ptr %buf0, i64 1
+  %count = load volatile i32, ptr %count_ptr
   br label %loop
 loop:
-  %i = phi i32 [ 0, %entry ], [ %next, %loop ]
+  %i = phi i32 [ 0, %entry ], [ %next, %body ]
+  %more = icmp ult i32 %i, %count
+  br i1 %more, label %body, label %exit
+body:
   call void @llvm.amdgcn.s.sleep(i32 127)
   %next = add i32 %i, 1
-  %done = icmp eq i32 %next, {iterations}
-  br i1 %done, label %exit, label %loop
+  br label %loop
 exit:
   store float 0.0, ptr %buf0
   ret void
-}}
-attributes #0 = {{ nounwind "amdgpu-flat-work-group-size"="1,1" }}
-"#
-    )
 }
+attributes #0 = { nounwind "amdgpu-flat-work-group-size"="1,1" }
+"#;
 
-/// A graph of `count` sleepy kernels over one host-visible output, or `None`
-/// where clang or capture isn't available.
-fn sleepy_graph(
-    alloc: &AmdAllocator,
-    iterations: u32,
-    count: usize,
-) -> Option<(Box<dyn crate::device::Graph>, AmdProgram, ProbeBuffer)> {
-    let bytes = clang_amdgcn(&sleepy_ir(iterations), alloc.dev.arch.mcpu())?;
+/// A one-kernel sleepy graph over a host-visible output, or `None` where clang
+/// or capture isn't available.
+fn sleepy_graph(alloc: &AmdAllocator) -> Option<(Box<dyn crate::device::Graph>, AmdProgram, ProbeBuffer)> {
+    let bytes = clang_amdgcn(SLEEPY_IR, alloc.dev.arch.mcpu())?;
     let program =
         AmdProgram::load(alloc.dev.clone(), alloc, &bytes, "sleepy", &global_f32_buffer_abi()).expect("load program");
     let output = ProbeBuffer::new(alloc);
-    let kernels = (0..count)
-        .map(|index| graph_kernel(&program, vec![output.gpu as *mut u8], Vec::from_iter(index.checked_sub(1))))
-        .collect::<Vec<_>>();
-    let graph = AmdGraph::capture(alloc, &kernels).expect("capture")?;
+    let graph = AmdGraph::capture(alloc, &[graph_kernel(&program, vec![output.gpu as *mut u8], Vec::new())])
+        .expect("capture")?;
     Some((graph, program, output))
+}
+
+/// The sleep count that makes the sleepy kernel run about `target` on this
+/// part: it grows the count by the measured shortfall, at most 64× a step, so
+/// a part with a short `s_sleep` or a fast clock takes more steps, not a
+/// shorter kernel. `SLEEPY_ITERS` replaces the calibration.
+fn calibrate_sleepy(
+    graph: &dyn crate::device::Graph,
+    output: &ProbeBuffer,
+    core: &crate::amd::device::AmdDeviceCore,
+    target: std::time::Duration,
+) -> u32 {
+    if let Some(iterations) = std::env::var("SLEEPY_ITERS").ok().and_then(|value| value.parse().ok()) {
+        return iterations;
+    }
+    let span = |iterations: u32| {
+        output.set_word(1, iterations);
+        let timestamps = graph.replay_profiled(&[], &[]).expect("profiled replay").expect("profile support");
+        core.synchronize_all().expect("synchronize_all");
+        let (start, end) = timestamps[0].timestamps_ns().expect("graph GPU timestamps");
+        std::time::Duration::from_nanos(end - start)
+    };
+    // `s_sleep 127` is at least 8128 clocks, so 2^22 sleeps outlast any target.
+    const MAX_SLEEPS: f64 = (1u32 << 22) as f64;
+    let (mut iterations, mut measured) = (1_000u32, span(1_000));
+    while measured < target {
+        let ratio = (target.as_secs_f64() / measured.as_secs_f64().max(1e-9)).clamp(2.0, 64.0);
+        let grown = (f64::from(iterations) * ratio).min(MAX_SLEEPS) as u32;
+        let longer = span(grown);
+        assert!(
+            grown > iterations && longer.as_secs_f64() > 1.25 * measured.as_secs_f64(),
+            "the span does not grow with the sleep count ({iterations} → {grown} sleeps took {measured:?} → \
+             {longer:?}): broken GPU timestamps or a no-op s_sleep"
+        );
+        (iterations, measured) = (grown, longer);
+    }
+    println!("calibrated: {iterations} sleeps take {measured:?}");
+    iterations
 }
 
 /// Two threads blocked on one graph replay both wake as it retires: the replay
 /// raises the completion interrupt, and each waiter's event age sees it though
 /// the queue event resets on the first wake. Lateness is wall time past the
 /// kernel's GPU span; a missed interrupt leaves a waiter to its next
-/// `WAIT_EVENTS` slice (up to 200 ms).
+/// `WAIT_EVENTS` slice (up to 200 ms). The kernel's sleep count is calibrated
+/// to four times the span the trials require, whatever the part's clock.
 ///
 /// Run: `cargo test -p svod-device --lib graph_waiters -- --ignored --nocapture --test-threads=1`
 #[test]
 #[ignore = "manual hardware probe; needs a real AMD GPU + clang"]
 fn graph_waiters_wake_as_the_replay_retires() {
+    const MIN_SPAN: std::time::Duration = std::time::Duration::from_millis(10);
     let Some(alloc) = amd_alloc_or_skip() else { return };
     let _serial = PM4_GRAPH_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _pm4 = Pm4GraphOverride::enable(alloc.dev.core());
     ensure_hw_signal_pool(&alloc);
-    let iterations = std::env::var("SLEEPY_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(80_000);
-    let Some((graph, _program, output)) = sleepy_graph(&alloc, iterations, 1) else { return };
+    let Some((graph, _program, output)) = sleepy_graph(&alloc) else { return };
+    output.set_word(1, calibrate_sleepy(&*graph, &output, alloc.dev.core(), 4 * MIN_SPAN));
 
     for trial in 0..3 {
         output.set(-1.0);
@@ -751,10 +792,7 @@ fn graph_waiters_wake_as_the_replay_retires() {
         assert_eq!(output.get(), 0.0, "trial {trial}: the kernel store must land");
         let (start, end) = timestamps[0].timestamps_ns().expect("graph GPU timestamps");
         let span = std::time::Duration::from_nanos(end - start);
-        assert!(
-            span > std::time::Duration::from_millis(10),
-            "trial {trial}: the kernel must outlast the spin, {span:?}"
-        );
+        assert!(span > MIN_SPAN, "trial {trial}: the kernel must outlast the spin, {span:?}");
         for wall in woke {
             let late = wall.saturating_sub(span);
             println!("waiters trial {trial}: GPU {span:?}, woke after {wall:?}, {late:?} late");

@@ -346,16 +346,19 @@ fn scratch_growth_preserves_old_state_on_drain_or_allocation_failure() {
 /// the per-thread size, so on AQL, where a grow remaps the queue twice and
 /// each remap preempts every queue of the process, 64 growing requests remap
 /// four times. The registers' limit caps the doubling, never a request.
-#[test_case::test_case(1; "pm4")]
-#[test_case::test_case(2; "aql")]
-fn scratch_grows_geometrically_up_to_the_register_limit(xccs: u32) {
-    use super::test_support::MockAmdCall;
+#[test_case::test_case(1, true; "pm4")]
+#[test_case::test_case(2, false; "aql")]
+#[test_case::test_case(1, false; "aql forced on one xcc")]
+fn scratch_grows_geometrically_up_to_the_register_limit(xccs: u32, pm4: bool) {
+    use super::test_support::{MockAmdCall, install_signal_pool, mock_device_queues};
     use crate::amd::va_registry::AllocTag;
 
-    let (iface, allocator) = mock_device_with_signals(xccs);
+    let (iface, allocator) = mock_device_queues(xccs, pm4);
+    install_signal_pool(&allocator);
     let pool = pool_queue(&allocator);
+    assert_eq!(pool.queue().is_pm4(), pm4);
     let remaps = || iface.call_count(|call| matches!(call, MockAmdCall::UpdateQueue { .. }));
-    let aql = usize::from(xccs > 1);
+    let aql = usize::from(!pm4);
     assert_eq!((iface.alloc_count_for_tag(AllocTag::Scratch), remaps()), (1, 2 * aql), "the initial descriptor");
     for size in (1..=64).map(|step| 2048 + step * 256) {
         pool.ensure_has_local_memory(size).expect("scratch growth");

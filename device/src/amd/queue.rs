@@ -1479,19 +1479,17 @@ impl AmdComputeQueue {
     /// use the PM4 path (`KFD_IOC_QUEUE_TYPE_COMPUTE`), submitting raw PM4
     /// dwords directly into the ring; multi-XCC CDNA uses AQL, where each
     /// dispatch is a 64-byte AQL packet and PM4 helpers are wrapped via the
-    /// vendor IB packet. `SVOD_AMD_AQL` set to anything but `"0"` forces AQL.
-    /// Used by `AmdGraph::capture` to skip the (multi-MiB) per-graph build on
-    /// PM4 queues unless PM4 graph capture is opted into (`SVOD_PM4_GRAPH=1`);
-    /// AQL queues are always captured.
+    /// vendor IB packet. `SVOD_AMD_AQL` set to anything but `"0"` when the
+    /// device opens forces AQL. Used by `AmdGraph::capture` to skip the
+    /// (multi-MiB) per-graph build on PM4 queues unless PM4 graph capture is
+    /// opted into ([`AmdDeviceCore::set_pm4_graph`]); AQL queues are always
+    /// captured.
     pub fn will_use_pm4(core: &AmdDeviceCore) -> bool {
-        let force_aql = std::env::var("SVOD_AMD_AQL").ok().map(|s| s != "0").unwrap_or(false);
-        !force_aql && core.node.num_xcc.max(1) == 1
+        core.pm4_queues()
     }
 
     pub fn create(allocator: &AmdAllocator) -> Result<Box<Self>> {
         let core = allocator.dev.core();
-        // `SVOD_AMD_AQL=1` forces AQL even on single-XCC, useful for
-        // bisecting PM4 vs AQL bring-up issues.
         let is_pm4 = Self::will_use_pm4(core);
         let queue_type = if is_pm4 { kfd::KFD_IOC_QUEUE_TYPE_COMPUTE } else { kfd::KFD_IOC_QUEUE_TYPE_COMPUTE_AQL };
         let inner = create_queue(allocator, queue_type, COMPUTE_RING_BYTES, !is_pm4, /*needs_cwsr=*/ true)?;
