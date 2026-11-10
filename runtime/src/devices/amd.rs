@@ -21,7 +21,7 @@ use svod_dtype::{AmdArch, DeviceSpec};
 use svod_ir::UOp;
 
 use crate::clang::ClangToolchain;
-use crate::object_cache::{CompilerIdentity, OBJECT_CACHE_SCHEMA, ObjectCache, ObjectCacheKey};
+use crate::object_cache::{CompilerIdentity, OBJECT_CACHE_SCHEMA, ObjectCache};
 
 /// Create an `AMD:N` device end-to-end (allocator + renderer + compiler +
 /// runtime). The arch is queried from KFD topology at device-open time and
@@ -122,9 +122,9 @@ pub fn create_amd_codegen(device_id: usize, arch: AmdArch) -> Result<(Arc<dyn Re
     let toolchain = crate::amd::compile::amd_toolchain(cache.as_deref()).map_err(runtime_as_device)?;
     let integer_bf16 = amd_bf16_casts_in_integers(toolchain.llvm_major());
     let renderer = Arc::new(AmdRendererWrapper { device: spec, arch, integer_bf16 });
-    // The per-kernel `-nogpulib` decision comes from the IR, which is already
-    // part of every object-cache key; the persisted identity records the
-    // arch-stable, ocml-free flag set.
+    // The compiler-level identity records the flags of IR without device
+    // library calls or matrix products; each kernel's object key carries its
+    // own flags (`AmdCompiler::compile`).
     let flags = crate::amd::compile::amd_object_flags("", arch, toolchain.llvm_major());
     let identity = CompilerIdentity {
         schema: OBJECT_CACHE_SCHEMA,
@@ -221,7 +221,8 @@ struct AmdCompiler {
 impl Compiler for AmdCompiler {
     fn compile(&self, spec: &ProgramSpec) -> Result<CompiledSpec> {
         crate::amd::compile::dump_amd(&self.toolchain, &spec.src, self.arch);
-        let key = ObjectCacheKey::new(spec.src.as_bytes(), self.identity.clone());
+        let key =
+            crate::amd::compile::amd_object_key(&self.identity, &spec.src, self.arch, self.toolchain.llvm_major());
         let bytes = if let Some(cache) = &self.cache {
             cache.get_or_compile(
                 &key,

@@ -135,6 +135,20 @@ pub(crate) fn amd_object_flags(ir: &str, arch: AmdArch, llvm_major: Option<u32>)
     flags
 }
 
+/// The object-cache key of `ir`: `identity` with the flags `ir` compiles
+/// with, which follow the IR, so a change of flag policy never reuses an
+/// object built under the old one.
+pub(crate) fn amd_object_key(
+    identity: &crate::object_cache::CompilerIdentity,
+    ir: &str,
+    arch: AmdArch,
+    llvm_major: Option<u32>,
+) -> crate::object_cache::ObjectCacheKey {
+    let mut identity = identity.clone();
+    identity.flags = amd_object_flags(ir, arch, llvm_major);
+    crate::object_cache::ObjectCacheKey::new(ir.as_bytes(), identity)
+}
+
 pub(crate) fn compile_ir_to_amd_object_with(
     toolchain: &ClangToolchain,
     ir: &str,

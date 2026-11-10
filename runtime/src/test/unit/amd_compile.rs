@@ -132,3 +132,22 @@ fn machine_sinking_is_off_where_it_sinks_a_matrix_product(version: &str) -> bool
     }
     amd_sinks_wmma(major)
 }
+
+/// A kernel's object key carries the flags it compiles with: the same IR keyed
+/// under a flag policy that sank its matrix product never matches.
+#[test]
+fn an_object_key_carries_the_kernels_own_flags() {
+    let identity = crate::object_cache::CompilerIdentity {
+        schema: crate::object_cache::OBJECT_CACHE_SCHEMA,
+        backend: "amd-clang".into(),
+        target_architecture: "amdgcn-amd-amdhsa/gfx1151".into(),
+        toolchain: "clang".into(),
+        flags: amd_object_flags("", AmdArch::Gfx1151, Some(22)),
+        abi: String::new(),
+        object_format: String::new(),
+    };
+    let ir = "call @llvm.amdgcn.wmma.f32.16x16x16.f16";
+    let key = amd_object_key(&identity, ir, AmdArch::Gfx1151, Some(22));
+    assert!(key.compiler.flags.iter().any(|flag| flag == "-disable-machine-sink"));
+    assert_ne!(key.digest(), crate::object_cache::ObjectCacheKey::new(ir.as_bytes(), identity).digest());
+}
