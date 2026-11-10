@@ -40,6 +40,17 @@ fn release_mem_cache_flush_is_arch_specific() {
 }
 
 #[test]
+fn release_mem_order_writes_nothing_and_raises_no_interrupt() {
+    let event = release_mem_event_type(CACHE_FLUSH_AND_INV_TS_EVENT) | release_mem_event_index(EVENT_INDEX_END_OF_PIPE);
+    for is_gfx9 in [false, true] {
+        let pkt = release_mem_order(is_gfx9);
+        assert_eq!((pkt[0], pkt[1]), (packet3(PACKET3_RELEASE_MEM, 6), event));
+        assert_eq!(pkt[2], 0, "no data, no interrupt, memory destination");
+        assert_eq!(&pkt[3..], &[0; 5]);
+    }
+}
+
+#[test]
 fn release_mem_timestamp_is_a_bare_gpu_clock_probe() {
     // The timestamp probe must carry the GPU-clock data_sel, no interrupt, and —
     // despite the `CACHE_FLUSH_AND_INV_TS_EVENT` event NAME — NO cache action.

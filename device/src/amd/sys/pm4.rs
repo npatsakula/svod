@@ -262,11 +262,12 @@ pub fn release_mem_event(addr: u64, event_id: u32, is_gfx9: bool) -> [u32; 8] {
     packet
 }
 
-/// End-of-pipe ordering packet with no memory write, matching Tinygrad's first
-/// timestamp RELEASE_MEM. The zero address is ignored when DATA_SEL is none.
+/// End-of-pipe ordering packet with no memory write, Tinygrad's first
+/// timestamp RELEASE_MEM without its interrupt: KFD reserves event id 0, so an
+/// interrupt with no id only sends it scanning every event. The zero address is
+/// ignored when DATA_SEL is none.
 pub fn release_mem_order(is_gfx9: bool) -> [u32; 8] {
-    let memsel = release_mem_int_sel(INT_SEL_INTERRUPT_AFTER_WRITE)
-        | if is_gfx9 { 0 } else { release_mem_dst_sel(DST_SEL_MEMORY) };
+    let memsel = if is_gfx9 { 0 } else { release_mem_dst_sel(DST_SEL_MEMORY) };
     [
         packet3(PACKET3_RELEASE_MEM, 6),
         release_mem_event_type(CACHE_FLUSH_AND_INV_TS_EVENT) | release_mem_event_index(EVENT_INDEX_END_OF_PIPE),

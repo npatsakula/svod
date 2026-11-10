@@ -20,6 +20,17 @@ fn aql_scratch_descriptor_gfx9_encoding() {
     assert_eq!(d.wave64_lane_byte_size, 256, "wave64: priv_seg * 64 / 64");
 }
 
+/// Both generations record the per-lane stride the backing was sized with,
+/// the request rounded to the wave's scratch unit over 64 lanes, as ROCr does.
+#[test_case::test_case(AmdArch::Gfx942, 112; "gfx9, 16-byte lanes")]
+#[test_case::test_case(AmdArch::Gfx1100, 100; "gfx11, 4-byte lanes")]
+fn aql_scratch_lane_size_is_the_rounded_stride(arch: AmdArch, lane: u32) {
+    let (iface, allocator) = super::test_support::mock_device(1);
+    let iface = Arc::clone(&iface) as Arc<dyn AmdIface>;
+    let (.., size_per_thread, _, desc) = alloc_scratch(&iface, &allocator.dev.node, &arch, 100).expect("scratch");
+    assert_eq!((size_per_thread, desc.wave64_lane_byte_size), (lane, lane));
+}
+
 /// `wave_scratch` is truncated to the arch's WAVESIZE field width; the wave
 /// count keeps the low 12 bits regardless.
 #[test_case::test_case(AmdArch::Gfx942 => 0x1FFF; "cdna, 13 bits")]

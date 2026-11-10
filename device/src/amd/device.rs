@@ -125,8 +125,8 @@ pub(crate) struct AqlScratchDesc {
     pub tmpring_size: u32,
     /// `amd_queue_t.scratch_resource_descriptor` — a 4-dword SQ_BUF_RSRC.
     pub resource_descriptor: [u32; 4],
-    /// `amd_queue_t.scratch_wave64_lane_byte_size` — per-lane byte size (wave64,
-    /// so just the per-thread private segment size).
+    /// `amd_queue_t.scratch_wave64_lane_byte_size` — the per-lane stride of a
+    /// wave64, the rounded per-thread size (ROCr `InitScratchSRD`).
     pub wave64_lane_byte_size: u32,
 }
 
@@ -146,7 +146,7 @@ impl AqlScratchDesc {
     /// Build the gfx9 scratch descriptor. `size_per_xcc` goes in NUM_RECORDS
     /// (WORD2) — the per-XCC slice of the shared backing buffer — and the
     /// SWIZZLE_ENABLE bit (WORD1 bit 31) enables the per-thread scratch swizzle.
-    pub(crate) fn gfx9(scratch_va: u64, size_per_xcc: usize, tmpring_size: u32, private_segment_size: u32) -> Self {
+    pub(crate) fn gfx9(scratch_va: u64, size_per_xcc: usize, tmpring_size: u32, size_per_thread: u32) -> Self {
         Self {
             backing_va: scratch_va,
             tmpring_size,
@@ -156,7 +156,7 @@ impl AqlScratchDesc {
                 size_per_xcc as u32,
                 SCRATCH_RSRC_WORD3_GFX9,
             ],
-            wave64_lane_byte_size: private_segment_size,
+            wave64_lane_byte_size: size_per_thread,
         }
     }
 
@@ -966,7 +966,7 @@ pub(crate) fn alloc_scratch(
     // generation (ROCr `InitScratchSRD` switches the same way): a future arch
     // must pick its own V# layout here, not inherit one from an else-bucket.
     let aql_desc = match arch.gfx_major() {
-        9 => AqlScratchDesc::gfx9(va, size_per_xcc, tmpring_size, private_segment_size),
+        9 => AqlScratchDesc::gfx9(va, size_per_xcc, tmpring_size, size_per_thread),
         // gfx12's V# differs from gfx11 only in compression bits that stay
         // zero; the TMPRING packing difference lives in `pack_tmpring`.
         11 | 12 => AqlScratchDesc::gfx11(va, size_per_xcc, tmpring_size, size_per_thread),
