@@ -17,7 +17,7 @@
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use libc::{
     MAP_ANONYMOUS, MAP_FIXED, MAP_NORESERVE, MAP_PRIVATE, MAP_SHARED, PROT_NONE, PROT_READ, PROT_WRITE, mmap, munmap,
@@ -126,16 +126,19 @@ pub trait AmdIface: Send + Sync + std::fmt::Debug {
 /// [`Hdp::flush`] once its stores are done. A [`crate::buffer::HostWrite`]
 /// into VRAM marks its stores [`Hdp::defer`]red when it drops, and the
 /// device's next doorbell flushes them once for every guard since the last.
+/// A doorbell counts a deferral flushed only once its own flush has landed,
+/// so one racing another's flush still flushes.
 #[derive(Debug)]
 pub(crate) struct Hdp {
     iface: Arc<dyn AmdIface>,
-    deferred: AtomicBool,
+    deferred: AtomicU64,
+    flushed: AtomicU64,
     submissions_in_vram: bool,
 }
 
 impl Hdp {
     pub(crate) fn new(iface: Arc<dyn AmdIface>, submissions_in_vram: bool) -> Self {
-        Self { iface, deferred: AtomicBool::new(false), submissions_in_vram }
+        Self { iface, deferred: AtomicU64::new(0), flushed: AtomicU64::new(0), submissions_in_vram }
     }
 
     /// Whether kernargs and command buffers live in VRAM.
@@ -154,18 +157,17 @@ impl Hdp {
     /// flushes them. The fence drains its write-combining buffers first.
     pub(crate) fn defer(&self) {
         std::sync::atomic::fence(Ordering::SeqCst);
-        self.deferred.store(true, Ordering::Release);
+        self.deferred.fetch_add(1, Ordering::Release);
     }
 
     /// Run by every doorbell after its SeqCst fence: flush the submission's
     /// own stores when they went to VRAM, else the stores host writes
     /// deferred since the last doorbell.
     pub(crate) fn flush_for_doorbell(&self) {
-        if self.submissions_in_vram {
-            self.deferred.store(false, Ordering::Relaxed);
+        let deferred = self.deferred.load(Ordering::Acquire);
+        if self.submissions_in_vram || self.flushed.load(Ordering::Acquire) < deferred {
             self.iface.flush_hdp();
-        } else if self.deferred.load(Ordering::Relaxed) && self.deferred.swap(false, Ordering::AcqRel) {
-            self.iface.flush_hdp();
+            self.flushed.fetch_max(deferred, Ordering::Release);
         }
     }
 }

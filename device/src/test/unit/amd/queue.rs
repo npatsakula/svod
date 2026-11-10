@@ -566,6 +566,26 @@ fn a_copy_doorbell_flushes_hdp_only_after_a_vram_host_write(uncached: bool) {
     assert_eq!(flushes(), after, "the deferred flush runs once");
 }
 
+/// A doorbell that rings while another doorbell's flush is still landing
+/// flushes too: the stores deferred before that flush began count as flushed
+/// only once it has landed.
+#[test]
+fn a_doorbell_during_another_flush_still_flushes() {
+    use super::test_support::MockAmdCall;
+
+    let (iface, allocator) = mock_device(1);
+    iface.set_hdp_flush_register();
+    let hdp = Arc::clone(allocator.dev.core().hdp());
+    let flushes = || iface.call_count(|call| *call == MockAmdCall::HdpFlush);
+    hdp.defer();
+    let racing = Arc::clone(&hdp);
+    iface.during_next_hdp_flush(move || racing.flush_for_doorbell());
+    hdp.flush_for_doorbell();
+    assert_eq!(flushes(), 2);
+    hdp.flush_for_doorbell();
+    assert_eq!(flushes(), 2, "a landed flush covers every earlier deferral");
+}
+
 /// The CP reads a compute queue's CWSR headers on its first context save or
 /// restore, which no doorbell orders: the host flushes them before KFD
 /// creates the queue.

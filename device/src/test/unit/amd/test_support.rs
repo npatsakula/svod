@@ -101,6 +101,7 @@ struct MockAmdState {
     free_issues: Vec<MockFreeIssue>,
     queue_event_mailbox: Option<QueueEventMailbox>,
     hdp_flush_register: bool,
+    during_hdp_flush: Option<Box<dyn FnOnce() + Send>>,
 }
 
 /// Host-only AMD backend with page-aligned, stable allocations and explicit
@@ -145,6 +146,11 @@ impl MockAmdIface {
     /// writes after its VRAM stores; without it the flush is skipped.
     pub(crate) fn set_hdp_flush_register(&self) {
         self.state.lock().hdp_flush_register = true;
+    }
+
+    /// Run `hook` inside the next HDP flush, after its write and before it lands.
+    pub(crate) fn during_next_hdp_flush(&self, hook: impl FnOnce() + Send + 'static) {
+        self.state.lock().during_hdp_flush = Some(Box::new(hook));
     }
 
     pub(crate) fn script_wait(&self, outcome: Result<Option<Error>>) {
@@ -367,9 +373,16 @@ impl AmdIface for MockAmdIface {
     }
 
     fn flush_hdp(&self) {
-        let mut state = self.state.lock();
-        if state.hdp_flush_register {
+        let hook = {
+            let mut state = self.state.lock();
+            if !state.hdp_flush_register {
+                return;
+            }
             state.transcript.push(MockAmdCall::HdpFlush);
+            state.during_hdp_flush.take()
+        };
+        if let Some(hook) = hook {
+            hook();
         }
     }
 
