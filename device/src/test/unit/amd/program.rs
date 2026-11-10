@@ -1121,3 +1121,69 @@ attributes #0 = { nounwind "amdgpu-flat-work-group-size"="64,64" }
     crate::allocator::Allocator::free(&alloc, src, words * 4, &spec);
     dst.free_amd_device_in_place();
 }
+
+/// A dispatch invalidates its lane's caches with a full barrier only after
+/// stores reached memory behind them: the host's through HDP and the copy
+/// engine's, or on the lane's first dispatch. A timed dispatch always does, so
+/// a tuner measures every candidate cold; a barrier counts as done only once
+/// its dispatch was published. Every dispatch's completion still writes L2
+/// back before the timeline store the host polls, and an AQL dispatch keeps
+/// its system-scope release.
+#[test_case::test_case(1; "pm4")]
+#[test_case::test_case(2; "aql")]
+fn a_dispatch_invalidates_caches_only_after_stores_behind_them(xccs: u32) {
+    use crate::allocator::Allocator;
+    use crate::amd::sys::{hsa, pm4};
+    use crate::hcq::{Command, Submission};
+
+    let Some(bytes) = clang_amdgcn(EMPTY_IR, "gfx1100") else { return };
+    let mock = load_mock_program_on(xccs, &bytes, "empty", &[], true);
+    let core = mock.device.core();
+    let pool = crate::amd::connector::PoolQueue::new_with_resources(Arc::clone(core), &mock.allocator).unwrap();
+    let owner = crate::amd::connector::OwnerCtx::new(Arc::clone(core), mock.allocator.clone());
+    let gfx9 = core.arch.gfx_major() == 9;
+    let full: &[u32] = if gfx9 { &pm4::acquire_mem_gfx9() } else { &pm4::acquire_mem() };
+    let dispatch = |profile: bool| {
+        let (ring, packet, value) = (pool.queue().ring_write_idx(), pool.queue().ring_write_idx(), pool.pm4_value());
+        let result = unsafe {
+            mock.program.execute_on(&owner, &pool, &[], &[], Some([1, 1, 1]), Some([1, 1, 1]), false, profile)
+        };
+        let dwords = pool.queue().published_pm4(ring);
+        let completion = pm4::release_mem_write(pool.pm4_signal().value_addr(), value, true, true, false, gfx9);
+        if result.is_ok() {
+            assert_eq!(dwords.windows(completion.len()).filter(|run| *run == completion).count(), 1, "{dwords:x?}");
+            let flush = if gfx9 { pm4::EOP_TC_WB_ACTION_EN } else { pm4::RELEASE_MEM_GCR_GL2_WB };
+            assert_ne!(completion[1] & flush, 0, "the host reads what the completion wrote back");
+        }
+        if xccs > 1 && result.is_ok() {
+            let header = u16::from_le_bytes(pool.queue().ring_packet(packet + 1)[..2].try_into().unwrap());
+            let release = (header >> hsa::hsa_packet_header_t_HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE) & 3;
+            assert_eq!(u32::from(release), hsa::hsa_fence_scope_t_HSA_FENCE_SCOPE_SYSTEM);
+        }
+        retire_lane(&pool);
+        result.map(|_| dwords.windows(full.len()).filter(|run| *run == full).count())
+    };
+
+    assert_eq!(dispatch(false).unwrap(), 1, "a new lane's caches are unknown");
+    assert_eq!(dispatch(false).unwrap(), 0, "kernel to kernel the dispatch's fences suffice");
+    assert_eq!(dispatch(true).unwrap(), 1, "a timed dispatch runs cold");
+    assert_eq!(dispatch(true).unwrap(), 1, "every timed dispatch runs cold");
+    assert_eq!(dispatch(false).unwrap(), 0);
+
+    let opts = crate::allocator::BufferSpec { cpu_access: true, ..Default::default() };
+    let buffer = mock.allocator.alloc(64, &opts, false).unwrap();
+    assert_eq!(dispatch(false).unwrap(), 0, "the host stored nothing yet");
+    mock.allocator._copyin(&buffer, 0, &[7; 16]).unwrap();
+    assert_eq!(dispatch(false).unwrap(), 1, "the host stored into VRAM");
+    assert_eq!(dispatch(false).unwrap(), 0);
+
+    let copy = crate::amd::queue::AmdCopyQueue::create(&mock.allocator).unwrap();
+    let mut transfer = Submission::new(crate::hcq::QueueKind::Copy(0));
+    transfer.push(Command::Copy { dst: 0x1000, src: 0x2000, bytes: 4 });
+    copy.submit_hcq(&transfer).unwrap();
+    mock.iface.script_publication(Err(scripted_error("dispatch publication")));
+    assert!(dispatch(false).is_err());
+    assert_eq!(dispatch(false).unwrap(), 1, "SDMA stored, and the barrier before was never published");
+    assert_eq!(dispatch(false).unwrap(), 0);
+    mock.allocator.free(buffer, 64, &opts);
+}

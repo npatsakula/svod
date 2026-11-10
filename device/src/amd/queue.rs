@@ -1305,6 +1305,12 @@ impl QueueInner {
         // SAFETY: doorbell is mmapped MMIO; aligned 64-bit store.
         unsafe { std::ptr::write_volatile(self.doorbell.as_ptr(), doorbell_value) };
     }
+
+    /// Publish the SDMA ring, whose copies store behind the GPU caches.
+    fn publish_sdma(&self) {
+        self.hdp.note_dma_write();
+        self.publish(self.write_idx);
+    }
 }
 
 pub(crate) struct LinkedComputePublication<'a> {
@@ -1461,7 +1467,7 @@ impl Drop for CopyTimelineReservation<'_> {
 impl LinkedCopyPublication<'_> {
     pub(crate) fn publish(&mut self, replay: &crate::hcq::ReplayCommandBuffer) {
         push_sdma_bytes(&mut self.inner, replay.bytes());
-        self.inner.publish(self.inner.write_idx);
+        self.inner.publish_sdma();
     }
 }
 
@@ -2122,6 +2128,34 @@ impl AmdComputeQueue {
         unsafe { *(inner.ring_host.as_ptr().add(offset) as *const [u8; AQL_PACKET_BYTES]) }
     }
 
+    /// The PM4 this queue published from write index `from` on: PM4 ring
+    /// dwords, or on AQL the control programs its vendor packets run, read at
+    /// their GPU address, which is the host address on the mock. Test-only.
+    #[cfg(test)]
+    pub(crate) fn published_pm4(&self, from: u64) -> Vec<u32> {
+        let inner = self.inner.lock();
+        let ring = |index: u64, unit: usize| {
+            // SAFETY: the ring spans `ring_size` bytes, a whole number of units.
+            unsafe { inner.ring_host.as_ptr().add((index as usize * unit) % inner.ring_size) }
+        };
+        if self.is_pm4 {
+            return (from..inner.write_idx).map(|index| unsafe { *(ring(index, 4) as *const u32) }).collect();
+        }
+        let mut dwords = Vec::new();
+        for index in from..inner.write_idx {
+            // SAFETY: as above; a packet's first dword holds its header.
+            let packet = unsafe { std::slice::from_raw_parts(ring(index, AQL_PACKET_BYTES) as *const u32, 16) };
+            if packet[0] & 0xff == hsa_packet_type_t_HSA_PACKET_TYPE_VENDOR_SPECIFIC {
+                let address = u64::from(packet[2]) | (u64::from(packet[3]) << 32);
+                let count = (packet[4] & pm4::INDIRECT_BUFFER_SIZE_MASK) as usize;
+                // SAFETY: a mock GPU address is the host address of the live
+                // control program the packet runs.
+                dwords.extend_from_slice(unsafe { std::slice::from_raw_parts(address as *const u32, count) });
+            }
+        }
+        dwords
+    }
+
     /// The error this queue reported, if any: the code the CP wrote into the
     /// `queue_inactive_signal` as it halted the AQL queue (e.g. `0x401`,
     /// insufficient scratch), else the exception bits KFD set in `ErrorReason`.
@@ -2515,7 +2549,7 @@ impl AmdCopyQueue {
         let mut g = self.inner.lock();
         wait_sdma_headroom(&g, dwords.len() * 4).inspect_err(|error| self.core.poison(&error.to_string()))?;
         push_sdma(&mut g, &dwords);
-        g.publish(g.write_idx);
+        g.publish_sdma();
         Ok(())
     }
 
@@ -2648,7 +2682,7 @@ impl AmdCopyQueue {
             // queue. SDMA doorbell + wptr are byte counters (= write_idx). Both
             // are written after the last abortable step, so an abandoned
             // submission never leaves an advertised wptr behind.
-            ring.publish(ring.write_idx);
+            ring.publish_sdma();
             reservation.mark_published();
             ring.commit();
             self.core.publication_checkpoint(crate::amd::iface::PublicationStage::AfterDoorbell)?;
@@ -2658,7 +2692,7 @@ impl AmdCopyQueue {
         // Wait for this submission's exact fence outside the queue lock. At the
         // rollover watermark, drain any later reservations before resetting the
         // shared 32-bit memory timeline. Coherence for copied data is handled by
-        // the consuming compute dispatch's full acquire_mem prologue.
+        // the full acquire_mem the publication obliges every lane's next dispatch to.
         finalizer.wait(COPY_TIMEOUT_MS).inspect_err(|error| self.core.poison(&error.to_string()))?;
         if self.timeline.current() > crate::amd::signal::TIMELINE_WRAP_WATERMARK {
             // Serialize the snapshot, wait, and reset against all SDMA timeline

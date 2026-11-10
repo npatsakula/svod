@@ -73,6 +73,9 @@ pub(crate) struct PoolQueue {
     /// hence one cache per lane rather than a fresh
     /// `CommandBufferCache::default()` at every link site, which never hit.
     link_cache: Mutex<crate::hcq::CommandBufferCache>,
+    /// The device's count of stores behind the GPU caches (`Hdp`) this lane
+    /// last invalidated its caches after.
+    caches_invalidated_at: AtomicU64,
 }
 
 /// Atomic lane claims, split from queue construction so exclusivity can be
@@ -487,6 +490,7 @@ impl PoolQueue {
             retired,
             inflight: Mutex::new(VecDeque::new()),
             link_cache: Mutex::default(),
+            caches_invalidated_at: AtomicU64::new(0),
         });
         // Register in the core so `synchronize_all` can drain this queue's
         // in-flight work via `Weak<PoolQueue>`, reading only signal slots and
@@ -508,6 +512,19 @@ impl PoolQueue {
     #[inline]
     pub fn queue(&self) -> &AmdComputeQueue {
         &self.queue
+    }
+
+    /// Whether this lane's next dispatch must invalidate its caches, always
+    /// when `force`d: `Some` count of stores behind them it would cover, to
+    /// hand to [`Self::caches_invalidated`] once that dispatch is published.
+    pub(crate) fn cache_invalidate(&self, force: bool) -> Option<u64> {
+        let writes = self.core.hdp().writes_behind_caches();
+        (force || writes > self.caches_invalidated_at.load(Ordering::Relaxed)).then_some(writes)
+    }
+
+    /// A published dispatch invalidated this lane's caches after `writes`.
+    pub(crate) fn caches_invalidated(&self, writes: u64) {
+        self.caches_invalidated_at.fetch_max(writes, Ordering::Relaxed);
     }
 
     /// Borrow this queue's kernarg arena.

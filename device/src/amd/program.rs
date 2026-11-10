@@ -649,8 +649,8 @@ impl AmdProgram {
         layout.pack(&mut kernargs, &addresses, vals)?;
 
         // 2. Submit sequence:
-        //   PM4: wait(counter, prev) → memory_barrier → exec → signal(counter, next)
-        //   AQL: vendor-IB wait/barrier → native dispatch → vendor-IB timeline store
+        //   PM4: wait(counter, prev) → [memory_barrier] → exec → signal(counter, next)
+        //   AQL: vendor-IB wait/[barrier] → native dispatch → vendor-IB timeline store
         let g = global_size.unwrap_or([1, 1, 1]);
         let l = local_size.unwrap_or([1, 1, 1]);
 
@@ -712,12 +712,22 @@ impl AmdProgram {
                 target_major: self.target_major,
             }),
         };
+        // The full barrier only after stores behind this lane's caches: kernel
+        // to kernel the dispatch's own acquire and release suffice. A timed
+        // dispatch always takes it, so a tuner measures every candidate cold.
+        let invalidate = pool.cache_invalidate(profile);
         let mut submission = crate::hcq::Submission::new(crate::hcq::QueueKind::Compute(0));
-        submission.push(crate::hcq::Command::MemoryBarrier).push(crate::hcq::Command::Compute(dispatch));
+        if invalidate.is_some() {
+            submission.push(crate::hcq::Command::MemoryBarrier);
+        }
+        submission.push(crate::hcq::Command::Compute(dispatch));
         if profile {
             submission.request_profile();
         }
         let result = queue.submit_hcq_dispatch(pool, &submission, &kernargs, pmc_start, pmc_read)?;
+        if let Some(writes) = invalidate {
+            pool.caches_invalidated(writes);
+        }
         result.finalizer.retain_code(self.code_object());
         pool.register_inflight(Arc::clone(&result.finalizer));
         owner.set_newest(Arc::clone(&result.finalizer));
@@ -817,7 +827,7 @@ impl Program for AmdProgram {
     /// `private_segment_fixed_size`, so it lands on spilling candidates
     /// specifically and no amount of repetition averages it out.
     ///
-    /// The run is cold: like every dispatch here it goes behind the coherence
+    /// The run is cold: a timed dispatch always goes behind the coherence
     /// barrier, which writes back and invalidates the whole cache hierarchy, L2
     /// included. The probes touch no cache, so the span is the kernel's alone.
     ///

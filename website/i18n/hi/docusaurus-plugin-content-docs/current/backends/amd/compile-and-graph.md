@@ -107,8 +107,10 @@ kernargs के साथ एक HSA dispatch packet चाहिए होग�
    और हर scalar को एक 4-byte `i32` के रूप में लिखते हुए। `i32` packing जान-बूझकर है — renderer
    `Index → i32` lower करता है, इसलिए descriptor का `kernarg_size` 4-byte vars को reflect
    करता है; 8 bytes pack करना अगले slot में overflow कर जाता।
-3. एक **submission बनाता है** — `MemoryBarrier` और फिर `Compute` का एक `hcq::Submission`, जो
-   kernarg VA, `rsrc` triple, और PM4 program address साथ ले जाता है।
+3. एक **submission बनाता है** — `Compute` का एक `hcq::Submission`, जो kernarg VA,
+   `rsrc` triple, और PM4 program address साथ ले जाता है; उससे पहले `MemoryBarrier`
+   तभी आता है जब lane के पिछले barrier के बाद host या SDMA ने उसके caches को
+   bypass करके लिखा हो, lane के पहले dispatch पर, और हर timed dispatch पर।
 4. `queue.submit_hcq_dispatch(pool, &submission, …)` के माध्यम से **dispatch करता है**। एक
    PM4 queue पर `lower_hcq_pm4` → `build_exec_pm4` raw dwords emit करता है, और optional
    4-dword scratch descriptor को `COMPUTE_USER_DATA_0` में उसी `scratch_address` snapshot से

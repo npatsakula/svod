@@ -111,8 +111,10 @@ wait, profile)` 是 plan 与图使用的、以通道为范围的调度路径—�
    是刻意的——渲染器将 `Index → i32` 降低，因此描述符的
    `kernarg_size` 反映 4 字节的 var；打包 8 字节会溢出进
    下一个槽。
-3. **构建一次提交**——一个先 `MemoryBarrier` 再 `Compute` 的
-   `hcq::Submission`，携带 kernarg VA、`rsrc` 三元组以及 PM4 程序地址。
+3. **构建一次提交**——一个含 `Compute` 的 `hcq::Submission`，携带 kernarg VA、
+   `rsrc` 三元组以及 PM4 程序地址；若主机或 SDMA 自该 lane 上次屏障以来绕过其缓存
+   写入过内存，或这是该 lane 的首次调度，或这是一次计时调度，则其前先有
+   `MemoryBarrier`。
 4. 经由 `queue.submit_hcq_dispatch(pool, &submission, …)` **调度**。
    在 PM4 队列上，`lower_hcq_pm4` → `build_exec_pm4` 发出原始 dword，可选的 4-dword
    scratch 描述符会被前置到 `COMPUTE_USER_DATA_0`，其取值与写入

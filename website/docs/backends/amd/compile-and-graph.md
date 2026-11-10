@@ -114,9 +114,10 @@ leased `PoolQueue`. (The `Program::execute` trait method builds a throwaway
    `i32` packing is deliberate — the renderer lowers `Index → i32`, so the
    descriptor's `kernarg_size` reflects 4-byte vars; packing 8 bytes would
    overflow into the next slot.
-3. **Builds a submission** — an `hcq::Submission` of `MemoryBarrier` then
-   `Compute`, carrying the kernarg VA, the `rsrc` triple, and the PM4 program
-   address.
+3. **Builds a submission** — an `hcq::Submission` of `Compute`, carrying the
+   kernarg VA, the `rsrc` triple, and the PM4 program address, after a
+   `MemoryBarrier` when the host or SDMA stored behind the lane's caches since
+   its last one, on the lane's first dispatch, and on every timed dispatch.
 4. **Dispatches** through `queue.submit_hcq_dispatch(pool, &submission, …)`.
    On a PM4 queue `lower_hcq_pm4` → `build_exec_pm4` emits raw dwords, and the
    optional 4-dword scratch descriptor is prepended to `COMPUTE_USER_DATA_0`

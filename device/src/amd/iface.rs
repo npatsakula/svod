@@ -130,17 +130,43 @@ pub trait AmdIface: Send + Sync + std::fmt::Debug {
 /// device's next doorbell flushes them once for every guard since the last.
 /// A doorbell counts a deferral flushed only once its own flush has landed,
 /// so one racing another's flush still flushes.
+///
+/// It also counts the stores that reach device memory behind the GPU caches,
+/// which a lane's caches may hold stale lines for: these host stores and the
+/// copy engine's ([`Self::note_dma_write`]). A lane invalidates its caches
+/// before its next dispatch once the count passed the one it last invalidated
+/// at (`PoolQueue::cache_invalidate`). Kernargs and command buffers are not
+/// counted: uncached system memory bypasses L2, and a multi-XCC part keeps L2
+/// coherent with host stores to its local VRAM (CLR's device kernargs).
 #[derive(Debug)]
 pub(crate) struct Hdp {
     iface: Arc<dyn AmdIface>,
     deferred: AtomicU64,
     flushed: AtomicU64,
+    behind_caches: AtomicU64,
     submissions_in_vram: bool,
 }
 
 impl Hdp {
     pub(crate) fn new(iface: Arc<dyn AmdIface>, submissions_in_vram: bool) -> Self {
-        Self { iface, deferred: AtomicU64::new(0), flushed: AtomicU64::new(0), submissions_in_vram }
+        Self {
+            iface,
+            deferred: AtomicU64::new(0),
+            flushed: AtomicU64::new(0),
+            // Above any lane's start, so a new lane's first dispatch invalidates.
+            behind_caches: AtomicU64::new(1),
+            submissions_in_vram,
+        }
+    }
+
+    /// Stores behind the GPU caches so far.
+    pub(crate) fn writes_behind_caches(&self) -> u64 {
+        self.behind_caches.load(Ordering::Acquire)
+    }
+
+    /// The copy engine is about to store behind the GPU caches.
+    pub(crate) fn note_dma_write(&self) {
+        self.behind_caches.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Whether kernargs and command buffers live in VRAM.
@@ -153,6 +179,7 @@ impl Hdp {
     pub(crate) fn flush(&self) {
         std::sync::atomic::fence(Ordering::SeqCst);
         self.iface.flush_hdp();
+        self.behind_caches.fetch_add(1, Ordering::AcqRel);
     }
 
     /// This thread's VRAM stores so far are done; the device's next doorbell
@@ -160,6 +187,7 @@ impl Hdp {
     pub(crate) fn defer(&self) {
         std::sync::atomic::fence(Ordering::SeqCst);
         self.deferred.fetch_add(1, Ordering::Release);
+        self.behind_caches.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Run by every doorbell after its SeqCst fence: flush the submission's
