@@ -23,8 +23,8 @@ use crate::kernels::gemm::{
 };
 use crate::kernels::heads::{HeadsSpec, Rope, heads};
 use crate::kernels::nearest::{
-    Floors, Live, Metric, NearestCfg, NearestMergeSpec, NearestSpec, RescoreSpec, SelectCfg, SelectSpec, nearest,
-    nearest_merge, nearest_rescore, nearest_select,
+    Floors, Live, Metric, NearestCfg, NearestMergeSpec, NearestSpec, Pow2, RescoreSpec, SelectCfg, SelectSpec, Way,
+    nearest, nearest_merge, nearest_rescore, nearest_select,
 };
 use crate::kernels::rows::{Norm, NormCfg, NormSpec, norm};
 use crate::kernels::{Act, Batch};
@@ -333,8 +333,8 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
         let p = NearestProblem { n: 1 << 16, m: 1 << 16, d, dtype: ScalarDType::Float16, metric, floors, groups, k };
         // A named way's first config, else the ranking's first.
         let way = |c: &&NearestCfg| match name {
-            _ if name.contains("queued") => c.queue.is_some(),
-            _ if name.contains("registers") => c.queue.is_none() && c.select.is_none(),
+            _ if name.contains("queued") => c.queue().is_some(),
+            _ if name.contains("registers") => c.list == Way::Registers,
             _ => true,
         };
         let Some(&cfg) = planner.nearest_ranked(p).iter().find(way) else { continue };
@@ -369,7 +369,7 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
         let d = planner.nearest_depth(d, ScalarDType::Int8).expect("an 8-bit core");
         let dtype = ScalarDType::Int8;
         let p = NearestProblem { n: 1 << 16, m: 1 << 16, d, dtype, metric, floors, groups, k };
-        let way = |c: &&NearestCfg| !name.contains("queued") || c.queue.is_some();
+        let way = |c: &&NearestCfg| !name.contains("queued") || c.queue().is_some();
         let streamed = |c: &&NearestCfg| name.contains("streamed") == c.bk.is_some();
         let ranked = planner.nearest_ranked(p);
         let Some(&cfg) = ranked.iter().filter(way).find(streamed).or(ranked.iter().find(way)) else { continue };
@@ -415,8 +415,11 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
     // Split over the candidates (shares of one tile and of two), and a merge
     // of shares, of a least alone and of lists: in registers, the longest
     // there, and queued.
-    for (k, queue, name) in [(1, None, ""), (8, None, " 8"), (64, None, " 64"), (256, Some(32), " 256 queued")] {
-        let cfg = NearestCfg { splits: 2, queue, ..NearestCfg::streamed(32, 32, 32, 2) };
+    let queued = Way::Queued(Pow2::of(32));
+    for (k, list, name) in
+        [(1, Way::Registers, ""), (8, Way::Registers, " 8"), (64, Way::Registers, " 64"), (256, queued, " 256 queued")]
+    {
+        let cfg = NearestCfg { splits: 2, list, ..NearestCfg::streamed(32, 32, 32, 2) };
         let (metric, floors, live) = (Metric::L2, Floors::default(), Live::default());
         let spec = assumed(
             NearestSpec { n: 100, m: 90, d: 64, metric, floors, groups: true, k, live, dtype: ScalarDType::BFloat16 },
@@ -430,7 +433,7 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
     // A score matrix, and its listing into empty lists of 100 and of 1024
     // (carried lists hold an order the scratch inputs would not).
     let select = SelectCfg { warps: 4, queue: 2, filter: false };
-    let cfg = NearestCfg { select: Some(select), ..NearestCfg::new(64, 32, 2) };
+    let cfg = NearestCfg { list: Way::Matrix(select), ..NearestCfg::new(64, 32, 2) };
     let (metric, live) = (Metric::L2, Live::default());
     let spec = assumed(
         NearestSpec {
@@ -480,7 +483,7 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
             groups: true,
             k,
         };
-        let way = |c: &&NearestCfg| c.queue.is_some() == queued && c.select.is_none();
+        let way = |c: &&NearestCfg| c.queue().is_some() == queued && c.select().is_none();
         let Some(&cfg) = planner.nearest_ranked(p).iter().find(way) else { continue };
         let (metric, floors, live) = (Metric::SquaredL2, both, live(0, k as i64));
         let spec = assumed(
@@ -508,7 +511,7 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
     push("nearest live split", nearest::<BF16>(&spec), Lowering::new(&planner.device));
     let merge = NearestMergeSpec { n: 100, splits: 3, metric, k: 8, live: live(0, 8) };
     push("nearest live merge", nearest_merge(&merge), Lowering::new(&planner.device));
-    let cfg = NearestCfg { select: Some(select), ..NearestCfg::new(64, 32, 2) };
+    let cfg = NearestCfg { list: Way::Matrix(select), ..NearestCfg::new(64, 32, 2) };
     let (metric, live) = (Metric::L2, live(30, 100));
     let spec = assumed(
         NearestSpec {
@@ -532,7 +535,7 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
     // Filtered: the trips' leasts stored beside the scores, a listing bound
     // by them, in shares and merged.
     let filtered = SelectCfg { queue: 1, filter: true, ..select };
-    let cfg = NearestCfg { select: Some(filtered), splits: 2, ..NearestCfg::new(64, 32, 2) };
+    let cfg = NearestCfg { list: Way::Matrix(filtered), splits: 2, ..NearestCfg::new(64, 32, 2) };
     let (metric, live) = (Metric::NegDot, Live::default());
     let spec = assumed(
         NearestSpec {

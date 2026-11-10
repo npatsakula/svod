@@ -49,7 +49,7 @@ fn every_familys_config_code_round_trips() {
     use crate::atoms::Core;
     use crate::kernels::attention::FaCfg;
     use crate::kernels::conv::ConvCfg;
-    use crate::kernels::nearest::{LaneQueue, Metric, NearestCfg, SelectCfg};
+    use crate::kernels::nearest::{LaneQueue, Metric, NearestCfg, Pow2, SelectCfg, Way};
     use crate::kernels::rows::NormCfg;
     use crate::ops::config::{Tiled, gemm_lattice};
     fn round<C: Tiled + std::fmt::Debug>(cs: &[C]) {
@@ -99,13 +99,26 @@ fn every_familys_config_code_round_trips() {
         k: 64,
     };
     let mut nearest = planner.nearest_ranked(problem).to_vec();
-    nearest.push(NearestCfg { lanes: Some(LaneQueue { width: 4, depth: 32, passes: true }), ..nearest[0] });
     nearest.push(NearestCfg {
-        select: Some(SelectCfg { warps: 2, queue: 16, filter: true }),
+        lanes: Some(LaneQueue { width: Pow2::of(4), depth: Pow2::of(32), passes: true }),
+        ..nearest[0]
+    });
+    nearest.push(NearestCfg {
+        list: Way::Matrix(SelectCfg { warps: 2, queue: 16, filter: true }),
         lanes: None,
         ..nearest[0]
     });
+    nearest.push(NearestCfg { list: Way::Queued(Pow2::of(16)), ..nearest[0] });
     round(&nearest);
+    let cfg = NearestCfg::new(64, 64, 2);
+    assert_eq!(cfg.code(), "64,64,r2,16,~,1,~,~");
+    assert_eq!(NearestCfg { list: Way::Queued(Pow2::of(32)), ..cfg }.code(), "64,64,r2,16,~,1,q32,~");
+    let matrix = Way::Matrix(SelectCfg { warps: 4, queue: 2, filter: true });
+    assert_eq!(NearestCfg { list: matrix, ..cfg }.code(), "64,64,r2,16,~,1,m,4,2,1,~");
+    // A queue or a lane queue off a power of two, a list of no form.
+    for bad in ["64,64,r2,16,~,1,q24,~", "64,64,r2,16,~,1,~,3,2,0", "64,64,r2,16,~,1,~,4,6,0", "64,64,r2,16,~,1,x,~"] {
+        assert!(NearestCfg::of_code(bad).is_none(), "{bad}");
+    }
     // A code that is not the family's form holds no config.
     // A raster of no rows, one without its mark, a code without its raster.
     for bad in ["w,128,128,32,2,2,r2,g0", "w,128,128,32,2,2,r2,8", "w,128,128,32,2,2,r2", "w,128,128,32,2,2,r2,g"] {
@@ -1046,8 +1059,8 @@ const VENDORED_RATES: [(&str, u64); 9] = [
 /// landed off the compute, timed 1.3 ms — three candidates under their
 /// floor beside the honest sample of the same lines.
 const VENDORED_CHOICES: [&str; 2] = [
-    "choice|nearest|gfx1151-40sm|Float16|256x1048576x768x64|0000000000000001|0000000000000001|0000000000000001 0:128,128,r2,16,32,1,~,4,2,1,~ 1297360 1:128,128,r2u,16,32,1,~,4,2,1,~ 1305240 2:128,128,r1,16,32,1,~,4,2,1,~ 296351560",
-    "choice|nearest|gfx1151-40sm|Float16|256x1048576x768x64|0000000000000002|0000000000000001|0000000000000002 1:128,128,r2,16,32,1,~,4,2,1,~ 1325040 32:64,32,r2,16,32,128,~,~,4,4,1 25261320",
+    "choice|nearest|gfx1151-40sm|Float16|256x1048576x768x64|0000000000000001|0000000000000001|0000000000000001 0:128,128,r2,16,32,1,m,4,2,1,~ 1297360 1:128,128,r2u,16,32,1,m,4,2,1,~ 1305240 2:128,128,r1,16,32,1,m,4,2,1,~ 296351560",
+    "choice|nearest|gfx1151-40sm|Float16|256x1048576x768x64|0000000000000002|0000000000000001|0000000000000002 1:128,128,r2,16,32,1,m,4,2,1,~ 1325040 32:64,32,r2,16,32,128,~,4,4,1 25261320",
 ];
 
 /// Every timed candidate of the stores' choice lines clears its physical

@@ -1636,6 +1636,7 @@ fn a_list_costs_its_registers_and_merges(target: Target, per_16_rows: u32, shari
     let p = |k| self_join(1 << 16, 1 << 16, 64, Metric::SquaredL2, k);
     let regs = |k| cfg.registers(&target, 64, k, svod_dtype::ScalarDType::Float16).unwrap();
     let LaneQueue { width, depth, .. } = LaneQueue::PORTABLE;
+    let (width, depth) = (width.get(), depth.get());
     assert_eq!(cfg.sharing(&target, 64, svod_dtype::ScalarDType::Float16), Some(sharing as usize));
     let deals = (cfg.bkv / width) as u32;
     for k in [2, 8, 32] {
@@ -1666,7 +1667,7 @@ fn a_list_costs_its_registers_and_merges(target: Target, per_16_rows: u32, shari
 #[test_case(gfx1201(); "gfx1201")]
 #[test_case(crate::test::unit::targets::amd(AmdArch::Gfx1151, 40); "gfx1151")]
 fn a_long_list_is_queued_or_listed_from_a_matrix(target: Target) {
-    use crate::kernels::nearest::{Floors, Metric, NearestCfg, SelectCfg};
+    use crate::kernels::nearest::{Floors, Metric, NearestCfg, Pow2, SelectCfg, Way};
     use crate::ops::config::{NearestProblem, REGISTER_K, Rejected, TargetRejected};
     let planner = planner(target.clone());
     let p = |k| NearestProblem {
@@ -1680,8 +1681,8 @@ fn a_long_list_is_queued_or_listed_from_a_matrix(target: Target) {
         k,
     };
     let base = NearestCfg::new(32, 16, 2);
-    let queued = NearestCfg { queue: Some(32), ..base };
-    let matrix = NearestCfg { select: Some(SelectCfg { warps: 4, queue: 2, filter: false }), ..base };
+    let queued = NearestCfg { list: Way::Queued(Pow2::of(32)), ..base };
+    let matrix = NearestCfg { list: Way::Matrix(SelectCfg { warps: 4, queue: 2, filter: false }), ..base };
     let regs = |cfg: &NearestCfg, k| cfg.registers(&target, 64, k, svod_dtype::ScalarDType::Float16).unwrap();
     for k in [64, 256, 1024] {
         assert_eq!(regs(&queued, k), regs(&queued, 64), "a queue's registers whatever its list's length");
@@ -1705,7 +1706,7 @@ fn a_long_list_is_queued_or_listed_from_a_matrix(target: Target) {
     let ways = |k| {
         let lattice = p(k).lattice(&target);
         let has = |f: fn(&NearestCfg) -> bool| lattice.iter().any(f);
-        [has(|c| c.queue.is_none() && c.select.is_none()), has(|c| c.queue.is_some()), has(|c| c.select.is_some())]
+        [has(|c| c.list == Way::Registers), has(|c| c.queue().is_some()), has(|c| c.select().is_some())]
     };
     assert_eq!(ways(32), [true, false, false], "a list of 32 in registers alone");
     assert_eq!(ways(REGISTER_K), [true, true, true], "a list of {REGISTER_K} every way");
@@ -1812,9 +1813,9 @@ fn a_list_plans_by_its_bound(k: usize, registers: bool, long: bool) {
     );
     let Plan::Kernel(ranked) = plan else { panic!("k {k} plans no kernel: {plan:?}") };
     let has = |f: fn(&crate::kernels::nearest::NearestCfg) -> bool| ranked.iter().any(f);
-    assert_eq!(has(|c| c.queue.is_none() && c.select.is_none()), registers, "k {k}: register lists");
-    assert_eq!(has(|c| c.queue.is_some()), long && k < 1024, "k {k}: queued lists");
-    assert_eq!(has(|c| c.select.is_some()), long, "k {k}: score matrices");
+    assert_eq!(has(|c| c.list == crate::kernels::nearest::Way::Registers), registers, "k {k}: register lists");
+    assert_eq!(has(|c| c.queue().is_some()), long && k < 1024, "k {k}: queued lists");
+    assert_eq!(has(|c| c.select().is_some()), long, "k {k}: score matrices");
 }
 
 /// The cost charges every pair's epilogue beside the product: at a shallow

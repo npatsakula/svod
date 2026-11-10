@@ -12,7 +12,7 @@ use test_case::test_case;
 use super::*;
 use crate::atoms::Device;
 use crate::ir::{Program, Var};
-use crate::kernels::nearest::Live;
+use crate::kernels::nearest::{Live, Pow2, Way};
 use crate::kernels::{Admits, Admitted};
 use crate::lower::Lowering;
 
@@ -46,15 +46,15 @@ fn live(case: &Case, rows: bool, kmax: usize) -> Live {
 /// live length `k` is: unchanged where it keeps one, else a register list
 /// up to [`config::REGISTER_K`], a queue past it.
 fn concrete_way(cfg: NearestCfg, k: usize) -> NearestCfg {
-    let keeps = match (cfg.queue, cfg.select) {
+    let keeps = match (cfg.queue(), cfg.select()) {
         (Some(q), _) => q < k,
         (_, Some(s)) => s.fits(k),
         _ => k <= config::REGISTER_K,
     };
     match keeps {
         true => cfg,
-        false if k <= config::REGISTER_K => NearestCfg { queue: None, select: None, ..cfg },
-        false => NearestCfg { queue: Some(16), select: None, ..cfg },
+        false if k <= config::REGISTER_K => NearestCfg { list: Way::Registers, ..cfg },
+        false => NearestCfg { list: Way::Queued(Pow2::of(16)), ..cfg },
     }
 }
 
@@ -100,11 +100,11 @@ impl Case {
         let depth = self.d.next_multiple_of(16);
         let rows_var = live.rows.iter().map(|_| (ROWS, n as i64));
         let vars: Vec<(&str, i64)> = rows_var.chain(live.k.iter().map(|_| (LIST, k as i64))).collect();
-        let (score, index) = match cfg.select {
+        let (score, index) = match cfg.select() {
             Some(select) => {
                 // Filtered, its bound read at the live length.
                 let select = SelectCfg { filter: true, ..select };
-                let cfg = NearestCfg { select: Some(select), ..cfg };
+                let cfg = NearestCfg { list: Way::Matrix(select), ..cfg };
                 let (scored, listing) = (Lowering::new(device), Lowering::new(device));
                 let (mut score, mut index) = (vec![], vec![]);
                 for r0 in (0..self.n).step_by(panel) {
@@ -261,12 +261,12 @@ proptest! {
 #[test_case(NearestCfg::streamed(32, 32, 16, 1), config::REGISTER_K; "streamed registers")]
 #[test_case(NearestCfg { splits: 3, ..NearestCfg::new(32, 16, 2) }, 8; "split registers")]
 #[test_case(NearestCfg { splits: 3, ..NearestCfg::new(32, 16, 2) }, config::REGISTER_K; "split registers longest")]
-#[test_case(NearestCfg { queue: Some(16), ..NearestCfg::new(32, 16, 2) }, 100; "queued")]
-#[test_case(NearestCfg { queue: Some(16), splits: 3, ..NearestCfg::new(32, 16, 2) }, 100; "split queued")]
-#[test_case(NearestCfg { queue: Some(32), ..NearestCfg::streamed(32, 32, 16, 1) }, 256; "streamed queued")]
-#[test_case(NearestCfg { queue: Some(32), splits: 4, ..NearestCfg::streamed(32, 32, 16, 1) }, 256; "split streamed queued")]
-#[test_case(NearestCfg { select: Some(SelectCfg { warps: 2, queue: 2, filter: false }), ..NearestCfg::new(16, 16, 2) }, 100; "score matrix")]
-#[test_case(NearestCfg { select: Some(SelectCfg { warps: 4, queue: 8, filter: false }), ..NearestCfg::new(64, 64, 1) }, 1024; "score matrix 1024")]
+#[test_case(NearestCfg { list: Way::Queued(Pow2::of(16)), ..NearestCfg::new(32, 16, 2) }, 100; "queued")]
+#[test_case(NearestCfg { list: Way::Queued(Pow2::of(16)), splits: 3, ..NearestCfg::new(32, 16, 2) }, 100; "split queued")]
+#[test_case(NearestCfg { list: Way::Queued(Pow2::of(32)), ..NearestCfg::streamed(32, 32, 16, 1) }, 256; "streamed queued")]
+#[test_case(NearestCfg { list: Way::Queued(Pow2::of(32)), splits: 4, ..NearestCfg::streamed(32, 32, 16, 1) }, 256; "split streamed queued")]
+#[test_case(NearestCfg { list: Way::Matrix(SelectCfg { warps: 2, queue: 2, filter: false }), ..NearestCfg::new(16, 16, 2) }, 100; "score matrix")]
+#[test_case(NearestCfg { list: Way::Matrix(SelectCfg { warps: 4, queue: 8, filter: false }), ..NearestCfg::new(64, 64, 1) }, 1024; "score matrix 1024")]
 fn live_bounds_keep_their_edges(cfg: NearestCfg, kmax: usize) {
     let cap = 45;
     for m in [150, 20] {
@@ -301,7 +301,7 @@ fn live_lists_keep_the_lists_of_their_values_on_device(kmax: usize, d: usize) {
     let problem = case.problem(depth, kmax);
     let ranked = planner.nearest_ranked(problem);
     // Split three ways where the way splits (a score matrix never does).
-    let splits = |c: &NearestCfg| match (kmax, c.select) {
+    let splits = |c: &NearestCfg| match (kmax, c.select()) {
         (8 | 100, None) => shared_out(NearestCfg { splits: 3, ..*c }, m),
         _ => *c,
     };
@@ -310,12 +310,12 @@ fn live_lists_keep_the_lists_of_their_values_on_device(kmax: usize, d: usize) {
             problem
                 .lattice(&planner.device.target)
                 .into_iter()
-                .find(|c| c.queue.is_some() && problem.admit(&planner, c).is_ok())
+                .find(|c| c.queue().is_some() && problem.admit(&planner, c).is_ok())
         })
         .flatten();
     let mut kinds = vec![];
     for cfg in ranked.iter().copied().chain(queued).map(|c| splits(&c)) {
-        let kind = (cfg.queue.is_some(), cfg.select.is_some(), cfg.splits > 1);
+        let kind = (cfg.queue().is_some(), cfg.select().is_some(), cfg.splits > 1);
         if !kinds.contains(&kind) {
             kinds.push(kind);
             for (n, k) in [(1, 1), (37, kmax.div_ceil(3)), (cap, kmax), (cap - 1, kmax - 1)] {
@@ -406,7 +406,7 @@ fn assert_live_op(
     assert_eq!(score.shape().unwrap().to_vec(), [n_var.as_sint(), k_var.as_sint()]);
     assert_eq!(index.shape().unwrap().to_vec(), [n_var.as_sint(), k_var.as_sint()]);
     if let Some(cfg) = used {
-        let kernel = match (cfg.select, cfg.splits) {
+        let kernel = match (cfg.select(), cfg.splits) {
             (Some(_), _) => "nearest_select",
             (None, 1) => "nearest",
             _ => "nearest_merge",
@@ -446,7 +446,7 @@ fn way(
         let lattice = p.lattice(&planner.device.target);
         let admitted = lattice.iter().filter(|c| p.admit(planner, c).is_ok());
         let mut ways =
-            ranked.iter().chain(admitted).filter(|c| c.queue.is_some() == queue && c.select.is_some() == select);
+            ranked.iter().chain(admitted).filter(|c| c.queue().is_some() == queue && c.select().is_some() == select);
         let cfg = shared_out(NearestCfg { splits, ..*ways.next().expect("the way admitted") }, spec.m);
         assumed(spec.into_spec(), cfg)
     }
@@ -474,7 +474,7 @@ fn live_op_keeps_the_op_lists(
     super::super::ops::untuned(|| {
         let case = Case::draw(300, 1000, d, draw(Metric::NegDot, BOTH, Some(4), false, false), 13);
         let cfg = assert_live_op(&case, DType::Float16, kmax, bindings, &way(queue, select, splits)).expect("a kernel");
-        assert_eq!((cfg.queue.is_some(), cfg.select.is_some(), cfg.splits), (queue, select, splits), "{cfg:?}");
+        assert_eq!((cfg.queue().is_some(), cfg.select().is_some(), cfg.splits), (queue, select, splits), "{cfg:?}");
         // Past the candidates: the slots past them `+∞` at −1.
         let few = Case::draw(300, 20, d, draw(Metric::NegDot, BOTH, Some(4), false, false), 13);
         assert_live_op(&few, DType::Float16, kmax, &[(300, kmax), (7, kmax)], &way(queue, select, splits));
@@ -524,7 +524,7 @@ fn live_rows_span_the_panels_of_a_score_matrix() {
             spec
         });
         let bindings = [(cap, kmax), (100, kmax), (131_073, 7), (cap - 1, 1)];
-        assert!(assert_live_op(&case, DType::Float16, kmax, &bindings, &panels).is_some_and(|c| c.select.is_some()));
+        assert!(assert_live_op(&case, DType::Float16, kmax, &bindings, &panels).is_some_and(|c| c.select().is_some()));
     });
 }
 

@@ -40,18 +40,52 @@ pub struct NearestCfg {
     /// an even share of them into a partial least and index; 1: one block
     /// folds them all.
     pub splits: usize,
-    /// A row's register list of this many scores (a power of two below its
-    /// `k`), merged into the rest of its `k` held in the outputs whenever
-    /// some row of the warp fills its own; `None`: the register list holds
-    /// all `k`.
-    pub queue: Option<usize>,
-    /// The scores stored as a matrix ([`nearest`] over a block of the
-    /// candidates), whose rows [`nearest_select`] lists under this config;
-    /// `None`: the kernel lists them itself.
-    pub select: Option<SelectCfg>,
+    /// Where a row's `k` least are kept.
+    pub list: Way,
     /// How the lanes queue a row's candidates in front of its list (`k > 1`
     /// listed by the kernel itself); `None` at `k = 1`.
     pub lanes: Option<LaneQueue>,
+}
+
+/// Where a row's `k` least scores are kept.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Way {
+    /// All `k` in a register list.
+    #[default]
+    Registers,
+    /// A register list of this many (below `k`), merged into the rest of
+    /// the `k` held in the outputs whenever some row of the warp fills its
+    /// own.
+    Queued(Pow2),
+    /// The scores stored as a matrix ([`nearest`] over a block of the
+    /// candidates), whose rows [`nearest_select`] lists under this config.
+    Matrix(SelectCfg),
+}
+
+/// A power of two, held as its exponent.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Pow2(u8);
+
+impl Pow2 {
+    /// `v` where it is a power of two.
+    pub const fn new(v: usize) -> Option<Self> {
+        if v.is_power_of_two() { Some(Self(v.trailing_zeros() as u8)) } else { None }
+    }
+
+    /// `v`, which is a power of two.
+    pub const fn of(v: usize) -> Self {
+        Self::new(v).expect("a power of two")
+    }
+
+    pub const fn get(self) -> usize {
+        1 << self.0
+    }
+}
+
+impl std::fmt::Debug for Pow2 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.get().fmt(f)
+    }
 }
 
 /// A row's queues in front of its list: each lane holding a row deals out
@@ -61,11 +95,11 @@ pub struct NearestCfg {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct LaneQueue {
     /// A row's queues side by side, the columns a deal takes of a row: a
-    /// power of two, a multiple of the lanes a product spreads a row over,
-    /// so a deal renames registers.
-    pub width: usize,
-    /// The scores a queue holds, a power of two.
-    pub depth: usize,
+    /// multiple of the lanes a product spreads a row over, so a deal renames
+    /// registers.
+    pub width: Pow2,
+    /// The scores a queue holds.
+    pub depth: Pow2,
     /// A trip's scores offered a deal at a time in passes, each stopping
     /// at a deal some full queue would take another of; else in rounds of
     /// each lane's least not yet offered. Rounds vote less, but hold a
@@ -77,7 +111,7 @@ pub struct LaneQueue {
 impl LaneQueue {
     /// As wide as the lanes CUDA's and RDNA's swapped products spread a row
     /// over, or more: what a list config without its own takes.
-    pub const PORTABLE: Self = Self { width: 4, depth: 2, passes: false };
+    pub const PORTABLE: Self = Self { width: Pow2::of(4), depth: Pow2::of(2), passes: false };
 }
 
 /// Why [`nearest`] refuses a config's lists, whatever the target: what its
@@ -85,37 +119,29 @@ impl LaneQueue {
 /// ([`crate::ops::config::Rejected::Lowers`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, snafu::Snafu)]
 pub enum Invalid {
-    #[snafu(display("a queue of {queue} below a list of {k}: a power of two from 2"))]
-    Queue { queue: usize, k: usize },
-    #[snafu(display("a score matrix unqueued: {queue} queued beside {select:?}"))]
-    QueuedMatrix { queue: usize, select: SelectCfg },
+    #[snafu(display("a queue of {queue:?} below a list of {k}: from 2"))]
+    Queue { queue: Pow2, k: usize },
     #[snafu(display("{select:?} lists {k}: a lane's queue, a power of two, fits the list's runs of {LANES}"))]
     Select { select: SelectCfg, k: usize },
-    #[snafu(display("lane queues {lanes:?} dealing {bkv} candidates: powers of two, a column at least"))]
+    #[snafu(display("lane queues {lanes:?} dealing {bkv} candidates: wider than a column, dealing them whole"))]
     Lanes { lanes: LaneQueue, bkv: usize },
 }
 
 impl NearestCfg {
     /// Whether [`nearest`] keeps `k` scores a row under this config: a
-    /// queue is a power of two from 2 below `k`, a score matrix is
-    /// unqueued and its listing fits `k` ([`SelectCfg::fits`]), and a
-    /// list's lane queues are powers of two wide (past one) and deep,
+    /// queue is from 2 below `k`, a score matrix's listing fits `k`
+    /// ([`SelectCfg::fits`]), and a list's lane queues are past one wide,
     /// dealing a trip's candidates whole.
     pub fn lists(&self, k: usize) -> Result<(), Invalid> {
-        if let Some(queue) = self.queue {
-            if !(queue.is_power_of_two() && (2..k).contains(&queue)) {
-                return Err(Invalid::Queue { queue, k });
-            }
-            if let Some(select) = self.select {
-                return Err(Invalid::QueuedMatrix { queue, select });
-            }
-        }
-        if let Some(select) = self.select {
-            return if select.fits(k) { Ok(()) } else { Err(Invalid::Select { select, k }) };
+        match self.list {
+            Way::Queued(queue) if !(2..k).contains(&queue.get()) => return Err(Invalid::Queue { queue, k }),
+            Way::Matrix(select) if select.fits(k) => return Ok(()),
+            Way::Matrix(select) => return Err(Invalid::Select { select, k }),
+            _ => {}
         }
         let lanes = self.lane_queue();
-        let LaneQueue { width, depth, .. } = lanes;
-        let dealt = width.is_power_of_two() && width > 1 && depth.is_power_of_two() && self.bkv.is_multiple_of(width);
+        let width = lanes.width.get();
+        let dealt = width > 1 && self.bkv.is_multiple_of(width);
         if k > 1 && !dealt {
             return Err(Invalid::Lanes { lanes, bkv: self.bkv });
         }
@@ -136,8 +162,7 @@ impl NearestCfg {
             warp_rows: WARP_ROWS,
             bk: None,
             splits: 1,
-            queue: None,
-            select: None,
+            list: Way::Registers,
             lanes: None,
         }
     }
@@ -159,6 +184,22 @@ impl NearestCfg {
         self.schedule.unroll()
     }
 
+    /// The queue a queued list holds in registers.
+    pub fn queue(&self) -> Option<usize> {
+        match self.list {
+            Way::Queued(q) => Some(q.get()),
+            _ => None,
+        }
+    }
+
+    /// How a score matrix's rows are listed, where the scores are one.
+    pub fn select(&self) -> Option<SelectCfg> {
+        match self.list {
+            Way::Matrix(s) => Some(s),
+            _ => None,
+        }
+    }
+
     /// The lane queues a list takes ([`LaneQueue::PORTABLE`] unless set).
     pub fn lane_queue(&self) -> LaneQueue {
         self.lanes.unwrap_or(LaneQueue::PORTABLE)
@@ -168,7 +209,7 @@ impl NearestCfg {
     /// queue's, else the list's in whole pairs of the lane queues' width, a
     /// power of two.
     pub fn list_slots(&self, k: usize) -> usize {
-        self.queue.unwrap_or(k.next_power_of_two().max(self.lane_queue().width))
+        self.queue().unwrap_or(k.next_power_of_two().max(self.lane_queue().width.get()))
     }
 
     /// Static shared memory in bytes of operands of `dtype` at depth `d`:
@@ -355,7 +396,7 @@ pub(crate) const MAX_CANDIDATES: usize = 1 << 24;
 /// row `i`'s list at `(s·`[`share_stride`]` + i)·k`, in the units the
 /// scores are compared in, for [`nearest_merge`].
 ///
-/// [Queued](NearestCfg::queue), the register list is a queue of the scores
+/// [Queued](Way::Queued), the register list is a queue of the scores
 /// below the row's `k`-th, and the list proper is the outputs' (`+∞` at −1
 /// to start; split, its share's): once some row's could not take another
 /// lanes' queue whole the warp merges every row's into it, run by run of the
@@ -392,7 +433,7 @@ fn nearest_body<'k, T: MmaIn>(k: &mut Kernel<'k>, spec: &Admitted<NearestSpec>) 
     let chunk = 16 / T::DTYPE.bytes();
     assert!(cfg.bk.is_none() || d.is_multiple_of(chunk), "a streamed depth {d} of whole 16-byte chunks");
     assert!(live.k.is_none() || top > 1, "a live list of more than one score");
-    assert!(live.rows.is_none() || live.from() == 0 || cfg.select.is_some(), "a panel of a score matrix");
+    assert!(live.rows.is_none() || live.from() == 0 || cfg.select().is_some(), "a panel of a score matrix");
     let (held_rows, from) = (live.held(n), live.from());
     let x = k.input::<T>("x", held_rows * d);
     let c = k.input::<T>("c", m * d);
@@ -403,13 +444,13 @@ fn nearest_body<'k, T: MmaIn>(k: &mut Kernel<'k>, spec: &Admitted<NearestSpec>) 
     let col_floor = floors.col.then(|| k.input::<F32>("col_floor", m));
     let grouped = groups.then(|| (k.input::<I32>("row_group", held_rows), k.input::<I32>("col_group", m)));
     let split = splits > 1;
-    let matrix = cfg.select.is_some();
+    let matrix = cfg.select().is_some();
     let (score, index) = if split { ("score_part", "index_part") } else { ("score", "index") };
     let parts = top * if split { splits * share_stride(n) } else { n };
     // A score matrix is written once; a list is held in its outputs and read back.
     let score_matrix = matrix.then(|| k.output::<F32>("scores", n * m));
     let lists = (!matrix).then(|| (k.inout::<F32>(score, parts), k.inout::<I32>(index, parts)));
-    let mins = cfg.select.is_some_and(|s| s.filter).then(|| k.output::<F32>("mins", n * tiles));
+    let mins = cfg.select().is_some_and(|s| s.filter).then(|| k.output::<F32>("mins", n * tiles));
     let rows_live = live.rows(k, n);
     let k_live = live.k(k);
     // The rows a block's views hold: those of the capacity even where the
@@ -613,6 +654,7 @@ fn nearest_body<'k, T: MmaIn>(k: &mut Kernel<'k>, spec: &Admitted<NearestSpec>) 
     // a queue of `depth` pairs, column `c` of each a queue a lane holds of
     // the scores it is dealt below the row's `k`-th, unsorted.
     let LaneQueue { width: w, depth: slots, .. } = cfg.lane_queue();
+    let (w, slots) = (w.get(), slots.get());
     let lane = Shape::new(bq, w);
     // The slots the register list holds: the list's (its bound's where it
     // is live) in a power of two of whole pairs; queued, the queue's.
@@ -727,7 +769,7 @@ fn nearest_body<'k, T: MmaIn>(k: &mut Kernel<'k>, spec: &Admitted<NearestSpec>) 
         let (list, queue, kth) = state(carried);
         let list = queued_into(k, list, queue);
         let fresh = empty_seq(k, lane, slots);
-        if cfg.queue.is_none() {
+        if cfg.queue().is_none() {
             let kth = element(k, &list, kth_slot.clone());
             return packed(&list, &fresh, kth);
         }
@@ -963,7 +1005,7 @@ fn nearest_body<'k, T: MmaIn>(k: &mut Kernel<'k>, spec: &Admitted<NearestSpec>) 
     }
     // Queued, the block's lists start empty in the outputs, held as the
     // queue is: a lane reads back the slots it writes.
-    if cfg.queue.is_some() {
+    if cfg.queue().is_some() {
         let [score0, index0] = empty_seq(k, lane, 1)[0];
         let index0 = k.cast::<F32, I32>(index0);
         k.loop_vec::<F32>(run_count.clone(), vec![], |k, c, _| {
@@ -1063,7 +1105,7 @@ fn nearest_body<'k, T: MmaIn>(k: &mut Kernel<'k>, spec: &Admitted<NearestSpec>) 
     // What the lanes still queue merged in.
     let (list, queue, _) = state(&carried);
     let list = queued_into(k, list, queue);
-    if cfg.queue.is_some() {
+    if cfg.queue().is_some() {
         flush(k, list, true);
         return;
     }

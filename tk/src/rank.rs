@@ -32,7 +32,7 @@ use crate::ir::Var;
 use crate::kernels::attention::{AttnMask, Bias, FaCfg};
 use crate::kernels::conv::{ConvCfg, ConvGeom};
 use crate::kernels::gemm::{Epilogue, GemmCfg};
-use crate::kernels::nearest::{Floors, Live, Metric, NearestCfg, NearestSpec};
+use crate::kernels::nearest::{Floors, Live, Metric, NearestCfg, NearestSpec, Way};
 use crate::kernels::{Act, Batch};
 use crate::ops::DEVICE_TEST;
 use crate::ops::attention::split_ranked;
@@ -1413,7 +1413,7 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
         ));
     }
     let ranked = planner.nearest_ranked(problem(64));
-    if let Some(&cfg) = ranked.iter().find(|c| c.queue.is_none() && c.select.is_none()) {
+    if let Some(&cfg) = ranked.iter().find(|c| c.list == Way::Registers) {
         let claim = planner.claim_of(&problem(64), &cfg).expect("ranked");
         let valu = claim.ops.fold(config::pair_op(&device), 1.0, &config::Weights::same());
         // The listing's static decomposition beside the expected-ops row:
@@ -1421,7 +1421,7 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
         // `k = 1`, where no list runs) against the parts
         // [`NearestProblem::listing_static`] counts, within ±30 % — the
         // guarded bodies, the merge network's stages, the queues' sort.
-        let twin = crate::kernels::nearest::NearestCfg { lanes: None, queue: None, select: None, ..cfg };
+        let twin = crate::kernels::nearest::NearestCfg { lanes: None, list: Way::Registers, ..cfg };
         let listing = |prog: crate::ir::Program| {
             counted(&crate::lower::standalone(prog, &lowering).ok()?.program).map(|c| c.valu as f64)
         };

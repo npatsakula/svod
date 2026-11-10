@@ -55,7 +55,9 @@ use crate::ops::config::LAUNCH;
 /// names off the default only. 10 ends it in its tail split (`~`, or `t4`
 /// for four ways, [`crate::kernels::gemm::TailSplit`]). 11 times a
 /// candidate of several programs with a [`LAUNCH`] between each two
-/// ([`launched`]), where 10 summed their kernels alone.
+/// ([`launched`]), where 10 summed their kernels alone, and codes a nearest
+/// config's list as one field ([`crate::kernels::nearest::Way`]), where 10
+/// held a queue and a score matrix's listing apart.
 pub(crate) const FORMAT: u32 = 11;
 /// Measurement: the rounds a contender is timed (the first over every
 /// candidate, the rest over the contenders), and the rounds the two leaders

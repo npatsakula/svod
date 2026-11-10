@@ -14,7 +14,7 @@ use crate::ir::Schedule;
 use crate::kernels::attention::{FaCfg, Forms, WARP_ROWS, narrowest_warp_rows};
 use crate::kernels::conv::ConvCfg;
 use crate::kernels::gemm::{GemmCfg, TailSplit, TileOrder};
-use crate::kernels::nearest::{LaneQueue, NearestCfg, SelectCfg};
+use crate::kernels::nearest::{LaneQueue, NearestCfg, Pow2, SelectCfg, Way};
 use crate::kernels::rows::NormCfg;
 use crate::tune::Compiled;
 
@@ -370,6 +370,36 @@ impl<T: Field> Field for Option<T> {
     }
 }
 
+impl Field for Pow2 {
+    fn put(&self, out: &mut Vec<String>) {
+        self.get().put(out);
+    }
+    fn take(fields: &mut Fields<'_>) -> Option<Self> {
+        Pow2::new(usize::take(fields)?)
+    }
+}
+
+/// `~` in registers, `q16` queued, `m` then the listing a score matrix.
+impl Field for Way {
+    fn put(&self, out: &mut Vec<String>) {
+        match self {
+            Way::Registers => out.push("~".into()),
+            Way::Queued(q) => out.push(format!("q{}", q.get())),
+            Way::Matrix(select) => {
+                out.push("m".into());
+                select.put(out);
+            }
+        }
+    }
+    fn take(fields: &mut Fields<'_>) -> Option<Self> {
+        match fields.next()? {
+            "~" => Some(Way::Registers),
+            "m" => SelectCfg::take(fields).map(Way::Matrix),
+            q => Pow2::new(q.strip_prefix('q')?.parse().ok()?).map(Way::Queued),
+        }
+    }
+}
+
 impl<T: Field, const N: usize> Field for [T; N] {
     fn put(&self, out: &mut Vec<String>) {
         self.iter().for_each(|v| v.put(out));
@@ -482,8 +512,8 @@ coded!(
     NormCfg { br }
 );
 coded!(
-    /// `64,64,r2,16,~,1,~,~,4,32,0`
-    NearestCfg { bq, bkv, schedule, warp_rows, bk, splits, queue, select, lanes }
+    /// `64,64,r2,16,~,1,~,4,2,0` (`q16` queued, `m,4,2,0` a score matrix)
+    NearestCfg { bq, bkv, schedule, warp_rows, bk, splits, list, lanes }
 );
 
 /// The configs of `ranked` that may stand for their tiles, in order.

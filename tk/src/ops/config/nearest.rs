@@ -10,7 +10,7 @@ use svod_dtype::ScalarDType;
 use crate::atoms::{Fill, Target};
 use crate::ir::{Axis, Orient, Schedule, Shape};
 use crate::kernels::attention::WARP_ROWS;
-use crate::kernels::nearest::{Floors, LANES, LaneQueue, Metric, NearestCfg, SelectCfg, select_runs};
+use crate::kernels::nearest::{Floors, LANES, LaneQueue, Metric, NearestCfg, Pow2, SelectCfg, Way, select_runs};
 use crate::layouts::{TileLayout, WarpGrid, chunked, fills_in_chunks};
 
 use super::attention::{FA_STAGES, QUERY_BLOCKS};
@@ -79,7 +79,7 @@ impl NearestCfg {
     /// estimated 252 so, 284 whole, 256 and spilled compiled).
     pub(crate) fn held(&self, target: &Target, d: usize, k: usize, dtype: ScalarDType) -> Option<u32> {
         let [operands, scores] = self.lane_parts(target, d, dtype)?;
-        let listed = k > 1 && self.select.is_none();
+        let listed = k > 1 && self.select().is_none();
         let scores = if self.bk.is_some() && !listed { scores } else { 2 * scores };
         Some(operands + scores + self.list_registers(target, d, k, dtype)?)
     }
@@ -91,20 +91,21 @@ impl NearestCfg {
     /// the lanes' queue's pairs, and the row vectors the vote and the passes
     /// carry; none at `k = 1`, whose least and index the scores' count
     /// covers; a merge's network holds half as many tiles again beside them.
-    /// [Queued](NearestCfg::queue), the queue's pairs and the
+    /// [Queued](Way::Queued), the queue's pairs and the
     /// [`FLUSH_TILES`] its merge into the outputs holds beside them. A
     /// register-staged ring unrolled over its slots holds a list's pairs and
     /// the staged chunks once more (gfx1151, 16 rows by 32 candidates, a list
     /// of 64 at depth 48: 226 registers rolled, 255 and spilled unrolled).
     fn list_registers(&self, target: &Target, d: usize, k: usize, dtype: ScalarDType) -> Option<u32> {
-        if k == 1 || self.select.is_some() {
+        if k == 1 || self.select().is_some() {
             return Some(0);
         }
         let LaneQueue { width, depth, passes } = self.lane_queue();
+        let (width, depth) = (width.get(), depth.get());
         let row = self.scores_layout(target, d, dtype)?.row_vector();
         let tile = TileLayout::spread_row(&row, width as u32).regs();
         let pairs = (self.list_slots(k) / width) as u32;
-        let flush = if self.queue.is_some() { FLUSH_TILES * pairs } else { 0 };
+        let flush = if self.queue().is_some() { FLUSH_TILES * pairs } else { 0 };
         // Rounds hold the trip's deals not yet offered across them.
         let rest = if passes { 0 } else { (self.bkv / width) as u32 };
         let tiles = 2 * pairs + 2 * depth as u32 + flush + pairs + rest;
@@ -211,7 +212,7 @@ const FLUSH_SLOT_I: f64 = 175.0;
 const LISTING_FIXED_I: f64 = 450.0;
 /// Search bound: the scores a lane queues of a row before the warp merges
 /// the queues into the lists.
-const LANE_DEPTHS: [usize; 2] = [2, 4];
+const LANE_DEPTHS: [Pow2; 2] = [Pow2::of(2), Pow2::of(4)];
 /// Search bound: the deals a trip's scores are dealt in: each is a branch
 /// of the trip's code, twice over (the first pass and the later ones); 64
 /// of them (gfx1151, 128 candidates in pairs of lanes) built a program
@@ -227,7 +228,7 @@ pub(crate) const REGISTER_K: usize = 64;
 /// as well.
 const LONG_FROM: usize = 33;
 /// Search bound: the queues of a list held in the outputs.
-const QUEUES: [usize; 2] = [16, 32];
+const QUEUES: [Pow2; 2] = [Pow2::of(16), Pow2::of(32)];
 /// Model: the tiles a merge into the outputs holds a pair of the queue
 /// beside it: a run of the list and the carry, each scores and indices.
 const FLUSH_TILES: u32 = 4;
@@ -360,7 +361,7 @@ impl NearestProblem {
         target: &Target,
         &(d, dtype, k): &(usize, ScalarDType, usize),
     ) -> Result<u32, TargetRejected> {
-        if cfg.queue.is_none() && cfg.select.is_none() && k > REGISTER_K {
+        if cfg.queue().is_none() && cfg.select().is_none() && k > REGISTER_K {
             return Err(TargetRejected::TopK { k, most: REGISTER_K });
         }
         if cfg.lists(k).is_err() || !cfg.fits(target, d, dtype) || target.geometry_of(dtype).is_none() {
@@ -375,12 +376,11 @@ impl NearestProblem {
         if held > target.lane_budget(cfg.warps()) {
             return Err(TargetRejected::Registers { need: held, have: target.lane_budget(cfg.warps()) });
         }
-        if k > 1 && cfg.select.is_none() {
+        if k > 1 && cfg.select().is_none() {
             let lanes = cfg.lane_queue();
             let sharing = cfg.sharing(target, d, dtype).ok_or(TargetRejected::Layout)?;
-            let queued = lanes.width * lanes.depth;
-            if lanes.width < sharing || cfg.bkv / lanes.width > MOST_DEALS || cfg.queue.is_some_and(|q| 2 * queued > q)
-            {
+            let (width, queued) = (lanes.width.get(), lanes.width.get() * lanes.depth.get());
+            if width < sharing || cfg.bkv / width > MOST_DEALS || cfg.queue().is_some_and(|q| 2 * queued > q) {
                 return Err(TargetRejected::Lowers);
             }
         }
@@ -438,7 +438,7 @@ impl NearestProblem {
         let shared = 1.0 - distinct as f64 / (flight * filled) as f64;
         // A trip stores its f32 scores, a row's at least a line; filtered,
         // each row's least of the trip too, a sector a row.
-        let stores = match &cfg.select {
+        let stores = match cfg.select() {
             Some(s) => {
                 let mut bytes = (bq * (bkv * 4).max(LINE)) as f64 / chunks as f64;
                 if s.filter {
@@ -451,12 +451,12 @@ impl NearestProblem {
         // A trip's pair epilogue: the bundle over the chunk's share of a
         // tile's pairs, and every further operation each of them carries.
         let pairs = (bq * bkv) as f64 / chunks as f64;
-        let mut ops = match cfg.select.is_some() {
+        let mut ops = match cfg.select().is_some() {
             true => Ops::of(Kind::Scan, pairs * MATRIX_OPS),
             false => Ops::of(Kind::Pair, pairs * PAIR_OPS),
         }
         .add(Kind::Pair, pairs * (companions as f64 + if self.groups { GROUPS_PAIR } else { 0.0 }));
-        if k > 1 && cfg.select.is_none() {
+        if k > 1 && cfg.select().is_none() {
             let lanes = cfg.lane_queue();
             ops = ops.plus(share.listing(cfg, lanes, target.wave).scaled(waves as f64 / (tiles * chunks) as f64));
         }
@@ -470,7 +470,7 @@ impl NearestProblem {
             }
         };
         let mut sections = [Spread::default(); 2];
-        if let Some(select) = &cfg.select {
+        if let Some(select) = &cfg.select() {
             sections = self.select_spreads(select, bkv);
         } else if splits > 1 {
             sections[0] = self.merge_spread(splits);
@@ -584,6 +584,7 @@ impl NearestProblem {
     /// queues.
     pub(crate) fn listing(&self, cfg: &NearestCfg, lanes: LaneQueue, wave: u32) -> Ops {
         let LaneQueue { width, depth, passes } = lanes;
+        let (width, depth) = (width.get(), depth.get());
         let (rows, tiles, wave) = (cfg.warp_rows as f64, self.m.div_ceil(cfg.bkv), f64::from(wave));
         let deals = (cfg.bkv / width) as f64;
         let (elems, t) = (rows * width as f64, depth as f64);
@@ -609,7 +610,7 @@ impl NearestProblem {
         let sort = queued * queued.log2() * (queued.log2() + 1.0) / 2.0;
         let merge = rows * (sort + held * (held.log2() + 1.0)) * LIST_SLOT;
         let mut ops = Ops::of(Kind::Deal, walk).add(Kind::Merge, (rows * self.offers() / per_merge + 1.0) * merge);
-        if let Some(q) = cfg.queue {
+        if let Some(q) = cfg.queue() {
             let stages = 1.0 + 2.0 * (q as f64).log2();
             let flush = (self.k.div_ceil(q) * q) as f64 * rows * stages * MERGE_SLOT;
             ops = ops.add(Kind::Merge, (self.offers() / ((held - queued) * QUEUE_FILLED) + 1.0) * flush);
@@ -643,6 +644,7 @@ impl NearestProblem {
     /// are declared to be.
     pub(crate) fn listing_static(&self, cfg: &NearestCfg) -> f64 {
         let LaneQueue { width, depth, passes } = cfg.lane_queue();
+        let (width, depth) = (width.get(), depth.get());
         let deals = (cfg.bkv / width) as f64;
         let held = cfg.list_slots(self.k) as f64;
         let queued = (width * depth) as f64;
@@ -651,7 +653,7 @@ impl NearestProblem {
         (if passes { PASS_DEAL_I } else { ROUND_DEAL_I }) * deals
             + LIST_STAGE_I * stages(held)
             + QUEUE_STAGE_I * sort
-            + cfg.queue.map_or(0.0, |q| FLUSH_SLOT_I * q as f64)
+            + cfg.queue().map_or(0.0, |q| FLUSH_SLOT_I * q as f64)
             + LISTING_FIXED_I
     }
 
@@ -675,15 +677,15 @@ impl NearestProblem {
     /// outputs and listed from a score matrix as well, the listings
     /// [filtered](SelectCfg::filter) where a row's trips are many to its
     /// list's slots ([`FILTER_GROUPS`]).
-    fn lists(&self) -> Vec<(Option<usize>, Option<SelectCfg>)> {
-        let registers = (self.k <= REGISTER_K).then_some((None, None));
+    fn lists(&self) -> Vec<Way> {
+        let registers = (self.k <= REGISTER_K).then_some(Way::Registers);
         let long = self.k >= LONG_FROM;
-        let queued = QUEUES.into_iter().filter(|&q| long && q < self.k).map(|q| (Some(q), None));
+        let queued = QUEUES.into_iter().filter(|&q| long && q.get() < self.k).map(Way::Queued);
         let filters =
             [false, true].into_iter().filter(|&f| !f || self.m >= FILTER_GROUPS * self.k * CANDIDATE_BLOCKS[0]);
         let selects =
             filters.flat_map(|filter| SELECT_QUEUES.map(|queue| SelectCfg { warps: SELECT_WARPS, queue, filter }));
-        let selects = selects.filter(|s| long && s.fits(self.k)).map(|s| (None, Some(s)));
+        let selects = selects.filter(|s| long && s.fits(self.k)).map(Way::Matrix);
         registers.into_iter().chain(queued).chain(selects).collect()
     }
 
@@ -691,7 +693,7 @@ impl NearestProblem {
     /// form of [`Self::lists`] over: the body of [`Self::lattice`], handed
     /// the list forms to span (the bounds' fire-log prices what they cut
     /// over the same tiles).
-    fn span(&self, target: &Target, lists: &[(Option<usize>, Option<SelectCfg>)]) -> Vec<NearestCfg> {
+    fn span(&self, target: &Target, lists: &[Way]) -> Vec<NearestCfg> {
         let stages: &[usize] = if target.fill == Fill::CpAsync { &FA_STAGES } else { &NEAREST_STAGED };
         let mut out = vec![];
         for bq in QUERY_BLOCKS {
@@ -704,11 +706,11 @@ impl NearestProblem {
                     for bk in NEAREST_DEPTHS.map(|bk| bk.map(|bk| bk * 2 / self.dtype.bytes())) {
                         for &stages in stages {
                             for unroll in [false, true] {
-                                for &(queue, select) in lists {
+                                for &list in lists {
                                     let cfg = NearestCfg::new(bq, bkv, stages);
                                     let schedule = Schedule::ring(stages, unroll);
-                                    let cfg = NearestCfg { schedule, warp_rows, bk, queue, select, ..cfg };
-                                    if self.k == 1 || select.is_some() {
+                                    let cfg = NearestCfg { schedule, warp_rows, bk, list, ..cfg };
+                                    if self.k == 1 || matches!(list, Way::Matrix(_)) {
                                         out.push(cfg);
                                         continue;
                                     }
@@ -716,10 +718,12 @@ impl NearestProblem {
                                     // twice, dealing a trip's scores in at most `MOST_DEALS`.
                                     let Some(sharing) = cfg.sharing(target, self.d, self.dtype) else { continue };
                                     let narrowest = sharing.max(bkv / MOST_DEALS).max(2);
-                                    for width in [narrowest, 2 * narrowest].into_iter().filter(|&w| w <= bkv) {
+                                    let widths = [narrowest, 2 * narrowest].into_iter().filter(|&w| w <= bkv);
+                                    for width in widths.filter_map(Pow2::new) {
                                         for depth in LANE_DEPTHS {
-                                            let ways =
-                                                [false, true].into_iter().filter(|&p| !p || bkv / width >= PASS_DEALS);
+                                            let ways = [false, true]
+                                                .into_iter()
+                                                .filter(|&p| !p || bkv / width.get() >= PASS_DEALS);
                                             for passes in ways {
                                                 let lanes = Some(LaneQueue { width, depth, passes });
                                                 out.push(NearestCfg { lanes, ..cfg });
@@ -762,7 +766,7 @@ impl NearestProblem {
         let mut matrix = Vec::new();
         let mut products: HashMap<SelectCfg, HashSet<NearestCfg>> = HashMap::new();
         admitted.retain(|&(ns, _, c)| {
-            let Some(select) = c.select else { return true };
+            let Some(select) = c.select() else { return true };
             let tiles = products.entry(select).or_default();
             if tiles.len() < MATRIX_TILES {
                 tiles.insert(c.tile());
@@ -789,7 +793,7 @@ impl NearestProblem {
     /// cannot be priced by it; only run with the plan log's debug level on.
     fn cut(&self, planner: &Planner, kept: f64) {
         let target = &planner.device.target;
-        let price = |forms: Vec<(Option<usize>, Option<SelectCfg>)>| {
+        let price = |forms: Vec<Way>| {
             self.span(target, &forms)
                 .into_iter()
                 .filter_map(|c| self.admit(planner, &c).ok().map(|(ns, _)| ns))
@@ -797,12 +801,12 @@ impl NearestProblem {
         };
         // The queued and score-matrix forms under LONG_FROM.
         if self.k < LONG_FROM {
-            let queued = QUEUES.into_iter().filter(|&q| q < self.k).map(|q| (Some(q), None));
+            let queued = QUEUES.into_iter().filter(|&q| q.get() < self.k).map(Way::Queued);
             let selects = SELECT_QUEUES
                 .into_iter()
                 .map(|queue| SelectCfg { warps: SELECT_WARPS, queue, filter: false })
                 .filter(|s| s.fits(self.k))
-                .map(|s| (None, Some(s)));
+                .map(Way::Matrix);
             fired("LONG_FROM", &price(queued.chain(selects).collect()), kept);
         }
         // The filtered listings under FILTER_GROUPS' trip count; where
@@ -812,7 +816,7 @@ impl NearestProblem {
                 .into_iter()
                 .map(|queue| SelectCfg { warps: SELECT_WARPS, queue, filter: true })
                 .filter(|s| s.fits(self.k))
-                .map(|s| (None, Some(s)))
+                .map(Way::Matrix)
                 .collect();
             fired("FILTER_GROUPS", &price(filtered), kept);
         }
@@ -821,7 +825,7 @@ impl NearestProblem {
             .lattice(target)
             .into_iter()
             .filter_map(|c| {
-                let lanes = c.lanes.filter(|l| !l.passes && c.bkv / l.width < PASS_DEALS)?;
+                let lanes = c.lanes.filter(|l| !l.passes && c.bkv / l.width.get() < PASS_DEALS)?;
                 let twin = NearestCfg { lanes: Some(LaneQueue { passes: true, ..lanes }), ..c };
                 self.admit(planner, &twin).ok().map(|(ns, _)| ns)
             })
@@ -912,7 +916,7 @@ impl Planner {
         // A score matrix splits only to fill SMs its query blocks leave
         // idle: split over many rows its larger tiles priced cheapest
         // spilled on gfx1151 (16384² at depth 768, 1024 scores).
-        if cfg.select.is_some() && blocks >= self.sms() {
+        if cfg.select().is_some() && blocks >= self.sms() {
             return None;
         }
         let (flight, rows) = match cfg.bk {
@@ -924,7 +928,7 @@ impl Planner {
             None => (self.sms(), blocks),
         };
         // A score matrix's shares store their own scores: none fills a list.
-        let per = if cfg.select.is_some() { 1 } else { p.k };
+        let per = if cfg.select().is_some() { 1 } else { p.k };
         let most = prev_power_of_two(p.m.div_ceil(cfg.bkv) / (SPLIT_TILES * per));
         let fill = flight.div_ceil(rows).next_power_of_two().min(most);
         if per == 1 || most < 2 {

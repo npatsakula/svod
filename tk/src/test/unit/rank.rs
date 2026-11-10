@@ -177,8 +177,8 @@ fn the_epilogue_clusters_scale_their_own_constants() {
     let ranked = planner.nearest_ranked(lists);
     let (list, matrix) = ranked
         .iter()
-        .find(|c| c.select.is_none())
-        .zip(ranked.iter().find(|c| c.select.is_some()))
+        .find(|c| c.select().is_none())
+        .zip(ranked.iter().find(|c| c.select().is_some()))
         .expect("a list and a score-matrix config ranked");
     let lists_of = [(list, &["pair", "deal", "merge"][..]), (matrix, &["pair", "scan"][..])];
     for (cfg, clusters) in lists_of {
@@ -274,7 +274,7 @@ fn the_claimed_fill_holds_its_program(target: Target, most: f64) {
 #[test]
 fn the_listing_static_decomposition_maps_its_programs() {
     use crate::build::F16;
-    use crate::kernels::nearest::{Floors, LaneQueue, Live, Metric, NearestCfg, NearestSpec, nearest};
+    use crate::kernels::nearest::{Floors, LaneQueue, Live, Metric, NearestCfg, NearestSpec, Pow2, Way, nearest};
     let target = sm86();
     let device = crate::atoms::Device { target: target.clone(), costs: crate::probe::GUESSED };
     let lowering = crate::lower::Lowering::new(&device);
@@ -288,16 +288,15 @@ fn the_listing_static_decomposition_maps_its_programs() {
         groups: false,
         k,
     };
-    let lanes = |w, d, p| Some(LaneQueue { width: w, depth: d, passes: p });
-    let base = |bkv, lanes, queue| NearestCfg {
+    let lanes = |w, d, p| Some(LaneQueue { width: Pow2::of(w), depth: Pow2::of(d), passes: p });
+    let base = |bkv, lanes, queue: Option<usize>| NearestCfg {
         bq: 128,
         bkv,
         schedule: Schedule::ring(3, false),
         warp_rows: 16,
         bk: None,
         splits: 1,
-        queue,
-        select: None,
+        list: queue.map_or(Way::Registers, |q| Way::Queued(Pow2::of(q))),
         lanes,
     };
     let count = |k: usize, cfg: NearestCfg| {
@@ -333,7 +332,7 @@ fn the_listing_static_decomposition_maps_its_programs() {
     ];
     let mut worst = 0.0f64;
     for (k, cfg) in rows {
-        let twin = NearestCfg { lanes: None, queue: None, select: None, ..cfg };
+        let twin = NearestCfg { lanes: None, list: Way::Registers, ..cfg };
         let Some(adder) = count(k, cfg).zip(count(1, twin)).map(|(whole, least)| whole - least) else {
             panic!("{k} {cfg:?} does not lower");
         };

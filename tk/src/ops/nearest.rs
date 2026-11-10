@@ -572,7 +572,7 @@ fn launched(
     super::ran(OP, "nearest", spec.cfg());
     let rows_in = [Some(&xp), x_scale.as_ref(), x_sq.as_ref(), row_floor.as_ref(), row_group.as_ref()];
     let cols_in = [Some(&cp), c_scale.as_ref(), c_sq.as_ref(), col_floor.as_ref(), col_group.as_ref()];
-    if spec.cfg().select.is_some() {
+    if spec.cfg().select().is_some() {
         return live_k(matrix(&planner, x.dtype(), &spec, rows_in, cols_in, &x_var)?);
     }
     let splits = spec.cfg().splits;
@@ -644,7 +644,7 @@ const SELECT_FILL: usize = 8;
 fn launches<'t>(spec: &Admitted<'t, NearestSpec>, planner: &Planner) -> Vec<Block<'t>> {
     let NearestSpec { n, m, k, metric, .. } = **spec;
     let cfg = spec.cfg();
-    let select = cfg.select.expect("a score matrix");
+    let select = cfg.select().expect("a score matrix");
     let sms = planner.sms();
     let (panel, block) = select_blocks(n, m, k, &cfg, scratch(planner.device.target.memory_bytes));
     let mut out = vec![];
@@ -698,7 +698,7 @@ fn matrix(
 ) -> Result<(Tensor, Tensor)> {
     let NearestSpec { n, m, k, .. } = **spec;
     let cfg = spec.cfg();
-    let select = cfg.select.expect("a score matrix");
+    let select = cfg.select().expect("a score matrix");
     let graph_err = || GraphSnafu { op: OP };
     // `len` of `inputs` from `start`, of `whole` each.
     let part = |inputs: [Option<&Tensor>; 5], start: usize, len: usize, whole: usize| {
@@ -853,7 +853,7 @@ pub(crate) fn timed<'t>(
 /// of its shares.
 pub(crate) fn programs(planner: &Planner, dtype: DType, spec: &Admitted<NearestSpec>) -> crate::tune::Candidate {
     let lowering = Lowering::new(&planner.device);
-    if spec.cfg().select.is_some() {
+    if spec.cfg().select().is_some() {
         // Every block's scores, bound and listing, as [`matrix`] launches them.
         let blocks = launches(spec, planner).into_iter().flat_map(|Block { scores, bound, list, .. }| {
             let scores = (typed!(dtype.clone(), kernel, &scores, int8), lowering.clone());
