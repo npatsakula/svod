@@ -321,6 +321,34 @@ fn a_split_the_problem_cannot_run_is_refused() {
     assert_eq!(whole.admit(&planner, &split(4)).map(|_| ()), refused, "whole waves");
 }
 
+/// A tail split's f32 partials take at most an eighth of the device's
+/// memory, the share a score matrix's block takes: on a card with exactly
+/// eight times its partials' bytes the split runs, a byte less and it is
+/// refused with what it needed, and the ranking holds no split whose
+/// partials pass the bound.
+#[test]
+fn a_split_whose_partials_outgrow_the_memory_is_refused() {
+    use crate::ops::config::{Rejected, ShapeRejected};
+    let cfg = GemmCfg { tail: TailSplit::new(4), ..gemm_cfg([128, 128, 64], 1, [4, 2], false) };
+    let p = GemmProblem::new(1, 8192, 4096, 4096, &Epilogue::DEFAULT);
+    let on = |memory: Option<u64>| {
+        let target = Target { memory_bytes: memory, ..Target::card("mi300x").expect("a listed card") };
+        Planner::new(Device { target, costs: costs() }).expect("an SM count")
+    };
+    let plan = p.tail_plan(&on(None), &cfg).expect("a tail");
+    let need = plan.split * plan.tail.count() * 128 * 128 * 4;
+    assert!(p.admit(&on(Some(8 * need as u64)), &cfg).is_ok());
+    let most = need - 4;
+    let refused = Err(Rejected::Shape(ShapeRejected::Partials { need, most }));
+    assert_eq!(p.admit(&on(Some(8 * need as u64 - 1)), &cfg).map(|_| ()), refused);
+    let planner = on(Some(8 * need as u64 - 1));
+    for split in planner.gemm_ranked(1, 8192, 4096, 4096, &Epilogue::DEFAULT).iter().filter(|c| c.tail.is_some()) {
+        let plan = p.tail_plan(&planner, split).expect("a ranked split plans its tail");
+        let bytes = plan.split * plan.tail.count() * split.tile[0] * split.tile[1] * 4;
+        assert!(bytes < need, "{split:?} holds {bytes} bytes of partials");
+    }
+}
+
 /// Where the model prices a split cheapest, the ranking still leads
 /// unsplit and holds the split only as a twin of its unsplit pipeline: the
 /// split's model is fitted to a few probed shapes, and it ran 4–8 %

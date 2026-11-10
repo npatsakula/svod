@@ -92,6 +92,9 @@ pub enum ShapeRejected {
     /// GEMM (or a convolution), a tile the merge's does not divide, a split
     /// that does not divide the trips, or whole waves that leave no tail.
     Tail,
+    /// Its tail split's f32 partials take more bytes than a call may
+    /// allocate beside its operands.
+    Partials { need: usize, most: usize },
 }
 
 /// A ranking: its configs with their costs ([`Planner::price`] ns of SM

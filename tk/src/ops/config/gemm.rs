@@ -258,6 +258,13 @@ struct Part {
 /// The bytes of a split's f32 partial.
 const F32: usize = 4;
 
+/// The most bytes a tail split's f32 partials take, allocated at every call
+/// beside the operands: the share of device memory a score matrix's block
+/// takes ([`crate::kernels::nearest::scratch`]).
+fn partials(planner: &Planner) -> usize {
+    crate::kernels::nearest::scratch(planner.device.target.memory_bytes).saturating_mul(F32)
+}
+
 impl GemmProblem {
     /// `batches` products of `m × k` by `k × n` under `epilogue`.
     pub fn new(batches: usize, m: usize, n: usize, k: usize, epilogue: &Epilogue) -> Self {
@@ -389,7 +396,8 @@ impl GemmProblem {
     /// A feasible config's [claim](super::cost::Claim) on this shape: its
     /// checks first — a step at least two matrix-core depths where the
     /// reduction allows one, a step that divides it, a tail split that runs
-    /// the problem ([`Self::tail_plan`]) — then its resources over the whole
+    /// the problem ([`Self::tail_plan`]) with partials a call may allocate
+    /// ([`partials`]) — then its resources over the whole
     /// grid, every tile data-parallel: a tail split's are its launches'
     /// ([`Self::plan_price`]), its claim the floor's and the occupancy's.
     pub(crate) fn claim(&self, planner: &Planner, cfg: &GemmCfg, regs: u32) -> Result<Claim, Rejected> {
@@ -401,9 +409,11 @@ impl GemmProblem {
             return Err(ShapeRejected::Tail.into());
         }
         let claim = self.claim_part(planner, cfg, regs, whole)?;
-        match self.plan_of(planner, cfg, &claim) {
-            Some(_) => Ok(claim),
-            None => Err(ShapeRejected::Tail.into()),
+        let plan = self.plan_of(planner, cfg, &claim).ok_or(ShapeRejected::Tail)?;
+        let (need, most) = (plan.split * plan.tail.count() * cfg.tile[0] * cfg.tile[1] * F32, partials(planner));
+        match need <= most {
+            true => Ok(claim),
+            false => Err(ShapeRejected::Partials { need, most }.into()),
         }
     }
 
