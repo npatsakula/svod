@@ -9,7 +9,7 @@ sidebar_label: Layouts और Lowering
 `Device` (target और उसकी costs) और products किस matrix instruction पर issue होंगे (`core`):
 warp-level core के लिए `Lowering::new(&device)`, अपने config के core के लिए `GemmCfg::lowering`
 और `FaCfg::lowering`। Block tile पर `WarpGrid` (`Kernel::warps`) और हर ring का schedule
-(`pipeline` का `Ring`) program के अपने हैं; shared rows हमेशा XOR-swizzle होती हैं।
+(`Kernel::ring` का `Schedule`, जिसके अनुसार वह ring पाने वाली pipeline चलती है) program के अपने हैं; shared rows हमेशा XOR-swizzle होती हैं।
 `lower::standalone(program, &lowering)` बिना जुड़े device के किसी target के
 लिए lower करता है, और `lower::render` वह LLVM text लौटाता है जो backend के compiler को सौंपा जाता।
 
@@ -22,9 +22,19 @@ warp-level core के लिए `Lowering::new(&device)`, अपने config �
 | 5. Shared orientation | `lower` | Registers के ज़रिए भरा गया shared allocation उस axis के साथ रखा जाता है जिस पर उसके readers के fragments चलते हैं, ताकि gather 16-byte loads हो; `cp.async` tiles row-major रहते हैं |
 | 6. Emission | `lower/emit/` | Statements program order में `UOp::linear_program` में emit होते हैं |
 
-`lower` `Error::Grid` के साथ fail होता है जब program के warps warp grid के warps न हों, या body में
-`Warps` statement होने पर उनका गुणज न हों; और `Error::DivergentBarrier` के साथ जब कोई block barrier
-warp पर branch के नीचे हो, जिसे कुछ warps छोड़ देंगे।
+`lower` किसी भी क़दम से पहले fail होता है:
+
+- `Error::Grid` के साथ जब program के warps warp grid के warps न हों, या body में `Warps`
+  statement होने पर उनका गुणज न हों;
+- `Error::Escaped` के साथ जब कोई register tile ऐसी जगह पढ़ा जाए जहाँ उसकी definition उस read को
+  dominate नहीं करती: loop body, branch या `Warps` body से रखा गया tile जो उसके बाहर पढ़ा जाए;
+- `Error::SharedPast` के साथ जब कोई shared view, जिसका offset उसके loops के trips और उसकी
+  pipeline के slots से bounded है, अपने allocation के पार पहुँचे: ring उस pipeline से कम slots
+  रखती है जिसके stages उसे छूते हैं।
+
+Barrier pass `Error::DivergentBarrier` के साथ fail होता है जब कोई block barrier, author का लिखा
+या lowering का डाला हुआ, warp पर branch (`where_any`, `if_any`) के नीचे हो, जिसे कुछ warps छोड़
+देंगे।
 
 ## F2 linear layouts {#f2-linear-layouts}
 
@@ -45,7 +55,7 @@ pub fn mma_sync_c() -> Layout {
 
 Algebra में `identity`, `zeros`, `from_bases`, `transpose`, `product` (एक layout को दूसरे पर tile
 करना), `sublayout` और `apply` हैं। Tests हर atom को vendor ISA documents के lane formulas
-(`test/unit/atoms.rs`) से और tk1 के closed forms (`test/unit/layout.rs`) से जाँचते हैं।
+(`test/unit/atoms.rs`) से और closed-form lane maps (`test/unit/layout.rs`) से जाँचते हैं।
 
 किसी register tile का layout एक `layouts::TileLayout { frag, reps, warps }` है। इसमें
 `(Reg, Lane)` पर एक fragment होता है, जो हर warp के sub-tile में `reps` बार दोहराया जाता है, साथ में
@@ -61,7 +71,7 @@ layouts उस atom से पढ़ता है जो values को consume �
 |---|---|---|
 | CUDA | `mma.sync` m16n8k16 | `mma_sync_a`, `mma_sync_b`, `mma_sync_c` |
 | CUDA sm_90 | `wgmma` m64nNk16, चार warps एक साथ | `wgmma_a`, `wgmma_c`; `B` descriptor के ज़रिए, कभी registers में नहीं |
-| AMD CDNA | MFMA 16×16×16 | `mfma_16x16x16` |
+| AMD CDNA | MFMA 16×16×16; wide core पर 32×32×8 (`Core::Wide`, attention) | `mfma_16x16x16`; `mfma_32x32x8_a`, `mfma_32x32x8_c` |
 | AMD RDNA3 / RDNA4 | WMMA 16×16×16 | `wmma_gfx11_input`, `wmma_gfx11_acc` / `wmma_gfx12` |
 | Apple | simdgroup 8×8×8 (सिर्फ़ atom; कोई kernels नहीं) | `simdgroup_8x8` |
 
@@ -102,13 +112,17 @@ ring की swizzled rows पर एक `wgmma` chain के रूप में
    में वर्गीकृत करता है। `Exchange` तभी तक रखा जाता है जब तक उसका काम shared memory से होकर एक round
    trip से सस्ता हो (`Relayout::work × Costs::lane_move < Costs::smem_trip`)। Emitter `Exchange` को
    target के `atoms::LaneMove` से lower करता है (CUDA पर `shfl.sync`, RDNA पर DPP और `permlanex16`,
-   CDNA पर `ds_bpermute`)।
+   CDNA पर `ds_bpermute`)। `flip` इन्हीं classes से चलता है: हर उस lane के भीतर जहाँ वह दोनों
+   बदले जाने वाले elements रखती है (एक register renaming), वरना `TileLayout::flip` के lane moves
+   से; किसी और warp में रखे partners supported नहीं हैं, और rotate करने वाले GEMM की ranking केवल
+   वे tiles admit करती है जिनके warps पूरे heads रखते हैं।
 
 ## Schedule templates {#schedule-templates}
 
-`schedule::expand` हर `Pipeline` को उसके `Ring { stages, unroll, crews }` और target के `Fill` से
-चलाता है। एक crew: हर warp load भी करता है और compute भी। दो crews: block के warps एक
-register-staged slot पर एक cluster के अंतर से दो crews में (CDNA GEMM, `GemmCfg::crews == 2`)।
+`schedule::expand` हर `Pipeline` को उसके `Schedule` (`depth` slots की ring, unrolled या नहीं, या
+दो crews) और target के `Fill` से चलाता है। एक crew: हर warp load भी करता है और compute भी। दो
+crews: block के warps एक register-staged slot पर एक cluster के अंतर से दो crews में (CDNA GEMM,
+`Schedule::PingPong`)।
 
 | Fill | `pipeline(extent, ring, …)` का expansion |
 |---|---|

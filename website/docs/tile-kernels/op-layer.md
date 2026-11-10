@@ -19,7 +19,12 @@ pub fn add_layer_norm(x: &Tensor, residual: &Tensor, w: &Tensor, b: Option<&Tens
     -> Result<(Tensor, Tensor)>;
 pub fn rms_norm(x: &Tensor, w: &Tensor, eps: f64) -> Result<Tensor>;
 pub fn add_rms_norm(x: &Tensor, residual: &Tensor, w: &Tensor, eps: f64) -> Result<(Tensor, Tensor)>;
+pub fn nearest(x: &Tensor, c: &Tensor, opts: Nearest) -> Result<(Tensor, Tensor)>;
+pub fn k_nearest(x: &Tensor, c: &Tensor, k: impl Into<SInt>, opts: Nearest) -> Result<(Tensor, Tensor)>;
+pub fn k_nearest_reranked(x: &Tensor, c: &Tensor, k: impl Into<SInt>, opts: Nearest, rerank: Rerank)
+    -> Result<(Tensor, Tensor)>;
 pub fn supported(device: &DeviceSpec) -> bool;
+pub fn chosen() -> Option<Chosen>;
 ```
 
 | Op | Shapes | Options |
@@ -30,6 +35,7 @@ pub fn supported(device: &DeviceSpec) -> bool;
 | `conv2d` | `x [B, H, W, Cin]`, `w [Cout, kh, kw, Cin / groups]` → `[B, Ho, Wo, Cout]` | `Conv { stride, pad, dilation, groups, bias, act, residual, scale, out_dtype }`; a 1×1 is `linear` |
 | `heads` | `qkv [B, T, (H + 2·H_kv)·D]` → `q`, `k`, `v` | `Qkv { heads, kv_heads, head_dim, q_norm, k_norm, eps, rope }` |
 | `layer_norm`, `rms_norm` | `x [..., D]`, `w`/`b [D]` | `add_*` take `residual` like `x` and return `(x + residual, norm)` |
+| `nearest`, `k_nearest`, `k_nearest_reranked` | `x [N, D]`, `c [M, D]` → f32 scores and i32 indices, `[N]` (`nearest`) or `[N, k]` | `Nearest { metric, row_floor, col_floor, groups }`; the reranked search also `Rerank { margin, x8, c8, search }` |
 
 `Linear::scale` multiplies the activated value before the residual add:
 `scale·act(x·wᵀ + bias) + residual`, so a Conformer half-step `x + 0.5·ffn(x)` is one GEMM.
@@ -105,6 +111,8 @@ dim is `Fallback::Symbolic`.
 | `Shape { op, operand, got, expected }` | An operand's shape does not fit the op |
 | `Dtype { op, operand, got, want }` | `w` (or `k`, `v`, norm weights, rope tables) differs from the input's dtype |
 | `Heads { op, heads, kv_heads }` | `heads` is not a multiple of `kv_heads` |
+| `NoScores { op }` | A nearest search asked for `k = 0` |
+| `Unbound { op, got }` | `k` is neither a count nor a bound variable |
 | `Graph { op, source }` | Building the graph fallback failed |
 | `Launch { op, source }` | Lowering or binding the kernel failed |
 

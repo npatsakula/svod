@@ -9,8 +9,8 @@ whose instruction list is already in order. A `Lowering` holds what the program 
 the `Device` (the target and its costs) and which matrix instruction the products issue on
 (`core`): `Lowering::new(&device)` for the warp-level core, `GemmCfg::lowering` and
 `FaCfg::lowering` for their config's. The `WarpGrid` over the block tile (`Kernel::warps`) and
-each ring's schedule (`pipeline`'s `Schedule`) are the program's own; shared rows are always
-XOR-swizzled. `lower::standalone(program, &lowering)` lowers for a target with no device
+each ring's `Schedule` (`Kernel::ring`, which the pipeline handed the ring runs) are the
+program's own; shared rows are always XOR-swizzled. `lower::standalone(program, &lowering)` lowers for a target with no device
 attached, and `lower::render` returns the LLVM text the backend's compiler would be handed.
 
 | Step | Module | Effect |
@@ -22,9 +22,19 @@ attached, and `lower::render` returns the LLVM text the backend's compiler would
 | 5. Shared orientation | `lower` | A shared allocation filled through registers is stored along the axis its readers' fragments run along, so a gather is 16-byte loads; `cp.async` tiles stay row-major |
 | 6. Emission | `lower/emit/` | Statements are emitted in program order into `UOp::linear_program` |
 
-`lower` fails with `Error::Grid` when the program's warps are not the warp grid's, or a
-multiple of it with a `Warps` statement in the body, and with `Error::DivergentBarrier` when a
-block barrier sits under a branch on the warp, which some warps would skip.
+`lower` fails before any step:
+
+- with `Error::Grid` when the program's warps are not the warp grid's, or a multiple of it with
+  a `Warps` statement in the body;
+- with `Error::Escaped` when a register tile is read where its definition does not dominate the
+  read: a tile kept from a loop's body, a branch or a `Warps` body and read past it;
+- with `Error::SharedPast` when a shared view, its offset bounded by its loops' trips and its
+  pipeline's slots, reaches past its allocation: a ring holding fewer slots than the pipeline
+  whose stages reach it runs.
+
+The barrier pass fails with `Error::DivergentBarrier` when a block barrier, written by the
+author or inserted by the lowering, sits under a branch on the warp (`where_any`, `if_any`),
+which some warps would skip.
 
 ## F2 linear layouts
 
@@ -46,7 +56,7 @@ pub fn mma_sync_c() -> Layout {
 
 The algebra has `identity`, `zeros`, `from_bases`, `transpose`, `product` (tile one layout over
 another), `sublayout` and `apply`. The tests check every atom against the lane formulas of the
-vendor ISA documents (`test/unit/atoms.rs`) and against tk1's closed forms (`test/unit/layout.rs`).
+vendor ISA documents (`test/unit/atoms.rs`) and against closed-form lane maps (`test/unit/layout.rs`).
 
 A register tile's layout is a `layouts::TileLayout { frag, reps, warps }`. It holds a fragment
 over `(Reg, Lane)`, repeated `reps` times inside each warp's sub-tile, with the warps' sub-tile
@@ -62,7 +72,7 @@ inference reads the operand layouts from the atom that consumes the values.
 |---|---|---|
 | CUDA | `mma.sync` m16n8k16 | `mma_sync_a`, `mma_sync_b`, `mma_sync_c` |
 | CUDA sm_90 | `wgmma` m64nNk16, four warps at once | `wgmma_a`, `wgmma_c`; `B` through a descriptor, never held |
-| AMD CDNA | MFMA 16×16×16 | `mfma_16x16x16` |
+| AMD CDNA | MFMA 16×16×16; 32×32×8 on the wide core (`Core::Wide`, attention) | `mfma_16x16x16`; `mfma_32x32x8_a`, `mfma_32x32x8_c` |
 | AMD RDNA3 / RDNA4 | WMMA 16×16×16 | `wmma_gfx11_input`, `wmma_gfx11_acc` / `wmma_gfx12` |
 | Apple | simdgroup 8×8×8 (atom only; no kernels) | `simdgroup_8x8` |
 

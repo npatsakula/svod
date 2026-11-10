@@ -4,23 +4,37 @@ sidebar_label: Kernel Library
 
 # Kernel Library
 
-Every kernel in `svod_tk::kernels` is a function `fn k<T: Elem>(spec: &Spec) -> Program`,
-generic over the 16-bit element type (`BF16` or `F16`); `gemm` and `nearest` also take 8-bit
-integers (`I8`, accumulated exactly in i32: `gemm` stores f32, `nearest` scales each row's
-products by the rows' `x_scale` and `c_scale`). Each spec has a `batch: Batch`:
-`Batch::Static(n)` launches `n` batches, and `Batch::var(name, min, max)` (an `ir::Var`) launches the live
-count of a runtime variable bound by name, with buffers sized for `max`. Each config type has a
-`lowering(&device)` (an `atoms::Device`: the target and its costs). Models reach these kernels
-through the [op layer](./op-layer), which picks the config.
+Every kernel in `svod_tk::kernels` is a function from a spec to a `Program`, generic over the
+16-bit element type (`BF16` or `F16`); `gemm` and `nearest` also take 8-bit integers (`I8`,
+accumulated exactly in i32: `gemm` stores f32, `nearest` scales each row's products by the rows'
+`x_scale` and `c_scale`).
+
+Where the planner picks a kernel's config (`gemm`, `conv`, `attention`, `nearest`), the spec
+(`GemmSpec`, `ConvSpec`, `AttnSpec`, `NearestSpec`) is a plain description of shapes and options,
+and the kernel takes it admitted under its config: `fn k<T>(spec: &Admitted<Spec>) -> Program`.
+`spec.admitted(&planner, cfg)` returns one where the planner admits `cfg` for that very spec (the
+config feasible on the target for the problem the spec states, claimed on its shape), or the
+reason it does not; the `unsafe` `Admitted::assume(spec, cfg)` takes a config without admission
+and checks nothing. An admitted spec is read-only: it derefs to the spec, and `cfg()` returns the
+config. The other kernels (`heads`, `norm`, `combine`, `split_merge` and the nearest search's
+select, merge and rescore) take their spec as it is, its config inside.
+
+`GemmSpec`, `ConvSpec`, `AttnSpec`, `HeadsSpec` and `NormSpec` have a `batch: Batch`:
+`Batch::Static(n)` launches `n` batches, and `Batch::var(name, min, max)` (an `ir::Var`) launches
+the live count of a runtime variable bound by name, with buffers sized for `max`. `GemmCfg` and
+`FaCfg` have a `lowering(&device)` (an `atoms::Device`: the target and its costs); the other
+kernels lower with `Lowering::new(&device)`. Models reach these kernels through the
+[op layer](./op-layer), which picks the config.
 
 | Kernel | Spec → program | Kernel name | Op |
 |---|---|---|---|
-| GEMM + epilogue | `GemmSpec` → `gemm::gemm` | `gemm` | `ops::linear` |
+| GEMM + epilogue | `GemmSpec` → `gemm::gemm` (`TailSpec` → `gemm::gemm_tail` when its tail is split) | `gemm` (+ `split_merge`) | `ops::linear` |
 | Implicit-GEMM convolution | `ConvSpec` → `conv::conv` (+ `gemm::split_merge` when split) | `conv`, `split_merge` | `ops::conv2d` |
 | Flash attention forward | `AttnSpec` → `attention::attention` | `flash_attention` | `ops::attention` |
 | Split merge | `CombineSpec` → `attention::combine` | `combine_splits` | `ops::attention` with splits |
 | Attention prologue | `HeadsSpec` → `heads::heads` | `heads` | `ops::heads` |
 | LayerNorm / RMSNorm | `NormSpec` → `rows::norm` | `layer_norm` / `rms_norm` | `ops::{layer_norm, rms_norm, add_*}` |
+| Nearest-neighbour search | `NearestSpec` → `nearest::nearest` | `nearest` (+ `nearest_select`, `nearest_merge`, `nearest_rescore`) | `ops::{nearest, k_nearest, k_nearest_reranked}` |
 
 ## GEMM
 
@@ -37,14 +51,14 @@ the matrix product runs on the f32 accumulator, and the result is rounded once a
 | `out_f32` | f32 output and residual, the accumulator stored unrounded |
 | `rope` | `Rope { heads, head_dim, seq }`: the first `heads` heads of `head_dim` columns rotated by `[seq, head_dim/2]` cos and sin tables (output row `m` at position `m % seq`), the columns after them stored as they are; with a bias alone, on a tile whose warps hold whole heads (`GemmCfg::turns`) |
 
-`GemmCfg { tile: [bm, bn, bk], warps: [rows, cols], core, schedule, order }`. Rows
+`GemmCfg { tile: [bm, bn, bk], warps: [rows, cols], core, schedule, order, tail }`. Rows
 past `m` and columns past `n` are bounded views, so `m` and `n` are free. `k` must be a multiple
-of `bk`. `core: Core::Group` issues the products on `wgmma` (sm_90); `schedule: Schedule::ping_pong(k)` runs the two
-warp rows in ping-pong over one slot (CDNA). The blocks walk the output tiles in groups of
-`order` tile rows (`gemm::TileOrder`, 8 by default; one row is row-major, the grid's rows
-column-major), so blocks resident together read the same B tiles. The planner plans every
-config at the default, which measured best or within a few percent of the best on MI300X,
-sm_86 and gfx1201; a config may carry another group height (the `g` field of its code).
+of `bk`. `core: Core::Group` issues the products on `wgmma` (sm_90);
+`schedule: Schedule::ping_pong(k)` runs the two warp rows in ping-pong over one slot (CDNA). The
+blocks walk the output tiles in groups of `order` tile rows (`gemm::TileOrder`, 8 by default,
+`TileOrder::DEFAULT`; one row is row-major, the grid's rows column-major), so blocks resident
+together read the same B tiles. The planner plans every config at the default; a config may
+carry another group height (the `g` field of its code).
 
 The rotation reads each element's partner half a head along through a column `flip`. When a
 warp's columns hold whole heads, a lane holds both halves, and the flip is a register
@@ -52,21 +66,30 @@ renaming. The tables are read through a periodic view, so every head of a row re
 same `[head_dim/2]` row. The turn is not free in the ranking: its operations and the tables'
 reads are claimed beside the epilogue's, and a tile that holds no whole heads is refused.
 
+`tail` (`gemm::TailSplit`, up to `config::TAIL_SPLITS` ways) splits the tiles of a partial last
+wave along K: the whole waves run data-parallel, the tail writes f32 partials, and `split_merge`
+applies the epilogue. The planner prices each split with a launch cost (`config::LAUNCH`) for
+every launch past the first, and refuses one whose partials outgrow an eighth of device memory
+(`ShapeRejected::Partials`); the tuner times a leading split beside its unsplit pipeline.
+Batched, gated, rotating and convolution GEMMs take none.
+
 There is no tile table. `config::Planner::gemm_ranked` enumerates tiles, `bk`, warp grids, ring
 depths and unrolling, keeps what the lowering runs on the target (the atoms tile the warp grid,
 the fills split into whole 16-byte chunks per thread, the ring fits shared memory) and ranks the
 rest in nanoseconds of SM time from the device's measured `Costs`. Every device input to the
-ranking is measured; its few model constants (`BAND`, `CACHE_SHARE`, `CACHE_SPILL`,
-`OVERLAP_WAVES` in `ops::config`) are meant to hold for every device. The ranking orders, and
-the tuner measures the first 64 tiles that compile without spilling ([Tuning](./tuning)).
+ranking is measured; its model constants (`BAND`, `OVERLAP_WAVES`, `LAUNCH` and each family's
+operation weights, each marked `Model:` in `ops::config`) are meant to hold for every device, and
+fill bytes are priced from the measured cache ladder. A GEMM's output is priced at its type's
+bytes, with its residual and bias reads. The ranking orders, and the tuner measures the first 56
+tiles (`config::SHORTLIST`) that compile without spilling ([Tuning](./tuning)).
 
 ## Convolution
 
 `conv::conv` is an implicit GEMM over channels-last `x [b, h, w, cin]` and `w [cout, kh, kw,
 cin]`: A is a row-mapped view of the image (`conv::im2col_view`), so padding rows read zero and
 nothing is materialized. `K = kh·kw·cin` runs as one pipeline, each step inside one tap (`bk`
-divides `cin`). On a starved grid of a single static batch, `ConvCfg::split` splits K over
-grid z and `gemm::split_merge` applies the epilogue. `ops::conv2d` takes a 1×1 as `linear` and
+divides `cin`). On a starved grid of a single static batch, `ConvCfg::split` (a `ConvSpec`'s
+`split`) splits K over grid z and `gemm::split_merge` applies the epilogue. `ops::conv2d` takes a 1×1 as `linear` and
 keeps `groups ≠ 1`, `cin` off 16 and `cout` off 8 on the graph.
 
 ## Flash attention
@@ -93,14 +116,14 @@ Only key blocks that a causal, window, chunk, length or segment edge crosses com
 predicate; blocks fully inside run unmasked. A key mask and a bias are read in every block. A
 query that sees no key yields zeros, as the graph writes it.
 
-**Cache mode** (`AttnSpec::cache = Some(Cache { .. })`) reads K and V from a cache
+**Cache mode** (`AttnSpec::cache = Some(CacheLayout { .. })`) reads K and V from a cache
 `[rows, tk, heads_total, d]` that holds several layers' heads:
 
-| `Cache` field | Effect |
+| `CacheLayout` field | Effect |
 |---|---|
 | `rows`, `heads_total` | The cache's shape |
 | `row_map` | A `[batch]` i32 parameter: the cache row each batch lane reads |
-| `appended` | Rows of `[batch, appended, kv_heads, d]` keys and values scored after the cached prefix (the tokens a decoder step just projected), at most a key block |
+| `appended` | Rows of `[batch, appended, kv_heads, d]` keys and values scored after the cached prefix (the tokens a decoder step just projected), at most a key block; 0 appends nothing |
 | `app_lens` | A `[batch]` i32 parameter of visible appended rows |
 
 The first of this attention's heads is a `[1]` i32 `head_start` parameter, so every layer runs
@@ -109,7 +132,7 @@ one program.
 **Packed mode** (`AttnSpec::packed`) reads `q`, `k` and `v` from one
 `[batch, t, heads + 2·kv_heads, d]` parameter, a fused projection, at head offsets 0, `heads` and
 `heads + kv_heads`, without a cache. The kernel is `flash_attention_packed`, tuned apart from the
-split one; on the same config both compute the same bits.
+one of separate operands; on the same config both compute the same bits.
 
 **Key splits** (`FaCfg::splits > 1`) give a few long rows, such as a decoder step, more blocks.
 Each split writes f32 partials `o_part`, `m_part` and `l_part`, and `combine` merges them.
@@ -123,7 +146,7 @@ candidate together with its merge.
 |---|---|
 | `warp_rows` | Query rows per warp: 16 (one atom row) or 32 (each K and V fragment feeds two atom rows); the 32-row form is a variant the tuner times beside its 16-row tile |
 | `key_warps` | A one-row-warp block (`bq = 16`, offered for `t ≤ 16`) splits its key blocks over 1, 2 or 4 warps, each with its own ring slots and softmax state, merged through shared memory |
-| `core` | `Core::Group` runs both products on `wgmma` (sm_90) |
+| `core` | `Core::Wide` runs both products on CDNA's 32×32×8 MFMA; `Core::Group` on `wgmma` (sm_90) |
 | `forms` | The softmax forms below |
 
 Candidates come from the same lattice and cost model as the GEMM's
@@ -165,3 +188,23 @@ in 16..=256, and candidates are `br ∈ {4, 8, 16}`.
 With `residual: true` it normalizes `x + residual` rounded to the element type and also writes
 that sum, which is the pre-norm residual stream of a transformer layer. `d` must be a multiple
 of 256 in 256..=2048, and candidates are `br ∈ {4, 8, 16}` rows per block.
+
+## Nearest-neighbour search
+
+`nearest::nearest` scores the rows of `x [n, d]` against the candidates `c [m, d]` under a
+`Metric` (`SquaredL2`, `ShiftedL2`, `L2`, `NegDot`) and keeps each row's `k` least scores,
+ascending, with their indices. `NearestSpec { n, m, d, dtype, metric, floors, groups, k, live }`
+states its element type (`dtype`: a 16-bit float or 8-bit integers), and the kernel runs over that
+type alone. `NearestCfg::list` (`nearest::Way`) says where a row's `k` least are kept:
+
+| `Way` | List |
+|---|---|
+| `Registers` | All `k` in a register list |
+| `Queued(Pow2)` | A register queue of that many scores (from 2, below `k`), merged into the rest of the list held in the outputs |
+| `Matrix(SelectCfg)` | The scores stored as a matrix, whose rows `nearest_select` lists |
+
+`Pow2` holds a power of two, so a queue, and the width and depth of a list's lane queues
+(`LaneQueue`), are powers of two by construction. Split (`NearestCfg::splits > 1`), the blocks of
+a query block each fold a share of the candidates and `nearest_merge` merges the shares' lists.
+`k_nearest_reranked` searches over 8-bit or 16-bit rows and scores the candidates it keeps again
+in f32 with `nearest_rescore`.

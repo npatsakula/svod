@@ -32,7 +32,7 @@ ordering bugs सिर्फ़ device पर दिखते हैं।
 | फ़ाइल (`test/unit/`) | स्तर | क्या जाँचता है |
 |---|---|---|
 | `atoms.rs`, `layout.rs`, `layouts.rs` | host | हर atom के operand layouts vendor ISA lane formulas के ख़िलाफ़, F2 algebra के नियम, inference, relayouts और swizzles |
-| `build.rs`, `interp.rs`, `schedule.rs`, `sync.rs`, `emit.rs` | host | Builder records, interpreter semantics, pipeline expansion, barrier pass, emitted list |
+| `build.rs`, `interp.rs`, `schedule.rs`, `sync.rs`, `emit.rs` | host | Builder records, interpreter semantics, pipeline expansion, barrier pass, emitted list और lowering के refusals |
 | `ops_plan.rs` | host | हर op का `Plan` और error, हर shape, dtype और target के लिए |
 | `offline.rs` | host | Copy किए गए tune store से पढ़े गए card targets और costs |
 | `targets.rs` | host + device | हर target के लिए हर kernel family lower, lowering से पहले और बाद में interpret, और compile (`ptxas`, clang); GPU पर, device gate |
@@ -40,6 +40,8 @@ ordering bugs सिर्फ़ device पर दिखते हैं।
 | `attention.rs`, `heads.rs`, `rows.rs`, `conv.rs`, `gather.rs` | host + device | Program एक f64 reference के ख़िलाफ़, फिर lowered कर्नेल program के ख़िलाफ़ |
 | `device.rs`, `parts.rs` | device | GEMM शुरू से अंत तक, और वे हिस्से जिनसे attention बनता है (`cp.async` devices पर) |
 | `ops.rs` | device | हर op अपने graph fallback के ख़िलाफ़, बेढब shapes पर |
+| `nearest.rs` | host + device | Nearest-neighbour family एक f64 reference के विरुद्ध; GPU पर, हर ranked config और op अपने graph के विरुद्ध |
+| `tail.rs`, `raster.rs` | host | GEMM का tail split और raster: हर tile ठीक एक बार covered, interpreter में programs, planner के offers |
 | `tune.rs` | host + device | Store round trip, key की स्थिरता, एक असली GEMM tuning |
 
 ## Suite चलाना {#running-the-suite}
@@ -104,7 +106,7 @@ directory है, जिसकी probe lines ranking की कीमत तय
 `--cfg N` N-वाँ ranked config emit करता है, `--out DIR` output directory का नाम देता है (`tk_dump`)।
 
 `--op` `gemm` (`--shape MxNxK`), `attention` (`BxHxTxD`), `norm` (`RxD`), `conv`
-(`BxHxWxCINxCOUT`) या `heads` (`BxTxHxKVxD`) लेता है, हर एक op layer के अपने shape gate और tuning
+(`BxHxWxCINxCOUT`), `heads` (`BxTxHxKVxD`) या `nearest` (`NxMxD`, `--metric`, `--k K`) लेता है, हर एक op layer के अपने shape gate और tuning
 से होकर। `--cfg tuned` वह config emit करता है जो tuner ने कार्ड पर चुना था, उसे `--store` copy से
 पढ़कर और उसमें कुछ लिखे बिना: stored line op, device, dtype, shape और उस config list से match होती है
 जिससे op layer उसे key करता है, चाहे उसे किसी भी compiler या kernel build ने लिखा हो, और dump पढ़ी गई

@@ -5,18 +5,18 @@ sidebar_label: Tuning
 # Tuning
 
 Each op ranks its configs per shape in `ops::config` from the device's measured costs (see
-[Device costs](#device-costs)), dropping the configs priced past 2.5× the cheapest once 16 tiles are
-kept (`config::PRUNED_PAST`): on sm_86 none of them ran within the contender band. The ranking is a model, and so is a register count, so neither
+[Device costs](#device-costs)), dropping the configs priced past 2.5× the cheapest
+(`config::PRUNED_PAST`) once 16 tiles are kept (`config::KEPT_TILES`). The ranking is a model,
+and so is a register count, so neither
 admits a config. One rule does: the tuner compiles the ranked configs in parallel until it has
-the first 64 tiles in ranked order (`config::SHORTLIST`) whose compiled kernels do not spill (a
+the first 56 tiles in ranked order (`config::SHORTLIST`) whose compiled kernels do not spill (a
 kernel reporting scratch bytes spilled; a backend that reports nothing admits). A tile is
 admitted at its first clean pipeline (ring depth, unrolling), so an unrolled ring that spills
 yields to its rolled twin. A pipeline is compiled only when the tile's pipelines ranked ahead of
-it spilled or failed, and none past the 64th clean tile: what a walk in ranked order compiling
+it spilled or failed, and none past the 56th clean tile: what a walk in ranked order compiling
 one config at a time would compile (`config::Search`). The tiles none of whose pipelines compile
-clean follow the clean ones within the 64, a pipeline each: the compiled kernel judges what it
-can and the time the rest (no op falls to the graph because of spills, and on gfx1201 the 16384²
-depth-768 nearest's best tile spills 196 bytes a lane and runs 2 % ahead of the clean pick). A config's
+clean follow the clean ones within the 56, a pipeline each: the compiled kernel judges what it
+can and the time the rest (no op falls to the graph because of spills). A config's
 compile starts as soon as the search wants it, on the thread pool (where the pool has room, a tile's next pipeline starts while the one ahead still compiles, its verdict used only where the walk would have asked for it); one whose compiler runs past
 30 s (`tune::COMPILE_TIMEOUT`) is killed and rejected as a failure would be, and the planner log
 says so (`compile timed out`); one whose lowered program emits more instructions than its target
@@ -26,12 +26,14 @@ the planner log) and rejected alike. Each program is lowered once per tuning: wh
 fingerprint lowered is the body the compile launches.
 
 The admitted configs, with their variants (key splits for attention, reduction splits for a
-starved convolution), are the candidates the tune store measures the first time a device meets
+starved convolution, a GEMM's tail split beside its unsplit pipeline), are the candidates the tune store measures the first time a device meets
 a shape. The other pipelines of the leading tiles, those within the contender band of the
 leader and at most eight (`config::TWIN_TILES`), are then compiled and timed against the winner,
 spilling or not, and the fastest is the choice. Attention tunes its softmax forms and its tiles
 in turn (see the [Kernel Library](./kernel-library#flash-attention)). When nothing compiles (no
-device to compile on) the first 64 tiles are used untested.
+device to compile on) the first 56 tiles are used untested. A GEMM's tail split whose f32
+partials would take more than an eighth of device memory, allocated at every call beside the
+operands, is refused on its shape (`ShapeRejected::Partials`).
 
 With tuning off nothing is timed: the ranked list's first config that compiles clean runs,
 found compiling in ranked batches of eight and kept in the store as a `first` line. The
@@ -48,12 +50,13 @@ clocks down under real data is timed as it will run; integer operands hold zeros
 |---|---|
 | Warm-up | Back-to-back runs until the clock plateaus |
 | Rounds | One round of every candidate in ranked order, where a candidate whose first timed run passes 2× the best so far keeps that run as its time; then 3 more of the contenders: those within 1.2× of the first round's best (within 2×, under 8 candidates), each round past the second only those within 1.05× of the best so far, the later rounds running backwards and forwards in turn so that each candidate runs after both its neighbours; then 4 more of the two leaders, where more than two contenders ran. The first timing of a tuning, which only picks its leading tiles, stops after the second round: those tiles are timed again with their other pipelines |
-| Per round | 5 ms of device time in back-to-back sustain runs of the candidate's programs in order (at most 1024 launches, sized by the candidate's last run), then profiled runs of each program, keeping each candidate's minimum: as many as 20 ms of device time holds, 2 to 5 (`tune::runs`), and no sustain for a candidate of 5 ms or more, whose first timed run then counts among them; the leaders' rounds (and the cost probes) keep 5 runs after a sustain |
+| Per round | 5 ms of device time in back-to-back sustain runs of the candidate's programs in order (at most 1024 launches, sized by the candidate's last run), then profiled runs of each program until its minimum settles, keeping each candidate's minimum: at least as many as 20 ms of device time holds, 2 to 5 (`tune::runs`; 5 in the leaders' rounds and the cost probes), then until three runs in a row stay within 97 % of the minimum, 24 at most; outside the leaders' rounds, a candidate of 5 ms or more gets neither the sustain nor more runs: its first timed run is its round's time |
 | Time of a run | The sum of its kernels' GPU timestamps |
 
 The sustain is sized in device time because launches queue asynchronously. A candidate is a
 list of programs, a kernel plus the merge of its partial results for a split, and its time is
-the sum of its programs' times. Candidates not compiled yet when a timing starts (a split's
+the sum of its programs' times plus `config::LAUNCH` for each launch past its first
+(`tune::launched`): the gap between two kernels, which no device stamp sees. Candidates not compiled yet when a timing starts (a split's
 variants, a tile's twins) compile on all but one of the pool's threads while the ones ready are
 timed, each timed when the ranked order reaches it. A candidate that fails to build or run is skipped. If nothing
 measures, the first candidate is used and nothing is stored.
@@ -71,16 +74,17 @@ Two guards keep a time honest:
 | What | Value |
 |---|---|
 | Directory | `$SVOD_TK_TUNE_DIR`, else `$XDG_CACHE_HOME/svod/tk_tune`, else `~/.cache/svod/tk_tune` |
-| File | One per device and crate version, e.g. `sm_86_28sm-v0.2.0.txt`, headed by its line format (`format 10`); a file of another format, or without the line, is dropped whole |
-| Line | `kind\|op\|device\|dtype\|shape\|candidates\|compiler\|programs numbers`: a `choice` holds the candidates that ran, fastest first, each `index ns` (a candidate whose programs emit what another's do — an unrolling the schedule folds away — is recorded at its twin's ns, the kernel the two share); a `value` a measured number; an `admitted` the ranked indices admission kept; a `first` the first clean config's index |
+| File | One per device and crate version, e.g. `sm_86_28sm-v<crate version>.txt`, headed by its line format (`format 11`); a file of another format, or without the line, is dropped whole |
+| Line | `kind\|op\|device\|dtype\|shape\|candidates\|compiler\|programs numbers`: a `choice` holds the candidates that ran, fastest first, each `index:code ns`, `code` the config's own text, so a line replays without its ranking (a candidate whose programs emit what another's do — an unrolling the schedule folds away — is recorded at its twin's ns, the kernel the two share); a `value` a measured number; an `admitted` the `index:code` of each config admission kept; a `first` the `index:code` of the first clean config |
 | Key | `tune::TuneKey { op, device, dtype, shape, candidates, compiler }`, where `device` is arch and SM count (`sm_86-28sm`) and `compiler` digests the device's compiler (`tune::compiler`) |
 
-Lines from a real store on the RTX 3060: an attention choice (shape `[batch, t, tk, heads,
-kv_heads, d]`, candidate 0 at 3904 ns) and a cost probe's value (femtoseconds per unit).
+The shape of a GEMM choice (shape `[batch, m, n, k]`, its codes ending in the raster and the
+tail split, `~` for none) and of a cost probe's value (femtoseconds per unit); the digests and
+numbers are placeholders:
 
 ```text
-choice|attention|sm_86-28sm|BFloat16|2x10x12x6x2x64|08bd45c243ff1581|9154cc72f03d25cd|ef103f71226add50 0 3904 1 3936
-value|probe:cached_1m|sm_86-28sm|Int32||0a2d6c02b82988af|9154cc72f03d25cd|d2a8e296bcce85e4 16601
+choice|linear|sm_86-28sm|BFloat16|1x4096x4096x4096|<candidates>|<compiler>|<programs> 0:w,128,256,64,2,4,r3u,g8,~ <ns> 3:w,128,128,32,2,2,r3u,g8,~ <ns>
+value|probe:cached_1m|sm_86-28sm|Int32||<candidates>|<compiler>|<programs> <fs>
 ```
 
 The `programs` field fingerprints the kernels the candidates emit: the lowered program and the
@@ -94,19 +98,25 @@ replace the file. An unreadable or unwritable store counts as a miss, never an e
 ## Device costs
 
 The ranking's costs (`atoms::Costs`: a shared byte, a streamed byte, a scattered element, a
-matrix-core step under a full SM, alone on its SIMD and as a warpgroup product, a score's
+matrix-core step under a full SM, alone on its SIMD, as a warpgroup product, on the wide core
+and over 8-bit integers (under a full SM and alone), a score's
 softmax, a pipeline trip over two ring slots unrolled and rolled and over one, the two-slot and
 one-slot trips of a block alone on its SM, a lane move, a shared round trip, the global latency
-through two ring slots and, where fills are `cp.async`, through one, and the L2 rate and size)
+through two ring slots and, where fills are `cp.async`, through one, and the cache ladder: a
+streamed byte's cost at each working-set size, the L2 rate and size read from it)
 are measured on the device by `probe::costs` the first time a process plans for it. Each field is a pair of programs, a probe
 doing all its baseline does plus a known amount of the primitive. The values go in the same
 store file as `value|probe:<field>` lines, so later processes read them back. A probe that
 fails leaves its field at zero, is warned about, and is named in `Planner::unmeasured`, which
 the device gate `device_costs_are_physical` holds empty: the planner ranks with what it has
 rather than leaving the device to the graph. Only a device without an SM count has no planner.
+What the target states rather than the probes measure prices residency: the blocks an SM holds
+at once are those its shared memory, registers and wave slots fit, and at most
+`Occupancy::blocks`, the hardware's limit whatever their resources.
 
-Host tests declare costs instead (`test::unit::costs()`, and `gfx1151_costs()` pasted from a
-gfx1151 store). For a card this machine has no device for, `Target::offline` or `Target::card`
+Host tests declare costs instead: `costs()`, the guessed fixture, and `sm86_costs()`,
+`gfx1201_costs()`, `gfx942_costs()` and `gfx1151_costs()` in `test/unit/mod.rs`, each copied
+from that device's probes. For a card this machine has no device for, `Target::offline` or `Target::card`
 gives the target, and `probe::stored` reads the costs from a tune store copied from that card;
 without one, `probe::GUESSED` stands in and the ranking is a guess. The
 [`tk_dump` example](./testing-and-debugging#planning-for-another-card) does both.

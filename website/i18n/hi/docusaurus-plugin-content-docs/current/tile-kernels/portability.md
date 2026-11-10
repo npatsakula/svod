@@ -17,8 +17,8 @@ Target यह घोषित करता है कि chip क्या क�
 की कीमत (`atoms::Costs`) पहले इस्तेमाल पर device पर मापी जाती है (`probe::costs`) और tune store में रखी
 जाती है; host tests इसे घोषित करते हैं ([Tuning](./tuning#device-costs))। हर family के लिए कोई cost
 tables नहीं हैं। Costs lowering तक `Lowering::device` के रूप में पहुँचती हैं (orientation, exchange या
-round trip) और op layer तक `Planner` के device के रूप में (candidate rankings)। मापे गए targets और
-उनके आँकड़े [अवलोकन](./overview#targets) में हैं।
+round trip) और op layer तक `Planner` के device के रूप में (candidate rankings)। Targets और उनके
+matrix cores [अवलोकन](./overview#targets) में सूचीबद्ध हैं।
 
 `ops::supported(device)` तब true है जब `device` default device हो, उसके target के पास tk kernels हों
 (`config::has_kernels`) और वह एक SM count बताता हो; cost probes पहले पूछने पर चलते हैं। किसी भी दूसरे
@@ -42,7 +42,7 @@ slots पर। यही path CUDA पर एक device test में चल�
 |---|---|
 | Matrix-core atoms और उनके layouts | `atoms`, `layout/atoms.rs` |
 | Copy के तरीक़े (`cp.async`, `ldmatrix`, register staging, transposing loads) | `Target` fields, emitter |
-| Schedule templates | `schedule::Schedule` |
+| Schedule templates | `ir::Schedule`, `schedule::expand` |
 | Config candidate rankings | `ops::config`, मापी गई `Costs` से |
 
 किसी एक vendor के लिए अलग किया गया kernel program सिर्फ़ एक सीमित अपवाद के रूप में अनुमत है।
@@ -53,7 +53,7 @@ slots पर। यही path CUDA पर एक device test में चल�
 |---|---|
 | Hopper TMA, mbarrier, warp-specialized producers | शुरू नहीं हुआ; GEMM और attention `cp.async` से भरे जाने वाले `wgmma` चलाते हैं |
 | Blackwell `tcgen05`, tensor memory | शुरू नहीं हुआ; sm_120 sm_80 path चलाता है |
-| CDNA MFMA 32×32, `buffer_load … lds` | शुरू नहीं हुआ (32×32 layouts मौजूद हैं, atom नहीं) |
+| GEMM के लिए CDNA MFMA 32×32, `buffer_load … lds` | शुरू नहीं हुआ; attention 32×32×8 MFMA को `Core::Wide` के रूप में चलाता है |
 | CDNA के बाहर two-crew ping-pong | `Target::crews` सिर्फ़ वहीं 2 है जहाँ matrix core vector units के बगल में चलता है और एक lane की file दो crews के accumulators रखती है (CDNA) |
 | Apple | सिर्फ़ atoms; कोई kernels नहीं |
 | Convolution का image-staged रूप, depthwise, grouped | ग्राफ़ |

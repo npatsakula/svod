@@ -21,7 +21,7 @@ let out = run(&prog, vec![a.clone(), b.clone(), vec![0.0; m * n]], &[("b", 1)]).
 | 文件（`test/unit/`） | 层面 | 检查内容 |
 |---|---|---|
 | `atoms.rs`, `layout.rs`, `layouts.rs` | 主机 | 每个原子的操作数布局与厂商 ISA lane 公式的对比、F2 代数定律、推断、重布局与 swizzle |
-| `build.rs`, `interp.rs`, `schedule.rs`, `sync.rs`, `emit.rs` | 主机 | 构建器记录、解释器语义、流水线展开、屏障 pass、发射出的列表 |
+| `build.rs`, `interp.rs`, `schedule.rs`, `sync.rs`, `emit.rs` | 主机 | 构建器记录、解释器语义、流水线展开、屏障 pass、发射出的列表以及降级的拒绝 |
 | `ops_plan.rs` | 主机 | 每个算子在各种形状、数据类型和目标下的 `Plan` 与错误 |
 | `offline.rs` | 主机 | 显卡目标，以及从拷贝来的调优存储中读取的代价 |
 | `targets.rs` | 主机 + 设备 | 每个目标上的每个内核族：降级、在降级前后各解释一次并编译（`ptxas`、clang）；在 GPU 上运行设备门控 |
@@ -29,6 +29,8 @@ let out = run(&prog, vec![a.clone(), b.clone(), vec![0.0; m * n]], &[("b", 1)]).
 | `attention.rs`, `heads.rs`, `rows.rs`, `conv.rs`, `gather.rs` | 主机 + 设备 | 程序与 f64 参考比较，然后降级后的内核与程序比较 |
 | `device.rs`, `parts.rs` | 设备 | 端到端的 GEMM，以及注意力所组合的各部件（在 `cp.async` 设备上） |
 | `ops.rs` | 设备 | 每个算子在刁钻形状上与其计算图回退比较 |
+| `nearest.rs` | 主机 + 设备 | 最近邻族对照 f64 参考；在 GPU 上，每个排序的配置以及算子对照其计算图 |
+| `tail.rs`, `raster.rs` | 主机 | GEMM 的尾部拆分与光栅顺序：每个 tile 恰好覆盖一次、解释器中的程序、规划器给出的拆分 |
 | `tune.rs` | 主机 + 设备 | 存储往返、键稳定性、一次真实的 GEMM 调优 |
 
 ## 运行测试套件 {#running-the-suite}
@@ -73,7 +75,7 @@ cargo run -p svod-tk --release --example tk_dump -- --arch gfx942 --op attention
 
 `--card` 接受 `atoms::CARDS` 中的名称（`rtx3060`、`h100-pcie`、`h100-sxm`、`rtx5070`、`rtx5090`、`mi300x`、`mi355x`、`rx9070xt`、`strix-halo`）；`--arch` 接受一个架构，配合 `--sms`/`--xcds` 使用，否则取列出的第一张卡的值。`--store` 是从该卡拷贝来的调优存储目录，其探针行为排序定价；没有它时则用猜测的代价。`--cfg N` 发射排序中第 N 个配置，`--out DIR` 指定输出目录（`tk_dump`）。
 
-`--op` 接受 `gemm`（`--shape MxNxK`）、`attention`（`BxHxTxD`）、`norm`（`RxD`）、`conv`（`BxHxWxCINxCOUT`）或 `heads`（`BxTxHxKVxD`），每一种都经过算子层自己的形状关卡和调优。`--cfg tuned` 发射调优器在该卡上选中的配置，从 `--store` 副本中读取且不向其写入任何内容：存储的行按算子、设备、数据类型、形状以及算子层作为键的配置列表匹配，不论写入它的是哪个编译器或哪次内核构建；转储会打印读取的每个键，或指出缺少哪一行。`--compare FILE [--fun NAME]` 把参考内核（`.cubin`、AMD 代码对象，或 SASS、PTX、AMDGCN 文本）的主循环与 tk 的主循环并排打印，二者按同一方式计数。
+`--op` 接受 `gemm`（`--shape MxNxK`）、`attention`（`BxHxTxD`）、`norm`（`RxD`）、`conv`（`BxHxWxCINxCOUT`）、`heads`（`BxTxHxKVxD`）或 `nearest`（`NxMxD`、`--metric`、`--k K`），每一种都经过算子层自己的形状关卡和调优。`--cfg tuned` 发射调优器在该卡上选中的配置，从 `--store` 副本中读取且不向其写入任何内容：存储的行按算子、设备、数据类型、形状以及算子层作为键的配置列表匹配，不论写入它的是哪个编译器或哪次内核构建；转储会打印读取的每个键，或指出缺少哪一行。`--compare FILE [--fun NAME]` 把参考内核（`.cubin`、AMD 代码对象，或 SASS、PTX、AMDGCN 文本）的主循环与 tk 的主循环并排打印，二者按同一方式计数。
 
 ```bash
 cargo run -p svod-tk --release --example tk_dump -- --card rtx3060 --op gemm --shape 4096x4096x4096 --cfg tuned --store ~/.cache/svod/tk_tune
