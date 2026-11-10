@@ -811,34 +811,47 @@ impl IndexWidth {
     }
 }
 
+/// A recorded tile program; read-only outside the crate, so what the
+/// lowering derives from it (a parameter never stored to is `readonly`, a
+/// phase's layouts) is what [`Kernel::record`](crate::build::Kernel::record)
+/// and the passes made:
+///
+/// ```compile_fail,E0616
+/// # use svod_tk::build::{F32, Kernel};
+/// # use svod_tk::ir::ParamKind;
+/// let mut prog = Kernel::record("k", |k| {
+///     k.output::<F32>("y", 1);
+/// });
+/// prog.params[0].kind = ParamKind::In;
+/// ```
 #[derive(Clone, Debug, PartialEq)]
 pub struct Program<P: Phase = Authored> {
-    pub name: String,
-    pub params: Vec<Param>,
-    pub vars: Vec<Var>,
-    pub index: IndexWidth,
-    pub grid: [ScalarId; 3],
-    pub warps: u32,
+    pub(crate) name: String,
+    pub(crate) params: Vec<Param>,
+    pub(crate) vars: Vec<Var>,
+    pub(crate) index: IndexWidth,
+    pub(crate) grid: [ScalarId; 3],
+    pub(crate) warps: u32,
     /// How the warps spread a block-wide register tile: every warp, or a
     /// whole grid of them where the others run only inside
     /// [`Stmt::Warps`].
-    pub warp_grid: crate::layouts::WarpGrid,
-    pub smem: Vec<SmemAlloc<P>>,
-    pub scalars: Vec<Scalar>,
-    pub values: Vec<Value>,
-    pub body: Block<P>,
+    pub(crate) warp_grid: crate::layouts::WarpGrid,
+    pub(crate) smem: Vec<SmemAlloc<P>>,
+    pub(crate) scalars: Vec<Scalar>,
+    pub(crate) values: Vec<Value>,
+    pub(crate) body: Block<P>,
     /// Register values the author holds under a fixed layout; a consumer
     /// wanting another re-holds them (a probe of what that costs, say).
-    pub pins: Vec<(ValId, TileLayout)>,
+    pub(crate) pins: Vec<(ValId, TileLayout)>,
     /// Every register value's layout, by [`ValId`], once laid.
-    pub layouts: P::Layouts,
+    pub(crate) layouts: P::Layouts,
 }
 
 impl<P: Phase> Program<P> {
     /// The program's declarations in phase `Q`, each shared allocation's
     /// storage through `storage` (by index) and the layouts `layouts`, with
     /// an empty body; and the body in this phase, for `Q`'s pass to place.
-    pub fn rephase<Q: Phase>(
+    pub(crate) fn rephase<Q: Phase>(
         self,
         storage: impl FnMut(usize, P::Storage) -> Q::Storage,
         layouts: Q::Layouts,
@@ -868,6 +881,17 @@ impl<P: Phase> Program<P> {
         (prog, body)
     }
 
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    /// The parameters in launch order, each with the access its kernel
+    /// recorded.
+    pub fn params(&self) -> &[Param] {
+        &self.params
+    }
+    pub fn body(&self) -> &Block<P> {
+        &self.body
+    }
     pub fn value(&self, id: ValId) -> &Value {
         &self.values[id.index()]
     }
