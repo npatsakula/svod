@@ -412,7 +412,7 @@ fn gemm_nt_crews(m: usize, n: usize, k: usize, tile: [usize; 3]) -> Program {
         order: Default::default(),
         tail: None,
     };
-    gemm::<BF16>(&assumed(GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default() }, cfg))
+    gemm::<BF16>(&assumed(gemm_spec(m, n, k), cfg))
 }
 
 fn gemm_nt_batched(m: usize, n: usize, k: usize, tile: [usize; 3], stages: usize, batch: Batch) -> Program {
@@ -424,7 +424,12 @@ fn gemm_nt_batched(m: usize, n: usize, k: usize, tile: [usize; 3], stages: usize
         order: Default::default(),
         tail: None,
     };
-    gemm::<BF16>(&assumed(GemmSpec { m, n, k, batch, epilogue: Epilogue::default() }, cfg))
+    gemm::<BF16>(&assumed(GemmSpec { batch, ..gemm_spec(m, n, k) }, cfg))
+}
+
+/// A single `m×n×k` GEMM with no epilogue.
+pub(super) fn gemm_spec(m: usize, n: usize, k: usize) -> GemmSpec {
+    GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT }
 }
 
 /// The next value of a 64-bit LCG stepping `seed`, uniform in `[-1, 1)`.

@@ -18,22 +18,14 @@ fn data(n: usize, seed: &mut u64) -> Vec<f64> {
     super::rounded(ScalarDType::BFloat16, n, seed, |x| x)
 }
 
-fn check(prog: Program, inputs: Vec<Vec<f64>>, out_elems: usize, tol: f64) {
+fn check(prog: Program, mut params: Vec<Vec<f64>>, out_elems: usize, tol: f64) {
     let Some(target) = super::cp_async_target() else { return };
-    let mut params = inputs.clone();
     params.push(vec![0.0; out_elems]);
-    let want = run(&prog, params, &[]).unwrap();
-    let lowering = Lowering::new(&declared(target));
-    let tensors: Vec<Tensor> = inputs
-        .iter()
-        .map(|v| Tensor::from_slice(v.iter().map(|&x| x as f32).collect::<Vec<_>>()).cast(DType::BFloat16))
-        .collect();
-    let out = Tensor::empty(&[out_elems], DType::Float32);
-    let mut refs: Vec<&Tensor> = tensors.iter().collect();
-    refs.push(&out);
-    let got: Vec<f32> = graph_launch(prog, &lowering, &refs).unwrap().to_vec::<f32>().unwrap();
-    let worst = got.iter().zip(want.last().unwrap()).map(|(g, w)| (*g as f64 - w).abs()).fold(0.0, f64::max);
-    assert!(worst < tol, "max abs diff {worst}");
+    let want = run(&prog, params.clone(), &[]).unwrap();
+    let params = super::device::poisoned(&prog, &params);
+    let got = super::targets::on_device(prog, &Lowering::new(&declared(target)), &params).pop().flatten().expect("out");
+    let worst = got.iter().zip(want.last().unwrap()).map(|(g, w)| (g - w).abs()).fold(0.0, f64::max);
+    assert!(worst < tol && !got.iter().any(|g| g.is_nan()), "max abs diff {worst}, or an element left unwritten");
 }
 
 /// `s = q · kᵀ` with Q loaded straight from global memory into the A layout

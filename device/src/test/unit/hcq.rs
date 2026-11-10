@@ -6,6 +6,7 @@ use crate::hcq::{
     RuntimePatchValues, SemanticLinkedPlan, SemanticLinkedSubmission, StoreScope, Submission, SubmissionExecutionError,
     SystemField, SystemPatchValues, TopologyOperation, TopologyOperationKind, TopologyResource, schedule_device_lanes,
 };
+use proptest::strategy::Strategy;
 use svod_dtype::{AddrSpace, DType, DeviceSpec};
 use svod_ir::ops;
 
@@ -515,6 +516,31 @@ fn topology_hazards_wait_for_the_producer_lane(
     let expected: &[LaneWait] = if hazard { &[LaneWait { lane: producer, value: 1 }] } else { &[] };
     assert_eq!(lanes[1].waits, expected);
     assert_eq!(null_order(lanes), [0, 1]);
+}
+
+fn byte_spans() -> impl Strategy<Value = Vec<(usize, usize)>> {
+    proptest::collection::vec((0usize..24, 1usize..9).prop_map(|(start, len)| (start, start + len)), 0..3)
+}
+
+proptest::proptest! {
+    /// Over non-empty byte ranges, the consumer waits exactly when it and the
+    /// producer touch a common byte and at least one of them writes it.
+    #[test]
+    fn topology_hazards_are_overlaps_with_a_write(
+        producer_reads in byte_spans(),
+        producer_writes in byte_spans(),
+        consumer_reads in byte_spans(),
+        consumer_writes in byte_spans(),
+    ) {
+        let bytes = |ranges: &[(usize, usize)]| {
+            ranges.iter().fold(0u32, |mask, &(start, end)| mask | ((1u32 << end) - (1u32 << start)))
+        };
+        let [pr, pw, cr, cw] = [&producer_reads, &producer_writes, &consumer_reads, &consumer_writes].map(|r| bytes(r));
+        let hazard = pw & (cr | cw) != 0 || pr & cw != 0;
+        topology_hazards_wait_for_the_producer_lane(
+            &producer_reads, &producer_writes, &consumer_reads, &consumer_writes, hazard,
+        );
+    }
 }
 
 #[test]

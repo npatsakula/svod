@@ -6,7 +6,7 @@ use svod_dtype::{DType, ScalarDType, default_device::default_device};
 use svod_tensor::Tensor;
 use test_case::test_case;
 
-use super::declared;
+use super::{declared, gemm_spec};
 use crate::atoms::{Core, Device, Fill};
 use crate::build::*;
 use crate::interp::{round_to, run};
@@ -21,7 +21,7 @@ use crate::ops::linear::programs;
 use crate::sweep::assumed;
 
 fn plain_gemm(m: usize, n: usize, k: usize, cfg: GemmCfg) -> Program {
-    gemm::<BF16>(&assumed(GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default() }, cfg))
+    gemm::<BF16>(&assumed(gemm_spec(m, n, k), cfg))
 }
 
 /// The GEMM configs the tuner times on the device for `spec`'s shape (its
@@ -39,6 +39,14 @@ pub(super) fn device_gemms(planner: &Planner, spec: &GemmSpec) -> (Vec<GemmCfg>,
         build,
     );
     (admitted, pick.expect("a GEMM the planner runs"))
+}
+
+/// `params` with each output `prog` only writes ([`ParamKind::Out`]) NaN:
+/// an element the device never writes then fails any check of it.
+pub(super) fn poisoned(prog: &Program, params: &[Vec<f64>]) -> Vec<Vec<f64>> {
+    let poison =
+        |(p, v): (&Param, &Vec<f64>)| if p.kind == ParamKind::Out { vec![f64::NAN; v.len()] } else { v.clone() };
+    prog.params.iter().zip(params).map(poison).collect()
 }
 
 /// The next [`lcg`](super::lcg) draw as an f32.
@@ -78,7 +86,7 @@ fn every_gemm_candidate_matches_the_interpreter() {
     let Some(planner) = super::device_planner() else { return };
     let mut cfgs = vec![];
     for (m, n, k) in [(4096, 4096, 4096), (704, 512, 512)] {
-        let spec = assumed(GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default() }, BIG);
+        let spec = assumed(gemm_spec(m, n, k), BIG);
         cfgs.extend(device_gemms(&planner, &spec).0.into_iter().filter(|c| !cfgs.contains(c)).collect::<Vec<_>>());
     }
     for cfg in cfgs {
@@ -105,8 +113,8 @@ fn warpgroup_gemm_matches_the_warp_core(tile: [usize; 3], group: [u32; 2], warp:
     let (m, n, k) = (tile[0] * 2 - 5, tile[1] + 8, tile[2] * 5);
     let cfgs = [(Core::Group, group), (Core::Warp, warp)]
         .map(|(core, warps)| GemmCfg { core, ..gemm_cfg(tile, stages, warps, false) });
-    let outs: Vec<Vec<f32>> = cfgs.iter().map(|cfg| check_gemm(&device, m, n, k, *cfg)).collect();
-    let (same, worst) = outs[0].iter().zip(&outs[1]).fold((0usize, 0.0f32), |(same, worst), (g, w)| {
+    let outs: Vec<Vec<f64>> = cfgs.iter().map(|cfg| check_gemm(&device, m, n, k, *cfg)).collect();
+    let (same, worst) = outs[0].iter().zip(&outs[1]).fold((0usize, 0.0f64), |(same, worst), (g, w)| {
         (same + usize::from(g.to_bits() == w.to_bits()), worst.max((g - w).abs() / w.abs().max(1.0)))
     });
     eprintln!(
@@ -156,27 +164,18 @@ pub(super) const BIG: GemmCfg = gemm_cfg([128, 128, 32], 2, [2, 4], true);
 
 /// The device's result, checked against the interpreter's within the
 /// rounding a bf16 store and f32 accumulation allow.
-fn check_gemm(device: &Device, m: usize, n: usize, k: usize, cfg: GemmCfg) -> Vec<f32> {
+fn check_gemm(device: &Device, m: usize, n: usize, k: usize, cfg: GemmCfg) -> Vec<f64> {
     let prog = plain_gemm(m, n, k, cfg);
     let lowering = cfg.lowering(device);
     let mut seed = 11;
-    let a: Vec<f32> = (0..m * k).map(|_| round_to(ScalarDType::BFloat16, lcg(&mut seed) as f64) as f32).collect();
-    let b: Vec<f32> = (0..n * k).map(|_| round_to(ScalarDType::BFloat16, lcg(&mut seed) as f64) as f32).collect();
-    let want = run(
-        &prog,
-        vec![a.iter().map(|&x| x as f64).collect(), b.iter().map(|&x| x as f64).collect(), vec![0.0; m * n]],
-        &[],
-    )
-    .unwrap();
-
-    let a_t = Tensor::from_slice(&a).cast(DType::BFloat16);
-    let b_t = Tensor::from_slice(&b).cast(DType::BFloat16);
-    let c_t = Tensor::empty(&[m * n], DType::BFloat16);
-    let out = graph_launch(prog, &lowering, &[&a_t, &b_t, &c_t]).unwrap();
-    let got: Vec<f32> = out.cast(DType::Float32).to_vec::<f32>().unwrap();
+    let mut draw =
+        |len: usize| -> Vec<f64> { (0..len).map(|_| round_to(ScalarDType::BFloat16, lcg(&mut seed) as f64)).collect() };
+    let params = vec![draw(m * k), draw(n * k), vec![0.0; m * n]];
+    let want = run(&prog, params.clone(), &[]).unwrap();
+    let got = super::targets::on_device(prog.clone(), &lowering, &poisoned(&prog, &params)).pop().flatten().expect("c");
     let mut worst = 0.0f64;
     for (i, (g, w)) in got.iter().zip(&want[2]).enumerate() {
-        let diff = (*g as f64 - w).abs();
+        let diff = (g - w).abs();
         worst = worst.max(diff);
         assert!(diff <= 1.6e-2 * w.abs().max(1.0), "{cfg:?}: c[{}, {}] = {g}, interpreter {w}", i / n, i % n);
     }
@@ -192,7 +191,7 @@ fn a_batch_past_i32_lands_at_its_stride() {
     let Some(planner) = super::device_planner() else { return };
     let (batches, m, n, k) = (2, 50_001, 50_001, 32);
     let cfg = planner.gemm_ranked(batches, m, n, k, &Epilogue::DEFAULT)[0];
-    let spec = assumed(GemmSpec { m, n, k, batch: Batch::Static(batches), epilogue: Epilogue::default() }, cfg);
+    let spec = assumed(GemmSpec { batch: Batch::Static(batches), ..gemm_spec(m, n, k) }, cfg);
     let mut seed = 17;
     let mut draw = |len: usize| {
         (0..len).map(|_| round_to(ScalarDType::BFloat16, lcg(&mut seed) as f64) as f32).collect::<Vec<_>>()
@@ -713,12 +712,10 @@ fn a_flip_of_the_accumulator_matches_the_interpreter(grid: [u32; 2], half: usize
     });
     let prog = prog;
     let xs: Vec<f64> = (0..rows * cols).map(|i| i as f64).collect();
-    let want = run(&prog, vec![xs.clone(), vec![0.0; rows * cols]], &[]).unwrap();
-    let x_t = Tensor::from_slice(xs.iter().map(|&v| v as f32).collect::<Vec<_>>());
-    let y_t = Tensor::empty(&[rows * cols], DType::Float32);
-    let got = graph_launch(prog, &Lowering::new(&declared(target)), &[&x_t, &y_t]).unwrap();
-    let got: Vec<f64> = got.to_vec::<f32>().unwrap().into_iter().map(f64::from).collect();
-    assert_eq!(got, want[1]);
+    let params = vec![xs, vec![0.0; rows * cols]];
+    let want = run(&prog, params.clone(), &[]).unwrap();
+    let got = super::targets::on_device(prog.clone(), &Lowering::new(&declared(target)), &poisoned(&prog, &params));
+    assert_eq!(got[1].as_ref(), Some(&want[1]));
 }
 
 /// A periodic view of a bf16 table with gathered rows reads into registers
@@ -745,12 +742,10 @@ fn a_periodic_table_matches_the_interpreter(period: usize) {
     let prog = prog;
     let mut seed = 3;
     let xs = super::rounded(ScalarDType::BFloat16, table_rows * period, &mut seed, |x| x);
-    let want = run(&prog, vec![xs.clone(), vec![0.0; rows * cols]], &[]).unwrap();
-    let x_t = Tensor::from_slice(xs.iter().map(|&v| v as f32).collect::<Vec<_>>()).cast(DType::BFloat16);
-    let y_t = Tensor::empty(&[rows * cols], DType::Float32);
-    let got = graph_launch(prog, &Lowering::new(&declared(target)), &[&x_t, &y_t]).unwrap();
-    let got: Vec<f64> = got.to_vec::<f32>().unwrap().into_iter().map(f64::from).collect();
-    assert_eq!(got, want[1]);
+    let params = vec![xs, vec![0.0; rows * cols]];
+    let want = run(&prog, params.clone(), &[]).unwrap();
+    let got = super::targets::on_device(prog.clone(), &Lowering::new(&declared(target)), &poisoned(&prog, &params));
+    assert_eq!(got[1].as_ref(), Some(&want[1]));
 }
 
 /// The configs the tuner admits for a fused projection that turns its
@@ -763,7 +758,7 @@ fn turning_gemms_match_the_interpreter() {
     let (m, n, k, d) = (200, 576, 128, 64);
     let rope = Rope { heads: 6, head_dim: d, seq: 50 };
     let epilogue = Epilogue { rope: Some(rope), ..Epilogue::DEFAULT };
-    let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue };
+    let spec = GemmSpec { epilogue, ..gemm_spec(m, n, k) };
     let ranked: Vec<GemmCfg> = planner.gemm_ranked(1, m, n, k, &epilogue).to_vec();
     let build = |cfg| vec![(gemm::<BF16>(&assumed(spec.clone(), cfg)), cfg.lowering(&planner.device))];
     let shape = [1, m, n, k];
@@ -786,16 +781,15 @@ fn turning_gemms_match_the_interpreter() {
             (round_to(ScalarDType::BFloat16, angle.cos()), round_to(ScalarDType::BFloat16, angle.sin()))
         })
         .unzip();
-    let tensor = |v: &[f64]| Tensor::from_slice(v.iter().map(|&x| x as f32).collect::<Vec<_>>()).cast(DType::BFloat16);
-    let (a_t, b_t, cos_t, sin_t) = (tensor(&a), tensor(&b), tensor(&cos), tensor(&sin));
+    let params = vec![a, b, cos, sin, vec![0.0; m * n]];
     for cfg in &cfgs {
         let prog = gemm::<BF16>(&assumed(spec.clone(), *cfg));
-        let want = run(&prog, vec![a.clone(), b.clone(), cos.clone(), sin.clone(), vec![0.0; m * n]], &[]).unwrap();
-        let c_t = Tensor::empty(&[m * n], DType::BFloat16);
-        let got = graph_launch(prog, &cfg.lowering(&planner.device), &[&a_t, &b_t, &cos_t, &sin_t, &c_t]).unwrap();
-        let got: Vec<f32> = got.cast(DType::Float32).to_vec::<f32>().unwrap();
+        let want = run(&prog, params.clone(), &[]).unwrap();
+        let device_params = poisoned(&prog, &params);
+        let got = super::targets::on_device(prog, &cfg.lowering(&planner.device), &device_params).pop().flatten();
+        let got = got.expect("c");
         for (i, (g, w)) in got.iter().zip(&want[4]).enumerate() {
-            let diff = (*g as f64 - w).abs();
+            let diff = (g - w).abs();
             assert!(diff <= 1.6e-2 * w.abs().max(1.0), "{cfg:?}: c[{}, {}] = {g}, interpreter {w}", i / n, i % n);
         }
         eprintln!("{cfg:?}: matches");
@@ -821,7 +815,7 @@ fn a_tail_split_matches_the_interpreter(wave: usize) {
     let stages = planner.device.target.fill.stages(2);
     let cfg = GemmCfg { order, tail: Some(split), ..gemm_cfg([64, 64, 64], stages, [2, 2], false) };
     let epilogue = Epilogue { bias: true, act: Act::Gelu, residual: true, ..Epilogue::DEFAULT };
-    let spec = assumed(GemmSpec { m, n, k, batch: Batch::Static(1), epilogue }, cfg);
+    let spec = assumed(GemmSpec { epilogue, ..gemm_spec(m, n, k) }, cfg);
     let tail = TailSpec { gemm: spec.clone(), plan: TailPlan::new(12, wave, split).expect("a tail") };
     let mut seed = 29;
     let mut draw = |len: usize| (0..len).map(|_| round_to(ScalarDType::BFloat16, lcg(&mut seed) as f64)).collect();

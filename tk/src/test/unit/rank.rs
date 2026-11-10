@@ -5,17 +5,18 @@
 use crate::sweep::assumed;
 use test_case::test_case;
 
-use super::Scratch;
+use super::tune::write_store;
+use super::{Scratch, gemm_spec, self_join};
 use svod_dtype::{AmdArch, ScalarDType};
 
 use crate::atoms::{Target, sm86};
 use crate::ir::Schedule;
 use crate::kernels::Batch;
-use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec};
+use crate::kernels::gemm::{Epilogue, GemmCfg};
 use crate::ops::config::{GemmProblem, Planner, Tiled, representatives};
 use crate::ops::tuned;
 use crate::rank;
-use crate::tune::{Entry, Kind, TuneKey, TuneStore};
+use crate::tune::{Entry, FORMAT, Kind, TuneKey, TuneStore};
 
 /// Spearman's ρ of a perfect order, an inverted one, ties, and a side with
 /// no variance at all.
@@ -39,13 +40,13 @@ fn spearman_correlates(a: &[f64], b: &[f64], want: Option<f64>) {
 /// the store makes.
 fn store(dir: &std::path::Path, ns: impl Fn(usize) -> u64) -> Planner {
     let target = sm86();
-    let file = TuneStore::at(Some(dir.to_path_buf())).file("sm_86-28sm").expect("a file");
-    let mut text = format!("format {}\n", crate::tune::FORMAT);
     let mut guessed = crate::probe::GUESSED;
-    for (name, value) in guessed.fields() {
-        text += &format!("value|probe:{name}|sm_86-28sm|Float16|0|0|0|0 {}\n", (*value * 1e6) as u64);
-    }
-    std::fs::write(&file, &text).expect("written");
+    let mut lines: Vec<String> = guessed
+        .fields()
+        .into_iter()
+        .map(|(name, value)| format!("value|probe:{name}|sm_86-28sm|Float16|0|0|0|0 {}", (*value * 1e6) as u64))
+        .collect();
+    write_store(dir, "sm_86-28sm", FORMAT, &lines);
     let measured = crate::probe::stored(dir, &target).expect("the file's costs");
     let planner = Planner::measured(target.clone(), measured).expect("an SM count");
     let ranked = planner.gemm_ranked(1, 512, 512, 512, &Epilogue::DEFAULT);
@@ -61,10 +62,13 @@ fn store(dir: &std::path::Path, ns: impl Fn(usize) -> u64) -> Planner {
     timed.sort_by_key(|&(_, ns)| ns);
     let at: Vec<(usize, String)> = at.iter().map(|&i| (i, reps[i].code())).collect();
     let timed: Vec<(usize, String, u64)> = timed.into_iter().map(|(i, ns)| (i, admitted[i].code(), ns)).collect();
-    text += &format!("{} {}\n", keyed("", &reps).line(Kind::Admitted, 1), Entry::Admitted(at.into()).render());
-    text +=
-        &format!("{} {}\n", keyed(" screened", &admitted).line(Kind::Choice, 1), Entry::Choice(timed.into()).render());
-    std::fs::write(&file, &text).expect("written");
+    lines.push(format!("{} {}", keyed("", &reps).line(Kind::Admitted, 1), Entry::Admitted(at.into()).render()));
+    lines.push(format!(
+        "{} {}",
+        keyed(" screened", &admitted).line(Kind::Choice, 1),
+        Entry::Choice(timed.into()).render()
+    ));
+    write_store(dir, "sm_86-28sm", FORMAT, &lines);
     planner
 }
 
@@ -139,19 +143,10 @@ fn a_line_no_ranking_makes_replays_from_its_own_configs() {
 /// theirs.
 #[test]
 fn the_epilogue_clusters_scale_their_own_constants() {
-    use crate::kernels::nearest::{Floors, Metric};
+    use crate::kernels::nearest::Metric;
     use crate::ops::config::Weights;
     let mut planner = super::planner(crate::atoms::sm86());
-    let problem = |k| crate::ops::config::NearestProblem {
-        n: 1 << 14,
-        m: 1 << 14,
-        d: 128,
-        dtype: ScalarDType::Float16,
-        metric: Metric::SquaredL2,
-        floors: Floors::default(),
-        groups: false,
-        k,
-    };
+    let problem = |k| self_join(1 << 14, 1 << 14, 128, Metric::SquaredL2, k);
     let cost =
         |planner: &Planner, p: &crate::ops::config::NearestProblem, cfg: &crate::kernels::nearest::NearestCfg| {
             p.admit(planner, cfg).expect("admitted").0
@@ -197,10 +192,8 @@ fn the_op_layers_tuning_reads_the_same_line() {
     let dir = Scratch::new("rank-op");
     let planner = store(&dir, |at| [900, 800, 700, 600][at]);
     let ranked = planner.gemm_ranked(1, 512, 512, 512, &Epilogue::DEFAULT);
-    let spec = GemmSpec { m: 512, n: 512, k: 512, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT };
-    let pick =
-        tuned::linear(&TuneStore::replay(dir.to_path_buf()), &planner, svod_dtype::DType::BFloat16, &ranked, spec)
-            .cfg();
+    let store = TuneStore::replay(dir.to_path_buf());
+    let pick = tuned::linear(&store, &planner, svod_dtype::DType::BFloat16, &ranked, gemm_spec(512, 512, 512)).cfg();
     assert_eq!(pick, representatives(&ranked)[3], "the line's fastest, at 600 ns");
 }
 
@@ -278,16 +271,7 @@ fn the_listing_static_decomposition_maps_its_programs() {
     let target = sm86();
     let device = crate::atoms::Device { target: target.clone(), costs: crate::probe::GUESSED };
     let lowering = crate::lower::Lowering::new(&device);
-    let problem = |k| crate::ops::config::NearestProblem {
-        n: 1 << 16,
-        m: 1 << 16,
-        d: 128,
-        dtype: ScalarDType::Float16,
-        metric: Metric::SquaredL2,
-        floors: Floors::default(),
-        groups: false,
-        k,
-    };
+    let problem = |k| self_join(1 << 16, 1 << 16, 128, Metric::SquaredL2, k);
     let lanes = |w, d, p| Some(LaneQueue { width: Pow2::of(w), depth: Pow2::of(d), passes: p });
     let base = |bkv, lanes, queue: Option<usize>| NearestCfg {
         bq: 128,

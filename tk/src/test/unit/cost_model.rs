@@ -1,10 +1,10 @@
-//! The planner's cost model against the device: every config a ranking
-//! admits for a few GEMM and attention shapes (4096³, model projections,
-//! flash attention at d64/d128 with and without a causal mask) compiled and
-//! timed beside the ns the model ranks it at, and the tuner's pick timed
-//! with them. One `fit|…` line a config and a `pick|…` line a shape, for an
-//! offline fit of rank correlation and regret; never asserts. And the
-//! model's terms on the host, from fixture costs.
+//! The planner's cost model: its terms on the host, from fixture costs and
+//! the pairs devices measured; and against the device, every config a
+//! ranking admits for a few GEMM and attention shapes (4096³, model
+//! projections, flash attention at d64/d128 with and without a causal mask)
+//! compiled and timed beside the ns the model ranks it at, and the tuner's
+//! pick timed with them: one `fit|…` line a config and a `pick|…` line a
+//! shape, for an offline fit of rank correlation and regret (printed only).
 
 use proptest::prelude::*;
 
@@ -60,11 +60,11 @@ fn report<C: std::fmt::Debug>(
     eprintln!("pick|{label}|{}|{pick:?}", show(&ns[ranked.len()]));
 }
 
-/// The GEMM shapes: `(label, m, n, k, epilogue)`.
 /// The probed layers' epilogues beside the plain one.
 const RESIDUAL: Epilogue = Epilogue { residual: true, ..Epilogue::DEFAULT };
 const SWIGLU: Epilogue = Epilogue { act: Act::Silu, gated: true, ..Epilogue::DEFAULT };
 
+/// The GEMM shapes: `(label, m, n, k, epilogue)`.
 fn gemm_shapes() -> Vec<(&'static str, usize, usize, usize, Epilogue)> {
     let plain = Epilogue::default();
     let gelu = Epilogue { act: Act::Gelu, ..plain };

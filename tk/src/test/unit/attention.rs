@@ -317,12 +317,12 @@ const fn key_warps(kw: usize, bkv: usize) -> FaCfg {
     FaCfg { key_warps: kw, ..FaCfg::new(16, bkv, 2) }
 }
 
-/// Two atom rows of queries per warp, `bq` by `bkv`, in the plain forms.
 /// A config on the wide core, one 32-row atom a warp.
 const fn wide(bq: usize, bkv: usize) -> FaCfg {
     FaCfg { core: Core::Wide, ..rows32(bq, bkv) }
 }
 
+/// Two atom rows of queries per warp, `bq` by `bkv`, in the plain forms.
 const fn rows32(bq: usize, bkv: usize) -> FaCfg {
     FaCfg { warp_rows: 2 * WARP_ROWS, ..FaCfg::new(bq, bkv, 2) }
 }
@@ -540,35 +540,19 @@ fn two_atom_rows_match_one_on_the_device(causal: bool, bias: bool, d: usize, bq:
         return;
     }
     let c = case(one.clone(), &[150, 77]);
-    let to_bf16 = |v: &[f64]| Tensor::from_slice(v.iter().map(|&x| x as f32).collect::<Vec<_>>()).cast(DType::BFloat16);
-    let (q, k, v) = (to_bf16(&c.q), to_bf16(&c.k), to_bf16(&c.v));
-    let elems = one.batch.capacity() * one.t * one.heads * d;
-    let extras: Vec<Tensor> = one
-        .extra_params()
-        .into_iter()
-        .zip(extra_params(&c))
-        .map(|(name, v)| match name {
-            "bias" => to_bf16(&v),
-            _ => Tensor::from_slice(v.iter().map(|&x| x as i32).collect::<Vec<_>>()),
-        })
-        .collect();
-    let bits = |spec: &Admitted<AttnSpec>| -> Vec<u16> {
-        let o = Tensor::empty(&[elems], DType::BFloat16);
-        let mut tensors = vec![&q, &k, &v, &o];
-        tensors.extend(&extras);
-        let outs = graph_launch_all(flash_attention(spec), &spec.cfg().lowering(device), &tensors).unwrap();
-        let mut plan = outs[3].prepare().unwrap();
-        plan.execute_with_vars(&[("b", 2)]).unwrap();
-        let mut bytes = vec![0u8; elems * 2];
-        outs[3].buffer().unwrap().copyout(&mut bytes).unwrap();
-        bytes.chunks(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect()
+    let params = params(&c);
+    let output = |spec: &Admitted<AttnSpec>| -> Vec<f64> {
+        let (prog, lowering) = (flash_attention(spec), spec.cfg().lowering(device));
+        let params = super::device::poisoned(&prog, &params);
+        let outs = super::targets::on_device_with(prog, &lowering, &params, &[("b", 2)]);
+        outs[3].clone().expect("o")
     };
-    let (got, want) = (bits(&two), bits(&one));
-    let same = got.iter().zip(&want).filter(|(a, b)| a == b).count();
+    let (got, want) = (output(&two), output(&one));
+    let same = got.iter().zip(&want).filter(|(a, b)| a.to_bits() == b.to_bits()).count();
     assert_eq!(same, got.len(), "{} of {} outputs differ from the 16-row kernel's", got.len() - same, got.len());
     let reference = reference(&c);
-    let worst = got.iter().zip(&reference).map(|(g, w)| (super::bf16(*g) - w).abs()).fold(0.0, f64::max);
-    assert!(worst < 2e-2, "max abs diff {worst} against the reference");
+    let worst = got.iter().zip(&reference).map(|(g, w)| (g - w).abs()).fold(0.0, f64::max);
+    assert!(worst < 2e-2 && !got.iter().any(|g| g.is_nan()), "max abs diff {worst} against the reference, or a NaN");
 }
 
 /// The cache operand's first elements a decoder step never reads (its rows
@@ -753,17 +737,9 @@ fn combine_matches_the_program(t: usize, heads: usize, d: usize, splits: usize, 
     let l_part = super::rounded(ScalarDType::Float32, rows, &mut seed, |x| 1.5 + x);
     let params = vec![o_part, m_part, l_part, vec![0.0; batch * t * heads * d]];
     let want = run(&combine::<BF16>(&spec), params.clone(), &[]).unwrap().swap_remove(3);
-    let tensors: Vec<Tensor> = params
-        .iter()
-        .enumerate()
-        .map(|(i, v)| {
-            let t = Tensor::from_slice(v.iter().map(|&x| x as f32).collect::<Vec<_>>());
-            if i == 3 { t.cast(DType::BFloat16) } else { t }
-        })
-        .collect();
-    let refs: Vec<&Tensor> = tensors.iter().collect();
-    let out = graph_launch(combine::<BF16>(&spec), &Lowering::new(&declared(target)), &refs).unwrap();
-    let got: Vec<f64> = out.cast(DType::Float32).to_vec::<f32>().unwrap().into_iter().map(f64::from).collect();
+    let (prog, lowering) = (combine::<BF16>(&spec), Lowering::new(&declared(target)));
+    let params = super::device::poisoned(&prog, &params);
+    let got = super::targets::on_device(prog, &lowering, &params).swap_remove(3).expect("o");
     let worst = got.iter().zip(&want).map(|(g, w)| (g - w).abs()).fold(0.0, f64::max);
     let bad: Vec<usize> =
         got.iter().zip(&want).enumerate().filter(|(_, (g, w))| (*g - *w).abs() > 2e-2).map(|(i, _)| i).collect();
@@ -773,7 +749,7 @@ fn combine_matches_the_program(t: usize, heads: usize, d: usize, splits: usize, 
         got.len(),
         bad.first().map(|&i| (i / d, i % d))
     );
-    assert!(worst < 2e-2, "max abs diff {worst}");
+    assert!(worst < 2e-2 && !got.iter().any(|g| g.is_nan()), "max abs diff {worst}, or an element left unwritten");
 }
 
 /// The attention configs the tuner admits on the device for `spec`'s shape

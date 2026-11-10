@@ -6,8 +6,10 @@ use svod_dtype::{DType, ScalarDType};
 use svod_tensor::Tensor;
 use test_case::test_case;
 
-use super::{assert_rel_close, declared};
-use crate::atoms::{Core, sm86};
+use super::device::poisoned;
+use super::targets::on_device;
+use super::{assert_rel_close, declared, gemm_spec};
+use crate::atoms::sm86;
 use crate::build::BF16;
 use crate::interp::{round_to, run};
 use crate::ir::*;
@@ -16,26 +18,11 @@ use crate::kernels::rows::{Norm, NormCfg, NormSpec, norm};
 use crate::kernels::{Act, Batch};
 use crate::launch::graph_launch_all;
 use crate::lower::Lowering;
+use crate::ops::config::gemm_cfg;
 use crate::sweep::assumed;
 
-fn gemm_nt_epilogue(
-    m: usize,
-    n: usize,
-    k: usize,
-    tile: [usize; 3],
-    stages: usize,
-    warps: [u32; 2],
-    epi: Epilogue,
-) -> Program {
-    let cfg = GemmCfg {
-        core: Core::Warp,
-        tile,
-        warps,
-        schedule: Schedule::ring(stages, true),
-        order: Default::default(),
-        tail: None,
-    };
-    gemm::<BF16>(&assumed(GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: epi }, cfg))
+fn gemm_nt_epilogue(m: usize, n: usize, k: usize, cfg: GemmCfg, epilogue: Epilogue) -> Program {
+    gemm::<BF16>(&assumed(GemmSpec { epilogue, ..gemm_spec(m, n, k) }, cfg))
 }
 
 fn norm_rows(norm_: Norm, rows: usize, d: usize, br: usize, eps: f64, residual: bool, bias: bool) -> Program {
@@ -52,14 +39,6 @@ fn upload(params: &[Vec<f64>]) -> Vec<Tensor> {
         .iter()
         .map(|p| Tensor::from_slice(p.iter().map(|&x| x as f32).collect::<Vec<_>>()).cast(DType::BFloat16))
         .collect()
-}
-
-/// Upload the bf16 parameters, run on the device, read every parameter back.
-fn on_device(prog: Program, lowering: &Lowering, params: &[Vec<f64>]) -> Vec<Vec<f64>> {
-    let tensors = upload(params);
-    let refs: Vec<&Tensor> = tensors.iter().collect();
-    let outs = graph_launch_all(prog, lowering, &refs).unwrap();
-    outs.iter().map(|t| t.cast(DType::Float32).to_vec::<f32>().unwrap().into_iter().map(f64::from).collect()).collect()
 }
 
 // ---- GEMM epilogues ---------------------------------------------------------
@@ -105,30 +84,14 @@ fn gemm_reference(m: usize, n: usize, k: usize, epi: Epilogue, p: &[Vec<f64>]) -
 }
 
 const EPILOGUES: [Epilogue; 8] = [
-    Epilogue { bias: true, residual: false, act: Act::None, gated: false, scale: None, out_f32: false, rope: None },
-    Epilogue { bias: false, residual: true, act: Act::None, gated: false, scale: None, out_f32: false, rope: None },
-    Epilogue { bias: true, residual: false, act: Act::Gelu, gated: false, scale: None, out_f32: false, rope: None },
-    Epilogue { bias: true, residual: true, act: Act::Silu, gated: false, scale: None, out_f32: false, rope: None },
-    Epilogue { bias: true, residual: false, act: Act::Silu, gated: true, scale: None, out_f32: false, rope: None },
-    Epilogue { bias: false, residual: true, act: Act::Gelu, gated: true, scale: None, out_f32: false, rope: None },
-    Epilogue {
-        bias: true,
-        residual: true,
-        act: Act::None,
-        gated: false,
-        scale: Some(Scale::new(0.5)),
-        out_f32: false,
-        rope: None,
-    },
-    Epilogue {
-        bias: true,
-        residual: false,
-        act: Act::Silu,
-        gated: true,
-        scale: Some(Scale::new(-1.5)),
-        out_f32: false,
-        rope: None,
-    },
+    Epilogue { bias: true, ..Epilogue::DEFAULT },
+    Epilogue { residual: true, ..Epilogue::DEFAULT },
+    Epilogue { bias: true, act: Act::Gelu, ..Epilogue::DEFAULT },
+    Epilogue { bias: true, residual: true, act: Act::Silu, ..Epilogue::DEFAULT },
+    Epilogue { bias: true, act: Act::Silu, gated: true, ..Epilogue::DEFAULT },
+    Epilogue { residual: true, act: Act::Gelu, gated: true, ..Epilogue::DEFAULT },
+    Epilogue { bias: true, residual: true, scale: Some(Scale::new(0.5)), ..Epilogue::DEFAULT },
+    Epilogue { bias: true, act: Act::Silu, gated: true, scale: Some(Scale::new(-1.5)), ..Epilogue::DEFAULT },
 ];
 
 /// The interpreter applies every epilogue as the f64 reference does.
@@ -142,7 +105,7 @@ const EPILOGUES: [Epilogue; 8] = [
 #[test_case(7; "bias swiglu negative scale")]
 fn epilogue_interpreter_matches_the_reference(which: usize) {
     let (m, n, k, epi) = (64, 64, 64, EPILOGUES[which]);
-    let prog = gemm_nt_epilogue(m, n, k, [32, 32, 16], 2, [2, 2], epi);
+    let prog = gemm_nt_epilogue(m, n, k, gemm_cfg([32, 32, 16], 2, [2, 2], true), epi);
     let params = gemm_inputs(m, n, k, epi);
     let want = gemm_reference(m, n, k, epi, &params);
     let out = run(&prog, params, &[]).unwrap();
@@ -154,7 +117,7 @@ fn epilogue_interpreter_matches_the_reference(which: usize) {
 #[test]
 fn bias_vector_takes_the_accumulators_column_layout() {
     let epi = Epilogue { bias: true, ..Epilogue::default() };
-    let prog = gemm_nt_epilogue(128, 128, 64, [128, 128, 32], 2, [2, 4], epi);
+    let prog = gemm_nt_epilogue(128, 128, 64, gemm_cfg([128, 128, 32], 2, [2, 4], true), epi);
     let prog = super::laid(prog, &declared(sm86())).unwrap();
     let lay = &prog.layouts;
     let add = prog
@@ -176,21 +139,14 @@ fn bias_vector_takes_the_accumulators_column_layout() {
 #[test_case(256, 256, 256, [128, 64, 32], 2, 2, 2; "256 cubed")]
 fn epilogues_match_on_device(m: usize, n: usize, k: usize, tile: [usize; 3], stages: usize, wr: u32, wc: u32) {
     let Some(target) = super::device_target() else { return };
+    let cfg = gemm_cfg(tile, stages, [wr, wc], true);
     for epi in EPILOGUES {
-        let prog = gemm_nt_epilogue(m, n, k, tile, stages, [wr, wc], epi);
+        let prog = gemm_nt_epilogue(m, n, k, cfg, epi);
         let params = gemm_inputs(m, n, k, epi);
         let want = gemm_reference(m, n, k, epi, &params);
         let interp = run(&prog, params.clone(), &[]).unwrap();
-        let cfg = GemmCfg {
-            core: Core::Warp,
-            tile,
-            warps: [wr, wc],
-            schedule: Schedule::ring(stages, true),
-            order: Default::default(),
-            tail: None,
-        };
-        let got = on_device(prog, &cfg.lowering(&declared(target.clone())), &params);
-        let (got, interp) = (got.last().unwrap(), interp.last().unwrap());
+        let got = on_device(prog.clone(), &cfg.lowering(&declared(target.clone())), &poisoned(&prog, &params));
+        let (got, interp) = (got.last().unwrap().as_ref().expect("c"), interp.last().unwrap());
         let d_interp = assert_rel_close("c vs interpreter", got, interp, 1.6e-2);
         let d_ref = assert_rel_close("c vs reference", got, &want, 1.6e-2);
         eprintln!("{m}x{n}x{k} {epi:?}: max abs diff {d_interp:.3e} (interpreter), {d_ref:.3e} (f64)");
@@ -297,12 +253,13 @@ fn norms_match_on_device(norm: Norm, d: usize, residual: bool, bias: bool, br: u
     let params = norm_inputs(norm, rows, d, residual, bias, 5);
     let (want, want_sum) = norm_reference(norm, rows, d, eps, residual, bias, &params);
     let interp = run(&prog, params.clone(), &[]).unwrap();
-    let got = on_device(prog, &Lowering::new(&declared(target)), &params);
+    let got = on_device(prog.clone(), &Lowering::new(&declared(target)), &poisoned(&prog, &params));
     let (o, s) = norm_outputs(norm, residual, bias);
-    let d_interp = assert_rel_close("out vs interpreter", &got[o], &interp[o], 1e-2);
-    let d_ref = assert_rel_close("out vs reference", &got[o], &want, 1e-2);
+    let out = |i: usize| got[i].as_ref().expect("an output");
+    let d_interp = assert_rel_close("out vs interpreter", out(o), &interp[o], 1e-2);
+    let d_ref = assert_rel_close("out vs reference", out(o), &want, 1e-2);
     if residual {
-        assert_rel_close("sum", &got[s], &want_sum, 0.0);
+        assert_rel_close("sum", out(s), &want_sum, 0.0);
     }
     eprintln!("{norm:?} d={d} residual={residual}: max abs diff {d_interp:.3e} (interpreter), {d_ref:.3e} (f64)");
 }

@@ -1,5 +1,5 @@
 use super::test_support::{
-    MockAmdCall, MockAmdIface, amd_alloc_or_skip, ensure_hw_signal_pool, install_signal_pool, mock_device,
+    MockAmdCall, MockAmdIface, amd_alloc_or_skip, ensure_hw_signal_pool, install_signal_pool, mock_device, pool_queue,
     replay_dwords, require_multi_xcc, require_single_xcc, retire_lane, scripted_error,
 };
 use crate::allocator::RawBuffer;
@@ -173,15 +173,15 @@ fn code_upload_flushes_hdp_after_its_stores() {
 #[test]
 fn program_code_allocation_is_balanced_on_success_and_failure() {
     let Some(mock) = mock_program(EMPTY_IR, "empty", &[], false) else { return };
-    assert_eq!((mock.iface.allocation_count(), mock.iface.live_handle_count()), (1, 1));
+    assert_eq!(mock.iface.counts(), (1, 0, 1));
     drop(mock.program);
-    assert_eq!((mock.iface.free_count(), mock.iface.live_handle_count()), (1, 0));
+    assert_eq!(mock.iface.counts(), (1, 1, 0));
 
     let bytes = clang_amdgcn(EMPTY_IR, "gfx1100").expect("clang succeeded above");
     let (iface, allocator) = mock_device(1);
     iface.script_alloc(Err(scripted_error("code allocation")));
     assert!(AmdProgram::load(Arc::clone(&allocator.dev), &allocator, &bytes, "empty", &[]).is_err());
-    assert_eq!((iface.allocation_count(), iface.free_count(), iface.live_handle_count()), (0, 0, 0));
+    assert_eq!(iface.counts(), (0, 0, 0));
 }
 
 /// A kernel needing SGPR dispatch-pointer setup is rejected — after its code has
@@ -204,7 +204,7 @@ attributes #0 = { nounwind "amdgpu-flat-work-group-size"="1,1" }
         AmdProgram::load(Arc::clone(&allocator.dev), &allocator, &bytes, "dispatch_ptr_program", &[]),
         Err(Error::Runtime { message }) if message.contains("ENABLE_SGPR_DISPATCH_PTR")
     ));
-    assert_eq!((iface.allocation_count(), iface.free_count(), iface.live_handle_count()), (1, 1, 0));
+    assert_eq!(iface.counts(), (1, 1, 0));
 }
 
 // ---------------------------------------------------------- graph capture (mock)
@@ -216,15 +216,12 @@ fn graph_capture_storage_unwinds_each_post_lane_allocation() {
     // test); 7..=9 are the graph's own kernarg and command-stream buffers.
     for fail_at in 7..=9 {
         let mock = load_mock_program(&bytes, "empty", &[], true);
-        let (allocations, frees) = (mock.iface.allocation_count(), mock.iface.free_count());
-        for _ in 0..fail_at {
-            mock.iface.script_alloc(Ok(()));
-        }
-        mock.iface.script_alloc(Err(scripted_error("graph allocation")));
+        let (allocations, frees, live) = mock.iface.counts();
+        mock.iface.script_alloc_fail_at(fail_at, "graph allocation");
         let kernels = [graph_kernel(&mock.program, Vec::new(), Vec::new())];
         assert!(AmdGraph::capture(&mock.allocator, &kernels).is_err(), "fail_at={fail_at}");
-        assert_eq!(mock.iface.allocation_count() - allocations, fail_at, "fail_at={fail_at}");
-        assert_eq!(mock.iface.free_count() - frees, fail_at - 7, "fail_at={fail_at}");
+        let counts = (allocations + fail_at, frees + fail_at - 7, live + 7);
+        assert_eq!(mock.iface.counts(), counts, "fail_at={fail_at}");
         assert!(mock.iface.free_issues().is_empty());
     }
 }
@@ -329,8 +326,7 @@ fn replayed_kernargs_and_command_buffers_share_one_placement(xccs: u32, kind: Al
     // of the plain and the profiled stream.
     assert_eq!((kinds(AllocTag::Kernarg), kinds(AllocTag::CommandBuffer)), (system(2), system(2)));
 
-    let pool =
-        crate::amd::connector::PoolQueue::new_with_resources(Arc::clone(mock.device.core()), &mock.allocator).unwrap();
+    let pool = pool_queue(&mock.allocator);
     let owner = crate::amd::connector::OwnerCtx::new(Arc::clone(mock.device.core()), mock.allocator.clone());
     let calls = [crate::device::PlanCall::Program {
         program: &mock.program,
@@ -355,8 +351,7 @@ fn linked_plan_submissions_end_on_the_completion_interrupt() {
     let Some(mock) = mock_program(EMPTY_IR, "empty", &[], false) else { return };
     install_signal_pool(&mock.allocator);
     mock.iface.set_queue_event_mailbox(MAILBOX);
-    let pool =
-        crate::amd::connector::PoolQueue::new_with_resources(Arc::clone(mock.device.core()), &mock.allocator).unwrap();
+    let pool = pool_queue(&mock.allocator);
     let owner = crate::amd::connector::OwnerCtx::new(Arc::clone(mock.device.core()), mock.allocator.clone());
     let lane = crate::hcq::LaneSubmission {
         lane: crate::hcq::DeviceQueue {
@@ -424,8 +419,7 @@ fn linked_plan_replay_retires_once_every_xcc_is_done(xccs: u32) {
     let Some(bytes) = clang_amdgcn(EMPTY_IR, "gfx1100") else { return };
     let mock = load_mock_program_on(xccs, &bytes, "empty", &[], false);
     install_signal_pool(&mock.allocator);
-    let pool =
-        crate::amd::connector::PoolQueue::new_with_resources(Arc::clone(mock.device.core()), &mock.allocator).unwrap();
+    let pool = pool_queue(&mock.allocator);
     let owner = crate::amd::connector::OwnerCtx::new(Arc::clone(mock.device.core()), mock.allocator.clone());
     let calls = [crate::device::PlanCall::Program {
         program: &mock.program,
@@ -462,8 +456,7 @@ fn graph_failed_drain_quarantines_graph_program_and_queue_storage() {
     drop(kernels);
     drop(mock.program);
     assert!(mock.device.is_poisoned());
-    assert_eq!(mock.iface.allocation_count(), allocations);
-    assert_eq!((mock.iface.free_count(), mock.iface.live_handle_count()), (0, allocations));
+    assert_eq!(mock.iface.counts(), (allocations, 0, allocations));
 }
 
 /// A linked plan owns its kernargs transactionally: nothing is allocated when
@@ -473,8 +466,7 @@ fn graph_failed_drain_quarantines_graph_program_and_queue_storage() {
 fn linked_plan_capture_and_transactional_publication_own_storage() {
     let Some(mock) = mock_program(EMPTY_IR, "empty", &[], false) else { return };
     install_signal_pool(&mock.allocator);
-    let pool =
-        crate::amd::connector::PoolQueue::new_with_resources(Arc::clone(mock.device.core()), &mock.allocator).unwrap();
+    let pool = pool_queue(&mock.allocator);
     let owner = crate::amd::connector::OwnerCtx::new(Arc::clone(mock.device.core()), mock.allocator.clone());
     let lane = crate::hcq::LaneSubmission {
         lane: crate::hcq::DeviceQueue {
@@ -1139,7 +1131,7 @@ fn a_dispatch_invalidates_caches_only_after_stores_behind_them(xccs: u32) {
     let Some(bytes) = clang_amdgcn(EMPTY_IR, "gfx1100") else { return };
     let mock = load_mock_program_on(xccs, &bytes, "empty", &[], true);
     let core = mock.device.core();
-    let pool = crate::amd::connector::PoolQueue::new_with_resources(Arc::clone(core), &mock.allocator).unwrap();
+    let pool = pool_queue(&mock.allocator);
     let owner = crate::amd::connector::OwnerCtx::new(Arc::clone(core), mock.allocator.clone());
     let gfx9 = core.arch.gfx_major() == 9;
     let full: &[u32] = if gfx9 { &pm4::acquire_mem_gfx9() } else { &pm4::acquire_mem() };

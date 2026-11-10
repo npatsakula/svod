@@ -149,14 +149,8 @@ fn gathered_gemm(m: usize, n: usize, kk: usize, tile: [usize; 3], stages: usize,
 }
 
 fn reference(a: &[f64], b: &[f64], m: usize, n: usize, kk: usize) -> Vec<f64> {
-    let mut c = vec![0.0; m * n];
-    for i in 0..m {
-        let Some(s) = source(i, m) else { continue };
-        for j in 0..n {
-            c[i * n + j] = (0..kk).map(|t| a[s * kk + t] * b[j * kk + t]).sum();
-        }
-    }
-    c
+    let rows = (0..m).flat_map(|i| source(i, m).map_or(vec![0.0; kk], |s| a[s * kk..(s + 1) * kk].to_vec()));
+    super::interp::naive_gemm(&rows.collect::<Vec<_>>(), b, n, kk)
 }
 
 #[test]
@@ -166,9 +160,7 @@ fn gathered_gemm_matches_the_reference_in_the_interpreter() {
     let (a, b) = (data(m * kk, &mut seed), data(n * kk, &mut seed));
     let prog = gathered_gemm(m, n, kk, [32, 32, 32], 2, [2, 2]);
     let got = run(&prog, vec![a.clone(), b.clone(), vec![0.0; m * n]], &[]).unwrap();
-    for (i, (g, w)) in got[2].iter().zip(reference(&a, &b, m, n, kk)).enumerate() {
-        assert!((g - w).abs() <= 1e-4 * w.abs().max(1.0), "c[{}, {}] = {g}, want {w}", i / n, i % n);
-    }
+    super::assert_rel_close("c", &got[2], &reference(&a, &b, m, n, kk), 1e-4);
 }
 
 /// `target` filling as `fill` does.

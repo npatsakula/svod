@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use proptest::prelude::*;
 use svod_dtype::{AmdArch, DType};
 use svod_ir::uop::eval::{eval_binary_op, eval_unary_op};
 use svod_ir::{ConstValue, Op, UOp, ops};
@@ -13,7 +14,7 @@ use crate::atoms::{Core, Costs, Device, Fill, Target};
 use crate::build::*;
 use crate::ir::*;
 use crate::kernels::Batch;
-use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
+use crate::kernels::gemm::{GemmSpec, gemm};
 use crate::kernels::rows::{Norm, NormCfg, NormSpec, norm};
 use crate::lower::Lowering;
 use crate::lower::emit::minimum;
@@ -35,42 +36,63 @@ fn f32(v: f64) -> Arc<UOp> {
     UOp::const_(DType::Float32, ConstValue::Float(v))
 }
 
-/// A float minimum is exact where `a + b - max(a, b)` is not: at an
-/// infinity (`inf - inf`), and where one side absorbs the other.
-#[test_case(f64::INFINITY, 1.0, 1.0; "an infinity")]
-#[test_case(f64::NEG_INFINITY, 1.0, f64::NEG_INFINITY; "a negative infinity")]
-#[test_case(1e30, 1.0, 1.0; "an absorbed side")]
-#[test_case(-3.0, 2.0, -3.0; "a negative side")]
-#[test_case(f64::NAN, 2.0, 2.0; "a NaN is ignored as max ignores it")]
-fn a_float_minimum_is_exact(a: f64, b: f64, want: f64) {
+/// `min(a, b)` over f32 constants, either way round, is [`f64::min`]: a NaN
+/// side ignored as max ignores it, either zero for a zero.
+fn assert_float_minimum(a: f64, b: f64) {
     for (x, y) in [(a, b), (b, a)] {
-        let got = eval(&minimum(&f32(x), &f32(y)).unwrap());
-        assert_eq!(got, ConstValue::Float(want), "min({x}, {y})");
+        let ConstValue::Float(got) = eval(&minimum(&f32(x), &f32(y)).unwrap()) else { panic!("a float") };
+        let want = x.min(y);
+        assert!(got == want || got.is_nan() && want.is_nan(), "min({x}, {y}) = {got}");
     }
 }
 
-/// An integer minimum is exact.
-#[test_case(-7, 3; "mixed signs")]
-#[test_case(5, 5; "equal sides")]
-fn an_integer_minimum_is_exact(a: i64, b: i64) {
-    let c = |v| UOp::const_(DType::Int32, ConstValue::Int(v));
-    assert_eq!(eval(&minimum(&c(a), &c(b)).unwrap()), ConstValue::Int(a.min(b)));
+/// A float minimum is exact where `a + b - max(a, b)` is not: at an
+/// infinity (`inf - inf`), and where one side absorbs the other.
+#[test_case(f64::INFINITY, 1.0; "an infinity")]
+#[test_case(f64::NEG_INFINITY, 1.0; "a negative infinity")]
+#[test_case(1e30, 1.0; "an absorbed side")]
+#[test_case(f64::NAN, 2.0; "a NaN is ignored as max ignores it")]
+fn a_float_minimum_is_exact(a: f64, b: f64) {
+    assert_float_minimum(a, b);
 }
 
-/// An integer minimum's range is the minimum of its sides' ranges, plain and
-/// sound: no wider than either side, as an index bounded by one side is.
-#[test_case((0, 9), (3, 5); "one range inside the other")]
-#[test_case((0, 9), (10, 20); "disjoint")]
-#[test_case((-4, 6), (2, 30); "overlapping")]
-fn an_integer_minimum_keeps_its_range_exact(a: (i64, i64), b: (i64, i64)) {
-    use svod_ir::uop::cached_property::CachedProperty;
-    use svod_ir::uop::properties::SoundVminVmaxProperty;
-    let x = UOp::scalar_param(0, Some("x".into()), DType::Int32, a.0, a.1);
-    let y = UOp::scalar_param(1, Some("y".into()), DType::Int32, b.0, b.1);
-    let m = minimum(&x, &y).unwrap();
-    let want = (ConstValue::Int(a.0.min(b.0)), ConstValue::Int(a.1.min(b.1)));
-    assert_eq!((*m.vmin(), *m.vmax()), want, "plain range");
-    assert_eq!(*SoundVminVmaxProperty::get(&m), Some(want), "sound range");
+/// Integers other than `i32::MIN`, which [`minimum`]'s negation wraps,
+/// either side as often the other's.
+fn ints() -> impl Strategy<Value = (i64, i64)> {
+    let int = || -i64::from(i32::MAX)..=i64::from(i32::MAX);
+    int().prop_flat_map(move |a| (Just(a), prop_oneof![Just(a), int()]))
+}
+
+proptest! {
+    /// A float minimum is exact whatever its sides.
+    #[test]
+    fn any_float_minimum_is_exact(a in any::<f32>(), b in any::<f32>()) {
+        assert_float_minimum(f64::from(a), f64::from(b));
+    }
+
+    /// An integer minimum is exact.
+    #[test]
+    fn an_integer_minimum_is_exact((a, b) in ints()) {
+        let c = |v| UOp::const_(DType::Int32, ConstValue::Int(v));
+        prop_assert_eq!(eval(&minimum(&c(a), &c(b)).unwrap()), ConstValue::Int(a.min(b)));
+    }
+
+    /// An integer minimum's range is the minimum of its sides' ranges, plain
+    /// and sound: no wider than either side, as an index bounded by one side
+    /// is, whether one range holds the other, they overlap or they are
+    /// disjoint.
+    #[test]
+    fn an_integer_minimum_keeps_its_range_exact((a0, a1) in ints(), (b0, b1) in ints()) {
+        use svod_ir::uop::cached_property::CachedProperty;
+        use svod_ir::uop::properties::SoundVminVmaxProperty;
+        let (a, b) = ((a0.min(a1), a0.max(a1)), (b0.min(b1), b0.max(b1)));
+        let x = UOp::scalar_param(0, Some("x".into()), DType::Int32, a.0, a.1);
+        let y = UOp::scalar_param(1, Some("y".into()), DType::Int32, b.0, b.1);
+        let m = minimum(&x, &y).unwrap();
+        let want = (ConstValue::Int(a.0.min(b.0)), ConstValue::Int(a.1.min(b.1)));
+        prop_assert_eq!((*m.vmin(), *m.vmax()), want, "plain range");
+        prop_assert_eq!(*SoundVminVmaxProperty::get(&m), Some(want), "sound range");
+    }
 }
 
 /// Lowered, a float tile's elementwise and reduced minimum add and subtract
@@ -194,9 +216,8 @@ fn a_guarded_scalar_read_stays_under_its_guard(max: i64, div: i64, guarded: bool
 
 /// A loop whose extent may fall below zero runs no trip, as the interpreter
 /// runs none: the backend compares a range's counter unsigned, so a negative
-/// end would run billions of trips (a listing's share of steps starting
-/// past the last read 8 GB before its scores on sm_86), and the emitter
-/// floors an extent the bounds let below zero. One the bounds keep at or
+/// end would run billions of trips, and the emitter floors an extent the
+/// bounds let below zero. One the bounds keep at or
 /// above zero is listed as it is: a share's count less one where it is
 /// positive (a register-staged ring's steady trips, `x − [0 < x]`) is
 /// bounded as such, not a step under the count's own low.
@@ -234,9 +255,6 @@ fn a_loop_extent_below_zero_runs_no_trip(steps: i64, steady: bool, floored: bool
     assert_eq!(max0(&end), floored, "range end {:?}", end.op().as_ref());
 }
 
-/// A tile re-held through the relayout scratch lowers in a program that
-/// interns no zero: the scratch is addressed from its start, not at an
-/// offset scalar of the program.
 /// A program emitting more instructions than a kernel may on its target
 /// ([`crate::atoms::Target::most_instructions`]: the CUDA bound above the
 /// AMD one) is refused by the lowering, before any compiler sees it,
@@ -270,6 +288,9 @@ fn a_program_past_the_instruction_bound_is_refused() {
     assert_eq!(err.to_string(), format!("huge emits {instructions} instructions, past the {most} a kernel may"));
 }
 
+/// A tile re-held through the relayout scratch lowers in a program that
+/// interns no zero: the scratch is addressed from its start, not at an
+/// offset scalar of the program.
 #[test]
 fn a_relayout_through_shared_memory_needs_no_zero_of_the_program() {
     use crate::layouts::{Relayout, chunked};
@@ -289,7 +310,6 @@ fn a_relayout_through_shared_memory_needs_no_zero_of_the_program() {
         let dst = k.view(y, tile.elems(), [tile.cols, 1], tile, [None, None]);
         k.store(dst, b);
     });
-    let prog = prog;
     assert!(!prog.scalars.contains(&Scalar::Const(0)), "the program interns a zero");
     let device = Device { target: crate::atoms::sm86(), costs };
     let lowering = Lowering::new(&device);
@@ -399,37 +419,42 @@ fn a_scalars_bounds_are_its_operations(f: for<'k> fn(&mut Kernel<'k>, Sc<'k>) ->
     assert_eq!(prog.bounds(id, &|_| None), want);
 }
 
-/// A `cp.async` fill goes in whole 16-byte chunks, the same count per
-/// thread ([`crate::layouts::fills_in_chunks`]); the emitter refuses any
-/// other, naming the fill, as the rankings' `fits` predicts.
-#[test_case(16, 32, true; "64 chunks over 32 threads")]
-#[test_case(16, 24, false; "48 chunks over 32 threads")]
-#[test_case(16, 20, false; "a row of two chunks and a half")]
-fn a_fill_goes_in_whole_chunks_per_thread(rows: usize, cols: usize, fills: bool) {
-    let shape = Shape::new(rows, cols);
-    assert_eq!(crate::layouts::fills_in_chunks(shape, 2, 32), fills);
-    let prog = Kernel::record("fill", |k| {
-        k.warps(1);
-        let x = k.input::<F16>("x", shape.elems());
-        let y = k.output::<F16>("y", shape.elems());
-        let s = k.smem::<F16>("s", shape.elems());
-        let src = k.view(x, 0, [cols, 1], shape, [None, None]);
-        let t = k.smem_view::<F16>(s, 0, shape);
-        k.stage(t, src, CopyMode::Async);
-        let held = Shape::new(rows, 16);
-        let v = k.smem_view::<F16>(s, 0, held);
-        let r = k.load(v);
-        let out = k.view(y, 0, [cols, 1], held, [None, None]);
-        k.store(out, r);
-    });
-    let lowering = Lowering::new(&super::declared(crate::atoms::sm86()));
-    match crate::lower::standalone(prog, &lowering) {
-        Ok(_) => assert!(fills, "a {rows}×{cols} fill lowered"),
-        Err(crate::lower::Error::Unsupported { what }) => {
-            assert!(!fills, "{what}");
-            assert_eq!(what, format!("a {rows}×{cols} fill by 32 threads"));
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// A `cp.async` fill goes in whole 16-byte chunks, the same count per
+    /// thread ([`crate::layouts::fills_in_chunks`]); the emitter refuses any
+    /// other, naming the fill, as the rankings' `fits` predicts.
+    #[test]
+    fn a_fill_goes_in_whole_chunks_per_thread(
+        rows in (0..=6u32).prop_map(|e| 1usize << e),
+        cols in prop_oneof![(2..=8usize).prop_map(|c| 8 * c), 16..=64usize],
+    ) {
+        let shape = Shape::new(rows, cols);
+        let fills = crate::layouts::fills_in_chunks(shape, 2, 32);
+        let prog = Kernel::record("fill", |k| {
+            k.warps(1);
+            let x = k.input::<F16>("x", shape.elems());
+            let y = k.output::<F16>("y", shape.elems());
+            let s = k.smem::<F16>("s", shape.elems());
+            let src = k.view(x, 0, [cols, 1], shape, [None, None]);
+            let t = k.smem_view::<F16>(s, 0, shape);
+            k.stage(t, src, CopyMode::Async);
+            let held = Shape::new(rows, 16);
+            let v = k.smem_view::<F16>(s, 0, held);
+            let r = k.load(v);
+            let out = k.view(y, 0, [cols, 1], held, [None, None]);
+            k.store(out, r);
+        });
+        let lowering = Lowering::new(&super::declared(crate::atoms::sm86()));
+        match crate::lower::standalone(prog, &lowering) {
+            Ok(_) => prop_assert!(fills, "a {}×{} fill lowered", rows, cols),
+            Err(crate::lower::Error::Unsupported { what }) => {
+                prop_assert!(!fills, "{}", what);
+                prop_assert_eq!(what, format!("a {rows}×{cols} fill by 32 threads"));
+            }
+            Err(e) => panic!("{e}"),
         }
-        Err(e) => panic!("{e}"),
     }
 }
 
@@ -481,16 +506,8 @@ fn the_text_claims_exactly_the_aliasing_tk_knows(target: Target) {
 #[test_case(amd(AmdArch::Gfx1201, 64); "gfx1201 folds the fragment to its load")]
 #[test_case(crate::atoms::sm86(); "sm_86 keeps its pairs")]
 fn a_products_operand_is_the_load_that_filled_it(target: Target) {
-    let cfg = GemmCfg {
-        tile: [64, 64, 32],
-        warps: [2, 2],
-        core: Core::Warp,
-        schedule: Schedule::ring(2, false),
-        order: Default::default(),
-        tail: None,
-    };
-    let spec =
-        assumed(GemmSpec { m: 128, n: 128, k: 128, batch: Batch::Static(1), epilogue: Epilogue::default() }, cfg);
+    let cfg = crate::ops::config::gemm_cfg([64, 64, 32], 2, [2, 2], false);
+    let spec = assumed(super::gemm_spec(128, 128, 128), cfg);
     let lowered =
         crate::lower::standalone(gemm::<BF16>(&spec), &Lowering::new(&super::declared(target.clone()))).unwrap();
     let (mut folded, mut stacked) = (0, 0);
@@ -566,10 +583,7 @@ fn a_grid_past_i32_is_refused() {
 #[test]
 fn a_constant_past_i32_keeps_its_value() {
     let cfg = crate::ops::config::gemm_cfg([128, 128, 32], 1, [2, 2], false);
-    let spec = assumed(
-        GemmSpec { m: 50_001, n: 50_001, k: 50_048, batch: Batch::Static(2), epilogue: Epilogue::DEFAULT },
-        cfg,
-    );
+    let spec = assumed(GemmSpec { batch: Batch::Static(2), ..super::gemm_spec(50_001, 50_001, 50_048) }, cfg);
     let target = amd(AmdArch::Gfx942, 304);
     let text = crate::lower::render(gemm::<BF16>(&spec), &cfg.lowering(&super::declared(target))).unwrap();
     assert!(text.contains("2500100001") && !text.contains("-1794867295"));
