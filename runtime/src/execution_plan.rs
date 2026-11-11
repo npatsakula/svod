@@ -246,7 +246,7 @@ struct GraphHazards {
 
 impl GraphHazards {
     fn overlaps(a: &Range<usize>, b: &Range<usize>) -> bool {
-        a.start < b.end && b.start < a.end
+        svod_device::hcq::bytes_overlap(a, b)
     }
 
     /// The sorted, deduplicated predecessors of kernel `e`, which then becomes

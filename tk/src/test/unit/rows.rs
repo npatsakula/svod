@@ -2,40 +2,25 @@
 //! host, and the lowered programs against both on the device.
 
 use proptest::prelude::*;
-use svod_dtype::{DType, ScalarDType};
-use svod_tensor::Tensor;
+use svod_dtype::ScalarDType;
 use test_case::test_case;
 
-use super::{assert_rel_close, declared};
-use crate::atoms::{Core, sm86};
+use super::device::poisoned;
+use super::targets::on_device;
+use super::{assert_rel_close, declared, gemm_spec};
+use crate::atoms::sm86;
 use crate::build::BF16;
 use crate::interp::{round_to, run};
 use crate::ir::*;
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Scale, gemm};
 use crate::kernels::rows::{Norm, NormCfg, NormSpec, norm};
 use crate::kernels::{Act, Batch};
-use crate::launch::graph_launch_all;
 use crate::lower::Lowering;
+use crate::ops::config::gemm_cfg;
 use crate::sweep::assumed;
 
-fn gemm_nt_epilogue(
-    m: usize,
-    n: usize,
-    k: usize,
-    tile: [usize; 3],
-    stages: usize,
-    warps: [u32; 2],
-    epi: Epilogue,
-) -> Program {
-    let cfg = GemmCfg {
-        core: Core::Warp,
-        tile,
-        warps,
-        schedule: Schedule::ring(stages, true),
-        order: Default::default(),
-        tail: None,
-    };
-    gemm::<BF16>(&assumed(GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: epi }, cfg))
+fn gemm_nt_epilogue(m: usize, n: usize, k: usize, cfg: GemmCfg, epilogue: Epilogue) -> Program {
+    gemm::<BF16>(&assumed(GemmSpec { epilogue, ..gemm_spec(m, n, k) }, cfg))
 }
 
 fn norm_rows(norm_: Norm, rows: usize, d: usize, br: usize, eps: f64, residual: bool, bias: bool) -> Program {
@@ -45,21 +30,6 @@ fn norm_rows(norm_: Norm, rows: usize, d: usize, br: usize, eps: f64, residual: 
 
 fn bf16s(n: usize, seed: &mut u64, f: impl Fn(f64) -> f64) -> Vec<f64> {
     super::rounded(ScalarDType::BFloat16, n, seed, f)
-}
-
-fn upload(params: &[Vec<f64>]) -> Vec<Tensor> {
-    params
-        .iter()
-        .map(|p| Tensor::from_slice(p.iter().map(|&x| x as f32).collect::<Vec<_>>()).cast(DType::BFloat16))
-        .collect()
-}
-
-/// Upload the bf16 parameters, run on the device, read every parameter back.
-fn on_device(prog: Program, lowering: &Lowering, params: &[Vec<f64>]) -> Vec<Vec<f64>> {
-    let tensors = upload(params);
-    let refs: Vec<&Tensor> = tensors.iter().collect();
-    let outs = graph_launch_all(prog, lowering, &refs).unwrap();
-    outs.iter().map(|t| t.cast(DType::Float32).to_vec::<f32>().unwrap().into_iter().map(f64::from).collect()).collect()
 }
 
 // ---- GEMM epilogues ---------------------------------------------------------
@@ -105,30 +75,14 @@ fn gemm_reference(m: usize, n: usize, k: usize, epi: Epilogue, p: &[Vec<f64>]) -
 }
 
 const EPILOGUES: [Epilogue; 8] = [
-    Epilogue { bias: true, residual: false, act: Act::None, gated: false, scale: None, out_f32: false, rope: None },
-    Epilogue { bias: false, residual: true, act: Act::None, gated: false, scale: None, out_f32: false, rope: None },
-    Epilogue { bias: true, residual: false, act: Act::Gelu, gated: false, scale: None, out_f32: false, rope: None },
-    Epilogue { bias: true, residual: true, act: Act::Silu, gated: false, scale: None, out_f32: false, rope: None },
-    Epilogue { bias: true, residual: false, act: Act::Silu, gated: true, scale: None, out_f32: false, rope: None },
-    Epilogue { bias: false, residual: true, act: Act::Gelu, gated: true, scale: None, out_f32: false, rope: None },
-    Epilogue {
-        bias: true,
-        residual: true,
-        act: Act::None,
-        gated: false,
-        scale: Some(Scale::new(0.5)),
-        out_f32: false,
-        rope: None,
-    },
-    Epilogue {
-        bias: true,
-        residual: false,
-        act: Act::Silu,
-        gated: true,
-        scale: Some(Scale::new(-1.5)),
-        out_f32: false,
-        rope: None,
-    },
+    Epilogue { bias: true, ..Epilogue::DEFAULT },
+    Epilogue { residual: true, ..Epilogue::DEFAULT },
+    Epilogue { bias: true, act: Act::Gelu, ..Epilogue::DEFAULT },
+    Epilogue { bias: true, residual: true, act: Act::Silu, ..Epilogue::DEFAULT },
+    Epilogue { bias: true, act: Act::Silu, gated: true, ..Epilogue::DEFAULT },
+    Epilogue { residual: true, act: Act::Gelu, gated: true, ..Epilogue::DEFAULT },
+    Epilogue { bias: true, residual: true, scale: Some(Scale::new(0.5)), ..Epilogue::DEFAULT },
+    Epilogue { bias: true, act: Act::Silu, gated: true, scale: Some(Scale::new(-1.5)), ..Epilogue::DEFAULT },
 ];
 
 /// The interpreter applies every epilogue as the f64 reference does.
@@ -142,7 +96,7 @@ const EPILOGUES: [Epilogue; 8] = [
 #[test_case(7; "bias swiglu negative scale")]
 fn epilogue_interpreter_matches_the_reference(which: usize) {
     let (m, n, k, epi) = (64, 64, 64, EPILOGUES[which]);
-    let prog = gemm_nt_epilogue(m, n, k, [32, 32, 16], 2, [2, 2], epi);
+    let prog = gemm_nt_epilogue(m, n, k, gemm_cfg([32, 32, 16], 2, [2, 2], true), epi);
     let params = gemm_inputs(m, n, k, epi);
     let want = gemm_reference(m, n, k, epi, &params);
     let out = run(&prog, params, &[]).unwrap();
@@ -154,7 +108,7 @@ fn epilogue_interpreter_matches_the_reference(which: usize) {
 #[test]
 fn bias_vector_takes_the_accumulators_column_layout() {
     let epi = Epilogue { bias: true, ..Epilogue::default() };
-    let prog = gemm_nt_epilogue(128, 128, 64, [128, 128, 32], 2, [2, 4], epi);
+    let prog = gemm_nt_epilogue(128, 128, 64, gemm_cfg([128, 128, 32], 2, [2, 4], true), epi);
     let prog = super::laid(prog, &declared(sm86())).unwrap();
     let lay = &prog.layouts;
     let add = prog
@@ -176,21 +130,14 @@ fn bias_vector_takes_the_accumulators_column_layout() {
 #[test_case(256, 256, 256, [128, 64, 32], 2, 2, 2; "256 cubed")]
 fn epilogues_match_on_device(m: usize, n: usize, k: usize, tile: [usize; 3], stages: usize, wr: u32, wc: u32) {
     let Some(target) = super::device_target() else { return };
+    let cfg = gemm_cfg(tile, stages, [wr, wc], true);
     for epi in EPILOGUES {
-        let prog = gemm_nt_epilogue(m, n, k, tile, stages, [wr, wc], epi);
+        let prog = gemm_nt_epilogue(m, n, k, cfg, epi);
         let params = gemm_inputs(m, n, k, epi);
         let want = gemm_reference(m, n, k, epi, &params);
         let interp = run(&prog, params.clone(), &[]).unwrap();
-        let cfg = GemmCfg {
-            core: Core::Warp,
-            tile,
-            warps: [wr, wc],
-            schedule: Schedule::ring(stages, true),
-            order: Default::default(),
-            tail: None,
-        };
-        let got = on_device(prog, &cfg.lowering(&declared(target.clone())), &params);
-        let (got, interp) = (got.last().unwrap(), interp.last().unwrap());
+        let got = on_device(prog.clone(), &cfg.lowering(&declared(target.clone())), &poisoned(&prog, &params));
+        let (got, interp) = (got.last().unwrap().as_ref().expect("c"), interp.last().unwrap());
         let d_interp = assert_rel_close("c vs interpreter", got, interp, 1.6e-2);
         let d_ref = assert_rel_close("c vs reference", got, &want, 1.6e-2);
         eprintln!("{m}x{n}x{k} {epi:?}: max abs diff {d_interp:.3e} (interpreter), {d_ref:.3e} (f64)");
@@ -297,12 +244,13 @@ fn norms_match_on_device(norm: Norm, d: usize, residual: bool, bias: bool, br: u
     let params = norm_inputs(norm, rows, d, residual, bias, 5);
     let (want, want_sum) = norm_reference(norm, rows, d, eps, residual, bias, &params);
     let interp = run(&prog, params.clone(), &[]).unwrap();
-    let got = on_device(prog, &Lowering::new(&declared(target)), &params);
+    let got = on_device(prog.clone(), &Lowering::new(&declared(target)), &poisoned(&prog, &params));
     let (o, s) = norm_outputs(norm, residual, bias);
-    let d_interp = assert_rel_close("out vs interpreter", &got[o], &interp[o], 1e-2);
-    let d_ref = assert_rel_close("out vs reference", &got[o], &want, 1e-2);
+    let out = |i: usize| got[i].as_ref().expect("an output");
+    let d_interp = assert_rel_close("out vs interpreter", out(o), &interp[o], 1e-2);
+    let d_ref = assert_rel_close("out vs reference", out(o), &want, 1e-2);
     if residual {
-        assert_rel_close("sum", &got[s], &want_sum, 0.0);
+        assert_rel_close("sum", out(s), &want_sum, 0.0);
     }
     eprintln!("{norm:?} d={d} residual={residual}: max abs diff {d_interp:.3e} (interpreter), {d_ref:.3e} (f64)");
 }
@@ -318,54 +266,4 @@ fn a_lane_norms_one_row_whatever_the_block() {
     let four = shuffles(4);
     assert!(four > 0);
     assert_eq!([shuffles(8), shuffles(16)], [four, four]);
-}
-
-/// Fastest GPU time of `plan`'s kernels after a warm-up long enough for the
-/// memory clock to leave idle.
-fn gpu_seconds(plan: &svod_runtime::ExecutionPlan) -> f64 {
-    let start = std::time::Instant::now();
-    while start.elapsed().as_millis() < 500 {
-        plan.execute().unwrap();
-    }
-    let mut best = f64::INFINITY;
-    for _ in 0..50 {
-        for kp in plan.execute_profiled().unwrap() {
-            if let (Some(s), Some(e)) = (kp.gpu_start_ns, kp.gpu_end_ns) {
-                best = best.min((e - s) as f64 * 1e-9);
-            }
-        }
-    }
-    best
-}
-
-/// Bandwidth of the row kernels on 8192×1024 bf16 against a graph `x + x`
-/// moving as many bytes; prints GB/s and never asserts (run with
-/// `--ignored --nocapture`).
-#[test]
-#[ignore = "perf probe: needs a GPU"]
-fn norm_bandwidth_probe() {
-    let Some(target) = super::device_target() else { return };
-    let (rows, d, eps) = (8192, 1024, 1e-5);
-    let gbs = |bytes: f64, secs: f64| bytes / secs / 1e9;
-    for (norm, residual) in [(Norm::Rms, false), (Norm::Layer, false), (Norm::Rms, true), (Norm::Layer, true)] {
-        let bias = norm == Norm::Layer;
-        let params = norm_inputs(norm, rows, d, residual, bias, 9);
-        let tensors = upload(&params);
-        for t in &tensors {
-            t.realize().unwrap();
-        }
-        let refs: Vec<&Tensor> = tensors.iter().collect();
-        // x (+ residual) in, out (+ sum) out; the weight vectors are noise.
-        let bytes = (2 * rows * d * if residual { 2 } else { 1 }) as f64 * 2.0;
-        let baseline = gpu_seconds(&(&tensors[0] + &tensors[0]).unwrap().prepare().unwrap());
-        eprintln!("graph x + x: {:.1} us, {:.0} GB/s", baseline * 1e6, gbs((4 * rows * d) as f64, baseline));
-        for br in [4, 8, 16] {
-            let prog = norm_rows(norm, rows, d, br, eps, residual, bias);
-            let (o, _) = norm_outputs(norm, residual, bias);
-            let plan =
-                graph_launch_all(prog, &Lowering::new(&declared(target.clone())), &refs).unwrap()[o].prepare().unwrap();
-            let secs = gpu_seconds(&plan);
-            eprintln!("{norm:?} residual={residual} br={br}: {:.1} us, {:.0} GB/s", secs * 1e6, gbs(bytes, secs));
-        }
-    }
 }

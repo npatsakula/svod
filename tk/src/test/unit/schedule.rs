@@ -196,25 +196,9 @@ fn ping_pong_cuts_a_trip_into_clusters() {
 #[test]
 fn staged_halves_keep_their_copys_scope() {
     use crate::build::BF16;
-    use crate::kernels::Batch;
-    use crate::kernels::attention::{AttnMask, AttnSpec, FaCfg, attention};
+    use crate::kernels::attention::{AttnMask, FaCfg, attention};
     let cfg = FaCfg { key_warps: 4, ..FaCfg::new(16, 16, 2) };
-    let mask = AttnMask::default();
-    let spec = assumed(
-        AttnSpec {
-            batch: Batch::Static(1),
-            t: 1,
-            tk: 64,
-            heads: 1,
-            kv_heads: 1,
-            d: 64,
-            mask,
-            cache: None,
-            packed: false,
-            scale: 0.125,
-        },
-        cfg,
-    );
+    let spec = assumed(super::attention::probe_spec(1, 1, 1, 64, 64, AttnMask::default()), cfg);
     let prog = expand(attention::<BF16>(&spec), Fill::Staged, Core::Warp);
     fn copies(block: &Block<Expanded>, inside: bool, out: &mut Vec<(bool, Scope, CopyMode)>) {
         for s in &block.0 {

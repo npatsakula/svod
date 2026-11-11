@@ -186,7 +186,7 @@ pub(crate) fn prune<C: Tiled>(ranked: &mut Vec<(f64, u32, C)>) {
 /// Search bound: the configs of a ranking logged with their costs.
 const LOGGED: usize = 16;
 /// Search bound: a config this factor past the cheapest one's cost cannot
-/// win: the measured best and every config within the tuner's contender
+/// win (`tk_bench fit` measures the spread): the measured best and every config within the tuner's contender
 /// band ([`crate::tune::CONTENDER`]) sit well inside it.
 pub(crate) const PRUNED_PAST: f64 = 2.5;
 /// Search bound: the tiles a ranking keeps whatever their cost, so a shortlist

@@ -104,5 +104,5 @@ cargo run -p svod-model --release --example nemotron_diarize -- audio_1.wav --dt
 tk 内核以其内核名称（`gemm`、`conv`、`flash_attention`、`heads`、`layer_norm`……）与图内核并列出现，并以相同方式计时。
 
 :::tip[在安静的 GPU 上测量]
-GPU 上的其他进程会使每个数字产生偏差。探针和调优存储会先预热时钟。运行探针时使用 `--test-threads=1`。
+GPU 上的其他进程会使每个数字产生偏差。`tk_bench`、探针和调优存储会先预热时钟。一次只运行一个 `tk_bench` 命令，运行探针测试时使用 `--test-threads=1`。
 :::

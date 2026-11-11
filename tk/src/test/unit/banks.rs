@@ -6,12 +6,14 @@ use proptest::prelude::*;
 use svod_dtype::AmdArch;
 use test_case::test_case;
 
+use super::attention::probe_spec;
+use super::gemm_spec;
+use super::targets::amd_asm;
 use crate::atoms::{SharedBanks, Target};
 use crate::build::BF16;
 use crate::ir::*;
-use crate::kernels::Batch;
 use crate::kernels::attention::{AttnMask, AttnSpec, FaCfg, attention};
-use crate::kernels::gemm::{Epilogue, GemmSpec, gemm};
+use crate::kernels::gemm::gemm;
 use crate::layouts::SharedSwizzle;
 use crate::lower::{Lowered, Lowering, standalone};
 use crate::ops::config;
@@ -45,28 +47,13 @@ fn gemm_on(arch: AmdArch) -> Lowered {
         schedule: Schedule::ping_pong(16),
         ..config::gemm_cfg([256, 256, 64], 1, [2, 4], false)
     };
-    let spec = assumed(GemmSpec { m: 512, n: 512, k: 256, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT }, cfg);
-    standalone(gemm::<BF16>(&spec), &cfg.lowering(&device)).unwrap()
+    standalone(gemm::<BF16>(&assumed(gemm_spec(512, 512, 256), cfg)), &cfg.lowering(&device)).unwrap()
 }
 
 fn attention_on(arch: AmdArch, d: usize) -> Lowered {
     let device = declared(amd(arch, 304));
     let cfg = FaCfg::new(16, 64, 2);
-    let spec = assumed(
-        AttnSpec {
-            batch: Batch::Static(1),
-            t: 64,
-            tk: 256,
-            heads: 1,
-            kv_heads: 1,
-            d,
-            mask: AttnMask::default(),
-            cache: None,
-            packed: false,
-            scale: 0.125,
-        },
-        cfg,
-    );
+    let spec = assumed(AttnSpec { scale: 0.125, ..probe_spec(1, 1, 64, 256, d, AttnMask::default()) }, cfg);
     standalone(attention::<BF16>(&spec), &Lowering::new(&device)).unwrap()
 }
 
@@ -131,14 +118,7 @@ fn a_target_without_banks_keeps_its_chunks(arch: AmdArch) {
 fn a_store_stays_within_a_half() {
     let low = gemm_on(AmdArch::Gfx942);
     let text = low.text(&amd(AmdArch::Gfx942, 304)).unwrap();
-    let asm = match svod_runtime::amd::compile_ir_to_amd_asm(&text, AmdArch::Gfx942) {
-        Ok(asm) => String::from_utf8(asm).unwrap(),
-        Err(e) if e.to_string().contains("AMDGPU target") || e.to_string().contains("too old") => {
-            eprintln!("skipped: clang has no AMDGPU target");
-            return;
-        }
-        Err(e) => panic!("{e}"),
-    };
+    let Some(asm) = amd_asm(&text, AmdArch::Gfx942) else { return };
     assert!(asm.contains("ds_write") && !asm.contains("ds_write_b128"), "{asm}");
 }
 
@@ -148,8 +128,7 @@ fn gemm_text_on(target: Target, m: usize, n: usize, k: usize) -> String {
         schedule: Schedule::ping_pong(16),
         ..config::gemm_cfg([256, 256, 64], 1, [2, 4], false)
     };
-    let spec = assumed(GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT }, cfg);
-    crate::lower::render(gemm::<BF16>(&spec), &cfg.lowering(&device)).unwrap()
+    crate::lower::render(gemm::<BF16>(&assumed(gemm_spec(m, n, k), cfg)), &cfg.lowering(&device)).unwrap()
 }
 
 fn gemm_text(arch: AmdArch, k: usize) -> String {
@@ -208,20 +187,8 @@ fn a_target_without_the_swizzle_stays_flat(arch: AmdArch) {
     assert_eq!(amd(arch, 304).cache_swizzle, None);
     let device = declared(amd(arch, 304));
     let cfg = config::gemm_cfg([64, 64, 32], 1, [2, 2], false);
-    let spec = assumed(GemmSpec { m: 256, n: 256, k: 512, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT }, cfg);
-    assert!(!crate::lower::render(gemm::<BF16>(&spec), &cfg.lowering(&device)).unwrap().contains(FAT_POINTER))
-}
-
-/// The assembly of `text`; `None` where clang has no AMDGPU target.
-fn amd_asm(text: &str, arch: AmdArch) -> Option<String> {
-    match svod_runtime::amd::compile_ir_to_amd_asm(text, arch) {
-        Ok(asm) => Some(String::from_utf8(asm).unwrap()),
-        Err(e) if e.to_string().contains("AMDGPU target") || e.to_string().contains("too old") => {
-            eprintln!("skipped: clang has no AMDGPU target");
-            None
-        }
-        Err(e) => panic!("{e}"),
-    }
+    let text = crate::lower::render(gemm::<BF16>(&assumed(gemm_spec(256, 256, 512), cfg)), &cfg.lowering(&device));
+    assert!(!text.unwrap().contains(FAT_POINTER))
 }
 
 #[test]

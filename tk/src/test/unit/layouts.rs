@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use proptest::prelude::*;
 use test_case::test_case;
 
 use svod_dtype::{AmdArch, GpuArch, ScalarDType};
@@ -127,19 +128,6 @@ fn attention_probabilities_feed_the_second_mma_without_data_movement() {
     assert_eq!(m_l.row_fold_masks().as_slice(), &[1, 2], "quads share a row");
 }
 
-#[test_case(64, 64, 4, 32; "square")]
-#[test_case(16, 256, 4, 32; "wide")]
-#[test_case(256, 8, 8, 64; "narrow, wave64")]
-#[test_case(4, 48, 4, 32; "48 wide: 16 spread three times")]
-#[test_case(8, 96, 4, 64; "96 wide, wave64")]
-fn natural_layouts_hold_every_element_once(rows: usize, cols: usize, warps: u32, lanes: u32) {
-    let l = natural(Shape::new(rows, cols), warps, lanes).unwrap();
-    assert_eq!(l.shape(), Shape::new(rows, cols));
-    let held: HashSet<_> = coords(&l, warps, lanes).into_iter().collect();
-    assert_eq!(held.len(), rows * cols);
-    assert!(l.regs() as usize * (warps * lanes) as usize >= rows * cols, "warps past the rows replicate");
-}
-
 #[test]
 fn shapes_that_do_not_tile_the_grid_are_rejected() {
     let target = sm86();
@@ -149,6 +137,80 @@ fn shapes_that_do_not_tile_the_grid_are_rejected() {
     assert!(atom.issue(direct, WarpGrid { rows: 2, cols: 4 }, 64, 128, 24).is_err(), "k = 24");
     let Issue { a, b, c, .. } = atom.issue(direct, WarpGrid { rows: 1, cols: 1 }, 16, 48, 32).unwrap();
     assert_eq!((a.reps, b.reps, c.reps), ([1, 2], [2, 6], [1, 6]), "48 columns are six n-halves");
+}
+
+/// Asserts `l` lays a `rows × cols` tile: every element held by some
+/// thread's register over `warps` warps of `lanes`, and nothing past it.
+fn assert_holds_its_tile(l: &TileLayout, rows: usize, cols: usize, warps: u32, lanes: u32) {
+    assert_eq!(l.shape(), Shape::new(rows, cols));
+    let held: HashSet<(u32, u32)> = coords(l, warps, lanes).into_iter().collect();
+    let tile = (0..rows as u32).flat_map(|r| (0..cols as u32).map(move |c| (r, c))).collect();
+    assert!(held == tile, "{} elements held of a {rows}×{cols} tile", held.len());
+}
+
+fn warps() -> impl Strategy<Value = u32> {
+    prop::sample::select(vec![1u32, 2, 4, 8])
+}
+
+fn lanes() -> impl Strategy<Value = u32> {
+    prop::sample::select(vec![32u32, 64])
+}
+
+proptest! {
+    /// A natural layout holds every element of any tile of power-of-two
+    /// rows, square, wide or narrow over either wave, a width no power of
+    /// two spreading its power-of-two part and repeating across the rest;
+    /// warps past the rows replicate.
+    #[test]
+    fn natural_layouts_hold_every_element_once(
+        rows in (0..=8u32).prop_map(|e| 1usize << e),
+        cols in 1..=256usize,
+        warps in warps(),
+        lanes in lanes(),
+    ) {
+        let l = natural(Shape::new(rows, cols), warps, lanes).unwrap();
+        assert_holds_its_tile(&l, rows, cols, warps, lanes);
+        prop_assert!(l.regs() as usize * (warps * lanes) as usize >= rows * cols, "warps past the rows replicate");
+    }
+
+    /// A register-staged fill's layout holds every element of a tile of
+    /// rows of whole 16-byte chunks, each lane's registers in 16-byte row runs,
+    /// the next lane holding the next row where they walk down the rows,
+    /// and replicates only warps (or lanes) the tile has no rows for: rows
+    /// and columns repeating by an odd factor, fewer chunks than threads,
+    /// 8-, 16- and 32-bit elements, either wave.
+    #[test]
+    fn chunked_layouts_cover_their_tile_in_16_byte_runs(
+        rows in 1..=96usize,
+        chunks in prop::sample::select(vec![1usize, 2, 3, 4, 5, 6, 8, 12, 16]),
+        bytes in prop::sample::select(vec![1usize, 2, 4]),
+        warps in warps(),
+        lanes in lanes(),
+        walk in prop::sample::select(vec![Axis::Col, Axis::Row]),
+    ) {
+        let v = 16 / bytes;
+        let cols = chunks * v;
+        let l = chunked(Shape::new(rows, cols), bytes, warps, lanes, walk).unwrap();
+        assert_holds_its_tile(&l, rows, cols, warps, lanes);
+        if walk == Axis::Row && rows.is_multiple_of(2) {
+            let (r0, c0) = l.coord(0, 0, 0);
+            prop_assert_eq!(l.coord(0, 1, 0), (r0 + 1, c0), "the next lane holds the next row");
+        }
+        let threads = (warps * lanes) as usize;
+        if (rows * chunks).is_multiple_of(threads) {
+            prop_assert_eq!(l.regs() as usize * threads, rows * cols, "a tile the threads divide is held once");
+        }
+        let v = v as u32;
+        for w in 0..warps {
+            for lane in 0..lanes {
+                for j in (0..l.regs()).step_by(v as usize) {
+                    let (r, c) = l.coord(w, lane, j);
+                    prop_assert_eq!(c % v, 0, "a run starts on a 16-byte boundary");
+                    prop_assert!((1..v).all(|e| l.coord(w, lane, j + e) == (r, c + e)), "a run is one row's columns");
+                }
+            }
+        }
+    }
 }
 
 /// A product's result is held as its atom leaves it: pinned otherwise, the
@@ -173,55 +235,6 @@ fn a_product_result_pinned_off_its_atom_is_refused() {
     });
     let err = laid(prog, &declared(sm86())).err();
     assert!(matches!(err, Some(crate::layouts::Error::Unresolved { value }) if value == acc), "{err:?}");
-}
-
-/// A register-staged fill's layout holds every element of its tile, each
-/// lane's registers in 16-byte row runs, and replicates only warps (or
-/// lanes) the tile has no rows for.
-#[test_case(128, 32, 2, 4, 32, Axis::Col; "128x32 bf16 on four waves")]
-#[test_case(96, 32, 2, 4, 32, Axis::Col; "96 rows repeat by three")]
-#[test_case(64, 48, 2, 2, 32, Axis::Col; "48 columns repeat by three")]
-#[test_case(16, 64, 2, 1, 32, Axis::Col; "one wave")]
-#[test_case(64, 64, 2, 4, 64, Axis::Col; "wave64")]
-#[test_case(8, 16, 2, 4, 32, Axis::Col; "fewer chunks than threads")]
-#[test_case(32, 32, 4, 2, 32, Axis::Col; "f32")]
-#[test_case(16, 128, 2, 4, 32, Axis::Row; "16 keys walked down the rows")]
-#[test_case(64, 64, 2, 2, 32, Axis::Row; "64 keys walked down the rows")]
-#[test_case(96, 32, 2, 4, 32, Axis::Row; "96 rows walked down the rows")]
-fn chunked_layouts_cover_their_tile_in_16_byte_runs(
-    rows: usize,
-    cols: usize,
-    bytes: usize,
-    warps: u32,
-    lanes: u32,
-    walk: Axis,
-) {
-    let l = chunked(Shape::new(rows, cols), bytes, warps, lanes, walk).unwrap();
-    assert_eq!(l.shape(), Shape::new(rows, cols));
-    let held: HashSet<(u32, u32)> = coords(&l, warps, lanes).into_iter().collect();
-    assert_eq!(held.len(), rows * cols, "every element held");
-    let v = (16 / bytes).min(cols) as u32;
-    if walk == Axis::Row {
-        let (r0, c0) = l.coord(0, 0, 0);
-        let (r1, c1) = l.coord(0, 1, 0);
-        assert_eq!((r1, c1), (r0 + 1, c0), "the next lane holds the next row");
-    }
-    let threads = (warps * lanes) as usize;
-    if (rows * cols / v as usize).is_multiple_of(threads) {
-        assert_eq!(l.regs() as usize * threads, rows * cols, "a tile the threads divide is held once, not replicated");
-    }
-    for w in 0..warps {
-        for lane in 0..lanes {
-            for j in (0..l.regs()).step_by(v as usize) {
-                let (r, c) = l.coord(w, lane, j);
-                assert_eq!(c % v, 0, "a run starts on a 16-byte boundary");
-                assert!(
-                    (1..v).all(|e| l.coord(w, lane, j + e) == (r, c + e)),
-                    "a run is one row's consecutive columns"
-                );
-            }
-        }
-    }
 }
 
 /// Elementwise ops whose operands are held otherwise than their result: two
@@ -375,8 +388,7 @@ fn rdna3_attention_trades_probabilities_between_half_waves() {
 /// trade P (1.5 moves an element), and the bias is read a row per lane, its
 /// row a line of its own (a scattered line still priced: over 4 warps of 32
 /// lanes a 64×16 bias over rows 128 bytes apart touches 64 lines for 2048
-/// bytes, 48 past what the bytes take coalesced — the old line-an-element
-/// count charged 1024 of, crossing over a round trip it no longer pays).
+/// bytes, 48 past what the bytes take coalesced).
 #[test_case(8.0; "a line at a lane move's cost")]
 #[test_case(222.0; "past the crossing a round trip once made")]
 #[test_case(900.0; "a line dearer than any round trip")]

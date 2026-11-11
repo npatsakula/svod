@@ -154,7 +154,7 @@ pub fn supported(device: &DeviceSpec) -> bool {
 /// candidate lists ranked for it, kept for the process, one per device. A
 /// device describes itself once: its probes run under the lock, and a
 /// second caller waits for them.
-pub(crate) fn planner(device: &DeviceSpec) -> Option<Arc<Planner>> {
+pub fn planner(device: &DeviceSpec) -> Option<Arc<Planner>> {
     static PLANNERS: LazyLock<Mutex<HashMap<DeviceSpec, Option<Arc<Planner>>>>> = LazyLock::new(Mutex::default);
     if *device != default_device() {
         return None;

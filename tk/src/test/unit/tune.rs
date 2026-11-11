@@ -5,12 +5,14 @@
 //! memo, a fingerprint keyed by what the candidates emit and remembered
 //! by what they are made of, and on the device a real GEMM tuning.
 
-use super::Scratch;
+use super::{Scratch, gemm_spec};
 use crate::ops::config::{Tiled, gemm_cfg};
 use crate::sweep::assumed;
 use std::cell::Cell;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use proptest::prelude::*;
 use svod_dtype::ScalarDType;
 use svod_runtime::KernelResources;
 use test_case::test_case;
@@ -18,7 +20,7 @@ use test_case::test_case;
 use crate::atoms::{Device, sm86};
 use crate::build::BF16;
 use crate::kernels::Batch;
-use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, TailSplit, TileOrder, gemm};
+use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, TailSplit, gemm};
 use crate::tune::{self, Bench, Entry, FORMAT, Kind, Pass, ScratchPool, TuneKey, TuneStore, fingerprint};
 
 /// A host key: no device, so no compiler digest.
@@ -39,77 +41,124 @@ fn cfgs(n: usize) -> Vec<crate::kernels::gemm::GemmCfg> {
         .collect()
 }
 
-/// Every family's config code holds the config whole and nothing else: the
-/// lattices the rankings walk — warp and warpgroup cores, a two-crew
-/// cluster, conv splits, nearest lists, lane queues and score matrices —
-/// round-trip through their code, and a code that is not the family's form
-/// holds no config.
-#[test]
-fn every_familys_config_code_round_trips() {
+/// Every value a config's code can hold of each field.
+mod fields {
+    use proptest::prelude::*;
+
     use crate::atoms::Core;
+    use crate::ir::Schedule;
+    use crate::kernels::attention::{FaCfg, Forms};
+    use crate::kernels::gemm::{GemmCfg, TailSplit, TileOrder};
+    use crate::kernels::nearest::{LaneQueue, NearestCfg, Pow2, SelectCfg, Way};
+
+    fn core() -> impl Strategy<Value = Core> {
+        prop_oneof![Just(Core::Warp), Just(Core::Wide), Just(Core::Group)]
+    }
+
+    fn schedule() -> impl Strategy<Value = Schedule> {
+        prop_oneof![
+            (1usize.., any::<bool>()).prop_map(|(d, u)| Schedule::ring(d, u)),
+            (1usize..).prop_map(Schedule::ping_pong)
+        ]
+    }
+
+    fn pow2() -> impl Strategy<Value = Pow2> {
+        (0..usize::BITS).prop_map(|e| Pow2::of(1 << e))
+    }
+
+    pub(super) fn gemm() -> impl Strategy<Value = GemmCfg> {
+        let order = (1..=TileOrder::MOST_ROWS).prop_map(|rows| TileOrder::grouped(rows).expect("a group of rows"));
+        let tail = proptest::option::of((2usize..).prop_map(|split| TailSplit::new(split).expect("a split")));
+        (core(), any::<[usize; 3]>(), any::<[u32; 2]>(), schedule(), order, tail)
+            .prop_map(|(core, tile, warps, schedule, order, tail)| GemmCfg { tile, warps, core, schedule, order, tail })
+    }
+
+    pub(super) fn attention() -> impl Strategy<Value = FaCfg> {
+        let forms = any::<[bool; 5]>().prop_map(|[truncate_p, sum_after, skip_rescale, raw_max, bias_direct]| Forms {
+            truncate_p,
+            sum_after,
+            skip_rescale,
+            raw_max,
+            bias_direct,
+        });
+        let blocks = (any::<usize>(), any::<usize>(), any::<usize>(), any::<usize>(), any::<usize>());
+        (blocks, schedule(), forms, core()).prop_map(
+            |((bq, bkv, splits, key_warps, warp_rows), schedule, forms, core)| FaCfg {
+                bq,
+                bkv,
+                schedule,
+                splits,
+                forms,
+                key_warps,
+                warp_rows,
+                core,
+            },
+        )
+    }
+
+    pub(super) fn nearest() -> impl Strategy<Value = NearestCfg> {
+        let select = (any::<u32>(), any::<usize>(), any::<bool>())
+            .prop_map(|(warps, queue, filter)| Way::Matrix(SelectCfg { warps, queue, filter }));
+        let list = prop_oneof![Just(Way::Registers), pow2().prop_map(Way::Queued), select];
+        let lanes =
+            (pow2(), pow2(), any::<bool>()).prop_map(|(width, depth, passes)| LaneQueue { width, depth, passes });
+        let blocks =
+            (any::<usize>(), any::<usize>(), any::<usize>(), proptest::option::of(any::<usize>()), any::<usize>());
+        (blocks, schedule(), list, proptest::option::of(lanes)).prop_map(
+            |((bq, bkv, warp_rows, bk, splits), schedule, list, lanes)| NearestCfg {
+                bq,
+                bkv,
+                schedule,
+                warp_rows,
+                bk,
+                splits,
+                list,
+                lanes,
+            },
+        )
+    }
+}
+
+/// `cfg` read back from its code.
+fn round_trips<C: Tiled + std::fmt::Debug>(cfg: C) -> Result<(), TestCaseError> {
+    let code = cfg.code();
+    prop_assert_eq!(C::of_code(&code), Some(cfg), "{}", code);
+    Ok(())
+}
+
+proptest! {
+    /// Every family's config code holds the config whole and nothing else:
+    /// any value of every field — each core, rings and two crews, every
+    /// raster and tail split, conv splits, the softmax forms, nearest lists
+    /// in registers, queued or from a score matrix, lane queues — round-trips
+    /// through its code.
+    #[test]
+    fn every_familys_config_code_round_trips(
+        gemm in fields::gemm(),
+        split in any::<usize>(),
+        br in any::<usize>(),
+        attention in fields::attention(),
+        nearest in fields::nearest(),
+    ) {
+        use crate::kernels::{conv::ConvCfg, rows::NormCfg};
+        round_trips(gemm)?;
+        round_trips(ConvCfg { gemm, split })?;
+        round_trips(NormCfg { br })?;
+        round_trips(attention)?;
+        round_trips(nearest)?;
+    }
+}
+
+/// A config's code is the form stored lines hold, and a code that is not
+/// the family's form holds no config.
+#[test]
+fn a_config_code_keeps_its_stored_form() {
     use crate::kernels::attention::FaCfg;
     use crate::kernels::conv::ConvCfg;
-    use crate::kernels::nearest::{LaneQueue, Metric, NearestCfg, Pow2, SelectCfg, Way};
-    use crate::kernels::rows::NormCfg;
-    use crate::ops::config::{Tiled, gemm_lattice};
-    fn round<C: Tiled + std::fmt::Debug>(cs: &[C]) {
-        for c in cs {
-            let code = c.code();
-            assert_eq!(C::of_code(&code).as_ref(), Some(c), "{c:?} does not round-trip as {code}");
-        }
-    }
-    let target = sm86();
-    let planner = super::planner(target.clone());
-    let mut gemm = gemm_lattice(&target);
-    gemm.push(GemmCfg { core: Core::Group, ..gemm_cfg([128, 256, 32], 4, [4, 4], false) });
-    // Every raster's group height, the default's and past it.
-    let rasters = [1, 3, 8, 64, usize::MAX].map(|rows| TileOrder::grouped(rows).expect("a group of rows"));
-    gemm.extend(rasters.map(|order| GemmCfg { order, ..gemm[0] }));
-    // Tail splits, the least and past the planner's most.
-    gemm.extend([2, 3, 16, 64].map(|split| GemmCfg { tail: TailSplit::new(split), ..gemm[0] }));
-    round(&gemm);
+    use crate::kernels::nearest::{NearestCfg, Pow2, SelectCfg, Way};
     let cfg = gemm_cfg([128, 256, 64], 3, [2, 4], true);
     assert_eq!(cfg.code(), "w,128,256,64,2,4,r3u,g8,~");
     assert_eq!(GemmCfg { tail: TailSplit::new(4), ..cfg }.code(), "w,128,256,64,2,4,r3u,g8,t4");
-    let mut conv: Vec<ConvCfg> = gemm.iter().map(|g| ConvCfg { gemm: *g, split: 4 }).collect();
-    conv.push(ConvCfg { gemm: gemm[0], split: 1 });
-    round(&conv);
-    round(&[NormCfg { br: 4 }, NormCfg { br: 32 }]);
-    let mut forms = planner.attention_ranked(8, 100, 100, 64, true, false).to_vec();
-    forms.push(FaCfg { core: Core::Group, splits: 2, key_warps: 4, ..forms[0] });
-    forms.push(FaCfg {
-        forms: crate::kernels::attention::Forms {
-            truncate_p: true,
-            sum_after: true,
-            skip_rescale: true,
-            raw_max: true,
-            bias_direct: true,
-        },
-        ..forms[0]
-    });
-    round(&forms);
-    let problem = crate::ops::config::NearestProblem {
-        n: 1 << 14,
-        m: 1 << 14,
-        d: 128,
-        dtype: ScalarDType::Float16,
-        metric: Metric::SquaredL2,
-        floors: Default::default(),
-        groups: false,
-        k: 64,
-    };
-    let mut nearest = planner.nearest_ranked(problem).to_vec();
-    nearest.push(NearestCfg {
-        lanes: Some(LaneQueue { width: Pow2::of(4), depth: Pow2::of(32), passes: true }),
-        ..nearest[0]
-    });
-    nearest.push(NearestCfg {
-        list: Way::Matrix(SelectCfg { warps: 2, queue: 16, filter: true }),
-        lanes: None,
-        ..nearest[0]
-    });
-    nearest.push(NearestCfg { list: Way::Queued(Pow2::of(16)), ..nearest[0] });
-    round(&nearest);
     let cfg = NearestCfg::new(64, 64, 2);
     assert_eq!(cfg.code(), "64,64,r2,16,~,1,~,~");
     assert_eq!(NearestCfg { list: Way::Queued(Pow2::of(32)), ..cfg }.code(), "64,64,r2,16,~,1,q32,~");
@@ -119,7 +168,6 @@ fn every_familys_config_code_round_trips() {
     for bad in ["64,64,r2,16,~,1,q24,~", "64,64,r2,16,~,1,~,3,2,0", "64,64,r2,16,~,1,~,4,6,0", "64,64,r2,16,~,1,x,~"] {
         assert!(NearestCfg::of_code(bad).is_none(), "{bad}");
     }
-    // A code that is not the family's form holds no config.
     // A raster of no rows, one without its mark, a code without its raster.
     for bad in ["w,128,128,32,2,2,r2,g0", "w,128,128,32,2,2,r2,8", "w,128,128,32,2,2,r2", "w,128,128,32,2,2,r2,g"] {
         assert!(GemmCfg::of_code(bad).is_none(), "{bad}");
@@ -132,10 +180,22 @@ fn every_familys_config_code_round_trips() {
     }
 }
 
+/// `lines` as `device`'s store file under `dir`, headed by the line of
+/// store format `format`.
+pub(super) fn write_store(dir: &Path, device: &str, format: u32, lines: &[String]) -> PathBuf {
+    let file = TuneStore::at(Some(dir.to_path_buf())).file(device).expect("a rooted store");
+    std::fs::write(&file, format!("format {format}\n{}\n", lines.join("\n"))).expect("a store file");
+    file
+}
+
+/// The path of [`key`]'s device file under `dir`.
+fn store_path(dir: &Path) -> PathBuf {
+    TuneStore::at(Some(dir.to_path_buf())).file(&key(&[], &[]).device).expect("a rooted store")
+}
+
 /// The store file of [`key`]'s device under `dir`.
-fn store_file(dir: &std::path::Path) -> String {
-    let path = dir.join(format!("sm_86_28sm-v{}.txt", env!("CARGO_PKG_VERSION")));
-    std::fs::read_to_string(path).expect("the store file")
+fn store_file(dir: &Path) -> String {
+    std::fs::read_to_string(store_path(dir)).expect("the store file")
 }
 
 /// A choice made the way [`TuneStore::choose`] makes one, from a closure of
@@ -183,11 +243,6 @@ fn timed<'a>(ns: &'a [Option<u64>], ran: &'a Cell<bool>) -> impl FnOnce() -> Vec
     }
 }
 
-/// The fastest is stored, its line holding the candidates that ran in timed
-/// order with their times (one that did not run left out), so a later process
-/// knows the leaders and how close they ran; a second store on the directory
-/// reads it back without measuring; a kernel change (another program
-/// fingerprint) re-measures.
 /// A store line is its key, a space and the entry, the key's fields split
 /// at bars: an op name with either would never be read back.
 #[test_case("packed attention"; "a space")]
@@ -197,6 +252,11 @@ fn an_op_name_splits_no_store_line(op: &'static str) {
     TuneKey::new(op, &sm86(), 0, ScalarDType::BFloat16, &[1], &[0usize]);
 }
 
+/// The fastest is stored, its line holding the candidates that ran in timed
+/// order with their times (one that did not run left out), so a later process
+/// knows the leaders and how close they ran; a second store on the directory
+/// reads it back without measuring; a kernel change (another program
+/// fingerprint) re-measures.
 #[test]
 fn a_winner_round_trips_through_the_store() {
     let dir = Scratch::new("tune-round-trip");
@@ -305,8 +365,7 @@ fn concurrent_writers_of_one_file_lose_no_line() {
 
 /// A plain bf16 GEMM's programs under `cfg` on sm_86.
 fn gemm_programs(cfg: crate::kernels::gemm::GemmCfg) -> tune::Candidate {
-    let spec =
-        assumed(GemmSpec { m: 128, n: 128, k: 128, batch: Batch::Static(1), epilogue: Epilogue::default() }, cfg);
+    let spec = assumed(gemm_spec(128, 128, 128), cfg);
     vec![(gemm::<BF16>(&spec), cfg.lowering(&Device { target: sm86(), costs: super::costs() }))]
 }
 
@@ -388,10 +447,9 @@ fn choices_and_values_share_a_file() {
 fn an_unreadable_line_is_dropped_at_the_next_write() {
     let dir = Scratch::new("tune-unreadable");
     let k = key(&[3, 3, 3], &[0, 1]);
-    let path = dir.join(format!("sm_86_28sm-v{}.txt", env!("CARGO_PKG_VERSION")));
     let kept = format!("{} 42", k.line(Kind::Value, 1));
-    let lines = format!("format {FORMAT}\ngemm|sm_86-28sm|BFloat16|3x3x3|0|0|0 1 100\n{kept}\nnonsense\n");
-    std::fs::write(&path, lines).unwrap();
+    let stale = "gemm|sm_86-28sm|BFloat16|3x3x3|0|0|0 1 100".to_string();
+    write_store(&dir, &k.device, FORMAT, &[stale, kept.clone(), "nonsense".into()]);
     let store = TuneStore::at(Some(dir.to_path_buf()));
     assert_eq!(store.entries(&k).len(), 1);
     assert_eq!(store.select(&k, 2, || 1, || vec![Some(9), Some(4)]), Some(1));
@@ -431,12 +489,7 @@ fn keys_are_stable(shape: &[usize], candidates: &[usize], compiler: u64, same: b
 /// parameter; a program's two parameters of one size never alias.
 #[test]
 fn candidates_share_scratch_buffers_without_aliasing_a_program() {
-    let spec = |tile| {
-        assumed(
-            GemmSpec { m: 256, n: 256, k: 256, batch: Batch::Static(1), epilogue: Epilogue::default() },
-            gemm_cfg(tile, 2, [2, 2], true),
-        )
-    };
+    let spec = |tile| assumed(gemm_spec(256, 256, 256), gemm_cfg(tile, 2, [2, 2], true));
     let (first, second) = (gemm::<BF16>(&spec([64, 64, 32])), gemm::<BF16>(&spec([128, 64, 32])));
     let pool = ScratchPool::default();
     let (a, b) = (pool.buffers(&first.params), pool.buffers(&second.params));
@@ -562,10 +615,9 @@ fn a_first_clean_config_round_trips_through_the_store() {
 fn a_file_of_another_format_is_dropped(written: Option<u32>, kept: bool) {
     let dir = Scratch::new(&format!("tune-format-{written:?}"));
     let k = key(&[2, 2, 2], &[0, 1]);
-    let path = dir.join(format!("sm_86_28sm-v{}.txt", env!("CARGO_PKG_VERSION")));
     let line = format!("{} 1:1 100 0:0 300", k.line(Kind::Choice, 7));
     let header = written.map_or(String::new(), |n| format!("format {n}\n"));
-    std::fs::write(&path, format!("{header}{line}\n")).unwrap();
+    std::fs::write(store_path(&dir), format!("{header}{line}\n")).unwrap();
     let store = TuneStore::at(Some(dir.to_path_buf()));
     assert_eq!(store.entries(&k).len(), usize::from(kept));
     let measured = Cell::new(false);
@@ -590,7 +642,7 @@ fn a_gemm_tunes_on_the_device() {
     let cfgs = super::first_eight(&planner.gemm_ranked(1, m, n, k, &Epilogue::DEFAULT));
     let batch = Batch::var("b", 1, 1);
     let build = |cfg: GemmCfg| {
-        let spec = assumed(GemmSpec { m, n, k, batch: batch.clone(), epilogue: Epilogue::default() }, cfg);
+        let spec = assumed(GemmSpec { batch: batch.clone(), ..gemm_spec(m, n, k) }, cfg);
         vec![(gemm::<BF16>(&spec), cfg.lowering(device))]
     };
     let key = TuneKey::new("gemm", &device.target, tune::compiler(&spec), ScalarDType::BFloat16, &[1, m, n, k], &cfgs);
@@ -766,8 +818,7 @@ fn a_scratch_plan_publishes_nothing() {
     let Some(planner) = super::device_planner() else { return };
     let device = &planner.device;
     let cfg = super::first_eight(&planner.gemm_ranked(1, 704, 512, 512, &Epilogue::DEFAULT))[0];
-    let spec =
-        assumed(GemmSpec { m: 704, n: 512, k: 512, batch: Batch::Static(1), epilogue: Epilogue::default() }, cfg);
+    let spec = assumed(gemm_spec(704, 512, 512), cfg);
     let pool = ScratchPool::default();
     let scratch = || tune::scratch_plan(gemm::<BF16>(&spec), &cfg.lowering(device), &pool).expect("a plan");
     let kernels = |plan: &svod_runtime::ExecutionPlan| plan.kernels().map(std::ptr::from_ref).collect::<Vec<_>>();
@@ -839,8 +890,7 @@ fn a_float_scratch_buffer_is_random_and_an_integer_one_is_zero() {
 /// A 4096³ GEMM candidate on the warp-level core for `target` under `costs`.
 fn gemm_candidate(target: crate::atoms::Target, costs: crate::atoms::Costs) -> tune::Candidate {
     let cfg = crate::ops::config::gemm_cfg([128, 128, 32], 2, [2, 4], true);
-    let spec =
-        assumed(GemmSpec { m: 4096, n: 4096, k: 4096, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT }, cfg);
+    let spec = assumed(gemm_spec(4096, 4096, 4096), cfg);
     vec![(gemm::<BF16>(&spec), cfg.lowering(&Device { target, costs }))]
 }
 
@@ -1106,7 +1156,7 @@ fn timed_candidates_clear_their_physical_floor() {
         shape: &[usize],
         code: &str,
     ) -> Option<f64> {
-        use crate::kernels::nearest::{Floors, Metric};
+        use crate::kernels::nearest::Metric;
         use crate::ops::config::{AttentionProblem, ConvProblem, GemmProblem, NearestProblem, Tiled};
         match op {
             "nearest" => {
@@ -1115,16 +1165,7 @@ fn timed_candidates_clear_their_physical_floor() {
                     [n, m, d, k] => (n, m, d, k),
                     _ => return None,
                 };
-                let p = NearestProblem {
-                    n,
-                    m,
-                    d,
-                    dtype,
-                    metric: Metric::SquaredL2,
-                    floors: Floors::default(),
-                    groups: false,
-                    k,
-                };
+                let p = NearestProblem { dtype, ..super::self_join(n, m, d, Metric::SquaredL2, k) };
                 planner.floor_of(&p, &Tiled::of_code(code)?)
             }
             "gemm" | "linear" => {
@@ -1218,15 +1259,12 @@ fn timed_candidates_clear_their_physical_floor() {
     let lie = |what: &str| what.contains("gfx1151") && what.contains("nearest [256, 1048576, 768, 64] 128,128,r2");
 
     let dir = Scratch::new("floor-store");
-    let file = TuneStore::at(Some(dir.to_path_buf())).file("gfx1151-40sm").expect("a rooted store");
     let lines: Vec<String> = VENDORED_RATES
         .iter()
-        .map(|&(op, fs)| {
-            format!("value|probe:{op}|gfx1151-40sm|Int32||00000000000000c0|00000000000000aa|00000000000000bb {fs}")
-        })
+        .map(|&(op, fs)| super::offline::line("gfx1151-40sm", op, "00000000000000bb", fs))
         .chain(VENDORED_CHOICES.iter().map(|line| (*line).to_string()))
         .collect();
-    std::fs::write(file, format!("format {FORMAT}\n{}\n", lines.join("\n"))).expect("a store file");
+    write_store(&dir, "gfx1151-40sm", FORMAT, &lines);
 
     let vendored = scan(&dir);
     println!("vendored candidates: {}", vendored.len());

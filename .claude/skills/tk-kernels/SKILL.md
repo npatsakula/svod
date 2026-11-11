@@ -1,6 +1,6 @@
 ---
 name: tk-kernels
-description: Write, check, debug and profile tile kernels with the `svod-tk` crate (tk/src). Use when adding or changing a tile program (`build::Kernel`), wiring it into `svod_tk::ops` and the config lattice, running it in the host interpreter or on a GPU, reading a lowering/layout/admission rejection, dumping a tk kernel's instruction list, LLVM IR, PTX/SASS or AMDGCN for a card this machine does not have, comparing its main loop with cuBLAS/CUTLASS/ThunderKittens/HipKittens/AITER ISA, reading the planner log or the tune store (or the config a card's store chose, offline), running the device probes and gates, or checking a change for perf regressions or proving a refactor byte-identical. Covers SVOD_DEVICE for the device gate, the tk_dump example (--cfg tuned, --compare), the tk_digest example, SVOD_DUMP_AMD_ASM, RUST_LOG=svod_tk::plan, TK_DUMP_LIST, SVOD_TK_TUNE, SVOD_TK_TUNE_DIR, device_costs_are_physical, families_match_the_interpreter_on_the_device, the *_probe tests.
+description: Write, check, debug and profile tile kernels with the `svod-tk` crate (tk/src). Use when adding or changing a tile program (`build::Kernel`), wiring it into `svod_tk::ops` and the config lattice, running it in the host interpreter or on a GPU, reading a lowering/layout/admission rejection, dumping a tk kernel's instruction list, LLVM IR, PTX/SASS or AMDGCN for a card this machine does not have, comparing its main loop with cuBLAS/CUTLASS/ThunderKittens/HipKittens/AITER ISA, reading the planner log or the tune store (or the config a card's store chose, offline), running the device probes and gates, or checking a change for perf regressions or proving a refactor byte-identical. Covers SVOD_DEVICE for the device gate, the tk_dump example (--cfg tuned, --compare), the tk_digest example, SVOD_DUMP_AMD_ASM, RUST_LOG=svod_tk::plan, TK_DUMP_LIST, SVOD_TK_TUNE, SVOD_TK_TUNE_DIR, device_costs_are_physical, families_match_the_interpreter_on_the_device, the tk_bench example and the *_probe tests.
 ---
 
 # tk tile kernels
@@ -32,7 +32,7 @@ for host work, `SVOD_DEVICE=CUDA` / `AMD` (or `CUDA:0`, `AMD:1`) for device work
 | Emitted instruction list | `TK_DUMP_LIST=1` (stderr, every `emit` call); pin one config with `SVOD_TK_TUNE=0` or use `tk_dump` |
 | LLVM IR / AMDGCN as compiled on a device | `SVOD_DUMP_NVPTX_IR=<dir>` / `SVOD_DUMP_AMD_IR=<dir>` → `<arch>_<kernel>_<ir digest>.ll`, `SVOD_DUMP_AMD_ASM=<dir>` → `.s` |
 | Tuning off | `SVOD_TK_TUNE=0` (process) or `tune::scoped(false, f)` (this thread): the first clean ranked config runs; probes still measure |
-| GEMM TFLOP/s per config | `SVOD_DEVICE=… cargo test -p svod-tk --release --lib gemm_throughput_probe -- --ignored --nocapture --test-threads=1` |
+| GEMM TFLOP/s of the tuner's pick and the ranked configs | `SVOD_DEVICE=… cargo run --release -p svod-tk --example tk_bench -- gemm --top 8` (see Measuring) |
 
 Not for tk kernels: `SVOD_DUMP_STAGE`, `SVOD_PER_STAGE_UOPS`, `SVOD_DUMP_LINEAR`, `BEAM`, `SVOD_NOOPT`. A tk body is a
 pre-linearized PROGRAM (`UOp::linear_program`): the optimizer skips it (`schedule/src/optimizer/mod.rs`, "A PROGRAM is past
@@ -223,27 +223,29 @@ re-running: `grep '^value|probe:' <file>`; indices point into the ranked list: t
 
 ## Measuring
 
-The `#[ignore]` probes print and never assert; one at a time on an idle GPU:
+Benchmarks run as the `tk_bench` example on the default device, one at a time on an idle GPU:
+`SVOD_DEVICE=… cargo run --release -p svod-tk --example tk_bench -- <command> [flags]`. Every command takes `--rounds R`
+(timed round-robin rounds, default 20, `fit` 2); `RUST_LOG=svod_tk=debug` adds the tuner's picks and round times.
+
+| Command | Prints |
+|---|---|
+| `gemm [--shape MxNxK,…] [--top N]` | bf16 TFLOP/s of the tuner's pick, marked, and of the planner's first `N` ranked configs; 4096³ by default |
+| `attention [--shape BxHxTxD,…] [--causal] [--bias] [--top N]` | FA TFLOP/s of what the op launches and of the first `N` ranked configs; by default B 4, H 8, T 2048 at d64 (plain, causal, a per-batch bias, both) and d128 (plain, causal) |
+| `nearest [--rows N] [--depths D,…] [--k K] [--metric squared-l2\|l2\|neg-dot]` | a self-join's Gpairs/s and TFLOP/s through the op, with `ops::chosen()`; by default 65536 rows at depths 16–128, k 1: SquaredL2, the same under 64 groups, L2 above both floors (`--metric` that one alone) |
+| `rerank [--rows N] [--candidates M] [--depths D,…] [--ks K,…] [--metric M]` | `k_nearest_reranked` over its 8-bit and its f16 search against the plain f16 `k_nearest`, Gpairs/s and × f16; by default 16384 rows, depths 128–768, k 1/16/64, NegDot |
+| `raster [--shape MxNxK,…]` | every raster (`TileOrder`, groups of 1, 2, 4, … tile rows and column-major) of the tuner's pick and the planner's first, × the default's beside the model's ×, on 4096³, 4096×1024×4096, 8192²×1024 by default |
+| `fit [--only LABEL,…] [--picks]` | the cost model against the device on a few GEMM (4096³, Nemotron, Qwen3, Whisper projections), attention and nearest shapes: `costs\|…`, a `fit\|label\|rank\|verdict\|ns predicted\|ns measured\|cfg` line a ranked config, `pick\|label\|ns\|cfg` and `tune\|label\|s` (the tuner's wall time; cold on a store of the device's probes alone); `--picks` times the picks alone, an A/B across builds |
+| `trips` | `residency\|op\|blocks\|trip\|wall\|spread\|base\|measurable` of the trip probes at 1–48 blocks an SM (`probe::trip_at`): what `TRIP_HIDING` is fitted to |
+| `pin --cfg BMxBNxBK:S:WRxWC[:rolled],… [--shape MxNxK,…] [--residual] [--gated]` | `pin\|shape\|cfg\|blocks\|measured\|model\|less latency\|less lone trip\|less step` a pinned GEMM config (3-part code unrolled; Whisper's fc2 1500×1280×5120 by default, `--gated` a SwiGLU epilogue): the model's ns with each term zeroed beside the measured ns |
+
+The `#[ignore]` probe tests left print and never assert:
 `-- --ignored --nocapture --test-threads=1`.
 
 | Probe test | Prints |
 |---|---|
-| `device::gemm_throughput_probe` | 4096³ bf16 TFLOP/s per config, the tuner's pick marked |
-| `device::gemm_candidates_probe`, `device::qwen3_gemm_candidates_probe` | every admitted candidate on Nemotron / Qwen3 shapes |
-| `device::gemm_raster_probe` | every raster (`TileOrder`, groups of 1, 2, 4, … tile rows and column-major) of the tuner's pick and the planner's first, µs and × the default's beside the model's ×, on 4096³, 4096×1024×4096, 8192²×1024 (`RASTER_SHAPES=MxNxK;…`) |
 | `device::gemm_tail_probe` | data-parallel vs the model's cheapest whole split-K vs its cheapest tail split (full waves data-parallel, the last partial wave split along K), µs, TFLOP/s and × DP beside the model's ×, two passes in opposite orders, the planner's pick marked; 8192×4096×4096, 4096³, 8192²×1024, 6144×4096×8192 (`TAIL_SHAPES=MxNxK;…`) |
-| `attention::{attention_throughput_probe, attention_candidates_probe, decode_throughput_probe}` | FA d64/d128 ± causal ± bias TFLOP/s; decoder step µs |
-| `conv::conv_throughput_probe`, `rows::norm_bandwidth_probe` | YOLO conv classes vs graph µs; norm GB/s |
-| `attention::key_warp_resources_probe` | registers/LDS/spill per key-warp config |
-| `device::first_execution_probe` (cp.async), `parts::mma_peak_probe` (CUDA) | build/lower/prepare cost; `mma.sync` ceiling |
 | `probe::probe_signals_are_strong` | every probe pair's signal (run alone) |
 | `nearest::knn_probe` | k-nearest lists: the tuned pick's Gpairs/s per `KNN_ROWS`/`KNN_DEPTHS`/`KNN_KS` (f16, NegDot and SquaredL2) and its share of k=1's (register lists to 64, queued into the outputs and score-matrix lists past 32; a score matrix splits over candidates as a least does and, `SelectCfg { filter }`, lists only the steps its trips' leasts bound, in shares merged by `nearest_merge`); `KNN_CANDIDATES` for a search instead of a self-join, `KNN_METRICS` one metric, `KNN_GRAPH`/`KNN_GRAPH_K` the graph fallback beside, `KNN_ALL` times every admitted config |
-| `nearest::rerank_probe` | `k_nearest_reranked`'s parts: the f16 search of `k`, the 8-bit and f16 searches of `k + MARGIN`, the exact pass, ms and Gpairs/s (`RR_ROWS`, `RR_CANDIDATES`, `RR_DEPTHS`, `RR_KS`, `RR_METRIC`, `RR_TUNE=0` pins) |
-| `nearest::recall_probe` | the reranked op's recall per search against the f64 top-k on `real_<d>.bin` embeddings (`RECALL_DIR`, `RECALL_QUERIES`, `RECALL_DEPTHS`) |
-| `nearest::list_time_probe` | list configs untuned, alternating runs (`LIST_CFGS` = `bq:bkv:stages:depth:width[:queue]`;…, `LIST_BK`, `LIST_SPLITS`, `LIST_KS`, `LIST_ROWS`, `LIST_CANDIDATES`, `LIST_DEPTH`, `LIST_RUNS`): the A/B of a list kernel change, split counts forced |
-| `nearest::list_ir_dump` | the LLVM IR of those configs into `LIST_IR` (`LIST_TARGET` sm_86/gfx1201/gfx1151, `LIST_INT8` over 8-bit rows, `LIST_STORE` a copied tune store whose probes orient the products as the card's own would), with each one's lines and lowering time, for `ptxas -v` register counts or `clang -S` |
-| `nearest::live::live_probe` | the op over rows bound to a variable against the op at the bound count (`LIVE_ROWS`, `LIVE_DEPTHS`, `LIVE_KS`): the concrete pick, the live op under that config and under its own pick, rows bound at twice the count run at it |
-| `nearest::tuning_probe` | cold tuning wall time, the pick, predicted vs measured per timed config (nearest at `TUNE_KS`, `TUNE_GEMMS`, `TUNE_ATTN`); run on a store of the probes' lines alone |
 
 Ad hoc timing in a test: `super::measure(candidates)` (compile + time, ns per candidate on scratch buffers). Models:
 `tk3_pr.md` Table B gives each row's command and line (e.g. `--example nemotron_diarize -- <wav> --dtype bf16 --profile`;

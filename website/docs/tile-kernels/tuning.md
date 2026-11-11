@@ -137,24 +137,27 @@ pick. `RUST_LOG=svod_tk=debug` adds the tuner's rounds.
 
 `tune::TuneStore::at(root)` builds a store at another root, or in memory only with `None`.
 
-## Probe tests
+## Benchmarks
 
-The probe tests are `#[ignore]` tests that print timings and never assert. They rank with the
-device's probed costs and time the shortlist the tuner admits, marking the tuner's pick. Run
-them one at a time on an idle GPU:
+The `tk_bench` example times tk's kernels on the default device (`SVOD_DEVICE`). Each config's
+time is its fastest profiled run, its kernels' device timestamps summed, after the clock has
+lifted; the configs of one shape are timed round-robin so drift hits each alike. It prints and
+never asserts. Run one command at a time on an idle GPU:
 
 ```bash
-SVOD_DEVICE=CUDA cargo test -p svod-tk --release --lib gemm_candidates_probe -- --ignored --nocapture --test-threads=1
+SVOD_DEVICE=CUDA cargo run --release -p svod-tk --example tk_bench -- gemm --top 8
 ```
 
-| Probe | Prints |
+| Command | Prints |
 |---|---|
-| `gemm_throughput_probe` | The admitted GEMM configs at 4096³ bf16, TFLOP/s, and the tuner's pick |
-| `gemm_candidates_probe` | Every admitted GEMM candidate on Nemotron's projection shapes and 4096³: the untuned pick, the fastest and the tuner's pick |
-| `qwen3_gemm_candidates_probe` | Qwen3-Embedding's projections: the shortlist, then the rest of the lattice |
-| `attention_throughput_probe` | Flash attention (B 4, H 8, T 2048; d 64/128, causal and not, d 64 with a bias): every admitted config and the tuner's pick with its softmax forms |
-| `attention_candidates_probe` | Every attention config of the lattice against the admitted shortlist |
-| `decode_throughput_probe` | A Whisper large-v3 decoder step's self and cross attention, tuned splits and unsplit |
-| `conv_throughput_probe` | Every admitted convolution candidate per YOLO26 class against the graph convolution |
-| `norm_bandwidth_probe` | The row kernels on 8192×1024 bf16, in GB/s |
-| `first_execution_probe` | Host cost of building, lowering and preparing a tk GEMM against a graph GEMM |
+| `gemm [--shape MxNxK,…] [--top N]` | bf16 GEMM TFLOP/s of the tuner's pick (4096³ by default), marked, and of the planner's first `N` ranked configs |
+| `attention [--shape BxHxTxD,…] [--causal] [--bias] [--top N]` | Flash attention TFLOP/s of what the op launches and of the first `N` ranked configs; by default B 4, H 8, T 2048 at d 64 (plain, causal, with a bias, both) and d 128 (plain, causal) |
+| `nearest [--rows N] [--depths D,…] [--k K] [--metric M]` | A self-join through the nearest op in Gpairs/s and TFLOP/s; by default 65536 rows at depths 16 to 128: squared distances, the same under 64 groups, L2 above both floors |
+| `rerank [--rows N] [--candidates M] [--depths D,…] [--ks K,…] [--metric M]` | `k_nearest_reranked` with its 8-bit and its f16 search against the plain f16 `k_nearest` |
+| `raster [--shape MxNxK,…]` | Every raster order of the tuner's GEMM pick and of the planner's first config against the default order, beside the cost model's price of each |
+| `fit [--only LABEL,…] [--picks]` | The cost model against the device: the predicted and measured time of each ranked config on a few GEMM, attention and nearest shapes, the tuner's pick and the tuner's wall time; `--picks` times the picks alone |
+| `trips` | The pipeline-trip probes at 1 to 48 blocks per SM |
+| `pin --cfg BMxBNxBK:S:WRxWC[:rolled],… [--shape MxNxK,…] [--residual] [--gated]` | Each pinned GEMM config's time (Whisper's fc2 by default) beside the model's price and that price with the memory latency, the lone trip or the matrix step zeroed: what each term holds of the config's time |
+
+`--metric` takes `squared-l2`, `l2` or `neg-dot`. Every command takes `--rounds R`, the timed
+rounds (20 by default, 2 for `fit`).

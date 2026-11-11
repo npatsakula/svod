@@ -3,13 +3,16 @@
 
 use test_case::test_case;
 
-use crate::atoms::Core;
+use super::attention::probe_spec;
+use super::gemm_spec;
 use crate::build::*;
 use crate::ir::*;
 use crate::kernels::Batch;
 use crate::kernels::attention::{AttnMask, AttnSpec, CacheLayout, FaCfg, attention};
-use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
+use crate::kernels::gemm::gemm;
+use crate::kernels::nearest::{Floors, Metric, NearestCfg, NearestSpec, nearest};
 use crate::lower::sync::insert_barriers;
+use crate::ops::config::gemm_cfg;
 use crate::sweep::assumed;
 
 /// The statements of `block` by kind.
@@ -45,7 +48,7 @@ fn out_view<'k>(k: &mut Kernel<'k>, out: ParamRef<'k, BF16, Out>, at: usize) -> 
 /// before the block reads it.
 #[test]
 fn warps_fence_their_own_effects_and_the_block_fences_theirs() {
-    let prog = Kernel::record("warps", |k| {
+    let mut prog = Kernel::record("warps", |k| {
         k.warps(4);
         let scratch = k.smem::<BF16>("scratch", 4 * 256);
         let out = k.output::<BF16>("o", 2 * 256);
@@ -63,7 +66,6 @@ fn warps_fence_their_own_effects_and_the_block_fences_theirs() {
         let o = out_view(k, out, 256);
         k.store(o, merged);
     });
-    let mut prog = prog;
     insert_barriers(&mut prog).unwrap();
     assert_eq!(
         top(&prog),
@@ -87,22 +89,7 @@ fn warps_fence_their_own_effects_and_the_block_fences_theirs() {
 #[test]
 fn a_key_warps_state_over_its_ring_is_fenced_by_the_warp_then_the_block() {
     let cfg = FaCfg { key_warps: 4, ..FaCfg::new(16, 16, 2) };
-    let mask = AttnMask::default();
-    let spec = assumed(
-        AttnSpec {
-            batch: Batch::Static(1),
-            t: 1,
-            tk: 64,
-            heads: 1,
-            kv_heads: 1,
-            d: 64,
-            mask,
-            cache: None,
-            packed: false,
-            scale: 0.125,
-        },
-        cfg,
-    );
+    let spec = assumed(probe_spec(1, 1, 1, 64, 64, AttnMask::default()), cfg);
     let mut prog = attention::<BF16>(&spec);
     insert_barriers(&mut prog).unwrap();
     assert!(
@@ -132,36 +119,11 @@ fn a_key_warps_state_over_its_ring_is_fenced_by_the_warp_then_the_block() {
     );
 }
 
-/// A warp's asynchronous copy still in flight when the warps end is landed,
-/// not only fenced, before the block reads its tile.
-#[test]
-fn a_warps_async_copy_is_landed_before_the_block_reads_it() {
-    let prog = Kernel::record("warps_async", |k| {
-        k.warps(4);
-        let src = k.input::<BF16>("x", 4 * 256);
-        let scratch = k.smem::<BF16>("scratch", 4 * 256);
-        k.each_warp(|k| {
-            let w = k.warp();
-            let g = k.view(src, w.clone() * 256, [16, 1], Shape::new(16, 16), [None, None]);
-            let region = k.smem_view::<BF16>(scratch, w * 256, Shape::new(16, 16));
-            k.stage(region, g, CopyMode::Async);
-        });
-        let first = k.smem_view::<BF16>(scratch, 0, Shape::new(16, 16));
-        let merged = k.load(first);
-        let out = k.output::<BF16>("o", 256);
-        let o = out_view(k, out, 0);
-        k.store(o, merged);
-    });
-    let mut prog = prog;
-    insert_barriers(&mut prog).unwrap();
-    assert_eq!(top(&prog), ["other", "commit", "wait", "barrier", "load", "out"]);
-}
-
 /// A loop may run no trip, so what was written before it is still unfenced
 /// after it even when its body ends on a barrier.
 #[test]
 fn a_store_before_a_loop_is_fenced_past_it() {
-    let prog = Kernel::record("zero_trips", |k| {
+    let mut prog = Kernel::record("zero_trips", |k| {
         let n = k.var("n", 0, 4);
         let s = k.smem::<F32>("s", 256);
         let tile = k.smem_view::<F32>(s, 0, Shape::new(16, 16));
@@ -173,7 +135,6 @@ fn a_store_before_a_loop_is_fenced_past_it() {
         let o = k.view(out, 0, [16, 1], Shape::new(16, 16), [None, None]);
         k.store(o, y);
     });
-    let mut prog = prog;
     let Some(Stmt::Loop(l)) = prog.body.0.iter_mut().find(|s| matches!(s, Stmt::Loop(_))) else { panic!("a loop") };
     l.body.0.push(Stmt::Sync(Sync::Barrier { scope: Scope::Block }));
     insert_barriers(&mut prog).unwrap();
@@ -182,24 +143,47 @@ fn a_store_before_a_loop_is_fenced_past_it() {
     assert_eq!(k[at + 1..at + 3], ["barrier", "load"], "{k:?}");
 }
 
-/// An asynchronous copy outside a pipeline is committed, waited for and
-/// fenced before its tile is read.
-#[test]
-fn an_async_copy_is_waited_for_before_a_read() {
-    let prog = Kernel::record("async", |k| {
-        let src = k.input::<BF16>("x", 256);
-        let g = k.view(src, 0, [16, 1], Shape::new(16, 16), [None, None]);
-        let s = k.smem::<BF16>("s", 256);
-        let tile = k.smem_view::<BF16>(s, 0, Shape::new(16, 16));
-        k.stage(tile, g, CopyMode::Async);
-        let y = k.load(tile);
+/// A 16×16 tile `s` an asynchronous copy fills outside a pipeline.
+fn copied<'k>(k: &mut Kernel<'k>) -> SmemRef<'k, BF16> {
+    let src = k.input::<BF16>("x", 256);
+    let g = k.view(src, 0, [16, 1], Shape::new(16, 16), [None, None]);
+    let s = k.smem::<BF16>("s", 256);
+    let tile = k.smem_view::<BF16>(s, 0, Shape::new(16, 16));
+    k.stage(tile, g, CopyMode::Async);
+    s
+}
+
+/// Four warps' 16×16 tiles of `scratch`, each filled by its warp's
+/// asynchronous copy.
+fn copied_by_warps<'k>(k: &mut Kernel<'k>) -> SmemRef<'k, BF16> {
+    k.warps(4);
+    let src = k.input::<BF16>("x", 4 * 256);
+    let scratch = k.smem::<BF16>("scratch", 4 * 256);
+    k.each_warp(|k| {
+        let w = k.warp();
+        let g = k.view(src, w.clone() * 256, [16, 1], Shape::new(16, 16), [None, None]);
+        let region = k.smem_view::<BF16>(scratch, w * 256, Shape::new(16, 16));
+        k.stage(region, g, CopyMode::Async);
+    });
+    scratch
+}
+
+/// An asynchronous copy is committed, waited for and fenced before its
+/// tile is read: one outside a pipeline, and a warp's still in flight when
+/// the warps end, landed, not only fenced, before the block reads its tile.
+#[test_case(copied, ["async", "commit", "wait", "barrier", "load", "out"]; "outside a pipeline")]
+#[test_case(copied_by_warps, ["other", "commit", "wait", "barrier", "load", "out"]; "a warp's past the warps")]
+fn an_async_copy_is_waited_for_before_a_read(copy: for<'k> fn(&mut Kernel<'k>) -> SmemRef<'k, BF16>, want: [&str; 6]) {
+    let mut prog = Kernel::record("async", |k| {
+        let s = copy(k);
+        let first = k.smem_view::<BF16>(s, 0, Shape::new(16, 16));
+        let y = k.load(first);
         let out = k.output::<BF16>("o", 256);
         let o = out_view(k, out, 0);
         k.store(o, y);
     });
-    let mut prog = prog;
     insert_barriers(&mut prog).unwrap();
-    assert_eq!(top(&prog), ["async", "commit", "wait", "barrier", "load", "out"]);
+    assert_eq!(top(&prog), want);
 }
 
 /// Where a barrier meets a tile an async copy is filling: the pass's own
@@ -219,7 +203,7 @@ enum Between {
 #[test_case(Between::Barrier; "an author's barrier")]
 #[test_case(Between::Loop; "a loop ending on a barrier")]
 fn a_pending_async_copy_survives_a_barrier(between: Between) {
-    let prog = Kernel::record("async_then_barrier", |k| {
+    let mut prog = Kernel::record("async_then_barrier", |k| {
         let src = k.input::<BF16>("x", 256);
         let g = k.view(src, 0, [16, 1], Shape::new(16, 16), [None, None]);
         let a = k.smem::<BF16>("a", 256);
@@ -248,7 +232,6 @@ fn a_pending_async_copy_survives_a_barrier(between: Between) {
             k.store(o, y);
         }
     });
-    let mut prog = prog;
     let after_copy = top(&prog).iter().position(|s| *s == "async").unwrap() + 1;
     match between {
         Between::Barrier => prog.body.0.insert(after_copy, Stmt::Sync(Sync::Barrier { scope: Scope::Block })),
@@ -311,64 +294,40 @@ fn zero_slot<'k>(k: &mut Kernel<'k>, ring: Ring<'k, BF16>) -> Shared<'k, BF16> {
     t
 }
 
-/// The template's first copies overwrite the ring, so a read of it before
-/// the pipeline is fenced first.
-#[test]
-fn a_ring_read_before_its_pipeline_is_fenced_at_entry() {
-    let mut prog = around_a_pipeline(
-        |k, ring| {
-            let t = zero_slot(k, ring);
-            let _ = k.load(t);
-        },
-        |_, _| {},
-    );
-    insert_barriers(&mut prog).unwrap();
-    let k = top(&prog);
-    let at = k.iter().position(|s| *s == "pipeline").unwrap();
-    assert_eq!(k[..at], ["other", "store", "barrier", "load", "other", "barrier"]);
+/// An async copy filling a tile other than the ring.
+fn copy_another<'k>(k: &mut Kernel<'k>, _: Ring<'k, BF16>) {
+    let x = k.input::<BF16>("y", 256);
+    let g = k.view(x, 0, [16, 1], Shape::new(16, 16), [None, None]);
+    let other = k.smem::<BF16>("other", 256);
+    let t = k.smem_view::<BF16>(other, 0, Shape::new(16, 16));
+    k.stage(t, g, CopyMode::Async);
 }
 
-/// No barrier follows the last consume, so its reads of the ring are open
-/// after the pipeline.
-#[test]
-fn a_ring_written_after_its_pipeline_is_fenced() {
-    let mut prog = around_a_pipeline(
-        |_, _| {},
-        |k, ring| {
-            zero_slot(k, ring);
-        },
-    );
+/// Code around a pipeline is fenced against its ring where they meet: the
+/// template's first copies overwrite the ring, so a read of it before the
+/// pipeline is fenced at entry; no barrier follows the last consume, so a
+/// write after it is fenced; and an async copy still filling another tile
+/// is landed before the pipeline, not left to the template's group count.
+#[test_case(|k, ring| { let t = zero_slot(k, ring); let _ = k.load(t); }, |_, _| {},
+    &["other", "store", "barrier", "load", "other", "barrier", "pipeline", "out"]; "a ring read before its pipeline")]
+#[test_case(|_, _| {}, |k, ring| { zero_slot(k, ring); },
+    &["other", "pipeline", "other", "barrier", "store", "out"]; "a ring written after its pipeline")]
+#[test_case(copy_another, |_, _| {}, &["async", "other", "commit", "wait", "barrier", "pipeline", "out"]; "an async copy before a pipeline")]
+fn a_pipeline_is_fenced_where_the_code_around_it_meets_it(
+    before: for<'k> fn(&mut Kernel<'k>, Ring<'k, BF16>),
+    after: for<'k> fn(&mut Kernel<'k>, Ring<'k, BF16>),
+    want: &[&str],
+) {
+    let mut prog = around_a_pipeline(before, after);
     insert_barriers(&mut prog).unwrap();
-    let k = top(&prog);
-    let at = k.iter().position(|s| *s == "pipeline").unwrap();
-    assert_eq!(k[at + 1..at + 4], ["other", "barrier", "store"], "{k:?}");
-}
-
-/// An async copy still filling another tile is landed before a pipeline,
-/// not left to the template's group count.
-#[test]
-fn an_async_copy_is_landed_before_a_pipeline() {
-    let mut prog = around_a_pipeline(
-        |k, _| {
-            let x = k.input::<BF16>("y", 256);
-            let g = k.view(x, 0, [16, 1], Shape::new(16, 16), [None, None]);
-            let other = k.smem::<BF16>("other", 256);
-            let t = k.smem_view::<BF16>(other, 0, Shape::new(16, 16));
-            k.stage(t, g, CopyMode::Async);
-        },
-        |_, _| {},
-    );
-    insert_barriers(&mut prog).unwrap();
-    let k = top(&prog);
-    let at = k.iter().position(|s| *s == "pipeline").unwrap();
-    assert_eq!(k[at - 3..at], ["commit", "wait", "barrier"], "{k:?}");
+    assert_eq!(top(&prog), want);
 }
 
 /// A consume body starts after the template's barrier: only what it does to
 /// its own tiles within one step is fenced.
 #[test]
 fn a_consume_body_fences_its_own_tiles() {
-    let prog = Kernel::record("consume_scratch", |k| {
+    let mut prog = Kernel::record("consume_scratch", |k| {
         let x = k.input::<BF16>("x", 4 * 256);
         let g = k.view(x, 0, [16, 1], Shape::new(16, 16), [None, None]);
         let ring = k.ring::<BF16>("ring", 256, 2);
@@ -395,7 +354,6 @@ fn a_consume_body_fences_its_own_tiles() {
         let o = out_view(k, out, 0);
         k.store(o, *last);
     });
-    let mut prog = prog;
     insert_barriers(&mut prog).unwrap();
     let Some(Stmt::Pipeline(p)) = prog.body.0.iter().find(|s| matches!(s, Stmt::Pipeline(_))) else {
         panic!("a pipeline")
@@ -403,12 +361,18 @@ fn a_consume_body_fences_its_own_tiles() {
     assert_eq!(kinds(&prog, &p.consume.body), ["load", "store", "barrier", "load"]);
 }
 
+const BOTH: Floors = Floors { row: true, col: true };
+
+/// 100 bf16 rows against 150 candidates at depth `d` under L2, grouped,
+/// floored by `floors`, keeping `k` scores a row.
+fn nearest_spec(d: usize, floors: Floors, k: usize) -> NearestSpec {
+    let (dtype, metric) = (svod_dtype::ScalarDType::BFloat16, Metric::L2);
+    NearestSpec { n: 100, m: 150, d, dtype, metric, floors, groups: true, k, live: Default::default() }
+}
+
 /// The shipped kernels keep their shared memory in pipeline rings, which
 /// their templates fence: the pass leaves them as they are.
-#[test_case(gemm::<BF16>(&assumed(
-    GemmSpec { m: 256, n: 256, k: 256, batch: Batch::Static(1), epilogue: Epilogue::default() },
-    GemmCfg { core: Core::Warp, tile: [128, 128, 32], warps: [2, 2], schedule: Schedule::ring(3, true), order: Default::default(), tail: None },
-)); "gemm")]
+#[test_case(gemm::<BF16>(&assumed(gemm_spec(256, 256, 256), gemm_cfg([128, 128, 32], 3, [2, 2], true))); "gemm")]
 #[test_case(attention::<BF16>(&assumed(
     AttnSpec {
         batch: Batch::var("b", 1, 2),
@@ -420,20 +384,8 @@ fn a_consume_body_fences_its_own_tiles() {
     },
     FaCfg { splits: 2, ..FaCfg::new(16, 64, 3) },
 )); "attention with every mask, a cache and splits")]
-#[test_case(crate::kernels::nearest::nearest::<BF16>(&assumed(
-    crate::kernels::nearest::NearestSpec {
-        n: 100, m: 150, d: 32, dtype: svod_dtype::ScalarDType::BFloat16, metric: crate::kernels::nearest::Metric::L2,
-        floors: crate::kernels::nearest::Floors { row: true, col: true }, groups: true, k: 1, live: Default::default(),
-    },
-    crate::kernels::nearest::NearestCfg::new(32, 32, 3),
-)); "nearest with floors and groups")]
-#[test_case(crate::kernels::nearest::nearest::<BF16>(&assumed(
-    crate::kernels::nearest::NearestSpec {
-        n: 100, m: 150, d: 32, dtype: svod_dtype::ScalarDType::BFloat16, metric: crate::kernels::nearest::Metric::L2,
-        floors: crate::kernels::nearest::Floors { row: true, col: true }, groups: true, k: 8, live: Default::default(),
-    },
-    crate::kernels::nearest::NearestCfg::new(32, 32, 3),
-)); "nearest lists with floors and groups")]
+#[test_case(nearest::<BF16>(&assumed(nearest_spec(32, BOTH, 1), NearestCfg::new(32, 32, 3))); "nearest with floors and groups")]
+#[test_case(nearest::<BF16>(&assumed(nearest_spec(32, BOTH, 8), NearestCfg::new(32, 32, 3))); "nearest lists with floors and groups")]
 fn shipped_kernels_need_no_barriers(prog: Program) {
     let mut fenced = prog.clone();
     insert_barriers(&mut fenced).unwrap();
@@ -459,7 +411,7 @@ fn a_block_barrier_under_a_branch_on_the_warp_is_refused(
         let o = k.view(out, 0, [16, 1], Shape::new(16, 16), [None, None]);
         k.store(o, y);
     }
-    let prog = Kernel::record("divergent", |k| {
+    let mut prog = Kernel::record("divergent", |k| {
         let s = k.smem::<F32>("s", 256);
         let out = k.output::<F32>("o", 256);
         let pred = if on_warp { k.warp().lt(2) } else { k.block(0).lt(2) };
@@ -469,7 +421,6 @@ fn a_block_barrier_under_a_branch_on_the_warp_is_refused(
             k.if_(pred, |k| body(k, s, out), |_| {});
         }
     });
-    let mut prog = prog;
     insert_barriers(&mut prog).map_err(|e| e.to_string())?;
     let mut stmt = &prog.body.0[0];
     if let Stmt::Warps { body } = stmt {
@@ -485,7 +436,7 @@ fn a_block_barrier_under_a_branch_on_the_warp_is_refused(
 #[test_case(true => Err("a shared tile's fence is a block barrier under a branch on the warp, which some warps skip".into()); "through shared memory")]
 #[test_case(false => Ok(()); "in registers")]
 fn a_block_barrier_under_a_vote_is_refused(shared: bool) -> Result<(), String> {
-    let prog = Kernel::record("voted", |k| {
+    let mut prog = Kernel::record("voted", |k| {
         let s = k.smem::<F32>("s", 256);
         let x = k.zeros::<F32>(Shape::new(16, 16));
         let low = k.reduce(x, Axis::Row, ReduceOp::Min);
@@ -505,7 +456,6 @@ fn a_block_barrier_under_a_vote_is_refused(shared: bool) -> Result<(), String> {
             [low],
         );
     });
-    let mut prog = prog;
     insert_barriers(&mut prog).map_err(|e| e.to_string())
 }
 
@@ -542,22 +492,7 @@ fn an_explicit_barrier_under_a_vote_is_refused(voted: bool) -> Result<(), String
 /// and adds nothing else.
 #[test]
 fn a_ring_restarted_in_a_loop_is_fenced_at_its_head() {
-    use crate::kernels::nearest::{Floors, Metric, NearestCfg, NearestSpec, nearest};
-    let cfg = NearestCfg::streamed(32, 32, 32, 3);
-    let spec = assumed(
-        NearestSpec {
-            n: 100,
-            m: 150,
-            d: 80,
-            metric: Metric::L2,
-            floors: Floors::default(),
-            groups: true,
-            k: 1,
-            live: Default::default(),
-            dtype: svod_dtype::ScalarDType::BFloat16,
-        },
-        cfg,
-    );
+    let spec = assumed(nearest_spec(80, Floors::default(), 1), NearestCfg::streamed(32, 32, 32, 3));
     let prog = nearest::<BF16>(&spec);
     let mut fenced = prog.clone();
     insert_barriers(&mut fenced).unwrap();

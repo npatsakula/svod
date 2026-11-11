@@ -51,10 +51,10 @@ fn mock_pmc_readback_frees_after_retirement() {
     let (iface, pool, handle, signal) = mock_pmc_handle();
     signal.reset(1);
     drop(handle);
-    assert_eq!((iface.allocation_count(), iface.free_count(), iface.live_handle_count()), (2, 1, 1));
+    assert_eq!(iface.counts(), (2, 1, 1));
     drop(signal);
     drop(pool);
-    assert_eq!((iface.free_count(), iface.live_handle_count()), (2, 0));
+    assert_eq!(iface.counts(), (2, 2, 0));
     assert!(iface.free_issues().is_empty());
 }
 
@@ -64,8 +64,8 @@ fn mock_pmc_failed_drain_poisons_and_quarantines_readback() {
     iface.script_wait(Err(Error::AmdIoctl { ioctl: "mock PMC drain", errno: 5 }));
     drop(handle);
     assert!(signal.wait_signal_value(1, 1).is_err());
-    assert_eq!((iface.allocation_count(), iface.free_count(), iface.live_handle_count()), (2, 0, 2));
+    assert_eq!(iface.counts(), (2, 0, 2));
     drop(signal);
     drop(pool);
-    assert_eq!((iface.free_count(), iface.live_handle_count()), (0, 2));
+    assert_eq!(iface.counts(), (2, 0, 2));
 }

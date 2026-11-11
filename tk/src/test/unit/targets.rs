@@ -29,7 +29,8 @@ use crate::lower::{Lowering, lower};
 use crate::ops::config::{self, NearestProblem, Planner};
 use crate::sweep::assumed;
 
-use super::{conv_first_eight, declared, first_eight, planner};
+use super::attention::probe_spec;
+use super::{conv_first_eight, declared, first_eight, gemm_spec, planner};
 use crate::sweep::device;
 pub(super) use crate::sweep::{Launch, amd, families, group_families, hopper, linear, render};
 
@@ -93,22 +94,7 @@ fn a_grid_takes_every_warp_or_whole_grids_run_alone(
             key_warps: warps as usize,
             ..crate::kernels::attention::FaCfg::new(16, 16, 2)
         };
-        let mask = AttnMask::default();
-        attention::<F16>(&assumed(
-            AttnSpec {
-                batch,
-                t: 1,
-                tk: 64,
-                heads: 1,
-                kv_heads: 1,
-                d: 64,
-                mask,
-                cache: None,
-                packed: false,
-                scale: 0.125,
-            },
-            cfg,
-        ))
+        attention::<F16>(&assumed(probe_spec(1, 1, 1, 64, 64, AttnMask::default()), cfg))
     } else {
         combine::<F16>(&CombineSpec { batch, t: 1, heads: 4, d: 64, splits: 2, cfg: NormCfg { br: warps as usize } })
     };
@@ -141,6 +127,38 @@ fn ptxas() -> Option<std::path::PathBuf> {
     on_path.chain(toolkits).find(|p| p.is_file())
 }
 
+/// What a failed AMDGPU compile says where clang has no AMDGPU backend, or
+/// one too old for the arch.
+const NO_AMDGPU: &[&str] = &["AMDGPU target", "too old"];
+
+/// What a failed PTX compile says where clang has no NVPTX backend.
+const NO_NVPTX: &[&str] = &["NVPTX target"];
+
+/// What a toolchain call made, `None` (logged) where its error says one of
+/// `missing`: the toolchain cannot target the arch at all.
+fn built<T>(made: Result<T, impl std::fmt::Display>, missing: &[&str]) -> Result<Option<T>, String> {
+    let e = match made {
+        Ok(made) => return Ok(Some(made)),
+        Err(e) => e.to_string(),
+    };
+    if !missing.iter().any(|missing| e.contains(missing)) {
+        return Err(e);
+    }
+    eprintln!("skipped: {e}");
+    Ok(None)
+}
+
+/// The AMDGPU assembly of `ir`, `None` where clang cannot target `arch`.
+pub(super) fn amd_asm(ir: &str, arch: AmdArch) -> Option<String> {
+    let asm = built(svod_runtime::amd::compile_ir_to_amd_asm(ir, arch), NO_AMDGPU).unwrap_or_else(|e| panic!("{e}"));
+    asm.map(|asm| String::from_utf8(asm).unwrap())
+}
+
+/// The AMDGPU code object of `ir`, `None` where clang cannot target `arch`.
+fn amd_object(ir: &str, arch: AmdArch) -> Option<Vec<u8>> {
+    built(svod_runtime::amd::compile_ir_to_amd_object(ir, arch), NO_AMDGPU).unwrap_or_else(|e| panic!("{e}"))
+}
+
 /// Every warpgroup attention lowers for sm_90a and assembles: the scores
 /// are a register-A chain over K-major key rows, the output's a register-A
 /// chain over MN-major value rows (B transposed), and neither tile is ever
@@ -162,21 +180,7 @@ fn every_group_attention_assembles_for_hopper() {
     for (bq, bkv, d, mask) in cases {
         let cfg = FaCfg { core: Core::Group, ..FaCfg::new(bq, bkv, 2) };
         assert!(cfg.fits(&target, d, mask.bias.is_some()), "{cfg:?} fits the warpgroup core at d {d}");
-        let spec = assumed(
-            AttnSpec {
-                batch: Batch::Static(2),
-                t: 300,
-                tk: 300,
-                heads: 2,
-                kv_heads: 2,
-                d,
-                mask,
-                cache: None,
-                packed: false,
-                scale: 0.125,
-            },
-            cfg,
-        );
+        let spec = assumed(AttnSpec { scale: 0.125, ..probe_spec(2, 2, 300, 300, d, mask) }, cfg);
         let name = format!("group attention bq {bq} bkv {bkv} d {d}");
         let ir = render(attention::<BF16>(&spec), &cfg.lowering(&device));
         assert!(ir.contains(&format!("wgmma.mma_async.sync.aligned.m64n{bkv}k16")), "{name}: no scores chain");
@@ -185,14 +189,8 @@ fn every_group_attention_assembles_for_hopper() {
         assert!(!ir.contains("@llvm.nvvm.mma."), "{name}: a warp-level product");
         // Only the bias tile is gathered from shared memory into registers.
         assert!(mask.bias.is_some() || !ir.contains("ldmatrix"), "{name}: a key or value fragment load");
-        let ptx = match svod_runtime::cuda::compile_ir_to_ptx(&ir, arch) {
-            Ok(ptx) => ptx,
-            Err(e) if e.to_string().contains("NVPTX target") => {
-                eprintln!("skipped: clang has no NVPTX target");
-                return;
-            }
-            Err(e) => panic!("{name}: {e}"),
-        };
+        let compiled = built(svod_runtime::cuda::compile_ir_to_ptx(&ir, arch), NO_NVPTX);
+        let Some(ptx) = compiled.unwrap_or_else(|e| panic!("{name}: {e}")) else { return };
         let Some(ptxas) = &ptxas else { continue };
         let mut command = Command::new(ptxas);
         command.args(["-arch=sm_90a", "-o", "/dev/null", "/dev/stdin"]);
@@ -366,8 +364,8 @@ fn every_family_lowers_keeps_its_numbers_and_compiles(target: Target, facts: Fac
         }
 
         match target.arch {
-            GpuArch::Amd(arch) => match svod_runtime::amd::compile_ir_to_amd_object(&ir, arch) {
-                Ok(object) => {
+            GpuArch::Amd(arch) => match built(svod_runtime::amd::compile_ir_to_amd_object(&ir, arch), NO_AMDGPU) {
+                Ok(Some(object)) => {
                     let descriptor = format!("{}.kd", prog.name);
                     check(object.starts_with(b"\x7fELF"), "an ELF code object");
                     check(
@@ -375,13 +373,11 @@ fn every_family_lowers_keeps_its_numbers_and_compiles(target: Target, facts: Fac
                         &format!("no {descriptor}"),
                     );
                 }
-                Err(e) if e.to_string().contains("AMDGPU target") || e.to_string().contains("too old") => {
-                    eprintln!("skipped: {e}")
-                }
-                Err(e) => check(false, &e.to_string()),
+                Ok(None) => {}
+                Err(e) => check(false, &e),
             },
-            GpuArch::Cuda(arch) => match svod_runtime::cuda::compile_ir_to_ptx(&ir, arch) {
-                Ok(ptx) => {
+            GpuArch::Cuda(arch) => match built(svod_runtime::cuda::compile_ir_to_ptx(&ir, arch), NO_NVPTX) {
+                Ok(Some(ptx)) => {
                     let sm = format!("sm_{}{}{}", arch.major, arch.minor, if arch.major >= 9 { "a" } else { "" });
                     check(String::from_utf8_lossy(&ptx).contains(&format!(".target {sm}")), &format!("not {sm}"));
                     if let Some(ptxas) = &ptxas {
@@ -392,8 +388,8 @@ fn every_family_lowers_keeps_its_numbers_and_compiles(target: Target, facts: Fac
                         }
                     }
                 }
-                Err(e) if e.to_string().contains("NVPTX target") => eprintln!("skipped: clang has no NVPTX target"),
-                Err(e) => check(false, &e.to_string()),
+                Ok(None) => {}
+                Err(e) => check(false, &e),
             },
             GpuArch::Metal(_) => unreachable!("Metal has no families"),
         }
@@ -496,7 +492,7 @@ fn block_derived(prog: Program, lowering: &Lowering) -> Vec<Vec<String>> {
 #[test]
 fn the_block_index_is_renumbered_only_over_several_dies() {
     let cfg = config::gemm_cfg([64, 64, 32], 2, [2, 2], false);
-    let spec = assumed(GemmSpec { m: 192, n: 320, k: 64, batch: Batch::Static(3), epilogue: Epilogue::default() }, cfg);
+    let spec = assumed(GemmSpec { batch: Batch::Static(3), ..gemm_spec(192, 320, 64) }, cfg);
     let lowering = |xcds: u32| {
         let target = Target { xcds, ..amd(AmdArch::Gfx942, 304) };
         cfg.lowering(&crate::atoms::Device { target, costs: super::costs() })
@@ -516,10 +512,8 @@ fn the_block_index_is_renumbered_only_over_several_dies() {
 }
 
 /// An `if`'s compare is listed with its scalar: a predicate first met inside
-/// another branch still guards a later `if` on it outside that branch. With
-/// the compare left to its first user it sat inside the first branch, and
-/// clang refused the kernel ("Instruction does not dominate all uses"); seen
-/// on gfx1201 with a warp guard nested in a crew guard.
+/// another branch still guards a later `if` on it outside that branch, and
+/// the kernel compiles where the toolchain is installed.
 #[test_case(amd(AmdArch::Gfx1201, 64); "gfx1201")]
 #[test_case(amd(AmdArch::Gfx1151, 40); "gfx1151")]
 fn a_predicate_met_inside_a_branch_guards_a_later_if(target: Target) {
@@ -539,16 +533,10 @@ fn a_predicate_met_inside_a_branch_guards_a_later_if(target: Target) {
         k.if_(outer, |k| k.if_(inner.clone(), |k| k.store(dst, ones), |_| {}), |_| {});
         k.if_(inner, |k| k.store(dst, twos), |_| {});
     });
-    let prog = prog;
     let device = crate::atoms::Device { target: target.clone(), costs: crate::atoms::Costs::default() };
     let lowering = Lowering::new(&device);
-    let ir = render(prog, &lowering);
-    match svod_runtime::amd::compile_ir_to_amd_object(&ir, arch) {
-        Ok(object) => assert_eq!(&object[..4], b"\x7fELF"),
-        Err(e) if e.to_string().contains("AMDGPU target") || e.to_string().contains("too old") => {
-            eprintln!("skipped: {e}");
-        }
-        Err(e) => panic!("{e}"),
+    if let Some(object) = amd_object(&render(prog, &lowering), arch) {
+        assert_eq!(&object[..4], b"\x7fELF");
     }
 }
 
@@ -650,8 +638,7 @@ fn an_operand_read_twice_matches_the_interpreter_on_the_device() {
         schedule: planner.device.target.kslice().map_or(cfg.schedule, Schedule::ping_pong),
         ..cfg
     };
-    let spec = assumed(GemmSpec { m, n: m, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT }, cfg);
-    let prog = gemm::<BF16>(&spec);
+    let prog = gemm::<BF16>(&assumed(gemm_spec(m, m, k), cfg));
     let mut seed = 5;
     let a = super::rounded(ScalarDType::BFloat16, m * k, &mut seed, |x| x);
     let want = interp::run(&prog, vec![a.clone(), a.clone(), vec![0.0; m * m]], &[]).unwrap().remove(2);
@@ -674,8 +661,7 @@ fn an_operand_read_twice_matches_the_interpreter_on_the_device() {
 fn a_launch_refuses_an_output_sharing_storage() {
     let (m, k) = (64, 32);
     let cfg = config::gemm_cfg([64, 64, 32], 1, [2, 2], false);
-    let prog =
-        gemm::<BF16>(&assumed(GemmSpec { m, n: m, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT }, cfg));
+    let prog = gemm::<BF16>(&assumed(gemm_spec(m, m, k), cfg));
     let aliased = |tensors: &[&Tensor]| matches!(aliasing(&prog, tensors), Err(launch::Error::Aliased { .. }));
     let (a, b, out) = (
         Tensor::from_slice(vec![0.5f32; m * k]),
@@ -748,8 +734,7 @@ fn ranked_launches(planner: &Planner, shortlist_deep: bool) -> Vec<(Launch, (usi
             let ranked = planner.gemm_ranked(1, m, n, k, &epilogue);
             let deep = if m == 4096 && shortlist_deep { config::SHORTLIST } else { 8 };
             for cfg in config::distinct(&ranked).take(deep) {
-                let spec =
-                    assumed(GemmSpec { m: 100, n: 96, k: cfg.tile[2] * 2, batch: Batch::Static(1), epilogue }, cfg);
+                let spec = assumed(GemmSpec { epilogue, ..gemm_spec(100, 96, cfg.tile[2] * 2) }, cfg);
                 let launch =
                     (format!("{m}x{n}x{k} g{gated} {cfg:?}"), gemm::<BF16>(&spec), cfg.lowering(&planner.device));
                 launches.push((launch, (cfg.smem_bytes(gated, 2), 0)));
@@ -759,21 +744,8 @@ fn ranked_launches(planner: &Planner, shortlist_deep: bool) -> Vec<(Launch, (usi
     for d in [32, 48, 64, 128] {
         for t in [1, 16, 100] {
             for cfg in first_eight(&planner.attention_ranked(2, t, 100, d, t > 1, false)) {
-                let spec = assumed(
-                    AttnSpec {
-                        batch: Batch::Static(1),
-                        t,
-                        tk: 100,
-                        heads: 2,
-                        kv_heads: 1,
-                        d,
-                        mask: AttnMask { causal: t > 1, ..AttnMask::default() },
-                        cache: None,
-                        packed: false,
-                        scale: 0.125,
-                    },
-                    cfg,
-                );
+                let mask = AttnMask { causal: t > 1, ..AttnMask::default() };
+                let spec = assumed(AttnSpec { kv_heads: 1, scale: 0.125, ..probe_spec(1, 2, t, 100, d, mask) }, cfg);
                 let launch = (format!("d{d} t{t} {cfg:?}"), attention::<BF16>(&spec), cfg.lowering(&planner.device));
                 launches.push((launch, (cfg.smem_bytes(d, false), 0)));
             }
@@ -892,21 +864,7 @@ fn attention_softmax_takes_the_declared_forms(
     let forms = Forms { truncate_p, skip_rescale, sum_after, ..lead.forms };
     let cfg = crate::kernels::attention::FaCfg { forms, ..lead };
     let mask = AttnMask { causal: true, ..AttnMask::default() };
-    let spec = assumed(
-        AttnSpec {
-            batch: Batch::Static(2),
-            t: 100,
-            tk: 100,
-            heads: 4,
-            kv_heads: 2,
-            d: 64,
-            mask,
-            cache: None,
-            packed: false,
-            scale: 0.125,
-        },
-        cfg,
-    );
+    let spec = assumed(AttnSpec { kv_heads: 2, ..probe_spec(2, 4, 100, 100, 64, mask) }, cfg);
     let prog = if f16 { attention::<F16>(&spec) } else { attention::<BF16>(&spec) };
     let casts = tile_ops(&prog.body, &|op| matches!(op, TileOp::Cast { round: Round::Zero, .. }));
     let scales = tile_ops(&prog.body, &|op| matches!(op, TileOp::Binary { f: BinaryOp::Scale, .. }));
@@ -981,9 +939,7 @@ fn register_staged_trips_are_fenced(arch: AmdArch, emitted: bool) {
     let device = declared(target);
     for (stages, want) in [(2, 2), (1, 1)] {
         let cfg = config::gemm_cfg([64, 64, 32], stages, [2, 2], stages == 2);
-        let spec =
-            assumed(GemmSpec { m: 130, n: 192, k: 128, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT }, cfg);
-        let tile = lowered_tile(gemm::<BF16>(&spec), &cfg.lowering(&device));
+        let tile = lowered_tile(gemm::<BF16>(&assumed(gemm_spec(130, 192, 128), cfg)), &cfg.lowering(&device));
         assert_eq!(
             fences(&tile.body),
             want,
@@ -1009,21 +965,27 @@ fn a_load_crosses_a_barrier(asm: &str) -> bool {
     false
 }
 
-/// Whether the `clang` on `PATH` is ROCm's fork (`AMD clang version …`).
-fn rocm_clang() -> bool {
-    std::process::Command::new("clang")
-        .arg("--version")
-        .output()
-        .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).starts_with("AMD clang"))
+/// Whether the `clang` on `PATH` is ROCm's fork (`AMD clang version …`) of an
+/// LLVM before 23, whose plain workgroup fence on RDNA waits only for LDS under
+/// `-mcumode`; the fork's later LLVM waits for every load, as upstream does.
+fn rocm_clang_before_23() -> bool {
+    std::process::Command::new("clang").arg("--version").output().is_ok_and(|out| {
+        let version = String::from_utf8_lossy(&out.stdout);
+        let major = version
+            .split_once("clang version ")
+            .and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_digit()).next().and_then(|m| m.parse::<u32>().ok()));
+        version.starts_with("AMD clang") && major.is_some_and(|m| m < 23)
+    })
 }
 
 /// A tk barrier fences shared memory only, so the one-slot register-staged
 /// trip's barrier between its products and its commit leaves the next step's
 /// loads in flight. A plain workgroup release fence on RDNA would wait for
 /// them first (`s_wait_loadcnt 0x0` on gfx12, `vmcnt(0)` on gfx11) under
-/// upstream LLVM; ROCm's clang (7.2) waits only for LDS there under
-/// `-mcumode`, so its plain fence leaves them in flight too. CDNA's fence
-/// never waited, and its code is unchanged.
+/// upstream LLVM and ROCm's LLVM 23 on; ROCm's earlier LLVM waits only for
+/// LDS there under `-mcumode`, so its plain fence leaves them in flight too
+/// ([`rocm_clang_before_23`]). CDNA's fence never waited, and its code is
+/// unchanged.
 #[test_case(AmdArch::Gfx1201, true; "gfx1201")]
 #[test_case(AmdArch::Gfx1151, true; "gfx1151")]
 #[test_case(AmdArch::Gfx1100, true; "gfx1100")]
@@ -1032,27 +994,19 @@ fn rocm_clang() -> bool {
 fn prefetch_loads_stay_in_flight_across_a_barrier(arch: AmdArch, rdna: bool) {
     let device = declared(amd(arch, 64));
     let cfg = config::gemm_cfg([64, 64, 32], 1, [2, 2], false);
-    let spec = assumed(GemmSpec { m: 256, n: 256, k: 512, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT }, cfg);
-    let ir = render(gemm::<BF16>(&spec), &cfg.lowering(&device));
+    let ir = render(gemm::<BF16>(&assumed(gemm_spec(256, 256, 512), cfg)), &cfg.lowering(&device));
     let mmra = r#", !mmra !{!"amdgpu-synchronize-as", !"local"}"#;
     let fences = ir.matches("fence syncscope(\"workgroup\")").count();
     assert!(fences > 0 && ir.matches(mmra).count() == fences, "every barrier fence is LDS-only:\n{ir}");
-    let asm = |ir: &str| match svod_runtime::amd::compile_ir_to_amd_asm(ir, arch) {
-        Ok(asm) => Some(String::from_utf8(asm).unwrap()),
-        Err(e) if e.to_string().contains("AMDGPU target") || e.to_string().contains("too old") => None,
-        Err(e) => panic!("{e}"),
-    };
-    let (Some(local), Some(plain)) = (asm(&ir), asm(&ir.replace(mmra, ""))) else {
-        eprintln!("skipped: clang has no AMDGPU target");
-        return;
-    };
+    let Some(local) = amd_asm(&ir, arch) else { return };
+    let plain = amd_asm(&ir.replace(mmra, ""), arch).expect("clang targets the arch");
     assert!(a_load_crosses_a_barrier(&local), "the next step's loads drain at the barrier:\n{local}");
     if rdna {
-        let rocm = rocm_clang();
+        let lds_only = rocm_clang_before_23();
         assert_eq!(
             a_load_crosses_a_barrier(&plain),
-            rocm,
-            "a plain workgroup fence drains unless ROCm's clang (rocm={rocm}):\n{plain}"
+            lds_only,
+            "a plain workgroup fence drains unless ROCm's clang before LLVM 23 (that clang: {lds_only}):\n{plain}"
         );
     } else {
         assert_eq!(local, plain, "the LDS-only fence changed CDNA code");
@@ -1069,22 +1023,7 @@ fn tile_relayouts(prog: &Program<crate::ir::Laid>, block: &crate::ir::Block<crat
 
 /// The probe's plain attention at head size `d` under `cfg` on `target`.
 fn attention_at(target: &Target, cfg: crate::kernels::attention::FaCfg, d: usize) -> (Program, Lowering) {
-    use crate::kernels::attention::{AttnMask, AttnSpec, attention};
-    let spec = assumed(
-        AttnSpec {
-            batch: Batch::Static(4),
-            t: 2048,
-            tk: 2048,
-            heads: 8,
-            kv_heads: 8,
-            d,
-            mask: AttnMask::default(),
-            cache: None,
-            packed: false,
-            scale: 0.125,
-        },
-        cfg,
-    );
+    let spec = assumed(AttnSpec { scale: 0.125, ..probe_spec(4, 8, 2048, 2048, d, AttnMask::default()) }, cfg);
     let device = crate::atoms::Device { target: target.clone(), costs: crate::atoms::Costs::default() };
     (attention::<BF16>(&spec), cfg.lowering(&device))
 }
@@ -1184,14 +1123,10 @@ fn a_branch_on_a_vote_lowers_to_the_warps_vote(target: Target, vote: &str) {
     let (pin, at) = (ir.find(r#"asm sideeffect "", "~{memory}"()"#), ir.find(vote));
     assert!(pin.zip(at).is_some_and(|(p, v)| p < v), "a pinned vote:\n{ir}");
     assert_eq!(ir.matches(vote).count(), 1, "one vote:\n{ir}");
-    if let GpuArch::Amd(arch) = target.arch {
-        match svod_runtime::amd::compile_ir_to_amd_object(&ir, arch) {
-            Ok(object) => assert_eq!(&object[..4], b"\x7fELF"),
-            Err(e) if e.to_string().contains("AMDGPU target") || e.to_string().contains("too old") => {
-                eprintln!("skipped: {e}");
-            }
-            Err(e) => panic!("{e}"),
-        }
+    if let GpuArch::Amd(arch) = target.arch
+        && let Some(object) = amd_object(&ir, arch)
+    {
+        assert_eq!(&object[..4], b"\x7fELF");
     }
 }
 
@@ -1252,14 +1187,7 @@ fn the_next_steps_loads_stay_above_a_vote(arch: AmdArch) {
         cfg,
     );
     let ir = render(nearest::<BF16>(&spec), &Lowering::new(&device));
-    let asm = match svod_runtime::amd::compile_ir_to_amd_asm(&ir, arch) {
-        Ok(asm) => String::from_utf8(asm).unwrap(),
-        Err(e) if e.to_string().contains("AMDGPU target") || e.to_string().contains("too old") => {
-            eprintln!("skipped: {e}");
-            return;
-        }
-        Err(e) => panic!("{e}"),
-    };
+    let Some(asm) = amd_asm(&ir, arch) else { return };
     let votes = loads_sunk_past_a_vote(&asm);
     assert!(!votes.is_empty(), "a branch on a vote:\n{asm}");
     assert!(votes.iter().all(|(_, sunk)| !sunk), "{votes:?}:\n{asm}");
@@ -1284,21 +1212,7 @@ fn the_probabilities_reach_pv_through_the_lanes_on_a_no_feed_target(mask: AttnMa
     let target = amd(AmdArch::Gfx1151, 40);
     let device = crate::atoms::Device { target: target.clone(), costs: super::gfx1151_store_costs() };
     let cfg = crate::kernels::attention::FaCfg::new(32, 128, 2);
-    let spec = assumed(
-        AttnSpec {
-            batch: Batch::Static(2),
-            t: 100,
-            tk: 100,
-            heads: 4,
-            kv_heads: 4,
-            d: 64,
-            mask,
-            cache: None,
-            packed: false,
-            scale: 0.125,
-        },
-        cfg,
-    );
+    let spec = assumed(probe_spec(2, 4, 100, 100, 64, mask), cfg);
     let declared = shared_bytes(&linear(attention::<F16>(&spec), &cfg.lowering(&device)));
     assert_eq!(declared, cfg.smem_bytes(64, false), "its rings alone, at the target's whole 64 KB");
 }

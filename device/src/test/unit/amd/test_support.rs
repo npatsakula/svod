@@ -5,6 +5,7 @@
 //! `super::test_support`.
 
 use crate::amd::AmdAllocator;
+use crate::amd::connector::PoolQueue;
 
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -131,6 +132,13 @@ impl MockAmdIface {
         self.state.lock().alloc_script.push_back(outcome);
     }
 
+    /// Let the next `ok` allocations succeed and fail the one after, as `stage`.
+    pub(crate) fn script_alloc_fail_at(&self, ok: usize, stage: &str) {
+        let mut state = self.state.lock();
+        state.alloc_script.extend((0..ok).map(|_| Ok(())));
+        state.alloc_script.push_back(Err(scripted_error(stage)));
+    }
+
     pub(crate) fn script_setup(&self, outcome: Result<()>) {
         self.state.lock().setup_script.push_back(outcome);
     }
@@ -167,6 +175,12 @@ impl MockAmdIface {
         self.state.lock().publication_script.push_back(MockPublicationOutcome::Panic);
     }
 
+    /// `(allocations, frees, live handles)` so far.
+    pub(crate) fn counts(&self) -> (usize, usize, usize) {
+        let state = self.state.lock();
+        (state.allocations, state.frees, state.live.len())
+    }
+
     pub(crate) fn allocation_count(&self) -> usize {
         self.state.lock().allocations
     }
@@ -183,10 +197,6 @@ impl MockAmdIface {
     /// The [`AllocKind`] of each successful allocation recorded for `tag`.
     pub(crate) fn alloc_kinds_for_tag(&self, tag: AllocTag) -> Vec<AllocKind> {
         self.state.lock().alloc_tags.iter().filter(|(recorded, _)| *recorded == tag).map(|(_, kind)| *kind).collect()
-    }
-
-    pub(crate) fn live_handle_count(&self) -> usize {
-        self.state.lock().live.len()
     }
 
     pub(crate) fn queue_setup_count(&self) -> usize {
@@ -233,11 +243,17 @@ impl MockAmdIface {
     }
 }
 
-/// A synthetic `xccs`-XCC device (1 selects the PM4 path, >1 the AQL path) over
-/// a fresh mock backend.
+/// A synthetic `xccs`-XCC device over a fresh mock backend, with the queues a
+/// real one gets by default: PM4 on one XCC, AQL on more.
 pub(crate) fn mock_device(xccs: u32) -> (Arc<MockAmdIface>, AmdAllocator) {
+    mock_device_queues(xccs, xccs == 1)
+}
+
+/// [`mock_device`] with PM4 compute queues when `pm4`, else AQL ones, as
+/// `SVOD_AMD_AQL` forces on one XCC.
+pub(crate) fn mock_device_queues(xccs: u32, pm4: bool) -> (Arc<MockAmdIface>, AmdAllocator) {
     let iface = Arc::new(MockAmdIface::default());
-    let dev = AmdDevice::synthetic_with_xcc(Arc::clone(&iface) as Arc<dyn AmdIface>, xccs);
+    let dev = AmdDevice::synthetic(Arc::clone(&iface) as Arc<dyn AmdIface>, xccs, pm4);
     (iface, AmdAllocator { dev, device_id: 0 })
 }
 
@@ -249,13 +265,18 @@ pub(crate) fn mock_device_with_signals(xccs: u32) -> (Arc<MockAmdIface>, AmdAllo
     (iface, allocator)
 }
 
+/// A fresh lane of `allocator`'s device.
+pub(crate) fn pool_queue(allocator: &AmdAllocator) -> Arc<PoolQueue> {
+    PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), allocator).expect("pool queue")
+}
+
 pub(crate) fn install_signal_pool(allocator: &AmdAllocator) {
     allocator.dev.core().install_signal_pool(crate::amd::signal::SignalPool::new(allocator, 64).expect("signal pool"));
 }
 
 /// Play the GPU retiring everything `lane` published: XCC0's timeline stores
 /// and, on AQL, the completion of each submission's last packet.
-pub(crate) fn retire_lane(lane: &crate::amd::connector::PoolQueue) {
+pub(crate) fn retire_lane(lane: &PoolQueue) {
     crate::sync::TimelineSignal::set(&**lane.pm4_signal(), lane.pm4_value() - 1);
     if let Some(retired) = lane.retired() {
         while crate::sync::TimelineSignal::value(&**retired.signal()) + 1 < retired.current() {

@@ -1,11 +1,10 @@
 use super::test_support::{
-    MockAmdCall, MockAmdIface, MockFreeIssue, amd_alloc_or_skip, install_signal_pool, mock_device,
+    MockAmdCall, MockAmdIface, MockFreeIssue, amd_alloc_or_skip, install_signal_pool, mock_device, pool_queue,
 };
 use crate::allocator::{Allocator, AmdBufferGuard, BufferSpec, RawBuffer};
 use crate::amd::iface::{AllocKind, AmdIface, HUGE_PAGE, reserve_va};
 use crate::amd::va_registry::AllocTag;
 use crate::error::Error;
-use std::sync::Arc;
 use test_case::test_case;
 
 /// Live VRAM alloc → free round-trip. Skipped on hosts that can't open an
@@ -60,10 +59,10 @@ fn raw_allocation_is_page_aligned_stable_and_freed_once() {
     assert_eq!(*size, 0x1000, "a sub-page request is rounded up to a whole page");
     unsafe { host_ptr.as_ptr().write(0x5a) };
     assert_eq!(unsafe { host_ptr.as_ptr().read() }, 0x5a);
-    assert_eq!((iface.allocation_count(), iface.live_handle_count()), (1, 1));
+    assert_eq!(iface.counts(), (1, 0, 1));
 
     alloc.free(buffer, 17, &opts);
-    assert_eq!((iface.free_count(), iface.live_handle_count()), (1, 0));
+    assert_eq!(iface.counts(), (1, 1, 0));
     assert_eq!(
         iface.transcript().iter().map(std::mem::discriminant).collect::<Vec<_>>(),
         [
@@ -90,8 +89,7 @@ fn construction_guard_reclaims_unless_the_device_may_still_read(poison: bool, pa
         Err(Error::Runtime { message: "later construction step failed".into() })
     }));
     assert_eq!(result.is_err(), panicking);
-    assert_eq!(iface.allocation_count(), 1);
-    assert_eq!((iface.free_count(), iface.live_handle_count()), (frees, 1 - frees));
+    assert_eq!(iface.counts(), (1, frees, 1 - frees));
 }
 
 /// The mock's own free accounting, which every lifecycle test asserts empty.
@@ -115,7 +113,7 @@ fn mock_detects_double_and_unknown_frees() {
 fn user_buffer_free_failed_drain_poisons_and_quarantines_allocation() {
     let (iface, alloc) = mock_device(1);
     install_signal_pool(&alloc);
-    let pool = crate::amd::connector::PoolQueue::new_with_resources(Arc::clone(alloc.dev.core()), &alloc).unwrap();
+    let pool = pool_queue(&alloc);
     let buffer = alloc.alloc(64, &BufferSpec::default(), false).unwrap();
     let allocations = iface.allocation_count();
     pool.next_pm4();
@@ -123,8 +121,7 @@ fn user_buffer_free_failed_drain_poisons_and_quarantines_allocation() {
 
     alloc.free(buffer, 64, &BufferSpec::default());
     assert!(alloc.dev.is_poisoned());
-    assert_eq!(iface.allocation_count(), allocations);
-    assert_eq!((iface.free_count(), iface.live_handle_count()), (0, allocations));
+    assert_eq!(iface.counts(), (allocations, 0, allocations));
     drop(pool);
     assert_eq!(iface.free_count(), 0);
 }
@@ -146,8 +143,7 @@ fn a_host_vram_write_is_flushed_before_the_next_submission(write: HostVramWrite)
     let (iface, alloc) = mock_device(1);
     install_signal_pool(&alloc);
     iface.set_hdp_flush_register();
-    let pool =
-        crate::amd::connector::PoolQueue::new_with_resources(Arc::clone(alloc.dev.core()), &alloc).expect("pool queue");
+    let pool = pool_queue(&alloc);
     let opts = BufferSpec { cpu_access: true, ..Default::default() };
     let src = alloc.alloc(64, &opts, false).expect("source");
     let dst = alloc.alloc(64, &opts, false).expect("destination");

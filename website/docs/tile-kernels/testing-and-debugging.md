@@ -143,6 +143,6 @@ tk kernels appear under their kernel names (`gemm`, `conv`, `flash_attention`, `
 `layer_norm`, …) next to graph kernels, timed the same way.
 
 :::tip[Measure on a quiet GPU]
-Another process on the GPU skews every number. The probes and the tune store warm the clock
-first. Run probes with `--test-threads=1`.
+Another process on the GPU skews every number. `tk_bench`, the probes and the tune store warm the
+clock first. Run one `tk_bench` command at a time, and probe tests with `--test-threads=1`.
 :::

@@ -17,14 +17,13 @@ fn gemm_matches_a_naive_reference(m: usize, n: usize, k: usize, bm: usize, bn: u
     let a = super::rounded(ScalarDType::BFloat16, m * k, &mut seed, |x| x);
     let b = super::rounded(ScalarDType::BFloat16, n * k, &mut seed, |x| x);
     let out = run(&prog, vec![a.clone(), b.clone(), vec![0.0; m * n]], &[("b", 1)]).unwrap();
-    for i in 0..m {
-        for j in 0..n {
-            let want: f64 = (0..k).map(|kk| a[i * k + kk] * b[j * k + kk]).sum();
-            let want = round_to(ScalarDType::BFloat16, want);
-            let got = out[2][i * n + j];
-            assert!((got - want).abs() <= 2e-2 * want.abs().max(1.0), "c[{i},{j}] = {got}, want {want}");
-        }
-    }
+    let want: Vec<f64> = naive_gemm(&a, &b, n, k).into_iter().map(|c| round_to(ScalarDType::BFloat16, c)).collect();
+    super::assert_rel_close("c", &out[2], &want, 2e-2);
+}
+
+/// The naive `a · bᵀ` of row-major `a` (`m × k`) and `b` (`n × k`).
+pub(super) fn naive_gemm(a: &[f64], b: &[f64], n: usize, k: usize) -> Vec<f64> {
+    (0..a.len() / k * n).map(|e| (0..k).map(|p| a[e / n * k + p] * b[e % n * k + p]).sum()).collect()
 }
 
 /// An 8-bit product accumulates in i32 exactly: a sum past 2^24 that f32

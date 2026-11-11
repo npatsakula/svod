@@ -65,22 +65,23 @@ value|probe:cached_1m|sm_86-28sm|Int32||<candidates>|<compiler>|<programs> <fs>
 
 `tune::TuneStore::at(root)` 在另一个根目录构建存储，传入 `None` 时仅存在于内存中。
 
-## 探针测试 {#probe-tests}
+## 基准测试 {#benchmarks}
 
-探针测试是带 `#[ignore]` 的测试，只打印耗时，从不断言。它们用设备探测到的代价排序，并为调优器准入的短名单计时，同时标出调优器的选择。在空闲的 GPU 上逐个运行：
+`tk_bench` 示例在默认设备（`SVOD_DEVICE`）上为 tk 的内核计时。每个配置的时间是时钟升频之后它最快的一次 profiling 运行，即其各内核设备时间戳之和；同一形状的各配置轮流计时，使漂移对每个配置的影响相同。它只打印，从不断言。在空闲的 GPU 上一次运行一个命令：
 
 ```bash
-SVOD_DEVICE=CUDA cargo test -p svod-tk --release --lib gemm_candidates_probe -- --ignored --nocapture --test-threads=1
+SVOD_DEVICE=CUDA cargo run --release -p svod-tk --example tk_bench -- gemm --top 8
 ```
 
-| 探针 | 输出 |
+| 命令 | 输出 |
 |---|---|
-| `gemm_throughput_probe` | 准入的 GEMM 配置在 4096³ bf16 上的 TFLOP/s，以及调优器的选择 |
-| `gemm_candidates_probe` | Nemotron 投影形状和 4096³ 上每个准入的 GEMM 候选：未调优时的选择、最快者以及调优器的选择 |
-| `qwen3_gemm_candidates_probe` | Qwen3-Embedding 的投影：先是短名单，然后是格点中的其余配置 |
-| `attention_throughput_probe` | Flash attention（B 4、H 8、T 2048；d 64/128，因果与非因果，以及带偏置的 d 64）：每个准入的配置，以及调优器的选择及其 softmax 形式 |
-| `attention_candidates_probe` | 格点中的每个注意力配置，与准入的短名单对比 |
-| `decode_throughput_probe` | 一个 Whisper large-v3 解码器步骤的自注意力和交叉注意力，调优后的拆分与不拆分对比 |
-| `conv_throughput_probe` | 每个 YOLO26 类别中每个准入的卷积候选，与图卷积对比 |
-| `norm_bandwidth_probe` | 行内核在 8192×1024 bf16 上的带宽，以 GB/s 计 |
-| `first_execution_probe` | 构建、降级和准备一个 tk GEMM 的主机开销，与图 GEMM 对比 |
+| `gemm [--shape MxNxK,…] [--top N]` | 调优器选择（默认 4096³）的 bf16 GEMM TFLOP/s，并加以标记，以及规划器排名前 `N` 的配置的 TFLOP/s |
+| `attention [--shape BxHxTxD,…] [--causal] [--bias] [--top N]` | 算子实际启动的内核以及排名前 `N` 的配置的 Flash attention TFLOP/s；默认 B 4、H 8、T 2048，d 64（普通、因果、带偏置、两者皆有）和 d 128（普通、因果） |
+| `nearest [--rows N] [--depths D,…] [--k K] [--metric M]` | 经 nearest 算子的一次自连接，以 Gpairs/s 和 TFLOP/s 计；默认 65536 行、深度 16 到 128：平方距离、64 个分组下的同一计算、高于两侧下限的 L2 |
+| `rerank [--rows N] [--candidates M] [--depths D,…] [--ks K,…] [--metric M]` | 分别以 8 位和 f16 搜索的 `k_nearest_reranked`，与普通 f16 `k_nearest` 对比 |
+| `raster [--shape MxNxK,…]` | 调优器的 GEMM 选择和规划器第一个配置的每种光栅顺序，与默认顺序对比，并列出代价模型对每种顺序的估价 |
+| `fit [--only LABEL,…] [--picks]` | 代价模型与设备的对比：若干 GEMM、注意力和 nearest 形状上每个排名配置的预测时间与实测时间、调优器的选择及调优器的墙钟时间；`--picks` 只为选择计时 |
+| `trips` | 每个 SM 驻留 1 到 48 个块时的流水线迭代探针 |
+| `pin --cfg BMxBNxBK:S:WRxWC[:rolled],… [--shape MxNxK,…] [--residual] [--gated]` | 每个固定的 GEMM 配置的时间（默认为 Whisper 的 fc2），旁边是模型的价格，以及分别将内存延迟、单独行程或矩阵核步骤置零后的价格：每一项占该配置时间的多少 |
+
+`--metric` 可取 `squared-l2`、`l2` 或 `neg-dot`。每个命令都接受 `--rounds R`，即计时轮数（默认 20，`fit` 为 2）。

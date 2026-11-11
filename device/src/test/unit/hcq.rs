@@ -6,6 +6,7 @@ use crate::hcq::{
     RuntimePatchValues, SemanticLinkedPlan, SemanticLinkedSubmission, StoreScope, Submission, SubmissionExecutionError,
     SystemField, SystemPatchValues, TopologyOperation, TopologyOperationKind, TopologyResource, schedule_device_lanes,
 };
+use proptest::strategy::Strategy;
 use svod_dtype::{AddrSpace, DType, DeviceSpec};
 use svod_ir::ops;
 
@@ -398,7 +399,7 @@ fn copy_op(operation: usize, src: TopologyResource, dst: TopologyResource) -> To
         lane: DeviceQueue { device: dst.owner.clone(), queue: QueueKind::Copy(0) },
         reads: vec![src.clone()],
         writes: vec![dst.clone()],
-        kind: TopologyOperationKind::Copy { src, dst, bytes: 16 },
+        kind: TopologyOperationKind::Copy { bytes: dst.end - dst.start, src, dst },
     }
 }
 
@@ -448,19 +449,25 @@ fn direct_copy_runs_on_the_executor_that_declares_access() {
 }
 
 /// Without declared peer access a cross-device copy splits into two staged legs,
-/// each waiting only on its own producer rather than on a global barrier.
-#[test]
-fn inaccessible_cross_device_copy_stages_through_the_host() {
+/// each waiting only on its own producer rather than on a global barrier. A
+/// copy of no bytes reads none of its producer's, so its first leg waits for
+/// nothing, while its host stage still orders its second leg after the first.
+#[test_case::test_case(0, 16, true; "sixteen bytes")]
+#[test_case::test_case(4, 4, false; "no bytes inside the producer's write")]
+fn inaccessible_cross_device_copy_stages_through_the_host(start: usize, end: usize, after_producer: bool) {
     let produced = resource(20, 0);
-    let output = resource(21, 1);
-    let operations =
-        [execute(0, lane(0, QueueKind::Compute(0)), vec![], vec![produced.clone()]), copy_op(1, produced, output)];
+    let output = resource_range(21, 1, start, end);
+    let operations = [
+        execute(0, lane(0, QueueKind::Compute(0)), vec![], vec![produced]),
+        copy_op(1, resource_range(20, 0, start, end), output),
+    ];
     let scheduled = schedule_local(&operations, QueueMergeLimits::UNLIMITED);
 
     assert_eq!(scheduled.len(), 3, "compute, source->host, target<-host");
     assert_eq!(scheduled[1].lane.device, gpu(0));
     assert_eq!(scheduled[1].commands[0].copy_leg, Some(CopyLeg::ToHost));
-    assert_eq!(scheduled[1].waits, [LaneWait { lane: scheduled[0].lane.clone(), value: 1 }]);
+    let producer = [LaneWait { lane: scheduled[0].lane.clone(), value: 1 }];
+    assert_eq!(scheduled[1].waits, if after_producer { &producer[..] } else { &[] });
     assert_eq!(scheduled[2].lane.device, gpu(1));
     assert_eq!(scheduled[2].commands[0].copy_leg, Some(CopyLeg::FromHost));
     assert_eq!(scheduled[2].waits, [LaneWait { lane: scheduled[1].lane.clone(), value: 1 }]);
@@ -496,6 +503,8 @@ fn equal_queue_numbers_on_different_devices_keep_distinct_timelines() {
 #[test_case::test_case(&[], &[(0, 16)], &[], &[(0, 16)], true; "write after write")]
 #[test_case::test_case(&[], &[(0, 9)], &[(8, 16)], &[], true; "overlapping byte ranges")]
 #[test_case::test_case(&[], &[(0, 8)], &[(8, 16)], &[], false; "disjoint byte ranges")]
+#[test_case::test_case(&[(4, 12)], &[], &[], &[(5, 5)], false; "an empty write inside a read")]
+#[test_case::test_case(&[], &[(0, 16)], &[(8, 8)], &[], false; "an empty read inside a write")]
 fn topology_hazards_wait_for_the_producer_lane(
     producer_reads: &[(usize, usize)],
     producer_writes: &[(usize, usize)],
@@ -515,6 +524,31 @@ fn topology_hazards_wait_for_the_producer_lane(
     let expected: &[LaneWait] = if hazard { &[LaneWait { lane: producer, value: 1 }] } else { &[] };
     assert_eq!(lanes[1].waits, expected);
     assert_eq!(null_order(lanes), [0, 1]);
+}
+
+fn byte_spans() -> impl Strategy<Value = Vec<(usize, usize)>> {
+    proptest::collection::vec((0usize..24, 0usize..9).prop_map(|(start, len)| (start, start + len)), 0..3)
+}
+
+proptest::proptest! {
+    /// The consumer waits exactly when it and the producer touch a common
+    /// byte and at least one of them writes it; an empty range touches none.
+    #[test]
+    fn topology_hazards_are_overlaps_with_a_write(
+        producer_reads in byte_spans(),
+        producer_writes in byte_spans(),
+        consumer_reads in byte_spans(),
+        consumer_writes in byte_spans(),
+    ) {
+        let bytes = |ranges: &[(usize, usize)]| {
+            ranges.iter().fold(0u32, |mask, &(start, end)| mask | ((1u32 << end) - (1u32 << start)))
+        };
+        let [pr, pw, cr, cw] = [&producer_reads, &producer_writes, &consumer_reads, &consumer_writes].map(|r| bytes(r));
+        let hazard = pw & (cr | cw) != 0 || pr & cw != 0;
+        topology_hazards_wait_for_the_producer_lane(
+            &producer_reads, &producer_writes, &consumer_reads, &consumer_writes, hazard,
+        );
+    }
 }
 
 #[test]
