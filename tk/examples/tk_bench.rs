@@ -734,17 +734,18 @@ fn attribution(a: &Analysis) -> Result<String> {
     let model =
         label("model.ns").ok_or("no model terms in the trace's labels: a `tk_bench sqtt gemm` capture has them")?;
     let total: i64 = a.classes.iter().map(|c| c.latency).sum::<i64>().max(1);
+    let waves = a.complete.max(1) as f64;
     let ns = |cycles: f64| a.sclk_mhz.map_or("-".into(), |mhz| format!("{:.0}", cycles * 1000.0 / mhz as f64));
     let mut o = String::new();
     let sclk = a.sclk_mhz.map_or("-".into(), |mhz| mhz.to_string());
     writeln!(
         o,
-        "== attribution (model: ns of the busiest SM, price less the term, terms overlap; measured: traced SIMD cycles summed over waves, ns at sclk {sclk} MHz)"
+        "== attribution (model: ns of the busiest SM, price less the term, terms overlap; measured: traced SIMD cycles a wave (mean of {waves}), ns at the traced sclk {sclk} MHz)"
     )?;
     writeln!(
         o,
         "{:<10} {:>10} {:>7} {:>12} {:>9} {:>11}  counterpart",
-        "term", "model ns", "model%", "cycles", "cycles%", "ns at sclk"
+        "term", "model ns", "model%", "cycles/wave", "cycles%", "ns at sclk"
     )?;
     let (matrix, matrix_stall) = a.cycles(&[Class::Matrix]);
     let measured: [(&str, Option<(i64, &str)>); 6] = [
@@ -758,29 +759,39 @@ fn attribution(a: &Analysis) -> Result<String> {
     for (term, counterpart) in measured {
         let m = label(&format!("model.{term}")).unwrap_or(f64::NAN);
         let (cycles, share, at, what) = match counterpart {
-            Some((c, what)) => (c.to_string(), format!("{:.1}", 100.0 * c as f64 / total as f64), ns(c as f64), what),
+            Some((c, what)) => {
+                let per_wave = c as f64 / waves;
+                (format!("{per_wave:.0}"), format!("{:.1}", 100.0 * c as f64 / total as f64), ns(per_wave), what)
+            }
             None => ("-".into(), "-".into(), "-".into(), "none traced"),
         };
         writeln!(o, "{term:<10} {m:>10.0} {:>7.1} {cycles:>12} {share:>9} {at:>11}  {what}", 100.0 * m / model)?;
     }
     writeln!(
         o,
-        "{:<10} {model:>10.0} {:>7.1} {total:>12} {:>9.1} {:>11}  all traced instructions",
+        "{:<10} {model:>10.0} {:>7.1} {:>12.0} {:>9.1} {:>11}  all traced instructions",
         "total",
         100.0,
+        total as f64 / waves,
         100.0,
-        ns(total as f64)
+        ns(total as f64 / waves)
     )?;
     let trips = label("model.trips").unwrap_or(f64::NAN);
     let per_sm = label("model.blocks_per_sm").unwrap_or(f64::NAN);
-    let iteration = a.main_loop.as_ref().and_then(|l| l.cycles).map(|c| c.median);
+    let main_loop = a.main_loop.as_ref();
+    let iteration = main_loop.and_then(|l| l.cycles).map(|c| c.median as f64);
+    // A wave runs the loop body once more than it takes the back edge.
+    let unroll = main_loop.and_then(|l| l.iterations).map(|i| (trips / (i.median as f64 + 1.0)).round().max(1.0));
+    let per_trip = iteration.zip(unroll).map(|(c, u)| c / u);
     writeln!(
         o,
-        "per trip   model {:.0} ns over {trips} trips × {per_sm} blocks/SM ({:.1} ns a block-trip); measured {} cycles a wave's iteration (median), {} ns",
+        "per trip   model {:.0} ns over {trips} trips × {per_sm} blocks/SM ({:.1} ns a block-trip); measured {} cycles a wave's iteration (median) of {} trips, {} cycles a trip, {} ns at the traced sclk",
         model / trips,
         model / trips / per_sm,
-        iteration.map_or("-".into(), |c| c.to_string()),
-        iteration.map_or("-".into(), |c| ns(c as f64)),
+        iteration.map_or("-".into(), |c| format!("{c:.0}")),
+        unroll.map_or("-".into(), |u| format!("{u:.0}")),
+        per_trip.map_or("-".into(), |c| format!("{c:.0}")),
+        per_trip.map_or("-".into(), ns),
     )?;
     let untraced = a.labels.get("candidate_ns").map_or("-", String::as_str);
     writeln!(
