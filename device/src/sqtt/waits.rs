@@ -72,9 +72,11 @@ struct Pending {
     order: Order,
 }
 
-/// One executed wait: its PC, stall, and what it waited for.
+/// One executed wait: its wave and record, PC, stall, and what it waited for.
 #[derive(Debug, Clone, Copy)]
 struct Hit {
+    wave: usize,
+    seq: usize,
     pc: u64,
     stall: i64,
     binding: Option<Bound>,
@@ -83,6 +85,8 @@ struct Hit {
 #[derive(Debug, Clone, Copy)]
 struct Bound {
     pc: u64,
+    /// The counter the binding was queued on.
+    counter: Counter,
     /// The binding's issue to the wait's release.
     latency: i64,
     /// The binding's issue to the wait's arrival: the other work that covered its latency.
@@ -98,6 +102,8 @@ struct Bound {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Binding {
     pub pc: u64,
+    /// The counter it was queued on where it bound.
+    pub counter: Counter,
     /// Wait instances it bound, those that stalled, and those whose binding is approximate.
     pub count: usize,
     pub stalled: usize,
@@ -152,9 +158,17 @@ struct Line {
     back_edge: bool,
 }
 
-impl Waits {
-    /// `code`: the `(pc, llvm-objdump line)` the waves were stitched against; reported PCs are less `base`.
-    pub fn new(waves: &[Wave], code: &[(u64, &str)], layout: Layout, base: u64) -> Self {
+/// The executed waits of the fully stitched waves, each with what it waited for.
+#[derive(Debug, Clone, Default)]
+pub struct Replay {
+    waves: usize,
+    skipped: usize,
+    hits: Vec<Hit>,
+}
+
+impl Replay {
+    /// `code`: the `(pc, llvm-objdump line)` the waves were stitched against.
+    pub fn new(waves: &[Wave], code: &[(u64, &str)], layout: Layout) -> Self {
         let lines: HashMap<u64, Line> = code
             .iter()
             .map(|&(pc, line)| {
@@ -162,20 +176,41 @@ impl Waits {
                 (pc, Line { kind: classify(line).kind, back_edge })
             })
             .collect();
-        let replayable = |w: &&Wave| w.complete && w.contexts == 0 && w.instructions.iter().all(|i| i.pc != 0);
-        let (mut hits, mut waits) = (vec![], Self::default());
-        for wave in waves.iter().filter(replayable) {
-            replay(&wave.instructions, &lines, layout, &mut hits);
-            waits.waves += 1;
+        let replayable = |w: &Wave| w.complete && w.contexts == 0 && w.instructions.iter().all(|i| i.pc != 0);
+        let mut replay = Self::default();
+        for (index, wave) in waves.iter().enumerate().filter(|w| replayable(w.1)) {
+            self::replay(index, &wave.instructions, &lines, layout, &mut replay.hits);
+            replay.waves += 1;
         }
-        waits.skipped = waves.len() - waits.waves;
+        replay.skipped = waves.len() - replay.waves;
+        replay
+    }
+
+    /// `(wave, record, counter, binding pc)` of every wait record that retired something: the wave's
+    /// index in the replayed slice, the wait's in the wave's records.
+    pub fn bound(&self) -> impl Iterator<Item = (usize, usize, Counter, u64)> + '_ {
+        self.hits.iter().filter_map(|h| h.binding.map(|b| (h.wave, h.seq, b.counter, b.pc)))
+    }
+
+    /// The waits at the PCs `within` keeps; reported PCs are less `base`.
+    pub fn waits(&self, base: u64, within: impl Fn(u64) -> bool) -> Waits {
+        let hits: Vec<Hit> = self.hits.iter().filter(|h| within(h.pc)).copied().collect();
+        let mut waits = Waits { waves: self.waves, skipped: self.skipped, ..Waits::default() };
         waits.aggregate(&hits, base);
         waits
+    }
+}
+
+impl Waits {
+    /// `code`: the `(pc, llvm-objdump line)` the waves were stitched against; reported PCs are less `base`.
+    pub fn new(waves: &[Wave], code: &[(u64, &str)], layout: Layout, base: u64) -> Self {
+        Replay::new(waves, code, layout).waits(base, |_| true)
     }
 
     fn aggregate(&mut self, hits: &[Hit], base: u64) {
         #[derive(Default)]
         struct Acc {
+            counter: Option<Counter>,
             count: usize,
             approx: usize,
             latency: Vec<i64>,
@@ -201,6 +236,7 @@ impl Waits {
                 continue;
             };
             let acc = bindings.entry(b.pc).or_default();
+            acc.counter.get_or_insert(b.counter);
             acc.count += 1;
             acc.approx += usize::from(b.approx);
             if hit.stall > 0 {
@@ -226,6 +262,7 @@ impl Waits {
             .into_iter()
             .map(|(pc, acc)| Binding {
                 pc: pc - base,
+                counter: acc.counter.expect("a binding's counter"),
                 count: acc.count,
                 stalled: acc.latency.len(),
                 approx: acc.approx,
@@ -247,7 +284,7 @@ impl Waits {
 }
 
 /// One wave from its start: queues every counted instruction, retires them at waits.
-fn replay(records: &[Instruction], lines: &HashMap<u64, Line>, layout: Layout, hits: &mut Vec<Hit>) {
+fn replay(wave: usize, records: &[Instruction], lines: &HashMap<u64, Line>, layout: Layout, hits: &mut Vec<Hit>) {
     let mut queues: [VecDeque<Pending>; Counter::ALL.len()] = Default::default();
     let mut edges = 0;
     for (seq, record) in records.iter().enumerate() {
@@ -258,7 +295,7 @@ fn replay(records: &[Instruction], lines: &HashMap<u64, Line>, layout: Layout, h
             Kind::Wait(wait) => {
                 let binding = retire(&mut queues, wait, record, edges);
                 if record.category == Category::Immed {
-                    hits.push(Hit { pc: record.pc, stall: record.stall, binding });
+                    hits.push(Hit { wave, seq, pc: record.pc, stall: record.stall, binding });
                 }
                 &[]
             }
@@ -279,7 +316,7 @@ fn replay(records: &[Instruction], lines: &HashMap<u64, Line>, layout: Layout, h
 
 /// Retires what `wait` waits for; the youngest retired binds it.
 fn retire(queues: &mut [VecDeque<Pending>], wait: Wait, record: &Instruction, edges: u32) -> Option<Bound> {
-    let (mut bound, mut approx) = (None::<Pending>, false);
+    let (mut bound, mut approx) = (None::<(Pending, Counter)>, false);
     for (counter, n) in wait.counts() {
         let queue = &mut queues[counter as usize];
         let n = usize::from(n);
@@ -290,13 +327,14 @@ fn retire(queues: &mut [VecDeque<Pending>], wait: Wait, record: &Instruction, ed
         let mixed_image = has(Order::Image) && queue.iter().any(|p| p.order != Order::Image);
         approx |= (n > 0 && has(Order::Unordered)) || has(Order::Flat) || mixed_image;
         let youngest = queue.drain(..queue.len() - n).next_back().expect("retires one at least");
-        if bound.is_none_or(|b| youngest.seq > b.seq) {
-            bound = Some(youngest);
+        if bound.is_none_or(|b| youngest.seq > b.0.seq) {
+            bound = Some((youngest, counter));
         }
     }
     let release = record.time + record.duration;
-    bound.map(|p| Bound {
+    bound.map(|(p, counter)| Bound {
         pc: p.pc,
+        counter,
         latency: release - p.issue,
         cover: record.time - p.issue,
         distance: edges - p.edges,

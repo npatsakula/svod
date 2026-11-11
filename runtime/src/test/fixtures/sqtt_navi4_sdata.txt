@@ -1,7 +1,8 @@
 == sqtt _Z9vectoropsv gfx1200 fixture=amd/navi4_sdata
-== verdict: largest share first; cycles are a traced wave's, an iteration (no model.trips label)
- 1 barrier            26.3%  1816 cycles an iteration in barriers
-   knob: balance the waves' work between barriers or drop one; the late arriver is not attributed yet
+== verdict: cycles are a traced wave's, an iteration (no model.trips label); exposed: not hidden by other pipes' work
+bound      occupancy_limited  41.4%  SIMD idle 41.4%: 8.0 waves a SIMD, ~13.6 would fill it; limit unknown
+   knob: more resident waves would fill the idle cycles; the capture records no resources to tell what limits them
+none       no loop finding passes its threshold
 kernel     - ns untraced, - ns traced, wave span 123811 cycles, sclk - MHz, pstate unrecorded
 traced     se0 sa0 wgp1 simd3 (8 waves) of 1 SEs
 waves      8 traced (8 complete) of 256 on the traced SEs, occupancy peak 256; lifetime min 114079 med 118980 max 122448 cycles
@@ -28,18 +29,18 @@ se0        255.8/256 (p95 256) over 93% of the span; 32 SIMDs 8.0/8; traced 8.0/
 iterations/wave  min 16 med 16 max 16 (waves 8)
 cycles/iteration min 2070 med 7960 p90 11645 max 12355 (n 120)
 trips      1 an iteration (no model.trips label: per-trip figures are per iteration), 128 in the loop over 8 waves
-== main loop cycles an iteration: a traced wave's, each cycle once (issue and stall by class)
-bucket                     all   share       se0
-issue valu               324.0    4.7%     324.0
-issue salu               278.1    4.0%     278.1
-issue vmem_store           1.0    0.0%       1.0
-issue branch               2.5    0.0%       2.5
-stall valu              2250.9   32.6%    2250.9
-stall salu                47.9    0.7%      47.9
-stall vmem_store           1.8    0.0%       1.8
-barrier                 1816.0   26.3%    1816.0
-idle                    2187.3   31.7%    2187.3
-total                   6909.5  100.0%    6909.5
+== main loop cycles an iteration: a traced wave's, each cycle once (issue, stall and idle by class); exposed: less what other pipes hid
+bucket                     all   share   exposed   share       se0
+issue valu               324.0    6.4%     324.0    6.4%     324.0
+issue salu               278.1    5.5%     134.0    2.6%     278.1
+issue branch               2.0    0.0%       0.6    0.0%       2.0
+stall valu              2250.9   44.5%    1493.6   29.5%    2250.9
+stall salu                47.9    0.9%       3.8    0.1%      47.9
+barrier                    0.0    0.0%       0.0    0.0%       0.0
+idle valu               1433.2   28.3%     863.2   17.1%    1433.2
+idle salu                723.2   14.3%     238.7    4.7%     723.2
+idle branch                2.0    0.0%       0.9    0.0%       2.0
+total                   5061.3  100.0%    3058.9   60.4%    5061.3
 == main loop: top 8 by stall
       pc    hits    cycles   lat/hit stall/hit  expo/hit  asm
   0x1b68     128     12384      96.8      95.8      51.8  v_add_nc_u32_e32 v2, -1, v1

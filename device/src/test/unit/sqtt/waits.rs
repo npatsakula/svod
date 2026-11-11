@@ -4,8 +4,8 @@ use proptest::prelude::*;
 use test_case::test_case;
 
 use super::fixture::stitched;
-use crate::sqtt::asm::{Kind, classify};
-use crate::sqtt::waits::Waits;
+use crate::sqtt::asm::{Counter, Kind, classify};
+use crate::sqtt::waits::{Replay, Waits};
 use crate::sqtt::wave::{Instruction, Wave};
 use crate::sqtt::{Category, Layout, Unit};
 
@@ -200,6 +200,8 @@ fn strix_prefetches_across_the_back_edge() {
 #[test_case("gfx1200/gemm")]
 #[test_case("svod/rdna4_gemm_v1")]
 #[test_case("svod/rdna4_gemm_v3")]
+#[test_case("svod/rdna4_gemm_1500")]
+#[test_case("svod/rdna4_gemm_1536")]
 #[test_case("svod/strix_smoke")]
 fn fixtures_add_up(fixture: &str) {
     let s = stitched(fixture);
@@ -253,4 +255,29 @@ proptest! {
         prop_assert_eq!(w.bindings.iter().map(|b| b.count).sum::<usize>() + w.unbound, w.instances);
         prop_assert!(w.bindings.iter().all(|b| b.latency.is_none_or(|l| l.min > 0)));
     }
+}
+
+/// A combined wait binds on the counter that had something to retire: the store a flush waits for
+/// is on `dscnt`, not on the `loadcnt` the wait names first. The replay hands every bound wait record
+/// to a caller by wave and record, and aggregates the waits at the PCs it keeps alone.
+#[test]
+fn combined_wait_binds_on_the_counter_that_retired() {
+    let program: Vec<String> = [
+        "ds_store_b128 v0, v[4:7]",
+        "s_wait_loadcnt_dscnt 0x0",
+        "global_load_b32 v1, v2, s[0:1]",
+        "s_wait_loadcnt 0x0",
+    ]
+    .map(String::from)
+    .into();
+    let code: Vec<(u64, &str)> = program.iter().enumerate().map(|(i, l)| (BASE + 4 * i as u64, l.as_str())).collect();
+    let waves = [wave(&program, &[0, 1, 2, 3], 5), wave(&program, &[0, 1, 2, 3], 5)];
+    let replay = Replay::new(&waves, &code, Layout::Rdna4);
+    let bound: Vec<_> = replay.bound().collect();
+    let expect = |w| [(w, 1, Counter::Ds, BASE), (w, 3, Counter::Load, BASE + 8)];
+    assert_eq!(bound, [expect(0), expect(1)].concat());
+    let w = replay.waits(0, |pc| pc == BASE + 4);
+    let counters: Vec<(u64, Counter)> = w.bindings.iter().map(|b| (b.pc, b.counter)).collect();
+    assert_eq!((w.waves, w.instances, counters), (2, 2, vec![(BASE, Counter::Ds)]));
+    assert_eq!(replay.waits(BASE, |_| true), analyze(Layout::Rdna4, &program, &waves));
 }

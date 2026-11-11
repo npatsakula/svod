@@ -1,16 +1,18 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 use proptest::prelude::*;
 use svod_device::profile::{CodeImage, SeTrace, SqttTrace};
+use svod_device::sqtt::asm::Counter;
+use svod_device::sqtt::hidden::Hiding;
 use svod_device::sqtt::stitch::objdump_lines;
 use svod_dtype::AmdArch;
 use test_case::test_case;
 
 use svod_device::amd::occupancy::Limiter;
 
-use super::verdict::Buckets;
-use super::{Analysis, Approx, Capture, Class, Evidence, FindingKind, Partition, Pstate, Spread};
+use super::verdict::{Buckets, load_bytes};
+use super::{Analysis, Approx, Capture, Class, Evidence, Finding, FindingKind, Partition, Pstate, Spread, WaitOn};
 
 fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../device/src/test/fixtures/sqtt")
@@ -62,6 +64,18 @@ fn replayed(fixture: &str) -> Analysis {
     Analysis::load(dir.path()).unwrap()
 }
 
+/// Every exposed bucket within its raw one.
+fn exposed_within(raw: &Partition, exposed: &Partition) -> bool {
+    fn within<K: PartialEq>(raw: &[(K, i64)], exposed: &[(K, i64)]) -> bool {
+        exposed.iter().all(|(k, e)| raw.iter().any(|(r, c)| r == k && (0..=*c).contains(e)))
+    }
+    within(&raw.issue, &exposed.issue)
+        && within(&raw.stall, &exposed.stall)
+        && within(&raw.wait, &exposed.wait)
+        && within(&raw.idle, &exposed.idle)
+        && (0..=raw.barrier).contains(&exposed.barrier)
+}
+
 #[test_case("amd/navi4_setpc")]
 #[test_case("amd/navi4_sdata")]
 #[test_case("amd/navi4_fifo")]
@@ -99,14 +113,21 @@ fn summarizes(fixture: &str) {
         a.traced.iter().map(|t| (t.waves, t.complete)).fold((0, 0), |s, t| (s.0 + t.0, s.1 + t.1)),
         (a.waves, a.complete)
     );
-    assert!(a.verdict.windows(2).all(|w| w[0].share >= w[1].share), "largest share first");
+    for findings in [&a.verdict.bound, &a.verdict.findings] {
+        assert!(findings.windows(2).all(|w| w[0].share >= w[1].share), "largest share first");
+    }
     assert!(text.lines().nth(1).unwrap().starts_with("== verdict"), "the verdict leads: {text}");
     if let Some(l) = &a.main_loop {
-        let p = &l.partition;
+        let (p, e) = (&l.partition, &l.exposed);
         assert_eq!(p.buckets(), p.cycles, "{fixture}: every loop cycle in one bucket");
-        let mut sum = Partition::default();
-        l.ses.iter().for_each(|s| sum.add(&s.partition));
-        assert_eq!(&sum, p, "the SEs' partitions add up");
+        assert_eq!(e.buckets(), e.cycles, "{fixture}: the exposed cycles add up");
+        assert!(e.cycles <= p.cycles && exposed_within(p, e), "{fixture}: exposed within raw");
+        let (mut sum, mut exposed) = (Partition::default(), Partition::default());
+        l.ses.iter().for_each(|s| {
+            sum.add(&s.partition);
+            exposed.add(&s.exposed);
+        });
+        assert_eq!((&sum, &exposed), (p, e), "the SEs' partitions add up");
         let edges = a.pcs.iter().find(|r| r.pc == l.back_edge).unwrap().hits;
         assert_eq!(
             (l.trips.total, l.trips.labelled, l.trips.per_iteration),
@@ -166,6 +187,7 @@ fn finds_the_main_loop() {
 /// The text an agent reads, fixed: `SVOD_SQTT_BLESS=1` rewrites the expected file after a deliberate change.
 #[test_case("amd/navi4_sdata", "sqtt_navi4_sdata.txt")]
 #[test_case("svod/rdna4_gemm_v1", "sqtt_rdna4_gemm_v1.txt")]
+#[test_case("svod/rdna4_gemm_1500", "sqtt_rdna4_gemm_1500.txt")]
 fn text_is_stable(fixture: &str, golden: &str) {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/test/fixtures").join(golden);
     let text = match fixture.strip_prefix("svod/") {
@@ -386,50 +408,137 @@ fn alu_per_trip(a: &Analysis) -> f64 {
     (l.partition.issued(&alu) + l.partition.stalled(&alu)) as f64 / l.trips.total as f64
 }
 
-fn loads(a: &Analysis, kind: FindingKind) -> (f64, Vec<super::Load>) {
-    let f = a.verdict.iter().find(|f| f.kind == kind).unwrap_or_else(|| panic!("{kind:?} in {:?}", a.verdict));
-    let Evidence::Waits { loads, .. } = &f.evidence else { panic!("{f:?}") };
-    (f.share, loads.clone())
+fn find(a: &Analysis, kind: FindingKind) -> Option<&Finding> {
+    a.verdict.bound.iter().chain(&a.verdict.findings).find(|f| f.kind == kind)
 }
 
-/// svod's ring GEMM (160 K-trips of 32, unrolled by 2): v1 waits on its A/B fill after the trip's
-/// matrix work, so the loads' latency is mostly covered and the barriers lead; v3's select pulls
-/// the waits up to just after issue (cover ~nothing of a ~1000-cycle latency), so its exposed loads
-/// lead and its guard arithmetic adds ~280 VALU cycles a trip. All three captures pinned the clock
-/// at the standard pstate and ran over 1.2x the untraced time.
+fn kinds(findings: &[Finding]) -> Vec<FindingKind> {
+    findings.iter().map(|f| f.kind).collect()
+}
+
+/// The exposed share of the loop's vector-memory waits and the stall before its loads issued.
+fn load_share(a: &Analysis) -> f64 {
+    let l = a.main_loop.as_ref().unwrap();
+    let vmem = |on: WaitOn| on.counter == Counter::Load;
+    let e = &l.exposed;
+    (e.waited(vmem) + e.stalled(&[Class::VmemLoad])) as f64 / l.partition.cycles as f64
+}
+
+/// svod's ring GEMM, its 1500- and 1536-row twins and the Strix GEMM all run 160 K-trips of 32,
+/// unrolled by 2. v1, v3 and Strix pinned the clock at the standard pstate and ran over 1.2x the
+/// untraced time; the 1500 and 1536 captures ran unpinned at 1.04x.
+#[test_case("rdna4_gemm_v1", Some(Pstate::Standard))]
+#[test_case("rdna4_gemm_v3", Some(Pstate::Standard))]
+#[test_case("rdna4_gemm_1500", Some(Pstate::Unpinned))]
+#[test_case("rdna4_gemm_1536", Some(Pstate::Unpinned))]
+#[test_case("strix_smoke", Some(Pstate::Standard))]
+fn verdict_reads_the_capture(name: &str, pstate: Option<Pstate>) {
+    let a = verdict_of(name);
+    let t = a.main_loop.as_ref().unwrap().trips;
+    assert_eq!((t.per_iteration, t.labelled), (2, true), "160 trips over 79 iterations and the head's");
+    assert_eq!(a.pstate, pstate);
+    let perturbed = pstate == Some(Pstate::Standard);
+    let all = a.verdict.bound.iter().chain(&a.verdict.findings);
+    assert!(all.clone().all(|f| f.approx.contains(&Approx::Perturbed) == perturbed), "{:?}", a.verdict);
+    assert!(a.verdict.findings.iter().all(|f| f.share <= f.raw + 1e-12), "exposed within raw: {:?}", a.verdict);
+    let l = a.main_loop.as_ref().unwrap();
+    let signals: Vec<u64> = a.pcs.iter().filter(|r| r.asm.starts_with("s_barrier_signal")).map(|r| r.pc).collect();
+    assert!(!l.barriers.is_empty());
+    for s in &l.barriers {
+        assert!(!signals.contains(&s.pc), "{name}: a signal is no wait: {s:?}");
+        assert!(s.last <= s.hits && s.causes.iter().map(|c| c.1).sum::<usize>() <= s.last, "{s:?}");
+        assert!(s.last > 0 && s.last * 2 < s.hits, "{name}: some traced wave arrives last, most don't: {s:?}");
+    }
+    let d = a.verdict.demand.clone().unwrap();
+    assert!(d.bytes_per_trip > 0 && d.gbs > 0.0 && d.bandwidth_gbs.is_none(), "{d:?}");
+}
+
+/// v1 waits on its A/B fill after the trip's matrix work: its loads' latency is covered, and with
+/// what other waves' pipes hid off, no loop finding passes a tenth of the loop. The barriers stay as
+/// a sink, the matrix pipe is ~74% busy and the SIMDs idle ~16% of the window.
 #[test]
-fn verdict_names_the_ring_gemm_limiters() {
-    let (v1, v3, strix) = (verdict_of("rdna4_gemm_v1"), verdict_of("rdna4_gemm_v3"), verdict_of("strix_smoke"));
-    for a in [&v1, &v3, &strix] {
-        let t = a.main_loop.as_ref().unwrap().trips;
-        assert_eq!((t.per_iteration, t.labelled), (2, true), "160 trips over 79 iterations and the head's");
-        assert_eq!(a.pstate, Some(Pstate::Standard));
-        assert!(a.verdict.iter().all(|f| f.approx.contains(&Approx::Perturbed)), "{:?}", a.verdict);
+fn v1_runs_near_matrix_throughput() {
+    let a = verdict_of("rdna4_gemm_v1");
+    let c = a.verdict.ceiling.clone().unwrap();
+    assert!((0.70..0.80).contains(&c.matrix), "{c:?}");
+    assert_eq!(kinds(&a.verdict.bound), [FindingKind::MatrixBound, FindingKind::OccupancyLimited]);
+    let occupancy = find(&a, FindingKind::OccupancyLimited).unwrap();
+    assert!((0.10..0.20).contains(&occupancy.share), "{occupancy:?}");
+    assert!(a.verdict.findings.iter().all(|f| f.share < 0.10), "{:?}", a.verdict.findings);
+    let barrier = find(&a, FindingKind::Barrier).unwrap();
+    assert!(barrier.raw > 0.20 && barrier.share < 0.10, "a sink: {barrier:?}");
+    assert!(load_share(&a) < 0.10 && find(&a, FindingKind::LoadExposed).is_none());
+    let l = a.main_loop.as_ref().unwrap();
+    for b in l.bindings.iter().filter(|b| b.pc == 0x9a0 || b.pc == 0x96c) {
+        let latency = b.latency.unwrap().median;
+        assert!(b.distance == [(0, b.count)] && b.cover.median * 10 > latency * 8, "mostly covered: {b:?}");
     }
-    assert!(matches!(v1.verdict[0].kind, FindingKind::Barrier | FindingKind::LoadExposed), "{:?}", v1.verdict);
-    let (v1_share, v1_loads) = loads(&v1, FindingKind::LoadExposed);
-    let pcs: Vec<u64> = v1_loads.iter().map(|l| l.pc).collect();
-    assert_eq!(pcs[..2], [0x9a0, 0x96c], "the A/B fill's last loads");
-    for l in &v1_loads {
-        let latency = l.latency.unwrap().median;
-        assert!(l.distance == [(0, l.waits)] && l.cover.median * 10 > latency * 8, "mostly covered: {l:?}");
-    }
-    let (v3_share, v3_loads) = loads(&v3, FindingKind::LoadExposed);
-    assert_eq!(v3.verdict[0].kind, FindingKind::LoadExposed);
-    assert!(v3_share > 2.0 * v1_share, "{v3_share} vs {v1_share}");
-    let top = &v3_loads[0];
-    assert_eq!((top.pc, top.stalled, top.waits), (0xa64, 316, 316));
-    assert!(top.cover.median * 10 < top.latency.unwrap().median, "waited right after issue: {top:?}");
+}
+
+/// v3's select pulls the ring fill's waits up to just after issue (cover ~nothing of a ~1000-cycle
+/// latency): its exposed loads lead, and the knob names the wait and the select right after it.
+#[test]
+fn v3_waits_right_behind_its_load() {
+    let (v1, v3) = (verdict_of("rdna4_gemm_v1"), verdict_of("rdna4_gemm_v3"));
+    let top = &v3.verdict.findings[0];
+    assert_eq!(top.kind, FindingKind::LoadExposed, "{:?}", v3.verdict.findings);
+    assert!(top.share > 2.0 * load_share(&v1) && top.share < top.raw, "{} vs {}", top.share, load_share(&v1));
+    let Evidence::Waits { loads, .. } = &top.evidence else { panic!("{top:?}") };
+    let load = &loads[0];
+    assert_eq!((load.pc, load.wait, load.stalled, load.waits), (0xa64, 0xab0, 316, 316));
+    assert!(load.short_cover() && load.consumer.starts_with("v_cndmask_b32"), "{load:?}");
+    assert!(top.knob.contains("0xab0 waits for 0xa64, then `v_cndmask_b32_e64 v147, 0, v147, s1`"), "{}", top.knob);
+    assert!(!v3.verdict.findings[1..].iter().any(|f| f.share >= 0.10), "{:?}", v3.verdict.findings);
     let added = alu_per_trip(&v3) - alu_per_trip(&v1);
     assert!((260.0..300.0).contains(&added), "v3's guards: {added:.1} VALU+SALU cycles a trip");
-    assert!(v3.verdict.iter().any(|f| f.kind == FindingKind::LoopOverhead));
-    assert!(!v1.verdict.iter().any(|f| f.kind == FindingKind::LoopOverhead), "{:?}", v1.verdict);
+}
+
+/// The 1500-row GEMM guards its staged fill's rows: 8 exec branches in the loop, ~11 VALU ops a
+/// trip of them. Its 1536-row control has no guard and keeps the matrix pipe ~90% busy.
+#[test]
+fn ragged_rows_are_loop_overhead() {
+    let (ragged, control) = (verdict_of("rdna4_gemm_1500"), verdict_of("rdna4_gemm_1536"));
+    let f = find(&ragged, FindingKind::LoopOverhead).unwrap();
+    let Evidence::Overhead { divergent, valu_hits, .. } = &f.evidence else { panic!("{f:?}") };
+    let execz: Vec<u64> = divergent.iter().filter(|d| d.1.starts_with("s_cbranch_execz")).map(|d| d.0).collect();
+    assert_eq!((divergent.len(), execz), (8, vec![0x5f4, 0x624, 0x7e4, 0x810]), "{divergent:?}");
+    assert!(*valu_hits > 5.0, "{valu_hits}");
+    assert!(ragged.text(4).contains("   0x810 s_cbranch_execz 65290"));
+    assert_eq!(kinds(&control.verdict.bound), [FindingKind::MatrixBound]);
+    assert!((0.85..0.95).contains(&control.verdict.bound[0].share), "{:?}", control.verdict.bound);
+    assert!(find(&control, FindingKind::LoopOverhead).is_none(), "{:?}", control.verdict.findings);
+    assert!(control.verdict.findings.iter().all(|f| f.share < 0.10), "{:?}", control.verdict.findings);
+}
+
+/// gfx11 traces matrix ops as 1-cycle tokens: no ceiling or pipe-share class, raw shares flagged, and
+/// the LDS ops' pre-issue stall (an untimed matrix op's cycles) is no LDS finding.
+#[test]
+fn strix_claims_nothing_of_its_matrix_pipe() {
+    let a = verdict_of("strix_smoke");
+    assert!(a.occupancy.untimed_matrix && a.verdict.ceiling.is_none());
     let bound = [FindingKind::MatrixBound, FindingKind::IssueBound];
-    assert!(strix.occupancy.untimed_matrix && !strix.verdict.iter().any(|f| bound.contains(&f.kind)));
-    let overhead = strix.verdict.iter().find(|f| f.kind == FindingKind::LoopOverhead).unwrap();
+    assert!(!a.verdict.bound.iter().any(|f| bound.contains(&f.kind)), "{:?}", a.verdict.bound);
+    assert!(a.verdict.findings.iter().all(|f| f.approx.contains(&Approx::UntimedMatrix) && f.share == f.raw));
+    let l = a.main_loop.as_ref().unwrap();
+    assert!(l.partition.stalled(&[Class::Lds]) as f64 > 0.10 * l.partition.cycles as f64, "the stall is there");
+    assert!(find(&a, FindingKind::LdsExposed).is_none(), "{:?}", a.verdict.findings);
+    let overhead = find(&a, FindingKind::LoopOverhead).unwrap();
     let Evidence::Overhead { divergent, .. } = &overhead.evidence else { panic!("{overhead:?}") };
     assert!(divergent.iter().any(|(pc, asm)| *pc == 0x920 && asm.starts_with("s_cbranch_execz")), "{divergent:?}");
-    assert!(strix.text(4).contains("note       gfx11 traces matrix ops as 1-cycle tokens"));
+    assert!(a.text(4).contains("note       gfx11 traces matrix ops as 1-cycle tokens"));
+}
+
+#[test_case("global_load_b128 v[0:3], v4, s[0:1]", Some(16))]
+#[test_case("global_load_b32 v0, v1, s[0:1]", Some(4))]
+#[test_case("buffer_load_dwordx4 v[0:3], v4, s[0:3], 0 offen", Some(16))]
+#[test_case("buffer_load_dword v0, v4, s[0:3], 0 offen", Some(4))]
+#[test_case("global_load_u16 v0, v1, s[0:1]", Some(2))]
+#[test_case("global_load_d16_hi_b16 v0, v1, s[0:1]", Some(2))]
+#[test_case("global_load_i8 v0, v1, s[0:1]", Some(1))]
+#[test_case("global_load_tr_b64 v[0:1], v2, s[0:1]", Some(8))]
+#[test_case("s_nop 0", None)]
+fn load_widths(asm: &str, bytes: Option<u64>) {
+    assert_eq!(load_bytes(asm), bytes);
 }
 
 fn record(time: i64, duration: i64, stall: i64, pc: u64) -> svod_device::sqtt::wave::Instruction {
@@ -451,41 +560,105 @@ fn wave(instructions: Vec<svod_device::sqtt::wave::Instruction>) -> svod_device:
     }
 }
 
+const LOOP: [(u64, &str); 6] = [
+    (0x0, "v_mov_b32 v0, 0"),
+    (0x8, "ds_store_b128 v0, v[4:7]"),
+    (0x10, "v_add_f32 v0, v1, v2"),
+    (0x14, "s_wait_loadcnt_dscnt 0x0"),
+    (0x18, "s_barrier_wait 0xffff"),
+    (0x20, "s_cbranch_scc0 65530"),
+];
+
+fn partition(waves: &[svod_device::sqtt::wave::Wave], bound: &[HashMap<usize, (Counter, u64)>]) -> Partition {
+    let hiding = Hiding::new(waves, &[], &HashSet::new());
+    Buckets::new(&LOOP).partition(waves, bound, 0x10..=0x20, &hiding).raw
+}
+
 /// A loop at 0x10..=0x20 of a VALU op, a wait, a barrier: overlapping records count once, a stall
-/// apart from its issue, gaps as idle; records before the loop and after its last record don't count.
+/// apart from its issue, gaps as idle on the record after them; records outside the loop don't
+/// count, and a wave that leaves and re-enters the loop counts its runs inside alone. The wait
+/// counts on the counter its binding was queued on, a store's apart.
 #[test]
 fn partition_counts_each_cycle_once() {
-    let lines = [
-        (0x0, "v_mov_b32 v0, 0"),
-        (0x10, "v_add_f32 v0, v1, v2"),
-        (0x14, "s_wait_loadcnt 0x0"),
-        (0x18, "s_barrier_wait 0xffff"),
-        (0x20, "s_cbranch_scc0 65530"),
-    ];
     let records = vec![
         record(0, 5, 0, 0x0),
         record(10, 6, 2, 0x10),
         record(14, 4, 4, 0x14),
         record(20, 10, 0, 0x18),
         record(25, 1, 0, 0x20),
-        record(40, 3, 0, 0x0),
+        record(40, 3, 0, 0x8),
+        record(100, 4, 0, 0x10),
+        record(106, 4, 0, 0x14),
     ];
-    let p = Buckets::new(&lines).partition(&[wave(records)], 0x10..=0x20);
-    let expect = Partition {
+    let expect = |wait: WaitOn| Partition {
         waves: 1,
-        cycles: 20,
-        issue: vec![(Class::Valu, 4)],
+        cycles: 30,
+        issue: vec![(Class::Valu, 8)],
         stall: vec![(Class::Valu, 2)],
-        wait: vec![(svod_device::sqtt::asm::Counter::Load, 2)],
+        wait: vec![(wait, 6)],
         barrier: 10,
-        idle: 2,
+        idle: vec![(Class::WaitVmem, 2), (Class::Barrier, 2)],
     };
-    assert_eq!(p, expect);
+    let unbound = WaitOn { counter: Counter::Load, store: false };
+    assert_eq!(partition(&[wave(records.clone())], &[]), expect(unbound), "unbound: its first counter");
+    let flush = HashMap::from([(2, (Counter::Ds, 0x8)), (7, (Counter::Ds, 0x8))]);
+    let p = partition(&[wave(records)], &[flush]);
+    assert_eq!(p, expect(WaitOn { counter: Counter::Ds, store: true }), "a ds_store flush");
+}
+
+/// Another wave's VALU issue over a wave's wait and gap hides them: the exposed partition takes the
+/// hidden cycles off, the raw keeps them.
+#[test]
+fn exposed_takes_off_what_other_waves_hid() {
+    let wait = svod_device::sqtt::wave::Instruction {
+        category: svod_device::sqtt::Category::Immed,
+        ..record(20, 10, 9, 0x14)
+    };
+    let waiting = wave(vec![record(10, 2, 0, 0x10), wait, record(40, 1, 0, 0x20)]);
+    let busy = wave((0..60).map(|t| record(t, 1, 0, 0x0)).collect());
+    let waves = [waiting, busy];
+    let hiding = Hiding::new(&waves, &[], &HashSet::new());
+    let pass = Buckets::new(&LOOP).partition(&waves[..1], &[], 0x10..=0x20, &hiding);
+    let (raw, exposed) = (pass.raw, pass.exposed);
+    assert_eq!((raw.cycles, raw.waited(|_| true), raw.idled(&[])), (31, 10, 18));
+    assert_eq!((exposed.waited(|_| true), exposed.idled(&[]), exposed.cycles), (0, 0, exposed.buckets()));
+    assert!(exposed_within(&raw, &exposed));
+}
+
+/// A gfx12 barrier: the wave arrives at its signal and waits at the wait. A short wait is the last
+/// arriver's, and the record that held the wave longest before its signal is why.
+#[test]
+fn barrier_names_the_last_arrivers_delay() {
+    let lines = [
+        (0x10, "v_add_f32 v0, v1, v2"),
+        (0x14, "s_wait_dscnt 0x0"),
+        (0x18, "s_barrier_signal -1"),
+        (0x1c, "s_mov_b32 s0, 0"),
+        (0x20, "s_barrier_wait 0xffff"),
+        (0x24, "s_cbranch_scc0 65530"),
+    ];
+    let trip = |t: i64, wait: i64, barrier: i64| {
+        vec![
+            record(t, 1, 0, 0x10),
+            record(t + 1, wait, wait - 1, 0x14),
+            record(t + 1 + wait, 1, 0, 0x18),
+            record(t + 30 + wait, 1, 0, 0x1c),
+            record(t + 31 + wait, barrier, 0, 0x20),
+            record(t + 31 + wait + barrier, 1, 0, 0x24),
+        ]
+    };
+    let records = [trip(0, 50, 2), trip(200, 3, 300)].concat();
+    let waves = [wave(records)];
+    let hiding = Hiding::new(&waves, &[], &HashSet::new());
+    let pass = Buckets::new(&lines).partition(&waves, &[], 0x10..=0x24, &hiding);
+    let sites: Vec<_> = pass.barriers.into_values().collect();
+    assert_eq!(sites, [super::BarrierSite { pc: 0x20, hits: 2, last: 1, causes: vec![(0x14, 1)] }]);
 }
 
 proptest! {
-    /// Whatever the records, the buckets add up to the cycles from each wave's first loop record to
-    /// the latest end of its records through its last.
+    /// Whatever the records, the buckets add up to the cycles of each wave's runs in the loop, from
+    /// a run's first record to the latest end of its records, and every exposed bucket is within
+    /// its raw one.
     #[test]
     fn partition_adds_up(
         waves in prop::collection::vec(
@@ -505,47 +678,50 @@ proptest! {
             .iter()
             .map(|w| wave(w.iter().map(|&(t, d, s, pc)| record(t, d, s.min(d), pcs[pc])).collect()))
             .collect();
-        let p = Buckets::new(&lines).partition(&waves, 0x10..=0x20);
+        let hiding = Hiding::new(&waves, &[], &HashSet::new());
+        let pass = Buckets::new(&lines).partition(&waves, &[], 0x10..=0x20, &hiding);
+        let (p, e) = (pass.raw, pass.exposed);
         prop_assert_eq!(p.buckets(), p.cycles);
+        prop_assert_eq!(e.buckets(), e.cycles);
+        prop_assert!(exposed_within(&p, &e));
         let expected: i64 = waves
             .iter()
-            .filter_map(|w| {
-                let inside = |i: &svod_device::sqtt::wave::Instruction| i.pc != 0;
-                let (first, last) = (w.instructions.iter().position(inside)?, w.instructions.iter().rposition(inside)?);
-                let records = &w.instructions[first..=last];
-                Some(records.iter().map(|r| r.time + r.duration).max().unwrap().max(records[0].time) - records[0].time)
-            })
+            .flat_map(|w| w.instructions.chunk_by(|a, b| (a.pc != 0) == (b.pc != 0)).filter(|r| r[0].pc != 0))
+            .map(|run| run.iter().map(|r| r.time + r.duration).max().unwrap().max(run[0].time) - run[0].time)
             .sum();
         prop_assert_eq!(p.cycles, expected);
     }
 }
 
-/// The findings no fixture reaches, from v1 with its pipes or residency moved past their thresholds:
-/// a busy matrix pipe is matrix-bound on gfx12 alone, a busy SIMD mostly not on matrix work is
-/// issue-bound, and one wave a SIMD cannot hide the loop's stall.
+/// The class findings past their thresholds, from v1 with its pipes or residency moved: a busy matrix
+/// pipe is matrix-bound on gfx12 alone, a busy SIMD mostly not on matrix work is issue-bound, and
+/// idle SIMD cycles are occupancy-limited, its knob by what the capture says of the limit.
 #[test]
-fn busy_and_occupancy_findings_fire_past_their_thresholds() {
+fn class_findings_fire_past_their_thresholds() {
     use FindingKind::{IssueBound, MatrixBound, OccupancyLimited};
-    let kinds = |a: &Analysis| super::verdict::rank(a).iter().map(|f| f.kind).collect::<Vec<_>>();
+    let bound = |a: &Analysis| kinds(&super::verdict::rank(a).bound);
     let mut a = verdict_of("rdna4_gemm_v1");
-    assert!(!kinds(&a).iter().any(|k| [MatrixBound, IssueBound, OccupancyLimited].contains(k)), "{:?}", a.verdict);
     let busy = |a: &mut Analysis, matrix: i64, any: i64| {
         for b in a.occupancy.ses.iter_mut().filter_map(|s| s.busy.as_mut()) {
             (b.matrix, b.any) = (b.cycles * matrix / 100, b.cycles * any / 100);
         }
     };
-    busy(&mut a, 90, 95);
-    assert_eq!(kinds(&a)[0], MatrixBound);
+    busy(&mut a, 69, 95);
+    assert!(bound(&a).is_empty(), "under every threshold");
+    busy(&mut a, 71, 95);
+    assert_eq!(bound(&a), [MatrixBound]);
     a.occupancy.untimed_matrix = true;
-    assert!(!kinds(&a).contains(&MatrixBound), "gfx11 cannot tell");
+    assert!(!bound(&a).contains(&MatrixBound), "gfx11 cannot tell");
     a.occupancy.untimed_matrix = false;
     busy(&mut a, 30, 95);
-    assert!(kinds(&a).contains(&IssueBound) && !kinds(&a).contains(&MatrixBound));
-    for t in a.occupancy.ses.iter_mut().filter_map(|s| s.traced.as_mut()) {
-        t.wave_cycles = t.cycles;
-    }
-    let f = super::verdict::rank(&a).into_iter().find(|f| f.kind == OccupancyLimited).unwrap();
-    let Evidence::Occupancy { observed, need, .. } = f.evidence else { panic!("{f:?}") };
-    assert!(observed == 1.0 && need > 1.5 && f.share > 0.0 && f.approx == [Approx::Perturbed], "{f:?}");
-    assert!(f.knob.contains("more workgroups"), "no limit known: {}", f.knob);
+    assert_eq!(bound(&a), [IssueBound]);
+    busy(&mut a, 30, 80);
+    let f = super::verdict::rank(&a).bound.into_iter().find(|f| f.kind == OccupancyLimited).unwrap();
+    let Evidence::Occupancy { observed, need, idle, limit: None } = f.evidence else { panic!("{f:?}") };
+    assert!((f.share - 0.2).abs() < 0.01 && idle == Some(f.share) && (need - observed / 0.8).abs() < 0.01, "{f:?}");
+    assert!(f.knob.contains("no resources"), "no limit known: {}", f.knob);
+    let mut capped = svod_capture("rdna4_gemm_v1", [10, 6, 1]).analyze().unwrap();
+    busy(&mut capped, 30, 80);
+    let f = super::verdict::rank(&capped).bound.into_iter().find(|f| f.kind == OccupancyLimited).unwrap();
+    assert!(f.knob.contains("resources cap the waves"), "4 of 4 waves: {}", f.knob);
 }

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::Category;
 use super::asm::{Kind, classify};
-use super::wave::{OtherSimd, Trace, Wave};
+use super::wave::{Instruction, OtherSimd, Trace, Wave};
 
 /// Cycles of a record that concurrent pipe activity hid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -192,44 +192,67 @@ impl Pipes {
     }
 }
 
+/// One SIMD's pipes and their unions: what [`Self::record`] measures a record's hidden cycles against.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Hiding {
+    pub pipes: Pipes,
+    math: Busy,
+    vector: Busy,
+    all: Busy,
+    matrix: HashSet<u64>,
+}
+
+impl Hiding {
+    pub fn new<'a>(waves: impl IntoIterator<Item = &'a Wave>, other: &[OtherSimd], matrix: &HashSet<u64>) -> Self {
+        let pipes = Pipes::new(waves, other, matrix);
+        let math = pipes.valu.union(&pipes.matrix);
+        let vector = math.union(&pipes.vmem);
+        let all = vector.union(&pipes.scalar);
+        Self { pipes, math, vector, all, matrix: matrix.clone() }
+    }
+
+    /// `_analyze_scope`'s step: the cycles of `inst`'s gap since `last` (the wave's previous record's
+    /// issue plus duration, else its start), stall and issue that another pipe's activity hid.
+    pub fn record(&self, last: i64, inst: &Instruction) -> Hidden {
+        let (clock, stall, cycles) = (inst.time, inst.stall, inst.duration);
+        let hides = |busy: &Busy| busy.hides(last, clock, stall, cycles);
+        let mem_only = |h: (i64, i64, i64)| h.0 + h.1;
+        let sum = |h: (i64, i64, i64)| h.0 + h.1 + h.2;
+        let no_issue = |h: (i64, i64, i64)| (h.0, h.1, 0);
+        let pipes = &self.pipes;
+        Hidden::of(if self.matrix.contains(&inst.pc) {
+            let (valu, wmma) = (no_issue(hides(&pipes.valu)), no_issue(hides(&pipes.matrix)));
+            if mem_only(valu) > mem_only(wmma) { valu } else { wmma }
+        } else if inst.category == Category::Valu {
+            let (valu, wmma) = (no_issue(hides(&pipes.valu)), hides(&pipes.matrix));
+            if mem_only(valu) > sum(wmma) { valu } else { wmma }
+        } else if vector_memory(inst.category) {
+            let (math, vmem) = (hides(&self.math), no_issue(hides(&pipes.vmem)));
+            if sum(math) > mem_only(vmem) { math } else { vmem }
+        } else if scalar(inst.category) {
+            let (vector, scal) = (hides(&self.vector), no_issue(hides(&pipes.scalar)));
+            if sum(vector) > mem_only(scal) { vector } else { scal }
+        } else {
+            hides(&self.all)
+        })
+    }
+}
+
 /// `_analyze_scope`: per PC, the cycles of one SIMD's records the other pipes' activity hid.
 pub fn scope<'a>(
     waves: impl IntoIterator<Item = &'a Wave> + Clone,
     other: &[OtherSimd],
     matrix: &HashSet<u64>,
 ) -> BTreeMap<u64, Hidden> {
-    let pipes = Pipes::new(waves.clone(), other, matrix);
-    let math = pipes.valu.union(&pipes.matrix);
-    let vector = math.union(&pipes.vmem);
-    let all = vector.union(&pipes.scalar);
-    let mem_only = |h: (i64, i64, i64)| h.0 + h.1;
-    let sum = |h: (i64, i64, i64)| h.0 + h.1 + h.2;
-    let no_issue = |h: (i64, i64, i64)| (h.0, h.1, 0);
+    let hiding = Hiding::new(waves.clone(), other, matrix);
     let mut by_pc = BTreeMap::<u64, Hidden>::new();
     for wave in waves {
         let mut last = wave.begin;
         for inst in &wave.instructions {
-            let (clock, stall, cycles) = (inst.time, inst.stall, inst.duration);
-            let hides = |busy: &Busy| busy.hides(last, clock, stall, cycles);
-            let hidden = if matrix.contains(&inst.pc) {
-                let (valu, wmma) = (no_issue(hides(&pipes.valu)), no_issue(hides(&pipes.matrix)));
-                if mem_only(valu) > mem_only(wmma) { valu } else { wmma }
-            } else if inst.category == Category::Valu {
-                let (valu, wmma) = (no_issue(hides(&pipes.valu)), hides(&pipes.matrix));
-                if mem_only(valu) > sum(wmma) { valu } else { wmma }
-            } else if vector_memory(inst.category) {
-                let (math, vmem) = (hides(&math), no_issue(hides(&pipes.vmem)));
-                if sum(math) > mem_only(vmem) { math } else { vmem }
-            } else if scalar(inst.category) {
-                let (vector, scal) = (hides(&vector), no_issue(hides(&pipes.scalar)));
-                if sum(vector) > mem_only(scal) { vector } else { scal }
-            } else {
-                hides(&all)
-            };
             if inst.pc != 0 {
-                *by_pc.entry(inst.pc).or_default() += Hidden::of(hidden);
+                *by_pc.entry(inst.pc).or_default() += hiding.record(last, inst);
             }
-            last = clock + cycles;
+            last = inst.time + inst.duration;
         }
     }
     by_pc

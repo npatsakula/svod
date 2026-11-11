@@ -29,6 +29,10 @@ fn golden(file: &str) -> BTreeMap<String, BTreeMap<u64, Hidden>> {
 #[test_case("svod/rdna4_gemm_v1", 1)]
 #[test_case("svod/rdna4_gemm_v3", 0)]
 #[test_case("svod/rdna4_gemm_v3", 1)]
+#[test_case("svod/rdna4_gemm_1500", 0)]
+#[test_case("svod/rdna4_gemm_1500", 1)]
+#[test_case("svod/rdna4_gemm_1536", 0)]
+#[test_case("svod/rdna4_gemm_1536", 1)]
 #[test_case("svod/strix_smoke", 0)]
 #[test_case("svod/strix_smoke", 1)]
 fn matches_amd(name: &str, se: u32) {

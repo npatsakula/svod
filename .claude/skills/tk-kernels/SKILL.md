@@ -279,17 +279,22 @@ of AMD's rocprof-trace-decoder, checked against its control CSVs) over `llvm-obj
   traced ns, labels: cfg, shape, `model.*` terms). `tk_bench sqtt --load DIR [--json] [--attribute]` or
   `svod_runtime::sqtt::Analysis::load(dir)` re-analyze with no GPU (`llvm-objdump` only if `kernel.s` is gone).
 - **Reading the report** (`Analysis::text`, fixed format, `== ` a section; `--json` is one line):
-  `!! TRUNCATED` (buffer filled: totals undercount) or `!! UNSTITCHED` first; `verdict` (ranked findings
-  `matrix_bound`/`load_exposed`/`lds_exposed`/`barrier`/`occupancy_limited`/`loop_overhead`/`issue_bound`, each with its
-  share of the main loop's wave-cycles, evidence (binding loads with cover vs latency and exposed cycles a trip, stalled
-  ops, divergent branches) and knob; `approx` = perturbed (traced > 1.2× untraced), untimed_matrix (gfx11: no
-  matrix/issue-bound finding), approx_bindings; thresholds are consts in `runtime/src/sqtt/verdict.rs`); `kernel`
+  `!! TRUNCATED` (buffer filled: totals undercount) or `!! UNSTITCHED` first; `verdict`: `ceiling` (matrix pipe busy
+  over the steady window, so removing every stall gains at most 1/busy; idle queued for the matrix pipe), `demand`
+  (global bytes a trip × resident waves ÷ trip time, GB/s), `bound` lines (`matrix_bound`/`issue_bound`/
+  `occupancy_limited`: pipe-busy shares of the window), then the loop's findings
+  `load_exposed`/`lds_exposed`/`barrier`/`loop_overhead` ranked by exposed share (raw less what other pipes' work hid,
+  AMD's hidden latency), each with evidence (binding load or store, its wait and the instruction after it, cover vs
+  latency; LDS load waits apart from the store flush before a barrier; who arrived last at each barrier and after
+  what; VALU/SALU issue beside the matrix issue, divergent branches) and knob; `approx` = perturbed (traced > 1.2×
+  untraced), untimed_matrix (gfx11: raw shares, no ceiling or pipe-share class), approx_bindings; thresholds are
+  consts in `runtime/src/sqtt/verdict.rs`); `kernel`
   untraced/traced ns and ratio, wave span, sclk (span over the traced ns), pstate; `traced` each SE's SIMD; `waves`; `time by class` (cycles summed over the
   traced SIMD's waves, `stall` the wait before issue, `exec` the rest: a barrier's or waitcnt's wait sits in `exec`
   where AMD's model books it as latency); `main loop` (innermost backward branch holding a `v_wmma`/`v_mfma`, else the
   hottest; iterations a wave = back-edge executions, cycles/iteration = gaps between them; trips an iteration from the
-  `model.trips` label, else per-iteration units; the loop's wave-cycles a trip split exactly into issue/stall by class,
-  waits by counter, barrier and idle, per SE) with its top rows by stall;
+  `model.trips` label, else per-iteration units; the loop's wave-cycles a trip, raw and exposed, split exactly into
+  issue/stall by class, waits by what bound them, barrier and idle by the class after it, per SE) with its top rows by stall;
   `hottest` by cycles. PCs are ELF addresses, as in `kernel.s`.
 - **`--attribute`** (report only): each `Planner::price` term as `price − price with its costs zeroed` (`steps`,
   `reads`, `fill`, `wait`, `lone_trip`, `trip`; they overlap, so they need not sum) beside the traced cycles of its
