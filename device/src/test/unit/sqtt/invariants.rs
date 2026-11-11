@@ -2,66 +2,12 @@
 //! and VALU issue cycles fit the time they were issued in.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 
-use serde_json::Value;
 use test_case::test_case;
 
-use crate::sqtt::stitch::{Stitcher, objdump_lines};
-use crate::sqtt::wave::{Instruction, Trace};
-use crate::sqtt::{Category, Layout, decode, wave};
-
-/// One fixture's disassembly `(pc, line)` and the stitched traces of its instruction-traced SEs.
-struct Stitched {
-    code: BTreeMap<u64, String>,
-    traces: Vec<Trace>,
-}
-
-fn root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/test/fixtures/sqtt")
-}
-
-fn read(dir: &std::path::Path, file: &str) -> Vec<u8> {
-    std::fs::read(dir.join(file)).unwrap_or_else(|e| panic!("{}: {e}", dir.join(file).display()))
-}
-
-/// `name`: `amd/<case>` (AMD's controls), `gfx1100|gfx1200/<example>` (tinygrad's) or `svod/<capture>`.
-fn stitched(name: &str) -> Stitched {
-    let dir = root().join(name);
-    let text = |file: &str| String::from_utf8(read(&dir, file)).unwrap();
-    let json = |file: &str| serde_json::from_str::<Value>(&text(file)).unwrap();
-    let (base, dump, streams): (u64, String, Vec<Vec<u8>>) = match name.split_once('/').unwrap().0 {
-        "amd" => {
-            let base = u64::from_str_radix(text("base.txt").trim().trim_start_matches("0x"), 16).unwrap();
-            (base, text("code_object.s"), vec![read(&dir, "se0.att")])
-        }
-        "svod" => {
-            let meta = json("meta.json");
-            let ses = meta["ses"].as_array().unwrap().iter().filter(|s| s["itrace"].as_bool().unwrap());
-            let streams = ses.map(|s| read(&dir, &format!("se{}.att", s["se"]))).collect();
-            (meta["load_base"].as_u64().unwrap(), text("kernel.s"), streams)
-        }
-        _ => {
-            let golden = json("golden.json");
-            let events = golden["events"].as_array().unwrap().iter().filter(|e| e["itrace"].as_bool().unwrap());
-            let streams = events.map(|e| read(&dir, &format!("trace{}.bin", e["index"]))).collect();
-            (golden["base"].as_u64().unwrap(), text("kernel.s"), streams)
-        }
-    };
-    let code: Vec<(u64, &str)> = objdump_lines(&dump).into_iter().map(|(pc, line)| (pc + base, line)).collect();
-    let traces = streams
-        .iter()
-        .map(|bytes| {
-            let mut trace = wave::analyze(decode(bytes));
-            let layout = if trace.header.version == 4 { Layout::Rdna4 } else { Layout::Rdna3 };
-            let mut stitcher = Stitcher::new(&code, layout);
-            trace.waves.iter_mut().for_each(|w| _ = stitcher.stitch(w));
-            trace
-        })
-        .collect();
-    let code = code.into_iter().map(|(pc, line)| (pc, line.split("//").next().unwrap().trim().to_string())).collect();
-    Stitched { code, traces }
-}
+use super::fixture::{Stitched, stitched};
+use crate::sqtt::wave::Instruction;
+use crate::sqtt::{Category, wave};
 
 /// The categories a record attributed to an instruction may carry, by mnemonic: the stitcher's
 /// trivial matches, with `Msg` for barriers and messages, and both branch outcomes.
@@ -114,7 +60,7 @@ fn categories(mnemonic: &str) -> &'static [Category] {
 fn disagreements(s: &Stitched) -> BTreeMap<(Category, String), usize> {
     let mut out = BTreeMap::new();
     for inst in s.traces.iter().flat_map(|t| &t.waves).flat_map(|w| &w.instructions).filter(|i| i.pc != 0) {
-        let mnemonic = s.code.get(&inst.pc).map_or("?", |l| l.split_whitespace().next().unwrap_or("?"));
+        let mnemonic = s.text(inst.pc).map_or("?", |l| l.split_whitespace().next().unwrap_or("?"));
         if inst.category != Category::Trap && !categories(mnemonic).contains(&inst.category) {
             *out.entry((inst.category, mnemonic.to_string())).or_default() += 1;
         }

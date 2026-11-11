@@ -30,6 +30,13 @@ cycles/iteration min 2070 med 7960 p90 11645 max 12355 (n 120)
   0x1c74     128      6100      47.7      46.7  v_add_f32_e32 v0, v0, v15
   0x1bdc     128      6015      47.0      46.0  v_cndmask_b32_e64 v1, v1, v3, s0
   0x1bc4     128      5356      41.8      40.8  v_cmp_lt_f32_e64 s0, 0, v5
+== waits: 160 on 8 waves (0 skipped), 112 unbound, 0 approximate; top 8 bindings by stall
+      pc   waits stalled     stall lat med lat p90     wait distance      asm
+  0x1a00       8       8     29415    3700    3706   0x1a28 0:8           s_load_b32 s0, s[0:1], 0xc
+  0x1a34       8       8      7645    1046    1063   0x1860 0:8           global_inv scope:SCOPE_SE
+  0x1ad4       8       8       526      68      68   0x1ae0 0:8           global_wb scope:SCOPE_SE
+  0x1844      16      16        32       5       5   0x1858 0:16          scratch_load_b32 v1, off, s32
+  0x19ac       8       8        16       6       6   0x19c4 0:8           scratch_load_b32 v6, off, s33
 == hottest 8 by cycles
       pc    hits    cycles   lat/hit stall/hit  asm
   0x25a4      64    232382    3631.0       0.0  s_barrier_wait 0xffff

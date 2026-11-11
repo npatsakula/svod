@@ -11,8 +11,11 @@ use std::process::{Command, Stdio};
 use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt, Snafu};
 use svod_device::profile::{CodeImage, SeTrace, SqttTrace};
+use svod_device::sqtt::asm::{self, Access, Counter, Kind, Memory, Space};
+pub use svod_device::sqtt::report::Spread;
 use svod_device::sqtt::report::{Report, Stats};
 use svod_device::sqtt::stitch::{Stitcher, branch, objdump_lines};
+use svod_device::sqtt::waits::Waits;
 use svod_device::sqtt::{Layout, decode, wave};
 use svod_dtype::AmdArch;
 
@@ -207,49 +210,7 @@ pub enum Class {
 
 impl Class {
     pub fn of(asm: &str) -> Self {
-        let text = asm.split("//").next().unwrap_or_default().trim();
-        let m = text.split_whitespace().next().unwrap_or_default();
-        let any = |prefixes: &[&str]| prefixes.iter().any(|p| m.starts_with(p));
-        if any(&["v_wmma", "v_swmmac", "v_mfma", "v_smfmac"]) {
-            Self::Matrix
-        } else if m.starts_with("v_") {
-            Self::Valu
-        } else if any(&["ds_", "lds_"]) {
-            Self::Lds
-        } else if any(&["global_", "buffer_", "flat_", "scratch_", "tbuffer_", "image_"]) {
-            if m.contains("load") || m.contains("sample") || m.contains("gather") {
-                Self::VmemLoad
-            } else {
-                Self::VmemStore
-            }
-        } else if any(&[
-            "s_load", "s_buffer_", "s_store", "s_dcache", "s_scratch", "s_atomic", "s_prefetch", "s_memtime",
-        ]) {
-            Self::Smem
-        } else if any(&["s_branch", "s_cbranch", "s_setpc", "s_swappc", "s_call", "s_rfe"]) {
-            Self::Branch
-        } else if any(&["s_waitcnt_depctr", "s_wait_alu", "s_wait_idle", "s_wait_expcnt", "s_wait_event"]) {
-            Self::Immediate
-        } else if any(&["s_waitcnt", "s_wait_"]) {
-            let vmem = ["vmcnt", "vscnt", "loadcnt", "storecnt", "samplecnt", "bvhcnt"];
-            if vmem.iter().any(|c| text.contains(c)) {
-                Self::WaitVmem
-            } else if ["lgkmcnt", "dscnt", "kmcnt"].iter().any(|c| text.contains(c)) {
-                Self::WaitLgkm
-            } else {
-                Self::Immediate
-            }
-        } else if m.starts_with("s_barrier") {
-            Self::Barrier
-        } else if any(&["s_sendmsg", "s_endpgm", "s_trap", "s_setprio", "s_sethalt", "s_ttrace", "s_icache"]) {
-            Self::Message
-        } else if any(&["s_nop", "s_delay", "s_clause", "s_sleep", "s_set_inst", "s_inst_prefetch", "s_version"]) {
-            Self::Immediate
-        } else if m.starts_with("s_") {
-            Self::Salu
-        } else {
-            Self::Other
-        }
+        Self::from(asm::classify(asm).kind)
     }
 
     pub fn name(self) -> &'static str {
@@ -272,22 +233,33 @@ impl Class {
     }
 }
 
-/// `n` samples' order statistics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Spread {
-    pub n: usize,
-    pub min: i64,
-    pub median: i64,
-    pub p90: i64,
-    pub max: i64,
-}
-
-impl Spread {
-    pub fn of(mut samples: Vec<i64>) -> Option<Self> {
-        samples.sort_unstable();
-        let n = samples.len();
-        let at = |q: usize| samples[(n * q / 100).min(n - 1)];
-        (n > 0).then(|| Self { n, min: samples[0], median: at(50), p90: at(90), max: samples[n - 1] })
+impl From<Kind> for Class {
+    fn from(kind: Kind) -> Self {
+        match kind {
+            Kind::Matrix => Self::Matrix,
+            Kind::Valu => Self::Valu,
+            Kind::Salu => Self::Salu,
+            Kind::Branch => Self::Branch,
+            Kind::Memory(Memory { space: Space::Ds | Space::LdsDirect, .. }) => Self::Lds,
+            Kind::Memory(Memory { space: Space::Smem, .. }) => Self::Smem,
+            Kind::Memory(Memory { access: Access::Load | Access::Sample | Access::Bvh, .. }) => Self::VmemLoad,
+            Kind::Memory(_) => Self::VmemStore,
+            Kind::Wait(wait) if wait.idle => Self::Immediate,
+            Kind::Wait(wait) => {
+                let on = |counters: &[Counter]| wait.counts().any(|(c, _)| counters.contains(&c));
+                if on(&[Counter::Load, Counter::Store, Counter::Sample, Counter::Bvh]) {
+                    Self::WaitVmem
+                } else if on(&[Counter::Ds, Counter::Km, Counter::Lgkm]) {
+                    Self::WaitLgkm
+                } else {
+                    Self::Immediate
+                }
+            }
+            Kind::Barrier => Self::Barrier,
+            Kind::SendMsg | Kind::Message => Self::Message,
+            Kind::Immediate | Kind::NoToken => Self::Immediate,
+            Kind::Other => Self::Other,
+        }
     }
 }
 
@@ -372,6 +344,8 @@ pub struct Analysis {
     pub main_loop: Option<MainLoop>,
     /// Every executed instruction, by PC.
     pub pcs: Vec<Row>,
+    /// What the traced waves' waits waited for.
+    pub waits: Waits,
 }
 
 /// The `<name>` of an `llvm-objdump` label line, `0000000000001700 <name>:`, with its address.
@@ -402,6 +376,7 @@ impl Analysis {
         let lines: Vec<(u64, &str)> =
             objdump_lines(&capture.disassembly).into_iter().map(|(pc, line)| (pc + base, line)).collect();
         let (mut ses, mut traced, mut waves, mut pcs) = (vec![], None, vec![], BTreeMap::<u64, Stats>::new());
+
         for se in &capture.trace.per_se {
             let mut trace = wave::analyze(decode(&se.bytes));
             let mut live = 0usize;
@@ -431,7 +406,7 @@ impl Analysis {
                 continue;
             }
             let h = trace.header;
-            traced.get_or_insert(Traced { sa: h.dsa, wgp: h.dwgp, simd: h.dsimd });
+            traced.get_or_insert((Traced { sa: h.dsa, wgp: h.dwgp, simd: h.dsimd }, layout));
             let mut stitcher = Stitcher::new(&lines, layout);
             for wave in &mut trace.waves {
                 stitcher.stitch(wave);
@@ -443,7 +418,7 @@ impl Analysis {
             }
             waves.append(&mut trace.waves);
         }
-        let traced = traced.context(NoItraceSnafu)?;
+        let (traced, layout) = traced.context(NoItraceSnafu)?;
         let text: BTreeMap<u64, &str> = lines.iter().copied().collect();
         let rows: Vec<Row> = pcs
             .iter()
@@ -488,6 +463,7 @@ impl Analysis {
             stitched: waves.iter().flat_map(|w| &w.instructions).filter(|i| i.pc != 0).count(),
             classes: classes.into_values().collect(),
             main_loop: main_loop(&lines, &pcs, &waves, base),
+            waits: Waits::new(&waves, &lines, layout, base),
             ses,
             pcs: rows,
         })
@@ -592,11 +568,45 @@ impl Analysis {
                 table(&mut o, rows.into_iter().take(top).collect());
             }
         }
+        self.waits_text(&mut o, top);
         let mut rows: Vec<&Row> = self.pcs.iter().collect();
         rows.sort_by_key(|r| (std::cmp::Reverse(r.latency), r.pc));
         let _ = writeln!(o, "== hottest {top} by cycles");
         table(&mut o, rows.into_iter().take(top).collect());
         o
+    }
+
+    /// The bindings whose waits stalled longest: `stalled` of `waits` stalled (latency over those),
+    /// `wait` is the wait PC it bound most often and `distance` lists `back edges:instances`.
+    fn waits_text(&self, o: &mut String, top: usize) {
+        use std::fmt::Write;
+        let w = &self.waits;
+        let _ = writeln!(
+            o,
+            "== waits: {} on {} waves ({} skipped), {} unbound, {} approximate; top {top} bindings by stall",
+            w.instances, w.waves, w.skipped, w.unbound, w.approx
+        );
+        let _ = writeln!(
+            o,
+            "{:>8} {:>7} {:>7} {:>9} {:>7} {:>7} {:>8} {:<12}  asm",
+            "pc", "waits", "stalled", "stall", "lat med", "lat p90", "wait", "distance"
+        );
+        let asm: BTreeMap<u64, &str> = self.pcs.iter().map(|r| (r.pc, r.asm.as_str())).collect();
+        for b in w.bindings.iter().take(top) {
+            let wait = b.waits.iter().max_by_key(|&&(pc, n)| (n, std::cmp::Reverse(pc))).map_or(0, |w| w.0);
+            let distance: Vec<String> = b.distance.iter().map(|(d, n)| format!("{d}:{n}")).collect();
+            let (med, p90) = b.latency.map_or(("-".into(), "-".into()), |l| (l.median.to_string(), l.p90.to_string()));
+            let asm = asm.get(&b.pc).copied().unwrap_or_default();
+            let _ = writeln!(
+                o,
+                "{:>#8x} {:>7} {:>7} {:>9} {med:>7} {p90:>7} {wait:>#8x} {:<12}  {asm}",
+                b.pc,
+                b.count,
+                b.stalled,
+                b.stall,
+                distance.join(",")
+            );
+        }
     }
 
     /// One paragraph: where the traced SIMD's time went and the main loop's pace.

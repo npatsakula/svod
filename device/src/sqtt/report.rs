@@ -2,6 +2,8 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 use super::Unit;
 use super::wave::Wave;
 
@@ -64,5 +66,24 @@ impl Report {
             });
         }
         report
+    }
+}
+
+/// `n` samples' order statistics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Spread {
+    pub n: usize,
+    pub min: i64,
+    pub median: i64,
+    pub p90: i64,
+    pub max: i64,
+}
+
+impl Spread {
+    pub fn of(mut samples: Vec<i64>) -> Option<Self> {
+        samples.sort_unstable();
+        let n = samples.len();
+        let at = |q: usize| samples[(n * q / 100).min(n - 1)];
+        (n > 0).then(|| Self { n, min: samples[0], median: at(50), p90: at(90), max: samples[n - 1] })
     }
 }

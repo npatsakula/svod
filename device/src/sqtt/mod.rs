@@ -5,11 +5,14 @@
 //! per-wave state machine over them, [`stitch::Stitcher`] attributes each traced instruction to a PC of
 //! a disassembly, and [`report::Report`] aggregates per-PC hit, latency, stall and idle cycles. Token and
 //! field names follow AMD's; tinygrad's `renderer/amd/sqtt.py` adds the `ALU_EXEC`/`VMEM_EXEC` tokens AMD
-//! leaves unknown.
+//! leaves unknown. On top, [`asm::classify`] reads what a disassembly line does and [`waits::Waits`]
+//! binds each executed wait to the instruction it waited for.
 
+pub mod asm;
 mod decode;
 pub mod report;
 pub mod stitch;
+pub mod waits;
 pub mod wave;
 
 use std::borrow::Cow;

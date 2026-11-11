@@ -86,6 +86,22 @@ fn summarizes(fixture: &str) {
     assert!(text.starts_with(&format!("== sqtt {} ", a.kernel)) && text.contains("== hottest 5 by cycles"));
     assert!(!text.contains('\x1b') && !text.contains("!!"), "{text}");
     assert!(a.summary().starts_with(&a.kernel));
+    assert_eq!(a.waits.waves + a.waits.skipped, a.waves);
+    assert!(text.contains("== waits: "));
+}
+
+/// The waits report ELF PCs, as the rest of the analysis: v3's select pulls the ring fill's first wait
+/// up to 0x74c, on the oldest of its six loads, waited within the trip that issued it.
+#[test]
+fn waits_report_elf_pcs() {
+    let a = Analysis::load(&fixtures().join("svod/rdna4_gemm_v3")).unwrap();
+    let site = a.waits.sites.iter().find(|s| s.pc == 0x74c).unwrap();
+    assert_eq!(site.bindings, [(0x6fc, site.instances)]);
+    let load = a.waits.bindings.iter().find(|b| b.pc == 0x6fc).unwrap();
+    assert_eq!(load.distance, [(0, load.count)]);
+    let row = |pc: u64| a.pcs.iter().find(|r| r.pc == pc).unwrap();
+    assert_eq!((row(0x74c).class, row(0x6fc).class), (Class::WaitVmem, Class::VmemLoad));
+    assert!(a.text(4).lines().any(|l| l.trim_start().starts_with("0xa64") && l.ends_with("global_load_b128 v[144:147], v[232:233], off")));
 }
 
 /// An empty kernel's waves issue only `s_endpgm`, which sends no token.
@@ -204,6 +220,15 @@ fn disassembles_without_kernel_s() {
 #[test_case("s_wait_dscnt 0x0", Class::WaitLgkm)]
 #[test_case("s_waitcnt_depctr 0xfffe", Class::Immediate)]
 #[test_case("s_delay_alu instid0(VALU_DEP_1)", Class::Immediate)]
+#[test_case("s_waitcnt_vscnt null, 0x0", Class::WaitVmem)]
+#[test_case("s_wait_kmcnt 0x0", Class::WaitLgkm)]
+#[test_case("s_wait_expcnt 0x0", Class::Immediate)]
+#[test_case("s_wait_idle", Class::Immediate)]
+#[test_case("s_wait_alu depctr_va_sdst(0)", Class::Immediate)]
+#[test_case("image_bvh_intersect_ray v[0:3], v[0:10], s[0:3]", Class::VmemLoad)]
+#[test_case("global_atomic_add_u32 v0, v1, v2, s[0:1] glc", Class::VmemStore)]
+#[test_case("s_memrealtime s[0:1]", Class::Smem)]
+#[test_case("s_sendmsg sendmsg(MSG_DEALLOC_VGPRS)", Class::Message)]
 #[test_case("s_barrier_wait 0xffff", Class::Barrier)]
 #[test_case("s_endpgm", Class::Message)]
 #[test_case("s_mov_b32 s0, 0", Class::Salu)]
