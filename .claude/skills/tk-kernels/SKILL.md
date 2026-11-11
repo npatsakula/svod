@@ -1,6 +1,6 @@
 ---
 name: tk-kernels
-description: Write, check, debug and profile tile kernels with the `svod-tk` crate (tk/src). Use when adding or changing a tile program (`build::Kernel`), wiring it into `svod_tk::ops` and the config lattice, running it in the host interpreter or on a GPU, reading a lowering/layout/admission rejection, dumping a tk kernel's instruction list, LLVM IR, PTX/SASS or AMDGCN for a card this machine does not have, comparing its main loop with cuBLAS/CUTLASS/ThunderKittens/HipKittens/AITER ISA, reading the planner log or the tune store (or the config a card's store chose, offline), running the device probes and gates, or checking a change for perf regressions or proving a refactor byte-identical. Covers SVOD_DEVICE for the device gate, the tk_dump example (--cfg tuned, --compare), the tk_digest example, SVOD_DUMP_AMD_ASM, RUST_LOG=svod_tk::plan, TK_DUMP_LIST, SVOD_TK_TUNE, SVOD_TK_TUNE_DIR, device_costs_are_physical, families_match_the_interpreter_on_the_device, the tk_bench example and the *_probe tests.
+description: Write, check, debug and profile tile kernels with the `svod-tk` crate (tk/src). Use when adding or changing a tile program (`build::Kernel`), wiring it into `svod_tk::ops` and the config lattice, running it in the host interpreter or on a GPU, reading a lowering/layout/admission rejection, dumping a tk kernel's instruction list, LLVM IR, PTX/SASS or AMDGCN for a card this machine does not have, comparing its main loop with cuBLAS/CUTLASS/ThunderKittens/HipKittens/AITER ISA, reading the planner log or the tune store (or the config a card's store chose, offline), running the device probes and gates, or checking a change for perf regressions or proving a refactor byte-identical. Covers SVOD_DEVICE for the device gate, the tk_dump example (--cfg tuned, --compare), the tk_digest example, SVOD_DUMP_AMD_ASM, RUST_LOG=svod_tk::plan, TK_DUMP_LIST, SVOD_TK_TUNE, SVOD_TK_TUNE_DIR, device_costs_are_physical, families_match_the_interpreter_on_the_device, the tk_bench example, its `sqtt` thread-trace report (SVOD_SQTT, SVOD_SQTT_DIR) and the *_probe tests.
 ---
 
 # tk tile kernels
@@ -237,6 +237,7 @@ does (`tune::measure`: a config's programs from `ops::candidates`, its merge or 
 | `fit [--only LABEL,…] [--picks]` | the cost model against the device on a few GEMM (4096³, Nemotron, Qwen3, Whisper projections), attention and nearest shapes: `costs\|…`, a `fit\|label\|rank\|verdict\|ns predicted\|ns measured\|cfg` line a ranked config, `pick\|label\|ns\|cfg` and `tune\|label\|s` (the tuner's wall time; cold on a store of the device's probes alone); `--picks` times the picks alone, an A/B across builds |
 | `trips` | `residency\|op\|blocks\|trip\|wall\|spread\|base\|measurable` of the trip probes at 1–48 blocks an SM (`probe::trip_at`): what `TRIP_HIDING` is fitted to |
 | `pin --cfg BMxBNxBK:S:WRxWC[:rolled],… [--shape MxNxK,…] [--residual] [--gated]` | `pin\|shape\|cfg\|blocks\|measured\|model\|less latency\|less lone trip\|less step` a pinned GEMM config (3-part code unrolled; Whisper's fc2 1500×1280×5120 by default, `--gated` a SwiGLU epilogue): the model's ns with each term zeroed beside the measured ns |
+| `sqtt gemm M N K [--cfg I\|tuned\|CODE,…] [--top N] [--out DIR] [--json] [--attribute]`, `sqtt --load DIR` | AMD RDNA3/RDNA4 thread trace of each config; see [Thread trace (SQTT)](#thread-trace-sqtt) |
 
 The `#[ignore]` probe tests left print and never assert:
 `-- --ignored --nocapture --test-threads=1`.
@@ -260,6 +261,38 @@ into registers costs the matrix pipe ~1/64 cycle a SIMD. A 64×64 warp tile read
 (−14 %) and VALU moves (~1 cycle each) cost less. gfx1151 (Strix Halo): 46–49 TOPS f16 = bf16 = int8 (the `iu8`
 WMMA runs at the 16-bit rate there, so 8-bit search gains only operand bytes), a `ds_load_b128` a product −12 %,
 two −16 %: its GEMM (31 TF tk, 26 hipBLASLt) is bound by memory, not the loop.
+
+## Thread trace (SQTT)
+
+AMD RDNA3/RDNA4 only (gfx11, gfx12; no CDNA). `runtime/src/sqtt.rs` reads a trace through `svod_device::sqtt` (a port
+of AMD's rocprof-trace-decoder, checked against its control CSVs) over `llvm-objdump -d` of the kernel's ELF.
+
+- **Capture a tk GEMM**: `SVOD_DEVICE=AMD cargo run --release -p svod-tk --example tk_bench -- sqtt gemm 1500 1280 5120
+  --cfg tuned,0 --attribute` (`--cfg` takes `tuned`, a rank `I` into `gemm_ranked`, or a `pin` code; `--residual`,
+  `--gated` as `pin`). It times the config untraced (`tune::measure`), then `tune::profile` runs
+  `ExecutionPlan::profile` with `ProfileOptions::sqtt`: one more pass with `set_sqtt` armed. Each kernel lands in
+  `<out>/gemm_MxNxK_<i>/p<program>/<index>_<entry>/`, its path printed (`saved …`).
+- **Any plan**: `SVOD_SQTT=1` (set before the device opens: the device keeps code objects only then) makes
+  `ProfileOptions::from_env` add Tier 5; the profile report then ends with one summary line a kernel, the dirs under
+  `SVOD_SQTT_DIR` (`./sqtt`). The traced pass syncs after each kernel and frees its `64 MiB × SEs` before the next.
+- **Offline replay**: a dir holds `se<N>.att` (raw), `kernel.co`, `kernel.s`, `meta.json` (arch, load base, untraced and
+  traced ns, labels: cfg, shape, `model.*` terms). `tk_bench sqtt --load DIR [--json] [--attribute]` or
+  `svod_runtime::sqtt::Analysis::load(dir)` re-analyze with no GPU (`llvm-objdump` only if `kernel.s` is gone).
+- **Reading the report** (`Analysis::text`, fixed format, `== ` a section; `--json` is one line):
+  `!! TRUNCATED` (buffer filled: totals undercount) or `!! UNSTITCHED` first; `kernel` untraced/traced ns, wave span,
+  sclk (span over the traced ns); `traced` the SIMD (`sa wgp simd`); `waves`; `time by class` (cycles summed over the
+  traced SIMD's waves, `stall` the wait before issue, `exec` the rest: a barrier's or waitcnt's wait sits in `exec`
+  where AMD's model books it as latency); `main loop` (innermost backward branch holding a `v_wmma`/`v_mfma`, else the
+  hottest; iterations a wave = back-edge executions, cycles/iteration = gaps between them) with its top rows by stall;
+  `hottest` by cycles. PCs are ELF addresses, as in `kernel.s`.
+- **`--attribute`** (report only): each `Planner::price` term as `price − price with its costs zeroed` (`steps`,
+  `reads`, `fill`, `wait`, `lone_trip`, `trip`; they overlap, so they need not sum) beside the traced cycles of its
+  counterpart: steps ↔ matrix issue less stall, reads ↔ `ds_*` + lgkm/ds waits, fill ↔ global memory + vm/load waits,
+  wait ↔ barrier + message; then model ns a trip vs a wave's cycles an iteration. Model ns is the busiest SM's time;
+  measured cycles are one SIMD's summed over its waves: compare shares and the per-iteration pace, not totals.
+- **Caveats**: one traced SIMD per SE (`SqttConfig::simd`, WGP 0 of SA 0), so a grid that misses it traces nothing
+  there (`limit_cu`); arming pins `profile_standard` through a DRM context (sysfs `stable_std` also works), so the traced
+  clock is not the untraced one; tracing perturbs timing: never compare a traced ns with an untraced one.
 
 ## Performance-regression protocol
 
@@ -295,3 +328,4 @@ For a change under `ops/config.rs`, `probe.rs`, `tune.rs`, `schedule.rs`, `layou
 | `tk/src/test/unit/{mod,targets,device,offline,ops,ops_plan,probe,tune,replay,isa,sweep,emit,sync}.rs` | gate, sweep, device tests, probes, store replay, ISA reader |
 | `tk/src/isa.rs`, `tk/src/sweep.rs` (`#[doc(hidden)]`) | main loop, functions, side-by-side table; the sweep's targets, families, digest set |
 | `tk/examples/tk_dump.rs`, `tk_digest.rs` | offline plan + IR + ISA + `--cfg tuned` + `--compare`; render digests + `--diff` |
+| `runtime/src/sqtt.rs`, `device/src/sqtt/` | SQTT `Capture` (save/load), `Analysis` (classes, main loop, text/JSON); decoder, wave model, stitcher |

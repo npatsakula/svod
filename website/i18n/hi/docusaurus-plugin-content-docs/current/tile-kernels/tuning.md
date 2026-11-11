@@ -159,6 +159,27 @@ SVOD_DEVICE=CUDA cargo run --release -p svod-tk --example tk_bench -- gemm --top
 | `fit [--only LABEL,…] [--picks]` | device के ख़िलाफ़ cost model: कुछ GEMM, attention और nearest shapes पर हर ranked config का predicted और measured समय, tuner का चुनाव और tuner का wall time; `--picks` सिर्फ़ चुनावों को मापता है |
 | `trips` | प्रति SM 1 से 48 blocks पर pipeline-trip probes |
 | `pin --cfg BMxBNxBK:S:WRxWC[:rolled],… [--shape MxNxK,…] [--residual] [--gated]` | हर pinned GEMM config का समय (default में Whisper का fc2), model की price के साथ और memory latency, lone trip या matrix step को शून्य करके वही price: config के समय में हर term कितना है |
+| `sqtt gemm M N K [--cfg I\|tuned\|BMxBNxBK:S:WRxWC[:rolled],…] [--top N] [--out DIR] [--json] [--attribute]` | सिर्फ़ AMD RDNA3/RDNA4: हर config की thread trace report ([Thread trace](#thread-trace) देखें); `sqtt --load DIR` सहेजी गई trace को फिर से पढ़ता है |
 
 `--metric` में `squared-l2`, `l2` या `neg-dot` दिया जाता है। हर command tuner की तरह समय मापता है: किसी config के
 सभी kernels एक साथ (split का merge, tail के partials) और op का plan भी उसी तरह।
+
+### Thread trace {#thread-trace}
+
+AMD RDNA3 या RDNA4 card पर `tk_bench sqtt` किसी GEMM config की SQ thread trace (SQTT) record करता है:
+पहले config का समय बिना trace के मापा जाता है, फिर trace चालू करके उसे एक बार और चलाया जाता है। हर
+kernel की trace `--out` (default `./sqtt`) के अंदर उसकी अपनी directory में सहेजी जाती है, और एक report
+छपती है: traced SIMD के cycles instruction class के हिसाब से, main loop के iterations और हर iteration
+के cycles, और सबसे ज़्यादा stall करने वाले instructions। `--attribute` cost model के हर term के साथ उन
+instructions के traced cycles दिखाता है जिनकी price वह term लगाता है। `--load` सहेजी गई directory को
+बिना GPU के फिर से पढ़ता है:
+
+```bash
+SVOD_DEVICE=AMD cargo run --release -p svod-tk --example tk_bench -- sqtt gemm 1500 1280 5120 --attribute
+cargo run --release -p svod-tk --example tk_bench -- sqtt --load <DIR>
+```
+
+हर shader engine पर सिर्फ़ एक SIMD instructions record करता है, इसलिए per-instruction संख्याएँ उसी SIMD
+की waves के बारे में हैं। Tracing एक stable power state तय करता है और traced run को धीमा करता है:
+traced समय की तुलना कभी untraced समय से न करें। `SVOD_SQTT=1` किसी भी profiled plan को इसी तरह trace
+करता है (`ExecutionPlan::profile`, `SVOD_SQTT_DIR` में सहेजा जाता है)।

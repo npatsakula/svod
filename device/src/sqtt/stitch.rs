@@ -151,6 +151,14 @@ fn branch_target(pc: u64, text: &str, comment: Option<&str>) -> u64 {
     pc.wrapping_add_signed(4 + 4 * delta)
 }
 
+/// The target of the direct branch (`s_branch`, `s_cbranch_*`) an [`objdump_lines`] line at `pc` holds,
+/// as the stitcher follows it.
+pub fn branch(pc: u64, line: &str) -> Option<u64> {
+    let (text, comment) = line.split_once("//").map_or((line, None), |(t, c)| (t, Some(c)));
+    let text = text.trim();
+    text.contains("branch").then(|| branch_target(pc, text, comment))
+}
+
 fn trivial(wave: Category, line: Class) -> bool {
     matches!(
         (wave, line),
@@ -197,10 +205,9 @@ impl<'a> Stitcher<'a> {
         let mut lines: Vec<Line<'a>> = code
             .iter()
             .map(|&(pc, line)| {
-                let (text, comment) = line.split_once("//").map_or((line, None), |(t, c)| (t, Some(c)));
-                let text = text.trim();
+                let text = line.split_once("//").map_or(line, |(t, _)| t).trim();
                 let class = trie.class(text, layout);
-                let target = if class == Class::Branch { branch_target(pc, text, comment) } else { 0 };
+                let target = if class == Class::Branch { branch(pc, line).unwrap_or(0) } else { 0 };
                 Line { pc, text, class, target, parsed: false, not_taken: 0 }
             })
             .collect();

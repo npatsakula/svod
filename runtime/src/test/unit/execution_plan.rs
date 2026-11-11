@@ -314,6 +314,23 @@ fn test_profile_carries_the_requested_origin_depth() {
     assert_eq!(plan.profile(&ProfileOptions::default()).expect("profile").origin_depth, None, "the leaf by default");
 }
 
+/// Tier 5 on a plan whose context cannot trace profiles as before, saving nothing.
+#[test]
+fn test_profile_without_a_thread_trace_saves_nothing() {
+    let mut builder = ExecutionPlanBuilder::new(DeviceSpec::Cpu);
+    let dst_idx = builder.add_buffer(1, cpu_buffer(DType::Float32, 4));
+    let src_idx = builder.add_buffer(2, f32_buffer(&[1.0, 2.0, 3.0, 4.0]));
+    builder.add_op(copy_op(99, vec![dst_idx, src_idx], Vec::new()));
+    builder.set_output_buffer(dst_idx);
+    let plan = builder.build().expect("build plan");
+
+    let dir = tempfile::tempdir().unwrap();
+    let opts = ProfileOptions { sqtt: Some(dir.path().join("sqtt")), ..Default::default() };
+    let profile = plan.profile(&opts).expect("profile");
+    assert!(profile.stages[0].sqtt.is_empty() && !profile.render_report().contains("SQTT"));
+    assert!(!dir.path().join("sqtt").exists());
+}
+
 /// A `CustomFunction` whose runtime is unimplemented surfaces its typed
 /// `Unsupported`, and — because the epoch was already reserved — the plan is
 /// poisoned rather than left retryable.

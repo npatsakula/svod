@@ -1,0 +1,42 @@
+== sqtt _Z9vectoropsv gfx1200 fixture=amd/navi4_sdata
+kernel     - ns untraced, - ns traced, wave span 123811 cycles, sclk - MHz
+traced     sa0 wgp1 simd3 on se0 of 1 SEs
+waves      8 traced (8 complete) of 256 on the traced SEs, occupancy peak 256; lifetime min 114079 med 118980 max 122448 cycles
+records    62512 stitched of 62512
+== time by class (traced SIMD, cycles summed over waves)
+class           hits      cycles  share       stall        exec
+valu           44432      339702  50.5%      292126       47576
+salu           17128       57250   8.5%        7354       49896
+vmem_load         24         237   0.0%         213          24
+vmem_store       184         630   0.1%         446         184
+smem               8           9   0.0%           1           8
+branch           376         376   0.1%           0         376
+wait_vmem        104        9674   1.4%        9570         104
+wait_lgkm         32       29447   4.4%       29415          32
+immediate         32          48   0.0%          16          32
+barrier          160      234837  34.9%           0      234837
+message           32         455   0.1%         220         235
+total          62512      672665 100.0%      339361      333304
+== main loop 0x1afc..=0x2590 (hottest, no matrix op)
+iterations/wave  min 16 med 16 max 16 (waves 8)
+cycles/iteration min 2070 med 7960 p90 11645 max 12355 (n 120)
+== main loop: top 8 by stall
+      pc    hits    cycles   lat/hit stall/hit  asm
+  0x1b68     128     12384      96.8      95.8  v_add_nc_u32_e32 v2, -1, v1
+  0x1b38     128      8866      69.3      65.3  v_sqrt_f32_e32 v1, v0
+  0x1e50     128      7916      61.8      60.8  v_fma_f32 v4, -v2, v1, v0
+  0x1dac     128      7410      57.9      56.9  v_add_f32_e32 v0, v0, v10
+  0x1bb8     128      6846      53.5      52.5  v_cndmask_b32_e64 v1, v1, v2, s0
+  0x1c74     128      6100      47.7      46.7  v_add_f32_e32 v0, v0, v15
+  0x1bdc     128      6015      47.0      46.0  v_cndmask_b32_e64 v1, v1, v3, s0
+  0x1bc4     128      5356      41.8      40.8  v_cmp_lt_f32_e64 s0, 0, v5
+== hottest 8 by cycles
+      pc    hits    cycles   lat/hit stall/hit  asm
+  0x25a4      64    232382    3631.0       0.0  s_barrier_wait 0xffff
+  0x1a28       8     29423    3677.9    3676.9  s_wait_kmcnt 0x0
+  0x1b68     128     12384      96.8      95.8  v_add_nc_u32_e32 v2, -1, v1
+  0x1b38     128      8866      69.3      65.3  v_sqrt_f32_e32 v1, v0
+  0x1e50     128      7916      61.8      60.8  v_fma_f32 v4, -v2, v1, v0
+  0x1860       8      7653     956.6     955.6  s_wait_loadcnt_dscnt 0x0
+  0x1dac     128      7410      57.9      56.9  v_add_f32_e32 v0, v0, v10
+  0x1bb8     128      6846      53.5      52.5  v_cndmask_b32_e64 v1, v1, v2, s0

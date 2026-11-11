@@ -83,5 +83,17 @@ SVOD_DEVICE=CUDA cargo run --release -p svod-tk --example tk_bench -- gemm --top
 | `fit [--only LABEL,…] [--picks]` | 代价模型与设备的对比：若干 GEMM、注意力和 nearest 形状上每个排名配置的预测时间与实测时间、调优器的选择及调优器的墙钟时间；`--picks` 只为选择计时 |
 | `trips` | 每个 SM 驻留 1 到 48 个块时的流水线迭代探针 |
 | `pin --cfg BMxBNxBK:S:WRxWC[:rolled],… [--shape MxNxK,…] [--residual] [--gated]` | 每个固定的 GEMM 配置的时间（默认为 Whisper 的 fc2），旁边是模型的价格，以及分别将内存延迟、单独行程或矩阵核步骤置零后的价格：每一项占该配置时间的多少 |
+| `sqtt gemm M N K [--cfg I\|tuned\|BMxBNxBK:S:WRxWC[:rolled],…] [--top N] [--out DIR] [--json] [--attribute]` | 仅限 AMD RDNA3/RDNA4：每个配置的线程追踪报告（见[线程追踪](#thread-trace)）；`sqtt --load DIR` 重新读取已保存的追踪 |
 
 `--metric` 可取 `squared-l2`、`l2` 或 `neg-dot`。每个命令都按调优器的方式计时：一个配置的所有内核一起计时（拆分的合并、尾部的部分和），算子的计划也一样。
+
+### 线程追踪 {#thread-trace}
+
+在 AMD RDNA3 或 RDNA4 显卡上，`tk_bench sqtt` 记录一个 GEMM 配置的 SQ 线程追踪（SQTT）：先在不追踪的情况下为该配置计时，再开启追踪运行一次。每个内核的追踪保存在 `--out`（默认 `./sqtt`）下各自的目录中，并打印一份报告：被追踪 SIMD 按指令类别的周期数、主循环的迭代次数与每次迭代的周期数，以及停顿最多的指令。`--attribute` 在每个代价模型项旁列出该项所计价指令的追踪周期。`--load` 无需 GPU 即可重新读取已保存的目录：
+
+```bash
+SVOD_DEVICE=AMD cargo run --release -p svod-tk --example tk_bench -- sqtt gemm 1500 1280 5120 --attribute
+cargo run --release -p svod-tk --example tk_bench -- sqtt --load <DIR>
+```
+
+每个着色器引擎只有一个 SIMD 记录指令，因此逐指令的数字描述的是该 SIMD 上的 wave。追踪会固定一个稳定的功耗状态并拖慢被追踪的运行：切勿将追踪下的时间与未追踪的时间比较。`SVOD_SQTT=1` 以同样方式追踪任何被剖析的计划（`ExecutionPlan::profile`，保存在 `SVOD_SQTT_DIR` 下）。

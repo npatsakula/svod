@@ -310,6 +310,7 @@ fn dispatch(name: &'static str, micros: u64, origin: Option<OriginId>, origins: 
         gpu_end_ns: None,
         static_info: None,
         counters: None,
+        sqtt: None,
     }
 }
 
@@ -712,4 +713,76 @@ fn json_export_round_trips_and_embeds_the_referenced_origins() {
     assert_eq!(head["parent"], serde_json::Value::Null, "a root scope");
     let call = by_id[&(s.ffn1_call.get() as u64)];
     assert_eq!(call["parent"], s.ffn1.get(), "call frames keep their module parent");
+}
+
+/// A traced dispatch's handle as the AMD one behaves: its trace reads only once retired, and it counts
+/// the trace buffers live.
+struct TracedHandle {
+    live: Arc<std::sync::atomic::AtomicUsize>,
+    retired: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl TracedHandle {
+    fn new(live: &Arc<std::sync::atomic::AtomicUsize>, retired: &Arc<std::sync::atomic::AtomicBool>) -> Arc<Self> {
+        live.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Arc::new(Self { live: Arc::clone(live), retired: Arc::clone(retired) })
+    }
+}
+
+impl Drop for TracedHandle {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl svod_device::DispatchTimestamps for TracedHandle {
+    fn timestamps_ns(&self) -> Option<(u64, u64)> {
+        Some((10, 25))
+    }
+
+    fn sqtt(&self) -> Option<svod_device::profile::SqttTrace> {
+        self.retired.load(std::sync::atomic::Ordering::SeqCst).then(|| svod_device::profile::SqttTrace {
+            arch: svod_dtype::AmdArch::Gfx1201,
+            per_se: vec![],
+            code: None,
+        })
+    }
+}
+
+/// Tier 5's drained pass synchronizes each traced dispatch, reads its trace and drops its handle
+/// before the next: one kernel's trace buffers live at a time, every trace kept. The plain pass holds
+/// every handle until its one synchronize.
+#[test]
+fn drained_dispatches_hold_one_trace_at_a_time() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let (live, retired) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicBool::new(false)));
+    let mut finalizer = crate::profiler::SubmissionProfileFinalizer::with_capacity(3);
+    for name in ["a", "b", "c"] {
+        retired.store(false, Ordering::SeqCst);
+        let handle = TracedHandle::new(&live, &retired);
+        assert_eq!(live.load(Ordering::SeqCst), 1, "{name}: an earlier trace is still live");
+        let sync = || {
+            retired.store(true, Ordering::SeqCst);
+            Ok(())
+        };
+        finalizer.push_drained(dispatch(name, 1, None, &[]), Some(handle), sync).unwrap();
+        assert_eq!(live.load(Ordering::SeqCst), 0, "{name}: its handle outlived the drain");
+    }
+    let profiles = finalizer.finish(|| panic!("nothing is left to synchronize")).unwrap();
+    assert!(profiles.iter().all(|p| p.sqtt.is_some() && (p.gpu_start_ns, p.gpu_end_ns) == (Some(10), Some(25))));
+
+    let mut held = crate::profiler::SubmissionProfileFinalizer::with_capacity(3);
+    retired.store(false, Ordering::SeqCst);
+    for name in ["a", "b", "c"] {
+        held.push(dispatch(name, 1, None, &[]), Some(TracedHandle::new(&live, &retired)));
+    }
+    assert_eq!(live.load(Ordering::SeqCst), 3);
+    let profiles = held
+        .finish(|| {
+            retired.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .unwrap();
+    assert!(profiles.iter().all(|p| p.sqtt.is_some()));
+    assert_eq!(live.load(Ordering::SeqCst), 0);
 }

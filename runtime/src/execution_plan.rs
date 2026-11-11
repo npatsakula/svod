@@ -42,7 +42,7 @@ use svod_ir::{CustomFunctionKind, Op, UOp};
 use crate::error::{ExecSnafu, Result};
 use crate::kernel_cache::CachedKernel;
 use crate::profiler::{
-    KernelProfile, KernelStaticInfo, ProfileOptions, RunProfile, StageProfile, SubmissionProfileFinalizer,
+    KernelProfile, KernelStaticInfo, ProfileOptions, RunProfile, SqttKernel, StageProfile, SubmissionProfileFinalizer,
 };
 use svod_ir::ops;
 
@@ -1436,14 +1436,18 @@ impl ExecutionPlan {
     /// Uses a captured graph's linked profiling variant when the backend exposes
     /// per-dispatch stamps; otherwise falls back to profiled per-call submissions.
     pub fn execute_profiled(&self) -> Result<Vec<KernelProfile>> {
-        self.execute_profiled_inner(/*per_dispatch=*/ false)
+        self.execute_profiled_inner(/*per_dispatch=*/ false, /*drain=*/ false)
     }
 
     /// [`Self::execute_profiled`], optionally refusing backend-native graph
     /// replay. Hardware counters are collected around individual launches, so a
     /// counted run has to take the per-dispatch path; a captured graph replays
     /// as one opaque submission and would report no counters at all.
-    fn execute_profiled_inner(&self, per_dispatch: bool) -> Result<Vec<KernelProfile>> {
+    ///
+    /// `drain` (Tier 5, per dispatch) synchronizes after every kernel and
+    /// reads its handle before the next is dispatched, so at most one
+    /// kernel's trace buffers are live.
+    fn execute_profiled_inner(&self, per_dispatch: bool, drain: bool) -> Result<Vec<KernelProfile>> {
         self.check_hcq_poison()?;
         self.check_no_host_writes()?;
         let mut finalizer = SubmissionProfileFinalizer::with_capacity(self.op_order.len());
@@ -1499,6 +1503,7 @@ impl ExecutionPlan {
                                 gpu_end_ns: None,
                                 static_info: None,
                                 counters: None,
+                                sqtt: None,
                             },
                             Some(handle),
                         );
@@ -1527,21 +1532,23 @@ impl ExecutionPlan {
                                 // Stamp before the metadata clones, so the
                                 // origin set never lands inside the timed window.
                                 let wall = start.elapsed();
-                                finalizer.push(
-                                    KernelProfile {
-                                        kernel: Arc::clone(&kernel.kernel),
-                                        device: kernel.device.clone(),
-                                        origin: kernel.origin,
-                                        origins: kernel.origins.clone(),
-                                        num_buffers: kernel.buffer_ptrs.len(),
-                                        wall,
-                                        gpu_start_ns: None,
-                                        gpu_end_ns: None,
-                                        static_info: None,
-                                        counters: None,
-                                    },
-                                    handle,
-                                );
+                                let profile = KernelProfile {
+                                    kernel: Arc::clone(&kernel.kernel),
+                                    device: kernel.device.clone(),
+                                    origin: kernel.origin,
+                                    origins: kernel.origins.clone(),
+                                    num_buffers: kernel.buffer_ptrs.len(),
+                                    wall,
+                                    gpu_start_ns: None,
+                                    gpu_end_ns: None,
+                                    static_info: None,
+                                    counters: None,
+                                    sqtt: None,
+                                };
+                                match drain {
+                                    true => finalizer.push_drained(profile, handle, || self.synchronize_ctx())?,
+                                    false => finalizer.push(profile, handle),
+                                }
                             }
                             PreparedOp::BufferCopy(copy) => self.execute_copy(copy)?,
                             PreparedOp::CustomFunction(custom) => self.execute_custom_function(custom)?,
@@ -1551,12 +1558,7 @@ impl ExecutionPlan {
                 })
             }
             .map_err(Self::submission_error)?;
-            finalizer.finish(|| {
-                if let Some(ctx) = self.plan_ctx.get().and_then(|context| context.as_deref()) {
-                    ctx.synchronize().context(ExecSnafu { context: "profiled HCQ finalizer" })?;
-                }
-                Ok(())
-            })
+            finalizer.finish(|| self.synchronize_ctx())
         })();
         if result.is_err()
             && let Some(ctx) = self.plan_ctx.get().and_then(|context| context.as_deref())
@@ -1584,11 +1586,7 @@ impl ExecutionPlan {
         let armed_ctx = if !opts.counters.is_enabled() {
             None
         } else {
-            let first_program = self.op_levels.iter().flatten().find_map(|&idx| match &self.ops[idx] {
-                PreparedOp::CompiledProgram(k) => Some(k.kernel.program.as_ref()),
-                _ => None,
-            });
-            match first_program.and_then(|p| self.plan_ctx(p).ok().flatten()) {
+            match self.first_ctx() {
                 Some(ctx) if ctx.pmc_available() => {
                     // `Default` means whatever this backend collects; an explicit
                     // list may name another backend's counters, which it drops.
@@ -1625,9 +1623,9 @@ impl ExecutionPlan {
                 stages: vec![StageProfile::gpu("profile", start.elapsed(), kernels)],
                 origin_depth: opts.origin_depth,
             };
-            let mut report = run(self.execute_profiled_inner(armed)?);
+            let mut report = run(self.execute_profiled_inner(armed, false)?);
             for _ in 1..opts.iters.max(1) {
-                report.merge_min(run(self.execute_profiled_inner(armed)?));
+                report.merge_min(run(self.execute_profiled_inner(armed, false)?));
             }
             // Collecting counters serializes the context and replays each kernel,
             // which inflates the dispatch's own event pair by orders of
@@ -1636,7 +1634,7 @@ impl ExecutionPlan {
             // counted pass's counters.
             if let Some(ctx) = armed_ctx {
                 ctx.set_pmc(&[]);
-                report.merge_min(run(self.execute_profiled_inner(true)?));
+                report.merge_min(run(self.execute_profiled_inner(true, false)?));
             }
             Ok(report)
         })();
@@ -1657,7 +1655,58 @@ impl ExecutionPlan {
                 profile.static_info = Some(self.kernel_static_info(pk));
             }
         }
+        if let Some(dir) = &opts.sqtt {
+            report.stages[0].sqtt = self.trace(dir, &report.stages[0].kernels)?;
+        }
         Ok(report)
+    }
+
+    /// Drain the plan's context, where it has one (profiled-timestamp harvest).
+    fn synchronize_ctx(&self) -> Result<()> {
+        if let Some(ctx) = self.plan_ctx.get().and_then(|context| context.as_deref()) {
+            ctx.synchronize().context(ExecSnafu { context: "profiled HCQ finalizer" })?;
+        }
+        Ok(())
+    }
+
+    /// The plan's context, minted for its first compiled kernel.
+    fn first_ctx(&self) -> Option<&dyn svod_device::PlanContext> {
+        let first_program = self.op_levels.iter().flatten().find_map(|&idx| match &self.ops[idx] {
+            PreparedOp::CompiledProgram(k) => Some(k.kernel.program.as_ref()),
+            _ => None,
+        });
+        first_program.and_then(|p| self.plan_ctx(p).ok().flatten())
+    }
+
+    /// Tier 5: one more pass with the plan's context tracing (AMD SQTT), each
+    /// kernel's trace saved under `dir/<index>_<entry point>` beside its
+    /// untraced time in `untraced`. A context that cannot trace leaves a note.
+    fn trace(&self, dir: &std::path::Path, untraced: &[KernelProfile]) -> Result<Vec<SqttKernel>> {
+        let Some(ctx) = self.first_ctx() else { return Ok(vec![]) };
+        if let Err(error) = ctx.set_sqtt(Some(svod_device::profile::SqttConfig::default())) {
+            eprintln!("SVOD_SQTT: no thread trace on this device ({error}); skipped");
+            return Ok(vec![]);
+        }
+        let traced = self.execute_profiled_inner(true, true);
+        ctx.set_sqtt(None).context(ExecSnafu { context: "disarm the thread trace" })?;
+        let mut kernels = vec![];
+        for (index, mut profile) in traced?.into_iter().enumerate() {
+            let Some(trace) = profile.sqtt.take() else { continue };
+            let entry = profile.kernel.entry_point.clone();
+            let name: String = entry.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+            let dir = dir.join(format!("{index:03}_{name}"));
+            let ns = untraced.get(index).and_then(|k| k.gpu_end_ns?.checked_sub(k.gpu_start_ns?));
+            let traced_ns =
+                profile.gpu_end_ns.zip(profile.gpu_start_ns).and_then(|(end, start)| end.checked_sub(start));
+            let analysis = crate::sqtt::Capture::new(*trace, ns).and_then(|mut capture| {
+                capture.traced_ns = traced_ns;
+                capture.labels.insert("kernel".into(), entry.clone());
+                capture.save(&dir)?;
+                capture.analyze()
+            });
+            kernels.push(SqttKernel { index, kernel: entry, dir, analysis: analysis.map_err(Into::into) });
+        }
+        Ok(kernels)
     }
 
     /// Tier-2/3 static analysis for one kernel: AST flop estimate, compulsory

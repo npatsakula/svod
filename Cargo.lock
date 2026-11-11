@@ -3818,6 +3818,7 @@ dependencies = [
  "object",
  "papaya",
  "parking_lot 0.12.5",
+ "proptest",
  "rayon",
  "serde",
  "serde_json",

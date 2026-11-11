@@ -158,6 +158,27 @@ SVOD_DEVICE=CUDA cargo run --release -p svod-tk --example tk_bench -- gemm --top
 | `fit [--only LABEL,…] [--picks]` | The cost model against the device: the predicted and measured time of each ranked config on a few GEMM, attention and nearest shapes, the tuner's pick and the tuner's wall time; `--picks` times the picks alone |
 | `trips` | The pipeline-trip probes at 1 to 48 blocks per SM |
 | `pin --cfg BMxBNxBK:S:WRxWC[:rolled],… [--shape MxNxK,…] [--residual] [--gated]` | Each pinned GEMM config's time (Whisper's fc2 by default) beside the model's price and that price with the memory latency, the lone trip or the matrix step zeroed: what each term holds of the config's time |
+| `sqtt gemm M N K [--cfg I\|tuned\|BMxBNxBK:S:WRxWC[:rolled],…] [--top N] [--out DIR] [--json] [--attribute]` | AMD RDNA3/RDNA4 only: each config's thread trace report (see [Thread trace](#thread-trace)); `sqtt --load DIR` reads a saved trace again |
 
 `--metric` takes `squared-l2`, `l2` or `neg-dot`. Every command times as the tuner does: a config's
 kernels together (a split's merge, a tail's partials) and an op's plan alike.
+
+### Thread trace
+
+On an AMD RDNA3 or RDNA4 card, `tk_bench sqtt` records an SQ thread trace (SQTT) of a GEMM
+config: the config is timed untraced first, then run once more with tracing on. Each kernel's
+trace is saved in its own directory under `--out` (`./sqtt` by default), and a report is printed:
+the traced SIMD's cycles by instruction class, the main loop's iterations and cycles per
+iteration, and the instructions that stall most. `--attribute` adds the cost model's terms next to
+the traced cycles of the instructions each term prices. `--load` reads a saved directory again,
+with no GPU:
+
+```bash
+SVOD_DEVICE=AMD cargo run --release -p svod-tk --example tk_bench -- sqtt gemm 1500 1280 5120 --attribute
+cargo run --release -p svod-tk --example tk_bench -- sqtt --load <DIR>
+```
+
+Only one SIMD per shader engine records instructions, so the per-instruction numbers describe the
+waves on that SIMD. Tracing pins a stable power state and slows the traced run: never compare a
+traced time with an untraced one. `SVOD_SQTT=1` traces any profiled plan the same way
+(`ExecutionPlan::profile`, saved under `SVOD_SQTT_DIR`).

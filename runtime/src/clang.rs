@@ -90,6 +90,12 @@ impl ClangToolchain {
             .map_err(|error| Error::JitCompilation { reason: format!("clang target probe was not UTF-8: {error}") })
     }
 
+    /// The LLVM tool `name` (`llvm-objdump`) installed beside this clang, else the one on `PATH`.
+    pub(crate) fn sibling(&self, name: &str) -> Result<PathBuf> {
+        let beside = self.executable.parent().map(|dir| dir.join(name)).filter(|tool| tool.is_file());
+        beside.map_or_else(|| resolve_executable(name), Ok)
+    }
+
     pub(crate) fn command(&self) -> Command {
         Command::new(&self.executable)
     }

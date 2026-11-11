@@ -37,13 +37,24 @@
 //!   timed beside the model's price and that price with one term zeroed at
 //!   a time (the memory latency, the lone trip, the matrix step): what each
 //!   term holds of the config's time.
+//! - `sqtt gemm M N K [--cfg I|tuned|BMxBNxBK:S:WRxWC[:rolled],…] [--top N]
+//!   [--out DIR] [--json] [--attribute] [--residual] [--gated]`: each config
+//!   (the tuner's pick by default, `I` the planner's `I`th) timed untraced,
+//!   then traced once on an AMD RDNA3/RDNA4 card (SQTT), its trace saved
+//!   under `DIR` (`./sqtt`) and its report printed (`--top` rows a table,
+//!   `--json` one line); `--attribute` sets the model's terms (`price` less
+//!   each) beside the traced SIMD's cycles of their counterparts.
+//!   `sqtt --load DIR [--json] [--attribute]` re-reads a saved trace, no GPU.
 
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use svod_dtype::default_device::default_device;
 use svod_dtype::{DType, ScalarDType};
-use svod_runtime::ExecutionPlan;
+use svod_runtime::sqtt::{Analysis, Capture, Class};
+use svod_runtime::{ExecutionPlan, ProfileOptions};
 use svod_tensor::Tensor;
 use svod_tk::atoms::{Core, Costs, Device};
 use svod_tk::ir::Schedule;
@@ -58,7 +69,8 @@ use svod_tk::tune::{self, Candidate, Compiled, TuneStore};
 
 type Result<T, E = Box<dyn std::error::Error>> = std::result::Result<T, E>;
 
-const USAGE: &str = "tk_bench <gemm|attention|nearest|rerank|raster|fit|trips|pin> [options]; see the example's docs";
+const USAGE: &str =
+    "tk_bench <gemm|attention|nearest|rerank|raster|fit|trips|pin|sqtt> [options]; see the example's docs";
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -66,6 +78,11 @@ fn main() -> Result<()> {
         println!("{USAGE}");
         return Ok(());
     };
+    if command == "sqtt" {
+        // SAFETY: no other thread runs yet. The AMD device keeps the code
+        // objects a trace maps its PCs through only when this is set as it opens.
+        unsafe { std::env::set_var("SVOD_SQTT", "1") };
+    }
     // The tuner's picks and round times under `RUST_LOG=svod_tk=debug`.
     let filter = tracing_subscriber::EnvFilter::from_default_env();
     tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).without_time().init();
@@ -79,6 +96,7 @@ fn main() -> Result<()> {
         "fit" => fit_bench(&args),
         "trips" => trips_bench(),
         "pin" => pin_bench(&args),
+        "sqtt" => sqtt_bench(&args),
         other => Err(format!("{other}: {USAGE}").into()),
     }
 }
@@ -570,11 +588,16 @@ fn pinned(code: &str) -> Result<GemmCfg> {
     })
 }
 
-fn pin_bench(args: &Args) -> Result<()> {
-    let planner = planner()?;
+/// `--residual` and `--gated` (a SwiGLU) on the plain epilogue.
+fn epilogue(args: &Args) -> Epilogue {
     let gated = args.flag("--gated");
     let act = if gated { Act::Silu } else { Act::None };
-    let epilogue = Epilogue { residual: args.flag("--residual"), gated, act, ..Epilogue::DEFAULT };
+    Epilogue { residual: args.flag("--residual"), gated, act, ..Epilogue::DEFAULT }
+}
+
+fn pin_bench(args: &Args) -> Result<()> {
+    let planner = planner()?;
+    let epilogue = epilogue(args);
     let cfgs = args.opt("--cfg").ok_or("--cfg BMxBNxBK:S:WRxWC[:rolled],…")?.split(',').map(pinned);
     let cfgs = cfgs.collect::<Result<Vec<_>>>()?;
     let (target, costs) = (&planner.device.target, planner.device.costs);
@@ -604,4 +627,165 @@ fn pin_bench(args: &Args) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The terms `pin` prices by: each with its costs zeroed.
+fn zeroed_terms(costs: Costs) -> [(&'static str, Costs); 6] {
+    [
+        ("steps", Costs { step: 0.0, step_group: 0.0, step_wide: 0.0, step_i8: 0.0, ..costs }),
+        ("reads", Costs { smem_byte: 0.0, ..costs }),
+        ("fill", Costs { global_byte: 0.0, l2_byte: 0.0, l2_bytes: 0.0, ..costs }),
+        ("wait", Costs { latency: 0.0, latency_one: 0.0, ..costs }),
+        ("lone_trip", Costs { trip_lone: 0.0, trip_one_lone: 0.0, ..costs }),
+        ("trip", Costs { trip: 0.0, trip_rolled: 0.0, trip_one: 0.0, ..costs }),
+    ]
+}
+
+/// The labels a GEMM trace carries for `--attribute`: the model's price of
+/// `cfg`, the price less each term, the trips a block runs and the blocks
+/// the busiest SM runs.
+fn gemm_model(planner: &Planner, [m, n, k]: [usize; 3], epilogue: Epilogue, cfg: GemmCfg) -> BTreeMap<String, String> {
+    let p = GemmProblem::new(1, m, n, k, &epilogue);
+    let priced = |planner: &Planner| p.admit(planner, &cfg).map_or(f64::NAN, |a| a.0);
+    let model = priced(planner);
+    let target = &planner.device.target;
+    let mut labels = BTreeMap::from([
+        ("op".into(), "gemm".into()),
+        ("shape".into(), format!("{m}x{n}x{k}")),
+        ("cfg".into(), gemm_label(&cfg)),
+        ("model.ns".into(), format!("{model:.0}")),
+        ("model.trips".into(), k.div_ceil(cfg.tile[2]).to_string()),
+    ]);
+    if let Some(sms) = target.sms {
+        let blocks = m.div_ceil(cfg.tile[0]) * n.div_ceil(cfg.tile[1]);
+        labels.insert("model.blocks_per_sm".into(), blocks.div_ceil(sms as usize).to_string());
+    }
+    for (term, costs) in zeroed_terms(planner.device.costs) {
+        let less = Planner::new(Device { target: target.clone(), costs }).map_or(f64::NAN, |z| priced(&z));
+        labels.insert(format!("model.{term}"), format!("{:.0}", model - less));
+    }
+    labels
+}
+
+fn sqtt_bench(args: &Args) -> Result<()> {
+    let top = args.num("--top", 12)?;
+    if let Some(dir) = args.opt("--load") {
+        return sqtt_print(&Capture::load(Path::new(dir))?, args, top);
+    }
+    let positional: Vec<&str> = args.0.iter().map(String::as_str).take_while(|a| !a.starts_with("--")).collect();
+    let usage = "sqtt gemm M N K [--cfg I|tuned|BMxBNxBK:S:WRxWC[:rolled],…] or sqtt --load DIR";
+    let ["gemm", m, n, k] = positional[..] else { return Err(usage.into()) };
+    let shape = [m.parse()?, n.parse()?, k.parse()?];
+    let [m, n, k] = shape;
+    let (planner, epilogue) = (planner()?, epilogue(args));
+    let ranked = planner.gemm_ranked(1, m, n, k, &epilogue);
+    let cfgs = args.opt("--cfg").unwrap_or("tuned").split(',').map(|c| match (c, c.parse::<usize>()) {
+        ("tuned", _) => Ok(gemm_pick(&planner, shape, epilogue, &ranked)),
+        (_, Ok(i)) => ranked.get(i).copied().ok_or_else(|| format!("--cfg {i}: {} ranked", ranked.len()).into()),
+        (code, _) => pinned(code),
+    });
+    let out = PathBuf::from(args.opt("--out").unwrap_or("sqtt"));
+    for (i, cfg) in cfgs.enumerate() {
+        let cfg = cfg?;
+        let untraced = timed_candidates(vec![gemm_candidate(&planner, shape, epilogue, cfg)?]).pop().and_then(|t| t.1);
+        let dir = out.join(format!("gemm_{m}x{n}x{k}_{i}"));
+        let opts = ProfileOptions { iters: 3, static_analysis: false, sqtt: Some(dir.clone()), ..Default::default() };
+        let profiles = tune::profile(gemm_candidate(&planner, shape, epilogue, cfg)?, &opts)
+            .ok_or_else(|| format!("{}: failed to build or run", gemm_label(&cfg)))?;
+        let traces: Vec<_> = profiles.iter().flat_map(|p| &p.stages).flat_map(|s| &s.sqtt).collect();
+        if traces.is_empty() {
+            return Err("no thread trace: SQTT needs an AMD RDNA3/RDNA4 device (SVOD_DEVICE=AMD)".into());
+        }
+        let mut labels = gemm_model(&planner, shape, epilogue, cfg);
+        labels.insert("candidate_ns".into(), untraced.map_or("-".into(), |t| t.as_nanos().to_string()));
+        for trace in traces {
+            if let Err(error) = &trace.analysis {
+                return Err(format!("{}: {error}", trace.dir.display()).into());
+            }
+            let mut capture = Capture::load(&trace.dir)?;
+            capture.labels.extend(labels.clone());
+            capture.save(&trace.dir)?;
+            println!("saved {}", trace.dir.display());
+            sqtt_print(&capture, args, top)?;
+        }
+    }
+    Ok(())
+}
+
+fn sqtt_print(capture: &Capture, args: &Args, top: usize) -> Result<()> {
+    let a = capture.analyze()?;
+    match args.flag("--json") {
+        true => println!("{}", a.to_json()),
+        false => print!("{}", a.text(top)),
+    }
+    if args.flag("--attribute") {
+        print!("{}", attribution(&a)?);
+    }
+    Ok(())
+}
+
+/// The model's terms beside the traced SIMD's cycles of what they price:
+/// steps the matrix ops' issue less their stall, reads the LDS ops and
+/// their waits, fill the global memory ops and their waits, wait the
+/// barriers and messages.
+fn attribution(a: &Analysis) -> Result<String> {
+    use std::fmt::Write;
+    let label = |key: &str| a.labels.get(key).and_then(|v| v.parse::<f64>().ok());
+    let model =
+        label("model.ns").ok_or("no model terms in the trace's labels: a `tk_bench sqtt gemm` capture has them")?;
+    let total: i64 = a.classes.iter().map(|c| c.latency).sum::<i64>().max(1);
+    let ns = |cycles: f64| a.sclk_mhz.map_or("-".into(), |mhz| format!("{:.0}", cycles * 1000.0 / mhz as f64));
+    let mut o = String::new();
+    let sclk = a.sclk_mhz.map_or("-".into(), |mhz| mhz.to_string());
+    writeln!(
+        o,
+        "== attribution (model: ns of the busiest SM, price less the term, terms overlap; measured: traced SIMD cycles summed over waves, ns at sclk {sclk} MHz)"
+    )?;
+    writeln!(
+        o,
+        "{:<10} {:>10} {:>7} {:>12} {:>9} {:>11}  counterpart",
+        "term", "model ns", "model%", "cycles", "cycles%", "ns at sclk"
+    )?;
+    let (matrix, matrix_stall) = a.cycles(&[Class::Matrix]);
+    let measured: [(&str, Option<(i64, &str)>); 6] = [
+        ("steps", Some((matrix - matrix_stall, "matrix issue less stall"))),
+        ("reads", Some((a.cycles(&[Class::Lds, Class::WaitLgkm]).0, "lds + wait_lgkm"))),
+        ("fill", Some((a.cycles(&[Class::VmemLoad, Class::VmemStore, Class::WaitVmem]).0, "vmem + wait_vmem"))),
+        ("wait", Some((a.cycles(&[Class::Barrier, Class::Message]).0, "barrier + message"))),
+        ("lone_trip", None),
+        ("trip", None),
+    ];
+    for (term, counterpart) in measured {
+        let m = label(&format!("model.{term}")).unwrap_or(f64::NAN);
+        let (cycles, share, at, what) = match counterpart {
+            Some((c, what)) => (c.to_string(), format!("{:.1}", 100.0 * c as f64 / total as f64), ns(c as f64), what),
+            None => ("-".into(), "-".into(), "-".into(), "none traced"),
+        };
+        writeln!(o, "{term:<10} {m:>10.0} {:>7.1} {cycles:>12} {share:>9} {at:>11}  {what}", 100.0 * m / model)?;
+    }
+    writeln!(
+        o,
+        "{:<10} {model:>10.0} {:>7.1} {total:>12} {:>9.1} {:>11}  all traced instructions",
+        "total",
+        100.0,
+        100.0,
+        ns(total as f64)
+    )?;
+    let trips = label("model.trips").unwrap_or(f64::NAN);
+    let per_sm = label("model.blocks_per_sm").unwrap_or(f64::NAN);
+    let iteration = a.main_loop.as_ref().and_then(|l| l.cycles).map(|c| c.median);
+    writeln!(
+        o,
+        "per trip   model {:.0} ns over {trips} trips × {per_sm} blocks/SM ({:.1} ns a block-trip); measured {} cycles a wave's iteration (median), {} ns",
+        model / trips,
+        model / trips / per_sm,
+        iteration.map_or("-".into(), |c| c.to_string()),
+        iteration.map_or("-".into(), |c| ns(c as f64)),
+    )?;
+    let untraced = a.labels.get("candidate_ns").map_or("-", String::as_str);
+    writeln!(
+        o,
+        "time       model {model:.0} ns, candidate {untraced} ns untraced (never compare the traced pass's ns)"
+    )?;
+    Ok(o)
 }

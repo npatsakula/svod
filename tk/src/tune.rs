@@ -32,7 +32,7 @@ use svod_dtype::{DType, DeviceSpec, ScalarDType};
 use svod_ir::SInt;
 use svod_ir::UOp;
 use svod_runtime::benchmark::{CLOCK_WARMUP, round_robin_min, warm_clock};
-use svod_runtime::{ExecutionPlan, KernelResources};
+use svod_runtime::{ExecutionPlan, KernelResources, ProfileOptions, RunProfile};
 use svod_tensor::{PrepareConfig, Tensor};
 
 use crate::atoms::Target;
@@ -1207,6 +1207,23 @@ pub fn measure(candidates: Vec<Candidate>) -> Vec<(Compiled, Option<u64>)> {
     let mut built = compile(candidates, &pool);
     let verdicts: Vec<Compiled> = built.iter().map(Built::verdict).collect();
     verdicts.into_iter().zip(time(&mut built)).collect()
+}
+
+/// A candidate's programs each [profiled](ExecutionPlan::profile) under
+/// `opts` on scratch buffers, after one untimed run, under the timing lock;
+/// [`ProfileOptions::sqtt`] goes to `<dir>/p<program>`, a thread trace
+/// a program. `None` where the candidate failed to build or run.
+pub fn profile(candidate: Candidate, opts: &ProfileOptions) -> Option<Vec<RunProfile>> {
+    let pool = ScratchPool::default();
+    let plans = compile(vec![candidate], &pool).pop()?.plans?;
+    let _device = DEVICE.lock().unwrap_or_else(PoisonError::into_inner);
+    let profiled = plans.into_iter().enumerate().map(|(p, (mut plan, vars))| {
+        let vars: Vec<(&str, i64)> = vars.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+        plan.execute_with_vars(&vars).ok()?;
+        let sqtt = opts.sqtt.as_ref().map(|dir| dir.join(format!("p{p}")));
+        plan.profile(&ProfileOptions { sqtt, ..opts.clone() }).ok()
+    });
+    profiled.collect()
 }
 
 /// Each prepared plan's best device time in ns, timed as [`measure`] times a
