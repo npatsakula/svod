@@ -164,11 +164,9 @@ pub(crate) fn tuned_on_device<C: crate::ops::config::Tiled + PartialEq + std::fm
     (candidates, pick)
 }
 
-/// Each candidate's best device time in ns, its programs' summed, on
-/// scratch buffers at capacity: compiled, then timed.
+/// Each candidate's best device time in ns ([`crate::tune::measure`]).
 fn measure(candidates: impl IntoIterator<Item = crate::tune::Candidate>) -> Vec<Option<u64>> {
-    let pool = crate::tune::ScratchPool::default();
-    crate::tune::time(&mut crate::tune::compile(candidates.into_iter().collect(), &pool))
+    crate::tune::measure(candidates.into_iter().collect()).into_iter().map(|(_, ns)| ns).collect()
 }
 
 /// The 8-bit step `probe::costs` measured on each fixture's device on

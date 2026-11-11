@@ -302,6 +302,21 @@ fn attend(q: &Tensor, k: &Tensor, v: &Tensor, packed: Option<&Tensor>, opts: Att
         .context(LaunchSnafu { op: OP })
 }
 
+/// The programs `spec` launches, as the tuner times them: its attention
+/// over each of `keys` key lengths and, split, the merge of its shares.
+pub fn programs(spec: &Admitted<AttnSpec>, keys: &[usize], dtype: &DType, planner: &Planner) -> crate::tune::Candidate {
+    let cfg = spec.cfg();
+    let mut programs: Vec<_> = keys
+        .iter()
+        .map(|&tk| (typed!(dtype, fa, &spec.map(|spec| AttnSpec { tk, ..spec })), cfg.lowering(&planner.device)))
+        .collect();
+    if cfg.splits > 1 {
+        let merge = merge(spec.batch.clone(), spec.t, spec.heads, spec.d, cfg.splits);
+        programs.push((typed!(dtype, combine, &merge), Lowering::new(&planner.device)));
+    }
+    programs
+}
+
 /// The merge of `splits` partial results.
 pub(crate) fn merge(batch: Batch, t: usize, heads: usize, d: usize, splits: usize) -> CombineSpec {
     CombineSpec { batch, t, heads, d, splits, cfg: NormCfg { br: MERGE_ROWS } }
@@ -374,15 +389,7 @@ pub fn tuned<'t>(
         });
         // A packed operand holds its own keys, none below `tk`.
         let below = !spec.packed && (cache.is_some() || lens);
-        let mut programs = timed_keys(tk, below, &cfg)
-            .into_iter()
-            .map(|tk| (typed!(dtype, fa, &spec.map(|spec| AttnSpec { tk, ..spec })), cfg.lowering(&planner.device)))
-            .collect::<Vec<_>>();
-        if cfg.splits > 1 {
-            let merge = merge(spec.batch.clone(), t, heads, d, cfg.splits);
-            programs.push((typed!(dtype, combine, &merge), Lowering::new(&planner.device)));
-        }
-        programs
+        programs(&spec, &timed_keys(tk, below, &cfg), &dtype, planner)
     };
     let mut tuner = Tuner::new(store, &planner.device, dtype.clone(), &shape, salt, build)
         .floored(|cfg| planner.floor_of(&problem, cfg));

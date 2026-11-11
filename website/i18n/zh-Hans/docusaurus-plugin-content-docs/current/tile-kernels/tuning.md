@@ -84,4 +84,4 @@ SVOD_DEVICE=CUDA cargo run --release -p svod-tk --example tk_bench -- gemm --top
 | `trips` | 每个 SM 驻留 1 到 48 个块时的流水线迭代探针 |
 | `pin --cfg BMxBNxBK:S:WRxWC[:rolled],… [--shape MxNxK,…] [--residual] [--gated]` | 每个固定的 GEMM 配置的时间（默认为 Whisper 的 fc2），旁边是模型的价格，以及分别将内存延迟、单独行程或矩阵核步骤置零后的价格：每一项占该配置时间的多少 |
 
-`--metric` 可取 `squared-l2`、`l2` 或 `neg-dot`。每个命令都接受 `--rounds R`，即计时轮数（默认 20，`fit` 为 2）。
+`--metric` 可取 `squared-l2`、`l2` 或 `neg-dot`。每个命令都按调优器的方式计时：一个配置的所有内核一起计时（拆分的合并、尾部的部分和），算子的计划也一样。

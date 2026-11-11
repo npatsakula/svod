@@ -160,5 +160,5 @@ SVOD_DEVICE=CUDA cargo run --release -p svod-tk --example tk_bench -- gemm --top
 | `trips` | प्रति SM 1 से 48 blocks पर pipeline-trip probes |
 | `pin --cfg BMxBNxBK:S:WRxWC[:rolled],… [--shape MxNxK,…] [--residual] [--gated]` | हर pinned GEMM config का समय (default में Whisper का fc2), model की price के साथ और memory latency, lone trip या matrix step को शून्य करके वही price: config के समय में हर term कितना है |
 
-`--metric` में `squared-l2`, `l2` या `neg-dot` दिया जाता है। हर command `--rounds R` लेता है, यानी
-मापे जाने वाले rounds (default 20, `fit` के लिए 2)।
+`--metric` में `squared-l2`, `l2` या `neg-dot` दिया जाता है। हर command tuner की तरह समय मापता है: किसी config के
+सभी kernels एक साथ (split का merge, tail के partials) और op का plan भी उसी तरह।

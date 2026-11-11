@@ -188,7 +188,7 @@ pub(crate) fn launched_tail(
 
 /// The programs `spec` launches in order with their lowerings: its GEMM,
 /// or its tail split's ([`gemm_tail`]).
-pub(crate) fn programs(spec: &Admitted<GemmSpec>, dtype: &DType, planner: &Planner) -> Candidate {
+pub fn programs(spec: &Admitted<GemmSpec>, dtype: &DType, planner: &Planner) -> Candidate {
     let lowering = spec.cfg().lowering(&planner.device);
     let Some(tail) = tail(spec, planner) else { return vec![(typed!(dtype, gemm, spec), lowering)] };
     let mut programs: Vec<_> = typed!(dtype, gemm_tail, &tail).into_iter().map(|p| (p, lowering.clone())).collect();

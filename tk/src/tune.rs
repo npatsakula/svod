@@ -817,7 +817,7 @@ pub(crate) struct Built {
 
 /// What compiling a candidate showed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Compiled {
+pub enum Compiled {
     Failed,
     /// A kernel [`spilled`]: admitted only where every candidate does, timed
     /// among a tile's pipelines.
@@ -1197,6 +1197,26 @@ fn compile_one(
     let key = plans.as_ref().filter(|_| !emitted.is_empty()).map(|_| digest(&emitted));
     let resources = plans.iter().flatten().flat_map(|(plan, _)| resources(plan)).collect();
     (Built { plans, resources }, key)
+}
+
+/// Each candidate's verdict and best device time in ns as the tuner times
+/// it: compiled on scratch buffers, its programs' times summed with their
+/// launches ([`time`]); `None` where it failed to build or run.
+pub fn measure(candidates: Vec<Candidate>) -> Vec<(Compiled, Option<u64>)> {
+    let pool = ScratchPool::default();
+    let mut built = compile(candidates, &pool);
+    let verdicts: Vec<Compiled> = built.iter().map(Built::verdict).collect();
+    verdicts.into_iter().zip(time(&mut built)).collect()
+}
+
+/// Each prepared plan's best device time in ns, timed as [`measure`] times a
+/// candidate: an op's plan, end to end.
+pub fn measure_plans(plans: Vec<ExecutionPlan>) -> Vec<Option<u64>> {
+    let mut built: Vec<Built> = plans
+        .into_iter()
+        .map(|plan| Built { resources: resources(&plan), plans: Some(vec![(plan, vec![])]) })
+        .collect();
+    time(&mut built)
 }
 
 /// Held across every [`time`] in the process, the probes' and the tuner's
