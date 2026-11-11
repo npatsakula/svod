@@ -258,6 +258,18 @@ pub trait PlanContext: Send + Sync {
     fn pmc_default(&self) -> Vec<crate::profile::PmcCounter> {
         Vec::new()
     }
+
+    /// Arm (`Some`) or disarm (`None`) an SQTT thread trace of this context's
+    /// profiling dispatches, read back through
+    /// [`DispatchTimestamps::sqtt`](crate::DispatchTimestamps::sqtt). Backends
+    /// without thread tracing refuse to arm.
+    fn set_sqtt(&self, config: Option<crate::profile::SqttConfig>) -> Result<()> {
+        snafu::ensure!(
+            config.is_none(),
+            crate::error::SqttUnsupportedSnafu { reason: "this backend has no thread trace" }
+        );
+        Ok(())
+    }
 }
 
 /// Why an execution plan could not use backend-native linked replay.

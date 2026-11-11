@@ -738,6 +738,41 @@ fn a_dispatch_retires_once_every_xcc_is_done_with_its_memory(xccs: u32) {
     assert!(dispatch.finalizer.retired());
 }
 
+/// Profiler programs bracket the compute, and the stop runs before the
+/// timeline store and its event-mailbox write: the host must not see the
+/// dispatch retire while the stop is still copying its results out.
+#[test]
+fn profile_programs_bracket_the_compute_and_precede_retirement() {
+    const MAILBOX: crate::amd::iface::QueueEventMailbox =
+        crate::amd::iface::QueueEventMailbox { address: 0xfeed_0000, event_id: 9 };
+    let (iface, allocator) = mock_device_with_signals(1);
+    iface.set_queue_event_mailbox(MAILBOX);
+    let pool = pool_queue(&allocator);
+    let marker = |tag: u32| [crate::amd::sys::pm4::packet3(crate::amd::sys::pm4::PACKET3_NOP, 0), tag];
+    let (start, stop) = (marker(0x5157_0001), marker(0x5157_0002));
+    let mut submission = compute_submission();
+    submission.request_profile();
+    pool.queue().submit_hcq_dispatch(&pool, &submission, &[0; 16], &start, &stop).unwrap();
+    let q = pool.queue().published_pm4(0);
+
+    let find = |needle: &[u32]| q.windows(needle.len()).position(|w| w == needle).expect("packet published");
+    let release_to = |addr: u64| {
+        let header = crate::amd::sys::pm4::packet3(crate::amd::sys::pm4::PACKET3_RELEASE_MEM, 6);
+        (0..q.len() - 4).find(|&i| q[i] == header && q[i + 3] == addr as u32 && q[i + 4] == (addr >> 32) as u32)
+    };
+    let dispatch = q
+        .iter()
+        .position(|&d| d == crate::amd::sys::pm4::packet3(crate::amd::sys::pm4::PACKET3_DISPATCH_DIRECT, 3))
+        .unwrap();
+    let retire = release_to(pool.pm4_signal().value_addr()).expect("timeline store");
+    let mailbox = release_to(MAILBOX.address).expect("mailbox store");
+    let (start, stop) = (find(&start), find(&stop));
+    assert!(
+        start < dispatch && dispatch < stop && stop < retire && retire < mailbox,
+        "{start} {dispatch} {stop} {retire} {mailbox}"
+    );
+}
+
 // ----------------------------------------------------------- HCQ → AMD packets
 
 fn pm4_state() -> Pm4LoweringState {

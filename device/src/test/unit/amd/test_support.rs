@@ -420,6 +420,10 @@ impl AmdIface for MockAmdIface {
         self.state.lock().queue_event_mailbox
     }
 
+    fn hold_stable_pstate(&self) -> Result<Box<dyn Send + Sync>> {
+        Ok(Box::new(()))
+    }
+
     fn flush_hdp(&self) {
         let hook = {
             let mut state = self.state.lock();

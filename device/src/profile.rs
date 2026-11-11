@@ -155,3 +155,53 @@ pub struct KernelResources {
     /// which the compiler lowers as register demand grows.
     pub occupancy: Option<f32>,
 }
+
+/// What an AMD SQTT (thread trace) capture records. One SIMD per SE emits
+/// instruction tokens; every traced SE records wave and register tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SqttConfig {
+    /// SEs that emit instruction tokens (bit `i` = SE `i`).
+    pub se_mask: u32,
+    /// The SIMD (0-3) of WGP 0, SA 0 whose instructions each SE traces.
+    pub simd: u8,
+    /// Trace buffer per SE, a multiple of 4 KiB.
+    pub bytes_per_se: usize,
+    /// Narrow `COMPUTE_STATIC_THREAD_MGMT_SE*` so a small grid lands on the
+    /// traced WGP (restored after the dispatch).
+    pub limit_cu: bool,
+}
+
+impl Default for SqttConfig {
+    fn default() -> Self {
+        Self { se_mask: 0b11, simd: 0, bytes_per_se: 64 << 20, limit_cu: false }
+    }
+}
+
+/// One SE's raw thread-trace stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeTrace {
+    pub se: u32,
+    /// Whether this SE emitted instruction tokens.
+    pub itrace: bool,
+    pub bytes: Vec<u8>,
+    /// The SE filled its buffer: the stream's tail is lost.
+    pub truncated: bool,
+}
+
+/// The traced kernel's code object and where it ran, for mapping trace PCs
+/// back to instructions: a PC `p` is ELF address `p - load_base`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeImage {
+    pub elf: Vec<u8>,
+    pub load_base: u64,
+    pub entry_pc: u64,
+}
+
+/// The thread trace of one dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqttTrace {
+    pub arch: svod_dtype::AmdArch,
+    pub per_se: Vec<SeTrace>,
+    /// `None` when the program was loaded before tracing was first armed.
+    pub code: Option<CodeImage>,
+}

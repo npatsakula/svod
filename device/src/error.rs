@@ -191,6 +191,21 @@ pub enum Error {
     /// Reachable only via cross-backend misuse, never on the CPU path.
     #[snafu(display("allocator does not support operation: {op}"))]
     Unsupported { op: &'static str },
+
+    /// SQTT thread tracing cannot run on this target, queue or configuration.
+    #[snafu(display("SQTT thread trace unsupported: {reason}"))]
+    SqttUnsupported { reason: String },
+
+    /// SQTT needs a stable power state: the DRM context could not pin one and
+    /// the device is not already in `profile_standard`.
+    #[snafu(display(
+        "SQTT requires a stable power state (pinning it through the DRM context failed: {source}); \
+         run `amd-smi set -l stable_std`"
+    ))]
+    SqttPowerState {
+        #[snafu(source(from(Error, Box::new)))]
+        source: Box<Error>,
+    },
 }
 
 /// Flatten `error` and its source chain into one line; `libloading` keeps the

@@ -1558,8 +1558,8 @@ impl AmdComputeQueue {
         pool: &PoolQueue,
         submission: &crate::hcq::Submission,
         kernargs: &[u8],
-        pmc_start: &[u32],
-        pmc_read: &[u32],
+        profile_start: &[u32],
+        profile_stop: &[u32],
     ) -> Result<HcqDispatchResult> {
         debug_assert!(
             Arc::ptr_eq(&self.core, pool.core()),
@@ -1572,8 +1572,8 @@ impl AmdComputeQueue {
             return Err(err);
         }
         if !self.is_pm4 {
-            if !pmc_start.is_empty() || !pmc_read.is_empty() {
-                return Err(Error::Runtime { message: "AMD AQL PMC register profiling is unsupported".into() });
+            if !profile_start.is_empty() || !profile_stop.is_empty() {
+                return Err(Error::Runtime { message: "AMD AQL register profiling (PMC, SQTT) is unsupported".into() });
             }
             pool.ensure_pm4_headroom()?;
             self.wait_dispatch_headroom(pool)?;
@@ -1725,28 +1725,34 @@ impl AmdComputeQueue {
             completion_xcc_mask: None,
             queue_event_mailbox: self.core.queue_event_mailbox().map(|mailbox| mailbox.address),
         };
-        let q = if pmc_start.is_empty() && pmc_read.is_empty() {
+        let q = if profile_start.is_empty() && profile_stop.is_empty() {
             lower_hcq_pm4(&finalized, state)?
         } else {
-            // PMC register programs are backend diagnostics rather than neutral
-            // HCQ commands. Keep their established bracketing while all semantic
-            // queue commands use the common lowerer.
+            // Profiler register programs (PMC, SQTT) are backend diagnostics
+            // rather than neutral HCQ commands: the start goes right before the
+            // compute, the stop before the timeline store that retires the
+            // dispatch (and its event mailbox write), so the host reads nothing
+            // the stop has yet to copy out.
             let compute = finalized
                 .commands
                 .iter()
                 .position(|command| matches!(command, crate::hcq::Command::Compute(_)))
                 .ok_or_else(|| Error::Runtime { message: "AMD PM4 HCQ submission has no compute command".into() })?;
-            let mut prefix = crate::hcq::Submission::new(finalized.queue);
-            prefix.commands.extend_from_slice(&finalized.commands[..compute]);
-            let mut middle = crate::hcq::Submission::new(finalized.queue);
-            middle.commands.extend_from_slice(&finalized.commands[compute..finalized.commands.len() - 1]);
-            let mut suffix = crate::hcq::Submission::new(finalized.queue);
-            suffix.commands.push(finalized.commands.last().unwrap().clone());
-            let mut q = lower_hcq_pm4(&prefix, state)?;
-            q.extend_from_slice(pmc_start);
-            q.extend(lower_hcq_pm4(&middle, state)?);
-            q.extend_from_slice(pmc_read);
-            q.extend(lower_hcq_pm4(&suffix, state)?);
+            let retire = finalized
+                .commands
+                .iter()
+                .rposition(|command| matches!(command, crate::hcq::Command::Store { dst, .. } if *dst == counter_addr))
+                .expect("a PM4 dispatch ends in its timeline store");
+            let lower = |commands: &[crate::hcq::Command]| {
+                let mut part = crate::hcq::Submission::new(finalized.queue);
+                part.commands.extend_from_slice(commands);
+                lower_hcq_pm4(&part, state)
+            };
+            let mut q = lower(&finalized.commands[..compute])?;
+            q.extend_from_slice(profile_start);
+            q.extend(lower(&finalized.commands[compute..retire])?);
+            q.extend_from_slice(profile_stop);
+            q.extend(lower(&finalized.commands[retire..])?);
             q
         };
 

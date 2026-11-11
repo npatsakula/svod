@@ -82,6 +82,12 @@ pub trait AmdIface: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// Hold the device at a stable power state until the returned guard drops
+    /// (for SQTT). Backends without an amdgpu DRM context refuse.
+    fn hold_stable_pstate(&self) -> Result<Box<dyn Send + Sync>> {
+        crate::error::SqttUnsupportedSnafu { reason: "no amdgpu DRM context on this backend" }.fail()
+    }
+
     /// Fault-injection checkpoint around queue publication. Production
     /// backends keep the default no-op; the host mock scripts failures here to
     /// prove reservation rollback and post-doorbell poisoning.
@@ -636,6 +642,10 @@ impl AmdIface for KfdIface {
 
     fn queue_event_mailbox(&self) -> Option<QueueEventMailbox> {
         Some(QueueEventMailbox { address: self.queue_event_mailbox_ptr, event_id: self.queue_event_id })
+    }
+
+    fn hold_stable_pstate(&self) -> Result<Box<dyn Send + Sync>> {
+        Ok(Box::new(crate::amd::sqtt::DrmStablePstate::acquire(&self.drm_fd)?))
     }
 
     fn alloc_raw(

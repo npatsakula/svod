@@ -128,6 +128,8 @@ pub const fn wait_reg_mem_engine(x: u32) -> u32 {
 
 /// `function = >= comparison`. Used for signal-value waits.
 pub const WAIT_REG_MEM_FUNC_GEQ: u32 = 5;
+/// `function = == comparison`. Used for register-status waits.
+pub const WAIT_REG_MEM_FUNC_EQ: u32 = 3;
 
 // ── PACKET3 opcodes & constants (PM4 dispatch path, single-XCC) ──────────
 //
@@ -182,6 +184,16 @@ pub const DISPATCH_INITIATOR_CS_W32_EN: u32 = 1 << 15;
 
 pub const CS_PARTIAL_FLUSH: u32 = 7;
 pub const EVENT_INDEX_PARTIAL_FLUSH: u32 = 4;
+/// `VGT_EVENT_TYPE` thread-trace events (gfx11/12 `soc` enums), written with
+/// event index 0.
+pub const THREAD_TRACE_MARKER: u32 = 53;
+pub const THREAD_TRACE_FINISH: u32 = 55;
+
+// ── COPY_DATA control (DW1) ───────────────────────────────────────────────
+
+pub const COPY_DATA_SRC_SEL_PERF: u32 = 4;
+pub const COPY_DATA_DST_SEL_TC_L2: u32 = 2 << 8;
+pub const COPY_DATA_WR_CONFIRM: u32 = 1 << 20;
 
 // ── Builders ──────────────────────────────────────────────────────────────
 
@@ -436,6 +448,24 @@ pub fn wait_reg_mem(addr: u64, value: u32, mask: u32) -> [u32; 7] {
     ]
 }
 
+/// Build a PM4 WAIT_REG_MEM packet that polls the register at absolute dword
+/// address `reg` until `(reg & mask) == value`. Used to wait out thread-trace
+/// status bits.
+pub fn wait_reg_mem_reg(reg: u32, value: u32, mask: u32) -> [u32; 7] {
+    let info = wait_reg_mem_mem_space(0) // register
+        | wait_reg_mem_function(WAIT_REG_MEM_FUNC_EQ)
+        | wait_reg_mem_engine(0); // ME engine
+    [
+        packet3(PACKET3_WAIT_REG_MEM, 5),
+        info,
+        reg,
+        0, // no write-then-wait register
+        value,
+        mask,
+        4, // poll interval
+    ]
+}
+
 /// Build a `PACKET3_SET_SH_REG`. `reg_offset` is the SH-relative offset
 /// (e.g. [`COMPUTE_PGM_LO`]). Successive `values` are written to consecutive
 /// registers, matching the `wreg(reg, *args)` semantics (the same `wreg`
@@ -476,7 +506,17 @@ pub fn set_uconfig_reg(reg_offset: u32, values: &[u32]) -> Vec<u32> {
 ///
 /// Layout (6 dwords): header, control `(2<<8)|4`, src reg, src hi (0), dst lo, dst hi.
 pub fn copy_data_reg_to_mem(src_reg: u32, dst: u64) -> [u32; 6] {
-    [packet3(PACKET3_COPY_DATA, 4), (2 << 8) | 4, src_reg, 0, dst as u32, (dst >> 32) as u32]
+    copy_data(COPY_DATA_DST_SEL_TC_L2 | COPY_DATA_SRC_SEL_PERF, src_reg, dst)
+}
+
+/// [`copy_data_reg_to_mem`] that holds the CP until the write is confirmed, so
+/// a following packet sees it landed. Used for the thread-trace write pointer.
+pub fn copy_data_reg_to_mem_confirmed(src_reg: u32, dst: u64) -> [u32; 6] {
+    copy_data(COPY_DATA_WR_CONFIRM | COPY_DATA_DST_SEL_TC_L2 | COPY_DATA_SRC_SEL_PERF, src_reg, dst)
+}
+
+fn copy_data(control: u32, src_reg: u32, dst: u64) -> [u32; 6] {
+    [packet3(PACKET3_COPY_DATA, 4), control, src_reg, 0, dst as u32, (dst >> 32) as u32]
 }
 
 /// Build a `PACKET3_DISPATCH_DIRECT` packet — 5 dwords total. The PM4 CP

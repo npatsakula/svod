@@ -21,10 +21,12 @@ import os
 import sys
 
 # (rust_static_name, regs.py module attr, prefix, (maj, min, rev))
-# gfx1151 / Strix Halo + gfx942 / MI300X (Aqua Vanjaram) target sets.
+# gfx1151 / Strix Halo, gfx1201 / RDNA4 (GC only, for the PM4 profilers) and
+# gfx942 / MI300X (Aqua Vanjaram) target sets.
 # Widen this list + re-run to add another arch.
 MODULES = [
     ("GC_11_5_0", "gc_11_5_0", "gc", (11, 5, 0)),
+    ("GC_12_0_0", "gc_12_0_0", "gc", (12, 0, 0)),
     ("MMHUB_3_3_0", "mmhub_3_3_0", "mmhub", (3, 3, 0)),
     ("MP_14_0_2", "mp_14_0_2", "mp", (14, 0, 2)),
     ("NBIO_7_11_0", "nbio_7_11_0", "nbio", (7, 11, 0)),

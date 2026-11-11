@@ -9,21 +9,12 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 
 use crate::allocator::RawBuffer;
-use crate::amd::am::regs::{self, RegDef};
 use crate::amd::connector::SubmissionFinalizer;
+use crate::amd::regwrite::RegWriter;
 use crate::amd::signal::AmdSignal;
 use crate::amd::sys::pm4;
 use crate::amd::topology::AmdNode;
 use crate::profile::{AmdCounter, CounterSet, PmcCounter};
-
-// gfx11_5_0 GC IP segment bases. Verified against Mesa register constants:
-// regGRBM_GFX_INDEX → abs 0xC200 dword = 0x30800 byte (R_030800);
-// regSQ_PERFCOUNTER0_SELECT → abs 0xD9C0 dword = 0x36700 byte (R_036700).
-const GC_BASES: [u64; 2] = [0x1260, 0xA000];
-
-const SET_SH_START: u64 = pm4::PACKET3_SET_SH_REG_START as u64;
-const SET_SH_END: u64 = 0x3000;
-const SET_UCONFIG_START: u64 = pm4::PACKET3_SET_UCONFIG_REG_START as u64;
 
 /// Whether any AMD GPU is pinned to a stable power state (`profile_standard`),
 /// required for meaningful perf-counter values. Scans the DRM sysfs nodes; on a
@@ -47,41 +38,9 @@ fn sq_perf_sel(c: AmdCounter) -> u32 {
     }
 }
 
-fn reg(name: &str) -> &'static RegDef {
-    regs::find(regs::GC_11_5_0, name).unwrap_or_else(|| panic!("gfx11_5_0 register table missing {name}"))
-}
-
-/// Absolute dword address (`base[segment] + offset`).
-fn abs_addr(r: &RegDef) -> u64 {
-    GC_BASES[r.segment as usize] + r.offset as u64
-}
-
-/// Emit a register write as a SET_SH_REG or SET_UCONFIG_REG packet, chosen by the
-/// register's absolute address window.
-fn wreg(out: &mut Vec<u32>, name: &str, fields: &[(&str, u32)]) {
-    let r = reg(name);
-    let val = r.encode(fields) as u32;
-    let a = abs_addr(r);
-    if (SET_SH_START..SET_SH_END).contains(&a) {
-        out.extend(pm4::set_sh_reg((a - SET_SH_START) as u32, &[val]));
-    } else {
-        out.extend(pm4::set_uconfig_reg((a - SET_UCONFIG_START) as u32, &[val]));
-    }
-}
-
-/// `GRBM_GFX_INDEX` set to broadcast all SE/SA/instances (for setup/control writes).
-fn grbm_broadcast(out: &mut Vec<u32>) {
-    wreg(
-        out,
-        "regGRBM_GFX_INDEX",
-        &[("se_broadcast_writes", 1), ("sa_broadcast_writes", 1), ("instance_broadcast_writes", 1)],
-    );
-}
-
-/// `GRBM_GFX_INDEX` indexed to one (se, sa, wgp) so the following COPY_DATA reads
-/// that WGP's counter. `instance_index` packs the WGP into bits [2+].
-fn grbm_index(out: &mut Vec<u32>, se: u32, sa: u32, wgp: u32) {
-    wreg(out, "regGRBM_GFX_INDEX", &[("se_index", se), ("sa_index", sa), ("instance_index", wgp << 2)]);
+/// PMC is gfx11-only; every gfx11 part shares 11.5's SQ perf-counter registers.
+fn gc() -> RegWriter {
+    RegWriter::gc((11, 5, 0)).expect("gfx11 GC registers are vendored")
 }
 
 /// The SE/SA/WGP grid to iterate for SQ counters, derived from KFD topology.
@@ -125,33 +84,34 @@ pub fn readback_bytes(n_counters: usize, grid: &PmcGrid) -> usize {
 /// instance, then copies every counter at that instance.
 pub fn build_streams(counters: &[AmdCounter], grid: &PmcGrid, buf_va: u64) -> (Vec<u32>, Vec<u32>) {
     let instances = grid.instances();
+    let gc = gc();
 
     // ── start: stop, program SELECTs + CTRL, enable, start ──
     let mut start = Vec::new();
-    grbm_broadcast(&mut start);
-    wreg(&mut start, "regCP_PERFMON_CNTL", &[("perfmon_state", 0)]);
-    wreg(&mut start, "regSQ_PERFCOUNTER_CTRL", &[("cs_en", 1), ("ps_en", 1), ("gs_en", 1), ("hs_en", 1)]);
-    wreg(&mut start, "regSQ_PERFCOUNTER_CTRL2", &[("force_en", 1), ("vmid_en", 0xffff)]);
+    gc.grbm_broadcast(&mut start);
+    gc.wreg(&mut start, "regCP_PERFMON_CNTL", &[("perfmon_state", 0)]);
+    gc.wreg(&mut start, "regSQ_PERFCOUNTER_CTRL", &[("cs_en", 1), ("ps_en", 1), ("gs_en", 1), ("hs_en", 1)]);
+    gc.wreg(&mut start, "regSQ_PERFCOUNTER_CTRL2", &[("force_en", 1), ("vmid_en", 0xffff)]);
     for (i, &c) in counters.iter().enumerate() {
         // gfx11 SQ uses even-numbered SELECT registers; readback uses index i.
-        wreg(&mut start, &format!("regSQ_PERFCOUNTER{}_SELECT", i * 2), &[("perf_sel", sq_perf_sel(c))]);
+        gc.wreg(&mut start, &format!("regSQ_PERFCOUNTER{}_SELECT", i * 2), &[("perf_sel", sq_perf_sel(c))]);
     }
-    wreg(&mut start, "regCOMPUTE_PERFCOUNT_ENABLE", &[("perfcount_enable", 1)]);
-    grbm_broadcast(&mut start);
-    wreg(&mut start, "regCP_PERFMON_CNTL", &[("perfmon_state", 0)]);
-    wreg(&mut start, "regCP_PERFMON_CNTL", &[("perfmon_state", 1)]);
+    gc.wreg(&mut start, "regCOMPUTE_PERFCOUNT_ENABLE", &[("perfcount_enable", 1)]);
+    gc.grbm_broadcast(&mut start);
+    gc.wreg(&mut start, "regCP_PERFMON_CNTL", &[("perfmon_state", 0)]);
+    gc.wreg(&mut start, "regCP_PERFMON_CNTL", &[("perfmon_state", 1)]);
 
     // ── read: sample, then copy each counter's _LO at every instance ──
     let los: Vec<u32> =
-        counters.iter().enumerate().map(|(i, _)| abs_addr(reg(&format!("regSQ_PERFCOUNTER{i}_LO"))) as u32).collect();
+        counters.iter().enumerate().map(|(i, _)| gc.addr(&format!("regSQ_PERFCOUNTER{i}_LO"))).collect();
     let mut read = Vec::new();
-    grbm_broadcast(&mut read);
-    wreg(&mut read, "regCP_PERFMON_CNTL", &[("perfmon_state", 1), ("perfmon_sample_enable", 1)]);
+    gc.grbm_broadcast(&mut read);
+    gc.wreg(&mut read, "regCP_PERFMON_CNTL", &[("perfmon_state", 1), ("perfmon_sample_enable", 1)]);
     let mut j = 0u32;
     for se in 0..grid.se {
         for sa in 0..grid.sa {
             for wgp in 0..grid.wgp {
-                grbm_index(&mut read, se, sa, wgp);
+                gc.grbm_index(&mut read, se, sa, wgp);
                 for (i, &lo) in los.iter().enumerate() {
                     let off = buf_va + ((i as u32 * instances + j) as u64) * 4;
                     read.extend(pm4::copy_data_reg_to_mem(lo, off));
@@ -162,8 +122,8 @@ pub fn build_streams(counters: &[AmdCounter], grid: &PmcGrid, buf_va: u64) -> (V
     }
     // Stop the perfmon after the final sample so it doesn't keep counting on the
     // GPU after profiling (global CP state — leaving it on perturbs other work).
-    grbm_broadcast(&mut read);
-    wreg(&mut read, "regCP_PERFMON_CNTL", &[("perfmon_state", 0)]);
+    gc.grbm_broadcast(&mut read);
+    gc.wreg(&mut read, "regCP_PERFMON_CNTL", &[("perfmon_state", 0)]);
     (start, read)
 }
 

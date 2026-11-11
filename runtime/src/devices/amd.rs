@@ -73,6 +73,11 @@ pub fn create_amd_device(registry: &DeviceRegistry, device_id: usize, arch: AmdA
     if std::env::var("SVOD_PM4_GRAPH").as_deref() == Ok("1") {
         device_handle.core().set_pm4_graph(true);
     }
+    // A thread trace maps PCs through the ELF, which a program keeps only when
+    // loaded after this (or after the first `set_sqtt`).
+    if std::env::var("SVOD_SQTT").as_deref() == Ok("1") {
+        device_handle.core().retain_code();
+    }
     // No default queue: every dispatcher leases its own `PoolQueue`
     // (`Program::execute` leases per call; plans/graphs hold one for their
     // lifetime). The pool starts empty and warms on first lease.

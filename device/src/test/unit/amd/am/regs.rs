@@ -5,8 +5,10 @@ fn selects_gfx1151_gc_module() {
     // Strix Halo reports GC 11.5.1 → the gc_11_5_0 table.
     let gc = select("gc", (11, 5, 1)).expect("gc module for gfx1151");
     assert!(!gc.is_empty());
-    // A wrong major has no match (we don't vendor gfx12 gc here yet).
-    assert!(select("gc", (12, 0, 0)).is_none());
+    // RDNA4 reports GC 12.0.1 → the gc_12_0_0 table; a major with no vendored
+    // module has no match.
+    assert!(select("gc", (12, 0, 1)).is_some_and(|gc| find(gc, "regSQ_THREAD_TRACE_BUF0_BASE_HI").is_some()));
+    assert!(select("gc", (10, 3, 0)).is_none());
 }
 
 #[test]

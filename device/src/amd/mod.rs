@@ -73,7 +73,11 @@ pub mod program;
 #[cfg(unix)]
 pub mod queue;
 #[cfg(unix)]
+pub mod regwrite;
+#[cfg(unix)]
 pub mod signal;
+#[cfg(unix)]
+pub mod sqtt;
 #[cfg(unix)]
 pub mod va_registry;
 

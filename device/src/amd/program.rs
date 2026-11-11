@@ -290,6 +290,9 @@ pub struct AmdProgram {
     /// Shared by the program and every captured/in-flight command that can
     /// execute it. The allocation is released only after the last GPU use.
     code: Arc<CodeObject>,
+    /// The ELF and where it loaded, kept for SQTT's PC mapping when the device
+    /// retains code ([`AmdDeviceCore::retain_code`](crate::amd::AmdDeviceCore::retain_code)).
+    image: Option<crate::profile::CodeImage>,
 }
 
 impl AmdProgram {
@@ -455,6 +458,11 @@ impl AmdProgram {
             );
         }
 
+        let image = device.core().retains_code().then(|| crate::profile::CodeImage {
+            elf: bytes.to_vec(),
+            load_base: code_gpu,
+            entry_pc: pm4_prog_addr,
+        });
         Ok(Self {
             name: kernel_name.to_string(),
             device_id: allocator.device_id,
@@ -472,6 +480,7 @@ impl AmdProgram {
             var_count,
             abi,
             code: Arc::new(CodeObject { buffer: code_buf.into_inner() }),
+            image,
         })
     }
 
@@ -690,7 +699,21 @@ impl AmdProgram {
             let (start, read) = crate::amd::pmc::build_streams(&pmc_counters, &grid, gpu);
             Some((buf, host, grid, start, read))
         };
+        let sqtt = match owner.sqtt_config().filter(|_| profile && is_pm4) {
+            Some(config) => Some(crate::amd::sqtt::Capture::new(
+                owner.allocator(),
+                config,
+                (g[0] * g[1] * g[2]) as u64,
+                self.image.clone(),
+            )?),
+            None => None,
+        };
+        // PMC programs and reads first, as Tinygrad does; the trace brackets
+        // the dispatch inside them.
         let (pmc_start, pmc_read): (&[u32], &[u32]) = pmc.as_ref().map_or((&[], &[]), |(_, _, _, s, r)| (s, r));
+        let (sqtt_start, sqtt_stop): (&[u32], &[u32]) = sqtt.as_ref().map_or((&[], &[]), |c| (&c.start, &c.stop));
+        let profile_start = [pmc_start, sqtt_start].concat();
+        let profile_stop = [pmc_read, sqtt_stop].concat();
 
         let dispatch = crate::hcq::ComputeDispatch {
             workgroup_size: [l[0] as u32, l[1] as u32, l[2] as u32],
@@ -724,7 +747,7 @@ impl AmdProgram {
         if profile {
             submission.request_profile();
         }
-        let result = queue.submit_hcq_dispatch(pool, &submission, &kernargs, pmc_start, pmc_read)?;
+        let result = queue.submit_hcq_dispatch(pool, &submission, &kernargs, &profile_start, &profile_stop)?;
         if let Some(writes) = invalidate {
             pool.caches_invalidated(writes);
         }
@@ -764,7 +787,12 @@ impl AmdProgram {
                 (Some(sig), None) => Some(sig),
                 (None, _) => None,
             };
-            Ok(handle)
+            Ok(match (handle, sqtt) {
+                (Some(inner), Some(capture)) => {
+                    Some(Arc::new(capture.into_handle(inner, Arc::clone(&result.finalizer))) as Arc<_>)
+                }
+                (handle, _) => handle,
+            })
         } else {
             Ok(result.timestamps.map(|signal| signal as Arc<dyn crate::sync::DispatchTimestamps>))
         }
