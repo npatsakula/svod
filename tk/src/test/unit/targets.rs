@@ -9,24 +9,25 @@ use std::sync::Arc;
 
 use proptest::prelude::*;
 use svod_dtype::{AmdArch, DType, GpuArch, ScalarDType};
-use svod_ir::{Op, UOp, ops};
+use svod_ir::{CanonicalGraph, Op, UOp, ops};
 use svod_tensor::Tensor;
 use test_case::test_case;
 
 use crate::atoms::{Core, Fill, Target};
 use crate::build::{BF16, F16};
 use crate::interp;
-use crate::ir::{Axis, ParamKind, Program};
+use crate::ir::{Axis, ParamKind, Program, Schedule};
 use crate::kernels::Batch;
 use crate::kernels::attention::{AttnMask, AttnSpec, Bias, CombineSpec, Forms, attention, combine};
 use crate::kernels::conv::ConvSpec;
 use crate::kernels::gemm::{Epilogue, GemmSpec, gemm};
 use crate::kernels::nearest::{Floors, Metric, NearestSpec, nearest};
 use crate::kernels::rows::NormCfg;
-use crate::launch::graph_launch_all;
+use crate::launch::{self, aliasing, graph_launch_all};
 use crate::lower::sync::insert_barriers;
 use crate::lower::{Lowering, lower};
 use crate::ops::config::{self, NearestProblem, Planner};
+use crate::sweep::assumed;
 
 use super::{conv_first_eight, declared, first_eight, planner};
 use crate::sweep::device;
@@ -53,7 +54,7 @@ pub(super) fn lowered(prog: Program, lowering: &Lowering) -> crate::lower::Resul
 }
 
 /// The tile program after `lowering` for interpretation.
-fn lowered_tile(prog: Program, lowering: &Lowering) -> Program {
+fn lowered_tile(prog: Program, lowering: &Lowering) -> Program<crate::ir::Laid> {
     lowered(prog, lowering).unwrap().tile
 }
 
@@ -93,19 +94,21 @@ fn a_grid_takes_every_warp_or_whole_grids_run_alone(
             ..crate::kernels::attention::FaCfg::new(16, 16, 2)
         };
         let mask = AttnMask::default();
-        attention::<F16>(&AttnSpec {
-            batch,
-            t: 1,
-            tk: 64,
-            heads: 1,
-            kv_heads: 1,
-            d: 64,
-            mask,
-            cache: None,
-            packed: false,
-            scale: 0.125,
+        attention::<F16>(&assumed(
+            AttnSpec {
+                batch,
+                t: 1,
+                tk: 64,
+                heads: 1,
+                kv_heads: 1,
+                d: 64,
+                mask,
+                cache: None,
+                packed: false,
+                scale: 0.125,
+            },
             cfg,
-        })
+        ))
     } else {
         combine::<F16>(&CombineSpec { batch, t: 1, heads: 4, d: 64, splits: 2, cfg: NormCfg { br: warps as usize } })
     };
@@ -159,19 +162,21 @@ fn every_group_attention_assembles_for_hopper() {
     for (bq, bkv, d, mask) in cases {
         let cfg = FaCfg { core: Core::Group, ..FaCfg::new(bq, bkv, 2) };
         assert!(cfg.fits(&target, d, mask.bias.is_some()), "{cfg:?} fits the warpgroup core at d {d}");
-        let spec = AttnSpec {
-            batch: Batch::Static(2),
-            t: 300,
-            tk: 300,
-            heads: 2,
-            kv_heads: 2,
-            d,
-            mask,
-            cache: None,
-            packed: false,
-            scale: 0.125,
+        let spec = assumed(
+            AttnSpec {
+                batch: Batch::Static(2),
+                t: 300,
+                tk: 300,
+                heads: 2,
+                kv_heads: 2,
+                d,
+                mask,
+                cache: None,
+                packed: false,
+                scale: 0.125,
+            },
             cfg,
-        };
+        );
         let name = format!("group attention bq {bq} bkv {bkv} d {d}");
         let ir = render(attention::<BF16>(&spec), &cfg.lowering(&device));
         assert!(ir.contains(&format!("wgmma.mma_async.sync.aligned.m64n{bkv}k16")), "{name}: no scores chain");
@@ -286,6 +291,9 @@ fn every_family_lowers_keeps_its_numbers_and_compiles(target: Target, facts: Fac
         let low = lowered(prog.clone(), &lowering).unwrap();
         let tile = &low.tile;
         let got = interp::run(tile, params, &vars).unwrap();
+        // A device launch digests the program's linear form before anything compiles.
+        let linear = &low.linear;
+        check(CanonicalGraph::from_root("identity", linear).is_ok(), "the program has no canonical identity");
         for (i, (g, w)) in got.iter().zip(&want).enumerate() {
             let same = g.iter().zip(w).all(|(a, b)| a == b || (a.is_nan() && b.is_nan()));
             check(same, &format!("parameter {i} differs after lowering"));
@@ -298,8 +306,7 @@ fn every_family_lowers_keeps_its_numbers_and_compiles(target: Target, facts: Fac
         insert_barriers(&mut twice).unwrap();
         check(twice == once, "the barrier pass fences what it fenced again");
 
-        let Op::Program(ops::Program { linear: Some(linear), .. }) = low.program.op() else { panic!("a program") };
-        let Op::Linear(ops::Linear { ops: list }) = linear.op() else { panic!("a linear list") };
+        let Op::Linear(ops::Linear { ops: list }) = low.linear.op() else { panic!("a linear list") };
         let zero = |u: &Arc<UOp>| matches!(u.op(), Op::Const(v) if v.0.try_int() == Some(0));
         for u in list.iter() {
             let buf = match u.op() {
@@ -312,7 +319,7 @@ fn every_family_lowers_keeps_its_numbers_and_compiles(target: Target, facts: Fac
             }
         }
 
-        let along = |ring: &str| tile.smem.iter().find(|a| a.name == ring).map(|a| a.along);
+        let along = |ring: &str| tile.smem.iter().find(|a| a.name == ring).map(|a| a.storage.along);
         let attention = name.starts_with("attention d");
         let rings = (along("k_s"), along("v_s"));
         if attention {
@@ -322,7 +329,7 @@ fn every_family_lowers_keeps_its_numbers_and_compiles(target: Target, facts: Fac
                 check((n == 0) == free, &format!("{n} tile relayouts"));
             }
         } else if name.starts_with("gemm") || name.starts_with("group gemm") || name.starts_with("conv") {
-            check(tile.smem.iter().all(|a| a.along == Axis::Col), "a GEMM tile stored column-major");
+            check(tile.smem.iter().all(|a| a.storage.along == Axis::Col), "a GEMM tile stored column-major");
         }
 
         let ir = low.text(&target).unwrap();
@@ -347,12 +354,13 @@ fn every_family_lowers_keeps_its_numbers_and_compiles(target: Target, facts: Fac
             check(ir.contains("ldmatrix") == target.ldmatrix, "fragments not read by ldmatrix where it is");
         }
         if name.starts_with("group gemm") {
-            let reg_operand = |s: &crate::ir::Stmt| matches!(s, crate::ir::Stmt::Copy { dst, .. } if tile.value(*dst).place == crate::ir::Place::Reg && tile.value(*dst).dtype == ScalarDType::BFloat16);
+            let reg_operand = |s: &crate::ir::Stmt<crate::ir::Laid>| matches!(s, crate::ir::Stmt::Copy { dst, .. } if tile.value(*dst).place == crate::ir::Place::Reg && tile.value(*dst).dtype == ScalarDType::BFloat16);
             check(!tile.walk().any(|(_, s)| reg_operand(s)), "an operand was loaded into registers");
             check(ir.contains("wgmma.mma_async.sync.aligned.m64n"), "no warpgroup product");
             check(!ir.contains("@llvm.nvvm.mma.") && !ir.contains("ldmatrix"), "a warp-level product");
             check(ir.contains("wgmma.fence") && ir.contains("fence.proxy.async"), "an unfenced chain");
-            let in_flight = prog.walk().any(|(_, s)| matches!(s, crate::ir::Stmt::Pipeline(p) if p.stages >= 3));
+            let in_flight =
+                prog.walk().any(|(_, s)| matches!(s, crate::ir::Stmt::Pipeline(p) if p.schedule.stages() >= 3));
             check(ir.contains("@llvm.nvvm.wgmma.wait_group") == in_flight, "the template's wait");
             check(ir.contains("wgmma.wait_group.sync.aligned 0;") == !in_flight, "the chain's own wait");
         }
@@ -488,7 +496,7 @@ fn block_derived(prog: Program, lowering: &Lowering) -> Vec<Vec<String>> {
 #[test]
 fn the_block_index_is_renumbered_only_over_several_dies() {
     let cfg = config::gemm_cfg([64, 64, 32], 2, [2, 2], false);
-    let spec = GemmSpec { m: 192, n: 320, k: 64, batch: Batch::Static(3), epilogue: Epilogue::default(), cfg };
+    let spec = assumed(GemmSpec { m: 192, n: 320, k: 64, batch: Batch::Static(3), epilogue: Epilogue::default() }, cfg);
     let lowering = |xcds: u32| {
         let target = Target { xcds, ..amd(AmdArch::Gfx942, 304) };
         cfg.lowering(&crate::atoms::Device { target, costs: super::costs() })
@@ -518,19 +526,20 @@ fn a_predicate_met_inside_a_branch_guards_a_later_if(target: Target) {
     use crate::build::{I32, Kernel, Sc};
     use crate::ir::{Const, Shape};
     let GpuArch::Amd(arch) = target.arch else { unreachable!() };
-    let mut k = Kernel::new("nested_if");
-    k.grid([Sc::from(4), Sc::from(1), Sc::from(1)]);
-    k.warps(2);
-    let tile = Shape::new(16, 16);
-    let y = k.param::<I32>("y", ParamKind::Out, 4 * 2 * tile.elems());
-    let slot = k.block(0) * 2 + k.warp();
-    let dst = k.view(y, slot * tile.elems(), [tile.cols, 1], tile, [None, None]);
-    let (outer, inner) = (k.block(0).lt(2), k.warp().eq(0));
-    let ones = k.fill::<I32>(tile, Const::Int(1));
-    let twos = k.fill::<I32>(tile, Const::Int(2));
-    k.if_(outer, |k| k.if_(inner.clone(), |k| k.store(dst, ones), |_| {}), |_| {});
-    k.if_(inner, |k| k.store(dst, twos), |_| {});
-    let prog = k.finish();
+    let prog = Kernel::record("nested_if", |k| {
+        k.grid([Sc::from(4), Sc::from(1), Sc::from(1)]);
+        k.warps(2);
+        let tile = Shape::new(16, 16);
+        let y = k.output::<I32>("y", 4 * 2 * tile.elems());
+        let slot = k.block(0) * 2 + k.warp();
+        let dst = k.view(y, slot * tile.elems(), [tile.cols, 1], tile, [None, None]);
+        let (outer, inner) = (k.block(0).lt(2), k.warp().eq(0));
+        let ones = k.fill::<I32>(tile, Const::Int(1));
+        let twos = k.fill::<I32>(tile, Const::Int(2));
+        k.if_(outer, |k| k.if_(inner.clone(), |k| k.store(dst, ones), |_| {}), |_| {});
+        k.if_(inner, |k| k.store(dst, twos), |_| {});
+    });
+    let prog = prog;
     let device = crate::atoms::Device { target: target.clone(), costs: crate::atoms::Costs::default() };
     let lowering = Lowering::new(&device);
     let ir = render(prog, &lowering);
@@ -630,6 +639,57 @@ fn families_match_the_interpreter_on_the_device() {
     check_on_device(&target);
 }
 
+/// One tensor as both operands: a kernel reading the same memory twice, as a
+/// self-join does, gets the same bytes both times.
+#[test]
+fn an_operand_read_twice_matches_the_interpreter_on_the_device() {
+    let Some(planner) = super::device_planner() else { return };
+    let (m, k) = (512, 256);
+    let cfg = config::gemm_cfg([256, 256, 64], 1, [2, 4], false);
+    let cfg = crate::kernels::gemm::GemmCfg {
+        schedule: planner.device.target.kslice().map_or(cfg.schedule, Schedule::ping_pong),
+        ..cfg
+    };
+    let spec = assumed(GemmSpec { m, n: m, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT }, cfg);
+    let prog = gemm::<BF16>(&spec);
+    let mut seed = 5;
+    let a = super::rounded(ScalarDType::BFloat16, m * k, &mut seed, |x| x);
+    let want = interp::run(&prog, vec![a.clone(), a.clone(), vec![0.0; m * m]], &[]).unwrap().remove(2);
+    let t = Tensor::from_slice(a.iter().map(|&x| x as f32).collect::<Vec<_>>()).cast(DType::BFloat16);
+    let out = Tensor::empty(&[m * m], DType::BFloat16);
+    let out = crate::launch::graph_launch(prog, &cfg.lowering(&planner.device), &[&t, &t, &out]).unwrap();
+    out.prepare().unwrap().execute().unwrap();
+    let mut bytes = vec![0u8; m * m * 2];
+    out.buffer().unwrap().copyout(&mut bytes).unwrap();
+    for (i, (g, w)) in super::decode(ScalarDType::BFloat16, &bytes).iter().zip(&want).enumerate() {
+        assert!((g - w).abs() <= 2e-2 * w.abs().max(1.0), "[{i}] = {g} vs {w}");
+    }
+}
+
+/// A parameter the kernel writes shares storage with no other, since the body
+/// declares its buffers `noalias`: parameters all read may be one tensor (the
+/// self-join above), an output that is one of them, or a window into one, is
+/// refused, realized or still lazy.
+#[test]
+fn a_launch_refuses_an_output_sharing_storage() {
+    let (m, k) = (64, 32);
+    let cfg = config::gemm_cfg([64, 64, 32], 1, [2, 2], false);
+    let prog =
+        gemm::<BF16>(&assumed(GemmSpec { m, n: m, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT }, cfg));
+    let aliased = |tensors: &[&Tensor]| matches!(aliasing(&prog, tensors), Err(launch::Error::Aliased { .. }));
+    let (a, b, out) = (
+        Tensor::from_slice(vec![0.5f32; m * k]),
+        Tensor::from_slice(vec![1.0f32; m * k]),
+        Tensor::from_slice(vec![0.0f32; m * m]),
+    );
+    assert!(!aliased(&[&a, &a, &out]), "two inputs may be one tensor");
+    assert!(aliased(&[&a, &b, &a]), "an input is not the output");
+    let window = out.try_shrink([(0usize, m)]).unwrap();
+    assert!(aliased(&[&window, &b, &out]), "a window into the output shares its storage");
+    let lazy = a.try_add(&b).unwrap();
+    assert!(!aliased(&[&lazy, &lazy, &out]) && aliased(&[&lazy, &b, &lazy]), "a lazy node is itself");
+}
+
 /// Each family lowered for its target alone and launched as that body, as
 /// the tuner launches a candidate it fingerprinted, writes bit for bit what
 /// the same program lowered at its launch writes.
@@ -684,11 +744,12 @@ fn ranked_launches(planner: &Planner, shortlist_deep: bool) -> Vec<(Launch, (usi
     let mut launches = vec![];
     for (m, n, k) in [(4096, 4096, 4096), (704, 512, 512), (1500, 1280, 5120), (37, 96, 48)] {
         for gated in [false, true] {
-            let ranked = planner.gemm_ranked(1, m, n, k, gated);
+            let epilogue = Epilogue { gated, ..Epilogue::DEFAULT };
+            let ranked = planner.gemm_ranked(1, m, n, k, &epilogue);
             let deep = if m == 4096 && shortlist_deep { config::SHORTLIST } else { 8 };
             for cfg in config::distinct(&ranked).take(deep) {
-                let epilogue = Epilogue { gated, ..Epilogue::DEFAULT };
-                let spec = GemmSpec { m: 100, n: 96, k: cfg.tile[2] * 2, batch: Batch::Static(1), epilogue, cfg };
+                let spec =
+                    assumed(GemmSpec { m: 100, n: 96, k: cfg.tile[2] * 2, batch: Batch::Static(1), epilogue }, cfg);
                 let launch =
                     (format!("{m}x{n}x{k} g{gated} {cfg:?}"), gemm::<BF16>(&spec), cfg.lowering(&planner.device));
                 launches.push((launch, (cfg.smem_bytes(gated, 2), 0)));
@@ -698,19 +759,21 @@ fn ranked_launches(planner: &Planner, shortlist_deep: bool) -> Vec<(Launch, (usi
     for d in [32, 48, 64, 128] {
         for t in [1, 16, 100] {
             for cfg in first_eight(&planner.attention_ranked(2, t, 100, d, t > 1, false)) {
-                let spec = AttnSpec {
-                    batch: Batch::Static(1),
-                    t,
-                    tk: 100,
-                    heads: 2,
-                    kv_heads: 1,
-                    d,
-                    mask: AttnMask { causal: t > 1, ..AttnMask::default() },
-                    cache: None,
-                    packed: false,
-                    scale: 0.125,
+                let spec = assumed(
+                    AttnSpec {
+                        batch: Batch::Static(1),
+                        t,
+                        tk: 100,
+                        heads: 2,
+                        kv_heads: 1,
+                        d,
+                        mask: AttnMask { causal: t > 1, ..AttnMask::default() },
+                        cache: None,
+                        packed: false,
+                        scale: 0.125,
+                    },
                     cfg,
-                };
+                );
                 let launch = (format!("d{d} t{t} {cfg:?}"), attention::<BF16>(&spec), cfg.lowering(&planner.device));
                 launches.push((launch, (cfg.smem_bytes(d, false), 0)));
             }
@@ -719,9 +782,11 @@ fn ranked_launches(planner: &Planner, shortlist_deep: bool) -> Vec<(Launch, (usi
     for class in super::conv::YOLO {
         let g = super::conv::yolo_geom(class);
         let [ho, wo] = g.out_hw();
-        for c in conv_first_eight(planner, 1, ho * wo, &g) {
-            let spec =
-                ConvSpec { batch: Batch::Static(1), geom: g, epilogue: Epilogue::DEFAULT, cfg: c.gemm, split: c.split };
+        for c in conv_first_eight(planner, 1, ho * wo, &g, &Epilogue::DEFAULT) {
+            let spec = assumed(
+                ConvSpec { batch: Batch::Static(1), geom: g, epilogue: Epilogue::DEFAULT, split: c.split },
+                c.gemm,
+            );
             for (i, (prog, lowering)) in spec.programs::<F16>(&planner.device).into_iter().enumerate() {
                 let smem = if i == 0 { c.gemm.smem_bytes(false, 2) } else { 0 };
                 launches.push(((format!("{g:?} {c:?} #{i}"), prog, lowering), (smem, 0)));
@@ -744,7 +809,20 @@ fn ranked_launches(planner: &Planner, shortlist_deep: bool) -> Vec<(Launch, (usi
         let dtype = ScalarDType::Float16;
         let p = NearestProblem { n: 1 << 16, m: 1 << 16, d, dtype, metric, floors, groups, k };
         for cfg in first_eight(&planner.nearest_ranked(p)) {
-            let spec = NearestSpec { n: 100, m: 150, d, metric, floors, groups, k, cfg, live: Default::default() };
+            let spec = assumed(
+                NearestSpec {
+                    n: 100,
+                    m: 150,
+                    d,
+                    metric,
+                    floors,
+                    groups,
+                    k,
+                    live: Default::default(),
+                    dtype: ScalarDType::BFloat16,
+                },
+                cfg,
+            );
             let name = format!("nearest d{d} {metric:?} {floors:?} {groups} k{k} {cfg:?}");
             let launch = (name, nearest::<BF16>(&spec), Lowering::new(&planner.device));
             launches.push((launch, (cfg.smem_bytes(d, dtype), 0)));
@@ -814,19 +892,21 @@ fn attention_softmax_takes_the_declared_forms(
     let forms = Forms { truncate_p, skip_rescale, sum_after, ..lead.forms };
     let cfg = crate::kernels::attention::FaCfg { forms, ..lead };
     let mask = AttnMask { causal: true, ..AttnMask::default() };
-    let spec = AttnSpec {
-        batch: Batch::Static(2),
-        t: 100,
-        tk: 100,
-        heads: 4,
-        kv_heads: 2,
-        d: 64,
-        mask,
-        cache: None,
-        packed: false,
-        scale: 0.125,
+    let spec = assumed(
+        AttnSpec {
+            batch: Batch::Static(2),
+            t: 100,
+            tk: 100,
+            heads: 4,
+            kv_heads: 2,
+            d: 64,
+            mask,
+            cache: None,
+            packed: false,
+            scale: 0.125,
+        },
         cfg,
-    };
+    );
     let prog = if f16 { attention::<F16>(&spec) } else { attention::<BF16>(&spec) };
     let casts = tile_ops(&prog.body, &|op| matches!(op, TileOp::Cast { round: Round::Zero, .. }));
     let scales = tile_ops(&prog.body, &|op| matches!(op, TileOp::Binary { f: BinaryOp::Scale, .. }));
@@ -862,24 +942,25 @@ fn a_bf16_sum_in_f32_takes_the_pair_dot_product_where_it_exists(target: Target, 
     use crate::ir::{ReduceOp, Shape};
     assert_eq!(target.dot2_bf16, dot2);
     let (rows, cols) = (4usize, 128usize);
-    let mut k = Kernel::new("held_sum");
-    k.warps(1);
-    let x = k.param::<F32>("x", ParamKind::In, rows * cols);
-    let y = k.param::<F32>("y", ParamKind::Out, rows);
-    let xv = k.view(x, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
-    let xr = k.load(xv);
-    let held = k.cast_toward_zero::<BF16>(xr);
-    let sum = k.reduce_f32(held, Axis::Row, ReduceOp::Sum);
-    let yv = k.view(y, 0, [1, 1], Shape::new(rows, 1), [None, None]);
-    k.store(yv, sum);
-    let ir = render(k.finish(), &Lowering::new(&declared(target)));
+    let prog = Kernel::record("held_sum", |k| {
+        k.warps(1);
+        let x = k.input::<F32>("x", rows * cols);
+        let y = k.output::<F32>("y", rows);
+        let xv = k.view(x, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
+        let xr = k.load(xv);
+        let held = k.cast_toward_zero::<BF16>(xr);
+        let sum = k.reduce_f32(held, Axis::Row, ReduceOp::Sum);
+        let yv = k.view(y, 0, [1, 1], Shape::new(rows, 1), [None, None]);
+        k.store(yv, sum);
+    });
+    let ir = render(prog, &Lowering::new(&declared(target)));
     assert_eq!(ir.contains("@llvm.amdgcn.fdot2.f32.bf16("), dot2, "{ir}");
     // A lane's odd member out is widened on every target.
     assert!(dot2 || ir.contains("fpext bfloat"), "{ir}");
 }
 
 /// `Sync::Fence` statements in `block`, recursively.
-fn fences(block: &crate::ir::Block) -> usize {
+fn fences(block: &crate::ir::Block<crate::ir::Laid>) -> usize {
     use crate::ir::{Stmt, Sync};
     block.walk().filter(|(_, s)| matches!(s, Stmt::Sync(Sync::Fence))).count()
 }
@@ -900,7 +981,8 @@ fn register_staged_trips_are_fenced(arch: AmdArch, emitted: bool) {
     let device = declared(target);
     for (stages, want) in [(2, 2), (1, 1)] {
         let cfg = config::gemm_cfg([64, 64, 32], stages, [2, 2], stages == 2);
-        let spec = GemmSpec { m: 130, n: 192, k: 128, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg };
+        let spec =
+            assumed(GemmSpec { m: 130, n: 192, k: 128, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT }, cfg);
         let tile = lowered_tile(gemm::<BF16>(&spec), &cfg.lowering(&device));
         assert_eq!(
             fences(&tile.body),
@@ -916,7 +998,7 @@ fn register_staged_trips_are_fenced(arch: AmdArch, emitted: bool) {
 fn a_load_crosses_a_barrier(asm: &str) -> bool {
     let mut in_flight = false;
     for op in asm.lines().map(str::trim).filter(|l| !l.starts_with(';')) {
-        if op.starts_with("global_load") {
+        if op.starts_with("global_load") || op.starts_with("buffer_load") {
             in_flight = true;
         } else if (op.starts_with("s_wait_loadcnt") && op.ends_with(" 0x0")) || op.contains("vmcnt(0)") {
             in_flight = false;
@@ -927,11 +1009,21 @@ fn a_load_crosses_a_barrier(asm: &str) -> bool {
     false
 }
 
+/// Whether the `clang` on `PATH` is ROCm's fork (`AMD clang version …`).
+fn rocm_clang() -> bool {
+    std::process::Command::new("clang")
+        .arg("--version")
+        .output()
+        .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).starts_with("AMD clang"))
+}
+
 /// A tk barrier fences shared memory only, so the one-slot register-staged
 /// trip's barrier between its products and its commit leaves the next step's
 /// loads in flight. A plain workgroup release fence on RDNA would wait for
-/// them first (`s_wait_loadcnt 0x0` on gfx12, `vmcnt(0)` on gfx11); CDNA's
-/// fence never waited, and its code is unchanged.
+/// them first (`s_wait_loadcnt 0x0` on gfx12, `vmcnt(0)` on gfx11) under
+/// upstream LLVM; ROCm's clang (7.2) waits only for LDS there under
+/// `-mcumode`, so its plain fence leaves them in flight too. CDNA's fence
+/// never waited, and its code is unchanged.
 #[test_case(AmdArch::Gfx1201, true; "gfx1201")]
 #[test_case(AmdArch::Gfx1151, true; "gfx1151")]
 #[test_case(AmdArch::Gfx1100, true; "gfx1100")]
@@ -940,7 +1032,7 @@ fn a_load_crosses_a_barrier(asm: &str) -> bool {
 fn prefetch_loads_stay_in_flight_across_a_barrier(arch: AmdArch, rdna: bool) {
     let device = declared(amd(arch, 64));
     let cfg = config::gemm_cfg([64, 64, 32], 1, [2, 2], false);
-    let spec = GemmSpec { m: 256, n: 256, k: 512, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg };
+    let spec = assumed(GemmSpec { m: 256, n: 256, k: 512, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT }, cfg);
     let ir = render(gemm::<BF16>(&spec), &cfg.lowering(&device));
     let mmra = r#", !mmra !{!"amdgpu-synchronize-as", !"local"}"#;
     let fences = ir.matches("fence syncscope(\"workgroup\")").count();
@@ -956,7 +1048,12 @@ fn prefetch_loads_stay_in_flight_across_a_barrier(arch: AmdArch, rdna: bool) {
     };
     assert!(a_load_crosses_a_barrier(&local), "the next step's loads drain at the barrier:\n{local}");
     if rdna {
-        assert!(!a_load_crosses_a_barrier(&plain), "a plain workgroup fence no longer drains:\n{plain}");
+        let rocm = rocm_clang();
+        assert_eq!(
+            a_load_crosses_a_barrier(&plain),
+            rocm,
+            "a plain workgroup fence drains unless ROCm's clang (rocm={rocm}):\n{plain}"
+        );
     } else {
         assert_eq!(local, plain, "the LDS-only fence changed CDNA code");
     }
@@ -964,7 +1061,7 @@ fn prefetch_loads_stay_in_flight_across_a_barrier(arch: AmdArch, rdna: bool) {
 
 /// `Relayout` statements of tiles in `block`, recursively; vectors are not
 /// counted.
-fn tile_relayouts(prog: &Program, block: &crate::ir::Block) -> usize {
+fn tile_relayouts(prog: &Program<crate::ir::Laid>, block: &crate::ir::Block<crate::ir::Laid>) -> usize {
     use crate::ir::{Stmt, TileOp};
     let tile = |src: &crate::ir::ValId| prog.value(*src).shape.rows > 1 && prog.value(*src).shape.cols > 1;
     block.walk().filter(|(_, s)| matches!(s, Stmt::Let { op: TileOp::Relayout { src }, .. } if tile(src))).count()
@@ -973,19 +1070,21 @@ fn tile_relayouts(prog: &Program, block: &crate::ir::Block) -> usize {
 /// The probe's plain attention at head size `d` under `cfg` on `target`.
 fn attention_at(target: &Target, cfg: crate::kernels::attention::FaCfg, d: usize) -> (Program, Lowering) {
     use crate::kernels::attention::{AttnMask, AttnSpec, attention};
-    let spec = AttnSpec {
-        batch: Batch::Static(4),
-        t: 2048,
-        tk: 2048,
-        heads: 8,
-        kv_heads: 8,
-        d,
-        mask: AttnMask::default(),
-        cache: None,
-        packed: false,
-        scale: 0.125,
+    let spec = assumed(
+        AttnSpec {
+            batch: Batch::Static(4),
+            t: 2048,
+            tk: 2048,
+            heads: 8,
+            kv_heads: 8,
+            d,
+            mask: AttnMask::default(),
+            cache: None,
+            packed: false,
+            scale: 0.125,
+        },
         cfg,
-    };
+    );
     let device = crate::atoms::Device { target: target.clone(), costs: crate::atoms::Costs::default() };
     (attention::<BF16>(&spec), cfg.lowering(&device))
 }
@@ -1005,7 +1104,7 @@ fn two_atom_rows_per_warp_lower(target: Target) {
     // the 16-row tile a chunk.
     let deep = if target.wave == 64 { 2 } else { 1 };
     for (d, bq, bkv) in [(64, 128, 32 * deep), (128, 128, 16 * deep), (64, 64, 64)] {
-        let one = FaCfg { unroll: true, forms: all, ..FaCfg::new(bq, bkv, 2) };
+        let one = FaCfg { schedule: Schedule::ring(2, true), forms: all, ..FaCfg::new(bq, bkv, 2) };
         let two = FaCfg { warp_rows: 2 * WARP_ROWS, ..one };
         assert!(one.fits(&target, d, false) && two.fits(&target, d, false));
         assert_eq!(two.warps() * 2, one.warps());
@@ -1028,19 +1127,19 @@ fn voted_rows() -> Program {
     use crate::build::{CmpOp, F32, Kernel};
     use crate::ir::{ReduceOp, Shape};
     let (rows, d) = (4, 256);
-    let mut k = Kernel::new("voted");
-    let x = k.param::<F32>("x", ParamKind::In, rows * d);
-    let y = k.param::<F32>("y", ParamKind::Out, rows);
-    k.warps(rows as u32);
-    let xv = k.view(x, 0, [d, 1], Shape::new(rows, d), [None, None]);
-    let xs = k.load(xv);
-    let most = k.reduce(xs, Axis::Row, ReduceOp::Max);
-    let zero = k.zeros::<F32>(Shape::new(rows, 1));
-    let positive = k.compare(zero, most, CmpOp::Lt);
-    let [out] = k.where_any(positive, |k| [k.reduce(xs, Axis::Row, ReduceOp::Sum)], [most]);
-    let yv = k.view(y, 0, [1, 1], Shape::new(rows, 1), [None, None]);
-    k.store(yv, out);
-    k.finish()
+    Kernel::record("voted", |k| {
+        let x = k.input::<F32>("x", rows * d);
+        let y = k.output::<F32>("y", rows);
+        k.warps(rows as u32);
+        let xv = k.view(x, 0, [d, 1], Shape::new(rows, d), [None, None]);
+        let xs = k.load(xv);
+        let most = k.reduce(xs, Axis::Row, ReduceOp::Max);
+        let zero = k.zeros::<F32>(Shape::new(rows, 1));
+        let positive = k.compare(zero, most, CmpOp::Lt);
+        let [out] = k.where_any(positive, |k| [k.reduce(xs, Axis::Row, ReduceOp::Sum)], [most]);
+        let yv = k.view(y, 0, [1, 1], Shape::new(rows, 1), [None, None]);
+        k.store(yv, out);
+    })
 }
 
 /// Small integers, every one of rows 0 and 2 negative, so their sums and
@@ -1138,17 +1237,20 @@ fn the_next_steps_loads_stay_above_a_vote(arch: AmdArch) {
     use crate::kernels::nearest::NearestCfg;
     let device = declared(amd(arch, 64));
     let cfg = NearestCfg { warp_rows: 32, ..NearestCfg::new(128, 16, 2) };
-    let spec = NearestSpec {
-        n: 32768,
-        m: 32768,
-        d: 256,
-        metric: Metric::NegDot,
-        floors: Floors::default(),
-        groups: false,
-        k: 1,
+    let spec = assumed(
+        NearestSpec {
+            n: 32768,
+            m: 32768,
+            d: 256,
+            metric: Metric::NegDot,
+            floors: Floors::default(),
+            groups: false,
+            k: 1,
+            live: Default::default(),
+            dtype: ScalarDType::BFloat16,
+        },
         cfg,
-        live: Default::default(),
-    };
+    );
     let ir = render(nearest::<BF16>(&spec), &Lowering::new(&device));
     let asm = match svod_runtime::amd::compile_ir_to_amd_asm(&ir, arch) {
         Ok(asm) => String::from_utf8(asm).unwrap(),
@@ -1182,19 +1284,21 @@ fn the_probabilities_reach_pv_through_the_lanes_on_a_no_feed_target(mask: AttnMa
     let target = amd(AmdArch::Gfx1151, 40);
     let device = crate::atoms::Device { target: target.clone(), costs: super::gfx1151_store_costs() };
     let cfg = crate::kernels::attention::FaCfg::new(32, 128, 2);
-    let spec = AttnSpec {
-        batch: Batch::Static(2),
-        t: 100,
-        tk: 100,
-        heads: 4,
-        kv_heads: 4,
-        d: 64,
-        mask,
-        cache: None,
-        packed: false,
-        scale: 0.125,
+    let spec = assumed(
+        AttnSpec {
+            batch: Batch::Static(2),
+            t: 100,
+            tk: 100,
+            heads: 4,
+            kv_heads: 4,
+            d: 64,
+            mask,
+            cache: None,
+            packed: false,
+            scale: 0.125,
+        },
         cfg,
-    };
+    );
     let declared = shared_bytes(&linear(attention::<F16>(&spec), &cfg.lowering(&device)));
     assert_eq!(declared, cfg.smem_bytes(64, false), "its rings alone, at the target's whole 64 KB");
 }

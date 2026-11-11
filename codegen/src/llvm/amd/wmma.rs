@@ -185,6 +185,14 @@ fn resolve_intrinsic(
     let in_dt = in_dt?;
     let acc_dt = acc_dt?;
 
+    if (n, m, k) == (32, 32, 8) {
+        let name = match (in_dt, acc_dt) {
+            (ScalarDType::Float16, ScalarDType::Float32) => "f16",
+            (ScalarDType::BFloat16, ScalarDType::Float32) => "bf16.1k",
+            _ => return None,
+        };
+        return arch.is_cdna().then(|| format!("llvm.amdgcn.mfma.f32.32x32x8{name}"));
+    }
     if (n, m) != (16, 16) {
         return None;
     }

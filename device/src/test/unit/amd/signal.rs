@@ -17,6 +17,29 @@ fn wait_count(iface: &MockAmdIface) -> usize {
     iface.call_count(|call| matches!(call, MockAmdCall::WaitEvents { .. }))
 }
 
+/// A completion signal counts the CP's decrements from zero, and with a
+/// mailbox the decrement raises the queue event: the CP writes `event_id` to
+/// `event_mailbox_ptr` (`amd_signal_t` +16 / +24) and interrupts.
+#[test_case::test_case(None; "silent")]
+#[test_case::test_case(Some(crate::amd::iface::QueueEventMailbox { address: 0xfeed_0000, event_id: 9 }); "interrupting")]
+fn a_completion_signal_counts_decrements(mailbox: Option<crate::amd::iface::QueueEventMailbox>) {
+    let (_iface, allocator) = mock_device(1);
+    let pool = SignalPool::new(&allocator, 1).expect("mock signal pool");
+    let signal = pool.acquire().expect("mock signal").counting_down(mailbox);
+    // SAFETY: the mock GPU VA is the host address of the 64-byte slot.
+    let word = |offset: u64| unsafe { std::ptr::read_volatile((signal.handle() + offset) as *const u64) };
+    assert_eq!(signal.value_addr(), signal.handle() + 8);
+    assert_eq!(word(16), mailbox.map_or(0, |mailbox| mailbox.address));
+    assert_eq!(word(24) as u32, mailbox.map_or(0, |mailbox| mailbox.event_id));
+    assert_eq!(signal.value(), 0);
+    signal.complete_packet();
+    signal.complete_packet();
+    assert_eq!((signal.value(), word(8)), (2, (-2i64) as u64));
+    signal.wait_signal_value(2, 1).expect("two retired packets");
+    signal.reset(0);
+    assert_eq!(word(8), 0);
+}
+
 /// Live pool round-trip: concurrent slots are distinct, and a released slot is
 /// handed back out with its value zeroed.
 #[test]
@@ -142,4 +165,140 @@ fn prepared_finalizer_wait_is_bounded_by_its_deadline() {
     let error = finalizer.wait(50).expect_err("an unpublished submission must not park forever");
     assert!(matches!(error, Error::TimelineTimeout { what: "AMD submission publication", .. }), "{error:?}");
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
+}
+
+/// A wait gives up on a queue that stops moving, and not on one whose read
+/// index keeps moving past the limit.
+#[test]
+fn a_moving_read_pointer_keeps_a_wait_alive() {
+    let (_iface, _allocator, _pool, signal) = mock_signal();
+    let index = Box::leak(Box::new(std::sync::atomic::AtomicU64::new(0)));
+    let read = QueueReadPointer::new(std::ptr::NonNull::new(index.as_ptr()).expect("a leaked box"));
+    signal.watch_queue(read);
+    assert!(signal.wait_signal_value(1, 20).is_err(), "the index stands still");
+    let reader = &*index;
+    let done = Arc::clone(&signal);
+    let mover = std::thread::spawn(move || {
+        for _ in 0..30 {
+            reader.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        done.reset(1);
+    });
+    signal.wait_signal_value(1, 50).expect("the index keeps it alive");
+    mover.join().unwrap();
+}
+
+/// A wait sleeps in `WAIT_EVENTS` once it outlives its polling budget, even
+/// while the queue keeps moving, and a silent one times out no sooner than its
+/// limit.
+#[test]
+fn a_long_wait_sleeps_while_the_queue_moves() {
+    let (iface, _allocator, _pool, signal) = mock_signal();
+    let index = Box::leak(Box::new(std::sync::atomic::AtomicU64::new(0)));
+    signal.watch_queue(QueueReadPointer::new(std::ptr::NonNull::new(index.as_ptr()).expect("a leaked box")));
+
+    let started = std::time::Instant::now();
+    let error = signal.wait_signal_value(1, 20).expect_err("the index stands still");
+    assert!(matches!(error, Error::TimelineTimeout { .. }), "{error:?}");
+    assert!(started.elapsed() >= std::time::Duration::from_millis(20));
+
+    let reader = &*index;
+    let done = Arc::clone(&signal);
+    let mover = std::thread::spawn(move || {
+        // Faster than the polling budget, so only the wait's age can sleep it.
+        for _ in 0..300 {
+            reader.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        done.reset(1);
+    });
+    let sleeps = wait_count(&iface);
+    signal.wait_signal_value(1, 20).expect("the index keeps it alive");
+    mover.join().unwrap();
+    assert!(wait_count(&iface) > sleeps, "a moving queue kept the wait polling");
+}
+
+/// Which error word a test plays the CP or KFD writing.
+#[derive(Clone, Copy, Debug)]
+enum QueueReport {
+    Inactive,
+    ErrorReason,
+}
+
+/// Write `code` into `lane`'s `report` word, as the CP or KFD does.
+fn report_queue_error(lane: &crate::amd::connector::PoolQueue, report: QueueReport, code: u64) {
+    let (inactive, reason) = lane.queue().error_word_ptrs();
+    let word = match report {
+        QueueReport::Inactive => inactive,
+        QueueReport::ErrorReason => reason,
+    };
+    // SAFETY: the word lives in the lane's error allocation, alive with `lane`.
+    unsafe { std::ptr::write_volatile(word, code) };
+}
+
+/// A wait sleeping in `WAIT_EVENTS` wakes on the queue event a stopped queue
+/// raises and fails at once with the decoded error, which poisons the device
+/// for every later wait.
+#[test_case::test_case(2, QueueReport::Inactive, 0x401, "queue_inactive_signal", "insufficient scratch"; "aql halt")]
+#[test_case::test_case(2, QueueReport::ErrorReason, 1 << 29, "ErrorReason", "preemption error"; "aql exception")]
+#[test_case::test_case(1, QueueReport::ErrorReason, 1 << 3, "ErrorReason", "illegal instruction"; "pm4 exception")]
+fn a_stopped_queue_fails_a_blocked_wait_at_once(
+    xccs: u32,
+    report: QueueReport,
+    code: u64,
+    expected_report: &str,
+    expected_cause: &str,
+) {
+    let (iface, allocator) = super::test_support::mock_device_with_signals(xccs);
+    let lane = crate::amd::connector::PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator)
+        .expect("pool queue");
+    let signal = Arc::clone(lane.pm4_signal());
+    let waiting = Arc::clone(&signal);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || tx.send(waiting.wait(1, 60_000)).unwrap());
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while wait_count(&iface) == 0 {
+        assert!(std::time::Instant::now() < deadline, "waiter never entered event polling");
+        std::thread::yield_now();
+    }
+    report_queue_error(&lane, report, code);
+    let error = rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("the stopped queue did not wake the waiter")
+        .expect_err("a stopped queue must fail the wait");
+    waiter.join().unwrap();
+    let Error::AmdQueueError { report, code: reported, cause, .. } = error else { panic!("{error:?}") };
+    assert_eq!((report, reported, cause), (expected_report, code, expected_cause));
+
+    assert!(allocator.dev.is_poisoned());
+    let later = signal.wait(1, 60_000).expect_err("the poison fails later waits");
+    assert!(matches!(later, Error::Runtime { message } if message.contains(expected_cause)));
+}
+
+/// A wait that runs out its deadline names the stopped queue rather than the
+/// deadline.
+#[test]
+fn a_timed_out_wait_names_the_stopped_queue() {
+    let (_iface, allocator) = super::test_support::mock_device_with_signals(2);
+    let lane = crate::amd::connector::PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator)
+        .expect("pool queue");
+    report_queue_error(&lane, QueueReport::Inactive, 0x80);
+    let error = lane.pm4_signal().wait(1, 1).expect_err("a stopped queue must fail the wait");
+    assert!(matches!(error, Error::AmdQueueError { cause: "out of VGPRs", .. }), "{error:?}");
+}
+
+/// Zeroed error words are no report: the wait sleeps and wakes in
+/// `WAIT_EVENTS` until its deadline and leaves the device usable.
+#[test_case::test_case(1; "pm4")]
+#[test_case::test_case(2; "aql")]
+fn quiet_error_words_leave_a_wait_to_its_deadline(xccs: u32) {
+    let (iface, allocator) = super::test_support::mock_device_with_signals(xccs);
+    let lane = crate::amd::connector::PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator)
+        .expect("pool queue");
+    let error = lane.pm4_signal().wait(1, 20).expect_err("nothing completes the wait");
+    assert!(matches!(error, Error::TimelineTimeout { .. }), "{error:?}");
+    assert!(wait_count(&iface) > 0, "the wait never slept, so never read the words on a wake");
+    assert!(!allocator.dev.is_poisoned());
 }

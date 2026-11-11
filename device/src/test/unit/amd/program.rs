@@ -1,12 +1,14 @@
 use super::test_support::{
-    MockAmdIface, amd_alloc_or_skip, ensure_hw_signal_pool, install_signal_pool, mock_device, replay_dwords,
-    require_multi_xcc, require_single_xcc, scripted_error,
+    MockAmdCall, MockAmdIface, amd_alloc_or_skip, ensure_hw_signal_pool, install_signal_pool, mock_device,
+    replay_dwords, require_multi_xcc, require_single_xcc, retire_lane, scripted_error,
 };
 use crate::allocator::RawBuffer;
 use crate::amd::AmdAllocator;
 use crate::amd::device::AmdDevice;
 use crate::amd::graph::AmdGraph;
+use crate::amd::iface::AllocKind;
 use crate::amd::program::*;
+use crate::amd::va_registry::AllocTag;
 use crate::device::{AbiParamDescriptor, AbiParamKind, GraphKernel, Program};
 use crate::error::Error;
 use std::sync::Arc;
@@ -97,7 +99,12 @@ fn mock_program(ir: &str, name: &str, abi: &[AbiParamDescriptor], graph: bool) -
 }
 
 fn load_mock_program(bytes: &[u8], name: &str, abi: &[AbiParamDescriptor], graph: bool) -> MockProgram {
-    let (iface, allocator) = mock_device(1);
+    load_mock_program_on(1, bytes, name, abi, graph)
+}
+
+/// [`load_mock_program`] on an `xccs`-XCC device (more than one is AQL).
+fn load_mock_program_on(xccs: u32, bytes: &[u8], name: &str, abi: &[AbiParamDescriptor], graph: bool) -> MockProgram {
+    let (iface, allocator) = mock_device(xccs);
     let device = Arc::clone(&allocator.dev);
     if graph {
         install_signal_pool(&allocator);
@@ -147,6 +154,22 @@ attributes #0 = { nounwind "amdgpu-flat-work-group-size"="1,64" }
     assert!(parsed.image.windows(16).any(|w| w == table), "the global's bytes are in the image");
 }
 
+/// The host uploads a code object into VRAM through the BAR and flushes HDP
+/// once its stores are done, before any dispatch can fetch it.
+#[test]
+fn code_upload_flushes_hdp_after_its_stores() {
+    let Some(bytes) = clang_amdgcn(EMPTY_IR, "gfx1100") else { return };
+    let (iface, allocator) = mock_device(1);
+    iface.set_hdp_flush_register();
+    let _program = AmdProgram::load(Arc::clone(&allocator.dev), &allocator, &bytes, "empty", &[]).expect("load");
+    let transcript = iface.transcript();
+    assert!(
+        matches!(transcript[..], [MockAmdCall::Alloc { cpu_access: true, zero: false, .. }, MockAmdCall::HdpFlush]),
+        "{transcript:?}"
+    );
+    assert_eq!(iface.alloc_kinds_for_tag(AllocTag::Vram), [AllocKind::DeviceVram { executable: true }]);
+}
+
 #[test]
 fn program_code_allocation_is_balanced_on_success_and_failure() {
     let Some(mock) = mock_program(EMPTY_IR, "empty", &[], false) else { return };
@@ -189,9 +212,9 @@ attributes #0 = { nounwind "amdgpu-flat-work-group-size"="1,1" }
 #[test]
 fn graph_capture_storage_unwinds_each_post_lane_allocation() {
     let Some(bytes) = clang_amdgcn(EMPTY_IR, "gfx1100") else { return };
-    // Stages 0..6 belong to the lane itself (covered by the pool-queue unwind
-    // test); 6..=8 are the graph's own kernarg and command-stream buffers.
-    for fail_at in 6..=8 {
+    // Stages 0..7 belong to the lane itself (covered by the pool-queue unwind
+    // test); 7..=9 are the graph's own kernarg and command-stream buffers.
+    for fail_at in 7..=9 {
         let mock = load_mock_program(&bytes, "empty", &[], true);
         let (allocations, frees) = (mock.iface.allocation_count(), mock.iface.free_count());
         for _ in 0..fail_at {
@@ -201,7 +224,7 @@ fn graph_capture_storage_unwinds_each_post_lane_allocation() {
         let kernels = [graph_kernel(&mock.program, Vec::new(), Vec::new())];
         assert!(AmdGraph::capture(&mock.allocator, &kernels).is_err(), "fail_at={fail_at}");
         assert_eq!(mock.iface.allocation_count() - allocations, fail_at, "fail_at={fail_at}");
-        assert_eq!(mock.iface.free_count() - frees, fail_at - 6, "fail_at={fail_at}");
+        assert_eq!(mock.iface.free_count() - frees, fail_at - 7, "fail_at={fail_at}");
         assert!(mock.iface.free_issues().is_empty());
     }
 }
@@ -212,7 +235,7 @@ fn graph_success_drop_frees_kernarg_and_both_resident_streams_once() {
     let allocations = mock.iface.allocation_count();
     let kernels = [graph_kernel(&mock.program, Vec::new(), Vec::new())];
     let graph = AmdGraph::capture(&mock.allocator, &kernels).unwrap().expect("graph");
-    assert_eq!(mock.iface.allocation_count() - allocations, 9);
+    assert_eq!(mock.iface.allocation_count() - allocations, 10);
     drop(graph);
     assert_eq!(mock.iface.free_count(), 3, "kernargs plus both resident streams");
     assert!(mock.iface.free_issues().is_empty());
@@ -246,10 +269,185 @@ fn graph_capture_emits_one_memory_barrier_for_the_whole_chain() {
     let dwords = replay_dwords(graph.linked_bytes());
     let runs = |needle: &[u32]| dwords.windows(needle.len()).filter(|run| *run == needle).count();
 
-    // One HDP flush + full acquire for the whole graph (tinygrad graph/hcq.py:157)...
-    assert_eq!(runs(&pm4::hdp_flush()), 1);
+    // One full acquire for the whole graph (tinygrad graph/hcq.py:157)...
+    assert_eq!(runs(&pm4::acquire_mem_gfx9()) + runs(&pm4::acquire_mem()), 1);
     // ...while every dispatch keeps its own CS_PARTIAL_FLUSH.
     assert_eq!(runs(&pm4::event_write(pm4::CS_PARTIAL_FLUSH, pm4::EVENT_INDEX_PARTIAL_FLUSH)), 3);
+}
+
+const MAILBOX: crate::amd::iface::QueueEventMailbox =
+    crate::amd::iface::QueueEventMailbox { address: 0x7_0000_1238, event_id: 9 };
+
+/// A captured graph ends on the KFD completion interrupt, after its timeline
+/// store, so a host blocked in `WAIT_EVENTS` wakes as the replay retires; a
+/// backend without the mailbox captures the stream unchanged.
+#[test]
+fn graph_capture_ends_on_the_completion_interrupt() {
+    let Some(mock) = mock_program(EMPTY_IR, "empty", &[], true) else { return };
+    let kernels = std::array::from_fn::<_, 2, _>(|_| graph_kernel(&mock.program, Vec::new(), Vec::new()));
+    let capture =
+        || replay_dwords(AmdGraph::capture_amd(&mock.allocator, &kernels).unwrap().expect("graph").linked_bytes());
+    let quiet = capture();
+    mock.iface.set_queue_event_mailbox(MAILBOX);
+    let woken = capture();
+    let interrupt = crate::amd::sys::pm4::release_mem_event(MAILBOX.address, MAILBOX.event_id, false);
+    // Each capture links its own kernargs, so compare the shape around them.
+    assert!(woken.ends_with(&interrupt), "{woken:x?}");
+    assert_eq!(woken.len(), quiet.len() + interrupt.len());
+    assert!(!quiet.windows(interrupt.len()).any(|run| run == interrupt));
+}
+
+/// A one-kernel linked plan on lane 0 of the mock device.
+fn one_kernel_semantic_plan() -> crate::hcq::SemanticLinkedPlan {
+    let lane = crate::hcq::LaneSubmission {
+        lane: crate::hcq::DeviceQueue {
+            device: svod_dtype::DeviceSpec::Amd { device_id: 0 },
+            queue: crate::hcq::QueueKind::Compute(0),
+        },
+        waits: Vec::new(),
+        commands: vec![crate::hcq::TopologyCommand { operation: 0, copy_leg: None }],
+        signal_value: 1,
+    };
+    crate::hcq::SemanticLinkedPlan::from_lane_submissions(vec![lane], |_| [0x1000, 0x1008]).unwrap()
+}
+
+/// Everything the host rewrites per replay shares one placement: the device's
+/// kernarg arena (which also holds AQL control programs), graph and
+/// linked-plan kernargs, and their PM4 IBs and AQL control programs live in
+/// VRAM on a multi-XCC part and in uncached system memory elsewhere.
+#[test_case::test_case(1, AllocKind::UncachedGtt; "pm4")]
+#[test_case::test_case(2, AllocKind::DeviceVram { executable: true }; "aql")]
+fn replayed_kernargs_and_command_buffers_share_one_placement(xccs: u32, kind: AllocKind) {
+    let Some(bytes) = clang_amdgcn(EMPTY_IR, "gfx1100") else { return };
+    let mock = load_mock_program_on(xccs, &bytes, "empty", &[], true);
+    let kinds = |tag| mock.iface.alloc_kinds_for_tag(tag);
+    let system = |count| vec![kind; count];
+
+    let kernels = [graph_kernel(&mock.program, Vec::new(), Vec::new())];
+    let _graph = AmdGraph::capture_amd(&mock.allocator, &kernels).unwrap().expect("graph");
+    // The lane's arena, then the graph's kernargs; a command buffer for each
+    // of the plain and the profiled stream.
+    assert_eq!((kinds(AllocTag::Kernarg), kinds(AllocTag::CommandBuffer)), (system(2), system(2)));
+
+    let pool =
+        crate::amd::connector::PoolQueue::new_with_resources(Arc::clone(mock.device.core()), &mock.allocator).unwrap();
+    let owner = crate::amd::connector::OwnerCtx::new(Arc::clone(mock.device.core()), mock.allocator.clone());
+    let calls = [crate::device::PlanCall::Program {
+        program: &mock.program,
+        buffers: &[],
+        vals: &[],
+        global_size: Some([1, 1, 1]),
+        local_size: Some([1, 1, 1]),
+    }];
+    let plan = crate::amd::AmdLinkedPlan::capture(&owner, &pool, &one_kernel_semantic_plan(), &calls)
+        .unwrap()
+        .expect("linked plan");
+    // The plan's kernargs; on AQL, a control program per native submission.
+    let control_programs = if xccs > 1 { plan.submission_bytes().len() } else { 0 };
+    assert_eq!(kinds(AllocTag::Kernarg), system(3));
+    assert_eq!(kinds(AllocTag::CommandBuffer), system(2 + control_programs));
+}
+
+/// Every native submission of a linked plan ends on the completion interrupt:
+/// the last one's timeline store is the plan's.
+#[test]
+fn linked_plan_submissions_end_on_the_completion_interrupt() {
+    let Some(mock) = mock_program(EMPTY_IR, "empty", &[], false) else { return };
+    install_signal_pool(&mock.allocator);
+    mock.iface.set_queue_event_mailbox(MAILBOX);
+    let pool =
+        crate::amd::connector::PoolQueue::new_with_resources(Arc::clone(mock.device.core()), &mock.allocator).unwrap();
+    let owner = crate::amd::connector::OwnerCtx::new(Arc::clone(mock.device.core()), mock.allocator.clone());
+    let lane = crate::hcq::LaneSubmission {
+        lane: crate::hcq::DeviceQueue {
+            device: svod_dtype::DeviceSpec::Amd { device_id: 0 },
+            queue: crate::hcq::QueueKind::Compute(0),
+        },
+        waits: Vec::new(),
+        commands: vec![crate::hcq::TopologyCommand { operation: 0, copy_leg: None }],
+        signal_value: 1,
+    };
+    let semantic = crate::hcq::SemanticLinkedPlan::from_lane_submissions(vec![lane], |_| [0x1000, 0x1008]).unwrap();
+    let calls = [crate::device::PlanCall::Program {
+        program: &mock.program,
+        buffers: &[],
+        vals: &[],
+        global_size: Some([1, 1, 1]),
+        local_size: Some([1, 1, 1]),
+    }];
+    let linked = crate::amd::AmdLinkedPlan::capture(&owner, &pool, &semantic, &calls).unwrap().expect("linked plan");
+    let interrupt = crate::amd::sys::pm4::release_mem_event(MAILBOX.address, MAILBOX.event_id, false);
+    let streams = linked.submission_bytes();
+    assert!(!streams.is_empty());
+    for stream in streams {
+        let dwords = replay_dwords(stream);
+        assert!(dwords.ends_with(&interrupt), "{dwords:x?}");
+        assert_eq!(dwords.windows(interrupt.len()).filter(|run| *run == interrupt).count(), 1);
+    }
+}
+
+/// An AQL graph replay rewrites its control program, which holds XCC0's
+/// timeline store, only once every XCC is done with the previous replay; a
+/// PM4 replay rewrites at the timeline point.
+#[test_case::test_case(1; "pm4")]
+#[test_case::test_case(2; "aql")]
+fn graph_replay_rewrites_its_program_once_every_xcc_is_done(xccs: u32) {
+    let Some(bytes) = clang_amdgcn(EMPTY_IR, "gfx1100") else { return };
+    let mock = load_mock_program_on(xccs, &bytes, "empty", &[], true);
+    let kernels = [graph_kernel(&mock.program, Vec::new(), Vec::new())];
+    let graph = AmdGraph::capture(&mock.allocator, &kernels).unwrap().expect("graph");
+    let lane = || mock.device.core().lease_queue(&mock.allocator).expect("the one lane");
+    graph.replay(&[], &[]).expect("first replay");
+    let retired = {
+        let lane = lane();
+        crate::sync::TimelineSignal::set(&**lane.pm4_signal(), lane.pm4_value() - 1);
+        lane.retired().cloned()
+    };
+    std::thread::scope(|scope| {
+        let second = scope.spawn(|| graph.replay(&[], &[]));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(second.is_finished(), xccs == 1, "xccs={xccs}");
+        if let Some(retired) = &retired {
+            retired.signal().complete_packet();
+        }
+        second.join().unwrap().expect("second replay");
+    });
+    retire_lane(&lane());
+}
+
+/// A linked plan's replay retires, and the next one rewrites its control
+/// programs and kernargs, once the CP completed the last packet of each of its
+/// AQL submissions; on PM4 at the plan's final point.
+#[test_case::test_case(1; "pm4")]
+#[test_case::test_case(2; "aql")]
+fn linked_plan_replay_retires_once_every_xcc_is_done(xccs: u32) {
+    let Some(bytes) = clang_amdgcn(EMPTY_IR, "gfx1100") else { return };
+    let mock = load_mock_program_on(xccs, &bytes, "empty", &[], false);
+    install_signal_pool(&mock.allocator);
+    let pool =
+        crate::amd::connector::PoolQueue::new_with_resources(Arc::clone(mock.device.core()), &mock.allocator).unwrap();
+    let owner = crate::amd::connector::OwnerCtx::new(Arc::clone(mock.device.core()), mock.allocator.clone());
+    let calls = [crate::device::PlanCall::Program {
+        program: &mock.program,
+        buffers: &[],
+        vals: &[],
+        global_size: Some([1, 1, 1]),
+        local_size: Some([1, 1, 1]),
+    }];
+    let mut linked = crate::amd::AmdLinkedPlan::capture(&owner, &pool, &one_kernel_semantic_plan(), &calls)
+        .unwrap()
+        .expect("linked plan");
+    linked.replay(&owner, &pool, &calls).map_err(|failure| failure.error).expect("replay");
+    let finalizer = owner.newest().expect("the replay's finalizer");
+    finalizer.land_timeline();
+    assert_eq!(finalizer.retired(), xccs == 1, "xccs={xccs}");
+    if let Some(retired) = pool.retired() {
+        assert_eq!(retired.current() - 1, linked.submission_bytes().len() as u64, "one count per submission");
+        let last = pool.queue().ring_packet(pool.queue().ring_write_idx() - 1);
+        assert_eq!(last[56..], retired.signal().handle().to_le_bytes());
+        retire_lane(&pool);
+    }
+    assert!(finalizer.retired());
 }
 
 #[test]
@@ -486,6 +684,176 @@ fn pm4_graph_two_kernel_raw_dependency() {
     graph_two_kernel_raw_probe(&alloc, alloc.dev.arch.mcpu());
 }
 
+/// One work-item that sleeps `iterations` times (`s_sleep 127`, a few µs
+/// each), then stores 0.0.
+fn sleepy_ir(iterations: u32) -> String {
+    format!(
+        r#"target triple = "amdgcn-amd-amdhsa"
+declare void @llvm.amdgcn.s.sleep(i32)
+define amdgpu_kernel void @sleepy(ptr noalias %buf0) #0 {{
+entry:
+  br label %loop
+loop:
+  %i = phi i32 [ 0, %entry ], [ %next, %loop ]
+  call void @llvm.amdgcn.s.sleep(i32 127)
+  %next = add i32 %i, 1
+  %done = icmp eq i32 %next, {iterations}
+  br i1 %done, label %exit, label %loop
+exit:
+  store float 0.0, ptr %buf0
+  ret void
+}}
+attributes #0 = {{ nounwind "amdgpu-flat-work-group-size"="1,1" }}
+"#
+    )
+}
+
+/// A graph of `count` sleepy kernels over one host-visible output, or `None`
+/// where clang or capture isn't available.
+fn sleepy_graph(
+    alloc: &AmdAllocator,
+    iterations: u32,
+    count: usize,
+) -> Option<(Box<dyn crate::device::Graph>, AmdProgram, ProbeBuffer)> {
+    let bytes = clang_amdgcn(&sleepy_ir(iterations), alloc.dev.arch.mcpu())?;
+    let program =
+        AmdProgram::load(alloc.dev.clone(), alloc, &bytes, "sleepy", &global_f32_buffer_abi()).expect("load program");
+    let output = ProbeBuffer::new(alloc);
+    let kernels = (0..count)
+        .map(|index| graph_kernel(&program, vec![output.gpu as *mut u8], Vec::from_iter(index.checked_sub(1))))
+        .collect::<Vec<_>>();
+    let graph = AmdGraph::capture(alloc, &kernels).expect("capture")?;
+    Some((graph, program, output))
+}
+
+/// CPU time the calling thread has used.
+fn thread_cpu() -> std::time::Duration {
+    // SAFETY: getrusage writes the struct it is given.
+    let usage = unsafe {
+        let mut usage = std::mem::zeroed::<libc::rusage>();
+        assert_eq!(libc::getrusage(libc::RUSAGE_THREAD, &mut usage), 0);
+        usage
+    };
+    let time = |t: libc::timeval| std::time::Duration::new(t.tv_sec as u64, t.tv_usec as u32 * 1000);
+    time(usage.ru_utime) + time(usage.ru_stime)
+}
+
+/// Two threads blocked on one graph replay both wake as it retires: the replay
+/// raises the completion interrupt, and each waiter's event age sees it though
+/// the queue event resets on the first wake. Lateness is wall time past the
+/// kernel's GPU span; a missed interrupt leaves a waiter to its next
+/// `WAIT_EVENTS` slice (up to 200 ms).
+///
+/// Run: `cargo test -p svod-device --lib graph_waiters -- --ignored --nocapture --test-threads=1`
+#[test]
+#[ignore = "manual hardware probe; needs a real AMD GPU + clang"]
+fn graph_waiters_wake_as_the_replay_retires() {
+    let Some(alloc) = amd_alloc_or_skip() else { return };
+    let _serial = PM4_GRAPH_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _pm4 = Pm4GraphOverride::enable(alloc.dev.core());
+    ensure_hw_signal_pool(&alloc);
+    let iterations = std::env::var("SLEEPY_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(80_000);
+    let Some((graph, _program, output)) = sleepy_graph(&alloc, iterations, 1) else { return };
+
+    for trial in 0..3 {
+        output.set(-1.0);
+        let started = std::time::Instant::now();
+        let timestamps = graph.replay_profiled(&[], &[]).expect("profiled replay").expect("profile support");
+        let woke = std::thread::scope(|scope| {
+            let waiters = [(); 2].map(|()| {
+                scope.spawn(|| {
+                    alloc.dev.core().synchronize_all().expect("synchronize_all");
+                    started.elapsed()
+                })
+            });
+            waiters.map(|waiter| waiter.join().unwrap())
+        });
+        assert_eq!(output.get(), 0.0, "trial {trial}: the kernel store must land");
+        let (start, end) = timestamps[0].timestamps_ns().expect("graph GPU timestamps");
+        let span = std::time::Duration::from_nanos(end - start);
+        assert!(
+            span > std::time::Duration::from_millis(10),
+            "trial {trial}: the kernel must outlast the spin, {span:?}"
+        );
+        for wall in woke {
+            let late = wall.saturating_sub(span);
+            println!("waiters trial {trial}: GPU {span:?}, woke after {wall:?}, {late:?} late");
+            assert!(late < std::time::Duration::from_millis(30), "trial {trial}: {late:?} late past {span:?}");
+        }
+    }
+    drop(graph);
+    output.raw.free_amd_device_in_place();
+}
+
+/// A long graph of short kernels: the waiting thread's CPU time against the
+/// wall time. A wait that sleeps uses a sliver of a core; one kept polling by
+/// progress (an AQL queue's read index) uses the whole wait. Prints only.
+///
+/// Run: `cargo test -p svod-device --release --lib long_graph_wait -- --ignored --nocapture --test-threads=1`
+#[test]
+#[ignore = "manual hardware probe; needs a real AMD GPU + clang"]
+fn long_graph_wait_cpu_probe() {
+    let Some(alloc) = amd_alloc_or_skip() else { return };
+    let _serial = PM4_GRAPH_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _pm4 = Pm4GraphOverride::enable(alloc.dev.core());
+    ensure_hw_signal_pool(&alloc);
+    let Some((graph, _program, output)) = sleepy_graph(&alloc, 800, 400) else { return };
+    for trial in 0..3 {
+        output.set(-1.0);
+        let (wall, cpu) = (std::time::Instant::now(), thread_cpu());
+        graph.replay(&[], &[]).expect("replay");
+        alloc.dev.core().synchronize_all().expect("synchronize_all");
+        let (wall, cpu) = (wall.elapsed(), thread_cpu() - cpu);
+        assert_eq!(output.get(), 0.0);
+        println!(
+            "long-wait trial {trial}: wall {wall:?}, waiter CPU {cpu:?} ({:.1} %)",
+            100.0 * cpu.as_secs_f64() / wall.as_secs_f64()
+        );
+    }
+    drop(graph);
+    output.raw.free_amd_device_in_place();
+}
+
+/// Replay-to-wake latency of a short graph: mean wall time per replay and
+/// synchronize, which a wait's spin budget trades against CPU. Prints only.
+///
+/// Run: `cargo test -p svod-device --release --lib short_graph_wait -- --ignored --nocapture --test-threads=1`
+#[test]
+#[ignore = "manual hardware probe; needs a real AMD GPU + clang"]
+fn short_graph_wait_latency_probe() {
+    let Some(alloc) = amd_alloc_or_skip() else { return };
+    let _serial = PM4_GRAPH_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _pm4 = Pm4GraphOverride::enable(alloc.dev.core());
+    ensure_hw_signal_pool(&alloc);
+    for iterations in [0, 30, 300] {
+        let Some((graph, _program, output)) = sleepy_graph(&alloc, iterations.max(1), 1) else { return };
+        let span = {
+            let timestamps = graph.replay_profiled(&[], &[]).expect("profiled replay").expect("profile support");
+            alloc.dev.core().synchronize_all().expect("synchronize_all");
+            let (start, end) = timestamps[0].timestamps_ns().expect("graph GPU timestamps");
+            std::time::Duration::from_nanos(end - start)
+        };
+        let mut walls = (0..300)
+            .map(|_| {
+                let wall = std::time::Instant::now();
+                graph.replay(&[], &[]).expect("replay");
+                alloc.dev.core().synchronize_all().expect("synchronize_all");
+                wall.elapsed()
+            })
+            .collect::<Vec<_>>();
+        walls.sort();
+        let cpu = thread_cpu();
+        println!(
+            "short-wait GPU {span:?}: median {:?}, p90 {:?}, max {:?} (thread CPU so far {cpu:?})",
+            walls[walls.len() / 2],
+            walls[walls.len() * 9 / 10],
+            walls[walls.len() - 1]
+        );
+        drop(graph);
+        output.raw.free_amd_device_in_place();
+    }
+}
+
 /// Dispatch one kernel through the per-plan `PlanContext` with `profile=true`,
 /// drain, and read back the GPU-clock span the two `release_mem_timestamp`
 /// probes wrote — the single-XCC PM4 path, which has no AQL `ENABLE_PROFILING`
@@ -602,4 +970,220 @@ attributes #0 = { alwaysinline nounwind "amdgpu-flat-work-group-size"="1,64" }
 
     assert_eq!(output.get(), 1.0);
     output.raw.free_amd_device_in_place();
+}
+
+/// Lanes dispatching at once while the shared kernarg ring wraps. Each thread
+/// counts its own dispatches into its own buffer through a kernarg pointer, and
+/// abandons a filler reservation per round so the ring wraps every few rounds,
+/// as a long suite's traffic does. A slot reused while live shows as counts
+/// moved between threads (PM4) or a timeline wait that never retires (AQL,
+/// whose control programs share the ring with the kernargs).
+///
+/// One thread per lane: the test build parks a lane acquisition for only 25 ms.
+///
+/// Run: `SVOD_DEVICE=AMD:0 [SVOD_AMD_AQL=1] cargo test -p svod-device --release --lib
+/// concurrent_lanes_survive_kernarg_wraps -- --ignored --nocapture`
+#[test]
+#[ignore = "manual hardware probe; needs a real AMD GPU + clang, and four lanes (the default)"]
+fn concurrent_lanes_survive_kernarg_wraps_probe() {
+    const COUNT_IR: &str = r#"target triple = "amdgcn-amd-amdhsa"
+define amdgpu_kernel void @count(ptr noalias %buf0) #0 {
+  %old = atomicrmw add ptr %buf0, i32 1 monotonic
+  ret void
+}
+attributes #0 = { alwaysinline nounwind "amdgpu-flat-work-group-size"="1,64" }
+"#;
+    const THREADS: usize = 4;
+    const ROUNDS: usize = 400;
+    const BURST: usize = 32;
+    let Some(alloc) = amd_alloc_or_skip() else { return };
+    ensure_hw_signal_pool(&alloc);
+    let Some(bytes) = clang_amdgcn(COUNT_IR, alloc.dev.arch.mcpu()) else { return };
+    let program = AmdProgram::load(alloc.dev.clone(), &alloc, &bytes, "count", &global_f32_buffer_abi()).expect("load");
+    let counters = (0..THREADS).map(|_| ProbeBuffer::new(&alloc)).collect::<Vec<_>>();
+    counters.iter().for_each(|counter| counter.set(0.0));
+    let addresses = counters.iter().map(|counter| counter.gpu).collect::<Vec<_>>();
+    std::thread::scope(|scope| {
+        for &address in &addresses {
+            let (alloc, program) = (&alloc, &program);
+            scope.spawn(move || {
+                let context = program.new_exec_context().expect("context").expect("AMD context");
+                for _ in 0..ROUNDS {
+                    for _ in 0..BURST {
+                        unsafe {
+                            context.dispatch(
+                                program,
+                                &[address as *mut u8],
+                                &[],
+                                Some([1, 1, 1]),
+                                Some([1, 1, 1]),
+                                false,
+                            )
+                        }
+                        .expect("dispatch");
+                    }
+                    let arena = alloc.dev.core().kernarg_arena.lock().upgrade().expect("a lane holds the arena");
+                    drop(arena.reserve(arena.size / 8, 16).expect("filler"));
+                    context.synchronize().expect("synchronize");
+                }
+            });
+        }
+    });
+    let counts = counters.iter().map(|counter| counter.get().to_bits()).collect::<Vec<_>>();
+    for counter in counters {
+        counter.raw.free_amd_device_in_place();
+    }
+    assert!(counts.iter().all(|&count| count == (ROUNDS * BURST) as u32), "per-thread dispatch counts {counts:?}");
+}
+
+/// Whether a host store into VRAM reaches the next dispatch: each round the
+/// host writes a fresh pattern into a host-visible VRAM buffer, flushes HDP
+/// (or not, `HDP_MODE=none`), and a kernel copies it into system memory the
+/// host then checks. Stale words mean HDP held the stores. Prints the count
+/// and the flush's cost.
+///
+/// Run: `SVOD_DEVICE=AMD:0 [HDP_MODE=none] [ROUNDS=…] [WORDS=…] cargo test -p svod-device --release --lib
+/// hdp_stale_write_probe -- --ignored --nocapture`
+#[test]
+#[ignore = "manual hardware probe; needs a real AMD GPU + clang"]
+fn hdp_stale_write_probe() {
+    const COPY_IR: &str = r#"target triple = "amdgcn-amd-amdhsa"
+declare i32 @llvm.amdgcn.workitem.id.x()
+declare i32 @llvm.amdgcn.workgroup.id.x()
+define amdgpu_kernel void @copy(ptr addrspace(1) noalias %src, ptr addrspace(1) noalias %dst) #0 {
+  %t = call i32 @llvm.amdgcn.workitem.id.x()
+  %g = call i32 @llvm.amdgcn.workgroup.id.x()
+  %b = shl i32 %g, 6
+  %i = add i32 %b, %t
+  %s = getelementptr i32, ptr addrspace(1) %src, i32 %i
+  %v = load volatile i32, ptr addrspace(1) %s
+  %d = getelementptr i32, ptr addrspace(1) %dst, i32 %i
+  store i32 %v, ptr addrspace(1) %d
+  ret void
+}
+attributes #0 = { nounwind "amdgpu-flat-work-group-size"="64,64" }
+"#;
+    let env = |key: &str, default: usize| std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default);
+    let (rounds, words) = (env("ROUNDS", 2000), env("WORDS", 1 << 16).next_multiple_of(64));
+    let flush = std::env::var("HDP_MODE").as_deref() != Ok("none");
+    let Some(alloc) = amd_alloc_or_skip() else { return };
+    ensure_hw_signal_pool(&alloc);
+    let Some(bytes) = clang_amdgcn(COPY_IR, alloc.dev.arch.mcpu()) else { return };
+    let abi = [0, 1].map(|slot| AbiParamDescriptor { slot, ..global_f32_buffer_abi()[0].clone() });
+    let program = AmdProgram::load(alloc.dev.clone(), &alloc, &bytes, "copy", &abi).expect("load");
+    let spec = crate::allocator::BufferSpec { cpu_access: true, ..Default::default() };
+    let src = crate::allocator::Allocator::alloc(&alloc, words * 4, &spec, false).expect("VRAM source");
+    let dst = alloc.alloc_uncached(words * 4).expect("GTT destination");
+    let (
+        RawBuffer::AmdDevice { gpu_addr: src_gpu, host_ptr: Some(src_host), vram: true, .. },
+        RawBuffer::AmdDevice { gpu_addr: dst_gpu, host_ptr: Some(dst_host), .. },
+    ) = (&src, &dst)
+    else {
+        panic!("a host-visible VRAM source and a mapped GTT destination")
+    };
+    let (src_host, dst_host) = (src_host.cast::<u32>().as_ptr(), dst_host.cast::<u32>().as_ptr());
+    let context = program.new_exec_context().expect("context").expect("AMD context");
+    let (mut stale_rounds, mut stale_words, mut flush_time) = (0usize, 0usize, std::time::Duration::ZERO);
+    for round in 1..=rounds as u32 {
+        for i in 0..words {
+            // SAFETY: both mappings hold `words` u32s; the GPU is idle here.
+            unsafe { std::ptr::write_volatile(src_host.add(i), round.wrapping_mul(0x9e37_79b9) ^ i as u32) };
+        }
+        if flush {
+            let t = std::time::Instant::now();
+            alloc.dev.core().hdp().flush();
+            flush_time += t.elapsed();
+        }
+        unsafe {
+            context.dispatch(
+                &program,
+                &[*src_gpu as *mut u8, *dst_gpu as *mut u8],
+                &[],
+                Some([words / 64, 1, 1]),
+                Some([64, 1, 1]),
+                false,
+            )
+        }
+        .expect("dispatch");
+        context.synchronize().expect("sync");
+        let stale = (0..words)
+            .filter(
+                |&i| unsafe { std::ptr::read_volatile(dst_host.add(i)) } != round.wrapping_mul(0x9e37_79b9) ^ i as u32,
+            )
+            .count();
+        stale_rounds += usize::from(stale > 0);
+        stale_words += stale;
+    }
+    println!(
+        "hdp-stale flush={flush} rounds={rounds} words={words}: stale rounds {stale_rounds}, stale words {stale_words}, flush {:.2} us/round",
+        flush_time.as_secs_f64() * 1e6 / rounds as f64
+    );
+    crate::allocator::Allocator::free(&alloc, src, words * 4, &spec);
+    dst.free_amd_device_in_place();
+}
+
+/// A dispatch invalidates its lane's caches with a full barrier only after
+/// stores reached memory behind them: the host's through HDP and the copy
+/// engine's, or on the lane's first dispatch. A timed dispatch always does, so
+/// a tuner measures every candidate cold; a barrier counts as done only once
+/// its dispatch was published. Every dispatch's completion still writes L2
+/// back before the timeline store the host polls, and an AQL dispatch keeps
+/// its system-scope release.
+#[test_case::test_case(1; "pm4")]
+#[test_case::test_case(2; "aql")]
+fn a_dispatch_invalidates_caches_only_after_stores_behind_them(xccs: u32) {
+    use crate::allocator::Allocator;
+    use crate::amd::sys::{hsa, pm4};
+    use crate::hcq::{Command, Submission};
+
+    let Some(bytes) = clang_amdgcn(EMPTY_IR, "gfx1100") else { return };
+    let mock = load_mock_program_on(xccs, &bytes, "empty", &[], true);
+    let core = mock.device.core();
+    let pool = crate::amd::connector::PoolQueue::new_with_resources(Arc::clone(core), &mock.allocator).unwrap();
+    let owner = crate::amd::connector::OwnerCtx::new(Arc::clone(core), mock.allocator.clone());
+    let gfx9 = core.arch.gfx_major() == 9;
+    let full: &[u32] = if gfx9 { &pm4::acquire_mem_gfx9() } else { &pm4::acquire_mem() };
+    let dispatch = |profile: bool| {
+        let (ring, packet, value) = (pool.queue().ring_write_idx(), pool.queue().ring_write_idx(), pool.pm4_value());
+        let result = unsafe {
+            mock.program.execute_on(&owner, &pool, &[], &[], Some([1, 1, 1]), Some([1, 1, 1]), false, profile)
+        };
+        let dwords = pool.queue().published_pm4(ring);
+        let completion = pm4::release_mem_write(pool.pm4_signal().value_addr(), value, true, true, false, gfx9);
+        if result.is_ok() {
+            assert_eq!(dwords.windows(completion.len()).filter(|run| *run == completion).count(), 1, "{dwords:x?}");
+            let flush = if gfx9 { pm4::EOP_TC_WB_ACTION_EN } else { pm4::RELEASE_MEM_GCR_GL2_WB };
+            assert_ne!(completion[1] & flush, 0, "the host reads what the completion wrote back");
+        }
+        if xccs > 1 && result.is_ok() {
+            let header = u16::from_le_bytes(pool.queue().ring_packet(packet + 1)[..2].try_into().unwrap());
+            let release = (header >> hsa::hsa_packet_header_t_HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE) & 3;
+            assert_eq!(u32::from(release), hsa::hsa_fence_scope_t_HSA_FENCE_SCOPE_SYSTEM);
+        }
+        retire_lane(&pool);
+        result.map(|_| dwords.windows(full.len()).filter(|run| *run == full).count())
+    };
+
+    assert_eq!(dispatch(false).unwrap(), 1, "a new lane's caches are unknown");
+    assert_eq!(dispatch(false).unwrap(), 0, "kernel to kernel the dispatch's fences suffice");
+    assert_eq!(dispatch(true).unwrap(), 1, "a timed dispatch runs cold");
+    assert_eq!(dispatch(true).unwrap(), 1, "every timed dispatch runs cold");
+    assert_eq!(dispatch(false).unwrap(), 0);
+
+    let opts = crate::allocator::BufferSpec { cpu_access: true, ..Default::default() };
+    let buffer = mock.allocator.alloc(64, &opts, false).unwrap();
+    assert_eq!(dispatch(false).unwrap(), 0, "the host stored nothing yet");
+    mock.allocator._copyin(&buffer, 0, &[7; 16]).unwrap();
+    assert_eq!(dispatch(false).unwrap(), 1, "the host stored into VRAM");
+    assert_eq!(dispatch(false).unwrap(), 0);
+
+    let copy = crate::amd::queue::AmdCopyQueue::create(&mock.allocator).unwrap();
+    let mut transfer = Submission::new(crate::hcq::QueueKind::Copy(0));
+    transfer.push(Command::Copy { dst: 0x1000, src: 0x2000, bytes: 4 });
+    copy.submit_hcq(&transfer).unwrap();
+    mock.iface.script_publication(Err(scripted_error("dispatch publication")));
+    assert!(dispatch(false).is_err());
+    assert_eq!(dispatch(false).unwrap(), 1, "SDMA stored, and the barrier before was never published");
+    assert_eq!(dispatch(false).unwrap(), 0);
+    mock.allocator.free(buffer, 64, &opts);
 }

@@ -27,7 +27,7 @@ ABI). Rust-привязки генерируются из него во врем
   `<drm/drm.h>` (рудиментарная — тело использует только поля `__u32 drm_fd`),
   сами вендорены под `device/include/`, и `build.rs` передаёт
   `-I<crate>/include`, так что bindgen резолвит их вместо `/usr/include`.
-  Сгенерированный файл содержит 60 структур и 34 константы. (bindgen'у нужен
+  (bindgen'у нужен
   `libclang`, который на macOS поставляется с Xcode CLT.)
 
   Он разрешает по allow-листу ровно те KFD-типы и константы, которые нужны
@@ -37,8 +37,9 @@ ABI). Rust-привязки генерируются из него во врем
   allowlist_type:  kfd_ioctl_.*_args, kfd_process_device_apertures,
                    kfd_event_data, kfd_hsa_signal_event_data,
                    kfd_hsa_memory_exception_data, kfd_hsa_hw_exception_data,
-                   kfd_memory_exception_failure, __u\d+, __s\d+
-  allowlist_var:   KFD_IOC_.*, KFD_MAX_QUEUE_PERCENTAGE, AMDKFD_IOC_.*
+                   kfd_memory_exception_failure, kfd_mmio_remap, __u\d+, __s\d+
+  allowlist_var:   KFD_IOC_.*, KFD_MAX_QUEUE_PERCENTAGE,
+                   KFD_RUNTIME_ENABLE_MODE_ENABLE_MASK, AMDKFD_IOC_.*
   ```
 
   (Коды запросов `AMDKFD_IOC_*` внесены в allow-лист, но никогда не
@@ -93,11 +94,11 @@ ABI). Rust-привязки генерируются из него во врем
 | `kfd_destroy_event` | `0x09` | Снести все три события при `Drop` |
 | `kfd_wait_events` | `0x0C` | `wait_events` — блокировка на событиях завершения / сбоя |
 | `kfd_acquire_vm` | `0x15` | Зарегистрировать DRM render fd как VM этого процесса для GPU |
-| `kfd_alloc_memory_of_gpu` | `0x16` | `alloc_raw` — выделить VRAM/GTT |
+| `kfd_alloc_memory_of_gpu` | `0x16` | `alloc_raw` — выделить VRAM/GTT; также MMIO-remap-страница |
 | `kfd_free_memory_of_gpu` | `0x17` | `free_raw` |
 | `kfd_map_memory_to_gpu` | `0x18` | Привязать выделение в таблицу страниц GPU |
 | `kfd_unmap_memory_from_gpu` | `0x19` | `free_raw` |
-| `kfd_runtime_enable` | `0x25` | Включить рантайм (только KFD ABI ≥ 1.14) |
+| `kfd_runtime_enable` | `0x25` | Включить рантайм KFD битом включения, один раз на процесс (только KFD ABI ≥ 1.14) |
 
 Ещё пять (`set_memory_policy`, `get_clock_counters`, `get_process_apertures`,
 `set_event`, `reset_event`) объявлены для полноты, но сейчас не вызываются.
@@ -112,18 +113,26 @@ flowchart TD
   A["open /dev/kfd (process-shared, one fd)"] --> B["open /dev/dri/renderD(minor) (per node — the DRM render fd)"]
   B --> C["GET_VERSION: capture ABI version"]
   C --> D["ACQUIRE_VM(drm_fd): register this fd as the process VM for the GPU"]
-  D --> E["RUNTIME_ENABLE: only if ABI is at least 1.14"]
+  D --> E["RUNTIME_ENABLE(ENABLE_MASK): once per process, only if ABI is at least 1.14"]
   E --> F["event page: alloc + bind once per process, map per device"]
   F --> G["CREATE_EVENT x 3: queue-signal, memory-fault, hw-exception"]
+  G --> H["HDP flush: ALLOC(MMIO_REMAP) + mmap from /dev/kfd, else a VRAM readback word"]
 ```
 
 Цепочка строго упорядочена: `ACQUIRE_VM` обязан предшествовать любому выделению,
 а event-страница должна быть привязана до первого `CREATE_QUEUE`.
+`RUNTIME_ENABLE` тоже должен идти до первой очереди процесса, после которой KFD
+его отвергает, поэтому рантайм для процесса включает первое открытое устройство,
+а следующее находит его уже включённым.
 
 С DRM render fd связана любопытная деталь: **DRM-ioctl нет вообще**. `drm_fd`
 используется лишь двумя способами — передаётся *по номеру* в `ACQUIRE_VM` и
 служит `mmap`-fd для видимых хосту маппингов. Doorbell, напротив, `mmap`-ится
-из KFD-fd.
+из KFD-fd — как и MMIO-remap-страница KFD: хост пишет в её регистр
+`HDP_MEM_FLUSH_CNTL` и читает его обратно, чтобы сбросить HDP. Если KFD такую
+страницу не даёт (страницы хоста больше 4 КиБ или KFD отклоняет выделение, как
+на SR-IOV VF), устройство вместо неё держит видимое хосту слово в VRAM и
+сбрасывает HDP записью в него с обратным чтением.
 
 ---
 
@@ -187,16 +196,18 @@ GPU.
 
 | `AllocKind` | Флаги | Используется для |
 |---|---|---|
-| `DeviceVram { executable }` | `VRAM \| WRITABLE \| NO_SUBSTITUTE` (+ `EXECUTABLE` для кода, + `PUBLIC`, когда видимо хосту) | Данные тензоров, code object, scratch; видимые хосту арены kernarg и управляющие буферы графов / связанных планов |
-| `UncachedGtt` | `GTT \| WRITABLE \| EXECUTABLE \| NO_SUBSTITUTE \| PUBLIC \| COHERENT \| UNCACHED` | Командные кольца, GART-страницы, слоты сигналов, промежуточный буфер SDMA |
+| `DeviceVram { executable }` | `VRAM \| WRITABLE \| NO_SUBSTITUTE` (+ `EXECUTABLE` для кода, + `PUBLIC`, когда видимо хосту) | Данные тензоров, code object, scratch; на частях с несколькими XCC — арены kernarg и управляющие буферы графов / связанных планов; слово для HDP-readback, где KFD не даёт remap-страницы |
+| `UncachedGtt` | `GTT \| WRITABLE \| EXECUTABLE \| NO_SUBSTITUTE \| PUBLIC \| COHERENT \| UNCACHED` | Командные кольца, GART-страницы, слоты сигналов, промежуточный буфер SDMA; на остальных — арены kernarg и управляющие буферы |
 
 Разновидность GTT `UNCACHED | COHERENT` важна: командное кольцо и слоты
 сигналов должны быть немедленно видимы и для CPU, и для GPU, иначе хост будет
 вечно крутиться в ожидании значения завершения, застрявшего в L2 GPU. KFD
 отклоняет `CREATE_QUEUE` на обычном VRAM-кольце с ошибкой `EINVAL`.
-Единственное выделение вне `alloc_raw` — это event-страница процесса
-(`alloc_event_page` в `device.rs`): она составляет те же флаги некэшируемого GTT
-сырыми ioctl и поэтому не попадает в [реестр VA](./debugging.md).
+Мимо `alloc_raw` идут два выделения: event-страница процесса
+(`alloc_event_page` в `device.rs`), которая составляет те же флаги
+некэшируемого GTT сырыми ioctl, и MMIO-remap-страница устройства
+(`MmioRemapPage::map` в `iface.rs`). Ни одно из них не попадает в
+[реестр VA](./debugging.md).
 
 ### `cpu_access` следует за очередью копирования
 
@@ -212,10 +223,13 @@ DMA: `_copyin`/`_copyout` копируются через промежуточн
 видимым хосту, а копии откатываются к обычному хостовому `memmove` после
 ограниченного по области `wait_storage`. Обобщённый `LruAllocator`
 (`device/src/allocator.rs`) складывает освобождённые буферы в пул по
-`(size, BufferSpec)`; code object'ы, буферы EOP / CWSR-сохранения контекста,
-кольца, GART-страницы, слоты сигналов и scratch никогда не попадают в этот пул —
-они вызывают `AmdAllocator` напрямую (`alloc_uncached_tagged` /
-`alloc_host_visible_tagged` / `alloc_scratch`) и идут прямо к шву.
+`(size, BufferSpec)`; code object'ы, арены kernarg, командные буферы графов /
+связанных планов, буферы EOP / CWSR-сохранения контекста, кольца,
+GART-страницы, слова ошибок очередей, слоты сигналов и scratch никогда не
+попадают в этот пул. Code object'ы запрашиваются через `AmdAllocator::alloc` с
+`nolru`; остальные вызывают тегированные точки входа напрямую
+(`alloc_submission_tagged`, `alloc_uncached_tagged`,
+`alloc_host_visible_tagged`) или `alloc_scratch` и идут прямо к шву.
 
 :::note[Состояние, разделяемое процессом]
 `/dev/kfd` открывается один раз на процесс и разделяется всеми устройствами

@@ -74,5 +74,6 @@ pub fn addr_space_num(target: LlvmTarget, addrspace: AddrSpace) -> u32 {
         (LlvmTarget::Amd(_) | LlvmTarget::Nvptx(_), AddrSpace::Global) => 1,
         (LlvmTarget::Amd(_) | LlvmTarget::Nvptx(_), AddrSpace::Local) => 3,
         (LlvmTarget::Amd(_) | LlvmTarget::Nvptx(_), AddrSpace::Reg) => 5,
+        (_, AddrSpace::Swizzled { .. }) => 7,
     }
 }

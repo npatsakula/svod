@@ -14,7 +14,7 @@ use crate::amd::connector::OwnerCtx;
 use crate::amd::program::AmdProgram;
 use crate::amd::queue::{
     AQL_PACKET_BYTES, Pm4LoweringState, build_pm4_indirect_buffer, lower_hcq_aql_submission_program,
-    lower_hcq_pm4_command_buffer, validate_aql_packet_count,
+    lower_hcq_pm4_command_buffer, push_queue_event_mailbox, validate_aql_packet_count,
 };
 use crate::device::{Graph, GraphKernel};
 use crate::error::{Error, Result};
@@ -104,9 +104,11 @@ fn lower_graph_submission(
         let lowered = lower_hcq_pm4_command_buffer(submission, state)?;
         build_pm4_indirect_buffer(0, lowered.bytes.len() / 4)?;
         let linked = lane.link(&lowered, &LinkPatchValues(links.to_vec()))?;
-        let buffer = AmdBufferGuard::new(
-            allocator.alloc_host_visible_tagged(lowered.bytes.len().max(16), crate::amd::va_registry::AllocTag::Gtt)?,
-        );
+        let buffer =
+            AmdBufferGuard::new(allocator.alloc_submission_tagged(
+                lowered.bytes.len().max(16),
+                crate::amd::va_registry::AllocTag::CommandBuffer,
+            )?);
         let (gpu, host) = match buffer.buffer() {
             RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(host), .. } => (*gpu_addr, host.as_ptr()),
             _ => return Err(Error::NotHostVisible { what: "PM4 graph command buffer" }),
@@ -117,10 +119,10 @@ fn lower_graph_submission(
     let control_link = links.len();
     let program = lower_hcq_aql_submission_program(submission, state, PatchSource::LinkAddress(control_link))?;
     validate_aql_packet_count(program.aql.bytes.len() / AQL_PACKET_BYTES)?;
-    let buffer = AmdBufferGuard::new(
-        allocator
-            .alloc_host_visible_tagged(program.control.bytes.len().max(16), crate::amd::va_registry::AllocTag::Gtt)?,
-    );
+    let buffer = AmdBufferGuard::new(allocator.alloc_submission_tagged(
+        program.control.bytes.len().max(16),
+        crate::amd::va_registry::AllocTag::CommandBuffer,
+    )?);
     let (gpu, host) = match buffer.buffer() {
         RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(host), .. } => (*gpu_addr, host.as_ptr()),
         _ => return Err(Error::NotHostVisible { what: "AQL graph control program" }),
@@ -200,7 +202,7 @@ impl AmdGraph {
         let (offsets, bytes) =
             kernarg_offsets(programs.iter().map(|program| program.kernarg_record_size()), KERNARG_ALIGN);
         let kernargs_buf = AmdBufferGuard::new(
-            allocator.alloc_host_visible_tagged(bytes.max(16), crate::amd::va_registry::AllocTag::Kernarg)?,
+            allocator.alloc_submission_tagged(bytes.max(16), crate::amd::va_registry::AllocTag::Kernarg)?,
         );
         let (kernargs_gpu, kernargs_host) = match kernargs_buf.buffer() {
             RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(host), .. } => (*gpu_addr, host.as_ptr()),
@@ -216,9 +218,9 @@ impl AmdGraph {
         // `comp_queues[dev].memory_barrier()` at the head of a captured device
         // queue (`graph/hcq.py:157`). Per-dispatch coherence is the narrow
         // `acquire_mem` + `CS_PARTIAL_FLUSH` that `build_exec_pm4` already
-        // emits, and the AQL packets carry the header BARRIER bit; a full HDP
-        // flush plus full-invalidate acquire per kernel bought nothing. Morok
-        // keeps the barrier AFTER the timeline wait, matching its own
+        // emits, and the AQL packets carry the header BARRIER bit; a
+        // full-invalidate acquire per kernel buys nothing. Svod keeps the
+        // barrier AFTER the timeline wait, matching its own
         // `Wait -> MemoryBarrier -> Compute` per-call finalization.
         submission.push(Command::MemoryBarrier);
         let mut links = Vec::with_capacity(kernels.len() * 2);
@@ -292,6 +294,8 @@ impl AmdGraph {
         submission.push(Command::Store { dst: 0, value: 0, scope: StoreScope::System });
         submission.bind(store, CommandField::StoreDst, PatchSource::System(SystemField::TimelineSignal(0)))?;
         submission.bind(store, CommandField::StoreValue, PatchSource::System(SystemField::TimelineValue(1)))?;
+        push_queue_event_mailbox(&mut submission, device.core());
+        let queue_event_mailbox = device.core().queue_event_mailbox().map(|mailbox| mailbox.address);
 
         let profile_linked = {
             let mut profiled = submission.clone();
@@ -321,9 +325,7 @@ impl AmdGraph {
                 tmpring_size: lane.tmpring_size(),
                 target_major: device.core().arch.gfx_major(),
                 completion_xcc_mask: (!pm4 && device.core().node.num_xcc > 1).then_some(1),
-                // Captured timeline stores are placeholders patched per replay, so
-                // they never carry the KFD interrupt companion.
-                queue_event_mailbox: None,
+                queue_event_mailbox,
             };
             Some(lower_graph_submission(allocator, &lane, &profiled, &links, state, pm4)?)
         };
@@ -333,9 +335,7 @@ impl AmdGraph {
             tmpring_size: lane.tmpring_size(),
             target_major: device.core().arch.gfx_major(),
             completion_xcc_mask: (!pm4 && device.core().node.num_xcc > 1).then_some(1),
-            // Captured timeline stores are placeholders patched per replay, so
-            // they never carry the KFD interrupt companion.
-            queue_event_mailbox: None,
+            queue_event_mailbox,
         };
         let (linked, control) = lower_graph_submission(allocator, &lane, &submission, &links, state, pm4)?;
         let command = linked.replay_buffer();

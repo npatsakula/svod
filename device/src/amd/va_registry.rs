@@ -30,19 +30,29 @@ use parking_lot::Mutex;
 /// culprit (see `amd-dispatch-lock-invariant`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AllocTag {
-    /// General device VRAM (tensor data, code, kernargs, EOP / ctx-save).
+    /// General device VRAM (tensor data, code, EOP / ctx-save).
     Vram,
     /// GTT-pinned host-visible control memory (queue ring, GART, signal slots).
     Gtt,
     SignalPool,
     QueueRing,
     QueueGart,
+    /// A compute queue's `queue_inactive_signal` and `ErrorReason` words.
     QueueInactive,
     Staging,
+    /// Kernargs: the device's arena (with AQL control programs) and the
+    /// kernargs graphs and linked plans own; VRAM on multi-XCC parts, uncached
+    /// GTT elsewhere (`Hdp`).
     Kernarg,
-    /// Register-spill scratch — GPU-only VRAM, realloc'd per kernel as private
-    /// segment sizes grow.
+    /// Command buffers graphs and linked plans own (PM4 IBs, AQL control
+    /// programs); placed as kernargs.
+    CommandBuffer,
+    /// Register-spill scratch — GPU-only VRAM, reallocated, at least doubling,
+    /// when a kernel needs more than it holds.
     Scratch,
+    /// The host-visible VRAM word the host reads back to flush HDP where KFD
+    /// gives no remap page.
+    HdpReadback,
 }
 
 impl AllocTag {
@@ -53,10 +63,12 @@ impl AllocTag {
             AllocTag::SignalPool => "GTT signal pool",
             AllocTag::QueueRing => "GTT queue ring",
             AllocTag::QueueGart => "GTT queue GART",
-            AllocTag::QueueInactive => "GTT queue-inactive signal",
+            AllocTag::QueueInactive => "GTT queue error words",
             AllocTag::Staging => "GTT SDMA staging",
             AllocTag::Kernarg => "kernarg",
+            AllocTag::CommandBuffer => "command buffer",
             AllocTag::Scratch => "scratch",
+            AllocTag::HdpReadback => "HDP readback word",
         }
     }
 }

@@ -127,8 +127,8 @@ tests यादृच्छिक व्यंजकों पर Z3 को orac
 
 ONNX इनिशियलाइज़र और `Tensor::from_path` टेंसर डिस्क से लेज़ी तरीके से मेमोरी-मैप होते हैं। डिवाइस बफ़र
 सब-व्यू समर्थित करते हैं। होस्ट कोड रियलाइज़्ड टेंसरों को उधार लिए गए
-`ndarray` व्यू (`array_view`, `array_view_mut`) से पढ़ता-लिखता है, इसलिए कैप्चर किए गए प्लान
-को डेटा देने में कुछ भी कॉपी नहीं होता।
+`ndarray` व्यू (`array_view`) से पढ़ता है और host write guard (`with_host_write`) से लिखता है,
+जो सीधे बफ़र में लिखता है, इसलिए कैप्चर किए गए प्लान को डेटा देने में कोई staging कॉपी नहीं लगती।
 
 ### कर्नेल फ़्यूज़न और एट्रिब्यूशन
 
@@ -219,7 +219,7 @@ let plan = Tensor::prepare_batch(outputs.values())?; // compile once
 plan.execute()?;
 
 for batch in batches {
-    input.array_view_mut::<f32>()?.as_slice_mut().unwrap().copy_from_slice(&batch);
+    input.with_host_write::<f32, _>(|w| w.copy_from(&batch))?;
     plan.execute()?; // replay: no tracing, no compilation, no allocation
 }
 ```

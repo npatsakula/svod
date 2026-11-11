@@ -35,8 +35,9 @@ parsed case-insensitively as `NAME[:N]` (`dtype/src/default_device.rs`):
 | `CUDA[:N]`, `GPU[:N]` | `DeviceSpec::Cuda { device_id }` |
 | `METAL[:N]` | `DeviceSpec::Metal { device_id }` (only `0` exists) |
 
-`NAME` alone is device 0. `NV` is rejected on purpose — the name is reserved
-for a future userspace NVIDIA driver. When nothing selects a device the
+`NAME` alone is device 0. `NV` is reserved for a future userspace NVIDIA
+driver: `DeviceSpecExt::parse` rejects it, and `SVOD_DEVICE` ignores it like
+any value it cannot parse, falling back to the platform default. When nothing selects a device the
 platform default applies: **`METAL:0` on macOS, `CPU` everywhere else**. The
 full precedence is a `with_default_device` scope, then a thread-local
 `set_default_device`, then `SVOD_DEVICE` (read once per process), then the
@@ -108,7 +109,7 @@ pub struct Device {
 | `RuntimeFactory` | — | loads a `CompiledSpec` into a `Program`; `Device::new` wraps it so every spec's stage identity is validated first |
 | `Program` | `execute`, `name` | one kernel launch; `execute_timed` (GPU-clock duration for BEAM), `new_exec_context`, `resource_usage` and `as_any` are optional |
 | `PlanContext` | `dispatch`, `synchronize` | per-plan state minted by `Program::new_exec_context`: lanes, completion tokens, timestamps, counters (`set_pmc`), native linked replay (`replay_linked_plan`) |
-| `Allocator` | `_alloc`, `name`, `device_spec` | `_copyin` / `_copyout` / `_transfer` / `_free` / `synchronize` / `supports_device_local` are optional and default to host-memory semantics |
+| `Allocator` | `_alloc`, `name`, `device_spec` | the rest are optional: `_copyin` / `_copyout` / `_transfer` default to an `Unsupported` error, `_free` drops the buffer, `synchronize` is a no-op and `supports_device_local` is `false` |
 | `Graph` | `replay` | a captured kernel chain replayed with one submission; `completion_token`, `replay_profiled` optional |
 | `CompletionToken`, `TimelineSignal`, `DispatchTimestamps` | | the synchronization and profiling handles the executor consumes (`device/src/sync.rs`) |
 

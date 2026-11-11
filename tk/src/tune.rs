@@ -8,7 +8,7 @@
 //! file per device and crate version. A line's key carries a digest of the
 //! device's compiler ([`compiler`]) and a fingerprint of the kernels the
 //! candidates emit ([`fingerprint`]), so a toolchain or kernel change
-//! re-measures and nothing else does; its candidates carry each config's
+//! re-measures, and a ranking change does not; its candidates carry each config's
 //! own code beside its index, so a line reads without re-deriving the list
 //! its digest names ([`crate::rank`]). An unreadable or unwritable store is
 //! a miss, never an error; a line the store cannot read is dropped at its
@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use svod_dtype::default_device::{default_device, with_default_device};
 use svod_dtype::{DType, DeviceSpec, ScalarDType};
+use svod_ir::SInt;
 use svod_ir::UOp;
 use svod_runtime::benchmark::{CLOCK_WARMUP, round_robin_min, warm_clock};
 use svod_runtime::{ExecutionPlan, KernelResources};
@@ -38,16 +39,22 @@ use crate::atoms::Target;
 use crate::ir::{Param, Program};
 use crate::launch;
 use crate::lower::Lowering;
+use crate::ops::config::LAUNCH;
 
 /// The store's line format, bumped when a line's meaning changes; a file of
-/// another format, or without the line, is dropped whole. 6 carries each
-/// candidate's config code beside its index (`idx:code ns` a timed pair,
-/// `idx:code` an admitted one), where 5 held indices alone into the list the
-/// line's digest names — a ranking change used to orphan every choice line,
-/// and now the line's own candidates replay ([`crate::rank`]). 5
-/// fingerprinted the emitted kernels, where 4 fingerprinted the programs
-/// and lowerings, targets and costs whole.
-pub(crate) const FORMAT: u32 = 6;
+/// another format, or without the line, is dropped whole. A timed candidate
+/// is `idx:code ns`, an admitted one `idx:code`: its index into the list
+/// the line's digest names and the config's own code
+/// ([`Field`](crate::ops::config::Field)), so a line's candidates replay without
+/// that list ([`crate::rank`]). A GEMM's code ends in its raster and tail
+/// split (`w,128,256,64,2,4,r3u,g8,~`, [`crate::kernels::gemm::TileOrder`],
+/// [`crate::kernels::gemm::TailSplit`]); a nearest config codes its list as
+/// one field (`~` in registers, `q16` queued, `m` then its listing a score
+/// matrix, [`crate::kernels::nearest::Way`]). The digest keys configs by
+/// their derived `Debug` and fingerprints the emitted kernels. A candidate
+/// of several programs is timed with a [`LAUNCH`] between each two
+/// ([`launched`]).
+pub(crate) const FORMAT: u32 = 11;
 /// Measurement: the rounds a contender is timed (the first over every
 /// candidate, the rest over the contenders), and the rounds the two leaders
 /// then run again ([`rounds`]).
@@ -67,8 +74,7 @@ pub(crate) enum Pass {
 /// its [`CONTENDER`]s; fewer run every round, a cut saving little and a
 /// short list being what a decode step's splits or a coordinate descent
 /// ask, where the candidates sit within a few percent of each other. A
-/// list of 8 to 15 is a shortlist all the same (gfx1151 admits 15 tiles of
-/// a split nearest at depth 768, a third of them past 1.4 times the best).
+/// list of 8 to 15 is a shortlist all the same.
 const CUT_FROM: usize = 8;
 /// Search bound: rounds past the first go to the candidates within this
 /// factor of the first round's best; the rest cannot win (a round's best of [`RUNS`] runs
@@ -80,17 +86,14 @@ pub(crate) const CONTENDER: f64 = 1.2;
 /// factor of the best so far. Two rounds in, a candidate's best sits within
 /// a few percent of its settled time, and a flat field (a split nearest's
 /// tiles, the GEMM's twins) keeps most of its contenders through every
-/// round of a 1.2 band: replaying the rounds recorded on sm_86, gfx1201 and
-/// gfx1151 (nearest at depths 512–1024, the 4096³ GEMM, an attention; 27
-/// timed lists) under a cut at 1.02–1.08 moved no pick, and one at 1.05
-/// times a fourth fewer candidates.
-const SETTLED: f64 = 1.05;
+/// round of a [`CONTENDER`] band, and a cut this tight moves no recorded
+/// pick.
+pub(crate) const SETTLED: f64 = 1.05;
 /// Search bound: a candidate whose first run takes this factor of the best
 /// time so far is timed no further, and no later round of a short list
-/// runs it: it cannot win. The first timed run follows an untimed one, and
-/// over 908 candidates on sm_86 (nearest, the 4096³ GEMM) it sat within
-/// 0.93–1.15 of the candidate's settled time: one aborted settles past 1.7
-/// times the best.
+/// runs it: it cannot win. The first timed run follows an untimed one and
+/// sits close to the candidate's settled time, so one aborted here settles
+/// well past the best.
 pub(crate) const HOPELESS: f64 = 2.0;
 /// Measurement: profiled runs per candidate per round, the most a tuner's
 /// round gives one ([`runs`]) and what the leaders' rounds and the probes give.
@@ -104,9 +107,7 @@ const MIN_RUNS: usize = 2;
 /// Measurement: the most profiled runs a candidate's minimum takes to prove
 /// consistent: a run under [`STEADY`] of the minimum so far resets the
 /// count, three over it settle the candidate. A clock still lifting shows a
-/// falling minimum run to run (a 3060 read a nearest search at 4.8 ms
-/// against its warm 0.87 while its every timed run rode the sagged clock);
-/// a warm kernel's minimum is flat within a run's drift.
+/// falling minimum run to run; a warm kernel's minimum is flat within a run's drift.
 const STABLE_RUNS: usize = 3;
 /// Measurement: a run within this of the minimum so far counts stable.
 const STEADY: f64 = 0.97;
@@ -204,8 +205,8 @@ pub type Candidate = Vec<(Program, Lowering)>;
 /// reads keys nothing, added, renamed or deleted. What a program emits is
 /// remembered by what it is made of, by the process and, for later
 /// processes of the same build, by the global store
-/// ([`TuneStore::fingerprint`]): lowering a shortlist takes 0.05–1.6 s,
-/// and a warm process lowers nothing.
+/// ([`TuneStore::fingerprint`]): lowering a shortlist is costly, and a
+/// warm process lowers nothing.
 pub(crate) fn fingerprint(candidates: &[Candidate]) -> u64 {
     TuneStore::global().fingerprint(candidates)
 }
@@ -775,7 +776,7 @@ pub(crate) type Floor<'a, C> = dyn Fn(&C) -> Option<f64> + 'a;
 
 /// [`ordered`]'s pairs less those under their floor: a candidate measuring
 /// below what its own bytes can stream at is a measurement that lied (a stamp
-/// that landed off its kernel, gfx1151's k-nearest pick of 2026-10-28), not a
+/// that landed off its kernel), not a
 /// fast kernel, and never a pick — measured, replayed or memoized alike.
 /// Everything refused leaves the order as it ran: a floor that refuses every
 /// candidate is itself what is wrong.
@@ -879,11 +880,8 @@ impl<C> Default for Bench<C> {
 
 /// Search bound: a candidate's compile past this is killed and the
 /// candidate rejected, as one that fails (its lowering and compiler runs
-/// together; Tinygrad's BEAM gives one 10 s). On gfx1201 the 16384² d128
-/// k64 nearest's queue-32 tiles spill at 256 VGPRs after 62–77 s of clang
-/// each, which was most of that shape's admission, while every clean one of
-/// nine nearest shapes compiled within 9 s at eight compiles at once (the
-/// slowest clang seen beside another process's load: 21 s).
+/// together; Tinygrad's BEAM gives one 10 s): clean kernels compile well
+/// within it, and the slowest compiles are spilling ones.
 pub(crate) const COMPILE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Compiles of a [`Bench`], `width` at a time, keyed by `K`: what compiled,
@@ -1205,8 +1203,9 @@ fn compile_one(
 /// alike: two measurements sharing the device would time each other.
 static DEVICE: Mutex<()> = Mutex::new(());
 
-/// Each built candidate's best device time in ns, its programs' summed;
-/// `None` where one failed to build or run. The device runs them one at a
+/// Each built candidate's best device time in ns, its programs' summed
+/// with their launches ([`launched`]); `None` where one failed to build or
+/// run. The device runs them one at a
 /// time, after the clock is lifted, under the process's one timing lock.
 pub(crate) fn time(built: &mut [Built]) -> Vec<Option<u64>> {
     let mut slots: Vec<Option<&mut Built>> = built.iter_mut().map(Some).collect();
@@ -1247,7 +1246,7 @@ fn time_with<B: BorrowMut<Built>>(
             *last = Some(run(plan)?);
             *fresh = *last;
         }
-        let first: Duration = last.iter().flatten().sum();
+        let first = launched(last.iter().copied())?;
         if abort.is_some_and(|abort| first > abort) {
             return Some(first);
         }
@@ -1258,29 +1257,25 @@ fn time_with<B: BorrowMut<Built>>(
         if sustained {
             sustain(&plans, SUSTAIN, first);
         }
-        plans
-            .iter()
-            .zip(last.iter_mut())
-            .zip(fresh)
-            .map(|((plan, last), fresh)| {
-                // Unsustained, the first run is as good as the next ones.
-                let mut timed = vec![fresh.or_else(|| run(plan))?];
-                if sustained {
-                    // Run until the minimum is consistent: the budget's
-                    // runs the floor, three stable ones settle it.
-                    let (mut stable, mut least) = (0, timed[0]);
-                    while timed.len() < MOST_RUNS && (timed.len() < runs || stable < STABLE_RUNS) {
-                        let r = run(plan)?;
-                        stable = if r.as_secs_f64() < least.as_secs_f64() * STEADY { 0 } else { stable + 1 };
-                        least = least.min(r);
-                        timed.push(r);
-                    }
+        let timed = plans.iter().zip(last.iter_mut()).zip(fresh).map(|((plan, last), fresh)| {
+            // Unsustained, the first run is as good as the next ones.
+            let mut timed = vec![fresh.or_else(|| run(plan))?];
+            if sustained {
+                // Run until the minimum is consistent: the budget's
+                // runs the floor, three stable ones settle it.
+                let (mut stable, mut least) = (0, timed[0]);
+                while timed.len() < MOST_RUNS && (timed.len() < runs || stable < STABLE_RUNS) {
+                    let r = run(plan)?;
+                    stable = if r.as_secs_f64() < least.as_secs_f64() * STEADY { 0 } else { stable + 1 };
+                    least = least.min(r);
+                    timed.push(r);
                 }
-                let t = best(timed.into_iter().map(Some))?;
-                *last = Some(t);
-                Some(t)
-            })
-            .sum::<Option<Duration>>()
+            }
+            let t = best(timed.into_iter().map(Some))?;
+            *last = Some(t);
+            Some(t)
+        });
+        launched(timed)
     };
     rounds(count, hopeless, pass, &mut time).into_iter().map(|t| t.map(|t| t.as_nanos() as u64)).collect()
 }
@@ -1317,10 +1312,8 @@ fn ready<'s, B: BorrowMut<Built>>(
 /// is often within a round's drift (two contenders have run every round
 /// together already); a [`Pass::Screen`] stops after the second round.
 /// The first round runs in the given order, the later ones in turn
-/// backwards and forwards: a candidate runs slower after some others (on
-/// sm_86 a nearest tile ran 4 % slower after its tile's other pipelines than
-/// after a larger tile, timed in one order or the other), and its minimum
-/// over both neighbours' runs keeps that out of the choice.
+/// backwards and forwards: a candidate runs slower after some others, and
+/// its minimum over both neighbours' runs keeps that out of the choice.
 /// `time` times a candidate; in the first round its
 /// second argument is the bar, `hopeless` times the best time so far, past
 /// which the candidate's first run may stand as its time; its third says a
@@ -1412,14 +1405,29 @@ impl ScratchPool {
     }
 }
 
+/// The most a scratch buffer draws at once, repeated past it: a clock sees no
+/// period this long, and a draw past `u32` words compiles into a loop per word.
+const SCRATCH_DRAW: usize = 1 << 31;
+
+/// `elems` uniform floats, a run of at most `most` drawn and repeated.
+pub(crate) fn drawn(elems: usize, most: usize) -> Tensor {
+    let run = elems.min(most);
+    let unit = Tensor::rand_with(&[run], DType::Float32, default_device()).expect("a scratch fill");
+    if run == elems {
+        return unit;
+    }
+    let times = SInt::from(elems.div_ceil(run));
+    unit.contiguous().repeat(&[times]).and_then(|t| t.try_shrink([(0, elems)])).expect("a scratch fill")
+}
+
 /// A scratch buffer's unrealized fill: a float parameter holds values in
 /// `[-1, 1)`, drawn on the device, so a card that clocks down under real
-/// data (the RX 9070 XT runs the 4096³ GEMM 15 % slower on random operands
-/// than on zeros, which toggle no bit) is timed as it will run; an integer
+/// data (zeros toggle no bit and run faster than real data) is timed as it
+/// will run; an integer
 /// parameter holds zeros, since a probe reads it as the slot to read next.
 fn scratch(p: &Param) -> Tensor {
     if p.dtype.is_float() {
-        let unit = Tensor::rand_with(&[p.elems], DType::Float32, default_device()).expect("a scratch fill");
+        let unit = drawn(p.elems, SCRATCH_DRAW);
         let spread = unit.try_mul(2.0f32).and_then(|t| t.try_sub(1.0f32)).expect("a scratch fill");
         spread.cast(p.dtype.into()).contiguous()
     } else {
@@ -1450,8 +1458,7 @@ fn scratch_plan_of(prog: Program, lowering: &Lowering, pool: &ScratchPool, body:
     .ok()?;
     let mut config = PrepareConfig::from_env();
     config.ephemeral = true;
-    // A program past what the scheduler's rewrites hold (a queued list two
-    // lanes wide 32 deep built 518k nodes on gfx1201, past the rewrite
+    // A program past what the scheduler's rewrites hold (past the rewrite
     // engine's stack) panics there: the candidate fails to build, as one
     // the compiler refuses, rather than taking the tuning down.
     let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| out.prepare_with(&config)));
@@ -1464,11 +1471,8 @@ fn scratch_plan_of(prog: Program, lowering: &Lowering, pool: &ScratchPool, body:
 /// queue without waiting, so a spin of host time would queue a thousand
 /// runs of a short kernel and every timed run after it would wait for the
 /// queue to drain. The candidate is sustained whole, not each plan for the
-/// budget: a split's merge alone queued a thousand microsecond launches,
-/// and the candidates timed after it ran slow (on gfx1201 an unsplit
-/// nearest at depth 768 timed 106–110 TFLOP/s among split ones, 124–126
-/// alone or with each candidate sustained whole, so the tuner never chose
-/// it).
+/// budget: a short plan sustained alone queues launches that slow the
+/// candidates timed after it.
 fn sustain(plans: &[&ExecutionPlan], budget: Duration, per_run: Duration) {
     let launches = budget.as_nanos().div_ceil(per_run.as_nanos().max(1)).clamp(1, SUSTAIN_LAUNCHES);
     for _ in 0..launches {
@@ -1600,6 +1604,19 @@ pub(crate) fn best(runs: impl Iterator<Item = Option<Duration>>) -> Option<Durat
     runs.sort_unstable();
     let median = *runs.get(runs.len() / 2)?;
     runs.into_iter().find(|&run| 2 * run >= median)
+}
+
+/// A candidate's time from its programs' own (`None` where one did not
+/// run): their sum and [`LAUNCH`] for every launch past the first, the gap
+/// between kernels no device stamp sees. Without it a split, timed kernel
+/// by kernel, would win wherever its kernels' sum does.
+pub(crate) fn launched(programs: impl IntoIterator<Item = Option<Duration>>) -> Option<Duration> {
+    let (mut sum, mut launches) = (Duration::ZERO, 0u32);
+    for time in programs {
+        sum += time?;
+        launches += 1;
+    }
+    Some(sum + Duration::from_nanos(LAUNCH as u64) * launches.saturating_sub(1))
 }
 
 /// One run's device time, its kernels' summed: a candidate is a kernel plus

@@ -8,6 +8,7 @@ use svod_dtype::DType;
 use test_case::test_case;
 
 use crate::atoms::{CARDS, Core, Target};
+use crate::kernels::gemm::Epilogue;
 use crate::ops::config::{self, Planner};
 use crate::ops::shape::{self, Extent, Plan};
 use crate::probe::{self, Measured};
@@ -97,7 +98,7 @@ fn costs_read_from_a_copied_store() {
     assert_eq!(unmeasured, ["step_i8", "step_lone_i8", "trip_lone", "trip_one_lone", "latency_one"]);
     // A rolled ring is not probed where fills are `cp.async`: its line is passed over.
     let want = |op: &str| match op {
-        "step_i8" | "step_lone_i8" | "trip_rolled" | "trip_lone" | "trip_one_lone" | "latency_one" => 0.0,
+        "step_wide" | "step_i8" | "step_lone_i8" | "trip_rolled" | "trip_lone" | "trip_one_lone" | "latency_one" => 0.0,
         _ => H100.iter().find(|f| f.0 == op).expect("a probe").1 as f64 * 1e-6,
     };
     let mut costs = costs;
@@ -156,7 +157,9 @@ fn a_planner_plans_for_a_card_without_it() {
         .expect("an H100 has SMs");
     let bf16 = [DType::BFloat16; 2];
     let x = Extent { dims: vec![4096, 4096], var: false };
-    let Plan::Kernel(gemm) = shape::linear(Some(&planner), &bf16, Some(&x), 4096, false) else { panic!("no GEMM") };
+    let Plan::Kernel(gemm) = shape::linear(Some(&planner), &bf16, Some(&x), 4096, &Epilogue::DEFAULT) else {
+        panic!("no GEMM")
+    };
     assert_eq!(gemm[0].core, Core::Group, "{:?}", gemm[0]);
     let q = Extent { dims: vec![8, 1024, 16, 128], var: false };
     let Plan::Kernel(fa) = shape::attention(Some(&planner), &[DType::BFloat16; 3], Some(&q), Some(&q), true, false)

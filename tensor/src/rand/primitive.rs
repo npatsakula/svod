@@ -80,10 +80,16 @@ fn random_bits(seed: &Tensor, counter: &Tensor, num: usize) -> Result<Tensor> {
     let new_key = threefry_random_bits(seed, &c_low, &c_high)?;
 
     // Step 2: build counts0 = arange(half), counts1 = counts0 + half.
-    // `arange_with_dtype` only fast-paths on `ConstValue::Int`, so go through
-    // the i64 entry point and cast to u32.
+    // `arange_with_dtype` only fast-paths on `ConstValue::Int`, so count in
+    // integers, i64 past i32::MAX words, and cast to u32.
     let half = num.div_ceil(2);
-    let counts0 = Tensor::arange(0, Some(half as i64), None)?.cast(u32_dt.clone());
+    let count = if i32::try_from(half).is_ok() { DType::Int32 } else { DType::Int64 };
+    let counts0 = Tensor::arange_with_dtype()
+        .start(UOp::const_(count.clone(), ConstValue::Int(0)))
+        .stop(UOp::const_(count.clone(), ConstValue::Int(half as i64)))
+        .dtype(count)
+        .call()?
+        .cast(u32_dt.clone());
     let half_t = Tensor::full(&[half], half as u32, u32_dt);
     let counts1 = counts0.try_add(&half_t)?;
 

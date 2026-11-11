@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use smallvec::{SmallVec, smallvec};
@@ -9,9 +9,13 @@ use svod_dtype::ext::HasDType;
 
 use crate::allocator::{Allocator, BufferSpec, RawBuffer};
 use crate::error::{
-    ImmutableBufferSnafu, InvalidViewSnafu, NdarrayShapeSnafu, NotCpuAccessibleSnafu, Result, SizeMismatchSnafu,
-    TypeMismatchSnafu, UnsupportedSnafu,
+    HostWriteLiveSnafu, ImmutableBufferSnafu, InvalidViewSnafu, NdarrayShapeSnafu, NotCpuAccessibleSnafu, Result,
+    SizeMismatchSnafu, TypeMismatchSnafu, UnsupportedSnafu,
 };
+
+mod host_write;
+
+pub use host_write::HostWrite;
 
 /// Global counter for unique buffer IDs.
 ///
@@ -57,7 +61,9 @@ struct BufferData {
     /// One-way immutability seal for shared weight storages: host writes
     /// through any handle or view are refused once set (see
     /// [`Buffer::mark_immutable`]).
-    immutable: std::sync::atomic::AtomicBool,
+    immutable: AtomicBool,
+    /// A [`HostWrite`] into this storage is live, through any handle or view.
+    host_writer: AtomicBool,
 }
 
 impl BufferData {
@@ -69,7 +75,8 @@ impl BufferData {
             total_size: size,
             options,
             zero_init,
-            immutable: std::sync::atomic::AtomicBool::new(false),
+            immutable: AtomicBool::new(false),
+            host_writer: AtomicBool::new(false),
         }
     }
 
@@ -318,7 +325,7 @@ impl Buffer {
 
     /// Seal the underlying storage against host writes (one-way). Used for
     /// shared weight storages: a write through ANY handle or view would
-    /// corrupt every model reading it, so `copyin*`, `as_*_mut` and
+    /// corrupt every model reading it, so `copyin*`, `host_write*` and
     /// copy-destination paths fail with `Error::ImmutableBuffer` afterwards.
     /// Device-side kernel writes are not intercepted here — the planner and
     /// replicate write-set analyses keep sealed storages out of kernel write
@@ -332,7 +339,67 @@ impl Buffer {
         if self.is_immutable() {
             return ImmutableBufferSnafu { op, storage: self.data.storage_id.0 }.fail();
         }
+        self.ensure_no_host_write(op)
+    }
+
+    /// Whether a [`HostWrite`] into this buffer's storage is live, through
+    /// any handle or view of it.
+    pub fn is_host_writing(&self) -> bool {
+        self.data.host_writer.load(Ordering::Acquire)
+    }
+
+    /// Fail with `HostWriteLive` while a [`HostWrite`] into this buffer's
+    /// storage is live: `op` would race its stores. Launch paths call it on
+    /// every buffer they bind.
+    pub fn ensure_no_host_write(&self, op: &'static str) -> Result<()> {
+        snafu::ensure!(!self.is_host_writing(), HostWriteLiveSnafu { op, storage: self.data.storage_id.0 });
         Ok(())
+    }
+
+    /// Exclusive host write access to this buffer as `[T]`, after the GPU
+    /// work on its storage has finished. `T` must be the buffer's dtype.
+    ///
+    /// # Errors
+    /// - `TypeMismatch` if `T` is not the buffer's dtype
+    /// - `HostWriteLive` while another guard into the same storage is live
+    /// - `ImmutableBuffer`, `NotCpuAccessible` as for `copyin`
+    pub fn host_write<T: HasDType + Copy>(&mut self) -> Result<HostWrite<'_, T>> {
+        snafu::ensure!(self.dtype == T::DTYPE, TypeMismatchSnafu { expected: T::DTYPE, actual: self.dtype.clone() });
+        HostWrite::acquire(self)
+    }
+
+    /// [`Self::host_write`] over the raw bytes, whatever the dtype.
+    pub fn host_write_bytes(&mut self) -> Result<HostWrite<'_, u8>> {
+        HostWrite::acquire(self)
+    }
+
+    /// Run `f` under a [`Self::host_write`] guard, dropped before returning.
+    pub fn with_host_write<T: HasDType + Copy, R>(
+        &mut self,
+        f: impl FnOnce(&mut HostWrite<'_, T>) -> Result<R>,
+    ) -> Result<R> {
+        f(&mut self.host_write::<T>()?)
+    }
+
+    /// The host address of this view for a [`HostWrite`], once the GPU work
+    /// on its storage has finished.
+    fn host_write_ptr(&self) -> Result<*mut u8> {
+        match self.data.raw() {
+            // SAFETY: the guard holds the storage's writer flag; the offset is
+            // bounded by the allocation (`Buffer::view`).
+            RawBuffer::Cpu { data, .. } => Ok(unsafe { (&mut *data.get()).as_mut_ptr().add(self.offset) }),
+            RawBuffer::Mmap { .. } | RawBuffer::AmdDevice { host_ptr: None, .. } => NotCpuAccessibleSnafu.fail(),
+            RawBuffer::Metal { contents, device, .. } => metal_host_ptr(device, *contents, self.offset),
+            RawBuffer::Cuda { device_ptr, host_ptr, device, .. } => {
+                cuda_host_ptr(device, *device_ptr, *host_ptr, self.offset)
+            }
+            RawBuffer::AmdDevice { host_ptr: Some(ptr), gpu_addr, device, .. } => {
+                // Host stores aren't ordered on the GPU timeline: wait the
+                // storage's in-flight readers and writers first.
+                device.core().wait_storage(*gpu_addr)?;
+                Ok(unsafe { ptr.as_ptr().add(self.offset) })
+            }
+        }
     }
 
     /// Ensure the underlying buffer is allocated.
@@ -374,6 +441,7 @@ impl Buffer {
     /// - `NotAllocated` if buffer hasn't been allocated
     /// - `NotCpuAccessible` for device-only buffers (use `copyout` instead)
     pub fn as_host_bytes(&self) -> Result<&[u8]> {
+        self.ensure_no_host_write("as_host_bytes")?;
         self.ensure_allocated()?;
         let raw = self.data.raw();
         match raw {
@@ -424,48 +492,6 @@ impl Buffer {
         }
     }
 
-    /// Get a mutable byte slice of the buffer data (CPU-accessible buffers only).
-    ///
-    /// # Safety contract (same as `as_host_bytes`)
-    /// Caller must ensure no kernels are executing concurrently.
-    ///
-    /// # Errors
-    /// - `NotAllocated` if buffer hasn't been allocated
-    /// - `NotCpuAccessible` for device-only buffers
-    #[allow(clippy::mut_from_ref)] // interior mutability via UnsafeCell
-    pub fn as_host_bytes_mut(&self) -> Result<&mut [u8]> {
-        self.ensure_mutable("as_host_bytes_mut")?;
-        self.ensure_allocated()?;
-        let raw = self.data.raw();
-        match raw {
-            RawBuffer::Cpu { data, .. } => {
-                // SAFETY: Same invariant as as_host_bytes — user code only
-                // accesses buffers between kernel runs. UnsafeCell provides
-                // interior mutability through the shared Arc<BufferData>.
-                let bytes = unsafe { &mut (&mut *data.get())[self.offset..self.offset + self.size] };
-                Ok(bytes)
-            }
-            // Mmap is read-only — no mutable access
-            RawBuffer::Mmap { .. } => NotCpuAccessibleSnafu.fail(),
-            RawBuffer::Metal { contents, device, .. } => {
-                let base = metal_host_ptr(device, *contents, self.offset)?;
-                Ok(unsafe { std::slice::from_raw_parts_mut(base, self.size) })
-            }
-            RawBuffer::Cuda { device_ptr, host_ptr, device, .. } => {
-                let base = cuda_host_ptr(device, *device_ptr, *host_ptr, self.offset)?;
-                Ok(unsafe { std::slice::from_raw_parts_mut(base, self.size) })
-            }
-            RawBuffer::AmdDevice { host_ptr: Some(ptr), gpu_addr, device, .. } => {
-                // Async dispatch: drain before raw host access — host-pointer
-                // reads/writes aren't ordered on the GPU timeline.
-                device.core().wait_storage(*gpu_addr)?;
-                let base = unsafe { ptr.as_ptr().add(self.offset) };
-                Ok(unsafe { std::slice::from_raw_parts_mut(base, self.size) })
-            }
-            RawBuffer::AmdDevice { host_ptr: None, .. } => NotCpuAccessibleSnafu.fail(),
-        }
-    }
-
     /// Typed immutable view over CPU-accessible buffer memory.
     ///
     /// Returns an ndarray view shaped according to the buffer's concrete dimensions.
@@ -476,6 +502,7 @@ impl Buffer {
     /// - `NotCpuAccessible` for non-CPU-accessible buffers
     /// - `NotAllocated` if buffer hasn't been allocated
     pub fn as_array<T: HasDType>(&self) -> Result<ndarray::ArrayViewD<'_, T>> {
+        self.ensure_no_host_write("as_array")?;
         self.ensure_allocated()?;
         if self.dtype != T::DTYPE {
             return TypeMismatchSnafu { expected: T::DTYPE, actual: self.dtype.clone() }.fail();
@@ -532,58 +559,9 @@ impl Buffer {
         }
     }
 
-    /// Typed mutable view over CPU-accessible buffer memory.
-    ///
-    /// Same as [`Self::as_array`] but allows writes. Caller must ensure no
-    /// kernels are executing concurrently (safety is the caller's
-    /// responsibility).
-    ///
-    /// # Errors
-    /// Same as [`Self::as_array`].
-    #[allow(clippy::mut_from_ref)]
-    pub fn as_array_mut<T: HasDType>(&self) -> Result<ndarray::ArrayViewMutD<'_, T>> {
-        self.ensure_mutable("as_array_mut")?;
-        self.ensure_allocated()?;
-        if self.dtype != T::DTYPE {
-            return TypeMismatchSnafu { expected: T::DTYPE, actual: self.dtype.clone() }.fail();
-        }
-        let raw = self.data.raw();
-        match raw {
-            RawBuffer::Cpu { data, cpu_accessible } if *cpu_accessible => {
-                let bytes = unsafe { &mut (&mut *data.get())[self.offset..self.offset + self.size] };
-                let count = bytes.len() / T::DTYPE.bytes();
-                let typed = unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr() as *mut T, count) };
-                ndarray::ArrayViewMutD::from_shape(ndarray::IxDyn(&self.shape), typed).context(NdarrayShapeSnafu)
-            }
-            RawBuffer::Metal { contents, device, .. } => {
-                let bytes_ptr = metal_host_ptr(device, *contents, self.offset)? as *mut T;
-                let count = self.size / T::DTYPE.bytes();
-                let typed = unsafe { std::slice::from_raw_parts_mut(bytes_ptr, count) };
-                ndarray::ArrayViewMutD::from_shape(ndarray::IxDyn(&self.shape), typed).context(NdarrayShapeSnafu)
-            }
-            RawBuffer::Cuda { device_ptr, host_ptr: host_ptr @ Some(_), device, .. } => {
-                let bytes_ptr = cuda_host_ptr(device, *device_ptr, *host_ptr, self.offset)? as *mut T;
-                let count = self.size / T::DTYPE.bytes();
-                let typed = unsafe { std::slice::from_raw_parts_mut(bytes_ptr, count) };
-                ndarray::ArrayViewMutD::from_shape(ndarray::IxDyn(&self.shape), typed).context(NdarrayShapeSnafu)
-            }
-            RawBuffer::AmdDevice { host_ptr: Some(ptr), gpu_addr, device, .. } => {
-                // Async dispatch: drain before raw host access — host-pointer
-                // reads/writes aren't ordered on the GPU timeline.
-                device.core().wait_storage(*gpu_addr)?;
-                // SAFETY: BAR-backed VRAM mapping is valid for the buffer's
-                // lifetime; scheduler ensures no concurrent kernel writes.
-                let bytes_ptr = unsafe { ptr.as_ptr().add(self.offset) } as *mut T;
-                let count = self.size / T::DTYPE.bytes();
-                let typed = unsafe { std::slice::from_raw_parts_mut(bytes_ptr, count) };
-                ndarray::ArrayViewMutD::from_shape(ndarray::IxDyn(&self.shape), typed).context(NdarrayShapeSnafu)
-            }
-            _ => NotCpuAccessibleSnafu.fail(),
-        }
-    }
-
     /// Zero-copy typed slice view (CPU-accessible only).
     pub fn as_slice<T: HasDType>(&self) -> Result<&[T]> {
+        self.ensure_no_host_write("as_slice")?;
         self.ensure_allocated()?;
         if self.dtype != T::DTYPE {
             return TypeMismatchSnafu { expected: T::DTYPE, actual: self.dtype.clone() }.fail();
@@ -708,6 +686,7 @@ impl Buffer {
     /// Delegates to the allocator's `_copyout`. Device backends synchronize
     /// their timeline inside `_copyout` before reading.
     pub fn copyout(&self, dst: &mut [u8]) -> Result<()> {
+        self.ensure_no_host_write("copyout")?;
         self.ensure_allocated()?;
 
         let expected = self.size;
@@ -721,6 +700,7 @@ impl Buffer {
     /// read for const-shaped outputs whose active region is shorter than the
     /// allocation (e.g. a partial last batch in `[max_batch, …]` buffers).
     pub fn copyout_prefix(&self, dst: &mut [u8]) -> Result<()> {
+        self.ensure_no_host_write("copyout_prefix")?;
         self.ensure_allocated()?;
 
         snafu::ensure!(dst.len() <= self.size, SizeMismatchSnafu { expected: self.size, actual: dst.len() });
@@ -737,6 +717,7 @@ impl Buffer {
     /// dispatch never races a still-running writer.
     pub fn copy_from(&mut self, src: &Buffer) -> Result<()> {
         self.ensure_mutable("copy_from")?;
+        src.ensure_no_host_write("copy_from")?;
         self.ensure_allocated()?;
         src.ensure_allocated()?;
 
@@ -760,6 +741,7 @@ impl Buffer {
     /// state rows can be recycled output→input without touching the host.
     pub fn copy_region_from(&mut self, dst_off: usize, src: &Buffer, src_off: usize, len: usize) -> Result<()> {
         self.ensure_mutable("copy_region_from")?;
+        src.ensure_no_host_write("copy_region_from")?;
         self.ensure_allocated()?;
         src.ensure_allocated()?;
         let dst_end = dst_off

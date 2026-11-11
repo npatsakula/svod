@@ -15,8 +15,8 @@ use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Scale, gemm};
 use crate::kernels::rows::{Norm, NormCfg, NormSpec, norm};
 use crate::kernels::{Act, Batch};
 use crate::launch::graph_launch_all;
-use crate::layouts::{Laid, infer};
 use crate::lower::Lowering;
+use crate::sweep::assumed;
 
 fn gemm_nt_epilogue(
     m: usize,
@@ -27,8 +27,15 @@ fn gemm_nt_epilogue(
     warps: [u32; 2],
     epi: Epilogue,
 ) -> Program {
-    let cfg = GemmCfg { core: Core::Warp, tile, stages, warps, unroll: true, crews: 1 };
-    gemm::<BF16>(&GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: epi, cfg })
+    let cfg = GemmCfg {
+        core: Core::Warp,
+        tile,
+        warps,
+        schedule: Schedule::ring(stages, true),
+        order: Default::default(),
+        tail: None,
+    };
+    gemm::<BF16>(&assumed(GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: epi }, cfg))
 }
 
 fn norm_rows(norm_: Norm, rows: usize, d: usize, br: usize, eps: f64, residual: bool, bias: bool) -> Program {
@@ -148,7 +155,8 @@ fn epilogue_interpreter_matches_the_reference(which: usize) {
 fn bias_vector_takes_the_accumulators_column_layout() {
     let epi = Epilogue { bias: true, ..Epilogue::default() };
     let prog = gemm_nt_epilogue(128, 128, 64, [128, 128, 32], 2, [2, 4], epi);
-    let Laid { prog, layouts: lay } = infer(prog, &declared(sm86()), Core::Warp).unwrap();
+    let prog = super::laid(prog, &declared(sm86())).unwrap();
+    let lay = &prog.layouts;
     let add = prog
         .walk()
         .find_map(|(_, s)| match s {
@@ -173,7 +181,14 @@ fn epilogues_match_on_device(m: usize, n: usize, k: usize, tile: [usize; 3], sta
         let params = gemm_inputs(m, n, k, epi);
         let want = gemm_reference(m, n, k, epi, &params);
         let interp = run(&prog, params.clone(), &[]).unwrap();
-        let cfg = GemmCfg { core: Core::Warp, tile, stages, warps: [wr, wc], unroll: true, crews: 1 };
+        let cfg = GemmCfg {
+            core: Core::Warp,
+            tile,
+            warps: [wr, wc],
+            schedule: Schedule::ring(stages, true),
+            order: Default::default(),
+            tail: None,
+        };
         let got = on_device(prog, &cfg.lowering(&declared(target.clone())), &params);
         let (got, interp) = (got.last().unwrap(), interp.last().unwrap());
         let d_interp = assert_rel_close("c vs interpreter", got, interp, 1.6e-2);

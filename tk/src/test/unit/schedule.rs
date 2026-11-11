@@ -5,8 +5,9 @@ use crate::atoms::{Core, Fill};
 use crate::interp::{round_to, run};
 use crate::ir::*;
 use crate::schedule::expand;
+use crate::sweep::assumed;
 
-fn count(prog: &Program, pred: impl Fn(&Stmt) -> bool) -> usize {
+fn count<P: Phase>(prog: &Program<P>, pred: impl Fn(&Stmt<P>) -> bool) -> usize {
     prog.walk().filter(|(_, s)| pred(s)).count()
 }
 
@@ -27,9 +28,9 @@ fn operands(m: usize, n: usize, k: usize) -> Vec<Vec<f64>> {
 #[test_case(Fill::Staged, 1; "register staged, one slot")]
 fn expansion_preserves_the_result(fill: Fill, stages: usize) {
     let (m, n, k) = (64usize, 32usize, 160usize);
-    let mut prog = super::gemm_nt(m, n, k, 32, 32, 32, stages);
+    let prog = super::gemm_nt(m, n, k, 32, 32, 32, stages);
     let want = run(&prog, operands(m, n, k), &[("b", 1)]).unwrap();
-    expand(&mut prog, fill, Core::Warp);
+    let prog = expand(prog, fill, Core::Warp);
     let got = run(&prog, operands(m, n, k), &[("b", 1)]).unwrap();
     assert_eq!(got[2], want[2]);
     assert_eq!(count(&prog, |s| matches!(s, Stmt::Pipeline(_))), 0);
@@ -65,9 +66,9 @@ fn expansion_preserves_the_result(fill: Fill, stages: usize) {
 #[test_case(4; "four stages")]
 fn products_in_flight_preserve_the_result(stages: usize) {
     let (m, n, k) = (64usize, 32usize, 160usize);
-    let mut prog = super::gemm_nt(m, n, k, 32, 32, 32, stages);
+    let prog = super::gemm_nt(m, n, k, 32, 32, 32, stages);
     let want = run(&prog, operands(m, n, k), &[("b", 1)]).unwrap();
-    expand(&mut prog, Fill::CpAsync, Core::Group);
+    let prog = expand(prog, Fill::CpAsync, Core::Group);
     let got = run(&prog, operands(m, n, k), &[("b", 1)]).unwrap();
     assert_eq!(got[2], want[2]);
     let syncs: Vec<Sync> =
@@ -106,7 +107,7 @@ fn ping_pong_expansion_preserves_the_result(bk: usize, slices: usize) {
     let want = run(&prog, operands(m, n, k), &[("b", 1)]).unwrap();
     // As the lowering: a product's shared operands become explicit reads first.
     crate::lower::materialize_operands(&mut prog, Core::Warp);
-    expand(&mut prog, Fill::Staged, Core::Warp);
+    let prog = expand(prog, Fill::Staged, Core::Warp);
     let got = run(&prog, operands(m, n, k), &[("b", 1)]).unwrap();
     assert_eq!(got[2], want[2]);
     assert_eq!(count(&prog, |s| matches!(s, Stmt::Pipeline(_))), 0);
@@ -127,8 +128,8 @@ fn ping_pong_expansion_preserves_the_result(bk: usize, slices: usize) {
 fn ping_pong_cuts_a_trip_into_clusters() {
     let mut prog = super::gemm_nt_crews(64, 64, 256, [64, 64, 64]);
     crate::lower::materialize_operands(&mut prog, Core::Warp);
-    expand(&mut prog, Fill::Staged, Core::Warp);
-    let kind = |s: &Stmt| match s {
+    let prog = expand(prog, Fill::Staged, Core::Warp);
+    let kind = |s: &Stmt<Expanded>| match s {
         Stmt::Copy { dst, src, mode: CopyMode::Staged, .. } => match (&prog.value(*src).place, prog.value(*dst).tier())
         {
             (Place::Global { param, .. }, Tier::Reg) => ["issue a", "issue b"][param.index()],
@@ -199,22 +200,23 @@ fn staged_halves_keep_their_copys_scope() {
     use crate::kernels::attention::{AttnMask, AttnSpec, FaCfg, attention};
     let cfg = FaCfg { key_warps: 4, ..FaCfg::new(16, 16, 2) };
     let mask = AttnMask::default();
-    let spec = AttnSpec {
-        batch: Batch::Static(1),
-        t: 1,
-        tk: 64,
-        heads: 1,
-        kv_heads: 1,
-        d: 64,
-        mask,
-        cache: None,
-        packed: false,
-        scale: 0.125,
+    let spec = assumed(
+        AttnSpec {
+            batch: Batch::Static(1),
+            t: 1,
+            tk: 64,
+            heads: 1,
+            kv_heads: 1,
+            d: 64,
+            mask,
+            cache: None,
+            packed: false,
+            scale: 0.125,
+        },
         cfg,
-    };
-    let mut prog = attention::<BF16>(&spec);
-    expand(&mut prog, Fill::Staged, Core::Warp);
-    fn copies(block: &Block, inside: bool, out: &mut Vec<(bool, Scope, CopyMode)>) {
+    );
+    let prog = expand(attention::<BF16>(&spec), Fill::Staged, Core::Warp);
+    fn copies(block: &Block<Expanded>, inside: bool, out: &mut Vec<(bool, Scope, CopyMode)>) {
         for s in &block.0 {
             if let Stmt::Copy { mode, scope, .. } = s {
                 out.push((inside, *scope, *mode));
@@ -248,19 +250,19 @@ fn staged_halves_keep_their_copys_scope() {
 #[test_case(2, ["fence", "commit", "commit", "barrier"], 2; "two slots fence the commit")]
 #[test_case(1, ["barrier", "commit", "commit", "barrier"], 1; "one slot commits between two barriers")]
 fn register_staging_peels_the_ring_into_three_branch_free_loops(stages: usize, tail: [&str; 4], unroll: u32) {
-    let mut prog = super::gemm_nt(32, 32, 64, 32, 32, 32, stages);
+    let prog = super::gemm_nt(32, 32, 64, 32, 32, 32, stages);
     let slots: Vec<ScalarId> = prog
         .walk()
         .filter_map(|(_, s)| if let Stmt::Pipeline(p) = s { Some([p.produce.slot, p.consume.slot]) } else { None })
         .flatten()
         .collect();
-    expand(&mut prog, Fill::Staged, Core::Warp);
+    let prog = expand(prog, Fill::Staged, Core::Warp);
     let constant = slots.iter().all(|&s| *prog.scalar(s) == Scalar::Const(0));
     assert!(!slots.is_empty() && constant == (stages == 1), "slot scalars constant: {constant}");
-    let loops: Vec<&Loop> =
+    let loops: Vec<&Loop<Expanded>> =
         prog.body.0.iter().filter_map(|s| if let Stmt::Loop(l) = s { Some(l) } else { None }).collect();
     let [head, steady, drain] = loops[..] else { panic!("three loops, got {}", loops.len()) };
-    let kind = |s: &Stmt| match s {
+    let kind = |s: &Stmt<Expanded>| match s {
         Stmt::Copy { dst, src, mode: CopyMode::Staged, .. } => match (prog.value(*src).tier(), prog.value(*dst).tier())
         {
             (Tier::Global, Tier::Reg) => "issue",
@@ -272,7 +274,7 @@ fn register_staging_peels_the_ring_into_three_branch_free_loops(stages: usize, t
         Stmt::Sync(Sync::Barrier { .. }) => "barrier",
         other => panic!("{other:?}"),
     };
-    let kinds = |l: &Loop| l.body.0.iter().map(kind).collect::<Vec<_>>();
+    let kinds = |l: &Loop<Expanded>| l.body.0.iter().map(kind).collect::<Vec<_>>();
     assert_eq!(kinds(head), ["issue", "issue", "commit", "commit", "barrier"]);
     let k = kinds(steady);
     let computes = k.len() - 7;
@@ -287,4 +289,32 @@ fn register_staging_peels_the_ring_into_three_branch_free_loops(stages: usize, t
     assert_eq!(steady.carried.len(), 1);
     let (s, d) = (steady.carried[0], drain.carried[0]);
     assert_eq!((d.init, d.phi, d.next), (s.phi, s.phi, s.next), "the drain continues the steady accumulator");
+}
+
+/// A fill builds only the rings its template runs: through registers one
+/// or two slots, so a three-slot register-staged ring (which the template
+/// refused with a panic) is `None` before any program holds it, and every
+/// config a family's lattice spans on a target runs on that target's fill.
+#[test]
+fn a_fill_builds_only_the_rings_it_runs() {
+    assert_eq!(Fill::Staged.ring(3, false), None);
+    assert_eq!(Fill::Staged.ring(2, true), Some(Schedule::ring(2, true)));
+    assert_eq!(Fill::CpAsync.ring(3, false), Some(Schedule::ring(3, false)));
+    assert_eq!(Fill::CpAsync.ring(0, false), None);
+    for (name, target) in crate::sweep::targets() {
+        let fill = target.fill;
+        let gemm = crate::ops::config::gemm_lattice(&target).into_iter().map(|c| c.schedule);
+        let attention =
+            crate::ops::config::AttentionProblem { tiles: 1, t: 1024, tk: 1024, d: 64, causal: false, bias: false }
+                .lattice(&target)
+                .into_iter()
+                .map(|c| c.schedule);
+        let nearest = super::self_join(4096, 4096, 128, crate::kernels::nearest::Metric::L2, 8)
+            .lattice(&target)
+            .into_iter()
+            .map(|c| c.schedule);
+        for schedule in gemm.chain(attention).chain(nearest) {
+            assert!(fill.runs(schedule), "{name}: {schedule:?} on {fill:?}");
+        }
+    }
 }

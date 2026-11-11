@@ -88,7 +88,7 @@ fn counted(target: &Target, probes: &[Probe], field: &str) -> f64 {
         probe.value(l.carried[0].phi).shape.elems()
     };
     match field {
-        "step" | "step_group" | "step_i8" => (blocks * extent * mma(probe) / 4096) as f64,
+        "step" | "step_group" | "step_wide" | "step_i8" => (blocks * extent * mma(probe) / 4096) as f64,
         "smem_byte" | "global_byte" => {
             let tier = if field == "smem_byte" { Tier::Smem } else { Tier::Global };
             (blocks * extent * loads_from(probe, tier).iter().map(|l| l.1).sum::<usize>()) as f64
@@ -125,13 +125,19 @@ fn an_unmeasured_field_leaves_its_default() {
     let target = sm86();
     let measured = crate::probe::assemble(&target, probes(&target), |p| match p.op {
         "probe:step" => Err(crate::probe::Error::Unmeasured { probe: p.op, last: "no stamps".into() }),
-        "probe:step_group" | "probe:trip_rolled" => unreachable!("an absent primitive is not measured"),
+        "probe:step_group" | "probe:step_wide" | "probe:trip_rolled" => {
+            unreachable!("an absent primitive is not measured")
+        }
         _ => Ok(1.5),
     });
     assert_eq!(measured.unmeasured, ["step"]);
     let mut costs = measured.costs;
     for (name, value) in costs.fields() {
-        assert_eq!(*value, if ["step", "step_group", "trip_rolled"].contains(&name) { 0.0 } else { 1.5 }, "{name}");
+        assert_eq!(
+            *value,
+            if ["step", "step_group", "step_wide", "trip_rolled"].contains(&name) { 0.0 } else { 1.5 },
+            "{name}"
+        );
     }
 }
 
@@ -240,6 +246,7 @@ fn units_count_the_primitive(target: Target) {
         if p.candidates.is_empty() {
             let absent = match field {
                 "step_group" => target.group_mma.is_empty(),
+                "step_wide" => target.wide_mma.is_empty(),
                 "step_i8" => target.geometry_of(svod_dtype::ScalarDType::Int8).is_none(),
                 "trip_rolled" => target.fill == Fill::CpAsync,
                 "latency_one" => target.fill == Fill::Staged,
@@ -266,8 +273,8 @@ fn units_count_the_primitive(target: Target) {
         let ring = |c: &crate::tune::Candidate| {
             c[0].0.walk().find_map(|(_, s)| match s {
                 Stmt::Pipeline(p) => {
-                    assert_eq!(p.crews, 1, "a probe runs every warp alike");
-                    Some(p.unroll)
+                    assert_eq!(p.schedule.crews(), 1, "a probe runs every warp alike");
+                    Some(p.schedule.unroll())
                 }
                 _ => None,
             })
@@ -282,7 +289,7 @@ fn units_count_the_primitive(target: Target) {
         fn roll(block: &mut Block) {
             for s in &mut block.0 {
                 if let Stmt::Pipeline(p) = s {
-                    p.unroll = false;
+                    p.schedule = p.schedule.rolled();
                 }
                 s.blocks_mut().for_each(roll);
             }
@@ -300,7 +307,9 @@ fn units_count_the_primitive(target: Target) {
         assert_eq!(ring(base), ring(probe), "{}: the baseline reads a ring as deep as the probe's", p.op);
     }
     let depth = |p: &Program| {
-        p.walk().find_map(|(_, s)| if let Stmt::Pipeline(p) = s { Some(p.stages) } else { None }).expect("a ring")
+        p.walk()
+            .find_map(|(_, s)| if let Stmt::Pipeline(p) = s { Some(p.schedule.stages()) } else { None })
+            .expect("a ring")
     };
     assert_eq!(
         (depth(pair(one).1), depth(pair(trip).1)),
@@ -395,9 +404,8 @@ fn shared_reads_are_unfenced(target: Target, barrier: &str) {
 /// baseline, and the probe's per loop trip.
 fn relayouts(target: &Target, p: &Probe, i: usize) -> Vec<Relayout> {
     let (prog, lowering) = &p.candidates[i][0];
-    let Lowered { tile, layouts, .. } =
-        lowered(prog.clone(), lowering).unwrap_or_else(|e| panic!("{}: {e}", prog.name));
-    let lay = |v: ValId| layouts[v.index()].clone().expect("laid");
+    let Lowered { tile, .. } = lowered(prog.clone(), lowering).unwrap_or_else(|e| panic!("{}: {e}", prog.name));
+    let lay = |v: ValId| tile.layouts[v.index()].clone().expect("laid");
     tile.walk()
         .filter_map(|(_, s)| match s {
             Stmt::Let { dst, op: TileOp::Relayout { src } } => {
@@ -496,6 +504,7 @@ fn device_costs_are_physical() {
     assert!(c.step_lone >= c.step, "{c:?}");
     let int8 = target.geometry_of(svod_dtype::ScalarDType::Int8).is_some();
     assert_eq!(c.step_i8 > 0.0, int8, "{c:?}");
+    assert_eq!(c.step_wide > 0.0, !target.wide_mma.is_empty(), "{c:?}");
     assert!(c.smem_trip > 0.0, "{c:?}");
     // A ring the planner prices apart from the unrolled two-slot one does no
     // less than it, within what the trip pairs resolve: each pair's

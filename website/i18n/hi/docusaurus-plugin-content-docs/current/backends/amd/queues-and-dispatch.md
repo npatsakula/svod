@@ -12,7 +12,7 @@ scheduling और failure handling के लिए Rust ownership का उप
 
 `AmdDeviceCore` एक bounded `QueuePool` का मालिक है। उसके slots fixed `OnceLock`s हैं और queues
 `SVOD_AMD_HW_QUEUES` तक lazily बनाई जाती हैं, जिसे 1 से 64 के बीच clamp किया जाता है और जिसका
-default multi-XCC CDNA पर 4 है, बाक़ी हर जगह 1। एक atomic bitset leases को track करता है:
+default 4 है। एक atomic bitset leases को track करता है:
 
 - एक initialized idle lane claim करना एक atomic compare-exchange है;
 - queue creation एक cold serialized path है;
@@ -49,8 +49,14 @@ AQL = otherwise
 - PM4 queues raw dwords publish करती हैं और अगले dword index पर ring करती हैं।
 - AQL queues 64-byte packets publish करती हैं और आख़िरी लिखे गए packet के index पर ring
   करती हैं।
-- AQL kernel `completion_signal` zero ही रहता है। Vendor-IB PM4 waits/stores ख़ुद timeline
-  completion के मालिक हैं, multi-XCC hardware पर XCC0 `PRED_EXEC` के साथ।
+- AQL kernel packets कोई `completion_signal` नहीं रखते। Vendor-IB PM4 waits/stores ख़ुद
+  timeline completion के मालिक हैं, multi-XCC hardware पर XCC0 `PRED_EXEC` के साथ।
+- XCC0 का timeline store तब land हो सकता है जब बाक़ी XCCs अभी उस IB को पढ़ रहे हों जिसमें
+  वह है, इसलिए एक AQL lane retired submissions भी गिनती है: हर publication का आख़िरी packet
+  lane के retirement signal को अपना AQL `completion_signal` बनाता है, जिसे CP तब decrement
+  करता है जब वह packet हर XCC पर retire हो चुका हो, और साथ में queue event raise करता है।
+  kernarg slots, control programs, graph और linked-plan memory, और lane drains इसी count का
+  wait करते हैं। PM4 lanes अपनी timeline पर retire होती हैं।
 
 lane lease compute co-tenancy को ख़त्म कर देता है। `AmdComputeQueue.inner` अब भी एक mutex का
 उपयोग एक Rust aliasing guard के रूप में करता है; सामान्य compute path पर वह uncontended है।
@@ -84,6 +90,12 @@ PM4, AQL, और SDMA publication — तीनों अपने rings को 
 producer index से दोबारा बनाया जाता है)। Ordinary dispatch अतिरिक्त रूप से in-flight timeline values को
 bound करता है। PM4 timeline values 2^31 watermark पर drain होकर reset हो जाते हैं, क्योंकि
 hardware wait/store packets निचले 32 bits की तुलना करते हैं।
+
+हर doorbell पहले एक SeqCst fence चलाता है, फिर host HDP flush करता है: जहाँ kernargs और
+command buffers VRAM में रहते हैं (multi-XCC parts) वहाँ हर doorbell पर, बाक़ी जगह केवल तब जब
+किसी dropped `HostWrite` guard ने ऐसा flush defer किया हो जिसे अभी तक कोई landed flush cover नहीं
+करता। Deferrals गिने जाते हैं, और एक doorbell उन्हें तभी flushed mark करता है जब उसका अपना
+flush land हो चुका हो, इसलिए किसी दूसरे के flush के दौरान बजने वाला doorbell भी flush करता है।
 
 ## Resource lifetime
 
@@ -149,10 +161,10 @@ pub trait AmdIface: Send + Sync + std::fmt::Debug {
     fn free_raw(&self, gpu_va: u64, size: usize, handle: u64);
     fn setup_ring(&self, desc: &RingDesc) -> Result<QueueHandle>;
     fn teardown_ring(&self, queue_id: u32, doorbell_base: NonNull<u8>) -> Result<QueueTeardown>;
-    fn wait_events(&self, timeout_ms: u32) -> Result<Option<Error>>;
+    fn wait_events(&self, timeout_ms: u32, age: &mut u64) -> Result<Option<Error>>;
 
-    // Defaulted hooks. `KfdIface` overrides the first and the last; the
-    // test mock overrides `publication_checkpoint`.
+    // Defaulted hooks. `KfdIface` overrides all but `publication_checkpoint`,
+    // which only the test mock overrides.
     fn queue_event_mailbox(&self) -> Option<QueueEventMailbox> {
         None
     }
@@ -162,16 +174,31 @@ pub trait AmdIface: Send + Sync + std::fmt::Debug {
     fn update_queue_percentage(&self, _queue_id: u32, _ring_gpu: u64, _ring_size: u32, _percentage: u32) -> Result<()> {
         Ok(())
     }
+    fn flush_hdp(&self) {}
 }
 ```
 
-Ring, GART, EOP, context-save, और inactive-signal buffers इस seam के ऊपर allocate होते हैं।
-`setup_ring` उन resources को activate करता है और doorbell map करता है।
+Ring, GART, EOP और context-save buffers, और हर compute queue के error words, इस seam के ऊपर
+allocate होते हैं। `setup_ring` उन resources को activate करता है और doorbell map करता है।
 `update_queue_percentage` ही वह चीज़ है जो एक AQL queue को दोबारा map करती है ताकि CP firmware
 अपना cached `amd_queue_t` scratch descriptor दोबारा पढ़े — lane creation पर और जब भी scratch
-बढ़े; एक failed remap device को poison कर देता है। जब `queue_event_mailbox` मौजूद हो, तो हर
+बढ़े, एक unmap और एक remap; एक failed remap device को poison कर देता है। हर remap device पर
+process की हर queue को preempt करता है, इसलिए एक grow per-thread scratch size को कम से कम
+दोगुना करता है (या request ले लेता है जब वह बड़ा हो), उस सबसे बड़े size तक जिसे
+`COMPUTE_TMPRING_SIZE.WAVESIZE` describe करता है। जब `queue_event_mailbox` मौजूद हो, तो हर
 completion store के साथ एक KFD event-interrupt companion जाता है, ताकि `wait_events` बिना
 polling के जाग सके।
+
+एक compute queue के error words हैं AQL `queue_inactive_signal`, जिसमें CP queue halt करते
+समय एक code लिखता है, और वह `ErrorReason` word जिसकी ओर उसके CWSR headers point करते हैं,
+जिसमें KFD queue exception के bits set करता है। दोनों queue event raise करते हैं। एक timeline
+wait `wait_events` से जागने पर और timeout होने पर हर lane के words पढ़ता है, और device को
+`Error::AmdQueueError` से poison करता है, जो decoded cause बताता है (देखें
+[Debugging](./debugging.md))।
+
+`flush_hdp` host के VRAM stores को HDP से flush करता है और flush के land होने तक wait करता है;
+`KfdIface` KFD के MMIO-remap flush register में लिखता है, या जहाँ KFD कोई remap page नहीं देता
+(एक SR-IOV VF), वहाँ एक host-visible VRAM word में store करके उसे वापस पढ़ता है।
 
 ## Configuration
 
@@ -179,13 +206,13 @@ polling के जाग सके।
 |---|---|---|
 | `SVOD_DEVICE` | `CPU` (macOS पर `METAL:0`) | default tensor device चुनें, उदाहरण के लिए `AMD:0` (`HIP` एक alias है) |
 | `SVOD_AMD_BACKEND` | `kfd` | AMD बैकएंड; फ़िलहाल केवल `kfd` स्वीकार्य है |
-| `SVOD_AMD_HW_QUEUES` | multi-XCC पर 4, वरना 1 | Bounded compute-lane count, 1 से 64 तक clamp किया गया |
+| `SVOD_AMD_HW_QUEUES` | 4 | Bounded compute-lane count, 1 से 64 तक clamp किया गया |
 | `SVOD_AMD_AQL` | unset | `0` के अलावा कोई भी value single-XCC hardware पर AQL को force करती है; हर queue creation पर पढ़ा जाता है |
 | `SVOD_AMD_SCOPED_SYNC` | unset | `=0` हर storage-scoped host wait को पूरे device drain से बदल देता है और producer recording रोक देता है; प्रति process एक बार latch होता है |
 | `SVOD_PM4_GRAPH` | unset | `=1` PM4 graph capture enable करता है; केवल `1` गिना जाता है; device creation पर एक बार पढ़ा जाता है |
 | `AMD_DISABLE_SDMA` | unset | SDMA copy queue skip करने के लिए किसी भी value पर सेट करें, जो buffers को host-visible बना देता है |
 | `SVOD_KFD_TOPOLOGY` | sysfs | tests के लिए KFD topology root override करें |
-| `SVOD_DEBUG_DISPATCH` | unset | program-load और dispatch grid, kernarg, scratch, तथा buffer addresses print करने के लिए किसी भी value पर सेट करें |
+| `SVOD_DEBUG_DISPATCH` | unset | हर program का load descriptor और हर dispatch का grid, scratch तथा buffer addresses print करने के लिए किसी भी value पर सेट करें |
 | `SVOD_DUMP_AMD_IR` | unset | वह directory जिसमें हर kernel का AMD LLVM IR `<mcpu>_<module>_<digest>.ll` के रूप में लिखा जाता है |
 | `SVOD_DUMP_AMD_ASM` | unset | वह directory जिसमें हर kernel का AMDGCN assembly `<mcpu>_<module>_<digest>.s` के रूप में लिखा जाता है, उसकी `.ll` वाले नाम के साथ (हर kernel पर clang का एक और run) |
 | `SVOD_OBJECT_CACHE`, `SVOD_OBJECT_CACHE_DIR`, `SVOD_OBJECT_CACHE_MAX_BYTES` | on | साझा on-disk object cache, देखें [CPU पेज](../cpu.md) |

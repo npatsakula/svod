@@ -1,7 +1,7 @@
 //! Running a tile program as a lazy graph kernel: placeholders sized at
 //! capacity, the lowered PROGRAM as the call body. The first `Out`
 //! parameter is the call's output and every other parameter an input;
-//! results return in `prog.params` order.
+//! results return in `prog.params()` order.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -42,6 +42,8 @@ pub enum Error {
     Graph { name: String, source: svod_tensor::error::Error },
     #[snafu(display("{name} declares {want} parameters, {got} tensors were given"))]
     Arity { name: String, want: usize, got: usize },
+    #[snafu(display("{name} writes {a}, which shares storage with {b}"))]
+    Aliased { name: String, a: String, b: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -63,7 +65,7 @@ pub(crate) fn graph_launch_once(prog: Program, lowering: &Lowering, tensors: &[&
 
 /// [`graph_launch_all`] of `body`, `prog` lowered already for its target
 /// alone ([`lower::standalone`]), kept in no memo: its parameters are
-/// positional in `prog.params` order, so the call binds `tensors` in that
+/// positional in `prog.params()` order, so the call binds `tensors` in that
 /// order. Where this device or the tensors' placeholders are not the ones it
 /// was lowered over, `prog` is lowered again for them.
 pub(crate) fn graph_launch_lowered(
@@ -102,11 +104,11 @@ pub(crate) fn graph_launch_lowered(
 }
 
 pub(crate) fn first_output(prog: &Program) -> usize {
-    prog.params.iter().position(|p| p.kind == ParamKind::Out).expect("a program writes something")
+    prog.params.iter().position(|p| p.kind != ParamKind::In).expect("a program writes something")
 }
 
 /// [`graph_launch`] returning every parameter's tensor as it is after the
-/// kernel, in `prog.params` order, so programs with several outputs can be read.
+/// kernel, in `prog.params()` order, so programs with several outputs can be read.
 pub fn graph_launch_all(prog: Program, lowering: &Lowering, tensors: &[&Tensor]) -> Result<Vec<Tensor>> {
     launch_all(prog, lowering, tensors, true)
 }
@@ -117,6 +119,7 @@ fn launch_all(prog: Program, lowering: &Lowering, tensors: &[&Tensor], memo: boo
         tensors.len() == prog.params.len(),
         AritySnafu { name: name.clone(), want: prog.params.len(), got: tensors.len() }
     );
+    aliasing(&prog, tensors)?;
     let out_at = first_output(&prog);
     // `custom_kernel` hands placeholders in `[out, ins...]` order.
     let ins: Vec<&Tensor> = tensors.iter().enumerate().filter(|(i, _)| *i != out_at).map(|(_, t)| *t).collect();
@@ -159,4 +162,26 @@ fn launch_all(prog: Program, lowering: &Lowering, tensors: &[&Tensor], memo: boo
     let out = outs.remove(0);
     outs.insert(out_at, out);
     Ok(outs)
+}
+
+/// No parameter the kernel writes shares storage with another: the body
+/// declares every buffer `noalias` and every input `readonly`
+/// ([`lower::lower`]), which only parameters all read may share. Two tensors
+/// share storage as one lazy node, or as realized buffers over one allocation
+/// whose windows overlap.
+pub(crate) fn aliasing(prog: &Program, tensors: &[&Tensor]) -> Result<()> {
+    let shared = |a: &Tensor, b: &Tensor| {
+        Arc::ptr_eq(&a.uop(), &b.uop())
+            || matches!((a.buffer(), b.buffer()), (Some(x), Some(y))
+                if x.storage_id() == y.storage_id()
+                    && x.offset() < y.offset() + y.size()
+                    && y.offset() < x.offset() + x.size())
+    };
+    for (i, (a, pa)) in tensors.iter().zip(&prog.params).enumerate() {
+        for (b, pb) in tensors[i + 1..].iter().zip(&prog.params[i + 1..]) {
+            let read = pa.kind == ParamKind::In && pb.kind == ParamKind::In;
+            snafu::ensure!(read || !shared(a, b), AliasedSnafu { name: &prog.name, a: &pa.name, b: &pb.name });
+        }
+    }
+    Ok(())
 }

@@ -14,7 +14,9 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use crate::amd::device::AmdDevice;
-use crate::amd::iface::{AllocKind, AllocResult, AmdIface, PublicationStage, QueueHandle, QueueTeardown, RingDesc};
+use crate::amd::iface::{
+    AllocKind, AllocResult, AmdIface, PublicationStage, QueueEventMailbox, QueueHandle, QueueTeardown, RingDesc,
+};
 use crate::amd::va_registry::AllocTag;
 use crate::error::{Error, Result};
 
@@ -27,8 +29,10 @@ pub(crate) enum MockAmdCall {
     Free { gpu_va: u64, size: usize, handle: u64 },
     SetupRing { ring_size: usize, queue_type: u32 },
     TeardownRing { queue_id: u32 },
+    UpdateQueue { queue_id: u32, percentage: u32 },
     WaitEvents { timeout_ms: u32 },
     PublicationCheckpoint { stage: PublicationStage },
+    HdpFlush,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,9 +97,13 @@ struct MockAmdState {
     teardown_script: VecDeque<Result<QueueTeardown>>,
     wait_script: VecDeque<Result<Option<Error>>>,
     publication_script: VecDeque<MockPublicationOutcome>,
-    alloc_tags: Vec<AllocTag>,
+    alloc_tags: Vec<(AllocTag, AllocKind)>,
     transcript: Vec<MockAmdCall>,
     free_issues: Vec<MockFreeIssue>,
+    queue_event_mailbox: Option<QueueEventMailbox>,
+    ctx_save_areas: Vec<(u64, u32)>,
+    hdp_flush_register: bool,
+    during_hdp_flush: Option<Box<dyn FnOnce() + Send>>,
 }
 
 /// Host-only AMD backend with page-aligned, stable allocations and explicit
@@ -131,6 +139,22 @@ impl MockAmdIface {
         self.state.lock().teardown_script.push_back(outcome);
     }
 
+    /// Give the mock KFD's queue-completion mailbox, as a real event page does.
+    pub(crate) fn set_queue_event_mailbox(&self, mailbox: QueueEventMailbox) {
+        self.state.lock().queue_event_mailbox = Some(mailbox);
+    }
+
+    /// Give the mock KFD's MMIO remap page, whose HDP flush register the host
+    /// writes after its VRAM stores; without it the flush is skipped.
+    pub(crate) fn set_hdp_flush_register(&self) {
+        self.state.lock().hdp_flush_register = true;
+    }
+
+    /// Run `hook` inside the next HDP flush, after its write and before it lands.
+    pub(crate) fn during_next_hdp_flush(&self, hook: impl FnOnce() + Send + 'static) {
+        self.state.lock().during_hdp_flush = Some(Box::new(hook));
+    }
+
     pub(crate) fn script_wait(&self, outcome: Result<Option<Error>>) {
         self.state.lock().wait_script.push_back(outcome);
     }
@@ -153,7 +177,12 @@ impl MockAmdIface {
 
     /// Successful allocations recorded for one [`AllocTag`], live or freed.
     pub(crate) fn alloc_count_for_tag(&self, tag: AllocTag) -> usize {
-        self.state.lock().alloc_tags.iter().filter(|recorded| **recorded == tag).count()
+        self.alloc_kinds_for_tag(tag).len()
+    }
+
+    /// The [`AllocKind`] of each successful allocation recorded for `tag`.
+    pub(crate) fn alloc_kinds_for_tag(&self, tag: AllocTag) -> Vec<AllocKind> {
+        self.state.lock().alloc_tags.iter().filter(|(recorded, _)| *recorded == tag).map(|(_, kind)| *kind).collect()
     }
 
     pub(crate) fn live_handle_count(&self) -> usize {
@@ -170,6 +199,12 @@ impl MockAmdIface {
 
     pub(crate) fn live_queue_count(&self) -> usize {
         self.state.lock().queues.len()
+    }
+
+    /// Each compute queue's ctx-save area: its address (the mock GPU VA is the
+    /// host address) and per-XCC stride, in setup order.
+    pub(crate) fn ctx_save_areas(&self) -> Vec<(u64, u32)> {
+        self.state.lock().ctx_save_areas.clone()
     }
 
     pub(crate) fn transcript(&self) -> Vec<MockAmdCall> {
@@ -218,6 +253,17 @@ pub(crate) fn install_signal_pool(allocator: &AmdAllocator) {
     allocator.dev.core().install_signal_pool(crate::amd::signal::SignalPool::new(allocator, 64).expect("signal pool"));
 }
 
+/// Play the GPU retiring everything `lane` published: XCC0's timeline stores
+/// and, on AQL, the completion of each submission's last packet.
+pub(crate) fn retire_lane(lane: &crate::amd::connector::PoolQueue) {
+    crate::sync::TimelineSignal::set(&**lane.pm4_signal(), lane.pm4_value() - 1);
+    if let Some(retired) = lane.retired() {
+        while crate::sync::TimelineSignal::value(&**retired.signal()) + 1 < retired.current() {
+            retired.signal().complete_packet();
+        }
+    }
+}
+
 pub(crate) fn scripted_error(stage: &str) -> Error {
     Error::Runtime { message: format!("scripted {stage} failure") }
 }
@@ -230,7 +276,7 @@ impl AmdIface for MockAmdIface {
     fn alloc_raw(
         &self,
         size: usize,
-        _kind: AllocKind,
+        kind: AllocKind,
         tag: AllocTag,
         cpu_access: bool,
         zero: bool,
@@ -253,7 +299,7 @@ impl AmdIface for MockAmdIface {
         let previous = state.live.insert(handle, MockLiveAllocation { _memory: memory, gpu_va, size });
         debug_assert!(previous.is_none());
         state.allocations += 1;
-        state.alloc_tags.push(tag);
+        state.alloc_tags.push((tag, kind));
         Ok(AllocResult { gpu_va, host_ptr, handle, size })
     }
 
@@ -294,6 +340,9 @@ impl AmdIface for MockAmdIface {
         let queue_id = state.next_queue_id;
         state.next_queue_id += 1;
         state.queues.insert(queue_id, MockQueue { doorbell });
+        if desc.ctx_gpu != 0 {
+            state.ctx_save_areas.push((desc.ctx_gpu, desc.ctx_save_restore_size));
+        }
         state.queue_setups += 1;
         Ok(QueueHandle { queue_id, doorbell_base, doorbell: doorbell_ptr })
     }
@@ -326,7 +375,12 @@ impl AmdIface for MockAmdIface {
         Ok(QueueTeardown::Complete)
     }
 
-    fn wait_events(&self, timeout_ms: u32) -> Result<Option<Error>> {
+    fn update_queue_percentage(&self, queue_id: u32, _ring_gpu: u64, _ring_size: u32, percentage: u32) -> Result<()> {
+        self.state.lock().transcript.push(MockAmdCall::UpdateQueue { queue_id, percentage });
+        Ok(())
+    }
+
+    fn wait_events(&self, timeout_ms: u32, _age: &mut u64) -> Result<Option<Error>> {
         let scripted = {
             let mut state = self.state.lock();
             state.transcript.push(MockAmdCall::WaitEvents { timeout_ms });
@@ -339,6 +393,24 @@ impl AmdIface for MockAmdIface {
             std::thread::sleep(std::time::Duration::from_millis(timeout_ms.into()));
         }
         Ok(None)
+    }
+
+    fn queue_event_mailbox(&self) -> Option<QueueEventMailbox> {
+        self.state.lock().queue_event_mailbox
+    }
+
+    fn flush_hdp(&self) {
+        let hook = {
+            let mut state = self.state.lock();
+            if !state.hdp_flush_register {
+                return;
+            }
+            state.transcript.push(MockAmdCall::HdpFlush);
+            state.during_hdp_flush.take()
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     fn publication_checkpoint(&self, stage: PublicationStage) -> Result<()> {

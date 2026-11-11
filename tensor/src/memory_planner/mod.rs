@@ -108,7 +108,7 @@ fn round_up(size: usize, block_size: usize) -> usize {
 /// Buffer reuse is shape-agnostic: codegen reads logical shape from the UOp
 /// graph, runtime dispatch passes raw `*mut u8` pointers, and the planner
 /// skips output buffers (the only consumers of `Buffer::shape()` via
-/// `as_array`/`as_array_mut`). Two non-output buffers with the same
+/// `as_array`). Two non-output buffers with the same
 /// `(device, dtype, rounded_size)` are interchangeable storage regardless
 /// of their logical shapes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -345,7 +345,7 @@ fn exclusion_reason(
 /// runtime executor uses for `op_levels`. Keyed on `kernel.id` +
 /// `ScheduleItem.dependencies`; `levels[i]` is item `i`'s longest
 /// dependency-path length. Returns `Err` (loud) on a cyclic or unresolved-dep
-/// schedule, matching the runtime — the planner no longer silently skips.
+/// schedule, matching the runtime.
 ///
 /// Sharing one implementation guarantees these levels equal the runtime's
 /// per-op levels (so level-interval reuse decisions match real execution

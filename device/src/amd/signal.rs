@@ -10,7 +10,7 @@
 use std::any::Any;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 
 use parking_lot::Mutex;
 
@@ -20,13 +20,48 @@ use crate::amd::device::AmdDeviceCore;
 use crate::error::{Error, Result};
 use crate::sync::TimelineSignal;
 
-/// Spin / yield budget before escalating to a KFD WAIT_EVENTS sleep: cheap
-/// polling for short waits, kernel blocking for long ones so a stalled wait
-/// doesn't pin a CPU.
+/// How long a wait polls before it sleeps in KFD `WAIT_EVENTS`, counted from
+/// the wait's start (ROCr `InterruptSignal::WaitRelaxed`: 200 µs). Every
+/// completion the host waits on raises the queue event, so a sleeping wait
+/// wakes as it retires, and a long one doesn't pin a CPU however often the
+/// queue moves.
 #[cfg(not(test))]
-const WAIT_EVENTS_ESCALATE_MS: u64 = 200;
+const SPIN: std::time::Duration = std::time::Duration::from_micros(200);
 #[cfg(test)]
-const WAIT_EVENTS_ESCALATE_MS: u64 = 1;
+const SPIN: std::time::Duration = std::time::Duration::from_millis(1);
+/// The polling part of [`SPIN`] that only spins; the rest yields.
+const SPIN_HOT: std::time::Duration = std::time::Duration::from_micros(100);
+/// The longest single `WAIT_EVENTS` sleep: a wait rechecks its value, its
+/// progress and its deadline at least this often.
+#[cfg(not(test))]
+const SLEEP_MS: u32 = 200;
+#[cfg(test)]
+const SLEEP_MS: u32 = 1;
+
+/// An AQL queue's packet read index, which waits on its timeline read as
+/// progress: a graph's one timeline store comes at its end, while the packet
+/// processor moves on from each barriered dispatch once it finishes. It reports
+/// in blocks (four packets on gfx942), so kernels several times shorter than a
+/// wait's limit are what this can tell from a hung queue.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QueueReadPointer(NonNull<u64>);
+
+// SAFETY: the pointer targets the queue's GART page, which a queue's teardown
+// keeps until its timeline is reached and quarantines when it isn't. A wait
+// reads it only short of its target, so a timeline outliving its queue is safe.
+unsafe impl Send for QueueReadPointer {}
+unsafe impl Sync for QueueReadPointer {}
+
+impl QueueReadPointer {
+    pub(crate) fn new(pointer: NonNull<u64>) -> Self {
+        Self(pointer)
+    }
+
+    fn load(self) -> u64 {
+        // SAFETY: see the `Send` impl; the GPU writes the slot, hence volatile.
+        unsafe { std::ptr::read_volatile(self.0.as_ptr()) }
+    }
+}
 
 /// 64-byte slot laid out as an `amd_signal_t` (kind@0, value@8). The AQL packet
 /// processor reads a dispatch packet's `completion_signal.handle` as the struct
@@ -43,10 +78,28 @@ const SIGNAL_VALUE_OFFSET: usize = 8;
 /// AMD HCQ submission finalizers write these fields with explicit PM4 timestamp
 /// commands on both PM4 and AQL queues.
 const SIGNAL_START_TS_OFFSET: usize = 32;
+/// Byte offsets of `amd_signal_t.event_mailbox_ptr` / `.event_id`: the CP
+/// writes the id there and interrupts when it decrements the signal.
+const SIGNAL_EVENT_MAILBOX_OFFSET: usize = 16;
+const SIGNAL_EVENT_ID_OFFSET: usize = 24;
 const SIGNAL_END_TS_OFFSET: usize = 40;
 /// The GPU clock counter feeding the timestamps ticks at the architected
 /// 100 MHz on AMD GPUs (10 ns per tick — tinygrad's `timestamp_divider=100`).
 const NS_PER_TICK: u64 = 10;
+
+/// Make the CP raise `mailbox`'s event whenever it writes the `amd_signal_t`
+/// at `base`: it stores `event_id` at `event_mailbox_ptr` and interrupts (ROCr
+/// `InterruptSignal`).
+///
+/// # Safety
+/// `base` must address a mapped, writable 64-byte `amd_signal_t`.
+pub(crate) unsafe fn raise_event_on_write(base: *mut u8, mailbox: crate::amd::iface::QueueEventMailbox) {
+    // SAFETY: the caller guarantees the 64-byte struct is mapped.
+    unsafe {
+        std::ptr::write_volatile(base.add(SIGNAL_EVENT_MAILBOX_OFFSET) as *mut u64, mailbox.address);
+        std::ptr::write_volatile(base.add(SIGNAL_EVENT_ID_OFFSET) as *mut u32, mailbox.event_id);
+    }
+}
 
 /// A pool-allocated AMD signal.
 ///
@@ -66,6 +119,11 @@ pub struct AmdSignal {
     /// `AMDKFD_IOC_WAIT_EVENTS` on the device's `queue_event`. `Weak` so
     /// signals don't extend device lifetime.
     device: Weak<AmdDeviceCore>,
+    /// The queue this signal is the timeline of, where it reports its reads.
+    queue_read: OnceLock<QueueReadPointer>,
+    /// A completion signal the CP decrements from 0: its value counts the
+    /// decrements, read as the negated raw word.
+    countdown: bool,
 }
 
 // SAFETY: AtomicU64 covers all reads/writes; the host pointer comes from a
@@ -103,6 +161,36 @@ impl AmdSignal {
         self.device.upgrade().and_then(|device| device.poison_error())
     }
 
+    /// The `amd_signal_t` base, an AQL packet's `completion_signal` handle.
+    pub(crate) fn handle(&self) -> u64 {
+        self.base_gpu
+    }
+
+    /// Count the AQL packets that name this signal as their completion signal:
+    /// the CP decrements it as each retires on every XCC, and raises the
+    /// queue event as it does when `mailbox` is given (ROCr `InterruptSignal`).
+    pub(crate) fn counting_down(mut self, mailbox: Option<crate::amd::iface::QueueEventMailbox>) -> Self {
+        self.countdown = true;
+        if let Some(mailbox) = mailbox {
+            // SAFETY: the full 64-byte slot is mapped; value lives at +8.
+            unsafe { raise_event_on_write((self.host_ptr.as_ptr() as *mut u8).sub(SIGNAL_VALUE_OFFSET), mailbox) };
+        }
+        self
+    }
+
+    /// Decrement the raw value as the CP does on a packet's completion.
+    #[cfg(test)]
+    pub(crate) fn complete_packet(&self) {
+        // SAFETY: NonNull valid for the pool's lifetime.
+        unsafe { self.host_ptr.as_ref().fetch_sub(1, Ordering::AcqRel) };
+    }
+
+    /// The raw word as this signal counts it; its own inverse.
+    #[inline]
+    fn counted(&self, raw: u64) -> u64 {
+        if self.countdown { raw.wrapping_neg() } else { raw }
+    }
+
     /// Slot index inside the pool. Useful for debugging.
     pub fn slot(&self) -> u32 {
         self.slot
@@ -112,7 +200,7 @@ impl AmdSignal {
     #[inline]
     fn load(&self) -> u64 {
         // SAFETY: NonNull valid for the pool's lifetime; AtomicU64 is race-free.
-        unsafe { self.host_ptr.as_ref().load(Ordering::Acquire) }
+        self.counted(unsafe { self.host_ptr.as_ref().load(Ordering::Acquire) })
     }
 
     /// Reset a slot before assigning it to a timeline or timestamp probe.
@@ -125,23 +213,38 @@ impl AmdSignal {
             let base = (self.host_ptr.as_ptr() as *mut u8).sub(SIGNAL_VALUE_OFFSET);
             std::ptr::write_volatile(base.add(SIGNAL_START_TS_OFFSET) as *mut u64, 0);
             std::ptr::write_volatile(base.add(SIGNAL_END_TS_OFFSET) as *mut u64, 0);
-            self.host_ptr.as_ref().store(value, Ordering::Release);
+            self.host_ptr.as_ref().store(self.counted(value), Ordering::Release);
         }
     }
 
-    /// Tiered busy-wait until `ready(value)` holds, or `timeout_ms` of *no
-    /// progress* elapses, or KFD reports a GPU fault. Shared by the
-    /// monotonic timeline waits.
+    /// Waits on this signal count `read` moving as progress.
+    pub(crate) fn watch_queue(&self, read: QueueReadPointer) {
+        self.queue_read.set(read).expect("a timeline belongs to one queue");
+    }
+
+    /// Wait until the value reaches `target`, `timeout_ms` passes with *no
+    /// progress* (the value, `progress` or the queue's read index moving), or
+    /// KFD reports a GPU fault or a compute queue reports an error. Shared by
+    /// the monotonic timeline waits.
     ///
     /// Early-exit on fault is load-bearing for BEAM search: a bad kernel config
     /// may fault the GPU, and paying the full timeout per rejected candidate is
     /// unaffordable.
     fn poll_until(&self, target: u64, timeout_ms: u64, what: &'static str, progress: &[Arc<AmdSignal>]) -> Result<()> {
-        let mut start = std::time::Instant::now();
+        // Two clocks: `waiting` paces polling against sleeping and never
+        // resets; `quiet` is time since the last progress and alone decides a
+        // hang, so a long healthy plan neither spins nor times out.
+        let waiting = std::time::Instant::now();
+        let mut quiet = waiting;
+        let mut age = 1;
         let mut prev = u64::MAX;
         let mut progress_values = vec![u64::MAX; progress.len()];
+        let mut read_prev = None;
+        // One strong count per wait: concurrent waiters would otherwise
+        // contend on the core's count every poll.
+        let device = self.device.upgrade();
         loop {
-            if let Some(error) = self.device.upgrade().and_then(|device| device.poison_error()) {
+            if let Some(error) = device.as_ref().and_then(|device| device.poison_error()) {
                 return Err(error);
             }
             let v = self.load();
@@ -155,13 +258,18 @@ impl AmdSignal {
                 advanced |= value != *previous;
                 *previous = value;
             }
-            if advanced {
-                start = std::time::Instant::now();
+            if let Some(read) = self.queue_read.get() {
+                let value = read.load();
+                advanced |= read_prev != Some(value);
+                read_prev = Some(value);
             }
-            if timeout_ms > 0 && start.elapsed().as_millis() as u64 >= timeout_ms {
-                // A hung kernel almost always raised a fault; surface it
-                // alongside the deadline.
-                let fault = self.device.upgrade().and_then(|d| d.poll_faults_nonblocking());
+            if advanced {
+                quiet = std::time::Instant::now();
+            }
+            if timeout_ms > 0 && quiet.elapsed().as_millis() as u64 >= timeout_ms {
+                // A hung kernel almost always raised a fault or stopped its
+                // queue; surface that instead of the deadline.
+                let fault = device.as_ref().and_then(|d| d.poll_faults_nonblocking().or_else(|| d.queue_error()));
                 return Err(fault.unwrap_or(Error::TimelineTimeout {
                     what,
                     target,
@@ -169,7 +277,7 @@ impl AmdSignal {
                     waited_ms: timeout_ms,
                 }));
             }
-            if let Some(fault) = self.spin_or_escalate(start)? {
+            if let Some(fault) = Self::spin_or_sleep(device.as_deref(), waiting, &mut age)? {
                 return Err(fault);
             }
         }
@@ -207,34 +315,30 @@ impl AmdSignal {
         (start != 0 && end >= start).then(|| (start * NS_PER_TICK, end * NS_PER_TICK))
     }
 
-    /// Tiered polling backoff: tight spin → `yield_now` → KFD `WAIT_EVENTS`
-    /// once we've burned `WAIT_EVENTS_ESCALATE_MS` of wall time. The kernel
-    /// wakes us when the device's `queue_event` fires, eliminating CPU burn
-    /// for stalled or long-running dispatches.
+    /// Tiered backoff by the wait's age: spin, then yield, then from [`SPIN`]
+    /// on sleep in KFD `WAIT_EVENTS` for at most [`SLEEP_MS`]. The sleep wakes
+    /// on the queue event a completion or a queue error raises and on the
+    /// memory and hardware fault events, so each wake also reads the queues'
+    /// error words.
     ///
     /// Returns the typed `WAIT_EVENTS` failure directly. Otherwise, `Some`
-    /// carries a reported GPU fault and `None` means a normal wake-up, timeout,
-    /// dropped device, or the pure spin/yield path.
+    /// carries a reported GPU fault or queue error and `None` means a normal
+    /// wake-up, timeout, dropped device, or the pure spin/yield path.
     #[inline]
-    fn spin_or_escalate(&self, start: std::time::Instant) -> Result<Option<Error>> {
-        let elapsed_ms = start.elapsed().as_millis() as u64;
-        if elapsed_ms >= WAIT_EVENTS_ESCALATE_MS
-            && let Some(dev) = self.device.upgrade()
+    fn spin_or_sleep(
+        device: Option<&AmdDeviceCore>,
+        waiting: std::time::Instant,
+        age: &mut u64,
+    ) -> Result<Option<Error>> {
+        let elapsed = waiting.elapsed();
+        if elapsed >= SPIN
+            && let Some(dev) = device
         {
-            // Sleep in the kernel for at most another tier worth of time;
-            // on return we re-check the host value and either complete
-            // or escalate again. wait_events watches the three KFD
-            // events (queue, mem fault, hw fault); a fault is returned
-            // here so we bail with the actual error instead of grinding
-            // through the rest of the timeout.
-            match dev.wait_events(WAIT_EVENTS_ESCALATE_MS as u32) {
-                Ok(Some(fault)) => return Ok(Some(fault)),
-                Ok(None) => return Ok(None),
-                Err(error) => return Err(error),
-            }
+            return Ok(dev.wait_events(SLEEP_MS, age)?.or_else(|| dev.queue_error()));
         }
-        std::hint::spin_loop();
-        if start.elapsed().as_micros() >= 100 {
+        if elapsed < SPIN_HOT {
+            std::hint::spin_loop();
+        } else {
             std::thread::yield_now();
         }
         Ok(None)
@@ -361,14 +465,13 @@ impl TimelineSignal for AmdSignal {
     }
 
     fn value(&self) -> u64 {
-        // SAFETY: NonNull is valid for the pool's lifetime; AtomicU64 reads
-        // are race-free.
-        unsafe { self.host_ptr.as_ref().load(Ordering::Acquire) }
+        self.load()
     }
 
     fn set(&self, value: u64) {
-        // SAFETY: same as `value`.
-        unsafe { self.host_ptr.as_ref().store(value, Ordering::Release) };
+        // SAFETY: NonNull is valid for the pool's lifetime; AtomicU64 stores
+        // are race-free.
+        unsafe { self.host_ptr.as_ref().store(self.counted(value), Ordering::Release) };
     }
 
     fn wait(&self, target: u64, timeout_ms: u64) -> Result<()> {
@@ -499,7 +602,9 @@ impl SignalPool {
             value_addr,
             host_ptr,
             pool: Arc::downgrade(self),
+            queue_read: OnceLock::new(),
             device: Arc::downgrade(&self.device),
+            countdown: false,
         })
     }
 

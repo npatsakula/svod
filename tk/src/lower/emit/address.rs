@@ -166,11 +166,18 @@ impl Emit<'_> {
                 };
                 let chunk = 16 / bytes as i64;
                 let swizzle = Swizzle::of_row(cols as usize, bytes);
-                let col = if swizzle != Swizzle::None {
-                    let (c, within) = (shr(&col, chunk.trailing_zeros()), and(&col, &c32(chunk - 1)));
-                    let (shift, mask) = (3 - swizzle.bits(), c32((1 << swizzle.bits()) - 1));
-                    let sw = if shift == 0 { and(&row, &mask) } else { and(&shr(&row, shift), &mask) };
-                    add(&mul(&xor(&c, &sw), &c32(chunk)), &within)
+                let halves = self.halves(view);
+                let col = if swizzle != Swizzle::None || halves.is_some() {
+                    let (mut c, mut within) = (shr(&col, chunk.trailing_zeros()), and(&col, &c32(chunk - 1)));
+                    if swizzle != Swizzle::None {
+                        let (shift, mask) = (3 - swizzle.bits(), c32((1 << swizzle.bits()) - 1));
+                        let sw = if shift == 0 { and(&row, &mask) } else { and(&shr(&row, shift), &mask) };
+                        c = xor(&c, &sw);
+                    }
+                    if let Some(bit) = halves {
+                        within = xor(&within, &mul(&and(&shr(&row, bit), &c32(1)), &c32(chunk / 2)));
+                    }
+                    add(&mul(&c, &c32(chunk)), &within)
                 } else {
                     col
                 };
@@ -190,7 +197,7 @@ impl Emit<'_> {
         let in_rows = match rows {
             Some(map) => map.valid.map(|v| {
                 let (_, v) = self.scalar_at(v, Some(&row));
-                v.try_cmpne(&c32(0)).expect("row gate")
+                v.try_cmpne(&v.const_like(0)).expect("row gate")
             }),
             None => bounds[0].map(|b| row.try_cmplt(&self.sc(b)).expect("bound compare")),
         };
@@ -257,9 +264,18 @@ impl Emit<'_> {
                 let unit = |s: ScalarId| matches!(self.prog.scalar(s), Scalar::Const(1));
                 if unit(stride[1]) { (Axis::Col, true) } else { (Axis::Row, unit(stride[0])) }
             }
-            Some(Place::Smem { alloc, .. }) => (self.prog.smem[alloc.index()].along, true),
+            Some(Place::Smem { alloc, .. }) => (self.prog.smem[alloc.index()].storage.along, true),
             None => (Axis::Col, true),
             Some(Place::Reg) => unreachable!(),
+        }
+    }
+
+    /// The row bit a view's allocation exchanges its chunks' halves on
+    /// ([`crate::layouts::SharedSwizzle`]): its accesses stay within a half.
+    pub(super) fn halves(&self, view: &View) -> Option<u32> {
+        match &view.place {
+            Some(Place::Smem { alloc, .. }) => self.prog.smem[alloc.index()].storage.halves,
+            _ => None,
         }
     }
 
@@ -281,6 +297,9 @@ impl Emit<'_> {
     pub(super) fn runs(&self, l: &TileLayout, view: &View) -> Vec<(u32, u32)> {
         let (along, contiguous) = self.along(view);
         let mut width = if contiguous { 16 / view.dtype.bytes() as u32 } else { 1 };
+        if self.halves(view).is_some() {
+            width = width.min(16 / view.dtype.bytes() as u32 / 2);
+        }
         // An aligned run no wider than the power of two dividing a period stays within one.
         if let Some(Place::Global { period: Some(p), .. }) = &view.place {
             width = width.min(1 << p.trailing_zeros());

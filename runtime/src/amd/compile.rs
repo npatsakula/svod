@@ -36,7 +36,8 @@ pub fn compile_ir_to_amd_asm(ir: &str, arch: AmdArch) -> crate::Result<Vec<u8>> 
 }
 
 fn compile_ir_to_amd_asm_with(toolchain: &ClangToolchain, ir: &str, arch: AmdArch) -> crate::Result<Vec<u8>> {
-    let flags = amd_object_flags(ir, arch).into_iter().map(|f| if f == "-c" { "-S".into() } else { f });
+    let flags =
+        amd_object_flags(ir, arch, toolchain.llvm_major()).into_iter().map(|f| if f == "-c" { "-S".into() } else { f });
     toolchain.compile_ir(&flags.collect::<Vec<_>>(), ir, &format!("amdgcn assembly (mcpu={})", arch.mcpu()))
 }
 
@@ -83,6 +84,19 @@ pub(crate) fn check_amd_clang(version: &str) -> crate::Result<()> {
     }
 }
 
+/// The first LLVM whose AMDGPU matrix instructions are convergent machine
+/// instructions (llvm-project #165602, and #178314 for the gfx11
+/// `V_WMMA_*_twoaddr` forms).
+pub(crate) const AMD_CONVERGENT_WMMA_LLVM: u32 = 23;
+
+/// Whether machine sinking may move a `v_wmma` into a divergent branch under
+/// a clang of LLVM `major`: below [`AMD_CONVERGENT_WMMA_LLVM`], or when the
+/// version is unknown. Inside the branch the lanes it skips never write the
+/// product's operands, so the product reads garbage.
+pub(crate) fn amd_sinks_wmma(major: Option<u32>) -> bool {
+    major.is_none_or(|major| major < AMD_CONVERGENT_WMMA_LLVM)
+}
+
 /// Clang driver flags for one kernel.
 ///
 /// `-nogpulib` skips the ROCm device-library search entirely, the way tinygrad
@@ -90,9 +104,13 @@ pub(crate) fn check_amd_clang(version: &str) -> crate::Result<()> {
 /// links no device libs). The renderer emits `@llvm.*` intrinsics for every
 /// float unary the AMDGPU backend can select, so the libraries are only needed
 /// when the IR still references the f64 `__ocml_*` entry points
-/// (`codegen/src/llvm/amd/ops.rs::render_float_unary`). The IR is part of the
-/// object-cache key, so keying a flag off it keeps the key sound.
-pub(crate) fn amd_object_flags(ir: &str, arch: AmdArch) -> Vec<String> {
+/// (`codegen/src/llvm/amd/ops.rs::render_float_unary`). Each kernel's object
+/// key carries the flags its IR selects ([`amd_object_key`]).
+///
+/// Below [`AMD_CONVERGENT_WMMA_LLVM`] (or when the version is unreadable)
+/// machine sinking is off for IR holding a matrix product; see
+/// [`amd_sinks_wmma`]. The toolchain's version is part of the cache key too.
+pub(crate) fn amd_object_flags(ir: &str, arch: AmdArch, llvm_major: Option<u32>) -> Vec<String> {
     let mut flags: Vec<String> = vec![
         "-x".into(),
         "ir".into(),
@@ -105,11 +123,28 @@ pub(crate) fn amd_object_flags(ir: &str, arch: AmdArch) -> Vec<String> {
         "-Wno-override-module".into(),
         "-fno-math-errno".into(),
     ];
+    if amd_sinks_wmma(llvm_major) && (ir.contains("@llvm.amdgcn.wmma") || ir.contains("@llvm.amdgcn.mfma")) {
+        flags.extend(["-mllvm", "-disable-machine-sink"].map(str::to_string));
+    }
     if !ir.contains("@__ocml_") {
         flags.push("-nogpulib".into());
     }
     flags.extend(["-", "-o", "-"].map(str::to_string));
     flags
+}
+
+/// The object-cache key of `ir`: `identity` with the flags `ir` compiles
+/// with, which follow the IR, so a change of flag policy never reuses an
+/// object built under the old one.
+pub(crate) fn amd_object_key(
+    identity: &crate::object_cache::CompilerIdentity,
+    ir: &str,
+    arch: AmdArch,
+    llvm_major: Option<u32>,
+) -> crate::object_cache::ObjectCacheKey {
+    let mut identity = identity.clone();
+    identity.flags = amd_object_flags(ir, arch, llvm_major);
+    crate::object_cache::ObjectCacheKey::new(ir.as_bytes(), identity)
 }
 
 pub(crate) fn compile_ir_to_amd_object_with(
@@ -126,7 +161,11 @@ pub(crate) fn compile_ir_to_amd_object_with(
         });
     }
     debug!(arch = arch.mcpu(), ir.length = ir.len(), "compiling amdgcn IR via clang");
-    toolchain.compile_ir(&amd_object_flags(ir, arch), ir, &format!("amdgcn (mcpu={})", arch.mcpu()))
+    toolchain.compile_ir(
+        &amd_object_flags(ir, arch, toolchain.llvm_major()),
+        ir,
+        &format!("amdgcn (mcpu={})", arch.mcpu()),
+    )
 }
 
 /// Validate both the generic ELF contract and the architecture encoded in

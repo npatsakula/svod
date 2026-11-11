@@ -41,27 +41,28 @@ fn device_matches(prog: Program) {
 /// reduces into the operand's vector and re-holds it.
 #[test]
 fn a_row_window_reduced_in_a_warp_per_row_loop() {
-    let mut k = Kernel::new("row_window");
-    let src = k.param::<F32>("src", ParamKind::In, ROWS * COLS);
-    let out = k.param::<F32>("out", ParamKind::Out, ROWS * 32);
-    k.grid([Sc::from(1), Sc::from(1), Sc::from(1)]);
-    k.warps(ROWS as u32);
-    let lane = Shape::new(ROWS, 32);
-    let init = vec![k.fill::<F32>(lane, Const::Float(f64::INFINITY))];
-    let view = k.view(src, 0, [COLS, 1], Shape::new(ROWS, 1), [None, None]);
-    let [least] = k.loop_vec(COLS, init, |k, step, carried| {
-        let v = k.at(view, 0, step);
-        let v = k.load(v);
-        let low = k.reduce(v, Axis::Row, ReduceOp::Min);
-        let zero = k.zeros::<F32>(lane);
-        let low = k.binary(low, zero, BinaryOp::Add);
-        vec![k.binary(carried[0], low, BinaryOp::Min)]
-    })[..] else {
-        unreachable!("a tile")
-    };
-    let v = k.view(out, 0, [32, 1], lane, [None, None]);
-    k.store(v, least);
-    device_matches(k.finish());
+    let prog = Kernel::record("row_window", |k| {
+        let src = k.input::<F32>("src", ROWS * COLS);
+        let out = k.output::<F32>("out", ROWS * 32);
+        k.grid([Sc::from(1), Sc::from(1), Sc::from(1)]);
+        k.warps(ROWS as u32);
+        let lane = Shape::new(ROWS, 32);
+        let init = vec![k.fill::<F32>(lane, Const::Float(f64::INFINITY))];
+        let view = k.view(src, 0, [COLS, 1], Shape::new(ROWS, 1), [None, None]);
+        let [least] = k.loop_vec(COLS, init, |k, step, carried| {
+            let v = k.at(view, 0, step);
+            let v = k.load(v);
+            let low = k.reduce(v, Axis::Row, ReduceOp::Min);
+            let zero = k.zeros::<F32>(lane);
+            let low = k.binary(low, zero, BinaryOp::Add);
+            vec![k.binary(carried[0], low, BinaryOp::Min)]
+        })[..] else {
+            unreachable!("a tile")
+        };
+        let v = k.view(out, 0, [32, 1], lane, [None, None]);
+        k.store(v, least);
+    });
+    device_matches(prog);
 }
 
 /// Read ahead: a loop carries the next `AHEAD` steps' loads in a ring, each
@@ -75,36 +76,37 @@ fn a_row_window_reduced_in_a_warp_per_row_loop() {
 #[test]
 fn a_read_ahead_ring_under_a_branch() {
     const AHEAD: usize = 2;
-    let mut k = Kernel::new("read_ahead");
-    let src = k.param::<F32>("src", ParamKind::In, ROWS * COLS * 32);
-    let out = k.param::<F32>("out", ParamKind::Out, ROWS * 32);
-    k.grid([Sc::from(1), Sc::from(1), Sc::from(1)]);
-    k.warps(ROWS as u32);
-    let lane = Shape::new(ROWS, 32);
-    let view = k.view(src, 0, [COLS * 32, 1], lane, [None, None]);
-    // The step `at`'s row of 32, zero past the last.
-    let fetch = |k: &mut Kernel, at: Sc| {
-        let [v] = k.select_if(
-            at.clone().lt(COLS),
-            |k| {
-                let v = k.at(view, 0, at * 32);
-                [k.load(v)]
-            },
-            |k| [k.zeros::<F32>(lane)],
-        );
-        v
-    };
-    let mut init = vec![k.zeros::<F32>(lane)];
-    init.extend((0..AHEAD).map(|p| fetch(&mut k, Sc::from(p))));
-    let sum = k.loop_vec(COLS, init, |k, step, carried| {
-        let sum = k.binary(carried[0], carried[1], BinaryOp::Add);
-        let next = fetch(k, step + AHEAD);
-        let mut out = vec![sum];
-        out.extend(carried[2..].iter().copied());
-        out.push(next);
-        out
-    });
-    let v = k.view(out, 0, [32, 1], lane, [None, None]);
-    k.store(v, sum[0]);
-    device_matches(k.finish());
+    fn body<'k>(k: &mut Kernel<'k>) {
+        let src = k.input::<F32>("src", ROWS * COLS * 32);
+        let out = k.output::<F32>("out", ROWS * 32);
+        k.grid([Sc::from(1), Sc::from(1), Sc::from(1)]);
+        k.warps(ROWS as u32);
+        let lane = Shape::new(ROWS, 32);
+        let view = k.view(src, 0, [COLS * 32, 1], lane, [None, None]);
+        // The step `at`'s row of 32, zero past the last.
+        let fetch = |k: &mut Kernel<'k>, at: Sc<'k>| {
+            let [v] = k.select_if(
+                at.clone().lt(COLS),
+                |k| {
+                    let v = k.at(view, 0, at * 32);
+                    [k.load(v)]
+                },
+                |k| [k.zeros::<F32>(lane)],
+            );
+            v
+        };
+        let mut init = vec![k.zeros::<F32>(lane)];
+        init.extend((0..AHEAD).map(|p| fetch(k, Sc::from(p))));
+        let sum = k.loop_vec(COLS, init, |k, step, carried| {
+            let sum = k.binary(carried[0], carried[1], BinaryOp::Add);
+            let next = fetch(k, step + AHEAD);
+            let mut out = vec![sum];
+            out.extend(carried[2..].iter().copied());
+            out.push(next);
+            out
+        });
+        let v = k.view(out, 0, [32, 1], lane, [None, None]);
+        k.store(v, sum[0]);
+    }
+    device_matches(Kernel::record("read_ahead", body));
 }

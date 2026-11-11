@@ -1493,7 +1493,7 @@ svod_tensor::codegen_tests! {
     }
 
     /// onnx.md "Replay" — prepare_batch over the placeholder, then write the
-    /// input through `array_view_mut` before every execute.
+    /// input through `with_host_write` before every execute.
     fn test_doc_runtime_input_prepare_replay(config) {
         use crate::importer::OnnxModel;
 
@@ -1503,7 +1503,7 @@ svod_tensor::codegen_tests! {
 
         let input = &inputs["x"];
         for (frame, expected) in [([1.0f32, 2.0, 3.0], [2.0f32, 4.0, 6.0]), ([4.0, 5.0, 6.0], [8.0, 10.0, 12.0])] {
-            input.array_view_mut::<f32>().unwrap().as_slice_mut().unwrap().copy_from_slice(&frame);
+            input.with_host_write::<f32, _>(|w| w.copy_from(&frame)).unwrap();
             plan.execute().unwrap();
             assert_eq!(outputs["y"].as_vec::<f32>().unwrap(), expected);
         }

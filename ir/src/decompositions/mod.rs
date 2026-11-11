@@ -172,7 +172,7 @@ pub fn bf16_integer_cast_patterns() -> TypedPatternMatcher<()> {
 
 /// Decomposition patterns for the AMD backend.
 ///
-/// This supplements the renderer-conditioned target matcher for Morok-only
+/// This supplements the renderer-conditioned target matcher for Svod-only
 /// Exp/Log/Cos/Tan/Pow operations. Exp2/Log2/Sin/Sqrt and renderer-supported
 /// Erf are deliberately absent so there is exactly one approximation-selection
 /// path.
@@ -180,7 +180,8 @@ pub fn bf16_integer_cast_patterns() -> TypedPatternMatcher<()> {
 /// The polynomials run directly on `f16`/`f32`/`f64` (tinygrad's
 /// `TRANSCENDENTAL_DTYPES`); any other dtype (integer `Pow` from ONNX
 /// `test_pow_types_*`, `bf16`, `fp8`) is cast to `f32`, decomposed, and cast
-/// back. f32 → bf16 casts are rewritten to an integer round.
+/// back. f32 → bf16 casts are left to [`bf16_integer_cast_patterns`], which a
+/// backend adds when it cannot select the native `fptrunc`.
 pub fn amd_decomposition_patterns() -> TypedPatternMatcher<()> {
     use crate::DType;
     fn transc(d: &DType) -> bool {

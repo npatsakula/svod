@@ -378,8 +378,8 @@ impl FireRedVadInference {
             let b = (n_windows - done).min(BATCH);
             load(jit, done, b)?;
             {
-                let mut view = jit.valid_view_mut::<f32>()?;
-                let slice = view.as_slice_mut().expect("contiguous valid");
+                let mut valid = jit.valid_host_write::<f32>()?;
+                let slice = valid.as_mut_slice();
                 slice.fill(0.0);
                 for i in 0..b {
                     let (_, src_lo, src_hi, dst_lo) = Self::span(done + i, n_frames);

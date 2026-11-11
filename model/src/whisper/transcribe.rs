@@ -163,9 +163,8 @@ impl WhisperRecognizer {
         let (max_batch, max_lanes) = (plan.encoder_batch, plan.decoder_slots);
         // Device-local outputs everywhere: the prefill and step logits are read
         // with one copyout per row and the caches move on-device. Reading the
-        // step logits through the host mapping instead costs a BAR read per
-        // row per token — 4 ms each on a discrete AMD card, 97 s of a 10-minute
-        // clip.
+        // step logits through the host mapping instead costs an uncached BAR
+        // read per row per token on a discrete card.
         let prepare_config = PrepareConfig::device_local();
 
         let mut mel_jit = WhisperMelJit::new(WhisperMel::new(n_mels));
@@ -217,8 +216,8 @@ impl WhisperRecognizer {
         // these values without bounds checks, so every lane must hold a valid
         // one from the start. Zero is always in range; seeding and stepping
         // then overwrite the lanes in use.
-        step_jit.cross_cache_map_mut()?.as_host_bytes_mut()?.fill(0);
-        step_jit.self_key_lens_mut()?.as_host_bytes_mut()?.fill(0);
+        step_jit.cross_cache_map_host_write::<i32>()?.fill(0);
+        step_jit.self_key_lens_host_write::<i32>()?.fill(0);
 
         Ok(Self {
             mel_jit,

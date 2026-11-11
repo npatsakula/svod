@@ -132,7 +132,7 @@ fn amd_pm4(rsrc: [u32; 3], program_address: u64, workgroup_count: [u32; 3]) -> A
 
 #[test]
 fn compute_queue_construction_unwinds_every_allocation_stage() {
-    for (xccs, allocation_stages) in [(1, 4), (2, 5)] {
+    for (xccs, allocation_stages) in [(1, 5), (2, 5)] {
         for fail_at in 0..allocation_stages {
             let (iface, allocator) = mock_device(xccs);
             for _ in 0..fail_at {
@@ -153,19 +153,19 @@ fn compute_queue_setup_success_failure_and_active_rollback_are_owned() {
     let (iface, allocator) = mock_device(1);
     iface.script_setup(Err(scripted_error("setup")));
     assert!(AmdComputeQueue::create(&allocator).is_err());
-    assert_eq!((iface.allocation_count(), iface.free_count(), iface.live_handle_count()), (4, 4, 0));
+    assert_eq!((iface.allocation_count(), iface.free_count(), iface.live_handle_count()), (5, 5, 0));
 
     let queue = AmdComputeQueue::create(&allocator).expect("queue");
     assert_eq!(iface.live_queue_count(), 1);
     drop(queue);
-    assert_eq!((iface.allocation_count(), iface.free_count(), iface.live_handle_count()), (8, 8, 0));
+    assert_eq!((iface.allocation_count(), iface.free_count(), iface.live_handle_count()), (10, 10, 0));
     assert_eq!((iface.queue_setup_count(), iface.queue_teardown_count(), iface.live_queue_count()), (1, 1, 0));
 
     // A leaked doorbell still retires the queue and all of its backing.
     let queue = AmdComputeQueue::create(&allocator).expect("queue with leaked doorbell");
     iface.script_teardown(Ok(crate::amd::iface::QueueTeardown::DoorbellLeaked { errno: 12 }));
     drop(queue);
-    assert_eq!((iface.allocation_count(), iface.free_count(), iface.live_handle_count()), (12, 12, 0));
+    assert_eq!((iface.allocation_count(), iface.free_count(), iface.live_handle_count()), (15, 15, 0));
     assert_eq!(iface.live_queue_count(), 0);
     assert!(iface.free_issues().is_empty());
 
@@ -175,7 +175,7 @@ fn compute_queue_setup_success_failure_and_active_rollback_are_owned() {
     iface.script_setup(Err(Error::AmdQueueStillActive { queue_id: 77, cause: "scripted rollback failure".into() }));
     assert!(matches!(AmdComputeQueue::create(&allocator), Err(Error::AmdQueueStillActive { .. })));
     assert!(allocator.dev.is_poisoned());
-    assert_eq!((iface.allocation_count(), iface.free_count(), iface.live_handle_count()), (4, 0, 4));
+    assert_eq!((iface.allocation_count(), iface.free_count(), iface.live_handle_count()), (5, 0, 5));
 }
 
 #[test]
@@ -260,7 +260,7 @@ fn copy_queue_drains_registered_linked_finalizers_before_teardown() {
 fn pool_queue_construction_unwinds_queue_arena_and_scratch_stages() {
     let (iface, allocator) = mock_device_with_signals(1);
     let baseline = iface.allocation_count();
-    for fail_at in 0..6 {
+    for fail_at in 0..7 {
         let (allocations, frees) = (iface.allocation_count(), iface.free_count());
         for _ in 0..fail_at {
             iface.script_alloc(Ok(()));
@@ -275,8 +275,8 @@ fn pool_queue_construction_unwinds_queue_arena_and_scratch_stages() {
 
     let (allocations, frees) = (iface.allocation_count(), iface.free_count());
     drop(PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator).expect("pool queue"));
-    assert_eq!(iface.allocation_count() - allocations, 6);
-    assert_eq!(iface.free_count() - frees, 6);
+    assert_eq!(iface.allocation_count() - allocations, 7);
+    assert_eq!(iface.free_count() - frees, 7);
     assert_eq!(iface.live_handle_count(), baseline);
 }
 
@@ -291,7 +291,7 @@ fn quarantined_queue_leaks_its_backing_without_a_poisoned_device() {
     queue.quarantine();
     drop(queue);
     assert!(!allocator.dev.is_poisoned());
-    assert_eq!((iface.free_count(), iface.live_handle_count()), (0, baseline + 4));
+    assert_eq!((iface.free_count(), iface.live_handle_count()), (0, baseline + 5));
     assert_eq!((iface.queue_teardown_count(), iface.live_queue_count()), (0, 1));
 }
 
@@ -304,7 +304,7 @@ fn pool_failed_drain_and_panic_abandonment_quarantine_every_backing() {
     iface.script_wait(Err(scripted_error("drain")));
     drop(pool);
     assert!(allocator.dev.is_poisoned());
-    assert_eq!((iface.free_count(), iface.live_handle_count()), (0, baseline + 6));
+    assert_eq!((iface.free_count(), iface.live_handle_count()), (0, baseline + 7));
 
     // A panic unwind quarantines the lane it abandons but must NOT poison the
     // process-global core: tinygrad latches per-device error state on drain
@@ -317,7 +317,7 @@ fn pool_failed_drain_and_panic_abandonment_quarantine_every_backing() {
     }));
     assert!(result.is_err());
     assert!(!allocator.dev.is_poisoned());
-    assert_eq!((iface.free_count(), iface.live_handle_count()), (0, baseline + 6));
+    assert_eq!((iface.free_count(), iface.live_handle_count()), (0, baseline + 7));
     assert_eq!(iface.queue_teardown_count(), 0, "an abandoned queue is never destroyed");
 }
 
@@ -341,25 +341,56 @@ fn scratch_growth_preserves_old_state_on_drain_or_allocation_failure() {
     iface.script_alloc(Err(scripted_error("replacement scratch allocation")));
     assert!(pool.ensure_has_local_memory(4096).is_err());
     assert!(!allocator.dev.is_poisoned());
-    assert_eq!(iface.allocation_count(), baseline + 6);
+    assert_eq!(iface.allocation_count(), baseline + 7);
     assert_eq!(iface.free_count(), 0, "old scratch must survive replacement allocation failure");
     drop(pool);
-    assert_eq!(iface.free_count(), 6);
+    assert_eq!(iface.free_count(), 7);
 
     let (iface, allocator) = mock_device_with_signals(1);
     let baseline = iface.allocation_count();
     let pool = PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator).expect("pool queue");
     pool.ensure_has_local_memory(4096).expect("scratch growth");
-    assert_eq!(iface.allocation_count(), baseline + 7);
+    assert_eq!(iface.allocation_count(), baseline + 8);
     assert_eq!(iface.free_count(), 1, "successful publication frees exactly the drained old scratch");
     // Idempotent: an already-satisfied request neither drains nor reallocates.
     pool.ensure_has_local_memory(4096).expect("satisfied scratch request");
     pool.ensure_has_local_memory(1).expect("smaller scratch request");
     assert_eq!(iface.alloc_count_for_tag(crate::amd::va_registry::AllocTag::Scratch), 2);
-    assert_eq!(iface.allocation_count(), baseline + 7);
+    assert_eq!(iface.allocation_count(), baseline + 8);
     drop(pool);
-    assert_eq!(iface.free_count(), 7);
+    assert_eq!(iface.free_count(), 8);
     assert!(iface.free_issues().is_empty());
+}
+
+/// Ever larger kernels grow scratch geometrically: each grow at least doubles
+/// the per-thread size, so on AQL, where a grow remaps the queue twice and
+/// each remap preempts every queue of the process, 64 growing requests remap
+/// four times. The registers' limit caps the doubling, never a request.
+#[test_case::test_case(1; "pm4")]
+#[test_case::test_case(2; "aql")]
+fn scratch_grows_geometrically_up_to_the_register_limit(xccs: u32) {
+    use super::test_support::MockAmdCall;
+    use crate::amd::va_registry::AllocTag;
+
+    let (iface, allocator) = mock_device_with_signals(xccs);
+    let pool = PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator).expect("pool queue");
+    let remaps = || iface.call_count(|call| matches!(call, MockAmdCall::UpdateQueue { .. }));
+    let aql = usize::from(xccs > 1);
+    assert_eq!((iface.alloc_count_for_tag(AllocTag::Scratch), remaps()), (1, 2 * aql), "the initial descriptor");
+    for size in (1..=64).map(|step| 2048 + step * 256) {
+        pool.ensure_has_local_memory(size).expect("scratch growth");
+    }
+    // 2048 → 4096 → 8192 → 16384 → 32768 covers the last request, 18432.
+    assert_eq!((iface.alloc_count_for_tag(AllocTag::Scratch), remaps()), (5, 10 * aql));
+    assert_eq!(iface.call_count(|call| *call == MockAmdCall::UpdateQueue { queue_id: 1, percentage: 0 }), 5 * aql);
+
+    // From half the limit on, doubling would overflow the 15-bit gfx11 WAVESIZE.
+    let limit = crate::amd::device::max_scratch_per_thread(&allocator.dev.arch);
+    pool.ensure_has_local_memory(limit / 2).expect("growth to half the limit");
+    pool.ensure_has_local_memory(limit / 2 + 4).expect("growth to the limit");
+    assert_eq!(pool.tmpring_size() >> 12, 0x7FFF, "the largest stride the register holds");
+    pool.ensure_has_local_memory(limit).expect("satisfied at the limit");
+    assert_eq!(iface.alloc_count_for_tag(AllocTag::Scratch), 7);
 }
 
 #[test]
@@ -436,6 +467,180 @@ fn publication_fails_at(iface: &MockAmdIface, stage: usize, panicking: bool, sub
     assert_eq!(&iface.publication_stages()[reached..], &STAGES[..=stage]);
 }
 
+/// The calls a publication makes from `mark` on: its checkpoints and HDP flushes.
+fn publication_calls(iface: &MockAmdIface, mark: usize) -> Vec<super::test_support::MockAmdCall> {
+    use super::test_support::MockAmdCall;
+    iface.transcript()[mark..]
+        .iter()
+        .filter(|call| matches!(call, MockAmdCall::PublicationCheckpoint { .. } | MockAmdCall::HdpFlush))
+        .cloned()
+        .collect()
+}
+
+/// Places every buffer in uncached GTT, as the kernarg arena, registered for
+/// scoped waits like the allocator's own buffers.
+#[derive(Debug)]
+struct GttAllocator(crate::amd::AmdAllocator);
+
+impl crate::allocator::Allocator for GttAllocator {
+    fn _alloc(
+        &self,
+        size: usize,
+        _: &crate::allocator::BufferSpec,
+        _: bool,
+    ) -> crate::Result<crate::allocator::RawBuffer> {
+        let raw = self.0.alloc_uncached(size)?;
+        if let crate::allocator::RawBuffer::AmdDevice { gpu_addr, .. } = &raw {
+            self.0.dev.core().register_storage(*gpu_addr);
+        }
+        Ok(raw)
+    }
+
+    fn _free(&self, buffer: crate::allocator::RawBuffer, options: &crate::allocator::BufferSpec) {
+        crate::allocator::Allocator::_free(&self.0, buffer, options)
+    }
+
+    fn name(&self) -> &str {
+        "AMD GTT"
+    }
+
+    fn device_spec(&self) -> svod_dtype::DeviceSpec {
+        crate::allocator::Allocator::device_spec(&self.0)
+    }
+}
+
+/// A host-mapped buffer of `bytes` on the mock device: VRAM, or GTT when `uncached`.
+fn host_buffer(allocator: &crate::amd::AmdAllocator, bytes: usize, uncached: bool) -> crate::buffer::Buffer {
+    let allocator: Arc<dyn crate::allocator::Allocator> =
+        if uncached { Arc::new(GttAllocator(allocator.clone())) } else { Arc::new(allocator.clone()) };
+    let spec = crate::allocator::BufferSpec { cpu_access: true, ..Default::default() };
+    let buffer = crate::buffer::Buffer::new(allocator, svod_dtype::DType::UInt8, vec![bytes], spec);
+    buffer.ensure_allocated().expect("mock allocation");
+    buffer
+}
+
+/// A compute doorbell on a multi-XCC part flushes HDP every time, its kernargs
+/// being in VRAM. Elsewhere the submission path writes only system memory, and
+/// a host write guard into VRAM is the one exception: once it drops, exactly
+/// the next doorbell flushes its stores, between its last write and the
+/// doorbell. While it lives nothing is flushed, and a guard into GTT never
+/// flushes.
+#[test_case::test_case(1, false; "pm4 vram")]
+#[test_case::test_case(2, false; "aql vram")]
+#[test_case::test_case(1, true; "pm4 gtt")]
+#[test_case::test_case(2, true; "aql gtt")]
+fn a_compute_doorbell_flushes_hdp_only_after_a_vram_host_write(xccs: u32, uncached: bool) {
+    use super::test_support::MockAmdCall;
+
+    let (iface, allocator) = mock_device_with_signals(xccs);
+    iface.set_hdp_flush_register();
+    let pool = PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator).expect("pool queue");
+    let mut buffer = host_buffer(&allocator, 64, uncached);
+    let doorbell = || {
+        let mark = iface.transcript().len();
+        pool.queue().submit_hcq_dispatch(&pool, &compute_submission(), &[0; 16], &[], &[]).expect("submit");
+        publication_calls(&iface, mark)
+    };
+    let checkpoint = |stage| MockAmdCall::PublicationCheckpoint { stage };
+    let [reserved, before, after] =
+        [PublicationStage::AfterReservation, PublicationStage::BeforeDoorbell, PublicationStage::AfterDoorbell]
+            .map(checkpoint);
+    let flushed = vec![reserved.clone(), before.clone(), MockAmdCall::HdpFlush, after.clone()];
+    let plain = if xccs > 1 { flushed.clone() } else { vec![reserved, before, after] };
+    for _ in 0..2 {
+        assert_eq!(doorbell(), plain, "xccs={xccs}");
+    }
+
+    let mut guard = buffer.host_write_bytes().expect("host write");
+    guard.fill(7);
+    assert_eq!(doorbell(), plain, "a live guard has nothing to flush yet");
+    let mark = iface.transcript().len();
+    drop(guard);
+    assert!(!iface.transcript()[mark..].contains(&MockAmdCall::HdpFlush), "a guard defers its flush");
+    assert_eq!(doorbell(), if uncached { plain.clone() } else { flushed }, "xccs={xccs} uncached={uncached}");
+    assert_eq!(doorbell(), plain, "the deferred flush runs once");
+    // Retire the mock lane, so freeing the buffer drains at once.
+    super::test_support::retire_lane(&pool);
+}
+
+/// SDMA doorbells follow the same contract: no flush of their own, one after
+/// a VRAM host write guard drops.
+#[test_case::test_case(false; "vram")]
+#[test_case::test_case(true; "gtt")]
+fn a_copy_doorbell_flushes_hdp_only_after_a_vram_host_write(uncached: bool) {
+    use super::test_support::MockAmdCall;
+
+    let (iface, allocator) = mock_device_with_signals(1);
+    iface.set_hdp_flush_register();
+    let queue = AmdCopyQueue::create(&allocator).expect("copy queue");
+    let mut buffer = host_buffer(&allocator, 64, uncached);
+    let mut copy = Submission::new(QueueKind::Copy(0));
+    copy.push(Command::Copy { dst: 0x1000, src: 0x2000, bytes: 4 });
+    let flushes = || iface.call_count(|call| *call == MockAmdCall::HdpFlush);
+
+    let before = flushes();
+    queue.submit_hcq(&copy).expect("submit");
+    assert_ne!(queue.ring_write_idx(), 0, "the copy was published");
+    assert_eq!(flushes(), before);
+
+    buffer
+        .with_host_write::<u8, _>(|guard| {
+            guard.fill(7);
+            Ok(())
+        })
+        .expect("host write");
+    assert_eq!(flushes(), before, "a guard defers its flush");
+    queue.submit_hcq(&copy).expect("submit");
+    let after = before + usize::from(!uncached);
+    assert_eq!(flushes(), after, "uncached={uncached}");
+    queue.submit_hcq(&copy).expect("submit");
+    assert_eq!(flushes(), after, "the deferred flush runs once");
+}
+
+/// A doorbell that rings while another doorbell's flush is still landing
+/// flushes too: the stores deferred before that flush began count as flushed
+/// only once it has landed.
+#[test]
+fn a_doorbell_during_another_flush_still_flushes() {
+    use super::test_support::MockAmdCall;
+
+    let (iface, allocator) = mock_device(1);
+    iface.set_hdp_flush_register();
+    let hdp = Arc::clone(allocator.dev.core().hdp());
+    let flushes = || iface.call_count(|call| *call == MockAmdCall::HdpFlush);
+    hdp.defer();
+    let racing = Arc::clone(&hdp);
+    iface.during_next_hdp_flush(move || racing.flush_for_doorbell());
+    hdp.flush_for_doorbell();
+    assert_eq!(flushes(), 2);
+    hdp.flush_for_doorbell();
+    assert_eq!(flushes(), 2, "a landed flush covers every earlier deferral");
+}
+
+/// The CP reads a compute queue's CWSR headers on its first context save or
+/// restore, which no doorbell orders: the host flushes them before KFD
+/// creates the queue.
+#[test_case::test_case(1; "pm4")]
+#[test_case::test_case(2; "aql")]
+fn cwsr_headers_are_flushed_before_the_queue_exists(xccs: u32) {
+    use super::test_support::MockAmdCall;
+
+    let (iface, allocator) = mock_device_with_signals(xccs);
+    iface.set_hdp_flush_register();
+    let mark = iface.transcript().len();
+    let _queue = AmdComputeQueue::create(&allocator).expect("compute queue");
+    let calls = &iface.transcript()[mark..];
+    let setup = calls.iter().position(|call| matches!(call, MockAmdCall::SetupRing { .. })).expect("queue setup");
+    // The zero-filled ctx-save buffer flushes, then the headers stored over it.
+    assert!(
+        matches!(
+            calls[..setup],
+            [.., MockAmdCall::Alloc { cpu_access: true, zero: true, .. }, MockAmdCall::HdpFlush, MockAmdCall::HdpFlush]
+        ),
+        "{calls:?}"
+    );
+}
+
 fn compute_submission() -> Submission {
     let mut submission = Submission::new(QueueKind::Compute(0));
     submission.push(Command::MemoryBarrier).push(Command::Compute(ComputeDispatch {
@@ -460,25 +665,61 @@ fn compute_publication_rolls_back_before_the_doorbell_and_poisons_after(xccs: u3
     let pool = PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator).expect("pool queue");
     for (stage, panicking) in [(0, false), (1, false), (1, true)] {
         publication_fails_at(&iface, stage, panicking, || {
-            let _ = pool.queue().submit_hcq_dispatch(&pool, &submission, &[], &[]);
+            let _ = pool.queue().submit_hcq_dispatch(&pool, &submission, &[0; 16], &[], &[]);
         });
         // The rolled-back reservation is handed straight back out, so the ring
         // never advances across the three abandoned attempts.
         assert_eq!((pool.pm4_value(), pool.queue().ring_write_idx()), (1, 0), "xccs={xccs}, stage={stage}");
         assert!(!allocator.dev.is_poisoned(), "xccs={xccs}, stage={stage}");
+        // So is the kernarg slot: the GPU never saw it.
+        assert!(pool.arena().live_slots().iter().all(|(_, state)| *state == "done"), "xccs={xccs}, stage={stage}");
     }
 
     for panicking in [false, true] {
         let (iface, allocator) = mock_device_with_signals(xccs);
         let pool = PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator).expect("pool queue");
         publication_fails_at(&iface, 2, panicking, || {
-            let _ = pool.queue().submit_hcq_dispatch(&pool, &submission, &[], &[]);
+            let _ = pool.queue().submit_hcq_dispatch(&pool, &submission, &[0; 16], &[], &[]);
         });
         assert_eq!(pool.pm4_value(), 2, "xccs={xccs}, panicking={panicking}");
         assert!(allocator.dev.is_poisoned(), "xccs={xccs}, panicking={panicking}");
+        // The CP owns the packets, and with them the kernarg slot they read.
+        assert_eq!(pool.arena().live_slots(), [(0, "submitted")], "xccs={xccs}, panicking={panicking}");
         drop(pool);
         assert_eq!(iface.free_count(), 0, "poisoned resources must be quarantined");
     }
+}
+
+/// On AQL, XCC0 stores a dispatch's timeline point from an IB inside its
+/// kernarg slot, which the other XCCs may still be reading when it lands. The
+/// dispatch's last packet names the lane's retirement signal, and the slot is
+/// reused and the dispatch retired only once the CP completed that packet,
+/// with no later submission needed. A PM4 lane retires at its timeline point.
+#[test_case::test_case(1; "pm4")]
+#[test_case::test_case(2; "aql")]
+fn a_dispatch_retires_once_every_xcc_is_done_with_its_memory(xccs: u32) {
+    let (_iface, allocator) = mock_device_with_signals(xccs);
+    let pool = PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator).expect("pool queue");
+    let dispatch = pool.queue().submit_hcq_dispatch(&pool, &compute_submission(), &[0; 16], &[], &[]).unwrap();
+    let arena = pool.arena();
+    assert_eq!(arena.live_slots(), [(0, "submitted")]);
+    dispatch.finalizer.land_timeline();
+    assert_eq!(dispatch.finalizer.retired(), xccs == 1, "xccs={xccs}");
+
+    let reused = std::thread::scope(|scope| {
+        let reuse = scope.spawn(|| arena.reserve(arena.size, 1).map(|slot| slot.offset()));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(reuse.is_finished(), xccs == 1, "xccs={xccs}");
+        if let Some(retired) = pool.retired() {
+            let last = pool.queue().ring_packet(pool.queue().ring_write_idx() - 1);
+            assert_eq!(last[56..], retired.signal().handle().to_le_bytes());
+            assert_eq!(pool.queue().ring_packet(0)[56..], [0; 8], "only the last packet completes");
+            retired.signal().complete_packet();
+        }
+        reuse.join().unwrap()
+    });
+    assert_eq!(reused.unwrap(), 0);
+    assert!(dispatch.finalizer.retired());
 }
 
 #[test]
@@ -588,46 +829,10 @@ fn hcq_pm4_command_goldens_concatenate_in_submission_order() {
             Command::Wait { signal_address: ADDRESS, value: 7 },
             &[0xc005_3c00, 0x15, 0x5566_7788, 0x1122_3344, 7, 0xffff_ffff, 4],
         ),
-        (
-            Command::MemoryBarrier,
-            &[
-                0xc005_3c00,
-                0x43,
-                0xe26,
-                0xe27,
-                0x1000,
-                0x1000,
-                0x20,
-                0xc006_5800,
-                0,
-                0xffff_ffff,
-                0xffff_ffff,
-                0,
-                0,
-                0,
-                0xc3f1,
-            ],
-        ),
+        (Command::MemoryBarrier, &[0xc006_5800, 0, 0xffff_ffff, 0xffff_ffff, 0, 0, 0, 0xc3f1]),
         (
             Command::Timestamp { dst: ADDRESS },
-            &[
-                0xc006_4900,
-                0x514,
-                0x0200_0000,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0xc006_4900,
-                0x514,
-                0x6000_0000,
-                0x5566_7788,
-                0x1122_3344,
-                0,
-                0,
-                0,
-            ],
+            &[0xc006_4900, 0x514, 0, 0, 0, 0, 0, 0, 0xc006_4900, 0x514, 0x6000_0000, 0x5566_7788, 0x1122_3344, 0, 0, 0],
         ),
         (
             Command::Store { dst: ADDRESS, value: 0xaabb_ccdd_eeff_0011, scope: StoreScope::System },
@@ -645,18 +850,62 @@ fn hcq_pm4_command_goldens_concatenate_in_submission_order() {
 
 /// Every `ACQUIRE_MEM` packet of a lowered PM4 stream.
 fn acquires(dwords: &[u32]) -> Vec<&[u32]> {
+    packets(dwords, crate::amd::sys::pm4::PACKET3_ACQUIRE_MEM)
+}
+
+/// Every type-3 packet with `opcode` in a lowered PM4 stream.
+fn packets(dwords: &[u32], opcode: u32) -> Vec<&[u32]> {
     let mut packets = Vec::new();
     let mut at = 0;
     while at < dwords.len() {
         let header = dwords[at];
         assert_eq!(header >> 30, 3, "a compute stream is type-3 packets: {header:#x} at {at}");
         let len = ((header >> 16) & 0x3fff) as usize + 2;
-        if (header >> 8) & 0xff == crate::amd::sys::pm4::PACKET3_ACQUIRE_MEM {
+        if (header >> 8) & 0xff == opcode {
             packets.push(&dwords[at..at + len]);
         }
         at += len;
     }
     packets
+}
+
+/// The host flushes HDP before the doorbell (`AmdIface::flush_hdp`), so a
+/// memory barrier keeps its full cache acquire but no register-space
+/// WAIT_REG_MEM: the CP's `GPU_HDP_FLUSH_REQ/DONE` bit is shared by every
+/// queue of every process, and concurrent requesters on it hang (gfx942).
+/// The timeline wait stays a memory-space poll.
+#[test_case::test_case(9, None; "gfx9 PM4")]
+#[test_case::test_case(11, None; "gfx11 PM4")]
+#[test_case::test_case(12, None; "gfx12 PM4")]
+#[test_case::test_case(9, Some(true); "multi-XCC AQL control")]
+#[test_case::test_case(9, Some(false); "single-XCC AQL control")]
+fn a_memory_barrier_flushes_caches_without_the_hdp_handshake(target_major: u32, aql: Option<bool>) {
+    use crate::amd::sys::pm4;
+
+    let dwords = match aql {
+        None => lower_hcq_pm4(
+            &compute_of([Command::Wait { signal_address: 0x2000, value: 7 }, Command::MemoryBarrier]),
+            Pm4LoweringState { target_major, ..pm4_state() },
+        )
+        .unwrap(),
+        Some(multi_xcc) => {
+            let submission = compute_of([Command::MemoryBarrier, Command::Compute(dispatch(0x1234_5600, 0x9000))]);
+            let finalized = finalize_hcq_aql_timeline_submission(&submission, 0x2000, 7, 8, None).unwrap();
+            let lowered = lower_hcq_aql_submission_program(
+                &finalized,
+                aql_control_state(multi_xcc),
+                crate::hcq::PatchSource::LinkAddress(0),
+            )
+            .unwrap();
+            replay_dwords(&lowered.control.bytes)
+        }
+    };
+
+    let waits = packets(&dwords, pm4::PACKET3_WAIT_REG_MEM);
+    assert_eq!(waits.len(), 1, "only the timeline wait remains");
+    assert_ne!(waits[0][1] & pm4::wait_reg_mem_mem_space(1), 0, "the wait polls memory, not a register pair");
+    let full: &[u32] = if target_major == 9 { &pm4::acquire_mem_gfx9() } else { &pm4::acquire_mem() };
+    assert_eq!(acquires(&dwords), [full], "the barrier keeps its full cache acquire");
 }
 
 /// A stamp writes the clock and touches no cache: an acquire after the start
@@ -1168,4 +1417,56 @@ fn set_aql_scratch_round_trips_through_gart() {
     assert_eq!(q.read_aql_scratch(), desc, "the GART descriptor must match what we wrote");
     assert_eq!((desc.backing_va, desc.tmpring_size), (va, tmpring));
     alloc.dev.core().iface().free_raw(va, size, handle);
+}
+
+// ------------------------------------------------------------ queue error words
+
+/// Both error words raise the queue event, as ROCr wires them: the AQL
+/// `queue_inactive_signal` carries the event's mailbox (`amd_signal_t` +16/+24)
+/// and every XCC's CWSR header names the `ErrorReason` word (+24) and the
+/// event (+32). A fresh queue reports nothing.
+#[test_case::test_case(1; "pm4")]
+#[test_case::test_case(2; "aql")]
+fn compute_queue_error_words_raise_the_queue_event(xccs: u32) {
+    let mailbox = crate::amd::iface::QueueEventMailbox { address: 0xfeed_0000, event_id: 9 };
+    let (iface, allocator) = mock_device(xccs);
+    iface.set_queue_event_mailbox(mailbox);
+    let queue = AmdComputeQueue::create(&allocator).expect("compute queue");
+    let (inactive, reason) = queue.error_word_ptrs();
+    // SAFETY: mock GPU VAs are host addresses of live allocations.
+    let word = |address: u64| unsafe { std::ptr::read_volatile(address as *const u64) };
+
+    let [(ctx, stride)] = iface.ctx_save_areas()[..] else { panic!("one ctx-save area") };
+    for xcc in 0..u64::from(xccs) {
+        let header = ctx + xcc * u64::from(stride);
+        assert_eq!(word(header + 24), reason as u64, "xcc {xcc}");
+        assert_eq!(word(header + 32) as u32, mailbox.event_id, "xcc {xcc}");
+    }
+    let signal = inactive as u64 - 8;
+    let armed = (word(signal + 16), word(signal + 24) as u32);
+    assert_eq!(armed, (mailbox.address, mailbox.event_id));
+    assert!(queue.halt_error().is_none());
+}
+
+#[test_case::test_case(0x401 => "insufficient scratch"; "scratch wave64")]
+#[test_case::test_case(0x400 => "insufficient scratch"; "scratch high bit alone")]
+#[test_case::test_case(0x8000_0000_0000_0401 => "insufficient scratch"; "scratch retry flag")]
+#[test_case::test_case(0x2 => "invalid dispatch dimensions"; "dimensions")]
+#[test_case::test_case(0x20 => "invalid packet format"; "generic format")]
+#[test_case::test_case(0x100 => "invalid packet format"; "vendor packet")]
+#[test_case::test_case(0x80 => "out of VGPRs"; "vgprs")]
+#[test_case::test_case(0x4000_0000 => "illegal instruction"; "illegal instruction")]
+#[test_case::test_case(0x10_0000 => "unknown halt code"; "unknown")]
+fn inactive_codes_decode_by_rocr_precedence(code: u64) -> &'static str {
+    inactive_cause(code)
+}
+
+#[test_case::test_case(1 << 3 => "illegal instruction"; "illegal instruction")]
+#[test_case::test_case(1 << 4 => "memory violation"; "memory violation")]
+#[test_case::test_case(1 << 17 => "invalid code object"; "code object")]
+#[test_case::test_case(1 << 29 => "preemption error"; "preemption")]
+#[test_case::test_case((1 << 29) | (1 << 1) => "wave trap"; "lowest code wins")]
+#[test_case::test_case(1 << 40 => "unknown exception"; "unknown")]
+fn error_reason_bits_decode_as_kfd_exception_codes(bits: u64) -> &'static str {
+    exception_cause(bits)
 }

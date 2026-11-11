@@ -26,8 +26,8 @@ version history). Rust bindings are generated from it at build time by
   `<linux/types.h>` for the `__uNN`/`__sNN` aliases) plus a stub `<drm/drm.h>`
   (vestigial — the body uses only `__u32 drm_fd` fields) are themselves vendored
   under `device/include/`, and `build.rs` passes `-I<crate>/include` so bindgen
-  resolves them instead of `/usr/include`. The generated file has 60 structs
-  and 34 constants. (bindgen needs `libclang`, which ships with the Xcode CLT
+  resolves them instead of `/usr/include`.
+  (bindgen needs `libclang`, which ships with the Xcode CLT
   on macOS.)
 
   It allow-lists exactly the KFD types and constants the backend needs:
@@ -36,8 +36,9 @@ version history). Rust bindings are generated from it at build time by
   allowlist_type:  kfd_ioctl_.*_args, kfd_process_device_apertures,
                    kfd_event_data, kfd_hsa_signal_event_data,
                    kfd_hsa_memory_exception_data, kfd_hsa_hw_exception_data,
-                   kfd_memory_exception_failure, __u\d+, __s\d+
-  allowlist_var:   KFD_IOC_.*, KFD_MAX_QUEUE_PERCENTAGE, AMDKFD_IOC_.*
+                   kfd_memory_exception_failure, kfd_mmio_remap, __u\d+, __s\d+
+  allowlist_var:   KFD_IOC_.*, KFD_MAX_QUEUE_PERCENTAGE,
+                   KFD_RUNTIME_ENABLE_MODE_ENABLE_MASK, AMDKFD_IOC_.*
   ```
 
   (The `AMDKFD_IOC_*` request codes are allow-listed but never materialize:
@@ -90,11 +91,11 @@ the ones with live call sites:
 | `kfd_destroy_event` | `0x09` | Tear the three events down on `Drop` |
 | `kfd_wait_events` | `0x0C` | `wait_events` — block on completion / fault events |
 | `kfd_acquire_vm` | `0x15` | Register the DRM render fd as this process's VM for the GPU |
-| `kfd_alloc_memory_of_gpu` | `0x16` | `alloc_raw` — allocate VRAM/GTT |
+| `kfd_alloc_memory_of_gpu` | `0x16` | `alloc_raw` — allocate VRAM/GTT; also the MMIO-remap page |
 | `kfd_free_memory_of_gpu` | `0x17` | `free_raw` |
 | `kfd_map_memory_to_gpu` | `0x18` | Bind an allocation into the GPU page table |
 | `kfd_unmap_memory_from_gpu` | `0x19` | `free_raw` |
-| `kfd_runtime_enable` | `0x25` | Enable the runtime (KFD ABI ≥ 1.14 only) |
+| `kfd_runtime_enable` | `0x25` | Enable the KFD runtime with the enable bit, once per process (KFD ABI ≥ 1.14 only) |
 
 Five more (`set_memory_policy`, `get_clock_counters`, `get_process_apertures`,
 `set_event`, `reset_event`) are declared for completeness but not currently
@@ -110,18 +111,26 @@ flowchart TD
   A["open /dev/kfd (process-shared, one fd)"] --> B["open /dev/dri/renderD(minor) (per node — the DRM render fd)"]
   B --> C["GET_VERSION: capture ABI version"]
   C --> D["ACQUIRE_VM(drm_fd): register this fd as the process VM for the GPU"]
-  D --> E["RUNTIME_ENABLE: only if ABI is at least 1.14"]
+  D --> E["RUNTIME_ENABLE(ENABLE_MASK): once per process, only if ABI is at least 1.14"]
   E --> F["event page: alloc + bind once per process, map per device"]
   F --> G["CREATE_EVENT x 3: queue-signal, memory-fault, hw-exception"]
+  G --> H["HDP flush: ALLOC(MMIO_REMAP) + mmap from /dev/kfd, else a VRAM readback word"]
 ```
 
 The chain is strictly ordered: `ACQUIRE_VM` must precede any allocation, and the
-event page must be bound before the first `CREATE_QUEUE`.
+event page must be bound before the first `CREATE_QUEUE`. `RUNTIME_ENABLE` must
+also precede the process's first queue, after which KFD refuses it, so the first
+device to open enables the runtime for the process and a later device finds it
+enabled.
 
 The DRM render fd is interesting: there are **no DRM ioctls**. The `drm_fd` is
 used only two ways — passed *by number* into `ACQUIRE_VM`, and as the `mmap` fd
 for host-visible mappings. The doorbell, by contrast, is `mmap`ped from the KFD
-fd.
+fd, and so is KFD's MMIO-remap page: the host writes its `HDP_MEM_FLUSH_CNTL`
+register and reads it back to flush HDP. Where KFD gives no remap page (host
+pages larger than 4 KiB, or a KFD that refuses the allocation, as on an SR-IOV
+VF), the device keeps a host-visible VRAM word instead and flushes by storing to
+it and reading it back.
 
 ---
 
@@ -184,15 +193,16 @@ place those flags are composed:
 
 | `AllocKind` | Flags | Used for |
 |---|---|---|
-| `DeviceVram { executable }` | `VRAM \| WRITABLE \| NO_SUBSTITUTE` (+ `EXECUTABLE` for code, + `PUBLIC` when host-visible) | Tensor data, code objects, scratch; host-visible kernarg arenas and graph / linked-plan control buffers |
-| `UncachedGtt` | `GTT \| WRITABLE \| EXECUTABLE \| NO_SUBSTITUTE \| PUBLIC \| COHERENT \| UNCACHED` | Command rings, GART pages, signal slots, the SDMA staging buffer |
+| `DeviceVram { executable }` | `VRAM \| WRITABLE \| NO_SUBSTITUTE` (+ `EXECUTABLE` for code, + `PUBLIC` when host-visible) | Tensor data, code objects, scratch; on multi-XCC parts, kernarg arenas and graph / linked-plan control buffers; the HDP readback word where KFD has no remap page |
+| `UncachedGtt` | `GTT \| WRITABLE \| EXECUTABLE \| NO_SUBSTITUTE \| PUBLIC \| COHERENT \| UNCACHED` | Command rings, GART pages, signal slots, the SDMA staging buffer; elsewhere, kernarg arenas and control buffers |
 
 The `UNCACHED | COHERENT` GTT flavor matters: the command ring and the signal
 slots must be immediately visible between CPU and GPU, or the host spins forever
 waiting on a completion value stuck in GPU L2. KFD rejects `CREATE_QUEUE` on a
-plain-VRAM ring with `EINVAL`. The one allocation outside `alloc_raw` is the
-per-process event page (`alloc_event_page` in `device.rs`), which composes the
-same uncached-GTT flags with raw ioctls and is therefore not in the
+plain-VRAM ring with `EINVAL`. Two allocations bypass `alloc_raw`: the per-process
+event page (`alloc_event_page` in `device.rs`), which composes the same
+uncached-GTT flags with raw ioctls, and the per-device MMIO-remap page
+(`MmioRemapPage::map` in `iface.rs`). Neither appears in the
 [VA registry](./debugging.md).
 
 ### `cpu_access` follows the copy queue
@@ -206,10 +216,12 @@ device→device DMA when either side is device-only. When no copy queue is
 present, `has_sdma_queue()` is `false`, so every buffer is forced host-visible
 and copies fall back to a plain host `memmove` after the scoped `wait_storage`.
 The generic `LruAllocator` (`device/src/allocator.rs`) pools freed buffers by
-`(size, BufferSpec)`; code objects, the EOP / CWSR context-save buffers, rings,
-GART pages, signal slots and scratch never enter that pool — they call the
-`AmdAllocator` directly (`alloc_uncached_tagged` / `alloc_host_visible_tagged`
-/ `alloc_scratch`) and go straight to the seam.
+`(size, BufferSpec)`; code objects, kernarg arenas, graph / linked-plan command
+buffers, the EOP / CWSR context-save buffers, rings, GART pages, queue error
+words, signal slots and scratch never enter that pool. Code objects ask
+`AmdAllocator::alloc` with `nolru`; the rest call the tagged entry points
+directly (`alloc_submission_tagged`, `alloc_uncached_tagged`,
+`alloc_host_visible_tagged`) or `alloc_scratch`, and go straight to the seam.
 
 :::note[Process-shared state]
 `/dev/kfd` is opened once per process and shared by all devices (events are

@@ -18,7 +18,7 @@ use tracing::debug;
 
 use crate::allocator::{Allocator, AmdBufferGuard, BufferSpec, RawBuffer};
 use crate::amd::device::AmdDevice;
-use crate::amd::iface::AllocKind;
+use crate::amd::iface::{AllocKind, HUGE_PAGE};
 use crate::amd::va_registry::AllocTag;
 use crate::error::{Result, UnsupportedSnafu};
 
@@ -51,9 +51,10 @@ impl AmdAllocator {
     }
 
     /// Allocate GTT-pinned system memory with `COHERENT | UNCACHED | PUBLIC`
-    /// flags — host-visible, uncached, suitable for queue rings, GART pages,
-    /// and signal slots. The `uncached` branch sets **GTT**, not VRAM
-    /// (uncached and VRAM are mutually exclusive in the flag composition).
+    /// flags — host-visible, uncached, for what the host writes per submission
+    /// outside [`Self::alloc_submission_tagged`]: queue rings, GART pages and
+    /// signal slots. The `uncached` branch sets **GTT**, not VRAM (uncached and
+    /// VRAM are mutually exclusive in the flag composition).
     pub fn alloc_uncached(&self, size: usize) -> Result<RawBuffer> {
         do_alloc(&self.dev, size, AllocKind::UncachedGtt, /*cpu_accessible=*/ true, /*zero_init=*/ true)
     }
@@ -69,6 +70,18 @@ impl AmdAllocator {
         )
     }
 
+    /// Kernargs and command buffers: VRAM or uncached GTT, as
+    /// [`crate::amd::iface::Hdp`] places them.
+    pub(crate) fn alloc_submission_tagged(&self, size: usize, tag: AllocTag) -> Result<RawBuffer> {
+        if self.dev.hdp().submissions_in_vram() {
+            self.alloc_host_visible_tagged(size, tag)
+        } else {
+            self.alloc_uncached_tagged(size, tag)
+        }
+    }
+
+    /// Host-visible VRAM. Host stores into it go through HDP, so the writer
+    /// flushes them ([`crate::amd::iface::Hdp::flush`]) before a GPU reads them.
     pub(crate) fn alloc_host_visible_tagged(&self, size: usize, tag: AllocTag) -> Result<RawBuffer> {
         do_alloc_tagged(
             &self.dev,
@@ -104,7 +117,7 @@ impl Allocator for AmdAllocator {
         let seam_zero = zero && cpu_access;
         let buf = AmdBufferGuard::new(do_alloc(
             &self.dev,
-            size,
+            whole_huge_pages(size),
             AllocKind::DeviceVram { executable: true },
             cpu_access,
             seam_zero,
@@ -117,18 +130,20 @@ impl Allocator for AmdAllocator {
 
     fn _copyin(&self, dest: &RawBuffer, dest_off: usize, src: &[u8]) -> Result<()> {
         match dest {
-            RawBuffer::AmdDevice { host_ptr: Some(ptr), gpu_addr, .. } => {
+            RawBuffer::AmdDevice { host_ptr: Some(ptr), gpu_addr, vram, .. } => {
                 // Wait this storage's recorded producers AND readers (a host
                 // overwrite is a WAR hazard against in-flight readers). Direct
                 // host writes aren't ordered on the GPU timeline.
                 self.dev.core().wait_storage(*gpu_addr)?;
-                // SAFETY: BAR-backed VRAM mapping valid for the buffer's lifetime;
+                // SAFETY: host mapping valid for the buffer's lifetime;
                 // scheduler exclusivity. `dest_off + src.len()` is bounded by the caller.
                 let dst = unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr().add(dest_off), src.len()) };
                 dst.copy_from_slice(src);
-                // Coherence: the next compute dispatch reading this VA does a full
-                // `acquire_mem` (L2 invalidate) in its prologue, so the host write
-                // is visible without extra bookkeeping here.
+                // VRAM stores leave HDP here; the next compute dispatch reading
+                // this VA does a full `acquire_mem` (L2 invalidate) in its prologue.
+                if *vram {
+                    self.dev.core().hdp().flush();
+                }
                 Ok(())
             }
             RawBuffer::AmdDevice { host_ptr: None, gpu_addr, .. } => {
@@ -167,7 +182,7 @@ impl Allocator for AmdAllocator {
     fn _transfer(&self, dest: &RawBuffer, dest_off: usize, src: &RawBuffer, src_off: usize, sz: usize) -> Result<()> {
         match (dest, src) {
             (
-                RawBuffer::AmdDevice { host_ptr: Some(dst_ptr), gpu_addr: dst_gpu, .. },
+                RawBuffer::AmdDevice { host_ptr: Some(dst_ptr), gpu_addr: dst_gpu, vram, .. },
                 RawBuffer::AmdDevice { host_ptr: Some(src_ptr), gpu_addr: src_gpu, .. },
             ) => {
                 // Wait both storages' recorded work before the host memmove:
@@ -182,8 +197,10 @@ impl Allocator for AmdAllocator {
                 unsafe {
                     std::ptr::copy(src_ptr.as_ptr().add(src_off), dst_ptr.as_ptr().add(dest_off), sz);
                 }
-                // Coherence handled by the consumer dispatch's full L2 acquire
-                // prologue (cf. `_copyin`).
+                // HDP flushed here, L2 by the consumer dispatch (cf. `_copyin`).
+                if *vram {
+                    self.dev.core().hdp().flush();
+                }
                 Ok(())
             }
             (RawBuffer::AmdDevice { gpu_addr: dst_gpu, .. }, RawBuffer::AmdDevice { gpu_addr: src_gpu, .. }) => {
@@ -199,7 +216,7 @@ impl Allocator for AmdAllocator {
 
     fn _free(&self, buffer: RawBuffer, _options: &BufferSpec) {
         let (gpu_addr, host_ptr, size, handle, device) = match buffer {
-            RawBuffer::AmdDevice { gpu_addr, host_ptr, size, handle, device } => {
+            RawBuffer::AmdDevice { gpu_addr, host_ptr, size, handle, device, .. } => {
                 (gpu_addr, host_ptr, size, handle, device)
             }
             // Wrong-allocator-for-buffer-type would be a programming bug.
@@ -265,13 +282,21 @@ fn do_alloc(
     zero_init: bool,
 ) -> Result<RawBuffer> {
     // Diagnostic tag for the VA registry: scratch is tagged at its own call
-    // site (`device::alloc_scratch`); everything routed through here is either a
-    // VRAM data/code/kernarg buffer or GTT control memory.
+    // site (`device::alloc_scratch`), kernargs and command buffers at theirs
+    // (`alloc_submission_tagged`); everything routed through here is either a
+    // VRAM data/code buffer or GTT control memory.
     let tag = match kind {
         AllocKind::DeviceVram { .. } => AllocTag::Vram,
         AllocKind::UncachedGtt => AllocTag::Gtt,
     };
     do_alloc_tagged(dev, size, kind, tag, cpu_accessible, zero_init)
+}
+
+/// A data buffer's bytes: a huge page or more takes whole huge pages. A partial
+/// last one costs the whole buffer's translation, and more the larger the tail;
+/// aligning the VA alone does not avoid it.
+fn whole_huge_pages(size: usize) -> usize {
+    if size >= HUGE_PAGE { size.next_multiple_of(HUGE_PAGE) } else { size }
 }
 
 fn do_alloc_tagged(
@@ -285,6 +310,10 @@ fn do_alloc_tagged(
     let r = dev.core().iface().alloc_raw(size, kind, tag, cpu_accessible, zero_init)?;
     if matches!(kind, AllocKind::DeviceVram { .. }) {
         dev.core().register_storage(r.gpu_va);
+        if zero_init && r.host_ptr.is_some() {
+            // The host zero-filled VRAM through the BAR.
+            dev.core().hdp().flush();
+        }
     }
     Ok(RawBuffer::AmdDevice {
         gpu_addr: r.gpu_va,
@@ -292,5 +321,6 @@ fn do_alloc_tagged(
         size: r.size,
         handle: r.handle,
         device: Arc::clone(dev),
+        vram: matches!(kind, AllocKind::DeviceVram { .. }),
     })
 }

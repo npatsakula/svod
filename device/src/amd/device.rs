@@ -101,8 +101,9 @@ impl Drop for EventPageAllocation<'_> {
 pub(crate) struct ScratchState {
     /// GPU VA of the current scratch buffer.
     pub gpu_va: u64,
-    /// Bytes per thread (rounded up to 4-byte slot stride for wave64).
-    /// Equivalent to the kernel's `max_private_segment_size`.
+    /// Bytes per thread the backing holds, a multiple of the scratch unit's
+    /// per-lane stride (16 B on gfx9, 4 B on gfx11/12); at least the private
+    /// segment of every kernel the lane ran.
     pub size_per_thread: u32,
     /// Packed `COMPUTE_TMPRING_SIZE` register value.
     pub tmpring_size: u32,
@@ -125,8 +126,8 @@ pub(crate) struct AqlScratchDesc {
     pub tmpring_size: u32,
     /// `amd_queue_t.scratch_resource_descriptor` — a 4-dword SQ_BUF_RSRC.
     pub resource_descriptor: [u32; 4],
-    /// `amd_queue_t.scratch_wave64_lane_byte_size` — per-lane byte size (wave64,
-    /// so just the per-thread private segment size).
+    /// `amd_queue_t.scratch_wave64_lane_byte_size` — the per-lane stride of a
+    /// wave64, the rounded per-thread size (ROCr `InitScratchSRD`).
     pub wave64_lane_byte_size: u32,
 }
 
@@ -146,7 +147,7 @@ impl AqlScratchDesc {
     /// Build the gfx9 scratch descriptor. `size_per_xcc` goes in NUM_RECORDS
     /// (WORD2) — the per-XCC slice of the shared backing buffer — and the
     /// SWIZZLE_ENABLE bit (WORD1 bit 31) enables the per-thread scratch swizzle.
-    pub(crate) fn gfx9(scratch_va: u64, size_per_xcc: usize, tmpring_size: u32, private_segment_size: u32) -> Self {
+    pub(crate) fn gfx9(scratch_va: u64, size_per_xcc: usize, tmpring_size: u32, size_per_thread: u32) -> Self {
         Self {
             backing_va: scratch_va,
             tmpring_size,
@@ -156,7 +157,7 @@ impl AqlScratchDesc {
                 size_per_xcc as u32,
                 SCRATCH_RSRC_WORD3_GFX9,
             ],
-            wave64_lane_byte_size: private_segment_size,
+            wave64_lane_byte_size: size_per_thread,
         }
     }
 
@@ -201,15 +202,17 @@ pub struct AmdDeviceCore {
     pub arch: AmdArch,
     /// Backend implementation (KFD today). All ioctls route through this.
     iface: Arc<dyn crate::amd::iface::AmdIface>,
+    /// Flushes the host's VRAM stores out of HDP; shared with every queue.
+    hdp: Arc<crate::amd::iface::Hdp>,
     /// Whether an SDMA copy queue is available on this physical device. Set
     /// by the factory once it installs one (every AMD part unless
     /// `AMD_DISABLE_SDMA` is set or creation fails); while `false`, every
     /// buffer is forced host-visible.
     has_sdma_queue: AtomicBool,
     /// Opt-in for PM4 single-XCC graph capture (see `AmdGraph::capture`). Default
-    /// `false` (per-call dispatch) — capture is a measured regression on gfx1151
-    /// despite a bit-identical transcript, so it's exposed only for hardware that
-    /// benefits or future barrier-granularity work. Set by the device factory;
+    /// `false` (per-call dispatch) — capture has not paid off on the PM4 parts
+    /// measured, so it's exposed only for hardware that benefits or future
+    /// barrier-granularity work. Set by the device factory;
     /// a per-device flag (not an env var) so tests toggle it without a process-
     /// global env race and `=0` can't accidentally enable it.
     pm4_graph: AtomicBool,
@@ -243,8 +246,8 @@ pub struct AmdDeviceCore {
     /// Process-global signal pool, allocated once per physical device. Lazily
     /// installed by the device factory and shared across every `PoolQueue`
     /// (PM4 counter signal acquired here at queue construction) — pool access
-    /// is rare (slot alloc on queue build), and one pool covers many
-    /// queues at 4 KiB total VRAM.
+    /// is rare (slot alloc on queue build), and one pool (64-byte GTT slots,
+    /// sized by the factory) covers every queue.
     signal_pool: OnceLock<Arc<crate::amd::signal::SignalPool>>,
     /// Process-global SDMA copy queue, installed by the factory once the signal
     /// pool exists. Its presence is what flips `has_sdma_queue` true and so
@@ -256,7 +259,7 @@ pub struct AmdDeviceCore {
     /// reaches its hardware cap rather than co-tenanting a mutable ring.
     queue_pool: crate::amd::connector::QueuePool,
     /// Max distinct KFD compute queues in the pool. Read once at open from
-    /// `SVOD_AMD_HW_QUEUES` (default 4 on multi-XCC, else 1; min 1). The per-process hardware budget
+    /// `SVOD_AMD_HW_QUEUES` (default 4; min 1). The per-process hardware budget
     /// is small (~24 user compute queues on CDNA; HIP's `GPU_MAX_HW_QUEUES`
     /// defaults to 4), so acquisition parks after reaching the cap.
     hw_queues: usize,
@@ -321,6 +324,7 @@ impl AmdDevice {
         let core = Arc::new(AmdDeviceCore {
             node,
             arch: AmdArch::Gfx1100,
+            hdp: Arc::new(crate::amd::iface::Hdp::new(Arc::clone(&iface), num_xcc > 1)),
             iface,
             has_sdma_queue: AtomicBool::new(false),
             pm4_graph: AtomicBool::new(false),
@@ -395,28 +399,19 @@ impl AmdDevice {
         debug!(node = node.node_id, gpu_id = node.gpu_id, arch = arch.mcpu(), backend = %backend, "AmdDevice opened");
 
         // Bounded exclusive-lane pool: at most `SVOD_AMD_HW_QUEUES` distinct
-        // KFD compute queues. The default is scheduler-aware, mirroring where
-        // the ROCm stack itself ships multi-queue:
-        //   - multi-XCC CDNA (MI300-class): 4 — queues are HWS/MEC-runlist
-        //     scheduled and concurrent AQL queues are the validated production
-        //     configuration (HIP's own GPU_MAX_HW_QUEUES default is 4);
-        //   - single-XCC gfx11+ (MES-scheduled, RDNA3/3.5/4): 1 — feeding
-        //     several PM4 user queues concurrently parks CP micro-engines in
-        //     `WAIT_REG_MEM` spins that MES cannot preempt and wedges the
-        //     firmware into an unrecoverable reset (reproduced on gfx1151;
-        //     see the crate-level AMD notes), and gfx11 MEC firmware implements no
-        //     scheduler-visible timeline-wait packet to lower waits onto
-        //     (the AMD barrier-value vendor packet is an illegal opcode
-        //     there). The env override remains for validation experiments.
+        // KFD compute queues, 4 by default as HIP's `GPU_MAX_HW_QUEUES`.
+        // Lanes share no in-queue HDP flush (see the crate-level AMD notes).
         let hw_queues = std::env::var("SVOD_AMD_HW_QUEUES")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(if node.num_xcc.max(1) > 1 { 4 } else { 1 })
+            .unwrap_or(4)
             .clamp(1, u64::BITS as usize);
 
+        let hdp = Arc::new(crate::amd::iface::Hdp::new(Arc::clone(&iface), node.num_xcc > 1));
         let core = Arc::new(AmdDeviceCore {
             node,
             arch,
+            hdp,
             iface,
             has_sdma_queue: AtomicBool::new(false),
             pm4_graph: AtomicBool::new(false),
@@ -572,6 +567,13 @@ impl AmdDeviceCore {
         &self.iface
     }
 
+    /// HDP, through which every host store into VRAM must be flushed before a
+    /// GPU engine reads it.
+    #[inline]
+    pub(crate) fn hdp(&self) -> &Arc<crate::amd::iface::Hdp> {
+        &self.hdp
+    }
+
     /// The KFD queue-completion event mailbox, when the backend has one. A
     /// timeline store paired with an interrupting write here wakes a blocked
     /// `WAIT_EVENTS` immediately instead of at the next poll tier.
@@ -600,8 +602,7 @@ impl AmdDeviceCore {
         self.signal_pool.get()
     }
 
-    /// The bounded queue-pool size (`SVOD_AMD_HW_QUEUES`; default 4 on
-    /// multi-XCC hardware, 1 otherwise).
+    /// The bounded queue-pool size (`SVOD_AMD_HW_QUEUES`; default 4).
     #[inline]
     pub fn hw_queues(&self) -> usize {
         self.hw_queues
@@ -673,9 +674,10 @@ impl AmdDeviceCore {
     /// Returns `Ok(Some(fault))` when a fault event fired (caller should bail
     /// with that error rather than continue polling the signal value).
     /// Returns `Ok(None)` for normal wake-ups (queue_event fired, timeout,
-    /// or no event yet).
-    pub fn wait_events(&self, timeout_ms: u32) -> Result<Option<Error>> {
-        match self.iface.wait_events(timeout_ms) {
+    /// or no event yet). `age` is the waiter's queue-event age
+    /// ([`AmdIface::wait_events`](crate::amd::iface::AmdIface::wait_events)).
+    pub fn wait_events(&self, timeout_ms: u32, age: &mut u64) -> Result<Option<Error>> {
+        match self.iface.wait_events(timeout_ms, age) {
             Ok(fault) => {
                 if let Some(error) = &fault {
                     self.poison_error_message(error);
@@ -729,13 +731,25 @@ impl AmdDeviceCore {
         // Non-blocking poll = `wait_events` with timeout 0. Preserves the
         // pre-refactor contract: ioctl error / no fault → `None`; fault →
         // poison with the bare message + return `Some`.
-        match self.iface.wait_events(0) {
+        match self.iface.wait_events(0, &mut 0) {
             Ok(Some(error)) => {
                 self.poison_error_message(&error);
                 Some(error)
             }
             _ => None,
         }
+    }
+
+    /// The first error a compute lane's queue reported, latched as the poison
+    /// (see `AmdComputeQueue::halt_error`). Both reports raise the queue event
+    /// and nothing else announces them, so a wait reads them as it wakes from
+    /// `WAIT_EVENTS` and as it times out.
+    pub(crate) fn queue_error(&self) -> Option<Error> {
+        // Upgraded outside the registry lock: the last strong count may drop here.
+        let lanes: Vec<_> = self.connectors.lock().iter().filter_map(Weak::upgrade).collect();
+        let error = lanes.iter().find_map(|lane| lane.queue().halt_error())?;
+        self.poison_error_message(&error);
+        Some(error)
     }
 }
 
@@ -906,10 +920,8 @@ pub(crate) fn alloc_scratch(
     arch: &AmdArch,
     private_segment_size: u32,
 ) -> Result<(u64, usize, u32, u32, u64, AqlScratchDesc)> {
-    const LANES_PER_WAVE: u32 = 64;
     const PAGE: usize = 0x1000;
-    // gfx9 (CDNA) scratch is 1024-byte aligned; gfx11/12 (RDNA) use 256.
-    let mem_alignment_size: u32 = if arch.is_cdna() { 1024 } else { 256 };
+    let mem_alignment_size = scratch_alignment(arch);
 
     let xccs = node.num_xcc.max(1);
     let simd_per_cu = node.simd_per_cu.max(1);
@@ -922,7 +934,8 @@ pub(crate) fn alloc_scratch(
     // boundary; sizing from raw `cu_cnt` under-provisions on a harvested 8-XCC
     // part, so a high-occupancy dispatch traps with an insufficient-scratch
     // exception (0x401) and the CP HALTS the queue waiting on `queue_inactive_
-    // signal` — which we never service, so it hangs forever with no fault.
+    // signal` — which we do not service: a waiter reports the halt as
+    // `AmdQueueError` and the device is lost to it.
     let cu_slots = cu_cnt.next_multiple_of(se_cnt);
 
     // Round up to the per-lane alignment stride.
@@ -964,7 +977,7 @@ pub(crate) fn alloc_scratch(
     // generation (ROCr `InitScratchSRD` switches the same way): a future arch
     // must pick its own V# layout here, not inherit one from an else-bucket.
     let aql_desc = match arch.gfx_major() {
-        9 => AqlScratchDesc::gfx9(va, size_per_xcc, tmpring_size, private_segment_size),
+        9 => AqlScratchDesc::gfx9(va, size_per_xcc, tmpring_size, size_per_thread),
         // gfx12's V# differs from gfx11 only in compression bits that stay
         // zero; the TMPRING packing difference lives in `pack_tmpring`.
         11 | 12 => AqlScratchDesc::gfx11(va, size_per_xcc, tmpring_size, size_per_thread),
@@ -974,17 +987,35 @@ pub(crate) fn alloc_scratch(
     Ok((va, total, tmpring_size, size_per_thread, handle, aql_desc))
 }
 
-/// Pack `COMPUTE_TMPRING_SIZE`: WAVES in bits 0..12, WAVESIZE at bit 12 with an
-/// arch-specific field width — gfx9 13b, gfx11 15b, gfx12 18b.
-pub(crate) fn pack_tmpring(waves: u32, wave_scratch: u32, arch: &AmdArch) -> u32 {
-    let wavesize_mask: u32 = if arch.is_cdna() {
+/// Scratch lanes are laid out per wave64 on every arch.
+const LANES_PER_WAVE: u32 = 64;
+
+/// The unit of a wave's scratch: gfx9 (CDNA) 1024 bytes, gfx11/12 (RDNA) 256.
+fn scratch_alignment(arch: &AmdArch) -> u32 {
+    if arch.is_cdna() { 1024 } else { 256 }
+}
+
+/// `COMPUTE_TMPRING_SIZE.WAVESIZE`, in scratch units: gfx9 13 bits, gfx11 15,
+/// gfx12 18.
+fn wavesize_mask(arch: &AmdArch) -> u32 {
+    if arch.is_cdna() {
         0x1FFF
     } else if arch.is_rdna4() {
         0x3FFFF
     } else {
         0x7FFF
-    };
-    (waves & 0xFFF) | ((wave_scratch & wavesize_mask) << 12)
+    }
+}
+
+/// The largest per-thread scratch `COMPUTE_TMPRING_SIZE.WAVESIZE` describes.
+pub(crate) fn max_scratch_per_thread(arch: &AmdArch) -> u32 {
+    wavesize_mask(arch) * scratch_alignment(arch) / LANES_PER_WAVE
+}
+
+/// Pack `COMPUTE_TMPRING_SIZE`: WAVES in bits 0..12, WAVESIZE at bit 12 with an
+/// arch-specific field width — gfx9 13b, gfx11 15b, gfx12 18b.
+pub(crate) fn pack_tmpring(waves: u32, wave_scratch: u32, arch: &AmdArch) -> u32 {
+    (waves & 0xFFF) | ((wave_scratch & wavesize_mask(arch)) << 12)
 }
 
 pub(crate) fn open_owned(path: &str) -> Result<OwnedFd> {

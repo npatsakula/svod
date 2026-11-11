@@ -186,7 +186,7 @@ fn buffer_views_expose_typed_host_slices() {
         let view = buffer.view(8, 8).unwrap();
         assert_eq!(view.as_slice::<f32>().unwrap(), &values[2..4]);
         assert_eq!(unsafe { view.as_raw_ptr() }, unsafe { buffer.as_raw_ptr().add(8) });
-        buffer.as_host_bytes_mut().unwrap()[..4].copy_from_slice(&1.5f32.to_le_bytes());
+        buffer.host_write_bytes().unwrap().copy_at(0, &1.5f32.to_le_bytes()).unwrap();
         let mut back = vec![0u8; 32];
         buffer.copyout(&mut back).unwrap();
         assert_eq!(f32::from_le_bytes(back[..4].try_into().unwrap()), 1.5);
@@ -266,7 +266,7 @@ fn copyin_from_a_host_mapped_source_retires_before_returning() {
         src.copyin(&data).unwrap();
         let Ok(bytes) = src.as_host_bytes() else { continue }; // no managed memory
         dst.copyin(bytes).unwrap();
-        src.as_host_bytes_mut().unwrap().fill(0xEE);
+        src.host_write_bytes().unwrap().fill(0xEE);
         let mut back = vec![0u8; len];
         dst.copyout(&mut back).unwrap();
         assert_eq!(back, data, "{spec:?}");

@@ -34,20 +34,23 @@ pub struct HeadsSpec {
 /// `k` and `v [batch, t, kv_heads, d]`. A block handles `br` rows of one
 /// head slot, in two half-width tiles so the rotation pairs the halves.
 pub fn heads<T: Elem>(spec: &HeadsSpec) -> Program {
+    Kernel::record("heads", |k| heads_body::<T>(k, spec))
+}
+
+fn heads_body<'k, T: Elem>(k: &mut Kernel<'k>, spec: &HeadsSpec) {
     let HeadsSpec { ref batch, t, heads, kv_heads, d, q_norm, k_norm, eps, rope, cfg: NormCfg { br } } = *spec;
     let (slots, half) = (heads + 2 * kv_heads, d / 2);
     let cap = batch.capacity();
-    let mut k = Kernel::new("heads");
-    let qkv = k.param::<T>("qkv", ParamKind::In, cap * t * slots * d);
-    let q_w = q_norm.then(|| k.param::<T>("q_w", ParamKind::In, d));
-    let k_w = k_norm.then(|| k.param::<T>("k_w", ParamKind::In, d));
+    let qkv = k.input::<T>("qkv", cap * t * slots * d);
+    let q_w = q_norm.then(|| k.input::<T>("q_w", d));
+    let k_w = k_norm.then(|| k.input::<T>("k_w", d));
     let table_rows = rope.map(|r| if r.per_batch { cap * t } else { t });
-    let cos = table_rows.map(|rows| k.param::<T>("cos", ParamKind::In, rows * half));
-    let sin = table_rows.map(|rows| k.param::<T>("sin", ParamKind::In, rows * half));
-    let q = k.param::<T>("q", ParamKind::Out, cap * t * heads * d);
-    let kk = k.param::<T>("k", ParamKind::Out, cap * t * kv_heads * d);
-    let v = k.param::<T>("v", ParamKind::Out, cap * t * kv_heads * d);
-    let (gz, bb) = batch.axis(&mut k);
+    let cos = table_rows.map(|rows| k.input::<T>("cos", rows * half));
+    let sin = table_rows.map(|rows| k.input::<T>("sin", rows * half));
+    let q = k.output::<T>("q", cap * t * heads * d);
+    let kk = k.output::<T>("k", cap * t * kv_heads * d);
+    let v = k.output::<T>("v", cap * t * kv_heads * d);
+    let (gz, bb) = batch.axis(k);
     // The head slots of a row group are the fastest-moving blocks, so the
     // blocks a dispatcher deals in turn read one row group's contiguous
     // bytes rather than a chunk of every row a row apart.
@@ -56,25 +59,27 @@ pub fn heads<T: Elem>(spec: &HeadsSpec) -> Program {
     let slot = k.block(0);
     let row0 = k.block(1) * br;
     let shape = Shape::new(br, half);
-    let tiles = |k: &mut Kernel, p: ParamRef<T>, width: usize, col: Sc| {
-        let view = k.view(p, batch_offset(&bb, t * width) + col, [width, 1], shape, [bound(t, br), None]);
-        [k.at(view, row0.clone(), 0), k.at(view, row0.clone(), half)]
-    };
-    let src = tiles(&mut k, qkv, slots * d, slot.clone() * d);
+    let tiles = Tiles { bb: bb.clone(), row0: row0.clone(), shape, t, br, half };
+    let src = tiles.of(k, qkv, slots * d, slot.clone() * d);
     let tables = rope.map(|r| {
         let offset = if r.per_batch { batch_offset(&bb, t * half) } else { Sc::from(0) };
-        let table = |k: &mut Kernel, p: ParamRef<T>| {
+        let table = |k: &mut Kernel<'k>, p: ParamRef<'k, T, In>| {
             let view = k.view(p, offset.clone(), [half, 1], shape, [bound(t, br), None]);
             let tile = k.at(view, row0.clone(), 0);
             load_f32(k, tile)
         };
-        (table(&mut k, cos.expect("rotated")), table(&mut k, sin.expect("rotated")))
+        (table(k, cos.expect("rotated")), table(k, sin.expect("rotated")))
     });
-    let (x1, x2) = (load_f32(&mut k, src[0]), load_f32(&mut k, src[1]));
+    let (x1, x2) = (load_f32(k, src[0]), load_f32(k, src[1]));
 
     // The head's `q`, `k` or `v` path: normed and rotated where asked, then
     // stored to its output at the slot's head.
-    let path = |k: &mut Kernel, out: ParamRef<T>, heads: usize, head: Sc, w: Option<ParamRef<T>>, rotate: bool| {
+    let path = |k: &mut Kernel<'k>,
+                out: ParamRef<'k, T, Out>,
+                heads: usize,
+                head: Sc<'k>,
+                w: Option<ParamRef<'k, T, In>>,
+                rotate: bool| {
         let (mut y1, mut y2) = (x1, x2);
         if let Some(w) = w {
             let sq1 = k.binary(y1, y1, BinaryOp::Mul);
@@ -83,7 +88,7 @@ pub fn heads<T: Elem>(spec: &HeadsSpec) -> Program {
             let sum = k.reduce(sq, Axis::Row, ReduceOp::Sum);
             let var = affine(k, sum, 1.0 / d as f64, eps);
             let inv = k.unary(var, UnaryOp::Rsqrt);
-            let weights = |k: &mut Kernel, col: usize| {
+            let weights = |k: &mut Kernel<'k>, col: usize| {
                 let view = k.view(w, col, [0, 1], Shape::new(1, half), [None, None]);
                 load_f32(k, view)
             };
@@ -99,7 +104,7 @@ pub fn heads<T: Elem>(spec: &HeadsSpec) -> Program {
             y1 = k.binary(c1, s2, BinaryOp::Sub);
             y2 = k.binary(s1, c2, BinaryOp::Add);
         }
-        let dst = tiles(k, out, heads * d, head * d);
+        let dst = tiles.of(k, out, heads * d, head * d);
         let (y1, y2) = (k.cast::<F32, T>(y1), k.cast::<F32, T>(y2));
         k.store(dst[0], y1);
         k.store(dst[1], y2);
@@ -117,5 +122,29 @@ pub fn heads<T: Elem>(spec: &HeadsSpec) -> Program {
             )
         },
     );
-    k.finish()
+}
+
+/// The block's two half-head `[br, half]` tiles at column `col` of a
+/// `[batch·t, width]` parameter, read or written.
+struct Tiles<'k> {
+    bb: Option<Sc<'k>>,
+    row0: Sc<'k>,
+    shape: Shape,
+    t: usize,
+    br: usize,
+    half: usize,
+}
+
+impl<'k> Tiles<'k> {
+    fn of<T: Elem, A: Access>(
+        &self,
+        k: &mut Kernel<'k>,
+        p: ParamRef<'k, T, A>,
+        width: usize,
+        col: Sc<'k>,
+    ) -> [Gmem<'k, T, A>; 2] {
+        let Tiles { bb, row0, shape, t, br, half } = self;
+        let view = k.view(p, batch_offset(bb, t * width) + col, [width, 1], *shape, [bound(*t, *br), None]);
+        [k.at(view, row0.clone(), 0), k.at(view, row0.clone(), *half)]
+    }
 }

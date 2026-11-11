@@ -52,7 +52,7 @@ pub const COMPUTE_RING_BYTES: usize = 16 * 1024 * 1024;
 pub const COPY_RING_BYTES: usize = 16 * 1024 * 1024;
 
 /// Conservative upper bound on the dwords a single PM4 dispatch writes to the
-/// ring (wait, HDP flush, acquire_mem, the SET_SH_REG stream, DISPATCH_DIRECT,
+/// ring (wait, acquire_mem, the SET_SH_REG stream, DISPATCH_DIRECT,
 /// RELEASE_MEM — a typical dispatch is ~150). Bounds in-flight dispatches so
 /// the host can never lap the ring.
 const MAX_DISPATCH_DWORDS: usize = 1024;
@@ -257,7 +257,8 @@ pub fn lower_hcq_aql(submission: &crate::hcq::Submission) -> Result<Vec<[u32; 16
 
 /// Wrap one ordinary AQL dispatch in the queue-owned timeline protocol.
 /// Kernel completion handles must remain unset; optional profiling uses PM4
-/// timestamp stores in the surrounding control runs.
+/// timestamp stores in the surrounding control runs. Publication gives the
+/// stream's last packet the lane's retirement signal (`PoolQueue::retired`).
 pub fn finalize_hcq_aql_timeline_submission(
     submission: &crate::hcq::Submission,
     counter_address: u64,
@@ -470,7 +471,7 @@ pub struct Pm4LoweringState {
 /// store (`ops_amd.py:391-393`): write the event id into the device's event
 /// mailbox so a host blocked in `WAIT_EVENTS` wakes on completion instead of at
 /// its next poll tier. No-op on backends without a KFD event.
-fn push_queue_event_mailbox(submission: &mut crate::hcq::Submission, core: &AmdDeviceCore) {
+pub(crate) fn push_queue_event_mailbox(submission: &mut crate::hcq::Submission, core: &AmdDeviceCore) {
     if let Some(mailbox) = core.queue_event_mailbox() {
         submission.push(crate::hcq::Command::Store {
             dst: mailbox.address,
@@ -512,8 +513,11 @@ pub fn lower_hcq_pm4(submission: &crate::hcq::Submission, state: Pm4LoweringStat
             crate::hcq::Command::Wait { signal_address, value } => {
                 q.extend_from_slice(&pm4::wait_reg_mem(*signal_address, value_u32("wait", *value)?, u32::MAX));
             }
+            // HDP is flushed by the host where it stores into VRAM
+            // (`amd::iface::Hdp`), not here: the CP's REQ/DONE handshake is
+            // shared by every queue on the device and hangs under concurrent
+            // requesters.
             crate::hcq::Command::MemoryBarrier => {
-                q.extend_from_slice(&pm4::hdp_flush());
                 if is_gfx9 {
                     q.extend_from_slice(&pm4::acquire_mem_gfx9());
                 } else {
@@ -924,6 +928,8 @@ pub struct AmdComputeQueue {
     /// it submits AQL packets (with PM4 wrapped in AQL vendor IB packets).
     /// Decided at queue creation from `num_xcc`, fixed for the queue's lifetime.
     is_pm4: bool,
+    /// Read without the ring lock: a waiter checks them while a lease publishes.
+    errors: QueueErrorWords,
 }
 
 /// Copy queue (SDMA). Stages host↔device and device↔device copies for
@@ -999,10 +1005,12 @@ struct QueueInner {
     /// the scratch fields at fixed offsets are patched here when the
     /// connector's scratch buffer is (re)allocated; see `set_aql_scratch`.
     gart_host: NonNull<u8>,
-    /// Host base of the `queue_inactive_signal` amd_signal_t (AQL only). The CP
-    /// trap handler writes its exception code into `value` (`+8`) and halts the
-    /// queue; reading it tells us WHY a wedge happened (e.g. `0x401`).
-    qinactive_host: Option<NonNull<u8>>,
+    /// The compute queue's error words; `None` on the SDMA queue.
+    errors: Option<QueueErrorWords>,
+    /// Flushes HDP at each doorbell: always where kernargs and command buffers
+    /// live in VRAM, else only the stores a `HostWrite` deferred. Counts the
+    /// SDMA ring's stores behind the GPU caches.
+    hdp: Arc<crate::amd::iface::Hdp>,
     /// Index of the next packet (in AQL_PACKET_BYTES-sized slots). For SDMA
     /// queues this is the next byte offset; type checks ensure callers don't
     /// confuse them.
@@ -1024,7 +1032,7 @@ struct QueueInner {
     _gart_buf: crate::allocator::RawBuffer,
     _eop_buf: Option<crate::allocator::RawBuffer>,
     _ctx_buf: Option<crate::allocator::RawBuffer>,
-    _qinactive_buf: Option<crate::allocator::RawBuffer>,
+    _errors_buf: Option<crate::allocator::RawBuffer>,
 }
 
 // SAFETY: ring/doorbell access goes through Mutex; underlying buffers are
@@ -1108,8 +1116,8 @@ impl Drop for QueueInner {
         if let Some(ctx) = self._ctx_buf.as_ref() {
             ctx.free_amd_device_in_place();
         }
-        if let Some(qinactive) = self._qinactive_buf.as_ref() {
-            qinactive.free_amd_device_in_place();
+        if let Some(errors) = self._errors_buf.as_ref() {
+            errors.free_amd_device_in_place();
         }
     }
 }
@@ -1249,7 +1257,7 @@ impl QueueInner {
         // LAST. On a host-visible device/large-BAR ring the packet processor can
         // otherwise latch a valid-typed packet over a torn body (stale grid_size /
         // kernarg_address / completion_signal) and stall the CP with no fault —
-        // rptr frozen on the packet, queue_inactive=0 (the exact wedge we see).
+        // rptr frozen on the packet, queue_inactive=0.
         unsafe {
             // dwords 1..16 (body) then dword 0 = INVALID header.
             std::ptr::copy_nonoverlapping(bytes.as_ptr().add(4), dst.add(4), AQL_PACKET_BYTES - 4);
@@ -1262,10 +1270,28 @@ impl QueueInner {
         self.write_idx += 1;
     }
 
+    /// Write a packet-aligned AQL stream whose last packet names `completion`
+    /// as its AQL completion signal, which the CP decrements once that packet
+    /// retired on every XCC.
+    fn push_aql_stream(&mut self, bytes: &[u8], completion: &crate::amd::signal::AmdSignal) {
+        let (last, packets) = bytes.as_chunks::<AQL_PACKET_BYTES>().0.split_last().expect("a validated AQL stream");
+        for packet in packets {
+            self.push_aql(packet);
+        }
+        let mut last = *last;
+        last[56..].copy_from_slice(&completion.handle().to_le_bytes());
+        self.push_aql(&last);
+    }
+
     /// Publish the current `write_idx` to GART + ring the doorbell. AQL uses
     /// the **last completed** slot (`write_idx - 1`); PM4 uses the **next**
     /// dword (`write_idx`).
     fn ring_doorbell(&self, is_pm4: bool) {
+        self.publish(if is_pm4 { self.write_idx } else { self.write_idx - 1 });
+    }
+
+    /// Publish `write_idx` to the GART wptr, then write `doorbell_value`.
+    fn publish(&self, doorbell_value: u64) {
         // GART wptr first: without it KFD sees the doorbell
         // change but reads a stale wptr.
         unsafe { std::ptr::write_volatile(self.write_ptr_host.as_ptr(), self.write_idx) };
@@ -1275,9 +1301,17 @@ impl QueueInner {
         // does. Without it the CP can observe the doorbell while the wptr /
         // ring packet / kernarg stores are still buffered (stale read → wedge).
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-        let doorbell_value = if is_pm4 { self.write_idx } else { self.write_idx - 1 };
+        // Kernargs and command buffers in VRAM, and the stores of a dropped
+        // `HostWrite`, flush here; see `Hdp`.
+        self.hdp.flush_for_doorbell();
         // SAFETY: doorbell is mmapped MMIO; aligned 64-bit store.
         unsafe { std::ptr::write_volatile(self.doorbell.as_ptr(), doorbell_value) };
+    }
+
+    /// Publish the SDMA ring, whose copies store behind the GPU caches.
+    fn publish_sdma(&self) {
+        self.hdp.note_dma_write();
+        self.publish(self.write_idx);
     }
 }
 
@@ -1287,15 +1321,22 @@ pub(crate) struct LinkedComputePublication<'a> {
 }
 
 impl LinkedComputePublication<'_> {
-    pub(crate) fn publish(&mut self, replay: &crate::hcq::ReplayCommandBuffer) {
+    /// Publish `replay` on `lane`. On AQL, returns the point of `lane`'s
+    /// retirement count at which its memory is free again.
+    pub(crate) fn publish(
+        &mut self,
+        lane: &PoolQueue,
+        replay: &crate::hcq::ReplayCommandBuffer,
+    ) -> Option<(Arc<crate::amd::signal::AmdSignal>, u64)> {
         if self.is_pm4 {
             self.inner.push_pm4_bytes(replay.bytes());
-        } else {
-            for packet in replay.bytes().as_chunks::<AQL_PACKET_BYTES>().0 {
-                self.inner.push_aql(packet);
-            }
+            self.inner.ring_doorbell(true);
+            return None;
         }
-        self.inner.ring_doorbell(self.is_pm4);
+        let retired = lane.aql_retired();
+        self.inner.push_aql_stream(replay.bytes(), retired.signal());
+        self.inner.ring_doorbell(false);
+        Some((Arc::clone(retired.signal()), retired.next()))
     }
 }
 
@@ -1428,9 +1469,7 @@ impl Drop for CopyTimelineReservation<'_> {
 impl LinkedCopyPublication<'_> {
     pub(crate) fn publish(&mut self, replay: &crate::hcq::ReplayCommandBuffer) {
         push_sdma_bytes(&mut self.inner, replay.bytes());
-        unsafe { std::ptr::write_volatile(self.inner.write_ptr_host.as_ptr(), self.inner.write_idx) };
-        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-        unsafe { std::ptr::write_volatile(self.inner.doorbell.as_ptr(), self.inner.write_idx) };
+        self.inner.publish_sdma();
     }
 }
 
@@ -1457,7 +1496,14 @@ impl AmdComputeQueue {
         let queue_type = if is_pm4 { kfd::KFD_IOC_QUEUE_TYPE_COMPUTE } else { kfd::KFD_IOC_QUEUE_TYPE_COMPUTE_AQL };
         let inner = create_queue(allocator, queue_type, COMPUTE_RING_BYTES, !is_pm4, /*needs_cwsr=*/ true)?;
         debug!(gpu_id = core.node.gpu_id, num_xcc = core.node.num_xcc, is_pm4 = is_pm4, "AmdComputeQueue created");
-        Ok(Box::new(Self { inner: Mutex::new(inner), state: QueueState::Active, core: Arc::clone(core), is_pm4 }))
+        let errors = inner.errors.expect("a compute queue has error words");
+        Ok(Box::new(Self {
+            inner: Mutex::new(inner),
+            state: QueueState::Active,
+            core: Arc::clone(core),
+            is_pm4,
+            errors,
+        }))
     }
 
     /// `true` when this queue submits raw PM4 dwords (single-XCC); `false`
@@ -1477,6 +1523,12 @@ impl AmdComputeQueue {
     /// COMPUTE-queue semantics are unreliable, which would deadlock a spin).
     /// The dispatches we wait on were submitted (doorbell rung) in prior calls,
     /// so the GPU will signal them; the wait always makes progress.
+    /// Where an AQL queue reports the packets it read; a PM4 queue's single IB
+    /// shows nothing of its dispatches there.
+    pub(crate) fn aql_read_pointer(&self) -> Option<crate::amd::signal::QueueReadPointer> {
+        (!self.is_pm4).then(|| crate::amd::signal::QueueReadPointer::new(self.inner.lock().read_ptr_host))
+    }
+
     fn wait_dispatch_headroom(&self, pool: &PoolQueue) -> Result<()> {
         let last_reserved = pool.pm4_value().saturating_sub(1);
         if last_reserved > RING_MAX_INFLIGHT {
@@ -1494,14 +1546,20 @@ impl AmdComputeQueue {
     /// The caller's exclusive lane lease keeps PM4 counter reservation and ring
     /// publication ordered. The backend-local `inner` guard is uncontended.
     ///
+    /// `kernargs` go into one kernarg ring slot (on AQL together with the PM4
+    /// control program), reserved after the headroom waits and published with
+    /// the timeline value this dispatch signals, on AQL with the lane's
+    /// retirement point instead.
+    ///
     /// Sequence (timestamps are present only when the submission requests them):
-    /// `wait(counter, prev) → memory_barrier → [timestamp] → exec → [timestamp]
-    /// → signal(counter, next)`.
+    /// `wait(counter, prev) → [memory_barrier] → [timestamp] → exec → [timestamp]
+    /// → signal(counter, next)`; the barrier comes from the submission.
     /// Returns the counter value this dispatch signals.
     pub(crate) fn submit_hcq_dispatch(
         &self,
         pool: &PoolQueue,
         submission: &crate::hcq::Submission,
+        kernargs: &[u8],
         pmc_start: &[u32],
         pmc_read: &[u32],
     ) -> Result<HcqDispatchResult> {
@@ -1540,6 +1598,16 @@ impl AmdComputeQueue {
                 timestamps.as_ref().map(|signal| (signal.start_ts_addr(), signal.end_ts_addr())),
             )?;
             push_queue_event_mailbox(&mut finalized, &self.core);
+            let compute = finalized
+                .commands
+                .iter()
+                .position(|command| matches!(command, crate::hcq::Command::Compute(_)))
+                .expect("an ordinary AQL dispatch holds one compute command");
+            finalized.bind(
+                compute,
+                crate::hcq::CommandField::ComputeKernargAddress,
+                crate::hcq::PatchSource::LinkAddress(1),
+            )?;
 
             let program = lower_hcq_aql_submission_program(
                 &finalized,
@@ -1552,31 +1620,31 @@ impl AmdComputeQueue {
                 },
                 crate::hcq::PatchSource::LinkAddress(0),
             )?;
-            let control_offset = pool.arena().bump(program.control.bytes.len(), 16)?;
-            let control_gpu = pool.arena().gpu_at(control_offset);
-            // SAFETY: the arena reservation covers the full resident PM4 control stream.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    program.control.bytes.as_ptr(),
-                    pool.arena().host_at(control_offset),
-                    program.control.bytes.len(),
-                );
-            }
+            let control = &program.control.bytes;
+            let kernarg_offset = control.len().next_multiple_of(crate::hcq::KERNARG_ALIGN);
+            let mut slot = pool.arena().reserve(kernarg_offset + kernargs.len(), crate::hcq::KERNARG_ALIGN)?;
+            let control_gpu = slot.gpu();
+            let host = slot.host();
+            host[..control.len()].copy_from_slice(control);
+            host[kernarg_offset..].copy_from_slice(kernargs);
             std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-            let linked = pool.link(&program.aql, &crate::hcq::LinkPatchValues(vec![control_gpu]))?;
-            self.publish_linked_aql_timeline(pool, &linked.replay_buffer(), next)?;
-            let finalizer = SubmissionFinalizer::timeline(Arc::clone(pool.pm4_signal()), next, timestamps.clone());
+            let links = crate::hcq::LinkPatchValues(vec![control_gpu, control_gpu + kernarg_offset as u64]);
+            let linked = pool.link(&program.aql, &links)?;
+            let finalizer =
+                self.publish_linked_aql_timeline(pool, &linked.replay_buffer(), next, Some(slot), timestamps.clone())?;
             return Ok(HcqDispatchResult { timestamps, finalizer });
         }
 
-        // The caller owns the lane across kernarg bump, write, and publication,
-        // so the PM4 counter and ring remain in the same order.
+        // The caller owns the lane across kernarg reservation, write, and
+        // publication, so the PM4 counter and ring remain in the same order.
         // Keep the PM4 counter < 2^32 (drain+reset at the watermark) before
         // reserving this dispatch's value.
         pool.ensure_pm4_headroom()?;
         // Ring back-pressure: block if too many dispatches are in flight, so an
         // async (`wait=false`) burst can't lap the ring. Outside the inner lock.
         self.wait_dispatch_headroom(pool)?;
+        let mut slot = pool.arena().reserve(kernargs.len(), crate::hcq::KERNARG_ALIGN)?;
+        slot.host().copy_from_slice(kernargs);
         let counter_addr = pool.pm4_signal().value_addr();
         let scratch_addr = pool.scratch_gpu_va();
         let tmpring_size = pool.tmpring_size();
@@ -1596,11 +1664,11 @@ impl AmdComputeQueue {
 
         let mut finalized = crate::hcq::Submission::new(submission.queue);
         finalized.push(crate::hcq::Command::Wait { signal_address: counter_addr, value: prev });
-        // The stamp waits below are gfx11's, measured there (gfx1151, 2026-10-28):
-        // they hold both stamps to the compute they bracket. On gfx12 (gfx1201)
-        // the wait on a stamp wedges the queue, and on both a store fence in its
-        // place leaves probes unmeasured — its stamps are left as they were, the
-        // tuner's physical floor the guard on what they read.
+        // The stamp waits below are gfx11's: they hold both stamps to the
+        // compute they bracket. On gfx12 a wait on a stamp wedges the queue,
+        // and on both a store fence in its place leaves probes unmeasured, so
+        // gfx12's stamps stay unwaited and the tuner's physical floor guards
+        // what they read.
         let fenced = self.core.arch.gfx_major() == 11 && ts_addrs.is_some();
         for command in &submission.commands {
             if matches!(command, crate::hcq::Command::Compute(_))
@@ -1609,10 +1677,8 @@ impl AmdComputeQueue {
                 finalized.push(crate::hcq::Command::Timestamp { dst: start_addr });
                 // A bare end-of-pipe clock write retires with the CP's event
                 // queue, not with the packets around it: dispatched behind
-                // other events its landing drags past a following compute
-                // (a 270 ms dispatch's start stamp landed 4 ms before its
-                // end, gfx1151), and left to complete on its own it lands
-                // before one (the same dispatch stamped 1-3 us). Both stamps
+                // other events its landing drags past a following compute,
+                // and left to complete on its own it lands before one. Both stamps
                 // are therefore waited to land where the dispatch needs them:
                 // the start one (zeroed by `reset`) before the compute is
                 // forwarded, the end one behind the timeline-class store that
@@ -1623,7 +1689,15 @@ impl AmdComputeQueue {
                     finalized.push(crate::hcq::Command::Wait { signal_address: start_addr + 4, value: 1 });
                 }
             }
-            finalized.push(command.clone());
+            match command {
+                crate::hcq::Command::Compute(dispatch) => {
+                    finalized.push(crate::hcq::Command::Compute(crate::hcq::ComputeDispatch {
+                        kernarg_address: slot.gpu(),
+                        ..dispatch.clone()
+                    }))
+                }
+                command => finalized.push(command.clone()),
+            };
             if matches!(command, crate::hcq::Command::Compute(_))
                 && let Some((_, end_addr)) = ts_addrs
             {
@@ -1689,6 +1763,7 @@ impl AmdComputeQueue {
         self.core.publication_checkpoint(crate::amd::iface::PublicationStage::BeforeDoorbell)?;
         ring.ring_doorbell(/*is_pm4=*/ true);
         reservation.mark_published();
+        slot.publish(pool.pm4_signal(), next);
         ring.commit();
         self.core.publication_checkpoint(crate::amd::iface::PublicationStage::AfterDoorbell)?;
         reservation.commit();
@@ -1774,7 +1849,9 @@ impl AmdComputeQueue {
 
     /// Patch and publish a linked AQL stream plus its resident PM4 control IBs
     /// through the queue-owned timeline. Kernel packets carry no completion;
-    /// the trailing control IB publishes `next` after all prior AQL packets.
+    /// the trailing control IB publishes `next` after all prior AQL packets,
+    /// and the finalizer retires once every XCC is done with that IB too, so
+    /// a replay rewrites `control_host` only then.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn replay_linked_aql_timeline(
         &self,
@@ -1805,8 +1882,7 @@ impl AmdComputeQueue {
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         linked.patch(replay, runtime, system)?;
         validate_aql_packet_count(replay.bytes().len() / AQL_PACKET_BYTES)?;
-        self.publish_linked_aql_timeline(pool, replay, next)?;
-        Ok(SubmissionFinalizer::timeline(Arc::clone(pool.pm4_signal()), next, None))
+        self.publish_linked_aql_timeline(pool, replay, next, None, None)
     }
 
     /// Lower and publish one complete HCQ command buffer with one doorbell.
@@ -1858,12 +1934,16 @@ impl AmdComputeQueue {
         self.submit_aql(&packets)
     }
 
+    /// Publish a linked AQL stream that stores `next` on the lane timeline. Its
+    /// memory, `kernargs` with it, retires on the lane's retirement count.
     fn publish_linked_aql_timeline(
         &self,
         pool: &PoolQueue,
         replay: &crate::hcq::ReplayCommandBuffer,
         next: u64,
-    ) -> Result<()> {
+        kernargs: Option<crate::amd::kernarg::KernargSlot<'_>>,
+        timestamps: Option<Arc<crate::amd::signal::AmdSignal>>,
+    ) -> Result<Arc<SubmissionFinalizer>> {
         if !replay.bytes().len().is_multiple_of(AQL_PACKET_BYTES) {
             return Err(Error::Runtime { message: "linked AQL stream is not packet aligned".into() });
         }
@@ -1876,16 +1956,21 @@ impl AmdComputeQueue {
         debug_assert_eq!(reserved, next, "queue lease must serialize timeline reservation");
         let mut reservation = TimelineReservation::new(pool, &self.core, reserved);
         self.core.publication_checkpoint(crate::amd::iface::PublicationStage::AfterReservation)?;
-        for packet in replay.bytes().as_chunks::<AQL_PACKET_BYTES>().0 {
-            ring.push_aql(packet);
-        }
+        let retired = pool.aql_retired();
+        ring.push_aql_stream(replay.bytes(), retired.signal());
         self.core.publication_checkpoint(crate::amd::iface::PublicationStage::BeforeDoorbell)?;
         ring.ring_doorbell(/*is_pm4=*/ false);
         reservation.mark_published();
+        let point = retired.next();
+        if let Some(slot) = kernargs {
+            slot.publish(retired.signal(), point);
+        }
+        let finalizer = SubmissionFinalizer::timeline(Arc::clone(pool.pm4_signal()), next, timestamps);
+        finalizer.retire_at((Arc::clone(retired.signal()), point));
         ring.commit();
         self.core.publication_checkpoint(crate::amd::iface::PublicationStage::AfterDoorbell)?;
         reservation.commit();
-        Ok(())
+        Ok(finalizer)
     }
 
     /// Wait for linked-publication headroom WITHOUT pinning the queue lock
@@ -1953,11 +2038,17 @@ impl AmdComputeQueue {
             let g = self.inner.lock();
             (g.queue_id, g.ring_gpu, g.ring_size as u32)
         };
-        self.core.iface().update_queue_percentage(queue_id, ring_gpu, ring_size, 0)?;
+        let fault = |e: &Error| {
+            if let Some(fault) = self.core.poll_faults_nonblocking() {
+                tracing::error!(%e, %fault, "queue update failed behind a memory fault");
+            }
+        };
+        self.core.iface().update_queue_percentage(queue_id, ring_gpu, ring_size, 0).inspect_err(fault)?;
         self.set_aql_scratch(desc);
         self.core
             .iface()
             .update_queue_percentage(queue_id, ring_gpu, ring_size, kfd::KFD_MAX_QUEUE_PERCENTAGE)
+            .inspect_err(fault)
             .inspect_err(|e| self.core.poison(&format!("AQL descriptor remap failed; queue left unmapped: {e}")))
     }
 
@@ -1984,14 +2075,13 @@ impl AmdComputeQueue {
                 base.add(hsa::OFFSET_SCRATCH_WAVE64_LANE_BYTE_SIZE) as *mut u32,
                 desc.wave64_lane_byte_size,
             );
-            // Force the host writes through to the GART page before returning:
-            // the page is mapped write-combining, so a CPU `Release` fence alone
-            // does not guarantee the command processor sees the new descriptor on
-            // the next dispatch. A read-back drains the WC buffers (and serialises
-            // with the fence below). Without this, a mid-stream scratch grow
-            // intermittently leaves the CP reading the stale descriptor — which,
-            // once the old backing is freed, points at unmapped VRAM and wedges
-            // the queue with no fault event.
+            // The GART page is uncached GTT, which KFD maps CPU-cached (no
+            // `CPU_GTT_USWC`) and the GPU snoops, so these stores need no
+            // write-combining drain; the read-back and the fence below only
+            // order them before the remap that makes the CP re-read the
+            // descriptor. A CP still holding the stale one would, once the old
+            // backing is freed, address unmapped VRAM and wedge the queue with
+            // no fault event.
             std::ptr::read_volatile(base.add(hsa::OFFSET_COMPUTE_TMPRING_SIZE) as *const u32);
         }
         std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
@@ -2022,10 +2112,6 @@ impl AmdComputeQueue {
         }
     }
 
-    /// The CP exception code the trap handler wrote into `queue_inactive_signal`
-    /// when it halted the queue (e.g. `0x401` insufficient-scratch), or `None`
-    /// if no exception is recorded (value `0`) / on PM4 queues. Used to turn a
-    /// blind dispatch timeout into a diagnosable error.
     /// Ring producer index. Test-only: proves an abandoned publication left no
     /// packets behind.
     #[cfg(test)]
@@ -2033,11 +2119,133 @@ impl AmdComputeQueue {
         self.inner.lock().write_idx
     }
 
-    pub(crate) fn inactive_exception(&self) -> Option<i64> {
-        let h = self.inner.lock().qinactive_host?;
-        // SAFETY: host-visible amd_signal_t; `value` is the i64 at +8.
-        let code = unsafe { std::ptr::read_volatile(h.as_ptr().add(8) as *const i64) };
-        (code != 0).then_some(code)
+    /// The AQL packet at ring index `index`. Test-only.
+    #[cfg(test)]
+    pub(crate) fn ring_packet(&self, index: u64) -> [u8; AQL_PACKET_BYTES] {
+        let inner = self.inner.lock();
+        let offset = (index as usize * AQL_PACKET_BYTES) % inner.ring_size;
+        // SAFETY: the ring spans `ring_size` bytes, a whole number of packets.
+        unsafe { *(inner.ring_host.as_ptr().add(offset) as *const [u8; AQL_PACKET_BYTES]) }
+    }
+
+    /// The PM4 this queue published from write index `from` on: PM4 ring
+    /// dwords, or on AQL the control programs its vendor packets run, read at
+    /// their GPU address, which is the host address on the mock. Test-only.
+    #[cfg(test)]
+    pub(crate) fn published_pm4(&self, from: u64) -> Vec<u32> {
+        let inner = self.inner.lock();
+        let ring = |index: u64, unit: usize| {
+            // SAFETY: the ring spans `ring_size` bytes, a whole number of units.
+            unsafe { inner.ring_host.as_ptr().add((index as usize * unit) % inner.ring_size) }
+        };
+        if self.is_pm4 {
+            return (from..inner.write_idx).map(|index| unsafe { *(ring(index, 4) as *const u32) }).collect();
+        }
+        let mut dwords = Vec::new();
+        for index in from..inner.write_idx {
+            // SAFETY: as above; a packet's first dword holds its header.
+            let packet = unsafe { std::slice::from_raw_parts(ring(index, AQL_PACKET_BYTES) as *const u32, 16) };
+            if packet[0] & 0xff == hsa_packet_type_t_HSA_PACKET_TYPE_VENDOR_SPECIFIC {
+                let address = u64::from(packet[2]) | (u64::from(packet[3]) << 32);
+                let count = (packet[4] & pm4::INDIRECT_BUFFER_SIZE_MASK) as usize;
+                // SAFETY: a mock GPU address is the host address of the live
+                // control program the packet runs.
+                dwords.extend_from_slice(unsafe { std::slice::from_raw_parts(address as *const u32, count) });
+            }
+        }
+        dwords
+    }
+
+    /// The error this queue reported, if any: the code the CP wrote into the
+    /// `queue_inactive_signal` as it halted the AQL queue (e.g. `0x401`,
+    /// insufficient scratch), else the exception bits KFD set in `ErrorReason`.
+    pub(crate) fn halt_error(&self) -> Option<Error> {
+        self.errors.error()
+    }
+
+    /// Host addresses of the `queue_inactive_signal` value and the
+    /// `ErrorReason` word, where a test plays the CP and KFD. Test-only.
+    #[cfg(test)]
+    pub(crate) fn error_word_ptrs(&self) -> (*mut u64, *mut u64) {
+        let base = self.errors.base.as_ptr();
+        // SAFETY: both offsets lie inside the QUEUE_ERROR_BYTES allocation.
+        unsafe { (base.add(8).cast(), base.add(QUEUE_ERROR_REASON_OFFSET).cast()) }
+    }
+}
+
+/// One GTT allocation per compute queue: the AQL `queue_inactive_signal`
+/// (`amd_signal_t`, value at +8), unused on PM4, and the CWSR header's
+/// `ErrorReason` word.
+const QUEUE_ERROR_BYTES: usize = 128;
+const QUEUE_ERROR_REASON_OFFSET: usize = 64;
+
+/// A compute queue's error words; see [`QUEUE_ERROR_BYTES`].
+#[derive(Clone, Copy, Debug)]
+struct QueueErrorWords {
+    queue_id: u32,
+    base: NonNull<u8>,
+}
+
+// SAFETY: `base` addresses the queue's error allocation, which the queue keeps
+// mapped (or leaks, when quarantined) for its whole life; it is only read.
+unsafe impl Send for QueueErrorWords {}
+unsafe impl Sync for QueueErrorWords {}
+
+impl QueueErrorWords {
+    fn error(self) -> Option<Error> {
+        // SAFETY: see the `Send` impl; the CP and KFD write the words, hence volatile.
+        let read = |offset| unsafe { std::ptr::read_volatile(self.base.as_ptr().add(offset) as *const u64) };
+        let (report, code, cause) = match (read(8), read(QUEUE_ERROR_REASON_OFFSET)) {
+            (0, 0) => return None,
+            (0, bits) => ("ErrorReason", bits, exception_cause(bits)),
+            (code, _) => ("queue_inactive_signal", code, inactive_cause(code)),
+        };
+        Some(Error::AmdQueueError { queue_id: self.queue_id, report, code, cause })
+    }
+}
+
+/// What a `queue_inactive_signal` code means, by ROCr's precedence
+/// (`AqlQueue::DynamicQueueEventsHandler`).
+pub(crate) fn inactive_cause(code: u64) -> &'static str {
+    const CAUSES: [(u64, &str); 11] = [
+        (0x401, "insufficient scratch"),
+        (0x2, "invalid dispatch dimensions"),
+        (0x4, "invalid group segment size"),
+        (0x8, "invalid code object"),
+        (0x120, "invalid packet format"),
+        (0x40, "workgroup too large"),
+        (0x80, "out of VGPRs"),
+        (0x200, "scratch reclaim requested"),
+        (0x2000_0000, "memory aperture violation"),
+        (0x4000_0000, "illegal instruction"),
+        (0x8000_0000, "debug trap"),
+    ];
+    CAUSES.iter().find(|(mask, _)| code & mask != 0).map_or("unknown halt code", |(_, cause)| cause)
+}
+
+/// What the lowest `KFD_EC_MASK(ec) = 1 << (ec - 1)` bit of an `ErrorReason`
+/// word means (`enum kfd_dbg_trap_exception_code`).
+pub(crate) fn exception_cause(bits: u64) -> &'static str {
+    match bits.trailing_zeros() + 1 {
+        1 => "wave abort",
+        2 => "wave trap",
+        3 => "wave math error",
+        4 => "illegal instruction",
+        5 => "memory violation",
+        6 => "aperture violation",
+        16 => "invalid dispatch dimensions",
+        17 => "invalid group segment size",
+        18 => "invalid code object",
+        19 => "reserved packet",
+        20 => "unsupported packet",
+        21 => "invalid workgroup size",
+        22 => "invalid register count",
+        23 => "unsupported vendor packet",
+        30 => "preemption error",
+        33 => "device memory violation",
+        34 => "RAS error",
+        35 => "fatal halt",
+        _ => "unknown exception",
     }
 }
 
@@ -2341,9 +2549,7 @@ impl AmdCopyQueue {
         let mut g = self.inner.lock();
         wait_sdma_headroom(&g, dwords.len() * 4).inspect_err(|error| self.core.poison(&error.to_string()))?;
         push_sdma(&mut g, &dwords);
-        unsafe { std::ptr::write_volatile(g.write_ptr_host.as_ptr(), g.write_idx) };
-        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-        unsafe { std::ptr::write_volatile(g.doorbell.as_ptr(), g.write_idx) };
+        g.publish_sdma();
         Ok(())
     }
 
@@ -2476,9 +2682,7 @@ impl AmdCopyQueue {
             // queue. SDMA doorbell + wptr are byte counters (= write_idx). Both
             // are written after the last abortable step, so an abandoned
             // submission never leaves an advertised wptr behind.
-            unsafe { std::ptr::write_volatile(ring.write_ptr_host.as_ptr(), ring.write_idx) };
-            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-            unsafe { std::ptr::write_volatile(ring.doorbell.as_ptr(), ring.write_idx) };
+            ring.publish_sdma();
             reservation.mark_published();
             ring.commit();
             self.core.publication_checkpoint(crate::amd::iface::PublicationStage::AfterDoorbell)?;
@@ -2488,7 +2692,7 @@ impl AmdCopyQueue {
         // Wait for this submission's exact fence outside the queue lock. At the
         // rollover watermark, drain any later reservations before resetting the
         // shared 32-bit memory timeline. Coherence for copied data is handled by
-        // the consuming compute dispatch's full acquire_mem prologue.
+        // the full acquire_mem the publication obliges every lane's next dispatch to.
         finalizer.wait(COPY_TIMEOUT_MS).inspect_err(|error| self.core.poison(&error.to_string()))?;
         if self.timeline.current() > crate::amd::signal::TIMELINE_WRAP_WATERMARK {
             // Serialize the snapshot, wait, and reset against all SDMA timeline
@@ -2574,8 +2778,8 @@ fn create_queue(
     needs_cwsr: bool,
 ) -> Result<QueueInner> {
     let dev = allocator.dev.core();
-    // Ring + GART are both VRAM with COHERENT | UNCACHED | PUBLIC flags
-    // (uncached + cpu-accessible). Using plain VRAM (no UNCACHED) makes
+    // Ring + GART are both GTT system memory with COHERENT | UNCACHED | PUBLIC
+    // flags (`AllocKind::UncachedGtt`). Using plain VRAM (no UNCACHED) makes
     // KFD reject the create_queue ioctl with EINVAL.
     let ring_buf =
         AmdBufferGuard::new(allocator.alloc_uncached_tagged(ring_size, crate::amd::va_registry::AllocTag::QueueRing)?);
@@ -2608,26 +2812,37 @@ fn create_queue(
         _ => return Err(Error::NotHostVisible { what: "GART page" }),
     };
 
-    let mut qinactive_buf: Option<AmdBufferGuard> = None;
-    let mut qinactive_host: Option<NonNull<u8>> = None;
-    if aql {
-        // A host-visible amd_signal_t the CP trap handler writes its exception
-        // code into (e.g. 0x401 insufficient-scratch) when it halts the queue.
-        // Without a real handle the CP can't report WHY it halted (silent wedge).
-        let qi_buf =
-            AmdBufferGuard::new(allocator.alloc_uncached_tagged(64, crate::amd::va_registry::AllocTag::QueueInactive)?);
-        let (qi_gpu, qi_host) = match qi_buf.buffer() {
-            crate::allocator::RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
-            _ => return Err(Error::NotHostVisible { what: "queue_inactive_signal" }),
-        };
-        // SAFETY: fresh 64-byte buffer. amd_signal_t: kind=USER@0, value=0@8.
+    // A compute queue's error words (see `QueueErrorWords`), both raising the
+    // queue event as ROCr wires them, so a sleeping waiter wakes on either.
+    let errors_buf = needs_cwsr
+        .then(|| {
+            allocator
+                .alloc_uncached_tagged(QUEUE_ERROR_BYTES, crate::amd::va_registry::AllocTag::QueueInactive)
+                .map(AmdBufferGuard::new)
+        })
+        .transpose()?;
+    let errors_mem = match errors_buf.as_ref().map(AmdBufferGuard::buffer) {
+        Some(crate::allocator::RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. }) => Some((*gpu_addr, *h)),
+        Some(_) => return Err(Error::NotHostVisible { what: "queue error words" }),
+        None => None,
+    };
+    let mailbox = dev.queue_event_mailbox();
+    if let Some((_, host)) = errors_mem {
+        // SAFETY: fresh QUEUE_ERROR_BYTES buffer. amd_signal_t: kind=USER@0,
+        // value=0@8; ErrorReason=0@QUEUE_ERROR_REASON_OFFSET.
         unsafe {
-            std::ptr::write_bytes(qi_host.as_ptr(), 0, 64);
+            std::ptr::write_bytes(host.as_ptr(), 0, QUEUE_ERROR_BYTES);
             std::ptr::write_volatile(
-                qi_host.as_ptr() as *mut i64,
+                host.as_ptr() as *mut i64,
                 crate::amd::sys::hsa::amd_signal_kind_t_AMD_SIGNAL_KIND_USER as i64,
             );
+            if let Some(mailbox) = mailbox {
+                crate::amd::signal::raise_event_on_write(host.as_ptr(), mailbox);
+            }
         }
+    }
+    if aql {
+        let (qi_gpu, _) = errors_mem.expect("an AQL queue is a compute queue");
         // Initialize the GART descriptor.
         // max_cu_id is total CUs across all XCCs - 1 (cu_cnt*xccs-1).
         let cu_cnt = dev.node.simd_count.max(1) / dev.node.simd_per_cu.max(1);
@@ -2652,8 +2867,6 @@ fn create_queue(
                 std::mem::size_of::<crate::amd::sys::hsa::amd_queue_t>(),
             );
         }
-        qinactive_buf = Some(qi_buf);
-        qinactive_host = Some(qi_host);
     }
 
     // Both AQL and plain COMPUTE queues use the same rptr/wptr offsets — the
@@ -2690,10 +2903,12 @@ fn create_queue(
         // header (`HsaUserContextSaveAreaHeader`) the CP reads on every context
         // save/restore (MES preempts a busy queue as routine runlist scheduling).
         // Without the header, a restore reads garbage `DebugOffset`/`DebugSize`
-        // and the queue silently strands (rptr frozen, no fault) — the exact
-        // multi-XCC wedge. Mirrors libhsakmt `fill_cwsr_header`.
-        let ctx_spec = BufferSpec { cpu_access: true, nolru: true, ..Default::default() };
-        let ctx_buf = AmdBufferGuard::new(allocator.alloc(cwsr_buffer_size, &ctx_spec, /*zero=*/ true)?);
+        // and the queue silently strands (rptr frozen, no fault). Mirrors
+        // libhsakmt `fill_cwsr_header`.
+        // KFD takes this buffer at its exact size.
+        let ctx_buf = AmdBufferGuard::new(
+            allocator.alloc_host_visible_tagged(cwsr_buffer_size, crate::amd::va_registry::AllocTag::Vram)?,
+        );
         let eop_gpu = match eop_buf.buffer() {
             crate::allocator::RawBuffer::AmdDevice { gpu_addr, .. } => *gpu_addr,
             _ => 0,
@@ -2703,7 +2918,13 @@ fn create_queue(
             _ => return Err(Error::NotHostVisible { what: "ctx-save buffer" }),
         };
         // Per-XCC `HsaUserContextSaveAreaHeader` (40 bytes): DebugOffset@16,
-        // DebugSize@20 (ErrorReason@24 / ErrorEventId@32 stay 0 — no event).
+        // DebugSize@20, ErrorReason@24, ErrorEventId@32. KFD ORs a queue
+        // exception's `KFD_EC_MASK` bits into the word ErrorReason points at
+        // and sets the ErrorEventId event (`send_exception_work_handler`); the
+        // pointer is a host address, which our mappings share with the GPU VA.
+        let (errors_gpu, _) = errors_mem.expect("a CWSR queue is a compute queue");
+        let error_reason = errors_gpu + QUEUE_ERROR_REASON_OFFSET as u64;
+        let error_event = mailbox.map_or(0, |mailbox| mailbox.event_id);
         // SAFETY: ctx_host is the zeroed cwsr_buffer_size region; each header sits
         // at `i * ctx_save_restore_size`, well within the buffer.
         unsafe {
@@ -2711,8 +2932,12 @@ fn create_queue(
                 let hdr = ctx_host.as_ptr().add(i * ctx_save_restore_size);
                 std::ptr::write_volatile(hdr.add(16) as *mut u32, ((xccs - i) * ctx_save_restore_size) as u32);
                 std::ptr::write_volatile(hdr.add(20) as *mut u32, (debug_memory_size * xccs) as u32);
+                std::ptr::write_volatile(hdr.add(24) as *mut u64, error_reason);
+                std::ptr::write_volatile(hdr.add(32) as *mut u32, error_event);
             }
         }
+        // The CP reads the headers on its first context save or restore.
+        dev.hdp().flush();
         (Some(eop_buf), Some(ctx_buf), eop_gpu, ctx_gpu, 0x1000u64, ctx_save_restore_size as u32, ctl_stack_size as u32)
     } else {
         (None, None, 0u64, 0u64, 0u64, 0u32, 0u32)
@@ -2766,12 +2991,13 @@ fn create_queue(
         write_idx: 0,
         queue_id,
         quarantined: false,
-        qinactive_host,
+        errors: errors_mem.map(|(_, base)| QueueErrorWords { queue_id, base }),
+        hdp: Arc::clone(dev.hdp()),
         _ring_buf: ring_buf.into_inner(),
         _gart_buf: gart_buf.into_inner(),
         _eop_buf: eop_buf.map(AmdBufferGuard::into_inner),
         _ctx_buf: ctx_buf.map(AmdBufferGuard::into_inner),
-        _qinactive_buf: qinactive_buf.map(AmdBufferGuard::into_inner),
+        _errors_buf: errors_buf.map(AmdBufferGuard::into_inner),
     })
 }
 

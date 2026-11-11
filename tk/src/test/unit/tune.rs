@@ -7,6 +7,7 @@
 
 use super::Scratch;
 use crate::ops::config::{Tiled, gemm_cfg};
+use crate::sweep::assumed;
 use std::cell::Cell;
 use std::time::Duration;
 
@@ -17,7 +18,7 @@ use test_case::test_case;
 use crate::atoms::{Device, sm86};
 use crate::build::BF16;
 use crate::kernels::Batch;
-use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
+use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, TailSplit, TileOrder, gemm};
 use crate::tune::{self, Bench, Entry, FORMAT, Kind, Pass, ScratchPool, TuneKey, TuneStore, fingerprint};
 
 /// A host key: no device, so no compiler digest.
@@ -48,7 +49,7 @@ fn every_familys_config_code_round_trips() {
     use crate::atoms::Core;
     use crate::kernels::attention::FaCfg;
     use crate::kernels::conv::ConvCfg;
-    use crate::kernels::nearest::{LaneQueue, Metric, NearestCfg, SelectCfg};
+    use crate::kernels::nearest::{LaneQueue, Metric, NearestCfg, Pow2, SelectCfg, Way};
     use crate::kernels::rows::NormCfg;
     use crate::ops::config::{Tiled, gemm_lattice};
     fn round<C: Tiled + std::fmt::Debug>(cs: &[C]) {
@@ -61,7 +62,15 @@ fn every_familys_config_code_round_trips() {
     let planner = super::planner(target.clone());
     let mut gemm = gemm_lattice(&target);
     gemm.push(GemmCfg { core: Core::Group, ..gemm_cfg([128, 256, 32], 4, [4, 4], false) });
+    // Every raster's group height, the default's and past it.
+    let rasters = [1, 3, 8, 64, usize::MAX].map(|rows| TileOrder::grouped(rows).expect("a group of rows"));
+    gemm.extend(rasters.map(|order| GemmCfg { order, ..gemm[0] }));
+    // Tail splits, the least and past the planner's most.
+    gemm.extend([2, 3, 16, 64].map(|split| GemmCfg { tail: TailSplit::new(split), ..gemm[0] }));
     round(&gemm);
+    let cfg = gemm_cfg([128, 256, 64], 3, [2, 4], true);
+    assert_eq!(cfg.code(), "w,128,256,64,2,4,r3u,g8,~");
+    assert_eq!(GemmCfg { tail: TailSplit::new(4), ..cfg }.code(), "w,128,256,64,2,4,r3u,g8,t4");
     let mut conv: Vec<ConvCfg> = gemm.iter().map(|g| ConvCfg { gemm: *g, split: 4 }).collect();
     conv.push(ConvCfg { gemm: gemm[0], split: 1 });
     round(&conv);
@@ -90,14 +99,32 @@ fn every_familys_config_code_round_trips() {
         k: 64,
     };
     let mut nearest = planner.nearest_ranked(problem).to_vec();
-    nearest.push(NearestCfg { lanes: Some(LaneQueue { width: 4, depth: 32, passes: true }), ..nearest[0] });
     nearest.push(NearestCfg {
-        select: Some(SelectCfg { warps: 2, queue: 16, filter: true }),
+        lanes: Some(LaneQueue { width: Pow2::of(4), depth: Pow2::of(32), passes: true }),
+        ..nearest[0]
+    });
+    nearest.push(NearestCfg {
+        list: Way::Matrix(SelectCfg { warps: 2, queue: 16, filter: true }),
         lanes: None,
         ..nearest[0]
     });
+    nearest.push(NearestCfg { list: Way::Queued(Pow2::of(16)), ..nearest[0] });
     round(&nearest);
+    let cfg = NearestCfg::new(64, 64, 2);
+    assert_eq!(cfg.code(), "64,64,r2,16,~,1,~,~");
+    assert_eq!(NearestCfg { list: Way::Queued(Pow2::of(32)), ..cfg }.code(), "64,64,r2,16,~,1,q32,~");
+    let matrix = Way::Matrix(SelectCfg { warps: 4, queue: 2, filter: true });
+    assert_eq!(NearestCfg { list: matrix, ..cfg }.code(), "64,64,r2,16,~,1,m,4,2,1,~");
+    // A queue or a lane queue off a power of two, a list of no form.
+    for bad in ["64,64,r2,16,~,1,q24,~", "64,64,r2,16,~,1,~,3,2,0", "64,64,r2,16,~,1,~,4,6,0", "64,64,r2,16,~,1,x,~"] {
+        assert!(NearestCfg::of_code(bad).is_none(), "{bad}");
+    }
     // A code that is not the family's form holds no config.
+    // A raster of no rows, one without its mark, a code without its raster.
+    for bad in ["w,128,128,32,2,2,r2,g0", "w,128,128,32,2,2,r2,8", "w,128,128,32,2,2,r2", "w,128,128,32,2,2,r2,g"] {
+        assert!(GemmCfg::of_code(bad).is_none(), "{bad}");
+        assert!(ConvCfg::of_code(&format!("{bad},1")).is_none(), "{bad},1");
+    }
     for bad in ["", "x", "w,1", "w,a,b,c,d,e,f,g,h", "64,64,2,0", "w,1,2,3,4,5,6,7,8,9,10"] {
         assert!(GemmCfg::of_code(bad).is_none());
         assert!(FaCfg::of_code(bad).is_none());
@@ -278,7 +305,8 @@ fn concurrent_writers_of_one_file_lose_no_line() {
 
 /// A plain bf16 GEMM's programs under `cfg` on sm_86.
 fn gemm_programs(cfg: crate::kernels::gemm::GemmCfg) -> tune::Candidate {
-    let spec = GemmSpec { m: 128, n: 128, k: 128, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg };
+    let spec =
+        assumed(GemmSpec { m: 128, n: 128, k: 128, batch: Batch::Static(1), epilogue: Epilogue::default() }, cfg);
     vec![(gemm::<BF16>(&spec), cfg.lowering(&Device { target: sm86(), costs: super::costs() }))]
 }
 
@@ -403,13 +431,11 @@ fn keys_are_stable(shape: &[usize], candidates: &[usize], compiler: u64, same: b
 /// parameter; a program's two parameters of one size never alias.
 #[test]
 fn candidates_share_scratch_buffers_without_aliasing_a_program() {
-    let spec = |tile| GemmSpec {
-        m: 256,
-        n: 256,
-        k: 256,
-        batch: Batch::Static(1),
-        epilogue: Epilogue::default(),
-        cfg: gemm_cfg(tile, 2, [2, 2], true),
+    let spec = |tile| {
+        assumed(
+            GemmSpec { m: 256, n: 256, k: 256, batch: Batch::Static(1), epilogue: Epilogue::default() },
+            gemm_cfg(tile, 2, [2, 2], true),
+        )
     };
     let (first, second) = (gemm::<BF16>(&spec([64, 64, 32])), gemm::<BF16>(&spec([128, 64, 32])));
     let pool = ScratchPool::default();
@@ -561,10 +587,10 @@ fn a_gemm_tunes_on_the_device() {
     let spec = svod_dtype::default_device::default_device();
     let device = &planner.device;
     let (m, n, k) = (704, 512, 512);
-    let cfgs = super::first_eight(&planner.gemm_ranked(1, m, n, k, false));
+    let cfgs = super::first_eight(&planner.gemm_ranked(1, m, n, k, &Epilogue::DEFAULT));
     let batch = Batch::var("b", 1, 1);
     let build = |cfg: GemmCfg| {
-        let spec = GemmSpec { m, n, k, batch: batch.clone(), epilogue: Epilogue::default(), cfg };
+        let spec = assumed(GemmSpec { m, n, k, batch: batch.clone(), epilogue: Epilogue::default() }, cfg);
         vec![(gemm::<BF16>(&spec), cfg.lowering(device))]
     };
     let key = TuneKey::new("gemm", &device.target, tune::compiler(&spec), ScalarDType::BFloat16, &[1, m, n, k], &cfgs);
@@ -739,8 +765,9 @@ fn without_a_hopeless_factor_every_candidate_runs_whole() {
 fn a_scratch_plan_publishes_nothing() {
     let Some(planner) = super::device_planner() else { return };
     let device = &planner.device;
-    let cfg = super::first_eight(&planner.gemm_ranked(1, 704, 512, 512, false))[0];
-    let spec = GemmSpec { m: 704, n: 512, k: 512, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg };
+    let cfg = super::first_eight(&planner.gemm_ranked(1, 704, 512, 512, &Epilogue::DEFAULT))[0];
+    let spec =
+        assumed(GemmSpec { m: 704, n: 512, k: 512, batch: Batch::Static(1), epilogue: Epilogue::default() }, cfg);
     let pool = ScratchPool::default();
     let scratch = || tune::scratch_plan(gemm::<BF16>(&spec), &cfg.lowering(device), &pool).expect("a plan");
     let kernels = |plan: &svod_runtime::ExecutionPlan| plan.kernels().map(std::ptr::from_ref).collect::<Vec<_>>();
@@ -812,7 +839,8 @@ fn a_float_scratch_buffer_is_random_and_an_integer_one_is_zero() {
 /// A 4096³ GEMM candidate on the warp-level core for `target` under `costs`.
 fn gemm_candidate(target: crate::atoms::Target, costs: crate::atoms::Costs) -> tune::Candidate {
     let cfg = crate::ops::config::gemm_cfg([128, 128, 32], 2, [2, 4], true);
-    let spec = GemmSpec { m: 4096, n: 4096, k: 4096, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg };
+    let spec =
+        assumed(GemmSpec { m: 4096, n: 4096, k: 4096, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT }, cfg);
     vec![(gemm::<BF16>(&spec), cfg.lowering(&Device { target, costs }))]
 }
 
@@ -1031,8 +1059,8 @@ const VENDORED_RATES: [(&str, u64); 9] = [
 /// landed off the compute, timed 1.3 ms — three candidates under their
 /// floor beside the honest sample of the same lines.
 const VENDORED_CHOICES: [&str; 2] = [
-    "choice|nearest|gfx1151-40sm|Float16|256x1048576x768x64|0000000000000001|0000000000000001|0000000000000001 0:128,128,2,0,16,32,1,~,4,2,1,~,~,~ 1297360 1:128,128,2,1,16,32,1,~,4,2,1,~,~,~ 1305240 2:128,128,1,0,16,32,1,~,4,2,1,~,~,~ 296351560",
-    "choice|nearest|gfx1151-40sm|Float16|256x1048576x768x64|0000000000000002|0000000000000001|0000000000000002 1:128,128,2,0,16,32,1,~,4,2,1,~,~,~ 1325040 32:64,32,2,0,16,32,128,~,~,~,~,4,4,1 25261320",
+    "choice|nearest|gfx1151-40sm|Float16|256x1048576x768x64|0000000000000001|0000000000000001|0000000000000001 0:128,128,r2,16,32,1,m,4,2,1,~ 1297360 1:128,128,r2u,16,32,1,m,4,2,1,~ 1305240 2:128,128,r1,16,32,1,m,4,2,1,~ 296351560",
+    "choice|nearest|gfx1151-40sm|Float16|256x1048576x768x64|0000000000000002|0000000000000001|0000000000000002 1:128,128,r2,16,32,1,m,4,2,1,~ 1325040 32:64,32,r2,16,32,128,~,4,4,1 25261320",
 ];
 
 /// Every timed candidate of the stores' choice lines clears its physical
@@ -1101,7 +1129,7 @@ fn timed_candidates_clear_their_physical_floor() {
             }
             "gemm" | "linear" => {
                 let &[cap, m, n, k] = shape else { return None };
-                let p = GemmProblem { batches: cap.max(1), m, n, k, halves: 1, rope: None };
+                let p = GemmProblem::new(cap.max(1), m, n, k, &Epilogue::DEFAULT);
                 planner.floor_of(&p, &Tiled::of_code(code)?)
             }
             "attention" => {
@@ -1140,12 +1168,9 @@ fn timed_candidates_clear_their_physical_floor() {
                     _ => return None,
                 };
                 let [ho, wo] = g.out_hw();
-                let p = ConvProblem {
-                    gemm: GemmProblem { batches: 1, m: images * ho * wo, n: g.cout, k: g.k(), halves: 1, rope: None },
-                    geom: g,
-                };
+                let p = ConvProblem::new(1, images * ho * wo, &g, &Epilogue::DEFAULT);
                 let c: crate::kernels::conv::ConvCfg = Tiled::of_code(code)?;
-                p.claim(planner, &c.gemm).ok().map(|claim| planner.floor(&claim))
+                planner.claim_of(&p, &c.gemm).ok().map(|claim| planner.floor(&claim))
             }
             _ => None,
         }
@@ -1190,7 +1215,7 @@ fn timed_candidates_clear_their_physical_floor() {
         worst.sort_by(|a, b| a.0.total_cmp(&b.0));
         worst
     }
-    let lie = |what: &str| what.contains("gfx1151") && what.contains("nearest [256, 1048576, 768, 64] 128,128,2,");
+    let lie = |what: &str| what.contains("gfx1151") && what.contains("nearest [256, 1048576, 768, 64] 128,128,r2");
 
     let dir = Scratch::new("floor-store");
     let file = TuneStore::at(Some(dir.to_path_buf())).file("gfx1151-40sm").expect("a rooted store");
@@ -1266,4 +1291,41 @@ fn an_underfloor_measurement_is_never_the_pick() {
         Some(&every),
     );
     assert_eq!(kept.map(|timed| timed[0].0), Some(0), "a floor refusing everything is ignored");
+}
+
+/// A draw past its most repeats its run to the exact length; within it, it is
+/// one run.
+#[test_case::test_case(100, 1000; "within")]
+#[test_case::test_case(250, 100; "repeated, cut short")]
+fn a_scratch_draw_repeats_its_run(elems: usize, most: usize) {
+    let got = crate::tune::drawn(elems, most).contiguous().to_vec::<f32>().unwrap();
+    assert_eq!(got.len(), elems);
+    assert!(got.iter().all(|v| (0.0..1.0).contains(v)));
+    let run = elems.min(most);
+    assert!((run..elems).all(|i| got[i] == got[i - run]));
+    assert!(got[..run].windows(2).any(|w| w[0] != w[1]));
+}
+
+/// A candidate's time is its programs' summed and a [`LAUNCH`] for every
+/// launch past the first: a tail split whose three kernels run 1 µs under
+/// the unsplit kernel alone loses to it once its two extra launches count,
+/// and a program that did not run fails the candidate.
+#[test]
+fn a_split_pays_its_launches() {
+    use crate::ops::config::LAUNCH;
+    let us = |t: u64| Some(Duration::from_micros(t));
+    let unsplit = [us(100)];
+    let split = [us(60), us(30), us(9)];
+    let summed = |programs: &[Option<Duration>]| programs.iter().flatten().sum::<Duration>();
+    assert!(summed(&split) < summed(&unsplit), "the split wins on its kernels alone");
+    let gaps = Duration::from_nanos(2 * LAUNCH as u64);
+    assert_eq!(tune::launched(unsplit), us(100));
+    assert_eq!(tune::launched(split), Some(summed(&split) + gaps));
+    let ns: Vec<Option<u64>> = [&unsplit[..], &split[..]]
+        .iter()
+        .map(|p| tune::launched(p.iter().copied()).map(|t| t.as_nanos() as u64))
+        .collect();
+    let order = tune::ordered(ns).expect("both ran");
+    assert_eq!(order.iter().map(|&(i, _)| i).collect::<Vec<_>>(), [0, 1], "the split leads: {order:?}");
+    assert_eq!(tune::launched([us(60), None, us(9)]), None);
 }

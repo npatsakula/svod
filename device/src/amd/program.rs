@@ -323,6 +323,7 @@ impl AmdProgram {
         };
         // SAFETY: code_host points to size bytes we just mmapped exclusively.
         unsafe { std::ptr::copy_nonoverlapping(parsed.image.as_ptr(), code_host.as_ptr(), parsed.image.len()) };
+        device.core().hdp().flush();
 
         let aql_prog_addr = code_gpu + parsed.kd_offset;
 
@@ -577,9 +578,8 @@ impl std::fmt::Debug for AmdProgram {
 }
 
 impl AmdProgram {
-    /// Lane-scoped dispatch entry point. Reads the queue, kernarg arena, scratch,
-    /// and PM4 counter from the exclusively leased `PoolQueue`. The lease spans
-    /// kernarg bump, write, and publication, so kernarg order matches ring order.
+    /// Lane-scoped dispatch entry point. Reads the queue, kernarg ring, scratch,
+    /// and PM4 counter from the exclusively leased `PoolQueue`.
     /// Callers must size lane scratch before calling.
     ///
     /// # Safety
@@ -642,22 +642,15 @@ impl AmdProgram {
             });
         }
 
-        // The caller's non-clone QueueLease is the sole publication authority,
-        // so kernarg reservation order is queue submission order.
-        let arena = pool.arena();
-        let off = arena.bump(self.kernarg_size(), crate::hcq::KERNARG_ALIGN)?;
-        // SAFETY: arena returned a valid slot; the exclusive lane serializes
-        // writers, so no concurrent writer holds the same offset.
-        let host_base = unsafe { arena.host_at(off) };
+        // Packed here, placed in the kernarg ring by the queue: the ring slot
+        // is reserved and published within the one submission that reads it.
         let addresses: smallvec::SmallVec<[u64; 8]> = buffers.iter().map(|p| *p as u64).collect();
-        // SAFETY: arena returned a writable record of kernarg_size bytes.
-        let dst = unsafe { std::slice::from_raw_parts_mut(host_base, self.kernarg_size()) };
-        layout.pack(dst, &addresses, vals)?;
-        let kernarg_gpu = arena.gpu_at(off);
+        let mut kernargs = smallvec::SmallVec::<[u8; 256]>::from_elem(0, self.kernarg_size());
+        layout.pack(&mut kernargs, &addresses, vals)?;
 
         // 2. Submit sequence:
-        //   PM4: wait(counter, prev) → memory_barrier → exec → signal(counter, next)
-        //   AQL: vendor-IB wait/barrier → native dispatch → vendor-IB timeline store
+        //   PM4: wait(counter, prev) → [memory_barrier] → exec → signal(counter, next)
+        //   AQL: vendor-IB wait/[barrier] → native dispatch → vendor-IB timeline store
         let g = global_size.unwrap_or([1, 1, 1]);
         let l = local_size.unwrap_or([1, 1, 1]);
 
@@ -665,7 +658,7 @@ impl AmdProgram {
             let bufs_str: Vec<String> =
                 buffers.iter().enumerate().map(|(i, b)| format!("buf{}={:#x}", i, *b as u64)).collect();
             eprintln!(
-                "[dispatch tv={}] kernel={} grid=[{}, {}, {}] local=[{}, {}, {}] is_pm4={} kernarg_gpu={:#x} scratch={:#x} {}",
+                "[dispatch tv={}] kernel={} grid=[{}, {}, {}] local=[{}, {}, {}] is_pm4={} scratch={:#x} {}",
                 pool.pm4_value(),
                 self.name,
                 g[0],
@@ -675,7 +668,6 @@ impl AmdProgram {
                 l[1],
                 l[2],
                 pool.queue().is_pm4(),
-                kernarg_gpu,
                 pool.scratch_gpu_va(),
                 bufs_str.join(" "),
             );
@@ -706,7 +698,8 @@ impl AmdProgram {
             private_segment_size: self.kd.private_segment_fixed_size,
             group_segment_size: self.kd.group_segment_fixed_size,
             kernel_object: self.aql_prog_addr,
-            kernarg_address: kernarg_gpu,
+            // Placed by the queue once it reserves the kernarg ring slot.
+            kernarg_address: 0,
             // Native completion ownership is assigned by the queue finalizer.
             completion_signal: 0,
             barrier: true,
@@ -719,30 +712,29 @@ impl AmdProgram {
                 target_major: self.target_major,
             }),
         };
+        // The full barrier only after stores behind this lane's caches: kernel
+        // to kernel the dispatch's own acquire and release suffice. A timed
+        // dispatch always takes it, so a tuner measures every candidate cold.
+        let invalidate = pool.cache_invalidate(profile);
         let mut submission = crate::hcq::Submission::new(crate::hcq::QueueKind::Compute(0));
-        submission.push(crate::hcq::Command::MemoryBarrier).push(crate::hcq::Command::Compute(dispatch));
+        if invalidate.is_some() {
+            submission.push(crate::hcq::Command::MemoryBarrier);
+        }
+        submission.push(crate::hcq::Command::Compute(dispatch));
         if profile {
             submission.request_profile();
         }
-        let result = queue.submit_hcq_dispatch(pool, &submission, pmc_start, pmc_read)?;
+        let result = queue.submit_hcq_dispatch(pool, &submission, &kernargs, pmc_start, pmc_read)?;
+        if let Some(writes) = invalidate {
+            pool.caches_invalidated(writes);
+        }
         result.finalizer.retain_code(self.code_object());
         pool.register_inflight(Arc::clone(&result.finalizer));
         owner.set_newest(Arc::clone(&result.finalizer));
 
         if wait {
-            if is_pm4 {
-                owner.synchronize()?;
-            } else if let Err(e) = owner.synchronize() {
-                if let Some(code) = queue.inactive_exception() {
-                    return Err(Error::Runtime {
-                        message: format!(
-                            "AQL dispatch '{}' did not complete: queue halted with exception {code:#x}",
-                            self.name
-                        ),
-                    });
-                }
-                return Err(e);
-            }
+            // A halted queue surfaces here as a typed `AmdQueueError`.
+            owner.synchronize()?;
         }
 
         if is_pm4 {
@@ -830,12 +822,12 @@ impl Program for AmdProgram {
     /// Without this a tuner times AMD on the host clock, which charges the
     /// kernel for the whole submit path: the PM4 stream rebuilt per call, the
     /// ring memcpy and doorbell, and — unboundedly — a scratch regrow in
-    /// `ensure_has_local_memory` or a kernarg-arena wrap that drains the
-    /// device. The first of those is driven by the candidate's own
+    /// `ensure_has_local_memory` or a kernarg reservation waiting for the
+    /// oldest live slot to retire. The first of those is driven by the candidate's own
     /// `private_segment_fixed_size`, so it lands on spilling candidates
     /// specifically and no amount of repetition averages it out.
     ///
-    /// The run is cold: like every dispatch here it goes behind the coherence
+    /// The run is cold: a timed dispatch always goes behind the coherence
     /// barrier, which writes back and invalidates the whole cache hierarchy, L2
     /// included. The probes touch no cache, so the span is the kernel's alone.
     ///

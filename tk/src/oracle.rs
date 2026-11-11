@@ -1,6 +1,6 @@
 //! The compile-probe oracle: instruction availability asked of the toolchain
 //! that compiles the kernels, per target, cached in the tune store like any
-//! probe. The [`Target`](crate::atoms::Target) booleans (`group_mma`,
+//! probe. The [`crate::atoms::Target`] booleans (`group_mma`,
 //! `ldmatrix`, `tr_load`, `dot2_bf16`, the int8 atoms) are the hand arch
 //! tables of [`crate::atoms`]; the oracle is what makes an unseen
 //! architecture self-describing — its verdict is the vendor assembler's own
@@ -43,6 +43,7 @@ fn op(name: &str) -> &'static str {
         "mma_i8" => "oracle:mma_i8",
         "cp_async" => "oracle:cp_async",
         "wmma16" => "oracle:wmma16",
+        "wide_mma" => "oracle:wide_mma",
         "tr_load" => "oracle:tr_load",
         "dot2_bf16" => "oracle:dot2_bf16",
         other => unreachable!("no oracle op for {other}"),
@@ -114,6 +115,11 @@ fn amd(target: &Target, a: AmdArch) -> Vec<Capability> {
     };
     vec![
         Capability { name: "wmma16", module: wmma16, table: target.geometry().is_some() },
+        Capability {
+            name: "wide_mma",
+            module: module("v_mfma_f32_32x32x8_f16 v[0:15], v[16:17], v[18:19], v[0:15]"),
+            table: !target.wide_mma.is_empty(),
+        },
         Capability { name: "mma_i8", module: mma_i8, table: target.geometry_of(ScalarDType::Int8).is_some() },
         Capability {
             name: "tr_load",
@@ -226,6 +232,7 @@ pub(crate) fn flipped(target: &Target, verdicts: &[(&'static str, Option<bool>)]
             "mma_i8" if !v => gated.mma.retain(|a| a.dtype_in != ScalarDType::Int8),
             "cp_async" => gated.fill = if v { Fill::CpAsync } else { Fill::Staged },
             "wmma16" if !v => gated.mma.retain(|a| a.dtype_in.bytes() != 2),
+            "wide_mma" if !v => gated.wide_mma = vec![],
             "tr_load" => gated.tr_load = v,
             "dot2_bf16" => gated.dot2_bf16 = v,
             _ => {}

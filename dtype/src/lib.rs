@@ -182,6 +182,9 @@ pub enum AddrSpace {
     Local,
     /// Register memory.
     Reg,
+    /// Global memory reached through a buffer descriptor whose cache is
+    /// swizzled on `stride` bytes.
+    Swizzled { stride: u16 },
 }
 
 /// Image type kind.
@@ -701,7 +704,7 @@ impl DType {
             Self::Vector { scalar, count } => format!("{}[{}]", scalar.c_style(), count),
             Self::Ptr { base, addrspace, .. } => {
                 let addr_str = match addrspace {
-                    AddrSpace::Global => "__global",
+                    AddrSpace::Global | AddrSpace::Swizzled { .. } => "__global",
                     AddrSpace::Local => "__local",
                     AddrSpace::Reg => "__register",
                 };

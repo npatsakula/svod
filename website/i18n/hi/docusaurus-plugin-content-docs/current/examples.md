@@ -54,17 +54,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   फ़्यूज़ करता है, कर्नेल कंपाइल करता है और उन्हें चलाता है। realize हुआ टेंसर shared borrow
   के पीछे ही रहता है।
 
-डेटा वापस पढ़ना:
+डेटा वापस पढ़ना (और उसी जगह लिखना):
 
 | मेथड | realize करता है? | लौटाता है |
 |---|---|---|
 | `as_vec::<T>()`, `as_ndarray::<T>()` | कभी नहीं — realize न होने पर `NoBuffer` त्रुटि | owned कॉपी |
 | `to_vec::<T>()`, `to_ndarray::<T>()` | ज़रूरत पड़ने पर | owned कॉपी |
 | `item::<T>()` | ज़रूरत पड़ने पर | एकमात्र एलिमेंट |
-| `array_view::<T>()`, `array_view_mut::<T>()` | कभी नहीं | उधार लिया `ndarray` view, zero-copy |
+| `array_view::<T>()` | कभी नहीं | उधार लिया `ndarray` view, zero-copy |
+| `with_host_write::<T, _>(f)` | कभी नहीं | `f` जो लौटाए; `f` एक exclusive `HostWrite` guard से लिखता है, view से नहीं |
 
 इसलिए सबसे छोटा रूप `(&a + &b)?.to_vec::<f32>()?` है। जहाँ छिपा हुआ realize एक बग होगा,
-वहाँ `as_*` परिवार का उपयोग करें। views को host-mappable बफ़र चाहिए
+वहाँ `as_*` परिवार का उपयोग करें। view और write guard को host-mappable बफ़र चाहिए
 (CPU, या host mapping वाला GPU बफ़र) और ऐसा टेंसर जो अपने बफ़र का मालिक हो,
 न कि किसी बफ़र का view।
 
@@ -323,7 +324,7 @@ fn stream(frames: &[Vec<f32>]) -> Result<(), Box<dyn std::error::Error>> {
 
     let plan = energy.prepare()?;                          // schedule + compile, once
     for frame in frames {
-        input.array_view_mut::<f32>()?.as_slice_mut().unwrap().copy_from_slice(frame);
+        input.with_host_write::<f32, _>(|w| w.copy_from(frame))?;
         plan.execute()?;                                   // replay: no tracing, no compilation
         println!("{}", energy.item::<f32>()?);
     }

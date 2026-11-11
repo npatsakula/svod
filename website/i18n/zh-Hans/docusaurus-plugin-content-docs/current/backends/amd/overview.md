@@ -102,11 +102,10 @@ flowchart TD
   above -->|"Arc(dyn AmdIface): alloc_raw, free_raw, setup_ring, teardown_ring, wait_events"| below
 ```
 
-所有*不是*内核调用的东西——16 MiB 的命令环、PM4/AQL 数据包构造、kernarg 递增分配
-arena、时间线计数器、程序加载器——都位于接缝之上。这个 trait 被刻意设计得很小：
+所有*不是*内核调用的东西——16 MiB 的命令环、PM4/AQL 数据包构造、kernarg 槽位环、时间线计数器、程序加载器——都位于接缝之上。这个 trait 被刻意设计得很小：
 **五个必需方法**（`alloc_raw`、`free_raw`、`setup_ring`、`teardown_ring`、
-`wait_events`），外加三个默认为空操作的钩子
-（`queue_event_mailbox`、`publication_checkpoint`、`update_queue_percentage`）。
+`wait_events`），外加四个默认为空操作的钩子
+（`queue_event_mailbox`、`publication_checkpoint`、`update_queue_percentage`、`flush_hdp`）。
 让它保持精简的关键洞见是：环、GART 页、EOP 缓冲区和 MQD *只不过是 GPU 内存*——
 它们通过 `alloc_raw` 在接缝之上分配，而驱动真正需要以不同方式完成的唯一一件事是
 **激活队列**（映射 doorbell，告诉调度器该环存在）：这就是 `setup_ring`。
@@ -121,7 +120,7 @@ arena、时间线计数器、程序加载器——都位于接缝之上。这个
 
 :::caution[AM 驱动只是脚手架]
 `device/src/amd/am/` 存放一个直接与 GPU 的 PCI BAR 对话的实验性用户态驱动。它没有
-实现 `AmdIface`，不可选择，也从未执行过任何内核：它的初始化流程曾经（2026 年 6 月）
+实现 `AmdIface`，不可选择，也从未执行过任何内核：它的初始化流程曾经
 通过独立的 `am_*` 示例，在一个 CDNA3 SR-IOV 虚拟功能上运行过一次，直到 GMC 上下文
 编程为止。关于究竟有哪些内容，见 [AM 驱动](./am-driver.md)。
 :::
@@ -132,8 +131,8 @@ arena、时间线计数器、程序加载器——都位于接缝之上。这个
 
 打开设备时，后端会在每个受支持的部件上安装一个 **SDMA 拷贝队列**
 （`AmdCopyQueue`），从而把 `has_sdma_queue` 置为 true；创建失败会记录一条警告并让
-缓冲区保持宿主可见，`AMD_DISABLE_SDMA`（任意值）会跳过这一尝试。该队列过去仅限
-CDNA，原因是对 RDNA 稳定性的担忧，后来追溯到 HDP 刷新握手，现已修复。有了它，
+缓冲区保持宿主可见，`AMD_DISABLE_SDMA`（任意值）会跳过这一尝试。
+有了它，
 中间结果可以位于**仅设备可见的 VRAM**（`cpu_access = false`），宿主↔设备拷贝走
 异步 DMA：`_copyin`/`_copyout` 经由 SDMA 队列中转，当任一侧为仅设备可见时
 `_transfer` 是一次设备→设备 DMA（两个宿主映射的缓冲区之间则是宿主 `memmove`）。

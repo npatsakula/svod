@@ -96,12 +96,8 @@ fn jit_rebinds_batch_without_reprepare() {
 /// Write inputs and execute with batch rebindable to `b`. Returns the live
 /// `(b, L, D)` output (only `b` rows read back).
 fn run(jit: &mut ModernBertJit, ids: &[i64], mask: &[i64], b: usize) -> Vec<f32> {
-    jit.input_ids_view_mut::<i64>().expect("input_ids view").as_slice_mut().expect("contiguous").copy_from_slice(ids);
-    jit.attention_mask_view_mut::<i64>()
-        .expect("attention_mask view")
-        .as_slice_mut()
-        .expect("contiguous")
-        .copy_from_slice(mask);
+    jit.input_ids_host_write::<i64>().expect("input_ids guard").copy_from(ids).expect("input_ids");
+    jit.attention_mask_host_write::<i64>().expect("attention_mask guard").copy_from(mask).expect("attention_mask");
     jit.execute_bound(b as i64).expect("execute");
     jit.hidden_to_vec::<f32>().expect("output read")
 }

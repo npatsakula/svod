@@ -56,6 +56,33 @@ impl Emit<'_> {
     }
 }
 
+/// `params` as this kernel's global accesses all reach them: through one
+/// cache-swizzled descriptor stride each, or flat as they are. A line must take
+/// one mapping across a dispatch ([`Target::cache_swizzle`]) and no lowering
+/// can tell which of its parameters alias, so every parameter takes the one
+/// stride. The stride only steers the cache, and only a power of two spreads
+/// rows: the largest within the row, whose loads gain most, of the widest input
+/// row or else output row that gains. A byte offset must fit 31 bits.
+pub(super) fn swizzled(params: Vec<Arc<UOp>>, prog: &Program<Laid>, target: &Target) -> Vec<Arc<UOp>> {
+    let fits = |p: &Param| p.elems.saturating_mul(p.dtype.bytes()) <= i32::MAX as usize;
+    let Some(swizzle) = target.cache_swizzle.filter(|_| prog.params.iter().all(fits)) else { return params };
+    let widest = |input: bool| {
+        let rows = prog.values.iter().filter_map(|v| match &v.place {
+            Place::Global { param, stride, .. } if (prog.params[param.index()].kind == ParamKind::In) == input => {
+                match prog.scalar(stride[0]) {
+                    Scalar::Const(row) => Some(*row as usize * v.dtype.bytes()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        });
+        rows.filter(|row| (swizzle.min_row..=swizzle.max_row).contains(row)).max()
+    };
+    let Some(row) = widest(true).or_else(|| widest(false)) else { return params };
+    let space = AddrSpace::Swizzled { stride: (1 << row.ilog2()).min(swizzle.max_stride) as u16 };
+    params.iter().map(|p| p.with_addrspace(space)).collect()
+}
+
 /// DPP's `row_xmask` control: OR the lane xor-mask within a row of 16.
 const DPP_ROW_XMASK: u32 = 0x160;
 

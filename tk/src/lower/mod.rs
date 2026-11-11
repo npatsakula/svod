@@ -8,14 +8,15 @@ use snafu::{ResultExt, Snafu, ensure};
 use svod_codegen::Renderer;
 use svod_codegen::llvm::LlvmTextRenderer;
 use svod_dtype::{DType, DeviceSpec, GpuArch};
-use svod_ir::{Op, UOp, ops};
+use svod_ir::UOp;
 
 use crate::atoms::{Core, Device, Target};
 use crate::ir::*;
-use crate::layouts::{self, Laid, TileLayout};
+use crate::layouts;
 use crate::schedule;
 
 pub mod emit;
+mod scopes;
 pub mod sync;
 
 #[derive(Debug, Snafu)]
@@ -38,6 +39,12 @@ pub enum Error {
     DivergentBarrier { what: &'static str },
     #[snafu(display("{name} emits {instructions} instructions, past the {most} a kernel may"))]
     TooLarge { name: String, instructions: usize, most: usize },
+    #[snafu(display("{name} counts to {extent}, past the i32 a range, grid or variable holds"))]
+    ExtentPastI32 { name: String, extent: i64 },
+    #[snafu(display("a view of {name} reaches elements {from}..{to}, which holds {held}"))]
+    SharedPast { name: String, from: i64, to: i64, held: usize },
+    #[snafu(display("tile {value} of {defined} is read in {used}, which its definition does not dominate"))]
+    Escaped { value: usize, defined: &'static str, used: &'static str },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -66,30 +73,75 @@ impl Lowering {
 
 pub struct Lowered {
     pub program: Arc<UOp>,
-    pub tile: Program,
-    pub layouts: Vec<Option<TileLayout>>,
+    /// The instruction list `program` holds (its LINEAR stage).
+    pub linear: Arc<UOp>,
+    /// The tile program as emitted: laid, with every register value's layout.
+    pub tile: Program<Laid>,
     /// The ranges the program's own schedule kept rolled (a loop whose body
     /// holds a product), which [`Lowered::text`] hints every target against
     /// unrolling further.
     pub rolled: Vec<u64>,
 }
 
-/// `params` are the flat buffer UOps in `prog.params` order (placeholders on
+/// `params` are the flat buffer UOps in `prog.params()` order (placeholders on
 /// the graph path, `UOp::param`s on the direct one).
 pub fn lower(mut prog: Program, lowering: &Lowering, params: Vec<Arc<UOp>>, device: DeviceSpec) -> Result<Lowered> {
+    // An input is never stored to ([`crate::build::Kernel::input`]), which the backend may know.
+    let params = params
+        .iter()
+        .zip(&prog.params)
+        .map(|(u, p)| if p.kind == ParamKind::In { u.with_readonly() } else { u.clone() })
+        .collect();
     let grid = prog.warp_grid.count();
     let lone = prog.walk().any(|(_, s)| matches!(s, Stmt::Warps { .. }));
     ensure!(prog.warps.is_multiple_of(grid) && (prog.warps == grid || lone), GridSnafu { warps: prog.warps, grid });
+    scopes::check(&prog)?;
+    within_shared(&prog)?;
     materialize_operands(&mut prog, lowering.core);
     sync::insert_barriers(&mut prog)?;
-    schedule::expand(&mut prog, lowering.device.target.fill, lowering.core);
-    let mut laid = layouts::infer(prog, &lowering.device, lowering.core).context(LayoutSnafu)?;
-    orient_shared(&mut laid, &lowering.device.target);
+    let prog = schedule::expand(prog, lowering.device.target.fill, lowering.core);
+    let laid = layouts::infer(prog, &lowering.device, lowering.core).context(LayoutSnafu)?;
     emit::ROLLED.with(|cell| cell.borrow_mut().clear());
-    let program = emit::emit(&laid, lowering, params, device)?;
+    let (program, linear) = emit::emit(&laid, lowering, params, device)?;
     let rolled = emit::ROLLED.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
-    let Laid { prog, layouts } = laid;
-    Ok(Lowered { program, tile: prog, layouts, rolled })
+    Ok(Lowered { program, linear, tile: laid, rolled })
+}
+
+/// Every shared view within its allocation wherever its offset is bounded,
+/// a loop's induction over its trips and a pipeline's slot over its ring:
+/// a ring that holds fewer slots than its pipeline runs is refused here, not
+/// read past on the device.
+fn within_shared(prog: &Program) -> Result<()> {
+    let mut ranges = std::collections::HashMap::new();
+    for (_, stmt) in prog.walk() {
+        let trips = |extent| prog.bounds(extent, &|iv| ranges.get(&iv).copied()).filter(|&(_, hi)| hi > 0);
+        match stmt {
+            Stmt::Loop(l) => {
+                let start = prog.bounds(l.start, &|iv| ranges.get(&iv).copied());
+                if let (Some((lo, hi)), Some((_, n))) = (start, trips(l.extent)) {
+                    ranges.insert(l.iv, (lo, hi + n - 1));
+                }
+            }
+            Stmt::Pipeline(p) => {
+                if let Some((_, n)) = trips(p.extent) {
+                    ranges.extend([(p.produce.step, (0, n - 1)), (p.consume.step, (0, n - 1))]);
+                }
+                let last = p.schedule.stages() as i64 - 1;
+                ranges.extend([(p.produce.slot, (0, last)), (p.consume.slot, (0, last))]);
+            }
+            _ => {}
+        }
+    }
+    for v in &prog.values {
+        let Place::Smem { alloc, offset } = v.place else { continue };
+        let a = &prog.smem[alloc.index()];
+        let held = a.elems * a.dtype.bytes() / v.dtype.bytes();
+        if let Some((from, hi)) = prog.bounds(offset, &|iv| ranges.get(&iv).copied()) {
+            let to = hi + v.shape.elems() as i64;
+            ensure!(from >= 0 && to <= held as i64, SharedPastSnafu { name: a.name.clone(), from, to, held });
+        }
+    }
+    Ok(())
 }
 
 /// `prog` lowered for its lowering's target alone, its parameters declared
@@ -115,10 +167,7 @@ impl Lowered {
     /// The instructions the program emitted (within
     /// [`Target::most_instructions`]).
     pub fn instructions(&self) -> usize {
-        let Op::Program(ops::Program { linear: Some(linear), .. }) = self.program.op() else {
-            unreachable!("a lowering emits a linear program")
-        };
-        linear.op().sources().len()
+        self.linear.op().sources().len()
     }
 
     /// The LLVM text of the program for `target`: what the backend's
@@ -130,71 +179,12 @@ impl Lowered {
             GpuArch::Metal(_) => return UnsupportedSnafu { what: "Metal's LLVM text" }.fail(),
         }
         .rolled(self.rolled.iter().copied());
-        let Op::Program(ops::Program { linear: Some(linear), .. }) = self.program.op() else {
-            unreachable!("a lowering emits a linear program")
-        };
+        if svod_schedule::spec::spec_enabled() {
+            let nodes = self.linear.op().sources();
+            svod_schedule::spec::type_verify_list(&nodes, &svod_schedule::spec::spec_program()).expect("a valid list");
+        }
         let name = &self.tile.name;
-        Ok(renderer.render(linear, Some(name)).context(RenderSnafu { name })?.code)
-    }
-}
-
-/// Store every shared allocation along the axis its readers' fragments run
-/// along: a tile whose consumers each hold runs of rows (a value tile under
-/// the product's B operand, say) is kept column-major, so the gathers are
-/// 16-byte loads instead of one load per element. Only allocations filled
-/// through registers can be stored transposed (the stores scatter; a chunk
-/// copy cannot), and readers that disagree keep the row-major default.
-fn orient_shared(laid: &mut Laid, target: &Target) {
-    let Laid { prog, layouts } = laid;
-    let lanes = target.wave;
-    let alloc = |prog: &Program, v: ValId| match prog.value(v).place {
-        Place::Smem { alloc, .. } => Some(alloc.index()),
-        _ => None,
-    };
-    let mut wants: Vec<Option<Axis>> = vec![None; prog.smem.len()];
-    let mut staged = vec![true; prog.smem.len()];
-    for (_, stmt) in prog.walk() {
-        let Stmt::Copy { dst, src, mode, .. } = stmt else { continue };
-        if let (Some(a), Tier::Global) = (alloc(prog, *dst), prog.value(*src).tier()) {
-            staged[a] &= *mode == CopyMode::Staged;
-        }
-        let (Some(a), Tier::Reg) = (alloc(prog, *src), prog.value(*dst).tier()) else { continue };
-        // A view under another type is scratch over a dead region: it takes
-        // the allocation's axis as it finds it.
-        if prog.value(*dst).dtype != prog.smem[a].dtype {
-            continue;
-        }
-        let l = layouts[dst.index()].as_ref().expect("a laid register tile");
-        let width = 16 / prog.value(*dst).dtype.bytes() as u32;
-        let widest = |along| l.runs(lanes, width, along).iter().map(|&(_, w)| w).max().unwrap_or(1);
-        let along = if widest(Axis::Row) > widest(Axis::Col) { Axis::Row } else { Axis::Col };
-        wants[a] = Some(match wants[a] {
-            Some(other) if other != along => Axis::Col,
-            _ => along,
-        });
-    }
-    let transposed: Vec<usize> = (0..prog.smem.len()).filter(|&i| staged[i] && wants[i] == Some(Axis::Row)).collect();
-    for &i in &transposed {
-        prog.smem[i].along = Axis::Row;
-    }
-    // The staged registers of a column-major tile hold column runs where the
-    // target loads them transposed, else are walked down its rows so a
-    // wave's lanes store consecutive elements; a warp's own copy spreads
-    // its chunks over that warp's lanes alone.
-    for (_, stmt) in prog.walk() {
-        let Stmt::Copy { dst, src, mode: CopyMode::Staged, scope } = stmt else { continue };
-        if !(alloc(prog, *dst).is_some_and(|a| transposed.contains(&a)) && prog.value(*src).tier() == Tier::Reg) {
-            continue;
-        }
-        let tmp = prog.value(*src);
-        let bytes = tmp.dtype.bytes();
-        let warps = if *scope == Scope::Warp { 1 } else { prog.warps };
-        let l = layouts::transposing(tmp.shape, warps, lanes)
-            .filter(|_| target.tr_load && bytes == 2)
-            .or_else(|| layouts::chunked(tmp.shape, bytes, warps, lanes, Axis::Row));
-        if let Some(l) = l {
-            layouts[src.index()] = Some(l);
-        }
+        Ok(renderer.render(&self.linear, Some(name)).context(RenderSnafu { name })?.code)
     }
 }
 

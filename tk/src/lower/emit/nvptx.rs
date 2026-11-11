@@ -63,7 +63,10 @@ impl Emit<'_> {
     /// landing as zeros.
     pub(super) fn load_l2_only(&mut self, s: &View, off: Arc<UOp>, gate: Option<Arc<UOp>>, w: usize) -> Vec<Arc<UOp>> {
         let safe = match &gate {
-            Some(g) => self.hoist(UOp::try_where(g.clone(), off, c32(0)).expect("safe offset")),
+            Some(g) => {
+                let zero = off.const_like(0);
+                self.hoist(UOp::try_where(g.clone(), off, zero).expect("safe offset"))
+            }
             None => off,
         };
         let src = self.access(&s.buf, &safe, 1);
@@ -101,7 +104,7 @@ impl Emit<'_> {
     /// committed inside the one statement (`codegen::llvm::nvptx::wgmma`) and
     /// waited for there too, unless the block holds the
     /// [`Sync::WaitProducts`] that waits for it later.
-    pub(super) fn group_mma(&mut self, dst: ValId, op: &TileOp) -> Result<()> {
+    pub(super) fn group_mma(&mut self, dst: ValId, op: &TileOp<Laid>) -> Result<()> {
         let TileOp::Mma { acc, a, b, a_t, b_t, .. } = *op else { unreachable!("a product") };
         let (va, vb, vd) = (self.value(a).clone(), self.value(b).clone(), self.value(dst).clone());
         let atom = self.low.device.target.group_mma(va.dtype, vd.dtype).expect("inference found the core").clone();

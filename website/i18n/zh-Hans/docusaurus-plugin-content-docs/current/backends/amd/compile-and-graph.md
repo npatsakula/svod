@@ -33,11 +33,12 @@ GPU 渲染器相同），因此调度器会在渲染之前分解它们：其
 `decompositor` 是 `svod_ir::decompositions::amd_decomposition_patterns()`，
 它针对 `f16`/`f32`/`f64` 把 `exp`、`log`、`cos`、`tan` 与 `pow` 降低为
 基于原生 `exp2`/`log2` 的 SLEEF 风格多项式——bf16、fp8 与整数操作数会在
-多项式前后转换为 f32——并把 f32→bf16 转换改写为整数的
-round-to-nearest-even 形式；出于同样的原因，`sin` 走共享的超越函数模式
+多项式前后转换为 f32；出于同样的原因，`sin` 走共享的超越函数模式
 （`v_sin_f32` 只对小参数精确）。只有 `exp2`、`log2` 与 `sqrt` 保持为原生的
-`@llvm.*` intrinsic（在 AMD 硬件上约 1 ulp）。渲染器本地的 `amd_extra_matcher()`
-最后运行。
+`@llvm.*` intrinsic（在 AMD 硬件上约 1 ulp）。若无法读取 clang 版本，
+decompositor 还会把 f32→bf16 转换改写为整数的 round-to-nearest-even 形式
+（`bf16_integer_cast_patterns`）；版本可读的 clang 在这里至少是 22，会原生完成
+这种收窄。渲染器本地的 `amd_extra_matcher()` 最后运行。
 
 ### 编译
 
@@ -47,13 +48,24 @@ round-to-nearest-even 形式；出于同样的原因，`sin` 走共享的超越�
 
 ```text
 clang -x ir -c -O3 --target=amdgcn-amd-amdhsa -mcpu=<arch> \
-      -mcumode -nogpuinc -Wno-override-module -fno-math-errno [-nogpulib] - -o -
+      -mcumode -nogpuinc -Wno-override-module -fno-math-errno \
+      [-mllvm -disable-machine-sink] [-nogpulib] - -o -
 ```
 
 仅当 IR 没有引用任何 `@__ocml_*` 入口点时才会加上 `-nogpulib`：
 渲染器为 AMDGPU 后端能够选择的每一个浮点一元运算都发出 `@llvm.*`
-intrinsic，因此只有 f64 的非 `sqrt` 一元运算才需要 ROCm 设备库。IR 本身是
-object 缓存键的一部分，所以据它来决定一个 flag 依然是可靠的。结果在以
+intrinsic，因此只有 f64 的非 `sqrt` 一元运算才需要 ROCm 设备库。
+
+当 IR 含有矩阵乘积（`@llvm.amdgcn.wmma` 或 `@llvm.amdgcn.mfma`），且 clang 的
+LLVM 版本低于 23 或无法读取其版本时，会加上 `-mllvm -disable-machine-sink`。
+这些版本没有把 AMDGPU 矩阵指令标记为 convergent，machine sinking 可能把这样的
+指令移进按 lane 门控的分支，而被跳过的 lane 不会写入它的操作数。两个 flag 都
+由 IR 决定，每个内核的 object 缓存键都带有该内核编译所用的 flag
+（`amd_object_key`），因此 flag 策略一旦改变，就绝不会复用按另一种策略构建的
+object；clang 版本同样是键的一部分。低于 22 的 clang 会被拒绝用于 AMD 代码，
+并报 `JitCompilation` 错误。
+
+结果在以
 `amd-clang` 身份缓存或被加载之前会先经过校验（`validate_amd_object`：ELF64-LE、
 `EM_AMDGPU`、`e_flags` 中的 arch、一个已定义的 `<name>.kd`）。
 
@@ -105,22 +117,27 @@ wait, profile)` 是 plan 与图使用的、以通道为范围的调度路径—�
    布局是否容得下：`ClikeKernargLayout::from_abi(abi)` 按 ABI 槽位顺序、
    以自然对齐（8 字节指针、4 字节标量）布置参数，其 `packed_size()`
    不得超过描述符的 `kernarg_size`。
-2. 通过 bump 设备的 16 MiB kernarg arena（由所有通道共享，16 字节对齐；
-   回绕时会先排空所有通道）**填充一个 kernarg 槽**，将每个
-   缓冲区 VA 写为 8 字节，将每个标量写为 4 字节的 `i32`。这种 `i32` 打包
-   是刻意的——渲染器将 `Index → i32` 降低，因此描述符的
-   `kernarg_size` 反映 4 字节的 var；打包 8 字节会溢出进
-   下一个槽。
-3. **构建一次提交**——一个先 `MemoryBarrier` 再 `Compute` 的
-   `hcq::Submission`，携带 kernarg VA、`rsrc` 三元组以及 PM4 程序地址。
+2. 把 kernarg **打包**进一个本地记录：每个缓冲区 VA 写为 8 字节，每个标量
+   写为 4 字节的 `i32`。这种 `i32` 打包是刻意的——渲染器将 `Index → i32`
+   降低，因此描述符的 `kernarg_size` 反映 4 字节的 var；打包 8 字节会溢出
+   该记录。
+3. **构建一次提交**——一个含 `Compute` 的 `hcq::Submission`，携带 `rsrc`
+   三元组以及 PM4 程序地址（kernarg 地址由队列填写）；若主机或 SDMA 自该 lane 上次屏障以来绕过其缓存
+   写入过内存，或这是该 lane 的首次调度，或这是一次计时调度，则其前先有
+   `MemoryBarrier`。
 4. 经由 `queue.submit_hcq_dispatch(pool, &submission, …)` **调度**。
+   队列在设备的 16 MiB kernarg 环中预留一个槽（由所有通道共享，16 字节对齐；
+   多 XCC 部件上位于 VRAM，其余位于 uncached GTT），把记录复制进去，并以使该
+   提交退役的那个点发布该槽。预留若碰到最旧的存活槽，只等待那一个槽。
    在 PM4 队列上，`lower_hcq_pm4` → `build_exec_pm4` 发出原始 dword，可选的 4-dword
    scratch 描述符会被前置到 `COMPUTE_USER_DATA_0`，其取值与写入
    `COMPUTE_DISPATCH_SCRATCH_BASE` 的 `scratch_address` 快照出自同一份——
    这样一次并发的 scratch 重分配就不会让描述符与寄存器不一致。在 AQL 队列上，
    `lower_hcq_aql_submission_program` 把 wait/barrier 发出为厂商 IB 的 PM4
    数据包，再发出 64 字节的调度数据包（`build_dispatch_packet_barrier`）和一个
-   厂商 IB 的 timeline 存储，控制字节暂存在 kernarg arena 中。
+   厂商 IB 的 timeline 存储。控制程序与 kernarg 共用这一个槽，它们的地址在
+   链接时补入。该槽依据通道的退役计数退役，而不是依据 XCC0 的 timeline 存储
+   （见[队列与调度](./queues-and-dispatch.md)）。
 5. 持有 code object，将 finalizer 登记为在飞，并把它记录为 owner 最新的完成。
    若 `wait`，则经由 owner 的 `synchronize()` 排空。
 
@@ -136,7 +153,8 @@ wait, profile)` 是 plan 与图使用的、以通道为范围的调度路径—�
 每内核的 `wait → barrier → exec → signal → doorbell` 往返付出 N 次是
 浪费。`AmdGraph`（`device/src/amd/graph.rs`）——以 tinygrad 的
 `HCQGraph` 为蓝本，但只有一个 barrier 且没有内核间信号——把整条链捕获进**一个命令流**（PM4 或 AQL，
-取决于队列用的是哪一种），将其绑定进一个宿主可见的页，并用
+取决于队列用的是哪一种），将其绑定进一个命令缓冲区（多 XCC 部件上位于
+VRAM，其余位于 uncached GTT），并用
 **一个 doorbell** 重放它。
 
 ### 结构
@@ -157,15 +175,15 @@ timeline 两端是 `System(SystemField::TimelineSignal/TimelineValue)`，PM4 的
 scratch 是 `System(ScratchAddress)`/`System(ScratchTmpring)`，程序与 kernarg
 指针则是 `LinkAddress` 条目——它们全都在重放时针对已租用的通道解析，
 因此图能与普通的每调用调度和 `synchronize` 组合。捕获在一个专用的
-`AllocTag::Kernarg` 页中为每个内核布置一个固定的 kernarg 槽——拥有那个页
-（而不是共享滚动的 kernarg arena，并发的每调用调度可能套圈进入陈旧的 VA）
-正是让重放安全的东西。
+`AllocTag::Kernarg` 页中为每个内核布置一个固定的 kernarg 槽（多 XCC 部件上
+位于 VRAM，其余位于 uncached GTT）。常驻命令流在每次重放时都指向这些固定地址，
+而 arena 槽会随预留它的那一次提交一同退役——因此图拥有自己的页并就地打补丁。
 
 重放（`Graph::replay`）会串行化图自有的可变存储，等待它上一个
 finalizer，获取一个独占的计算通道，确保通道 scratch 就绪，为当前的
 kernarg 与系统字段打上补丁，然后发布常驻的 PM4 IB 或 AQL 提交程序。
 参数完全相同时会整个跳过 kernarg 打包。它异步返回；下一次重放会在
-复用那份存储之前先等待。`replay_profiled` 运行一个带有每内核
+复用那份存储之前先等待，在 AQL 上要等到每个 XCC 都处理完上一次重放。`replay_profiled` 运行一个带有每内核
 `SystemField::Timestamp` 槽位的变体，并在返回时间戳之前同步。
 
 ### 捕获何时发生

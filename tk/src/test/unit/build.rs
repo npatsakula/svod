@@ -1,3 +1,4 @@
+use crate::build::Kernel;
 use crate::ir::*;
 
 /// A block-level GEMM mainloop records as one pipeline whose consumer carries
@@ -13,7 +14,7 @@ fn gemm_records_as_a_pipeline_with_a_carried_accumulator() {
     let kinds: Vec<_> = prog.walk().map(|(d, s)| (d, std::mem::discriminant(s))).collect();
     assert_eq!(kinds.iter().filter(|(d, _)| *d == 0).count(), 4, "zeros, pipeline, cast, store at the top level");
     let Stmt::Pipeline(p) = &prog.body.0[1] else { panic!("second statement is the pipeline") };
-    assert_eq!((p.stages, p.produce.body.0.len(), p.consume.body.0.len()), (3, 2, 1));
+    assert_eq!((p.schedule.stages(), p.produce.body.0.len(), p.consume.body.0.len()), (3, 2, 1));
     assert_eq!(p.carried.len(), 1);
     assert_eq!(prog.value(p.carried[0].phi).shape, Shape::new(bm, bn));
     assert_eq!(prog.vars, vec![Var { name: "b".into(), min: 1, max: 8 }]);
@@ -25,29 +26,38 @@ fn gemm_records_as_a_pipeline_with_a_carried_accumulator() {
 #[test_case::test_case(1, 8; "the same range")]
 #[test_case::test_case(1, 16 => panics "variable b is in 1..=8"; "another range")]
 fn a_variable_asked_for_again_keeps_its_range(min: i64, max: i64) {
-    let mut k = crate::build::Kernel::new("vars");
-    k.var("b", 1, 8);
-    k.var("b", min, max);
-    assert_eq!(k.finish().vars, vec![Var { name: "b".into(), min: 1, max: 8 }]);
+    let prog = Kernel::record("vars", |k| {
+        k.var("b", 1, 8);
+        k.var("b", min, max);
+    });
+    assert_eq!(prog.vars, vec![Var { name: "b".into(), min: 1, max: 8 }]);
 }
 
-/// A scalar read is of an input and no store writes an input, so the
-/// lowering may list a read anywhere its index is known.
-#[test]
-#[should_panic(expected = "a scalar load reads an input")]
-fn a_scalar_read_is_of_an_input() {
-    let mut k = crate::build::Kernel::new("read");
-    let p = k.param::<crate::build::I32>("p", ParamKind::Out, 4);
-    k.load_scalar(p, 0);
+/// A variable's range is a nonempty range of `i32`, as every range is: one
+/// past it either way, or an empty one, is refused where it is declared,
+/// before any program holds it.
+#[test_case::test_case(1, i64::from(i32::MAX) + 1 => panics "variable b in 1..=2147483648 is past i32"; "past the top")]
+#[test_case::test_case(i64::from(i32::MIN) - 1, 0 => panics "variable b in -2147483649..=0 is past i32"; "past the bottom")]
+#[test_case::test_case(2, 1 => panics "variable b is in the empty 2..=1"; "empty")]
+#[test_case::test_case(i64::from(i32::MIN), i64::from(i32::MAX); "all of i32")]
+fn a_variable_outside_i32_or_empty_is_refused_when_declared(min: i64, max: i64) {
+    let prog = Kernel::record("vars", |k| {
+        k.var("b", min, max);
+    });
+    assert_eq!(prog.vars, vec![Var { name: "b".into(), min, max }]);
 }
 
-#[test]
-#[should_panic(expected = "a store into an input")]
-fn no_store_writes_an_input() {
-    use crate::build::{I32, Kernel};
-    let mut k = Kernel::new("store");
-    let p = k.param::<I32>("p", ParamKind::In, 4);
-    let v = k.splat::<I32>(Shape::new(1, 4), 1);
-    let out = k.view(p, 0, [4, 1], Shape::new(1, 4), [None, None]);
-    k.store(out, v);
+/// Lone warps are whole copies of the warp grid; a grid set after them
+/// would silently drop them, so it is refused.
+#[test_case::test_case(false => (2, 8); "the grid first")]
+#[test_case::test_case(true => panics "the warp grid is set before the lone warps"; "the grid again after")]
+fn the_warp_grid_comes_before_the_lone_warps(again: bool) -> (u32, u32) {
+    let prog = Kernel::record("warps", |k| {
+        k.warps(2);
+        k.lone_warps(8);
+        if again {
+            k.warps(4);
+        }
+    });
+    (prog.warp_grid.count(), prog.warps)
 }

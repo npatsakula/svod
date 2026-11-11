@@ -1,23 +1,19 @@
 //! `AmdIface`: the device-backend seam.
 //!
-//! `AmdDeviceCore` no longer issues KFD ioctls directly — it routes every
-//! memory alloc/free, queue ring setup/teardown, and event wait through an
-//! `Arc<dyn AmdIface>`. The only implementor today is [`KfdIface`], a verbatim
-//! relocation of the KFD-direct path that previously lived inline across
-//! `allocator.rs`, `device.rs`, and `queue.rs`. KFD-specific state (the kfd /
-//! drm fds, KFD ABI version, event ids, and the per-process event page) lives
-//! on `KfdIface`, off the core. A future userspace AM driver becomes a second
-//! `AmdIface` implementor without touching any call site above the seam.
-//!
-//! This is a pure refactor: flag composition, ioctl argument layout, error
-//! mapping, and the fault-message strings are reproduced bit-for-bit.
+//! `AmdDeviceCore` routes every memory alloc/free, queue ring setup/teardown,
+//! event wait and HDP flush through an `Arc<dyn AmdIface>`. The only
+//! implementor is [`KfdIface`]; KFD-specific state (the kfd / drm fds, KFD ABI
+//! version, event ids, the per-process event page, the HDP flush path) lives
+//! on it, off the core. A userspace AM driver would be a second implementor
+//! without touching any call site above the seam.
 
 #![cfg(unix)]
 
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use libc::{
     MAP_ANONYMOUS, MAP_FIXED, MAP_NORESERVE, MAP_PRIVATE, MAP_SHARED, PROT_NONE, PROT_READ, PROT_WRITE, mmap, munmap,
@@ -31,10 +27,12 @@ use crate::error::{Error, Result};
 
 /// Size of the doorbell MMIO window mapped per queue (two 4 KiB pages).
 const DOORBELL_PAGE_BYTES: usize = 0x2000;
+/// The GPU page a large allocation should be mapped with.
+pub(crate) const HUGE_PAGE: usize = 0x20_0000;
 
 /// Backend seam for the AMD device. Every KFD ioctl that `AmdDeviceCore` (and
 /// its allocator / queue / connector helpers) needs is funnelled through one
-/// of these methods — five required, three defaulted — so a second backend
+/// of these methods — five required, four defaulted — so a second backend
 /// (the userspace AM driver) can be dropped in without editing any call site.
 pub trait AmdIface: Send + Sync + std::fmt::Debug {
     /// Reserve a host VA, KFD-allocate `size` bytes per `kind`, optionally map
@@ -65,13 +63,20 @@ pub trait AmdIface: Send + Sync + std::fmt::Debug {
     /// `Ok(Some(Error::GpuFault{..}))` on a memory fault,
     /// `Ok(Some(Error::Runtime{..}))` on a hardware exception, `Ok(None)` on a
     /// normal wake-up/timeout, `Err` if the WAIT_EVENTS ioctl itself failed.
-    fn wait_events(&self, timeout_ms: u32) -> Result<Option<Error>>;
+    ///
+    /// `age` is the queue event's age this waiter last saw (KFD ≥ 1.14): the
+    /// call returns at once if the event fired since, and writes the new age
+    /// back, so every waiter sees each completion however many share the
+    /// auto-reset event. A wait starts at 1, the age of an event that never
+    /// fired; 0 opts out (ROCr `InterruptSignal::WaitRelaxed`).
+    fn wait_events(&self, timeout_ms: u32, age: &mut u64) -> Result<Option<Error>>;
 
     /// The KFD queue-completion event mailbox, when this backend has one.
     /// A completion packet that writes `event_id` there and raises an interrupt
     /// wakes a blocked `WAIT_EVENTS` immediately instead of leaving it to the
     /// poll tier (tinygrad `AMDComputeQueue.signal`, `ops_amd.py:391-393`).
-    /// `None` on backends with no KFD event page (AM, host mocks), which then
+    /// An AQL lane's retirement signal and each compute queue's error words
+    /// raise it too. `None` on backends with no KFD event page (AM, host mocks), which then
     /// rely on the coherent GTT slot alone.
     fn queue_event_mailbox(&self) -> Option<QueueEventMailbox> {
         None
@@ -93,6 +98,103 @@ pub trait AmdIface: Send + Sync + std::fmt::Debug {
     /// KFD queue scheduler (host mocks) accept the default no-op.
     fn update_queue_percentage(&self, _queue_id: u32, _ring_gpu: u64, _ring_size: u32, _percentage: u32) -> Result<()> {
         Ok(())
+    }
+
+    /// Flush the host's writes to device-local memory out of HDP, the host
+    /// data path, and wait until the flush has landed (CLR's
+    /// `HDP_MEM_FLUSH_CNTL` write; ROCr only exposes the register to its
+    /// clients as `HDP_flush_`). Called through [`Hdp`] only. A no-op
+    /// where the backend has no flush register.
+    fn flush_hdp(&self) {}
+}
+
+/// HDP, the host data path: host stores into VRAM through the BAR may sit in
+/// it until it is flushed, so no GPU engine may read them before a flush.
+///
+/// Kernargs and command buffers (the kernarg arena, graph and plan kernargs,
+/// PM4 IBs and AQL control programs) live where the device reads them
+/// fastest, as CLR places them: VRAM on a multi-XCC part, where reads from
+/// system memory slow every kernel, and uncached system memory elsewhere,
+/// where draining the host's stores to VRAM costs more than it saves. With
+/// them in VRAM every doorbell flushes; otherwise the submission path writes
+/// only system memory and a doorbell flushes only what host writes deferred.
+///
+/// Other host stores into VRAM are rare and explicit (code upload, CWSR
+/// headers, zero-fill, copy-in, host transfers): each flushes with
+/// [`Hdp::flush`] once its stores are done. A [`crate::buffer::HostWrite`]
+/// into VRAM marks its stores [`Hdp::defer`]red when it drops, and the
+/// device's next doorbell flushes them once for every guard since the last.
+/// A doorbell counts a deferral flushed only once its own flush has landed,
+/// so one racing another's flush still flushes.
+///
+/// It also counts the stores that reach device memory behind the GPU caches,
+/// which a lane's caches may hold stale lines for: these host stores and the
+/// copy engine's ([`Self::note_dma_write`]). A lane invalidates its caches
+/// before its next dispatch once the count passed the one it last invalidated
+/// at (`PoolQueue::cache_invalidate`). Kernargs and command buffers are not
+/// counted: uncached system memory bypasses L2, and a multi-XCC part keeps L2
+/// coherent with host stores to its local VRAM (CLR's device kernargs).
+#[derive(Debug)]
+pub(crate) struct Hdp {
+    iface: Arc<dyn AmdIface>,
+    deferred: AtomicU64,
+    flushed: AtomicU64,
+    behind_caches: AtomicU64,
+    submissions_in_vram: bool,
+}
+
+impl Hdp {
+    pub(crate) fn new(iface: Arc<dyn AmdIface>, submissions_in_vram: bool) -> Self {
+        Self {
+            iface,
+            deferred: AtomicU64::new(0),
+            flushed: AtomicU64::new(0),
+            // Above any lane's start, so a new lane's first dispatch invalidates.
+            behind_caches: AtomicU64::new(1),
+            submissions_in_vram,
+        }
+    }
+
+    /// Stores behind the GPU caches so far.
+    pub(crate) fn writes_behind_caches(&self) -> u64 {
+        self.behind_caches.load(Ordering::Acquire)
+    }
+
+    /// The copy engine is about to store behind the GPU caches.
+    pub(crate) fn note_dma_write(&self) {
+        self.behind_caches.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Whether kernargs and command buffers live in VRAM.
+    pub(crate) fn submissions_in_vram(&self) -> bool {
+        self.submissions_in_vram
+    }
+
+    /// Flush this thread's VRAM stores so far: drain its write-combining
+    /// buffers, then flush HDP and read the flush back.
+    pub(crate) fn flush(&self) {
+        std::sync::atomic::fence(Ordering::SeqCst);
+        self.iface.flush_hdp();
+        self.behind_caches.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// This thread's VRAM stores so far are done; the device's next doorbell
+    /// flushes them. The fence drains its write-combining buffers first.
+    pub(crate) fn defer(&self) {
+        std::sync::atomic::fence(Ordering::SeqCst);
+        self.deferred.fetch_add(1, Ordering::Release);
+        self.behind_caches.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Run by every doorbell after its SeqCst fence: flush the submission's
+    /// own stores when they went to VRAM, else the stores host writes
+    /// deferred since the last doorbell.
+    pub(crate) fn flush_for_doorbell(&self) {
+        let deferred = self.deferred.load(Ordering::Acquire);
+        if self.submissions_in_vram || self.flushed.load(Ordering::Acquire) < deferred {
+            self.iface.flush_hdp();
+            self.flushed.fetch_max(deferred, Ordering::Release);
+        }
     }
 }
 
@@ -119,18 +221,24 @@ pub enum QueueTeardown {
 }
 
 /// Allocation flavor — selects the KFD flag set built in [`AmdIface::alloc_raw`].
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AllocKind {
     /// Device VRAM. `executable` adds the EXECUTABLE bit (set for general
     /// buffers, cleared for scratch). PUBLIC is derived from `cpu_access`.
     DeviceVram { executable: bool },
-    /// GTT-pinned, host-visible, uncached system memory (rings, GART, signal
-    /// slots, the event page).
+    /// GTT-pinned, host-visible, uncached system memory: rings, GART, signal
+    /// slots, and, off multi-XCC parts, kernargs and command buffers (see
+    /// `Hdp`). The GPU reads it snooped, through no HDP, and `UNCACHED`
+    /// maps it MTYPE UC on every arch, so no GPU L2 keeps a stale copy of a
+    /// reused slot. `COHERENT` alone maps NC, cached in L2, on gfx12
+    /// (`gmc_v12_0_get_vm_pte`) and on a gfx942 APU, where each XCC's L2
+    /// would cache it apart.
     UncachedGtt,
 }
 
 /// Result of [`AmdIface::alloc_raw`]: everything `RawBuffer::AmdDevice` needs
 /// except the owning device handle (the allocator adds that at the call site).
+#[derive(Debug)]
 pub struct AllocResult {
     pub gpu_va: u64,
     pub host_ptr: Option<NonNull<u8>>,
@@ -176,8 +284,7 @@ pub struct QueueHandle {
 // crosses the trait.
 unsafe impl Send for QueueHandle {}
 
-/// KFD-direct backend. Owns the per-process/per-device KFD state that used to
-/// live on `AmdDeviceCore`.
+/// KFD-direct backend. Owns the per-process/per-device KFD state.
 #[derive(Debug)]
 pub struct KfdIface {
     /// Shared `/dev/kfd` handle (one per process).
@@ -185,11 +292,6 @@ pub struct KfdIface {
     drm_fd: OwnedFd,
     /// Its own clone of the topology node (gpu_id, drm minor, etc.).
     node: AmdNode,
-    // The following are captured at bring-up and retained for parity with the
-    // pre-refactor `AmdDeviceCore` (KFD ABI gating + event-page bookkeeping).
-    // They are read only during `open`/diagnostics today, so allow the
-    // not-currently-reread fields rather than churn the layout.
-    #[allow(dead_code)]
     kfd_version: (u32, u32),
     /// VA + size of the GTT-pinned event page (held to keep it mapped).
     #[allow(dead_code)]
@@ -207,6 +309,9 @@ pub struct KfdIface {
     /// of recently-freed ranges, so a fault VA can be resolved to its owning
     /// (or stale, or nearest) allocation. See [`crate::amd::va_registry`].
     va: VaRegistry,
+    /// How the host flushes HDP: KFD's remap of the flush register, else a
+    /// VRAM readback.
+    hdp: Option<HdpFlush>,
     /// One-shot latch so the terminal fault is logged at `error` exactly once,
     /// even though `wait_events(0)` may re-observe the (non-auto-reset) fault
     /// event on subsequent poll-fault calls.
@@ -215,8 +320,8 @@ pub struct KfdIface {
 
 impl KfdIface {
     /// Open `/dev/kfd` + the node's DRM render fd, acquire the VM, enable the
-    /// runtime, bind the event page, and create the three completion / fault
-    /// events. Verbatim move of the bring-up block from `AmdDevice::open_uncached`.
+    /// runtime (once per process), bind the event page, create the three
+    /// completion / fault events, and map the HDP flush path.
     pub fn open(node: &AmdNode) -> Result<Self> {
         let kfd_fd = crate::amd::device::ensure_global_kfd()?;
         let drm_path = format!("/dev/dri/renderD{}", node.drm_render_minor);
@@ -230,6 +335,18 @@ impl KfdIface {
         }
         let kfd_version = (ver_args.major_version, ver_args.minor_version);
 
+        // Opening the fd queues the root page directory clear on SDMA, and
+        // ACQUIRE_VM's wait for it skips that BOOKKEEP fence (`amdgpu_sync_resv`
+        // stops at READ). The clear then lands over the first PDEs KFD writes
+        // with the CPU, and the walker retries forever until the GPU resets.
+        // `amdgpu_flush` runs on any close and drains the VM's job queues;
+        // nothing exposes the jobs' completion, so a pause covers their execution.
+        let flushed = drm_fd
+            .try_clone()
+            .map_err(|e| Error::AmdIoctl { ioctl: "dup(render node)", errno: e.raw_os_error().unwrap_or(0) })?;
+        drop(flushed);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+
         // ACQUIRE_VM tells KFD to register this DRM fd as the process's VM
         // for this GPU. Required before any alloc/map ioctls.
         let mut args = kfd::kfd_ioctl_acquire_vm_args { drm_fd: drm_fd.as_raw_fd() as u32, gpu_id: node.gpu_id };
@@ -241,11 +358,24 @@ impl KfdIface {
         }
 
         // RUNTIME_ENABLE — only on KFD >= 1.14; older kernels reject the
-        // ioctl with ENOTTY.
+        // ioctl with ENOTTY. A mask without the enable bit disables instead.
+        // KFD enables a process once (EBUSY after) and only before its first
+        // queue (EEXIST after), so the first device to open enables it and
+        // a later one finding it enabled goes on.
         if kfd_version >= (1, 14) {
-            let mut rt = kfd::kfd_ioctl_runtime_enable_args { mode_mask: 0, ..Default::default() };
-            if let Err(e) = unsafe { ioctl::kfd_runtime_enable(kfd_fd.as_raw_fd(), &mut rt as *mut _) } {
-                return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_RUNTIME_ENABLE", errno: e as i32 });
+            static ENABLED: OnceLock<std::result::Result<(), nix::errno::Errno>> = OnceLock::new();
+            let enabled = ENABLED.get_or_init(|| {
+                let mut rt = kfd::kfd_ioctl_runtime_enable_args {
+                    mode_mask: kfd::KFD_RUNTIME_ENABLE_MODE_ENABLE_MASK,
+                    ..Default::default()
+                };
+                match unsafe { ioctl::kfd_runtime_enable(kfd_fd.as_raw_fd(), &mut rt as *mut _) } {
+                    Ok(_) | Err(nix::errno::Errno::EBUSY) => Ok(()),
+                    Err(e) => Err(e),
+                }
+            });
+            if let Err(e) = enabled {
+                return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_RUNTIME_ENABLE", errno: *e as i32 });
             }
         }
 
@@ -306,7 +436,8 @@ impl KfdIface {
             );
         }
 
-        Ok(Self {
+        let mmio_remap = MmioRemapPage::map(&kfd_fd, node.gpu_id);
+        let mut iface = Self {
             kfd_fd,
             drm_fd,
             node: node.clone(),
@@ -319,16 +450,156 @@ impl KfdIface {
             mem_fault_event_id: mem_event.event_id,
             hw_fault_event_id: hw_event.event_id,
             va: VaRegistry::default(),
+            hdp: mmio_remap.map(HdpFlush::Register),
             fault_logged: AtomicBool::new(false),
-        })
+        };
+        if iface.hdp.is_none() {
+            // No remap page (an SR-IOV VF, whose kernel keeps the flush
+            // register to itself; larger host pages): read a VRAM word back,
+            // as ROCr (`PcieWcFlush`) and CLR (`DeviceKernelArgsReadback`) do.
+            let word = iface.alloc_raw(
+                0x1000,
+                AllocKind::DeviceVram { executable: false },
+                AllocTag::HdpReadback,
+                true,
+                true,
+            )?;
+            iface.hdp = Some(HdpFlush::Readback(word));
+        }
+        Ok(iface)
     }
 }
 
 impl Drop for KfdIface {
     fn drop(&mut self) {
+        match self.hdp.take() {
+            Some(HdpFlush::Register(page)) => {
+                // SAFETY: the page was mapped by `MmioRemapPage::map`; queues that
+                // flushed through it hold this iface, so none outlives it.
+                unsafe { munmap(page.base.as_ptr().cast(), MMIO_REMAP_PAGE_BYTES) };
+                self.free_kfd(page.handle);
+            }
+            Some(HdpFlush::Readback(word)) => self.free_raw(word.gpu_va, word.size, word.handle),
+            None => {}
+        }
         for event_id in [self.queue_event_id, self.mem_fault_event_id, self.hw_fault_event_id] {
             let mut args = kfd::kfd_ioctl_destroy_event_args { event_id, pad: 0 };
             let _ = unsafe { ioctl::kfd_destroy_event(self.kfd_fd.as_raw_fd(), &mut args as *mut _) };
+        }
+    }
+}
+
+/// How the host pushes its VRAM stores out of HDP before a doorbell.
+#[derive(Debug)]
+enum HdpFlush {
+    /// Write the flush register through KFD's remap page.
+    Register(MmioRemapPage),
+    /// Store to a host-visible VRAM word and read it back. A BAR read cannot
+    /// pass the posted writes before it, and AMD documents one readback as
+    /// flushing every earlier store (`HSA_AMD_AGENT_INFO_PCIE_STORES_NEED_FLUSH`;
+    /// CLR's `FlushSignalStores` flushes many with one).
+    Readback(AllocResult),
+}
+
+// SAFETY: the readback word is a mapping with no thread affinity; concurrent
+// flushes store the same value and only read it back.
+unsafe impl Sync for HdpFlush {}
+
+impl HdpFlush {
+    fn flush(&self) {
+        match self {
+            HdpFlush::Register(page) => page.flush(),
+            HdpFlush::Readback(word) => {
+                let word = word.host_ptr.expect("host-visible readback word").cast::<u32>().as_ptr();
+                // SAFETY: the word is this iface's own mapped VRAM allocation.
+                unsafe {
+                    std::ptr::write_volatile(word, 0);
+                    std::sync::atomic::fence(Ordering::SeqCst);
+                    std::ptr::read_volatile(word);
+                }
+            }
+        }
+    }
+}
+
+/// Size of KFD's MMIO-remap page; KFD offers it only on 4 KiB host pages.
+const MMIO_REMAP_PAGE_BYTES: usize = 0x1000;
+
+/// KFD's user mapping of the device's MMIO-remap page, which exposes the HDP
+/// flush registers (libhsakmt `map_mmio`, read by ROCr as `HDP_flush_`).
+///
+/// A write to `HDP_MEM_FLUSH_CNTL` flushes HDP from the host, without the CP's
+/// `GPU_HDP_FLUSH_REQ/DONE` handshake: that register pair is one channel per
+/// bit shared by every queue of every process, and its DONE bit toggles per
+/// request, so concurrent requesters on one bit can wait forever.
+#[derive(Debug)]
+struct MmioRemapPage {
+    base: NonNull<u32>,
+    handle: u64,
+}
+
+// SAFETY: an MMIO mapping with no thread affinity; a flush is one register
+// write any thread may issue.
+unsafe impl Send for MmioRemapPage {}
+unsafe impl Sync for MmioRemapPage {}
+
+impl MmioRemapPage {
+    /// Allocate and map the remap page, or `None` where KFD has none to give
+    /// (larger host pages, an SR-IOV VF, whose kernel keeps the register, an
+    /// older KFD): the host then flushes by readback.
+    fn map(kfd_fd: &OwnedFd, gpu_id: u32) -> Option<Self> {
+        // SAFETY: sysconf has no preconditions.
+        if unsafe { libc::sysconf(libc::_SC_PAGESIZE) } != MMIO_REMAP_PAGE_BYTES as libc::c_long {
+            return None;
+        }
+        let va = reserve_va(MMIO_REMAP_PAGE_BYTES).ok()?;
+        let mut args = kfd::kfd_ioctl_alloc_memory_of_gpu_args {
+            va_addr: va as u64,
+            size: MMIO_REMAP_PAGE_BYTES as u64,
+            gpu_id,
+            flags: kfd::KFD_IOC_ALLOC_MEM_FLAGS_MMIO_REMAP
+                | kfd::KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE
+                | kfd::KFD_IOC_ALLOC_MEM_FLAGS_COHERENT,
+            ..Default::default()
+        };
+        // SAFETY: kfd_fd is open; args is well-typed for ALLOC_MEMORY_OF_GPU.
+        if let Err(errno) = unsafe { ioctl::kfd_alloc_memory_of_gpu(kfd_fd.as_raw_fd(), &mut args as *mut _) } {
+            unsafe { munmap(va, MMIO_REMAP_PAGE_BYTES) };
+            debug!(?errno, "no KFD MMIO remap page; the host flushes HDP by readback");
+            return None;
+        }
+        // SAFETY: KFD hands out the remap page through /dev/kfd at `mmap_offset`.
+        let p = unsafe {
+            mmap(
+                va,
+                MMIO_REMAP_PAGE_BYTES,
+                PROT_READ | PROT_WRITE,
+                MAP_SHARED | MAP_FIXED,
+                kfd_fd.as_raw_fd(),
+                args.mmap_offset as i64,
+            )
+        };
+        if p == libc::MAP_FAILED {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            let mut free = kfd::kfd_ioctl_free_memory_of_gpu_args { handle: args.handle };
+            // SAFETY: the handle came from the allocation above.
+            let _ = unsafe { ioctl::kfd_free_memory_of_gpu(kfd_fd.as_raw_fd(), &mut free as *mut _) };
+            unsafe { munmap(va, MMIO_REMAP_PAGE_BYTES) };
+            tracing::warn!(errno, "mmap(KFD MMIO remap) failed; the host flushes HDP by readback");
+            return None;
+        }
+        Some(Self { base: NonNull::new(p.cast())?, handle: args.handle })
+    }
+
+    /// Flush HDP: write `HDP_MEM_FLUSH_CNTL`, then read it back so the flush
+    /// has landed before the caller's doorbell write (CLR `rocvirtual.cpp`).
+    fn flush(&self) {
+        let offset = kfd::kfd_mmio_remap_KFD_MMIO_REMAP_HDP_MEM_FLUSH_CNTL as usize / 4;
+        // SAFETY: the register lies inside the mapped page.
+        unsafe {
+            let reg = self.base.as_ptr().add(offset);
+            std::ptr::write_volatile(reg, 1);
+            std::ptr::read_volatile(reg);
         }
     }
 }
@@ -357,6 +628,12 @@ impl Drop for EventGuard {
 }
 
 impl AmdIface for KfdIface {
+    fn flush_hdp(&self) {
+        if let Some(hdp) = &self.hdp {
+            hdp.flush();
+        }
+    }
+
     fn queue_event_mailbox(&self) -> Option<QueueEventMailbox> {
         Some(QueueEventMailbox { address: self.queue_event_mailbox_ptr, event_id: self.queue_event_id })
     }
@@ -541,6 +818,7 @@ impl AmdIface for KfdIface {
     }
 
     fn update_queue_percentage(&self, queue_id: u32, ring_gpu: u64, ring_size: u32, percentage: u32) -> Result<()> {
+        tracing::debug!(queue_id, percentage, "AMDKFD_IOC_UPDATE_QUEUE");
         let mut args = kfd::kfd_ioctl_update_queue_args {
             ring_base_address: ring_gpu,
             queue_id,
@@ -571,9 +849,13 @@ impl AmdIface for KfdIface {
         Ok(QueueTeardown::Complete)
     }
 
-    fn wait_events(&self, timeout_ms: u32) -> Result<Option<Error>> {
+    fn wait_events(&self, timeout_ms: u32, age: &mut u64) -> Result<Option<Error>> {
         let mut events: [kfd::kfd_event_data; 3] = [Default::default(); 3];
         events[0].event_id = self.queue_event_id;
+        let aged = self.kfd_version >= (1, 14);
+        if aged {
+            events[0].__bindgen_anon_1.signal_event_data.last_event_age = *age;
+        }
         events[1].event_id = self.mem_fault_event_id;
         events[2].event_id = self.hw_fault_event_id;
         let mut args = kfd::kfd_ioctl_wait_events_args {
@@ -587,6 +869,10 @@ impl AmdIface for KfdIface {
         let rc = unsafe { ioctl::kfd_wait_events(self.kfd_fd.as_raw_fd(), &mut args as *mut _) };
         if let Err(e) = rc {
             return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_WAIT_EVENTS", errno: e as i32 });
+        }
+        if aged {
+            // SAFETY: slot [0] is the signal event, whose payload KFD writes back.
+            *age = unsafe { events[0].__bindgen_anon_1.signal_event_data.last_event_age };
         }
         // Inspect each event's union payload. `gpu_id != 0` signals the fault
         // was actually written by KFD (the union is zero-initialized when
@@ -700,8 +986,7 @@ impl KfdIface {
 }
 
 /// Compose the KFD `KFD_IOC_ALLOC_MEM_FLAGS_*` set for an allocation. This is
-/// the ONLY place the flags are built; it reproduces the four pre-refactor flag
-/// sets bit-for-bit (see the module doc / call sites).
+/// the ONLY place the flags are built.
 fn compose_flags(kind: AllocKind, cpu_access: bool) -> u32 {
     match kind {
         AllocKind::DeviceVram { executable } => {
@@ -728,15 +1013,32 @@ fn compose_flags(kind: AllocKind, cpu_access: bool) -> u32 {
     }
 }
 
-/// Reserve `size` bytes of host VA so KFD can bind VRAM into it.
-fn reserve_va(size: usize) -> Result<*mut libc::c_void> {
+/// Reserve `size` bytes of host VA so KFD can bind VRAM into it. A buffer of a
+/// huge page or more starts on one: an anonymous `mmap` aligns only lengths
+/// that are multiples of it (Linux ≥ 6.7, with THP on), and a VA off the
+/// physical alignment takes no large PTE fragments.
+pub(crate) fn reserve_va(size: usize) -> Result<*mut libc::c_void> {
+    let align = if size >= HUGE_PAGE { HUGE_PAGE } else { 1 };
+    let span = size + (align - 1);
     // SAFETY: standard libc::mmap signature; no aliasing concerns at this point.
-    let p = unsafe { mmap(std::ptr::null_mut(), size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0) };
+    let p = unsafe { mmap(std::ptr::null_mut(), span, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0) };
     if p == libc::MAP_FAILED {
         let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
         return Err(Error::AmdIoctl { ioctl: "mmap(VA reservation)", errno });
     }
-    Ok(p)
+    let (start, end) = (p as usize, p as usize + span);
+    let va = start.next_multiple_of(align);
+    let tail = (va + size).next_multiple_of(0x1000);
+    // SAFETY: both ranges lie in the reservation above and nothing uses them.
+    unsafe {
+        if va > start {
+            munmap(p, va - start);
+        }
+        if end > tail {
+            munmap(tail as *mut _, end - tail);
+        }
+    }
+    Ok(va as *mut _)
 }
 
 fn map_alloc_err(e: nix::errno::Errno, cpu_accessible: bool) -> Error {

@@ -9,9 +9,11 @@ use svod_dtype::{DType, DeviceSpec};
 use svod_tensor::Tensor;
 use svod_tk::atoms::{Core, Device, Target};
 use svod_tk::build::BF16;
+use svod_tk::ir::Schedule;
 use svod_tk::kernels::Batch;
-use svod_tk::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
+use svod_tk::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, TileOrder, gemm};
 use svod_tk::launch::graph_launch;
+use svod_tk::ops::config::Planner;
 use svod_tk::ops::{self, Act, Linear};
 
 fn lcg(seed: &mut u64) -> f32 {
@@ -28,7 +30,14 @@ fn flat(n: usize, seed: &mut u64) -> Tensor {
 }
 
 const fn cfg(tile: [usize; 3], warps: [u32; 2], unroll: bool) -> GemmCfg {
-    GemmCfg { tile, stages: 2, warps, unroll, core: Core::Warp, crews: 1 }
+    GemmCfg {
+        tile,
+        warps,
+        core: Core::Warp,
+        schedule: Schedule::ring(2, unroll),
+        order: TileOrder::DEFAULT,
+        tail: None,
+    }
 }
 
 #[test]
@@ -43,6 +52,7 @@ fn tk_gemm_tuned_vs_pinned() {
     let measured = svod_tk::probe::costs(&target).expect("device costs");
     assert!(measured.unmeasured.is_empty(), "unmeasured: {:?}", measured.unmeasured);
     let device = Device { costs: measured.costs, target };
+    let planner = Planner::new(device.clone()).expect("a planner for the device");
     let plain = Epilogue::default();
     let residual = Epilogue { residual: true, ..plain };
     let swiglu = Epilogue { act: Act::Silu, gated: true, ..plain };
@@ -84,7 +94,8 @@ fn tk_gemm_tuned_vs_pinned() {
 
         // tk at a pinned config.
         let mut pinned = |label: &str, c: GemmCfg| {
-            let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: epi, cfg: c };
+            let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: epi };
+            let spec = spec.admitted(&planner, c).unwrap_or_else(|why| panic!("{label} {c:?}: {why:?}"));
             let out = Tensor::empty(&[m * n], DType::BFloat16);
             let mut params: Vec<&Tensor> = vec![&a, &b];
             if let Some(r) = &r {
@@ -92,7 +103,7 @@ fn tk_gemm_tuned_vs_pinned() {
             }
             params.push(&out);
             let y = graph_launch(gemm::<BF16>(&spec), &c.lowering(&device), &params).unwrap();
-            plans.push((format!("tk {label} {:?} {:?} unroll={}", c.tile, c.warps, c.unroll), y.prepare().unwrap()));
+            plans.push((format!("tk {label} {:?} {:?} unroll={}", c.tile, c.warps, c.unroll()), y.prepare().unwrap()));
         };
         pinned("tabled", tabled);
         if let Some(l) = lattice {

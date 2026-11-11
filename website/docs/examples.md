@@ -54,19 +54,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   can, compiles the kernels and runs them. A realized tensor stays behind a
   shared borrow.
 
-Reading data back:
+Reading data back (and writing it in place):
 
 | Method | Realizes? | Returns |
 |---|---|---|
 | `as_vec::<T>()`, `as_ndarray::<T>()` | never — `NoBuffer` error if unrealized | owned copy |
 | `to_vec::<T>()`, `to_ndarray::<T>()` | on demand | owned copy |
 | `item::<T>()` | on demand | the single element |
-| `array_view::<T>()`, `array_view_mut::<T>()` | never | borrowed `ndarray` view, zero-copy |
+| `array_view::<T>()` | never | borrowed `ndarray` view, zero-copy |
+| `with_host_write::<T, _>(f)` | never | what `f` returns; `f` writes through an exclusive `HostWrite` guard, not a view |
 
 So the shortest form is `(&a + &b)?.to_vec::<f32>()?`. Use the `as_*` family
-where a hidden realize would be a bug. The views need a host-mappable buffer
-(CPU, or a GPU buffer with a host mapping) and a tensor that owns its buffer
-rather than a view of one.
+where a hidden realize would be a bug. The view and the write guard need a
+host-mappable buffer (CPU, or a GPU buffer with a host mapping) and a tensor
+that owns its buffer rather than a view of one.
 
 ---
 
@@ -323,7 +324,7 @@ fn stream(frames: &[Vec<f32>]) -> Result<(), Box<dyn std::error::Error>> {
 
     let plan = energy.prepare()?;                          // schedule + compile, once
     for frame in frames {
-        input.array_view_mut::<f32>()?.as_slice_mut().unwrap().copy_from_slice(frame);
+        input.with_host_write::<f32, _>(|w| w.copy_from(frame))?;
         plan.execute()?;                                   // replay: no tracing, no compilation
         println!("{}", energy.item::<f32>()?);
     }

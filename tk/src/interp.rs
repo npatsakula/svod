@@ -1,7 +1,8 @@
-//! Host execution of a tile program at the logical level: tiles are matrices,
-//! every block runs its statements in order, a pipeline is its serial
-//! interleaving. Values are rounded to their element type, so the result is
-//! what a correct lowering must reproduce up to accumulation order.
+//! Host execution of a tile program at the logical level, in any phase:
+//! tiles are matrices, every block runs its statements in order, a pipeline
+//! is its serial interleaving. Values are rounded to their element type, so
+//! the result is what a correct lowering must reproduce up to accumulation
+//! order.
 
 use std::collections::HashMap;
 
@@ -69,8 +70,8 @@ fn f16_round(x: f32) -> f32 {
     f32::from_bits(out)
 }
 
-struct Frame<'p> {
-    prog: &'p Program,
+struct Frame<'p, P: Phase> {
+    prog: &'p Program<P>,
     globals: Vec<Vec<f64>>,
     smem: Vec<Vec<f64>>,
     regs: HashMap<ValId, Vec<f64>>,
@@ -83,7 +84,7 @@ struct Frame<'p> {
 /// Run `prog` over its whole grid. `params` are the parameter buffers in
 /// declaration order (outputs included); `vars` bind the symbolic variables.
 /// Returns the buffers after every block ran.
-pub fn run(prog: &Program, params: Vec<Vec<f64>>, vars: &[(&str, i64)]) -> Result<Vec<Vec<f64>>> {
+pub fn run<P: Phase>(prog: &Program<P>, params: Vec<Vec<f64>>, vars: &[(&str, i64)]) -> Result<Vec<Vec<f64>>> {
     for (p, buf) in prog.params.iter().zip(&params) {
         ensure!(buf.len() == p.elems, ParamSizeSnafu { name: p.name.clone(), got: buf.len(), want: p.elems });
     }
@@ -113,7 +114,7 @@ pub fn run(prog: &Program, params: Vec<Vec<f64>>, vars: &[(&str, i64)]) -> Resul
     Ok(frame.globals)
 }
 
-impl Frame<'_> {
+impl<P: Phase> Frame<'_, P> {
     fn scalar(&self, id: ScalarId) -> Result<i64> {
         self.scalar_at(id, None)
     }
@@ -153,14 +154,14 @@ impl Frame<'_> {
         })
     }
 
-    fn block_run(&mut self, block: &Block) -> Result<()> {
+    fn block_run(&mut self, block: &Block<P>) -> Result<()> {
         for stmt in &block.0 {
             self.stmt(stmt)?;
         }
         Ok(())
     }
 
-    fn stmt(&mut self, stmt: &Stmt) -> Result<()> {
+    fn stmt(&mut self, stmt: &Stmt<P>) -> Result<()> {
         match stmt {
             Stmt::Let { dst, op } => {
                 let out = self.tile_op(*dst, op)?;
@@ -180,12 +181,13 @@ impl Frame<'_> {
                 }
             }
             Stmt::Pipeline(p) => {
+                let p = P::pipeline(p);
                 let extent = self.scalar(p.extent)?;
                 self.enter(&p.carried);
                 for i in 0..extent {
                     for stage in [&p.produce, &p.consume] {
                         self.induction.insert(stage.step, i);
-                        self.induction.insert(stage.slot, i % p.stages as i64);
+                        self.induction.insert(stage.slot, i % p.schedule.stages() as i64);
                         self.block_run(&stage.body)?;
                     }
                     self.advance(&p.carried);
@@ -245,7 +247,7 @@ impl Frame<'_> {
             Place::Reg => Some((r * cols + c) as i64),
             Place::Smem { alloc, offset } => Some(
                 self.scalar(*offset)?
-                    + (if self.prog.smem[alloc.index()].along == Axis::Row { c * rows + r } else { r * cols + c })
+                    + (if self.prog.smem[alloc.index()].along() == Axis::Row { c * rows + r } else { r * cols + c })
                         as i64,
             ),
             Place::Global { offset, stride, bounds, rows, period, .. } => {
@@ -324,7 +326,7 @@ impl Frame<'_> {
         Ok(())
     }
 
-    fn tile_op(&self, dst: ValId, op: &TileOp) -> Result<Vec<f64>> {
+    fn tile_op(&self, dst: ValId, op: &TileOp<P>) -> Result<Vec<f64>> {
         let out = self.prog.value(dst);
         let Shape { rows, cols } = out.shape;
         let data = match op {
@@ -459,7 +461,7 @@ impl Frame<'_> {
                 (0..rows * cols)
                     .map(|i| {
                         let (r, c) = (i / cols, i % cols);
-                        let at = order.as_ref().map_or(c * n + *j as usize, |o| o[r][c * n + *j as usize] as usize);
+                        let at = P::dealt(order, r, c * n + *j as usize);
                         if *col { at as f64 } else { v[r * s.cols + at] }
                     })
                     .collect()

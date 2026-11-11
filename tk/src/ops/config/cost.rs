@@ -16,7 +16,7 @@ use crate::kernels::nearest::NearestCfg;
 use super::attention::AttentionProblem;
 use super::gemm::GemmProblem;
 use super::nearest::NearestProblem;
-use super::search::{Rejected, Tiled};
+use super::search::{Rejected, TargetRejected, Tiled};
 
 /// Model: the elements of one 16×16×16 matrix-core step, [`Costs::step`]'s
 /// unit.
@@ -25,13 +25,10 @@ pub(crate) const STEP: usize = 16 * 16 * 16;
 pub(super) const ELEM: usize = 2;
 
 /// Model: how far past the cheapest config's cost the model cannot tell
-/// configs apart: on sm_86 the measured best of Nemotron's projections and of 4096³
-/// sat 12–31% behind the model's first.
+/// configs apart.
 pub(super) const BAND: f64 = 1.35;
-/// Model: the waves per SIMD past which a trip's pipes overlap no further
-/// (measured on gfx1201 and sm_86: sixteen waves per SIMD run a tile no
-/// better than four, and the ranking that counted them did put sixteen-warp
-/// blocks first on sm_86 where eight-warp ones run 7% faster).
+/// Model: the waves per SIMD past which a trip's pipes overlap no further:
+/// more waves run a tile no better.
 const OVERLAP_WAVES: f64 = 4.0;
 
 /// The closed ops vocabulary: the kinds of vector work a family may claim,
@@ -61,10 +58,9 @@ pub(crate) enum Kind {
     /// without the row's least, and its store's issue), a listed score's
     /// scan, a skipped step, a queue insert.
     Scan,
-    /// A tile epilogue's operations over the tile's elements (a gelu's
-    /// forty: the abs, the affines, the reciprocal, the polynomial's
-    /// multiplies, the square, the `exp2`, the tails), beside the steps in
-    /// every trip.
+    /// A tile epilogue's operations over the tile's elements (the layer's:
+    /// the store's rounding, a bias, an activation, a gate, a scale, a
+    /// residual), beside the steps in every trip.
     Epilogue,
 }
 
@@ -81,19 +77,12 @@ pub(crate) const PAIR_OPS: f64 = 5.0;
 /// added, a floor's maximum, the L2 clamp, a deal's least or vote, a merge's
 /// compare — in units of [`crate::atoms::Costs::score`], the whole
 /// [`crate::atoms::Costs::score`] a softmax element's bundle of them. A
-/// declared residual, not a hand value kept: two measured derivations were
-/// tried against the rank harness on fresh stores (16384² nearest at `k`
-/// 1, 16, 64, depths 128 and 768, three cards) and refuted — the score and
-/// step probes' ratio (`score/step`, sm_86 0.0097, gfx1201 0.0214 score
-/// units) prices the listing's chained work a fifth to a twentieth of its
-/// calibration, collapsing the queue-depth structure (gfx1151 prunes every
-/// 32-deep queue; a gfx1201 `k` 64 tune picks a queued list 7 % behind the
-/// register one) and dropping sm_86's fresh-store nearest ρ 0.415 → 0.381;
-/// the probe bundle's own counted op rate (`score/` its ~15 scalar
-/// operations) collapses it outright. The residual is the issue efficiency
-/// of chained vector work beside the matrix pipe, which no probe explains:
-/// the per-card fit from the store's own outcomes (the design's layer 2) is
-/// what replaces this value, regularized toward it.
+/// declared residual, not a probe-derived value: the issue efficiency of
+/// chained vector work beside the matrix pipe, which no probe explains (the
+/// score and step probes' ratio prices the listing's chained work far too
+/// low). A per-card fit from the store's own outcomes
+/// ([`crate::rank::fitted`]) is what would replace it, regularized toward
+/// it.
 pub(crate) fn pair_op(_: &Device) -> f64 {
     0.2
 }
@@ -101,7 +90,7 @@ pub(crate) fn pair_op(_: &Device) -> f64 {
 /// The ops kinds' multipliers, every one at its full weight by default: the
 /// tests and the rank harness perturb a kind alone (zeroed, to attribute
 /// the model's rank error to its cluster) and nothing else — the default of
-/// one everywhere is today's arithmetic exactly.
+/// one everywhere prices every kind at its full weight.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Weights {
     pub(crate) pair: f64,
@@ -112,7 +101,7 @@ pub(crate) struct Weights {
 }
 
 impl Weights {
-    /// Today's arithmetic: every kind at its full weight.
+    /// Every kind at its full weight.
     pub(crate) fn same() -> Self {
         Self { pair: 1.0, deal: 1.0, merge: 1.0, scan: 1.0, epilogue: 1.0 }
     }
@@ -204,6 +193,9 @@ pub(crate) enum Steps {
     /// Warpgroup steps over shared descriptors
     /// ([`crate::atoms::Costs::step_group`]).
     Group(f64),
+    /// Wide-core steps ([`crate::atoms::Costs::step_wide`]), priced as the
+    /// warp core's where a store holds no measure of them.
+    Wide(f64),
     /// 8-bit integer steps ([`crate::atoms::Costs::step_i8`], hidden at
     /// their own lone ratio where it was measured: the chain's latency does
     /// not scale with its step's throughput).
@@ -214,7 +206,7 @@ impl Steps {
     /// The step count, in [`STEP`]-elements.
     pub(crate) fn count(&self) -> f64 {
         match *self {
-            Steps::F16(n) | Steps::Group(n) | Steps::I8(n) => n,
+            Steps::F16(n) | Steps::Group(n) | Steps::Wide(n) | Steps::I8(n) => n,
         }
     }
 }
@@ -230,6 +222,18 @@ pub(crate) struct Stream {
     /// The share of a trip's bytes the blocks in flight re-read from the
     /// cache in front of DRAM (one another's lines).
     pub shared: f64,
+    /// Where the re-reads come back from: a share of them after the bytes
+    /// of each [`Reach`] streamed since their last read (a raster's reuse
+    /// distances), the rest after the whole of `unique`.
+    pub reach: [Reach; 2],
+}
+
+/// A share of a stream's re-reads and the working set they come back
+/// through: the bytes streamed between a line's read and its re-read.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Reach {
+    pub share: f64,
+    pub set: f64,
 }
 
 /// A whole-problem section beside the run's trips: a kernel of its own (a
@@ -297,6 +301,13 @@ pub(crate) struct Claim {
     /// The bytes a trip writes straight to DRAM (a score matrix's stores),
     /// priced at the global rate whatever the cache holds.
     pub stores: f64,
+    /// The bytes a block moves once its trips are done (a GEMM's output
+    /// tile with its epilogue's bias and residual, a split's f32 slot),
+    /// straight to DRAM at the global rate after
+    /// its last trip: no trip of the block is left to hide the store
+    /// behind, and the SM's blocks store theirs one after another
+    /// ([`Planner::price`]).
+    pub out: f64,
     /// The ring's depth and unrolling: its trip overhead and how far its
     /// prefetch runs.
     pub ring: usize,
@@ -310,22 +321,22 @@ pub(crate) struct Claim {
 }
 
 /// The safety divisor of [`Planner::floor`]: how many times below its bytes'
-/// measured pace a candidate may measure before the tuner refuses the number.
-/// Measured over every timed candidate of the three cards' stores and the
-/// local one on 2026-10-28 (23851 candidates): the least honest one reads
-/// 1.83x its floor, the k-nearest pick whose stamps landed off its kernel
-/// 0.20x — the floor sits between, half the bytes' pace.
+/// measured pace a candidate may measure before the tuner refuses the number:
+/// set between the least honest timed candidate's ratio to its floor and a
+/// lost-stamp reading's, half the bytes' pace.
 pub(crate) const FLOOR: f64 = 2.0;
 
 impl Claim {
     /// The bytes the kernel must move at least once: every distinct byte of
     /// its streams — the ring's and the side's alike — its straight-to-DRAM
-    /// stores and its whole-problem sections' — the work no config of the
-    /// problem can skip, whatever it caches or overlaps.
+    /// stores, its blocks' outputs and its whole-problem sections' — the
+    /// work no config of the problem can skip, whatever it caches or
+    /// overlaps.
     pub(crate) fn distinct(&self) -> f64 {
         self.fill.unique
             + self.side.unique
             + self.stores * self.trips as f64 * self.blocks as f64
+            + self.out * self.blocks as f64
             + self.sections.iter().map(|s| s.bytes * s.rows).sum::<f64>()
     }
 }
@@ -335,7 +346,7 @@ impl Claim {
 /// beyond its configs' own tiles ([`Tiled`]), so that a family cannot price
 /// what the vocabulary does not carry: poisoning is closed at the type
 /// level, and a new family is an impl, not a cost-model change. Unstable:
-/// publication (external families) is the design's phase F. The planner's
+/// not yet published for external families. The planner's
 /// per-family caches and the op layer's dispatch stay concrete at the
 /// boundary — an op builds tensors around its family's types either way —
 /// and the norms rank nothing (a fixed candidate list the tuner times).
@@ -343,14 +354,47 @@ pub(crate) trait Family {
     /// The configs the family ranks.
     type Cfg: Tiled;
 
+    /// The problem's static part: what decides, with the target, which of
+    /// the lattice's configs are feasible whatever the shape, and the key
+    /// the planner keeps them under ([`Planner::feasible`]).
+    type Static: std::hash::Hash + Eq + Clone;
+
+    fn statics(&self) -> Self::Static;
+
     /// Every config the family spans on `target`: its lattice, the search
     /// bounds' shape.
     fn lattice(&self, target: &Target) -> Vec<Self::Cfg>;
 
-    /// One config's [resources](Claim) on the planner's device: the checks
-    /// first — why it is left out — then what it uses.
-    fn claim(&self, planner: &Planner, cfg: &Self::Cfg) -> Result<Claim, Rejected>;
+    /// Whether `cfg` runs problems of `statics` on `target`: why it does
+    /// not, or the registers a lane holds by the layout count.
+    fn feasible(cfg: &Self::Cfg, target: &Target, statics: &Self::Static) -> Result<u32, TargetRejected>;
+
+    /// The planner's feasible configs of this family, by their statics.
+    fn kept(planner: &Planner) -> &Kept<Self::Static, Self::Cfg>;
+
+    /// A feasible config's [resources](Claim) on this problem's shape: why
+    /// it is left out, or what it uses; `regs` is what [`Self::feasible`]
+    /// counted for it.
+    fn claim(&self, planner: &Planner, cfg: &Self::Cfg, regs: u32) -> Result<Claim, Rejected>;
+
+    /// What a config whose resources are `claim` costs, ns of SM time: the
+    /// claim's run ([`Planner::price`]); a family whose config launches
+    /// several kernels prices each.
+    fn price(&self, planner: &Planner, _cfg: &Self::Cfg, claim: &Claim) -> f64 {
+        planner.price(claim)
+    }
 }
+
+/// A config feasible on the planner's target for a family's statics, with
+/// the registers a lane holds by the layout count.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Feasible<C> {
+    pub cfg: C,
+    pub regs: u32,
+}
+
+/// A family's feasible configs by their statics.
+pub(crate) type Kept<S, C> = papaya::HashMap<S, Arc<[Feasible<C>]>>;
 
 /// What the op layer plans with on one device: its target, what its
 /// primitives cost, and the problems ranked for it so far. An op plans its
@@ -378,6 +422,10 @@ pub struct Planner {
     pub(super) attention: papaya::HashMap<AttentionProblem, Arc<[FaCfg]>>,
     pub(super) nearest: papaya::HashMap<NearestProblem, Arc<[NearestCfg]>>,
     pub(super) conv: papaya::HashMap<super::conv::ConvProblem, Arc<[ConvCfg]>>,
+    /// Each family's feasible configs by its statics ([`Self::feasible`]).
+    pub(super) gemm_feasible: Kept<<GemmProblem as Family>::Static, GemmCfg>,
+    pub(super) attention_feasible: Kept<<AttentionProblem as Family>::Static, FaCfg>,
+    pub(super) nearest_feasible: Kept<<NearestProblem as Family>::Static, NearestCfg>,
 }
 
 /// The ranking kept under `key`, made by `rank` the first time it is asked for.
@@ -403,7 +451,38 @@ impl Planner {
             attention: papaya::HashMap::new(),
             nearest: papaya::HashMap::new(),
             conv: papaya::HashMap::new(),
+            gemm_feasible: papaya::HashMap::new(),
+            attention_feasible: papaya::HashMap::new(),
+            nearest_feasible: papaya::HashMap::new(),
         })
+    }
+
+    /// The lattice's configs feasible for `problem`'s statics on the target,
+    /// in lattice order, kept once per statics: the checks no shape moves
+    /// run once, and a ranking prices what is left.
+    pub(crate) fn feasible<P: Family>(&self, problem: &P) -> Arc<[Feasible<P::Cfg>]> {
+        let (target, statics) = (&self.device.target, problem.statics());
+        cached(P::kept(self), statics.clone(), || {
+            let feasible = |cfg: P::Cfg| P::feasible(&cfg, target, &statics).ok().map(|regs| Feasible { cfg, regs });
+            problem.lattice(target).into_iter().filter_map(feasible).collect()
+        })
+    }
+
+    /// A config's [claim](Claim) for `problem` through the one admission path
+    /// (a spec's [`Admitted`](crate::kernels::Admitted) comes from it):
+    /// feasible for the problem's statics ([`Family::feasible`]), then
+    /// claimed on its shape.
+    pub(crate) fn claim_of<P: Family>(&self, problem: &P, cfg: &P::Cfg) -> Result<Claim, Rejected> {
+        let regs = P::feasible(cfg, &self.device.target, &problem.statics())?;
+        problem.claim(self, cfg, regs)
+    }
+
+    /// What a feasible config costs the planner's device and the registers
+    /// its claim counts: [`Self::admit`] past the feasibility
+    /// [`Self::feasible`] settled; `None` where its shape leaves it out.
+    pub(crate) fn price_of<P: Family>(&self, problem: &P, feasible: &Feasible<P::Cfg>) -> Option<(f64, u32)> {
+        let claim = problem.claim(self, &feasible.cfg, feasible.regs).ok()?;
+        Some((problem.price(self, &feasible.cfg, &claim), claim.regs))
     }
 
     /// A planner over what the device's probes measured, as [`Self::new`].
@@ -426,17 +505,17 @@ impl Planner {
     /// waits and the sections beside the run's trips.
     ///
     /// The pipelining: the busiest SM issues the work of `⌈blocks / sms⌉`
-    /// blocks, each taken up as another ends (measured on sm_86: a 64×64
-    /// GEMM's time steps with that count, not with whole rounds of resident
-    /// blocks), every block-trip paying a trip's fixed overhead at the
+    /// blocks, each taken up as another ends (a GEMM's time steps with that
+    /// count, not with whole rounds of resident blocks), every block-trip
+    /// paying a trip's fixed overhead at the
     /// blocks the SM runs at once ([`crate::atoms::Costs::trip_at`]: the
     /// trip probes measure it per block-trip, alone and with the SM full).
     /// A trip's pipes (the fragment reads, the matrix-core steps, the fill)
     /// overlap across the waves a SIMD holds: the longest is paid whole, the
     /// rest in a share of one over the waves per SIMD up to
     /// [`OVERLAP_WAVES`], the blocks the SM holds at once ([`Self::resident`])
-    /// pooling theirs (measured on gfx1201 and sm_86: a block at one wave per
-    /// SIMD pays about their sum, at four or more the longest); a one-slot
+    /// pooling theirs (a block at one wave per SIMD pays about their sum, at
+    /// [`OVERLAP_WAVES`] or more the longest); a one-slot
     /// `cp.async` ring copies, waits and only then computes, so a block alone
     /// on its SM overlaps nothing with its fill. A SIMD holding fewer waves
     /// than hide a matrix-core chain's latency (`step_lone / step` of them, a
@@ -445,8 +524,16 @@ impl Planner {
     /// (a block of fewer waves than SIMDs leaves the rest idle), and every
     /// round of every trip pays the memory latency the ring cannot hide (it
     /// prefetches `stages - 1` trips ahead; a one-slot `cp.async` ring none,
-    /// [`crate::atoms::Costs::latency_one`]) on top of its issue: measured on
-    /// both, the latency adds rather than hides under the issue.
+    /// [`crate::atoms::Costs::latency_one`]) on top of its issue: the latency
+    /// adds rather than hides under the issue. The blocks
+    /// the SM runs at once hide that round's wait among themselves as far as
+    /// the trip probes measured a full SM hiding a lone block's trip — the
+    /// same wait at the barrier for a slot's loads — a block-trip's share
+    /// falling with the blocks to the card's
+    /// [`wait_hiding`](crate::atoms::Costs::wait_hiding) power (a round's
+    /// wait once at power one). The busiest SM's blocks' output stores
+    /// ([`Claim::out`]) add after their trips, not under the fill: a block's
+    /// last trip has nothing left to hide its store behind.
     pub(crate) fn price(&self, claim: &Claim) -> f64 {
         let Device { target, costs } = &self.device;
         let hide = match claim.steps {
@@ -461,25 +548,18 @@ impl Planner {
         let work = match claim.steps {
             Steps::F16(n) => n * costs.step,
             Steps::Group(n) => n * costs.step_group,
+            Steps::Wide(n) => n * if costs.step_wide > 0.0 { costs.step_wide } else { costs.step },
             Steps::I8(n) => n * costs.step_i8,
         };
         let (reads, epilogue) =
             (claim.reads * costs.smem_byte, claim.ops.fold(pair_op(&self.device), costs.score, &self.weights));
         let fill = claim.fill.bytes
-            * self.fill_byte(
-                claim.fill.unique,
-                (claim.blocks * claim.trips) as f64 * claim.fill.bytes,
-                claim.fill.shared,
-            )
+            * self.fill_byte(&claim.fill, (claim.blocks * claim.trips) as f64 * claim.fill.bytes)
             + claim.stores * costs.global_byte;
         // A side read's bytes at the ladder of the working set they name,
         // through the epilogue's pipe: see [`Claim::side`].
-        let side = claim.side.bytes
-            * self.fill_byte(
-                claim.side.unique,
-                (claim.blocks * claim.trips) as f64 * claim.side.bytes,
-                claim.side.shared,
-            );
+        let side =
+            claim.side.bytes * self.fill_byte(&claim.side, (claim.blocks * claim.trips) as f64 * claim.side.bytes);
         let trip = costs.trip(target.fill, claim.ring, claim.unroll);
         // The run the claim describes: `blocks` blocks of `waves` waves,
         // `trips` trips through a ring `stages` deep, a trip's issue down
@@ -512,38 +592,46 @@ impl Planner {
             ..=1 if serial => costs.latency_one.max(costs.latency),
             s => costs.latency / s.saturating_sub(1).max(1) as f64,
         };
+        let hiding = costs.wait_hiding(serial, crate::probe::trip_blocks(target));
+        let wait = wait * (at_once as f64).powf(1.0 - hiding);
         let run = claim.trips as f64 * (issue.max(rounds as f64 * wave) + rounds as f64 * wait);
         let section = |s: &Spread| {
             let work = s.ops.fold(pair_op(&self.device), costs.score, &self.weights);
             let bytes = s.bytes * costs.global_byte;
             (s.rows * work.max(bytes) / self.sms() as f64).max(s.waits * costs.latency)
         };
-        run + claim.waits * costs.latency + claim.sections.iter().map(section).sum::<f64>()
+        let out = per_sm as f64 * claim.out * costs.global_byte;
+        run + out + claim.waits * costs.latency + claim.sections.iter().map(section).sum::<f64>()
     }
 
     /// The blocks of `waves` waves an SM holds at once, each holding `smem`
     /// bytes of shared memory and `regs` registers a lane: by its shared
-    /// memory and by its SIMDs' register files and wave slots; none where a
-    /// block's registers by the layout count pass the SM's.
+    /// memory, by its SIMDs' register files and wave slots and by the
+    /// blocks it holds whatever their resources
+    /// ([`Target::blocks_per_sm`]); none where a block's registers by the
+    /// layout count pass the SM's.
     pub(crate) fn resident(&self, smem: usize, regs: u32, waves: usize) -> usize {
         let (target, o) = (&self.device.target, self.device.target.occupancy);
         let per_simd = o.waves.min(o.file / regs.max(1)) as usize;
-        (target.smem_bytes / smem.max(1)).min(o.simds as usize * per_simd / waves.max(1))
+        let held = (target.smem_bytes / smem.max(1)).min(o.simds as usize * per_simd / waves.max(1));
+        held.min(target.blocks_per_sm(waves))
     }
 
     /// What `cfg` costs the planner's device — ns of SM time — and a
     /// lane's registers by the layout count: the one admission path, a
-    /// [`Family`]'s claim priced; `None` with why the config is left out.
+    /// [`Family`]'s claim priced; `Err` with why the config is left out.
     pub(crate) fn admit<P: Family>(&self, problem: &P, cfg: &P::Cfg) -> Result<(f64, u32), Rejected> {
-        let claim = problem.claim(self, cfg)?;
-        Ok((self.price(&claim), claim.regs))
+        let regs = P::feasible(cfg, &self.device.target, &problem.statics())?;
+        let claim = problem.claim(self, cfg, regs)?;
+        Ok((problem.price(self, cfg, &claim), claim.regs))
     }
 
     /// The least wall ns `cfg`'s kernel can honestly take
-    /// ([`Planner::floor_of`] of its claim): a measured time under it is a
+    /// ([`Self::floor`] of its claim): a measured time under it is a
     /// measurement that lied, never a fast kernel.
     pub(crate) fn floor_of<P: Family>(&self, problem: &P, cfg: &P::Cfg) -> Option<f64> {
-        Some(self.floor(&problem.claim(self, cfg).ok()?))
+        let regs = P::feasible(cfg, &self.device.target, &problem.statics()).ok()?;
+        Some(self.floor(&problem.claim(self, cfg, regs).ok()?))
     }
 
     /// The least wall ns a claim's kernel can take: the bytes it must move
@@ -554,22 +642,27 @@ impl Planner {
         bytes * self.device.costs.rate(bytes) / (self.sms() as f64 * FLOOR)
     }
 
-    /// What a byte of a fill costs when `fill` bytes stream `unique`
-    /// distinct ones, of which the blocks in flight at once re-read a
-    /// `shared` part from one another's lines. Those come from the cache in
-    /// front of DRAM at its measured rate; of the rest, each distinct byte
-    /// comes from DRAM once and its re-reads at the cache ladder's measured
-    /// rate for a working set of `unique` bytes — the rate a stream of that
-    /// size runs at, whichever cache levels answer it (RDNA4's L2 and
-    /// Infinity Cache alike) and wherever its knee sits, no hand share of
-    /// the cache assumed. DRAM's rate where no ladder was measured.
-    pub(crate) fn fill_byte(&self, unique: f64, fill: f64, shared: f64) -> f64 {
+    /// What a byte of `stream` costs when it streams `fill` bytes in all.
+    /// The blocks in flight at once re-read a [`Stream::shared`] part from
+    /// one another's lines, which come from the cache in front of DRAM at
+    /// its measured rate; of the rest, each distinct byte comes from DRAM
+    /// once and its re-reads at the cache ladder's measured rate for the
+    /// working set they come back through ([`Stream::reach`], else the
+    /// whole `unique` bytes) — the rate a stream of that size runs at,
+    /// whichever cache levels answer it (RDNA4's L2 and Infinity Cache
+    /// alike) and wherever its knee sits, no hand share of the cache
+    /// assumed. DRAM's rate where no ladder was measured.
+    pub(crate) fn fill_byte(&self, stream: &Stream, fill: f64) -> f64 {
         let c = &self.device.costs;
         if c.l2_bytes <= 0.0 || fill <= 0.0 {
             return c.global_byte;
         }
+        let Stream { unique, shared, reach, .. } = *stream;
         let (shared, reread) = (shared.clamp(0.0, 1.0), (1.0 - unique / fill).max(0.0));
-        let stream = reread * c.rate(unique) + (1.0 - reread) * c.global_byte;
+        let reached: f64 = reach.iter().map(|r| r.share.clamp(0.0, 1.0)).sum::<f64>().min(1.0);
+        let rate = reach.iter().map(|r| r.share.clamp(0.0, 1.0) * c.rate(r.set)).sum::<f64>()
+            + (1.0 - reached) * c.rate(unique);
+        let stream = reread * rate + (1.0 - reread) * c.global_byte;
         shared * c.l2_byte + (1.0 - shared) * stream
     }
 }

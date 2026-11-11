@@ -122,49 +122,12 @@ pub const fn wait_reg_mem_function(x: u32) -> u32 {
 pub const fn wait_reg_mem_mem_space(x: u32) -> u32 {
     x << 4
 }
-pub const fn wait_reg_mem_operation(x: u32) -> u32 {
-    x << 6
-}
 pub const fn wait_reg_mem_engine(x: u32) -> u32 {
     x << 8
 }
 
 /// `function = >= comparison`. Used for signal-value waits.
 pub const WAIT_REG_MEM_FUNC_GEQ: u32 = 5;
-/// `function = == comparison`. Used for the HDP flush handshake.
-pub const WAIT_REG_MEM_FUNC_EQ: u32 = 3;
-
-// ── HDP flush register handshake ──────────────────────────────────────────
-//
-// A register-space WAIT_REG_MEM against the BIF HDP flush register pair is
-// emitted before `acquire_mem` in `memory_barrier`. Without this handshake,
-// host writes through the BAR (kernarg arena) may not have left the HDP
-// write buffers when the command processor consumes the next packet —
-// manifests as a hung dispatch with the signal never firing.
-//
-// The REQ/DONE pair is one handshake channel per bit — CP0..CP9, SDMA0/1,
-// then twenty reserved engines — shared by every agent on the GPU. amdgpu
-// gives each of its rings a bit of its own (`amdgpu_gfx_get_hdp_flush_mask`:
-// gfx `cp0 << pipe`, compute `cp2 << pipe`, MES cp8, KIQ cp9) and waits on
-// that bit alone. Requesting and waiting on all 32 bits at once, as tinygrad
-// does, races those kernel handshakes: once a concurrent MES/KIQ handshake
-// retires its bit, DONE never reads all-ones again and the CP polls forever
-// (seen on gfx1201 on roughly every other GigaAM load, rptr frozen on this
-// packet). A user queue owns no pipe under MES, so svod takes a channel no
-// kernel ring uses on any supported arch: reserved engine 0.
-//
-// The register pair address is **uniform across supported arches**:
-// gfx9 and gfx10+ both define `NBIO_BASE_INST0_SEG2 = 0x0D20`, and every
-// NBIO/NBIF dictionary defines the polled register at `(offset=262,
-// segment=2)` — only the symbolic name (PF0 vs PF1) differs across NBIO
-// versions (Strix Point's nbio_7_11_0 calls it `PF1_GPU_HDP_FLUSH_REQ`
-// while older nbios call the same physical register `PF0_GPU_HDP_FLUSH_REQ`;
-// this is purely a name disambiguation, not an address change).
-pub const HDP_FLUSH_REQ_ADDR: u32 = 0xD20 + 262;
-pub const HDP_FLUSH_DONE_ADDR: u32 = 0xD20 + 263;
-/// `GPU_HDP_FLUSH_REQ/DONE.RSVD_ENG0`, laid out identically in nbio 7.9,
-/// nbio 4.3 and nbif 6.3.1.
-pub const HDP_FLUSH_CHANNEL: u32 = 1 << 12;
 
 // ── PACKET3 opcodes & constants (PM4 dispatch path, single-XCC) ──────────
 //
@@ -299,11 +262,12 @@ pub fn release_mem_event(addr: u64, event_id: u32, is_gfx9: bool) -> [u32; 8] {
     packet
 }
 
-/// End-of-pipe ordering packet with no memory write, matching Tinygrad's first
-/// timestamp RELEASE_MEM. The zero address is ignored when DATA_SEL is none.
+/// End-of-pipe ordering packet with no memory write, Tinygrad's first
+/// timestamp RELEASE_MEM without its interrupt: KFD reserves event id 0, so an
+/// interrupt with no id only sends it scanning every event. The zero address is
+/// ignored when DATA_SEL is none.
 pub fn release_mem_order(is_gfx9: bool) -> [u32; 8] {
-    let memsel = release_mem_int_sel(INT_SEL_INTERRUPT_AFTER_WRITE)
-        | if is_gfx9 { 0 } else { release_mem_dst_sel(DST_SEL_MEMORY) };
+    let memsel = if is_gfx9 { 0 } else { release_mem_dst_sel(DST_SEL_MEMORY) };
     [
         packet3(PACKET3_RELEASE_MEM, 6),
         release_mem_event_type(CACHE_FLUSH_AND_INV_TS_EVENT) | release_mem_event_index(EVENT_INDEX_END_OF_PIPE),
@@ -381,8 +345,8 @@ pub const GCR_FLAGS_ALL: u32 = GCR_GLI_INV
 /// pre-dispatch `acquire_mem(gli=0, gl2=0)`. Yields 0x03F0.
 pub const GCR_FLAGS_NO_GLI_GL2: u32 = GCR_GLM_WB | GCR_GLM_INV | GCR_GLK_WB | GCR_GLK_INV | GCR_GLV_INV | GCR_GL1_INV;
 
-/// Build a PM4 ACQUIRE_MEM packet (cache invalidate). `memory_barrier()`
-/// issues this after a WAIT_REG_MEM on the HDP-flush register. `cache_flags`
+/// Build a PM4 ACQUIRE_MEM packet (cache invalidate), the body of
+/// `memory_barrier()`. `cache_flags`
 /// selects which cache levels to invalidate/write-back — use
 /// [`GCR_FLAGS_ALL`] for the `memory_barrier` site and
 /// [`GCR_FLAGS_NO_GLI_GL2`] for the pre-dispatch site in `build_exec_pm4`
@@ -436,9 +400,10 @@ pub fn acquire_mem_gfx9() -> [u32; 7] {
 ///
 /// Safe as a per-dispatch prologue because a PM4 queue has one XCC, whose L2
 /// every dispatch on the device reads through; memory written behind L2's back
-/// (host, SDMA) is acquired by a full `MemoryBarrier` (HDP flush, L2 invalidate)
-/// before the dispatch that reads it — the full L2 invalidate here would be
-/// pure redundant stall.
+/// (host, SDMA) is acquired by a full `MemoryBarrier` (L2 invalidate; the host
+/// has already flushed its VRAM stores out of HDP, see `Hdp`), which a lane
+/// takes before its next dispatch once such a store is counted — the
+/// full L2 invalidate here would be pure redundant stall.
 pub fn acquire_mem_gfx9_narrow() -> [u32; 7] {
     let cp_coher_cntl = COHER_SH_ICACHE_ACTION_ENA | COHER_SH_KCACHE_ACTION_ENA | COHER_TCL1_ACTION_ENA;
     [packet3(PACKET3_ACQUIRE_MEM, 5), cp_coher_cntl, 0xFFFF_FFFF, 0xFFFF_FFFF, 0, 0, 0x0000_000A]
@@ -469,28 +434,6 @@ pub fn wait_reg_mem(addr: u64, value: u32, mask: u32) -> [u32; 7] {
         mask,
         4, // poll interval (4 dword units)
     ]
-}
-
-/// Build a register-space WAIT_REG_MEM packet that writes `value` to
-/// `reg_req` and polls `reg_done` until `(reg_done & mask) == value`. This is
-/// the "register handshake" variant: `mem_space = 0` (register),
-/// `operation = 1` (write-then-poll), the same encoding and poll interval as
-/// amdgpu's `gfx_v12_0_ring_emit_hdp_flush`.
-///
-/// Layout: 7 dwords (same shape as memory-space variant), but the two
-/// address dwords carry `(reg_req, reg_done)` instead of `(addr_lo, addr_hi)`.
-pub fn wait_reg_mem_register(reg_req: u32, reg_done: u32, value: u32, mask: u32) -> [u32; 7] {
-    let info = wait_reg_mem_mem_space(0)            // 0 = register space
-        | wait_reg_mem_operation(1)                  // 1 = REQ→DONE handshake
-        | wait_reg_mem_function(WAIT_REG_MEM_FUNC_EQ)
-        | wait_reg_mem_engine(0);
-    [packet3(PACKET3_WAIT_REG_MEM, 5), info, reg_req, reg_done, value, mask, 0x20]
-}
-
-/// Build the HDP flush handshake packet for `memory_barrier`: request a
-/// flush on svod's own [`HDP_FLUSH_CHANNEL`] and wait for that bit alone.
-pub fn hdp_flush() -> [u32; 7] {
-    wait_reg_mem_register(HDP_FLUSH_REQ_ADDR, HDP_FLUSH_DONE_ADDR, HDP_FLUSH_CHANNEL, HDP_FLUSH_CHANNEL)
 }
 
 /// Build a `PACKET3_SET_SH_REG`. `reg_offset` is the SH-relative offset

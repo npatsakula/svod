@@ -206,7 +206,7 @@ jit_wrapper! {
 /// Host-resident recurrent weights for the scan. The input projection
 /// (`W_ih`, biases) lives in the feature JIT ([`SileroVad::forward_gates`]);
 /// only the recurrence stays host-side — per-step work is too small for a
-/// GPU launch and measured 3x slower as a CPU-device JIT than 8-lane SIMD.
+/// GPU launch, and slower as a CPU-device JIT than the 8-lane SIMD loop.
 pub(crate) struct VadHead {
     pub(crate) w_hh: ndarray::Array2<f32>,    // [4H, H]
     pub(crate) final_w: ndarray::Array1<f32>, // [H]
@@ -337,11 +337,10 @@ impl VadInference {
         while done < n_chunks {
             let b = (n_chunks - done).min(FEATURE_BATCH);
             {
-                let mut view = self.jit.chunks_view_mut::<f32>()?;
-                let slice = view.as_slice_mut().expect("contiguous chunks");
+                let mut chunks = self.jit.chunks_host_write::<f32>()?;
                 for i in 0..b {
                     let start = (done + i) * NUM_SAMPLES;
-                    slice[i * CHUNK_LEN..(i + 1) * CHUNK_LEN].copy_from_slice(&padded[start..start + CHUNK_LEN]);
+                    chunks.copy_at(i * CHUNK_LEN, &padded[start..start + CHUNK_LEN])?;
                 }
             }
             self.jit.execute()?;

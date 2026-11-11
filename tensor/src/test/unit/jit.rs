@@ -5,7 +5,7 @@
 use svod_dtype::DType;
 use test_case::test_case;
 
-use crate::jit::{Dim, InputSpec, JitError, OutputShape, shrink_batch, to_vec, view, view_mut, zero_fill};
+use crate::jit::{Dim, InputSpec, JitError, OutputShape, host_write, shrink_batch, to_vec, view, zero_fill};
 use crate::{PrepareConfig, Tensor, Variable};
 
 #[test_case(InputSpec::f32(&[2, 3]), DType::Float32, 6; "f32")]
@@ -108,13 +108,28 @@ fn views_reject_a_foreign_dtype_and_an_oversized_shape() {
 }
 
 #[test]
-fn write_view_and_zero_fill_reach_the_same_storage() {
+fn host_write_and_zero_fill_reach_the_same_storage() {
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0]);
     let mut buffer = t.buffer().expect("realized");
 
-    view_mut::<f32>(&buffer).unwrap()[1] = 20.0;
+    host_write::<f32>(&mut buffer).unwrap().copy_at(1, &[20.0]).unwrap();
     assert_eq!(to_vec::<f32>(&buffer, 3).unwrap(), vec![1.0, 20.0, 3.0]);
 
     zero_fill(&mut buffer).unwrap();
     assert_eq!(to_vec::<f32>(&buffer, 3).unwrap(), vec![0.0, 0.0, 0.0]);
+}
+
+#[test]
+fn a_plan_refuses_to_launch_while_a_host_write_into_its_input_is_live() {
+    let x = Tensor::empty(&[2], DType::Float32);
+    let double = (&x + &x).unwrap();
+    let plan = double.prepare().unwrap();
+    let mut input = x.buffer().expect("bound by prepare");
+    let guard = host_write::<f32>(&mut input).unwrap();
+    let err = plan.execute().expect_err("launch with a live guard");
+    assert!(err.to_string().contains("host write"), "{err}");
+    drop(guard);
+    x.with_host_write::<f32, _>(|w| w.copy_from(&[1.5, -2.0])).unwrap();
+    plan.execute().expect("the refusal does not poison the plan");
+    assert_eq!(double.as_vec::<f32>().unwrap(), [3.0, -4.0]);
 }

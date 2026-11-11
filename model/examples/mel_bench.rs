@@ -140,7 +140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stage = timed(args.runs, || {
         mel.frame_into(&audio, &mut framed);
         jit.framed_mut().unwrap().copyin(bytemuck::cast_slice(&framed)).unwrap();
-        jit.frames_view_mut::<i32>().unwrap().as_slice_mut().unwrap()[0] = frames as i32;
+        jit.frames_host_write::<i32>().unwrap().copy_at(0, &[frames as i32]).unwrap();
     });
     let execute = timed(args.runs, || {
         jit.execute().unwrap();

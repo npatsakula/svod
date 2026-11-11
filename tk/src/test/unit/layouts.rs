@@ -1,16 +1,16 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use test_case::test_case;
 
 use svod_dtype::{AmdArch, GpuArch, ScalarDType};
 
-use super::{costs, declared, lane_moves_dear};
+use super::{costs, declared, laid, lane_moves_dear};
 use crate::atoms::{Core, Costs, Device, Target, sm86};
 use crate::build::*;
 use crate::ir::*;
 use crate::layout::{self as frag, Dim};
 use crate::layouts::{
-    Issue, Laid, Pick, Relayout, Swizzle, TileLayout, WarpGrid, chunked, fills_in_chunks, infer, natural, transposing,
+    Issue, Pick, Relayout, Swizzle, TileLayout, WarpGrid, chunked, fills_in_chunks, natural, transposing,
 };
 
 fn coords(l: &TileLayout, warps: u32, lanes: u32) -> Vec<(u32, u32)> {
@@ -42,8 +42,6 @@ fn transposing_layouts_hold_16_byte_column_runs(rows: usize, cols: usize, warps:
     assert!(transposing(Shape::new(8, cols), warps, 32).is_none(), "blocks of 16");
 }
 
-/// The GEMM's accumulator takes the matrix core's C layout tiled over the
-/// warp grid, and the output cast inherits it.
 /// Inference that runs out of passes before every value is laid is an error,
 /// not a program the emitter finds unlaid values in.
 #[test_case(0 => matches Err(crate::layouts::Error::NotConverged { passes: 0 }); "out of passes")]
@@ -51,24 +49,27 @@ fn transposing_layouts_hold_16_byte_column_runs(rows: usize, cols: usize, warps:
 fn inference_out_of_passes_is_an_error(passes: usize) -> crate::layouts::Result<()> {
     let (target, grid) = (sm86(), WarpGrid { rows: 2, cols: 4 });
     let prog = Program { warps: 8, warp_grid: grid, ..super::gemm_nt(256, 256, 256, 128, 128, 32, 3) };
-    let Laid { prog, .. } = infer(prog, &declared(target.clone()), Core::Warp).unwrap();
-    crate::layouts::Infer::new(&prog, &target, grid, Core::Warp).solve_within(passes)
+    let prog = crate::schedule::expand(prog, target.fill, Core::Warp);
+    crate::layouts::Infer::new(&prog, &target, grid, Core::Warp, &HashMap::new()).solve_within(passes)
 }
 
+/// The GEMM's accumulator, carried by its ring's loop, takes the matrix
+/// core's C layout tiled over the warp grid, and the output cast inherits it.
 #[test]
 fn gemm_accumulator_gets_the_core_layout_over_the_warp_grid() {
     let grid = WarpGrid { rows: 2, cols: 4 };
     let prog = Program { warps: 8, warp_grid: grid, ..super::gemm_nt(256, 256, 256, 128, 128, 32, 3) };
-    let Laid { prog, layouts: lay } = infer(prog, &declared(sm86()), Core::Warp).unwrap();
-    let Stmt::Pipeline(p) = &prog.body.0[1] else { panic!("pipeline") };
-    let acc = lay[p.carried[0].phi.index()].as_ref().unwrap();
+    let prog = laid(prog, &declared(sm86())).unwrap();
+    let lay = &prog.layouts;
+    let Stmt::Loop(l) = &prog.body.0[1] else { panic!("the ring's loop") };
+    let acc = lay[l.carried[0].phi.index()].as_ref().unwrap();
     assert_eq!(acc.frag, frag::mma_sync_c());
     assert_eq!(acc.reps, [4, 4]);
     assert_eq!(acc.shape(), Shape::new(128, 128));
     assert_eq!(acc.regs(), 64, "128·128 f32 over 256 threads");
     let Stmt::Let { dst, op: TileOp::Cast { .. } } = &prog.body.0[2] else { panic!("cast") };
     assert_eq!(lay[dst.index()], Some(acc.clone()));
-    let init = p.carried[0].init;
+    let init = l.carried[0].init;
     assert_eq!(lay[init.index()], Some(acc.clone()), "the zero init adopts the carried layout");
     // every element of the block tile is held exactly once
     let held: HashSet<_> = coords(acc, 8, 32).into_iter().collect();
@@ -81,29 +82,32 @@ fn gemm_accumulator_gets_the_core_layout_over_the_warp_grid() {
 #[test]
 fn attention_probabilities_feed_the_second_mma_without_data_movement() {
     let (bq, bkv, d) = (64usize, 64usize, 64usize);
-    let mut k = Kernel::new("fa");
-    let q = k.param::<BF16>("q", ParamKind::In, bq * d);
-    let kk = k.smem::<BF16>("k", bkv * d);
-    let vv = k.smem::<BF16>("v", bkv * d);
-    let q_g = k.view(q, 0, [d, 1], Shape::new(bq, d), [None, None]);
-    let q_r = k.load(q_g);
-    let k_s = k.smem_view::<BF16>(kk, 0, Shape::new(bkv, d));
-    let v_s = k.smem_view::<BF16>(vv, 0, Shape::new(bkv, d));
-    let zero = k.zeros::<F32>(Shape::new(bq, bkv));
-    let s = k.mma(zero, q_r, false, k_s, true);
-    let m = k.reduce(s, Axis::Row, ReduceOp::Max);
-    let p = k.binary(s, m, BinaryOp::Sub);
-    let p = k.unary(p, UnaryOp::Exp2);
-    let l = k.reduce(p, Axis::Row, ReduceOp::Sum);
-    let p16 = k.cast::<F32, BF16>(p);
-    let o0 = k.zeros::<F32>(Shape::new(bq, d));
-    let o = k.mma(o0, p16, false, v_s, false);
-    let o = k.binary(o, l, BinaryOp::Div);
-    let out = k.param::<F32>("o", ParamKind::Out, bq * d);
-    let o_g = k.view(out, 0, [d, 1], Shape::new(bq, d), [None, None]);
-    k.store(o_g, o);
-    k.warps(4);
-    let Laid { prog, layouts: lay } = infer(k.finish(), &declared(sm86()), Core::Warp).unwrap();
+    let (prog, (q_r, m)) = Kernel::record_with("fa", |k| {
+        let q = k.input::<BF16>("q", bq * d);
+        let kk = k.smem::<BF16>("k", bkv * d);
+        let vv = k.smem::<BF16>("v", bkv * d);
+        let q_g = k.view(q, 0, [d, 1], Shape::new(bq, d), [None, None]);
+        let q_r = k.load(q_g);
+        let k_s = k.smem_view::<BF16>(kk, 0, Shape::new(bkv, d));
+        let v_s = k.smem_view::<BF16>(vv, 0, Shape::new(bkv, d));
+        let zero = k.zeros::<F32>(Shape::new(bq, bkv));
+        let s = *k.mma(zero, q_r, false, k_s, true);
+        let m = k.reduce(s, Axis::Row, ReduceOp::Max);
+        let p = k.binary(s, m, BinaryOp::Sub);
+        let p = k.unary(p, UnaryOp::Exp2);
+        let l = k.reduce(p, Axis::Row, ReduceOp::Sum);
+        let p16 = k.cast::<F32, BF16>(p);
+        let o0 = k.zeros::<F32>(Shape::new(bq, d));
+        let o = *k.mma(o0, p16, false, v_s, false);
+        let o = k.binary(o, l, BinaryOp::Div);
+        let out = k.output::<F32>("o", bq * d);
+        let o_g = k.view(out, 0, [d, 1], Shape::new(bq, d), [None, None]);
+        k.store(o_g, o);
+        k.warps(4);
+        (q_r.0, m.0)
+    });
+    let prog = laid(prog, &declared(sm86())).unwrap();
+    let lay = &prog.layouts;
     let relayouts: Vec<_> = prog
         .walk()
         .filter_map(|(_, s)| match s {
@@ -117,8 +121,8 @@ fn attention_probabilities_feed_the_second_mma_without_data_movement() {
     assert_eq!(from.frag, frag::mma_sync_c());
     assert_eq!(to.frag, frag::mma_sync_a());
     assert_eq!(from.relayout(to, 4, 32, &costs(), false), Relayout::Identity);
-    assert_eq!(lay[q_r.0.index()].as_ref().unwrap().frag, frag::mma_sync_a());
-    let m_l = lay[m.0.index()].as_ref().unwrap();
+    assert_eq!(lay[q_r.index()].as_ref().unwrap().frag, frag::mma_sync_a());
+    let m_l = lay[m.index()].as_ref().unwrap();
     assert_eq!((m_l.frag.in_size(Dim::Reg), m_l.shape()), (2, Shape::new(bq, 1)), "two rows per lane");
     assert_eq!(m_l.row_fold_masks().as_slice(), &[1, 2], "quads share a row");
 }
@@ -154,19 +158,21 @@ fn shapes_that_do_not_tile_the_grid_are_rejected() {
 #[test]
 fn a_product_result_pinned_off_its_atom_is_refused() {
     let shape = Shape::new(16, 16);
-    let mut k = Kernel::new("pinned_product");
-    k.warps(1);
-    let a = k.param::<BF16>("a", ParamKind::In, shape.elems());
-    let c = k.param::<F32>("c", ParamKind::Out, shape.elems());
-    let v = k.view(a, 0, [16, 1], shape, [None, None]);
-    let x = k.load(v);
-    let zero = k.zeros::<F32>(shape);
-    let acc = k.mma(zero, x, false, x, true);
-    k.pin(acc, natural(shape, 1, 32).unwrap());
-    let out = k.view(c, 0, [16, 1], shape, [None, None]);
-    k.store(out, acc);
-    let err = infer(k.finish(), &declared(sm86()), Core::Warp).err();
-    assert!(matches!(err, Some(crate::layouts::Error::Unresolved { value }) if value == acc.0), "{err:?}");
+    let (prog, acc) = Kernel::record_with("pinned_product", |k| {
+        k.warps(1);
+        let a = k.input::<BF16>("a", shape.elems());
+        let c = k.output::<F32>("c", shape.elems());
+        let v = k.view(a, 0, [16, 1], shape, [None, None]);
+        let x = k.load(v);
+        let zero = k.zeros::<F32>(shape);
+        let acc = *k.mma(zero, x, false, x, true);
+        k.pin(acc, natural(shape, 1, 32).unwrap());
+        let out = k.view(c, 0, [16, 1], shape, [None, None]);
+        k.store(out, acc);
+        acc.0
+    });
+    let err = laid(prog, &declared(sm86())).err();
+    assert!(matches!(err, Some(crate::layouts::Error::Unresolved { value }) if value == acc), "{err:?}");
 }
 
 /// A register-staged fill's layout holds every element of its tile, each
@@ -224,32 +230,35 @@ fn chunked_layouts_cover_their_tile_in_16_byte_runs(
 /// reads them in its result's layout.
 #[test]
 fn elementwise_operands_reach_the_op_in_its_layout() {
-    let mut k = Kernel::new("mixed");
-    k.warps(1);
-    let x = k.param::<BF16>("x", ParamKind::In, 256);
-    let y = k.param::<BF16>("y", ParamKind::In, 256);
-    let view = |k: &mut Kernel, p| k.view(p, 0, [16, 1], Shape::new(16, 16), [None, None]);
-    let (xg, yg) = (view(&mut k, x), view(&mut k, y));
-    let (xr, yr) = (k.load(xg), k.load(yg));
-    let acc = k.zeros::<F32>(Shape::new(16, 16));
-    let prod = k.mma(acc, xr, false, yr, false);
-    let sum = k.binary(xr, yr, BinaryOp::Add);
-    let sum = k.cast::<BF16, F32>(sum);
-    let both = k.binary(prod, sum, BinaryOp::Mul);
-    // Laid only by what follows: the sum as a B operand, `u` as an A one.
-    let z = k.param::<BF16>("z", ParamKind::In, 512);
-    let (ug, wg) = (view(&mut k, z), k.view(z, 256, [16, 1], Shape::new(16, 16), [None, None]));
-    let (u, w) = (k.load(ug), k.load(wg));
-    let uw = k.binary(u, w, BinaryOp::Add);
-    let acc = k.zeros::<F32>(Shape::new(16, 16));
-    let first = k.mma(acc, u, false, yr, false);
-    let again = k.mma(first, xr, false, uw, false);
-    let both = k.binary(both, again, BinaryOp::Add);
-    let out = k.param::<F32>("o", ParamKind::Out, 256);
-    let o = k.view(out, 0, [16, 1], Shape::new(16, 16), [None, None]);
-    k.store(o, both);
-    let Laid { prog, layouts } = infer(k.finish(), &declared(sm86()), Core::Warp).unwrap();
-    let lay = |v: &ValId| layouts[v.index()].clone().unwrap();
+    fn view<'k>(k: &mut Kernel<'k>, p: ParamRef<'k, BF16, In>) -> Gmem<'k, BF16> {
+        k.view(p, 0, [16, 1], Shape::new(16, 16), [None, None])
+    }
+    let prog = Kernel::record("mixed", |k| {
+        k.warps(1);
+        let x = k.input::<BF16>("x", 256);
+        let y = k.input::<BF16>("y", 256);
+        let (xg, yg) = (view(k, x), view(k, y));
+        let (xr, yr) = (k.load(xg), k.load(yg));
+        let acc = k.zeros::<F32>(Shape::new(16, 16));
+        let prod = *k.mma(acc, xr, false, yr, false);
+        let sum = k.binary(xr, yr, BinaryOp::Add);
+        let sum = k.cast::<BF16, F32>(sum);
+        let both = k.binary(prod, sum, BinaryOp::Mul);
+        // Laid only by what follows: the sum as a B operand, `u` as an A one.
+        let z = k.input::<BF16>("z", 512);
+        let (ug, wg) = (view(k, z), k.view(z, 256, [16, 1], Shape::new(16, 16), [None, None]));
+        let (u, w) = (k.load(ug), k.load(wg));
+        let uw = k.binary(u, w, BinaryOp::Add);
+        let acc = k.zeros::<F32>(Shape::new(16, 16));
+        let first = k.mma(acc, u, false, yr, false);
+        let again = *k.mma(first, xr, false, uw, false);
+        let both = k.binary(both, again, BinaryOp::Add);
+        let out = k.output::<F32>("o", 256);
+        let o = k.view(out, 0, [16, 1], Shape::new(16, 16), [None, None]);
+        k.store(o, both);
+    });
+    let prog = laid(prog, &declared(sm86())).unwrap();
+    let lay = |v: &ValId| prog.layouts[v.index()].clone().unwrap();
     let mut checked = 0;
     for (_, s) in prog.walk() {
         if let Stmt::Let { dst, op: TileOp::Binary { a, b, .. } } = s {
@@ -266,35 +275,36 @@ fn elementwise_operands_reach_the_op_in_its_layout() {
 /// when `bias`.
 fn attention_step(bias: bool) -> Program {
     let (bq, bkv, d) = (64usize, 16usize, 64usize);
-    let mut k = Kernel::new("fa");
-    let q = k.param::<BF16>("q", ParamKind::In, bq * d);
-    // Rows a line apart, as the kernel's bias views are (`bias_stride`):
-    // a lane's row is a line of its own.
-    let b = k.param::<BF16>("bias", ParamKind::In, bq * 64);
-    let kk = k.smem::<BF16>("k", bkv * d);
-    let vv = k.smem::<BF16>("v", bkv * d);
-    let q_g = k.view(q, 0, [d, 1], Shape::new(bq, d), [None, None]);
-    let q_r = k.load(q_g);
-    let k_s = k.smem_view::<BF16>(kk, 0, Shape::new(bkv, d));
-    let v_s = k.smem_view::<BF16>(vv, 0, Shape::new(bkv, d));
-    let zero = k.zeros::<F32>(Shape::new(bq, bkv));
-    let mut s = k.mma(zero, q_r, false, k_s, true);
-    if bias {
-        let b_g = k.view(b, 0, [64, 1], Shape::new(bq, bkv), [None, None]);
-        let b_r = k.load(b_g);
-        let b_r = k.cast::<BF16, F32>(b_r);
-        s = k.binary(s, b_r, BinaryOp::Add);
-    }
-    let m = k.reduce(s, Axis::Row, ReduceOp::Max);
-    let p = k.binary(s, m, BinaryOp::Sub);
-    let p = k.unary(p, UnaryOp::Exp2);
-    let p16 = k.cast::<F32, BF16>(p);
-    let o0 = k.zeros::<F32>(Shape::new(bq, d));
-    let o = k.mma(o0, p16, false, v_s, false);
-    let out = k.param::<F32>("o", ParamKind::Out, bq * d);
-    let o_g = k.view(out, 0, [d, 1], Shape::new(bq, d), [None, None]);
-    k.store(o_g, o);
-    let mut prog = k.finish();
+    let prog = Kernel::record("fa", |k| {
+        let q = k.input::<BF16>("q", bq * d);
+        // Rows a line apart, as the kernel's bias views are (`bias_stride`):
+        // a lane's row is a line of its own.
+        let b = k.input::<BF16>("bias", bq * 64);
+        let kk = k.smem::<BF16>("k", bkv * d);
+        let vv = k.smem::<BF16>("v", bkv * d);
+        let q_g = k.view(q, 0, [d, 1], Shape::new(bq, d), [None, None]);
+        let q_r = k.load(q_g);
+        let k_s = k.smem_view::<BF16>(kk, 0, Shape::new(bkv, d));
+        let v_s = k.smem_view::<BF16>(vv, 0, Shape::new(bkv, d));
+        let zero = k.zeros::<F32>(Shape::new(bq, bkv));
+        let mut s = *k.mma(zero, q_r, false, k_s, true);
+        if bias {
+            let b_g = k.view(b, 0, [64, 1], Shape::new(bq, bkv), [None, None]);
+            let b_r = k.load(b_g);
+            let b_r = k.cast::<BF16, F32>(b_r);
+            s = k.binary(s, b_r, BinaryOp::Add);
+        }
+        let m = k.reduce(s, Axis::Row, ReduceOp::Max);
+        let p = k.binary(s, m, BinaryOp::Sub);
+        let p = k.unary(p, UnaryOp::Exp2);
+        let p16 = k.cast::<F32, BF16>(p);
+        let o0 = k.zeros::<F32>(Shape::new(bq, d));
+        let o = *k.mma(o0, p16, false, v_s, false);
+        let out = k.output::<F32>("o", bq * d);
+        let o_g = k.view(out, 0, [d, 1], Shape::new(bq, d), [None, None]);
+        k.store(o_g, o);
+    });
+    let mut prog = prog;
     prog.warps = 4;
     prog
 }
@@ -310,11 +320,12 @@ fn gfx1151_attention(prog: Program, costs: &Costs) -> (Vec<Orient>, Vec<(TileLay
 fn gfx1151_attention_folds(prog: Program, costs: &Costs) -> (Vec<Orient>, Vec<(TileLayout, TileLayout)>, Vec<u32>) {
     let target = Target::for_arch(GpuArch::Amd(AmdArch::Gfx1151));
     let how = target.lane_move;
-    let Laid { prog, layouts: lay } = infer(prog, &Device { target, costs: *costs }, Core::Warp).unwrap();
+    let prog = laid(prog, &Device { target, costs: *costs }).unwrap();
+    let lay = &prog.layouts;
     let orients = prog
         .walk()
         .filter_map(|(_, s)| match s {
-            Stmt::Let { op: TileOp::Mma { orient, .. }, .. } => *orient,
+            Stmt::Let { op: TileOp::Mma { orient, .. }, .. } => Some(*orient),
             _ => None,
         })
         .collect();
@@ -563,32 +574,28 @@ fn a_fold_issues_the_lane_moves_it_is_priced(target: Target, orient: Orient, axi
     let (rows, cols) = (32, 32);
     let atom = target.mma(svod_dtype::ScalarDType::BFloat16, svod_dtype::ScalarDType::Float32).unwrap().clone();
     let held = atom.issue(orient, grid, rows, cols, 16).unwrap().c;
-    let mut k = Kernel::new("fold");
-    k.warps(grid);
-    let tile = Shape::new(rows, cols);
-    let x = k.param::<F32>("x", ParamKind::In, tile.elems());
-    let x = k.view(x, 0, [cols, 1], tile, [None, None]);
-    let x = k.load(x);
-    k.pin(x, held.clone());
-    let folded = k.reduce(x, axis, ReduceOp::Max);
-    let out = k.shape(folded);
-    let y = k.param::<F32>("y", ParamKind::Out, out.elems());
-    let y = k.view(y, 0, [out.cols, 1], out, [None, None]);
-    k.store(y, folded);
+    let prog = Kernel::record("fold", |k| {
+        k.warps(grid);
+        let tile = Shape::new(rows, cols);
+        let x = k.input::<F32>("x", tile.elems());
+        let x = k.view(x, 0, [cols, 1], tile, [None, None]);
+        let x = k.load(x);
+        k.pin(x, held.clone());
+        let folded = k.reduce(x, axis, ReduceOp::Max);
+        let out = k.shape(folded);
+        let y = k.output::<F32>("y", out.elems());
+        let y = k.view(y, 0, [out.cols, 1], out, [None, None]);
+        k.store(y, folded);
+    });
     let device = Device { target: target.clone(), costs: costs() };
     let lowering = crate::lower::Lowering::new(&device);
-    let prog = k.finish();
-    let laid = infer(prog.clone(), &device, Core::Warp).unwrap();
-    let priced: u32 = laid
-        .prog
+    let inferred = laid(prog.clone(), &device).unwrap();
+    let priced: u32 = inferred
         .walk()
         .filter_map(|(_, s)| match s {
             Stmt::Let { dst, op: TileOp::Reduce { src, axis, .. } } => {
-                Some(laid.layouts[src.index()].as_ref()?.fold_moves(
-                    laid.layouts[dst.index()].as_ref()?,
-                    *axis,
-                    target.lane_move,
-                ))
+                let (ls, ld) = (inferred.layouts[src.index()].as_ref()?, inferred.layouts[dst.index()].as_ref()?);
+                Some(ls.fold_moves(ld, *axis, target.lane_move))
             }
             _ => None,
         })

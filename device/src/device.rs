@@ -271,6 +271,7 @@ pub enum NativeReplayDecline {
     ForeignCopyEndpoint { operation: u64, endpoint: CopyEndpoint, expected: DeviceSpec, actual: DeviceSpec },
     IncompatibleCopyAllocation { operation: u64, endpoint: CopyEndpoint, expected: DeviceSpec },
     StagedCopy { operation: usize },
+    EmptyLaunch { operation: u64 },
     BackendUnsupported,
 }
 
@@ -838,6 +839,14 @@ pub struct ConcreteLaunchDims {
     pub local_size: Option<[usize; 3]>,
 }
 
+impl ConcreteLaunchDims {
+    /// No thread runs: a symbolic dimension bound to 0 (a variable with
+    /// `vmin == 0`) empties the grid, and the launch is skipped, not submitted.
+    pub fn is_empty(&self) -> bool {
+        self.global_size.iter().chain(self.local_size.iter().flatten()).any(|&dim| dim == 0)
+    }
+}
+
 fn default_launch_size() -> [Arc<UOp>; 3] {
     [UOp::index_const(1), UOp::index_const(1), UOp::index_const(1)]
 }
@@ -1025,9 +1034,9 @@ fn eval_launch_size(size: &[Arc<UOp>; 3], vars: &HashMap<&str, i64>) -> Result<[
     let mut out = [1usize; 3];
     for (idx, expr) in size.iter().enumerate() {
         let value = eval_launch_expr(expr, vars)?;
-        if value <= 0 {
+        if value < 0 {
             return Err(Error::Runtime {
-                message: format!("launch dimension {idx} evaluated to non-positive value {value}"),
+                message: format!("launch dimension {idx} evaluated to negative value {value}"),
             });
         }
         out[idx] = usize::try_from(value).map_err(|_| Error::Runtime {

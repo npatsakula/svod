@@ -4,7 +4,7 @@ sidebar_label: 布局与降级
 
 # 布局与降级 {#layouts-and-lowering}
 
-`lower::lower(program, &lowering, params, device)` 把 tile 程序变成一个指令列表已排好顺序的 Svod 程序。`Lowering` 包含程序本身没有说明的东西：`Device`（目标及其代价），以及乘积在哪种矩阵指令上发出（`core`）：warp 级核心用 `Lowering::new(&device)`，`GemmCfg::lowering` 和 `FaCfg::lowering` 用其配置的核心。块 tile 上的 `WarpGrid`（`Kernel::warps`）和每个环的调度（`pipeline` 的 `Ring`）属于程序本身；共享内存行总是做 XOR swizzle。`lower::standalone(program, &lowering)` 针对未连接设备的目标进行降级，`lower::render` 返回将交给后端编译器的 LLVM 文本。
+`lower::lower(program, &lowering, params, device)` 把 tile 程序变成一个指令列表已排好顺序的 Svod 程序。`Lowering` 包含程序本身没有说明的东西：`Device`（目标及其代价），以及乘积在哪种矩阵指令上发出（`core`）：warp 级核心用 `Lowering::new(&device)`，`GemmCfg::lowering` 和 `FaCfg::lowering` 用其配置的核心。块 tile 上的 `WarpGrid`（`Kernel::warps`）和每个环的 `Schedule`（`Kernel::ring`，拿到该环的流水线按它运行）属于程序本身；共享内存行总是做 XOR swizzle。`lower::standalone(program, &lowering)` 针对未连接设备的目标进行降级，`lower::render` 返回将交给后端编译器的 LLVM 文本。
 
 | 步骤 | 模块 | 作用 |
 |---|---|---|
@@ -15,7 +15,13 @@ sidebar_label: 布局与降级
 | 5. 共享内存方向 | `lower` | 经由寄存器填充的共享分配，沿其读者片段延伸的轴存储，使收集操作成为 16 字节加载；`cp.async` 的 tile 保持行主序 |
 | 6. 发射 | `lower/emit/` | 语句按程序顺序发射到 `UOp::linear_program` 中 |
 
-当程序的 warp 数不等于 warp 网格的 warp 数（或在主体中有 `Warps` 语句时不是其倍数）时，`lower` 以 `Error::Grid` 失败；当块屏障位于按 warp 分支的分支之下、会被部分 warp 跳过时，以 `Error::DivergentBarrier` 失败。
+`lower` 在任何步骤之前失败的情形：
+
+- 当程序的 warp 数不等于 warp 网格的 warp 数（或在主体中有 `Warps` 语句时不是其倍数）时，以 `Error::Grid` 失败；
+- 当寄存器 tile 在其定义不支配该读取的位置被读取时，以 `Error::Escaped` 失败：从循环体、分支或 `Warps` 主体中保留下来、在其之外读取的 tile；
+- 当共享视图的偏移（由其循环的行程数和其流水线的槽界定）超出其分配时，以 `Error::SharedPast` 失败：环持有的槽少于触及它的流水线所运行的槽数。
+
+当块屏障（作者写的或降级插入的）位于按 warp 分支（`where_any`、`if_any`）之下、会被部分 warp 跳过时，屏障 pass 以 `Error::DivergentBarrier` 失败。
 
 ## F2 线性布局 {#f2-linear-layouts}
 
@@ -31,7 +37,7 @@ pub fn mma_sync_c() -> Layout {
 }
 ```
 
-这套代数提供 `identity`、`zeros`、`from_bases`、`transpose`、`product`（把一个布局平铺到另一个布局之上）、`sublayout` 和 `apply`。测试把每个原子与厂商 ISA 文档中的 lane 公式（`test/unit/atoms.rs`）以及 tk1 的闭式公式（`test/unit/layout.rs`）进行对比。
+这套代数提供 `identity`、`zeros`、`from_bases`、`transpose`、`product`（把一个布局平铺到另一个布局之上）、`sublayout` 和 `apply`。测试把每个原子与厂商 ISA 文档中的 lane 公式（`test/unit/atoms.rs`）以及闭式的 lane 映射（`test/unit/layout.rs`）进行对比。
 
 寄存器 tile 的布局是 `layouts::TileLayout { frag, reps, warps }`。它包含一个定义在 `(Reg, Lane)` 上的片段，在每个 warp 的子 tile 内重复 `reps` 次，以及各 warp 的子 tile 坐标。
 
@@ -43,7 +49,7 @@ pub fn mma_sync_c() -> Layout {
 |---|---|---|
 | CUDA | `mma.sync` m16n8k16 | `mma_sync_a`, `mma_sync_b`, `mma_sync_c` |
 | CUDA sm_90 | `wgmma` m64nNk16，四个 warp 一起 | `wgmma_a`、`wgmma_c`；`B` 经描述符读取，从不驻留寄存器 |
-| AMD CDNA | MFMA 16×16×16 | `mfma_16x16x16` |
+| AMD CDNA | MFMA 16×16×16；宽核心上为 32×32×8（`Core::Wide`，注意力） | `mfma_16x16x16`；`mfma_32x32x8_a`、`mfma_32x32x8_c` |
 | AMD RDNA3 / RDNA4 | WMMA 16×16×16 | `wmma_gfx11_input`、`wmma_gfx11_acc` / `wmma_gfx12` |
 | Apple | simdgroup 8×8×8（仅原子；无内核） | `simdgroup_8x8` |
 
@@ -57,11 +63,11 @@ pub fn mma_sync_c() -> Layout {
 2. **逐元素操作统一布局。** `binary`、`cast`、`where_`、`mul_add` 的操作数和结果，以及循环的携带值，共享同一布局。
 3. **无约束的 tile 取自然布局。** 到达不动点时，没有任何约束的 tile 获得 `layouts::natural`：每个 lane 持有最多 8 个元素的短行向量，lane 先沿列再沿行遍历，warp 按行切分。
 4. **向量跟随其 tile。** `[rows, 1]` 或 `[1, cols]` 向量（例如 `reduce` 的输出或偏置行）被要求采用其 tile 所蕴含的行或列布局。
-5. **冲突变为重布局。** 两个消费者需要不同布局的值，会被插入一个 `TileOp::Relayout`。`TileLayout::relayout` 把它归类为 `Identity`、`RegPermute`（在每个 lane 内，免费）、`Exchange`（每个寄存器通过 lane-xor 移动从固定伙伴取得）或 `ViaSmem`。`Exchange` 只在其工作量的代价低于一次经由共享内存的往返时保留（`Relayout::work × Costs::lane_move < Costs::smem_trip`）。发射器用目标的 `atoms::LaneMove` 实现 `Exchange`（CUDA 上为 `shfl.sync`，RDNA 上为 DPP 和 `permlanex16`，CDNA 上为 `ds_bpermute`）。
+5. **冲突变为重布局。** 两个消费者需要不同布局的值，会被插入一个 `TileOp::Relayout`。`TileLayout::relayout` 把它归类为 `Identity`、`RegPermute`（在每个 lane 内，免费）、`Exchange`（每个寄存器通过 lane-xor 移动从固定伙伴取得）或 `ViaSmem`。`Exchange` 只在其工作量的代价低于一次经由共享内存的往返时保留（`Relayout::work × Costs::lane_move < Costs::smem_trip`）。发射器用目标的 `atoms::LaneMove` 实现 `Exchange`（CUDA 上为 `shfl.sync`，RDNA 上为 DPP 和 `permlanex16`，CDNA 上为 `ds_bpermute`）。`flip` 按相同的类别移动：在持有两个交换元素的 lane 内部完成（寄存器重命名），否则通过 `TileLayout::flip` 的 lane 间移动完成；伙伴位于其他 warp 的情况不受支持，带旋转的 GEMM 的排序只接受其 warp 持有完整头的 tile。
 
 ## 调度模板 {#schedule-templates}
 
-`schedule::expand` 按每个 `Pipeline` 的 `Ring { stages, unroll, crews }` 和目标的 `Fill` 展开它。一个工作组：每个 warp 都负责加载和计算。两个工作组：块内的 warp 分成两个相隔一个簇的工作组，共用一个寄存器暂存槽（CDNA GEMM，`GemmCfg::crews == 2`）。
+`schedule::expand` 按每个 `Pipeline` 的 `Schedule`（由 `depth` 个槽组成、展开或不展开的环，或两个工作组）和目标的 `Fill` 展开它。一个工作组：每个 warp 都负责加载和计算。两个工作组：块内的 warp 分成两个相隔一个簇的工作组，共用一个寄存器暂存槽（CDNA GEMM，`Schedule::PingPong`）。
 
 | 填充方式 | `pipeline(extent, ring, …)` 的展开方式 |
 |---|---|

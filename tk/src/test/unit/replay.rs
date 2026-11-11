@@ -86,7 +86,7 @@ fn a_replay_reads_a_keys_line_whatever_compiler_wrote_it(
 fn a_replay_writes_nothing() {
     let dir = Scratch::new("replay-writes");
     let planner = super::planner(sm86());
-    let ranked = planner.gemm_ranked(1, 256, 256, 256, false);
+    let ranked = planner.gemm_ranked(1, 256, 256, 256, &Epilogue::DEFAULT);
     let file = write(&dir, &key(), &[format!("{} 5", key().line(Kind::Value, 1))]);
     std::fs::create_dir_all(dir.join("emitted")).expect("emitted dir");
     let stale = dir.join("emitted/0000000000000000.txt");
@@ -94,8 +94,7 @@ fn a_replay_writes_nothing() {
     let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1);
     std::fs::File::options().write(true).open(&stale).and_then(|f| f.set_modified(old)).expect("aged");
     let before = tree(&dir);
-    let spec =
-        GemmSpec { m: 256, n: 256, k: 256, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg: ranked[0] };
+    let spec = GemmSpec { m: 256, n: 256, k: 256, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT };
     let store = TuneStore::replay(dir.to_path_buf());
     tuned::linear(&store, &planner, DType::BFloat16, &ranked, spec);
     assert!(store.lookups().iter().all(|l| matches!(l.found, Found::Missing { .. })), "{:?}", store.lookups());
@@ -113,9 +112,8 @@ fn a_replay_writes_nothing() {
 #[test_case(true; "the GEMM probes")]
 fn a_gemm_tuning_reads_the_key_the_op_layer_writes(probe: bool) {
     let planner = super::planner(sm86());
-    let ranked = planner.gemm_ranked(1, 512, 512, 512, false);
-    let spec =
-        GemmSpec { m: 512, n: 512, k: 512, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg: ranked[0] };
+    let ranked = planner.gemm_ranked(1, 512, 512, 512, &Epilogue::DEFAULT);
+    let spec = GemmSpec { m: 512, n: 512, k: 512, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT };
     let dir = Scratch::new(&format!("replay-key-{probe}"));
     let store = TuneStore::replay(dir.to_path_buf());
     let reps = representatives(&ranked);
@@ -146,7 +144,7 @@ fn a_batch_keys_as_it_did() {
 /// planner and its ranking's representatives.
 fn admitted_and_chosen(dir: &Path) -> (Planner, Arc<[GemmCfg]>, Vec<GemmCfg>) {
     let planner = super::planner(sm86());
-    let ranked = planner.gemm_ranked(1, 512, 512, 512, false);
+    let ranked = planner.gemm_ranked(1, 512, 512, 512, &Epilogue::DEFAULT);
     let reps = representatives(&ranked);
     let salt = format!("{:?}", (Batch::Static(1), Epilogue::DEFAULT));
     let at = |rule: &str, list: &[GemmCfg]| {
@@ -166,8 +164,8 @@ fn admitted_and_chosen(dir: &Path) -> (Planner, Arc<[GemmCfg]>, Vec<GemmCfg>) {
     (planner, ranked, reps)
 }
 
-fn spec(cfg: GemmCfg) -> GemmSpec {
-    GemmSpec { m: 512, n: 512, k: 512, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg }
+fn spec() -> GemmSpec {
+    GemmSpec { m: 512, n: 512, k: 512, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT }
 }
 
 /// A replayed tuning follows the stored stages: the admitted indices name
@@ -179,7 +177,7 @@ fn a_replayed_gemm_follows_the_admission_and_the_choice() {
     let dir = Scratch::new("replay-chain");
     let (planner, ranked, reps) = admitted_and_chosen(&dir);
     let store = TuneStore::replay(dir.to_path_buf());
-    let pick = tuned::linear(&store, &planner, DType::BFloat16, &ranked, spec(ranked[0])).cfg;
+    let pick = tuned::linear(&store, &planner, DType::BFloat16, &ranked, spec()).cfg();
     assert_eq!(pick, reps[1], "the choice's fastest, the second admitted");
     let lookups = store.lookups();
     let found: Vec<(Kind, Found)> = lookups.iter().map(|l| (l.kind, l.found)).collect();
@@ -201,7 +199,7 @@ fn the_planner_log_names_the_admitted_and_chosen_configs() {
     if let Some(dir) = std::env::var_os(CHILD) {
         super::traced();
         let (planner, ranked, _) = admitted_and_chosen(Path::new(&dir));
-        tuned::linear(&TuneStore::replay(dir.into()), &planner, DType::BFloat16, &ranked, spec(ranked[0]));
+        tuned::linear(&TuneStore::replay(dir.into()), &planner, DType::BFloat16, &ranked, spec());
         return;
     }
     let dir = Scratch::new("replay-log");

@@ -71,7 +71,7 @@ pub fn wgmma_a() -> Layout {
 
 /// The registers one `ldmatrix.sync.aligned.m8n8.x4[.trans].b16` fills: each lane gets
 /// a pair `(L/4, 2(L%4) + e)` of every 8×8 matrix (transposed under `.trans`), and
-/// register pair `p` is matrix `p` of the [`ldmatrix_x4_rows`] order (TL, BL, TR, BR)
+/// register pair `p` is matrix `p` of the lanes' addressing order (TL, BL, TR, BR)
 /// — plain, or with the middle two swapped under `.trans` (ThunderKittens `ldsm4t`).
 /// Plain equals [`mma_sync_16x16`], `.trans` its transpose.
 pub fn ldmatrix_x4(trans: bool) -> Layout {

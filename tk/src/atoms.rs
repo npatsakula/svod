@@ -16,6 +16,9 @@ pub enum Core {
     /// The warp-level atom ([`MmaAtom`]): operands in registers.
     #[default]
     Warp,
+    /// The wider, shallower warp-level atom ([`Target::wide_mma`]): the same
+    /// products in half the instructions, each reading more registers.
+    Wide,
     /// The warpgroup atom ([`GroupMmaAtom`]): a grid's rows are warpgroups
     /// of four warps, and shared operands are read through descriptors.
     Group,
@@ -143,6 +146,10 @@ pub struct Occupancy {
     /// matrix core has a file of its own (CDNA's AGPRs); 0 where accumulators
     /// take vector registers.
     pub acc_file: u32,
+    /// Blocks an SM holds at once whatever their resources: CUDA's limit;
+    /// on AMD a CU's barriers, which a block of one wave does not take
+    /// ([`Target::blocks_per_sm`]).
+    pub blocks: u32,
 }
 
 impl Occupancy {
@@ -152,12 +159,39 @@ impl Occupancy {
     }
 }
 
+/// Shared memory as `count` banks of `bytes` each, selected by the low address
+/// bits. A read keeps full bandwidth only while each `count` consecutive lanes
+/// reach `count` banks, half of it when they reach half of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SharedBanks {
+    pub count: u32,
+    pub bytes: u32,
+}
+
+/// Global memory through buffer descriptors with the cache-swizzle bit, which
+/// spreads rows a stride would pile into one L1 set. The bit changes how L1 lays out a line's
+/// 32-byte sectors: within one dispatch, a line read or stored under two
+/// mappings (flat and swizzled, or two strides) reads the wrong sector, so a
+/// kernel takes one mapping for all of them, whichever of its operands alias.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CacheSwizzle {
+    /// Bytes of the narrowest row that gains: narrower ones already spread.
+    pub min_row: usize,
+    /// Bytes of the widest row that gains: wider ones stay piled up.
+    pub max_row: usize,
+    /// The widest stride, in bytes, that spreads rows.
+    pub max_stride: usize,
+}
+
 /// What a target offers the lowering.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Target {
     pub arch: GpuArch,
     pub wave: u32,
     pub mma: Vec<MmaAtom>,
+    /// A warp-level core wider and shallower than [`Self::mma`]'s, over the
+    /// same 16-bit inputs, where the target has one.
+    pub wide_mma: Vec<MmaAtom>,
     /// Warpgroup matrix instructions over shared descriptors, where the
     /// target has them (Hopper).
     pub group_mma: Vec<GroupMmaAtom>,
@@ -182,12 +216,19 @@ pub struct Target {
     /// a cluster so one crew's products overlap the other's loads: two where
     /// the matrix core runs beside the vector units and a lane's file holds
     /// two crews' accumulators (CDNA), one elsewhere
-    /// ([`crate::schedule::Schedule::PingPong`]).
+    /// ([`crate::ir::Schedule::PingPong`]).
     pub crews: u32,
     /// Dies a dispatch deals its blocks to round-robin, each with its own L2
     /// (CDNA3's XCDs): the lowering renumbers blocks so consecutive ones share
-    /// a die ([`crate::lower::emit::die_order`]). 1 where a device is one die.
+    /// a die, each die's share of a dispatch laid end to end. 1 where a device
+    /// is one die.
     pub xcds: u32,
+    /// How shared memory serves a wave, where its reads depend on the address
+    /// ([`SharedBanks`]).
+    pub shared_banks: Option<SharedBanks>,
+    /// How global memory's rows spread over the L1 sets, where a descriptor
+    /// can steer them ([`CacheSwizzle`]).
+    pub cache_swizzle: Option<CacheSwizzle>,
     pub occupancy: Occupancy,
     /// What the semantic syncs a template places become.
     pub sync: SyncCaps,
@@ -222,10 +263,17 @@ impl Fill {
         }
     }
 
-    /// Whether this fill runs a ring `stages` deep as asked: what a config
-    /// asks of its ring is what the template builds ([`Self::stages`]).
-    pub fn runs(self, stages: usize) -> bool {
-        self.stages(stages) == stages
+    /// The ring this fill runs `stages` deep, unrolled or not: any depth
+    /// through `cp.async`, one or two slots through registers; `None` where
+    /// it runs none, so a config holds only rings its template builds.
+    pub fn ring(self, stages: usize, unroll: bool) -> Option<crate::ir::Schedule> {
+        (stages >= 1 && self.stages(stages) == stages).then(|| crate::ir::Schedule::ring(stages, unroll))
+    }
+
+    /// Whether this fill runs `schedule`: a ring it builds ([`Self::ring`]),
+    /// or two crews, whose one slot any fill stages.
+    pub fn runs(self, schedule: crate::ir::Schedule) -> bool {
+        !matches!(schedule, crate::ir::Schedule::Ring { depth, .. } if self.stages(depth.get()) != depth.get())
     }
 }
 
@@ -240,8 +288,7 @@ pub struct SyncCaps {
     /// The machine scheduler moves a pipeline trip's global loads below its
     /// products, or its shared-memory commit above them, unless fenced
     /// (`Sync::Fence` → `sched_barrier`), leaving the block waiting on global
-    /// memory with no product in flight: RDNA (gfx1151 sank a two-slot
-    /// 128×128×64 GEMM trip's loads to its commit; gfx1201 hoisted a commit).
+    /// memory with no product in flight: RDNA.
     pub commit_fence: bool,
     /// A wave's issue priority is settable (`Sync::Prio` → `s_setprio`): AMD.
     pub priority: bool,
@@ -297,6 +344,9 @@ pub struct Costs {
     /// The same step issued as part of a warpgroup product
     /// ([`GroupMmaAtom`]), 0 where the target has none.
     pub step_group: f64,
+    /// The same step's elements through the wide core ([`Core::Wide`]), 0
+    /// where the target has none.
+    pub step_wide: f64,
     /// The same step's 16×16×16 products over 8-bit integers into i32
     /// ([`Target::geometry_of`]), the SM full of waves; 0 where the target
     /// has no such core.
@@ -369,13 +419,14 @@ pub const LADDER: usize = 9;
 impl Costs {
     /// Every field a pair of programs measures, by name, in declaration
     /// order: all but the cache's, which a series of footprints measures.
-    pub fn fields(&mut self) -> [(&'static str, &mut f64); 18] {
+    pub fn fields(&mut self) -> [(&'static str, &mut f64); 19] {
         let Costs {
             smem_byte,
             global_byte,
             scatter,
             step,
             step_group,
+            step_wide,
             step_i8,
             step_lone,
             step_lone_i8,
@@ -399,6 +450,7 @@ impl Costs {
             ("scatter", scatter),
             ("step", step),
             ("step_group", step_group),
+            ("step_wide", step_wide),
             ("step_i8", step_i8),
             ("step_lone", step_lone),
             ("step_lone_i8", step_lone_i8),
@@ -460,14 +512,11 @@ impl Target {
     /// past it the lowering refuses the program
     /// ([`crate::lower::Error::TooLarge`]) and the tuner rejects the config
     /// as one that fails to compile, before the backend's compiler is
-    /// handed it. The largest kernels the planner ranks (nearest lists at
-    /// depth 128, `k` 64–80, 16384² rows) emit 270k on sm_86 (a register
-    /// list of 64 over 8-bit rows, a three-slot ring unrolled; the NVPTX
-    /// backend folds a 211k one to 25k lines of PTX, 236 registers, no
-    /// spill) and 176k on gfx1201 (a queued list of 80 over 8-bit rows,
-    /// unrolled: 4 s of clang), where a queued list whose product the
-    /// inference issued the wide way round emitted 400k, which took clang
-    /// 100 s and 700 MB a config and a pool of them the RX 9070 XT's 60 GB.
+    /// handed it. The bound sits above the largest kernels the planner ranks
+    /// (deep nearest lists over 8-bit rows, their rings unrolled) and below
+    /// the size at which the backend's compile time and memory make a tuning
+    /// pool impractical; AMD's is the lower, as its compiler is the slower on
+    /// such programs.
     pub fn most_instructions(&self) -> usize {
         match self.arch {
             GpuArch::Amd(_) => 1 << 18,
@@ -542,8 +591,22 @@ impl Target {
             if limits.max_threads_per_sm > 0 {
                 target.occupancy.waves = limits.max_threads_per_sm / lanes;
             }
+            if limits.max_blocks_per_sm > 0 {
+                target.occupancy.blocks = limits.max_blocks_per_sm;
+            }
         }
         Some(target)
+    }
+
+    /// The blocks of `waves` waves an SM holds at once whatever their
+    /// resources ([`Occupancy::blocks`]): on AMD a block of one wave takes
+    /// no barrier and only the wave slots bound it.
+    pub fn blocks_per_sm(&self, waves: usize) -> usize {
+        let o = self.occupancy;
+        match self.arch {
+            GpuArch::Amd(_) if waves <= 1 => (o.simds * o.waves) as usize,
+            _ => o.blocks as usize,
+        }
     }
 
     /// Registers one lane of a block of `waves` warps may hold: the lane's
@@ -559,6 +622,21 @@ impl Target {
         self.mma.iter().find(|a| a.dtype_in == dtype_in && a.dtype_out == dtype_out)
     }
 
+    /// The warp-level atoms `core` issues on.
+    fn atoms(&self, core: Core) -> &[MmaAtom] {
+        if core == Core::Wide { &self.wide_mma } else { &self.mma }
+    }
+
+    /// [`Self::mma`] on `core`.
+    pub fn mma_on(&self, core: Core, dtype_in: ScalarDType, dtype_out: ScalarDType) -> Option<&MmaAtom> {
+        self.atoms(core).iter().find(|a| a.dtype_in == dtype_in && a.dtype_out == dtype_out)
+    }
+
+    /// [`Self::geometry`] on `core`.
+    pub fn geometry_on(&self, core: Core) -> Option<&MmaAtom> {
+        self.atoms(core).iter().find(|a| a.dtype_in.bytes() == 2)
+    }
+
     /// The warp-level matrix core's geometry over 16-bit operands: its
     /// `m × n × k` and operand layouts, which every 16-bit input's atom
     /// shares (`test::unit::atoms::every_atom_of_a_target_shares_its_geometry`).
@@ -566,6 +644,12 @@ impl Target {
     /// ([`Self::mma`]).
     pub fn geometry(&self) -> Option<&MmaAtom> {
         self.mma.iter().find(|a| a.dtype_in.bytes() == 2)
+    }
+
+    /// How deep two crews hold an operand's k-slices, one atom's k so a slice
+    /// is one product's fragments; `None` where crews don't interleave.
+    pub fn kslice(&self) -> Option<usize> {
+        self.geometry().filter(|_| self.crews >= 2).map(|atom| atom.k as usize)
     }
 
     /// The warp-level matrix core over `dtype_in` into its accumulator (f32
@@ -581,7 +665,7 @@ impl Target {
     /// its atoms.
     pub fn issue(&self, core: Core, grid: WarpGrid, m: usize, n: usize, k: usize) -> Option<Issue> {
         match core {
-            Core::Warp => self.geometry()?.issue(Orient::Direct, grid, m, n, k).ok(),
+            Core::Warp | Core::Wide => self.geometry_on(core)?.issue(Orient::Direct, grid, m, n, k).ok(),
             Core::Group => self.group_mma.first()?.issue(grid, m, n, k).ok(),
         }
     }
@@ -598,6 +682,11 @@ impl Target {
 fn cuda(c: CudaArch) -> Target {
     let renderer = Renderer::for_cuda_arch(c);
     let waves = if (c.major == 8 && c.minor >= 6) || c.major == 12 { 12 } else { 16 };
+    let blocks = match (c.major, c.minor) {
+        (7, 5) | (8, 6) | (8, 7) => 16,
+        (8, 9) => 24,
+        _ => 32,
+    };
     let mut mma = mma_atoms(&renderer, (8, 16, 16), [frag::mma_sync_a(), frag::mma_sync_b(), frag::mma_sync_c()]);
     let bytes = [frag::mma_sync_a8(), frag::mma_sync_b8(), frag::mma_sync_c()];
     mma.extend(int8_atom(renderer.tensor_cores.iter(), renderer.device, (8, 16, 32), bytes));
@@ -605,6 +694,7 @@ fn cuda(c: CudaArch) -> Target {
         arch: GpuArch::Cuda(c),
         wave: c.wave_size(),
         mma,
+        wide_mma: vec![],
         group_mma: if c.major == 9 { group_mma_atoms(renderer.device) } else { vec![] },
         fill: if c.major >= 8 { Fill::CpAsync } else { Fill::Staged },
         ldmatrix: (c.major, c.minor) >= (7, 5),
@@ -615,12 +705,18 @@ fn cuda(c: CudaArch) -> Target {
         memory_bytes: None,
         crews: 1,
         xcds: 1,
-        occupancy: Occupancy { simds: 4, file: 512, waves, registers: 255, acc_file: 0 },
+        shared_banks: None,
+        cache_swizzle: None,
+        occupancy: Occupancy { simds: 4, file: 512, waves, registers: 255, acc_file: 0, blocks },
         sync: SyncCaps { warp_barrier: true, commit_fence: false, priority: false },
         lane_move: LaneMove::Shuffle,
         hardware_exp2: false,
     }
 }
+
+/// The workgroups of more than one wave a CU holds at once: one barrier
+/// each, sixteen a CU.
+const AMD_BARRIERS: u32 = 16;
 
 /// An AMD part: register-staged fills into 64 KB of LDS a workgroup (160 KB
 /// on gfx950), the 16×16×16 core, settable issue priority and the hardware
@@ -628,7 +724,7 @@ fn cuda(c: CudaArch) -> Target {
 /// registers a lane (up to 256 vector and 256 accumulator ones a wave),
 /// lane moves through the LDS crossbar, two crews. RDNA: WMMA on wave32,
 /// two SIMD32s with 192 KB of registers each, DPP lane moves, the bf16 pair
-/// dot product; RDNA4 adds transposing loads and needs its commit fenced.
+/// dot product and a fenced commit; RDNA4 adds transposing loads.
 fn amd(a: AmdArch) -> Target {
     let cdna = a.is_cdna();
     let (operand, accumulator) = if cdna {
@@ -652,15 +748,29 @@ fn amd(a: AmdArch) -> Target {
         int8_atom(renderer.tensor_cores.iter(), renderer.device, (16, 16, 16), layouts)
     };
     mma.extend(int8);
-    let occupancy = if cdna {
-        Occupancy { simds: 4, file: 512, waves: 8, registers: 256, acc_file: 256 }
+    let wide_mma = if cdna {
+        // Only the operand layouts place data here, so the 16-bit core's
+        // scheduler axes stand: no scheduler picks this atom.
+        let operand = frag::mfma_32x32x8_a();
+        let layouts = [operand.clone(), operand.transpose(), frag::mfma_32x32x8_c()];
+        let narrow = renderer.tensor_cores.iter().filter(|tc| tc.dims == (16, 16, 16));
+        narrow
+            .filter(|tc| is_half(&tc.dtype_in) && tc.dtype_out == DType::Float32)
+            .map(|tc| atom(&TensorCore { dims: (32, 32, 8), ..tc.clone() }, renderer.device, layouts.clone()))
+            .collect()
     } else {
-        Occupancy { simds: 2, file: 1536, waves: 16, registers: 256, acc_file: 0 }
+        vec![]
+    };
+    let occupancy = if cdna {
+        Occupancy { simds: 4, file: 512, waves: 8, registers: 256, acc_file: 256, blocks: AMD_BARRIERS }
+    } else {
+        Occupancy { simds: 2, file: 1536, waves: 16, registers: 256, acc_file: 0, blocks: AMD_BARRIERS }
     };
     Target {
         arch: GpuArch::Amd(a),
         wave: a.wave_size(),
         mma,
+        wide_mma,
         group_mma: vec![],
         fill: Fill::Staged,
         ldmatrix: false,
@@ -671,6 +781,12 @@ fn amd(a: AmdArch) -> Target {
         memory_bytes: None,
         crews: if cdna { 2 } else { 1 },
         xcds: 1,
+        shared_banks: (a == AmdArch::Gfx942).then_some(SharedBanks { count: 16, bytes: 8 }),
+        cache_swizzle: (a == AmdArch::Gfx942).then_some(CacheSwizzle {
+            min_row: 256,
+            max_row: 16 << 10,
+            max_stride: 8 << 10,
+        }),
         occupancy,
         sync: SyncCaps { warp_barrier: false, commit_fence: !cdna, priority: true },
         lane_move: if cdna { LaneMove::Permute } else { LaneMove::Dpp },
@@ -685,6 +801,7 @@ fn metal(f: MetalFamily) -> Target {
         arch: GpuArch::Metal(f),
         wave: 32,
         mma: mma_atoms(&Renderer::for_metal_family(f), (8, 8, 8), [s.transpose(), s.clone(), s]),
+        wide_mma: vec![],
         group_mma: vec![],
         fill: Fill::Staged,
         ldmatrix: false,
@@ -695,7 +812,9 @@ fn metal(f: MetalFamily) -> Target {
         memory_bytes: None,
         crews: 1,
         xcds: 1,
-        occupancy: Occupancy { simds: 4, file: 1024, waves: 8, registers: 128, acc_file: 0 },
+        shared_banks: None,
+        cache_swizzle: None,
+        occupancy: Occupancy { simds: 4, file: 1024, waves: 8, registers: 128, acc_file: 0, blocks: 32 },
         sync: SyncCaps { warp_barrier: false, commit_fence: false, priority: false },
         lane_move: LaneMove::SimdShuffle,
         hardware_exp2: false,
@@ -831,15 +950,27 @@ impl Costs {
         let lone = if stages <= 1 { self.trip_one_lone } else { self.trip_lone };
         trip.max(lone / (blocks.max(1) as f64).powi(TRIP_HIDING))
     }
+
+    /// The power of the blocks an SM runs at once by which they hide one
+    /// another's wait for a ring's loads, per block-trip: the power by which
+    /// the trip probes' `full` blocks of a full SM hid a lone block's trip
+    /// (`trip_lone / trip = full^power`; the one-slot pair where the ring is
+    /// a `serial` one-slot `cp.async` one), a lone block's trip being that
+    /// same wait at the barrier for its slot's loads. At least one: a round
+    /// of resident blocks waits at least once; one where the lone trip is
+    /// unmeasured.
+    pub fn wait_hiding(&self, serial: bool, full: usize) -> f64 {
+        let (lone, trip) = if serial { (self.trip_one_lone, self.trip_one) } else { (self.trip_lone, self.trip) };
+        if trip <= 0.0 || lone <= trip || full <= 1 {
+            return 1.0;
+        }
+        ((lone / trip).ln() / (full as f64).ln()).max(1.0)
+    }
 }
 
 /// Model: the power of the blocks an SM runs at once by which a lone
 /// block's trip overhead shrinks per block-trip: the blocks overlap one
-/// another's waits and share out what a round still waits. Measured per
-/// block-trip at one to four blocks an SM, sm_86 falls 127, 41, 16, 3 ns
-/// (about the square) and gfx1201 65, 27, 17, 11 (about the blocks); the
-/// square ranks both cards' configs closer to their measured order than
-/// either card's own exponent.
+/// another's waits and share out what a round still waits.
 pub(crate) const TRIP_HIDING: i32 = 2;
 
 const fn sm(major: u8, minor: u8) -> GpuArch {

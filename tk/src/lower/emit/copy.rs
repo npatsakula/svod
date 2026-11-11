@@ -63,9 +63,13 @@ impl Emit<'_> {
             let src_row = match bounds[0] {
                 Some(b) => {
                     let bound = self.sc(b);
-                    let last = bound.try_sub(&c32(1)).expect("bound").try_max(&c32(0)).expect("floor");
+                    let last = bound
+                        .try_sub(&bound.const_like(1))
+                        .expect("bound")
+                        .try_max(&bound.const_like(0))
+                        .expect("floor");
                     let over = row.try_cmplt(&last).expect("cmp");
-                    self.hoist(UOp::try_where(over, row.clone(), last).expect("clamp"))
+                    self.hoist(UOp::try_where(over, self.widened(row.clone()), last).expect("clamp"))
                 }
                 None => row.clone(),
             };
@@ -75,9 +79,13 @@ impl Emit<'_> {
             // row outside its map does, from element 0 of the operand.
             let gate = gate.filter(|_| gathered || bounds[1].is_some());
             let src_off = match &gate {
-                Some(g) => self.hoist(UOp::try_where(g.clone(), src_off, c32(0)).expect("safe offset")),
+                Some(g) => {
+                    let zero = src_off.const_like(0);
+                    self.hoist(UOp::try_where(g.clone(), src_off, zero).expect("safe offset"))
+                }
                 None => src_off,
             };
+            let (hi_row, hi_col) = (row.clone(), col.clone());
             let (dst_off, _) = self.address(&d, &Coord::plain(row, col));
             if mode == CopyMode::Async && self.low.device.target.fill == Fill::CpAsync {
                 let (dst, src) = (self.access(&d.buf, &dst_off, 1), self.access(&s.buf, &src_off, 1));
@@ -94,8 +102,15 @@ impl Emit<'_> {
                     Some(g) => self.zeroed(&g, v),
                     None => v,
                 };
-                let vals = (0..chunk as usize).map(|e| elem(&v, e, chunk as usize)).collect();
-                self.mem_store(&d.buf, &dst_off, vals);
+                let vals: Vec<_> = (0..chunk as usize).map(|e| elem(&v, e, chunk as usize)).collect();
+                if self.halves(&d).is_some() {
+                    let half = chunk as usize / 2;
+                    let (hi_off, _) = self.address(&d, &Coord::plain(hi_row, add(&hi_col, &c32(half as i64))));
+                    self.mem_store(&d.buf, &dst_off, vals[..half].to_vec());
+                    self.mem_store(&d.buf, &hi_off, vals[half..].to_vec());
+                } else {
+                    self.mem_store(&d.buf, &dst_off, vals);
+                }
             }
         }
         Ok(())
@@ -151,7 +166,8 @@ impl Emit<'_> {
             }
             let v = match gate {
                 Some(g) if gathered => {
-                    let safe = self.hoist(UOp::try_where(g.clone(), off, c32(0)).expect("safe offset"));
+                    let zero = off.const_like(0);
+                    let safe = self.hoist(UOp::try_where(g.clone(), off, zero).expect("safe offset"));
                     let v = self.mem_load(&s.buf, &safe, w, None);
                     self.zeroed(&g, v)
                 }

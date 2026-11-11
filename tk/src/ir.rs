@@ -2,16 +2,144 @@
 //! values. Nothing here is a DAG; identity is position, and the order the
 //! author wrote is the order the kernel runs in.
 //!
+//! A program's phase is its type ([`Phase`]): what the lowering has decided
+//! so far is a field of the phase, so an authored program has pipelines and
+//! no layouts, and a laid one has every product oriented and no pipeline.
 //! Layouts are not part of a value: the lowering assigns them from the atoms
-//! that consume each value and keeps them in a side table, starting from the
-//! few an author pins ([`Program::pins`]).
+//! that consume each value and the laid program carries them
+//! ([`Program::layouts`]), starting from the few an author pins
+//! ([`Program::pins`]).
+
+use std::convert::Infallible;
+use std::fmt::Debug;
+use std::num::NonZeroUsize;
 
 use svod_dtype::ScalarDType;
+
+use crate::layouts::TileLayout;
+
+/// What a program has decided. [`Authored`], it has its pipelines and none of
+/// the lowering's choices; [`Expanded`], its pipelines are loops and
+/// branches ([`crate::schedule::expand`]); [`Laid`], every product is
+/// oriented, every deal takes its columns as the layouts hold them, every
+/// shared allocation knows how it is stored and every register value has its
+/// layout ([`crate::layouts::infer`]). A pass takes the phase it needs, so
+/// none re-asserts another's work.
+pub trait Phase: Copy + Debug + PartialEq + 'static {
+    /// The pipeline statement, or none once expanded.
+    type Pipeline: Clone + Debug + PartialEq;
+    /// A product's orientation: the author's pin where there is one, or the
+    /// inference's choice.
+    type Orient: Copy + Debug + PartialEq;
+    /// The source column each element of a deal takes ([`TileOp::Deal`]).
+    type Deal: Clone + Debug + PartialEq;
+    /// How a shared allocation is stored ([`Storage`]).
+    type Storage: Clone + Debug + PartialEq;
+    /// Every register value's layout.
+    type Layouts: Clone + Debug + PartialEq;
+
+    /// The pipeline `p` is, where the phase has them.
+    fn pipeline(p: &Self::Pipeline) -> &Pipeline<Self>;
+    fn pipeline_mut(p: &mut Self::Pipeline) -> &mut Pipeline<Self>;
+    /// The source column element `(row, i)` of a deal's result takes, `i`
+    /// the column `c·n + j` a deal `j` of `n` into `[rows, w]` names.
+    fn dealt(order: &Self::Deal, row: usize, i: usize) -> usize;
+    /// The axis a shared allocation stores consecutive elements along.
+    fn along(storage: &Self::Storage) -> Axis;
+}
+
+/// The phase an author records ([`crate::build::Kernel::record`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Authored;
+
+impl Phase for Authored {
+    type Pipeline = Pipeline<Self>;
+    type Orient = Option<Orient>;
+    type Deal = ();
+    type Storage = ();
+    type Layouts = ();
+
+    fn pipeline(p: &Pipeline<Self>) -> &Pipeline<Self> {
+        p
+    }
+    fn pipeline_mut(p: &mut Pipeline<Self>) -> &mut Pipeline<Self> {
+        p
+    }
+    fn dealt((): &(), _: usize, i: usize) -> usize {
+        i
+    }
+    fn along((): &()) -> Axis {
+        Axis::Col
+    }
+}
+
+/// The phase whose pipelines the schedule templates have expanded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Expanded;
+
+impl Phase for Expanded {
+    type Pipeline = Infallible;
+    type Orient = Option<Orient>;
+    type Deal = ();
+    type Storage = ();
+    type Layouts = ();
+
+    fn pipeline(p: &Infallible) -> &Pipeline<Self> {
+        match *p {}
+    }
+    fn pipeline_mut(p: &mut Infallible) -> &mut Pipeline<Self> {
+        match *p {}
+    }
+    fn dealt((): &(), _: usize, i: usize) -> usize {
+        i
+    }
+    fn along((): &()) -> Axis {
+        Axis::Col
+    }
+}
+
+/// The phase the layout inference leaves: what the emitter consumes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Laid;
+
+impl Phase for Laid {
+    type Pipeline = Infallible;
+    type Orient = Orient;
+    /// Per row of the result, the source column each flat column takes.
+    type Deal = Vec<Vec<u32>>;
+    type Storage = Storage;
+    type Layouts = Vec<Option<TileLayout>>;
+
+    fn pipeline(p: &Infallible) -> &Pipeline<Self> {
+        match *p {}
+    }
+    fn pipeline_mut(p: &mut Infallible) -> &mut Pipeline<Self> {
+        match *p {}
+    }
+    fn dealt(order: &Vec<Vec<u32>>, row: usize, i: usize) -> usize {
+        order[row][i] as usize
+    }
+    fn along(storage: &Storage) -> Axis {
+        storage.along
+    }
+}
+
+/// How a shared allocation stores its tiles, decided once their readers are
+/// laid ([`crate::layouts::infer`]): consecutive elements run along `along`
+/// (`Col` is row-major, `Row` column-major), the axis the readers' fragments
+/// run along, and `halves` is the row bit each 16-byte chunk's halves are
+/// exchanged on ([`crate::layouts::SharedSwizzle`]) where the readers meet
+/// the target's banks only so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Storage {
+    pub along: Axis,
+    pub halves: Option<u32>,
+}
 
 macro_rules! id {
     ($($name:ident),*) => {$(
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-        pub struct $name(pub u32);
+        pub struct $name(pub(crate) u32);
         impl $name {
             pub fn index(self) -> usize {
                 self.0 as usize
@@ -218,7 +346,7 @@ pub enum ReduceOp {
 /// Pure tile operations. Elementwise operands must share a shape, or one of
 /// them is a vector (`[rows, 1]` or `[1, cols]`) broadcast along the other axis.
 #[derive(Clone, Debug, PartialEq)]
-pub enum TileOp {
+pub enum TileOp<P: Phase = Authored> {
     Fill(Const),
     /// A scalar in every element.
     Splat(ScalarId),
@@ -240,15 +368,15 @@ pub enum TileOp {
     },
     /// `acc + A·B`, with `A` read transposed when `a_t` (an `[k, m]` tile) and
     /// `B` read transposed when `b_t` (an `[n, k]` tile). `orient` is which
-    /// way round the core issues it: `None` until the layout inference
-    /// chooses, `Some` once laid or where the author pinned it.
+    /// way round the core issues it: the author's pin or the inference's
+    /// choice, as the phase holds it.
     Mma {
         acc: ValId,
         a: ValId,
         b: ValId,
         a_t: bool,
         b_t: bool,
-        orient: Option<Orient>,
+        orient: P::Orient,
     },
     /// Reduce along `axis`: `Row` folds every row to one column (`[rows, 1]`),
     /// `Col` folds every column to one row (`[1, cols]`). The fold runs in
@@ -307,10 +435,9 @@ pub enum TileOp {
         /// The source column each element takes, per row of the result, as
         /// the layouts the inference assigned hold them
         /// ([`crate::layouts::TileLayout::dealt`]): the device's order,
-        /// recorded once laid so the interpreter replays it. `None` until
-        /// then (and in a program never lowered): the fallback order,
-        /// column `c·n + j`.
-        order: Option<Vec<Vec<u32>>>,
+        /// which the interpreter replays once laid; before, the fallback
+        /// order, column `c·n + j`.
+        order: P::Deal,
     },
     /// The same elements held under the layout its consumer needs; inserted
     /// by the layout inference, never by an author (who pins layouts instead).
@@ -325,7 +452,34 @@ pub enum TileOp {
     },
 }
 
-impl TileOp {
+impl<P: Phase> TileOp<P> {
+    /// The op in phase `Q`, its product's orientation through `orient` and
+    /// its deal's order through `deal`.
+    pub fn map<Q: Phase>(
+        self,
+        orient: impl FnOnce(P::Orient) -> Q::Orient,
+        deal: impl FnOnce(P::Deal) -> Q::Deal,
+    ) -> TileOp<Q> {
+        match self {
+            TileOp::Fill(c) => TileOp::Fill(c),
+            TileOp::Splat(s) => TileOp::Splat(s),
+            TileOp::Coord(axis) => TileOp::Coord(axis),
+            TileOp::Unary { src, f } => TileOp::Unary { src, f },
+            TileOp::Binary { a, b, f } => TileOp::Binary { a, b, f },
+            TileOp::Cast { src, to, round } => TileOp::Cast { src, to, round },
+            TileOp::Mma { acc, a, b, a_t, b_t, orient: o } => TileOp::Mma { acc, a, b, a_t, b_t, orient: orient(o) },
+            TileOp::Reduce { src, axis, f } => TileOp::Reduce { src, axis, f },
+            TileOp::Where { pred, a, b } => TileOp::Where { pred, a, b },
+            TileOp::MulAdd { a, b, c } => TileOp::MulAdd { a, b, c },
+            TileOp::Transpose { src } => TileOp::Transpose { src },
+            TileOp::Shift { src, axis, fill } => TileOp::Shift { src, axis, fill },
+            TileOp::Flip { src, axis, mask } => TileOp::Flip { src, axis, mask },
+            TileOp::Deal { src, j, col, order } => TileOp::Deal { src, j, col, order: deal(order) },
+            TileOp::Relayout { src } => TileOp::Relayout { src },
+            TileOp::Move { src } => TileOp::Move { src },
+        }
+    }
+
     /// The register values the op reads.
     pub fn srcs(&self) -> impl Iterator<Item = ValId> {
         let [a, b, c] = match *self {
@@ -375,12 +529,12 @@ pub struct Carried {
 /// of one); several loops may share an `iv` (and the scalars defined from
 /// it) over consecutive ranges.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Loop {
+pub struct Loop<P: Phase = Authored> {
     pub iv: ScalarId,
     pub start: ScalarId,
     pub extent: ScalarId,
     pub carried: Vec<Carried>,
-    pub body: Block,
+    pub body: Block<P>,
     /// Copies of the body per emitted iteration (1 = rolled); the schedule
     /// template sets it so ring-slot arithmetic folds to constants.
     pub unroll: u32,
@@ -389,29 +543,95 @@ pub struct Loop {
 /// One side of a [`Pipeline`]: a body parameterized by the step it handles
 /// and the ring slot that step uses.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Stage {
+pub struct Stage<P: Phase = Authored> {
     pub step: ScalarId,
     pub slot: ScalarId,
-    pub body: Block,
+    pub body: Block<P>,
 }
 
-/// A producer/consumer loop over `extent` steps with a ring of `stages`
-/// shared-memory slots. `produce` fills its slot for its step; `consume`
-/// reads its slot for its step; the schedule template decides how far ahead
-/// production runs and which warps do what.
+/// How a [`Pipeline`] runs its ring of shared-memory slots; a target's
+/// [`crate::atoms::Fill::ring`] builds the rings it runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Schedule {
+    /// `depth` slots every warp fills and consumes, the loop copied once per
+    /// slot when `unroll`, so slot addressing folds to constants.
+    Ring { depth: NonZeroUsize, unroll: bool },
+    /// The block's warps as two crews a cluster apart over one slot, each
+    /// operand held as k-slices `kslice` deep, the target atom's k, so a
+    /// slice is one product's fragments ([`crate::schedule`]'s ping-pong).
+    PingPong { kslice: NonZeroUsize },
+}
+
+impl Schedule {
+    /// A ring of `stages` slots, which is at least one, over one crew.
+    pub const fn ring(stages: usize, unroll: bool) -> Self {
+        Self::Ring { depth: NonZeroUsize::new(stages).expect("a ring has a slot"), unroll }
+    }
+
+    /// Two crews over one slot, the operands k-sliced `kslice` deep, which is
+    /// at least one.
+    pub const fn ping_pong(kslice: usize) -> Self {
+        Self::PingPong { kslice: NonZeroUsize::new(kslice).expect("a slice has a depth") }
+    }
+
+    pub fn stages(self) -> usize {
+        match self {
+            Self::Ring { depth, .. } => depth.get(),
+            Self::PingPong { .. } => 1,
+        }
+    }
+
+    pub fn unroll(self) -> bool {
+        matches!(self, Self::Ring { unroll: true, .. })
+    }
+
+    pub fn crews(self) -> u32 {
+        if matches!(self, Self::PingPong { .. }) { 2 } else { 1 }
+    }
+
+    pub fn kslice(self) -> Option<usize> {
+        match self {
+            Self::PingPong { kslice } => Some(kslice.get()),
+            Self::Ring { .. } => None,
+        }
+    }
+
+    /// The schedule as part of a tile: a ring's depth and unrolling, its
+    /// pipelines, erased; the crews stay.
+    pub fn tile(self) -> Self {
+        match self {
+            Self::Ring { .. } => Self::ring(1, false),
+            pong => pong,
+        }
+    }
+
+    /// The schedule with its ring rolled.
+    pub fn rolled(self) -> Self {
+        match self {
+            Self::Ring { depth, .. } => Self::Ring { depth, unroll: false },
+            pong => pong,
+        }
+    }
+}
+
+/// A count of slots: a rolled ring of one crew.
+impl From<usize> for Schedule {
+    fn from(stages: usize) -> Self {
+        Self::ring(stages, false)
+    }
+}
+
+/// A producer/consumer loop over `extent` steps with a ring of shared-memory
+/// slots run as `schedule` says. `produce` fills its slot for its step;
+/// `consume` reads its slot for its step; the schedule template decides how
+/// far ahead production runs and which warps do what.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Pipeline {
+pub struct Pipeline<P: Phase = Authored> {
     pub extent: ScalarId,
-    pub stages: usize,
-    /// The loop copied once per ring slot, so slot addressing folds to
-    /// constants.
-    pub unroll: bool,
-    /// 1: every warp loads and computes; 2: the block's warps as two crews
-    /// a cluster apart over one slot ([`crate::schedule`]'s ping-pong).
-    pub crews: u32,
+    pub schedule: Schedule,
     pub carried: Vec<Carried>,
-    pub produce: Stage,
-    pub consume: Stage,
+    pub produce: Stage<P>,
+    pub consume: Stage<P>,
 }
 
 /// Whose threads a barrier gathers and a copy's chunks are spread over: the
@@ -453,10 +673,10 @@ pub enum Sync {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum Stmt {
+pub enum Stmt<P: Phase = Authored> {
     Let {
         dst: ValId,
-        op: TileOp,
+        op: TileOp<P>,
     },
     Copy {
         dst: ValId,
@@ -466,20 +686,21 @@ pub enum Stmt {
         /// [`Stmt::Warps`].
         scope: Scope,
     },
-    Loop(Loop),
-    Pipeline(Pipeline),
+    Loop(Loop<P>),
+    /// A [`Pipeline`] where the phase has them; nothing once expanded.
+    Pipeline(P::Pipeline),
     /// Every warp of the block runs `body` on its own: `Special::Warp` is
     /// its index, its copies move whole tiles with its lanes alone, and its
     /// barriers gather only itself. What the warps leave in shared memory is
     /// the block's open effect afterwards: the sync pass fences it before the
     /// block next touches it.
     Warps {
-        body: Block,
+        body: Block<P>,
     },
     If {
         pred: ScalarId,
-        then: Block,
-        otherwise: Block,
+        then: Block<P>,
+        otherwise: Block<P>,
         /// The branch's merge: past the statement each `dst` holds its
         /// branch's source (`None`: what `dst` held before it, which `then`
         /// replaces). Both sources keep their identity — every value stays
@@ -493,13 +714,21 @@ pub enum Stmt {
     Sync(Sync),
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct Block(pub Vec<Stmt>);
+#[derive(Clone, Debug, PartialEq)]
+pub struct Block<P: Phase = Authored>(pub Vec<Stmt<P>>);
+
+impl<P: Phase> Default for Block<P> {
+    fn default() -> Self {
+        Block(vec![])
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ParamKind {
     In,
     Out,
+    /// Written, then read back by the lanes that wrote it ([`crate::build::Kernel::inout`]).
+    InOut,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -511,16 +740,23 @@ pub struct Param {
     pub elems: usize,
 }
 
-/// A shared allocation. Its tiles are stored with consecutive elements
-/// along `along`: `Col` is row-major, `Row` column-major. The lowering sets
-/// it to the axis the tiles' consumers read fragments along
-/// (`lower::orient_shared`); an author never does.
+/// A shared allocation. How its tiles are stored is the layout inference's
+/// decision ([`Storage`]), which only a laid program holds; an author's is
+/// row-major.
 #[derive(Clone, Debug, PartialEq)]
-pub struct SmemAlloc {
+pub struct SmemAlloc<P: Phase = Authored> {
     pub name: String,
     pub dtype: ScalarDType,
     pub elems: usize,
-    pub along: Axis,
+    pub storage: P::Storage,
+}
+
+impl<P: Phase> SmemAlloc<P> {
+    /// The axis consecutive elements run along: `Col` row-major, `Row`
+    /// column-major.
+    pub fn along(&self) -> Axis {
+        P::along(&self.storage)
+    }
 }
 
 /// A bound symbolic variable of the launch, with the range it may take.
@@ -553,27 +789,109 @@ pub enum Orient {
     Swapped,
 }
 
+/// The width a program's scalars count in, fixed when it is built
+/// ([`crate::build::Kernel::finish`]): `i32`, or `i64` where a parameter's
+/// elements pass it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum IndexWidth {
+    I32,
+    I64,
+}
+
+impl IndexWidth {
+    pub fn of(params: &[Param]) -> Self {
+        if params.iter().any(|p| p.elems > i32::MAX as usize) { Self::I64 } else { Self::I32 }
+    }
+
+    pub fn dtype(self) -> svod_dtype::DType {
+        match self {
+            Self::I32 => svod_dtype::DType::Int32,
+            Self::I64 => svod_dtype::DType::Int64,
+        }
+    }
+}
+
+/// A recorded tile program; read-only outside the crate, so what the
+/// lowering derives from it (a parameter never stored to is `readonly`, a
+/// phase's layouts) is what [`Kernel::record`](crate::build::Kernel::record)
+/// and the passes made:
+///
+/// ```compile_fail,E0616
+/// # use svod_tk::build::{F32, Kernel};
+/// # use svod_tk::ir::ParamKind;
+/// let mut prog = Kernel::record("k", |k| {
+///     k.output::<F32>("y", 1);
+/// });
+/// prog.params[0].kind = ParamKind::In;
+/// ```
 #[derive(Clone, Debug, PartialEq)]
-pub struct Program {
-    pub name: String,
-    pub params: Vec<Param>,
-    pub vars: Vec<Var>,
-    pub grid: [ScalarId; 3],
-    pub warps: u32,
+pub struct Program<P: Phase = Authored> {
+    pub(crate) name: String,
+    pub(crate) params: Vec<Param>,
+    pub(crate) vars: Vec<Var>,
+    pub(crate) index: IndexWidth,
+    pub(crate) grid: [ScalarId; 3],
+    pub(crate) warps: u32,
     /// How the warps spread a block-wide register tile: every warp, or a
     /// whole grid of them where the others run only inside
     /// [`Stmt::Warps`].
-    pub warp_grid: crate::layouts::WarpGrid,
-    pub smem: Vec<SmemAlloc>,
-    pub scalars: Vec<Scalar>,
-    pub values: Vec<Value>,
-    pub body: Block,
+    pub(crate) warp_grid: crate::layouts::WarpGrid,
+    pub(crate) smem: Vec<SmemAlloc<P>>,
+    pub(crate) scalars: Vec<Scalar>,
+    pub(crate) values: Vec<Value>,
+    pub(crate) body: Block<P>,
     /// Register values the author holds under a fixed layout; a consumer
     /// wanting another re-holds them (a probe of what that costs, say).
-    pub pins: Vec<(ValId, crate::layouts::TileLayout)>,
+    pub(crate) pins: Vec<(ValId, TileLayout)>,
+    /// Every register value's layout, by [`ValId`], once laid.
+    pub(crate) layouts: P::Layouts,
 }
 
-impl Program {
+impl<P: Phase> Program<P> {
+    /// The program's declarations in phase `Q`, each shared allocation's
+    /// storage through `storage` (by index) and the layouts `layouts`, with
+    /// an empty body; and the body in this phase, for `Q`'s pass to place.
+    pub(crate) fn rephase<Q: Phase>(
+        self,
+        storage: impl FnMut(usize, P::Storage) -> Q::Storage,
+        layouts: Q::Layouts,
+    ) -> (Program<Q>, Block<P>) {
+        let Program { name, params, vars, index, grid, warps, warp_grid, smem, scalars, values, body, pins, .. } = self;
+        let mut storage = storage;
+        let smem = smem
+            .into_iter()
+            .enumerate()
+            .map(|(i, a)| SmemAlloc { name: a.name, dtype: a.dtype, elems: a.elems, storage: storage(i, a.storage) })
+            .collect();
+        let prog = Program {
+            name,
+            params,
+            vars,
+            index,
+            grid,
+            warps,
+            warp_grid,
+            smem,
+            scalars,
+            values,
+            body: Block::default(),
+            pins,
+            layouts,
+        };
+        (prog, body)
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    /// The parameters in launch order, each with the access its kernel
+    /// recorded.
+    pub fn params(&self) -> &[Param] {
+        &self.params
+    }
+    pub fn body(&self) -> &Block<P> {
+        &self.body
+    }
     pub fn value(&self, id: ValId) -> &Value {
         &self.values[id.index()]
     }
@@ -591,7 +909,7 @@ impl Program {
         }
     }
     /// Every statement, outermost first, with its nesting depth.
-    pub fn walk(&self) -> impl Iterator<Item = (usize, &Stmt)> {
+    pub fn walk(&self) -> impl Iterator<Item = (usize, &Stmt<P>)> {
         self.body.walk()
     }
 
@@ -654,11 +972,11 @@ impl Program {
     }
 }
 
-impl Block {
+impl<P: Phase> Block<P> {
     /// Every statement, each before the ones it nests, with its depth below
     /// this block.
-    pub fn walk(&self) -> impl Iterator<Item = (usize, &Stmt)> {
-        fn visit<'a>(block: &'a Block, depth: usize, out: &mut Vec<(usize, &'a Stmt)>) {
+    pub fn walk(&self) -> impl Iterator<Item = (usize, &Stmt<P>)> {
+        fn visit<'a, P: Phase>(block: &'a Block<P>, depth: usize, out: &mut Vec<(usize, &'a Stmt<P>)>) {
             for stmt in &block.0 {
                 out.push((depth, stmt));
                 stmt.blocks().for_each(|b| visit(b, depth + 1, out));
@@ -670,14 +988,17 @@ impl Block {
     }
 }
 
-impl Stmt {
+impl<P: Phase> Stmt<P> {
     /// The blocks the statement nests, in program order: a loop's or the
     /// warps' body, a pipeline's produce then consume, a branch's then and
     /// otherwise.
-    pub fn blocks(&self) -> impl Iterator<Item = &Block> {
+    pub fn blocks(&self) -> impl Iterator<Item = &Block<P>> {
         let (first, second) = match self {
             Stmt::Loop(l) => (Some(&l.body), None),
-            Stmt::Pipeline(p) => (Some(&p.produce.body), Some(&p.consume.body)),
+            Stmt::Pipeline(p) => {
+                let p = P::pipeline(p);
+                (Some(&p.produce.body), Some(&p.consume.body))
+            }
             Stmt::Warps { body } => (Some(body), None),
             Stmt::If { then, otherwise, .. } => (Some(then), Some(otherwise)),
             Stmt::Let { .. } | Stmt::Copy { .. } | Stmt::Sync(_) => (None, None),
@@ -686,14 +1007,41 @@ impl Stmt {
     }
 
     /// [`Self::blocks`], mutably.
-    pub fn blocks_mut(&mut self) -> impl Iterator<Item = &mut Block> {
+    pub fn blocks_mut(&mut self) -> impl Iterator<Item = &mut Block<P>> {
         let (first, second) = match self {
             Stmt::Loop(l) => (Some(&mut l.body), None),
-            Stmt::Pipeline(p) => (Some(&mut p.produce.body), Some(&mut p.consume.body)),
+            Stmt::Pipeline(p) => {
+                let p = P::pipeline_mut(p);
+                (Some(&mut p.produce.body), Some(&mut p.consume.body))
+            }
             Stmt::Warps { body } => (Some(body), None),
             Stmt::If { then, otherwise, .. } => (Some(then), Some(otherwise)),
             Stmt::Let { .. } | Stmt::Copy { .. } | Stmt::Sync(_) => (None, None),
         };
         first.into_iter().chain(second)
+    }
+
+    /// The statement in phase `Q`: its nested blocks through `block`, its
+    /// tile op (with the value it defines) through `op`. A pipeline is handed
+    /// back for `Q`'s pass to place, as a phase without them has nothing to
+    /// map it to.
+    pub fn map<Q: Phase>(
+        self,
+        block: &mut impl FnMut(Block<P>) -> Block<Q>,
+        op: &mut impl FnMut(ValId, TileOp<P>) -> TileOp<Q>,
+    ) -> Result<Stmt<Q>, P::Pipeline> {
+        Ok(match self {
+            Stmt::Let { dst, op: o } => Stmt::Let { dst, op: op(dst, o) },
+            Stmt::Copy { dst, src, mode, scope } => Stmt::Copy { dst, src, mode, scope },
+            Stmt::Loop(Loop { iv, start, extent, carried, body, unroll }) => {
+                Stmt::Loop(Loop { iv, start, extent, carried, body: block(body), unroll })
+            }
+            Stmt::Pipeline(p) => return Err(p),
+            Stmt::Warps { body } => Stmt::Warps { body: block(body) },
+            Stmt::If { pred, then, otherwise, results } => {
+                Stmt::If { pred, then: block(then), otherwise: block(otherwise), results }
+            }
+            Stmt::Sync(sync) => Stmt::Sync(sync),
+        })
     }
 }

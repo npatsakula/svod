@@ -332,17 +332,16 @@ impl Diarizer {
         // Padding rows encode one zero frame, attending to itself; a live row
         // without an attended frame (a recording shorter than one hop) does the
         // same, so every attention path sees at least one key.
-        let lens = |view: ndarray::ArrayViewMutD<'_, i32>, of: &dyn Fn(&StepPlan) -> usize, pad: i32| {
-            let mut view = view;
-            let slots = view.as_slice_mut().expect("contiguous lengths");
+        let lens = |mut lens: crate::jit::rt::HostWrite<'_, i32>, of: &dyn Fn(&StepPlan) -> usize, pad: i32| {
+            let slots = lens.as_mut_slice();
             slots.fill(pad);
             for (slot, plan) in slots.iter_mut().zip(plans) {
                 *slot = of(plan) as i32;
             }
         };
-        lens(jit.mel_valid_view_mut::<i32>()?, &|p| p.mel_valid, 0);
-        lens(jit.seq_lens_view_mut::<i32>()?, &|p| p.context + p.input, 1);
-        lens(jit.key_lens_view_mut::<i32>()?, &|p| (p.context + p.valid).max(1), 1);
+        lens(jit.mel_valid_host_write::<i32>()?, &|p| p.mel_valid, 0);
+        lens(jit.seq_lens_host_write::<i32>()?, &|p| p.context + p.input, 1);
+        lens(jit.key_lens_host_write::<i32>()?, &|p| (p.context + p.valid).max(1), 1);
         match &mut self.run_profile {
             Some(profile) => {
                 let started = Instant::now();

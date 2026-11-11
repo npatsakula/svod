@@ -44,6 +44,18 @@ pub enum Error {
     #[snafu(display("write to immutable buffer refused: {op} (storage id {storage})"))]
     ImmutableBuffer { op: &'static str, storage: u64 },
 
+    /// A `HostWrite` into the storage is live, so `op` would race its stores.
+    #[snafu(display("{op} refused: a host write into storage id {storage} is live"))]
+    HostWriteLive { op: &'static str, storage: u64 },
+
+    /// A `HostWrite::rows` row lies past the end of the buffer.
+    #[snafu(display("host write row {row} is out of bounds for {len} elements"))]
+    HostWriteRow { row: usize, len: usize },
+
+    /// A host write view is not aligned to its element type.
+    #[snafu(display("host write view at byte offset {offset} is not aligned to {align}"))]
+    MisalignedHostWrite { offset: usize, align: usize },
+
     /// Runtime execution error. Free-form catch-all; prefer the structured
     /// variants below when the data is structured.
     #[snafu(display("runtime error: {message}"))]
@@ -130,6 +142,12 @@ pub enum Error {
     /// quarantined because the kernel may still reference them.
     #[snafu(display("AMD queue {queue_id} remained active after setup rollback failed: {cause}"))]
     AmdQueueStillActive { queue_id: u32, cause: String },
+
+    /// An AMD compute queue reported an error: the code the CP wrote into the
+    /// AQL `queue_inactive_signal` as it halted the queue, or the exception
+    /// bits KFD set in the `ErrorReason` word its CWSR header names.
+    #[snafu(display("AMD compute queue {queue_id} stopped: {cause} ({report} {code:#x})"))]
+    AmdQueueError { queue_id: u32, report: &'static str, code: u64, cause: &'static str },
 
     /// AMD allocation failure (VRAM exhaustion, BAR-resize required, etc.).
     #[snafu(display("AMD allocation failed: {reason}"))]

@@ -23,7 +23,7 @@ pub fn addr_qualifier(dialect: CDialect, addrspace: Option<AddrSpace>) -> &'stat
     match dialect {
         CDialect::Clang => "",
         CDialect::Metal => match addrspace {
-            Some(AddrSpace::Global) => "device ",
+            Some(AddrSpace::Global | AddrSpace::Swizzled { .. }) => "device ",
             Some(AddrSpace::Local) => "threadgroup ",
             Some(AddrSpace::Reg) | None => "thread ",
         },

@@ -33,8 +33,9 @@ sidebar_label: अवलोकन
 | `CUDA[:N]`, `GPU[:N]` | `DeviceSpec::Cuda { device_id }` |
 | `METAL[:N]` | `DeviceSpec::Metal { device_id }` (केवल `0` मौजूद है) |
 
-अकेला `NAME` डिवाइस 0 है। `NV` जान-बूझकर reject किया जाता है — यह नाम भविष्य के एक userspace
-NVIDIA driver के लिए आरक्षित है। जब कुछ भी डिवाइस नहीं चुनता, तो platform default लागू होता
+अकेला `NAME` डिवाइस 0 है। `NV` भविष्य के एक userspace NVIDIA driver के लिए
+आरक्षित है: `DeviceSpecExt::parse` इसे reject करता है, और `SVOD_DEVICE` इसे किसी भी ऐसे
+value की तरह ignore करता है जिसे वह parse नहीं कर पाता, और platform default पर लौट आता है। जब कुछ भी डिवाइस नहीं चुनता, तो platform default लागू होता
 है: **macOS पर `METAL:0`, बाकी हर जगह `CPU`**। पूरी precedence यह है: एक
 `with_default_device` scope, फिर thread-local `set_default_device`, फिर `SVOD_DEVICE` (प्रति
 process एक बार पढ़ा जाता है), फिर platform default। GPU arch कभी spec का हिस्सा नहीं होता:
@@ -102,7 +103,7 @@ pub struct Device {
 | `RuntimeFactory` | — | `CompiledSpec` को `Program` में load करता है; `Device::new` इसे wrap करता है ताकि हर spec की stage identity पहले validate हो |
 | `Program` | `execute`, `name` | एक कर्नेल launch; `execute_timed` (BEAM के लिए GPU-clock duration), `new_exec_context`, `resource_usage` और `as_any` वैकल्पिक हैं |
 | `PlanContext` | `dispatch`, `synchronize` | `Program::new_exec_context` द्वारा बनाया गया प्रति-plan state: lanes, completion tokens, timestamps, counters (`set_pmc`), native linked replay (`replay_linked_plan`) |
-| `Allocator` | `_alloc`, `name`, `device_spec` | `_copyin` / `_copyout` / `_transfer` / `_free` / `synchronize` / `supports_device_local` वैकल्पिक हैं और default रूप से host-memory semantics रखते हैं |
+| `Allocator` | `_alloc`, `name`, `device_spec` | बाक़ी वैकल्पिक हैं: `_copyin` / `_copyout` / `_transfer` default रूप से `Unsupported` error लौटाते हैं, `_free` buffer को drop करता है, `synchronize` कुछ नहीं करता और `supports_device_local` `false` है |
 | `Graph` | `replay` | एक captured कर्नेल chain जो एक submission से replay होती है; `completion_token`, `replay_profiled` वैकल्पिक |
 | `CompletionToken`, `TimelineSignal`, `DispatchTimestamps` | | synchronization और profiling handles जिन्हें executor उपयोग करता है (`device/src/sync.rs`) |
 

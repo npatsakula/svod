@@ -10,13 +10,13 @@ use smallvec::smallvec;
 use svod_codegen::llvm::nvptx::smem::{cp_async_commit, cp_async_wait};
 use svod_codegen::llvm::nvptx::wgmma;
 use svod_dtype::{AddrSpace, DType, DeviceSpec, ScalarDType};
-use svod_ir::{AxisId, AxisType, BarrierFence, KernelInfo, Op, UOp};
+use svod_ir::{AxisId, AxisType, BarrierFence, ConstValue, KernelInfo, Op, UOp};
 
-use crate::atoms::{Core, Fill};
+use crate::atoms::{Core, Fill, Target};
 use crate::index::*;
 use crate::ir::*;
-use crate::layouts::{Laid, Moves, TileLayout};
-use crate::lower::{Lowering, ProgramSnafu, Result, TooLargeSnafu, UnsupportedSnafu};
+use crate::layouts::{Moves, TileLayout};
+use crate::lower::{ExtentPastI32Snafu, Lowering, ProgramSnafu, Result, TooLargeSnafu, UnsupportedSnafu};
 use snafu::{ResultExt, ensure};
 
 mod address;
@@ -32,12 +32,19 @@ thread_local! {
     pub(super) static ROLLED: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(vec![]) };
 }
 
-pub fn emit(laid: &Laid, low: &Lowering, params: Vec<Arc<UOp>>, device: DeviceSpec) -> Result<Arc<UOp>> {
-    let (prog, lay) = (&laid.prog, laid.layouts.as_slice());
+/// The laid program as a pre-linearized Svod program, and the instruction
+/// list it holds.
+pub fn emit(
+    prog: &Program<Laid>,
+    low: &Lowering,
+    params: Vec<Arc<UOp>>,
+    device: DeviceSpec,
+) -> Result<(Arc<UOp>, Arc<UOp>)> {
     // Parameters and buffers committed up front: the assembly rebuilds none
     // of the ops reading them to commit their shapes.
     let params = params.iter().map(UOp::committed_shape).collect();
-    let mut e = Emit::new(prog, lay, low, params);
+    let params = amdgpu::swizzled(params, prog, &low.device.target);
+    let mut e = Emit::new(prog, low, params);
     e.prologue()?;
     e.block(&prog.body)?;
     e.list.within(&prog.name)?;
@@ -50,7 +57,7 @@ pub fn emit(laid: &Laid, low: &Lowering, params: Vec<Arc<UOp>>, device: DeviceSp
     }
     let info = KernelInfo { name: Some(prog.name.clone()), ..Default::default() };
     ROLLED.with(|cell| cell.borrow_mut().extend(e.rolled));
-    UOp::linear_program(info, list, device).context(ProgramSnafu)
+    UOp::listed_program(info, list, device).context(ProgramSnafu)
 }
 
 /// The instruction list cut at the insertion point of every nesting level
@@ -120,8 +127,22 @@ impl Listing {
     }
 }
 
+/// Ranges and grids count in `i32` on every target, whatever the width of the
+/// addresses they build (a bound variable's range does by construction,
+/// [`crate::build::Kernel::var`]); a count past it is refused. A count without a
+/// bound is a row coordinate read from memory, in `i32` already.
+fn counted(name: &str, most: Option<i64>) -> Result<()> {
+    let extent = most.unwrap_or(0);
+    ensure!(extent <= i32::MAX as i64, ExtentPastI32Snafu { name, extent });
+    Ok(())
+}
+
 struct Emit<'a> {
-    prog: &'a Program,
+    prog: &'a Program<Laid>,
+    /// The width this program's scalars count in: past `i32` where a
+    /// parameter's elements are.
+    index: DType,
+    /// The program's layouts ([`Program::layouts`]).
     lay: &'a [Option<TileLayout>],
     low: &'a Lowering,
     params: Vec<Arc<UOp>>,
@@ -169,7 +190,7 @@ struct Emit<'a> {
     async_products: bool,
     /// Whether the loop being emitted holds a product, innermost last: the
     /// ranges opened over one that does are the schedule's own decision to
-    /// stay rolled, carried to the renderer ([`Lowered::rolled`]).
+    /// stay rolled, carried to the renderer ([`crate::lower::Lowered::rolled`]).
     rolling: Vec<bool>,
     rolled: Vec<u64>,
     range_id: usize,
@@ -221,7 +242,8 @@ impl Coord {
 }
 
 impl<'a> Emit<'a> {
-    fn new(prog: &'a Program, lay: &'a [Option<TileLayout>], low: &'a Lowering, params: Vec<Arc<UOp>>) -> Self {
+    fn new(prog: &'a Program<Laid>, low: &'a Lowering, params: Vec<Arc<UOp>>) -> Self {
+        let index = prog.index.dtype();
         let threads = prog.warps * low.device.target.wave;
         let tid = UOp::special_dtype(c32(threads as i64), "lidx0".to_string(), DType::Int32);
         let wave = c32(low.device.target.wave as i64);
@@ -231,9 +253,8 @@ impl<'a> Emit<'a> {
         // every iteration (a body may read `phi` after computing `next`). A
         // value that starts several loops starts none in place: each copies
         // it in ([`Self::loop_`]).
-        let carried = |stmt: &Stmt| match stmt {
+        let carried = |stmt: &Stmt<Laid>| match stmt {
             Stmt::Loop(l) => l.carried.clone(),
-            Stmt::Pipeline(p) => p.carried.clone(),
             _ => vec![],
         };
         let mut starts: HashMap<ValId, usize> = HashMap::new();
@@ -254,7 +275,8 @@ impl<'a> Emit<'a> {
         }
         Self {
             prog,
-            lay,
+            index,
+            lay: &prog.layouts,
             low,
             params,
             vars: HashMap::new(),
@@ -354,6 +376,9 @@ impl<'a> Emit<'a> {
     }
 
     fn prologue(&mut self) -> Result<()> {
+        for &extent in &self.prog.grid {
+            counted(&self.prog.name, self.prog.bounds(extent, &|_| None).map(|(_, hi)| hi))?;
+        }
         let n = self.params.len();
         for (i, v) in self.prog.vars.iter().enumerate() {
             let p = UOp::scalar_param(n + i, Some(v.name.clone()), DType::Int32, v.min, v.max);
@@ -396,13 +421,16 @@ impl<'a> Emit<'a> {
             }
             // Constants have no position: an unlisted node lands before its first user.
             Scalar::Const(v) => {
-                let u = c32(*v);
+                let u = UOp::const_(self.index.clone(), ConstValue::Int(*v));
                 self.scalars.insert(id, (0, u.clone()));
                 return (0, u);
             }
-            Scalar::Var(name) => (0, self.vars[name].clone()),
-            Scalar::Special(Special::Block(axis)) => (0, self.block_index(*axis as usize)),
-            Scalar::Special(Special::Warp) => (0, self.warp.clone()),
+            Scalar::Var(name) => (0, self.widened(self.vars[name].clone())),
+            Scalar::Special(Special::Block(axis)) => {
+                let block = self.block_index(*axis as usize);
+                (0, self.widened(block))
+            }
+            Scalar::Special(Special::Warp) => (0, self.widened(self.warp.clone())),
             Scalar::Induction => return self.inductions[&id].clone(),
             Scalar::Any(_) => unreachable!("a branch reads an any as its predicate, nothing else does"),
             Scalar::Bin(op, a, b) => {
@@ -415,13 +443,13 @@ impl<'a> Emit<'a> {
                     BinOp::Rem => a.try_cmod(&b),
                     BinOp::Min => minimum(&a, &b),
                     BinOp::Max => a.try_max(&b),
-                    BinOp::Lt => a.try_cmplt(&b).map(|c| c.cast(DType::Int32)),
-                    BinOp::Le => a.try_cmple(&b).map(|c| c.cast(DType::Int32)),
-                    BinOp::Eq => a.try_cmpeq(&b).map(|c| c.cast(DType::Int32)),
+                    BinOp::Lt => a.try_cmplt(&b).map(|c| c.cast(self.index.clone())),
+                    BinOp::Le => a.try_cmple(&b).map(|c| c.cast(self.index.clone())),
+                    BinOp::Eq => a.try_cmpeq(&b).map(|c| c.cast(self.index.clone())),
                     BinOp::And => a.try_and_op(&b),
                     BinOp::Or => a.try_or_op(&b),
                 };
-                (la.max(lb), u.expect("i32 scalar"))
+                (la.max(lb), u.expect("a scalar"))
             }
             // The parameter is an input, so no store moves under its read; a
             // read whose index may leave the parameter stays under the
@@ -441,7 +469,7 @@ impl<'a> Emit<'a> {
                 let inside = self.prog.bounds(*at, &bound).is_some_and(|(lo, hi)| lo >= 0 && hi < elems);
                 let level = if inside { level } else { level.max(self.guards.last().copied().unwrap_or(0)) };
                 let load = self.hoist_at(load_at(&idx, tag), level);
-                (level, load.cast(DType::Int32))
+                (level, self.widened(load.cast(DType::Int32)))
             }
         };
         let u = self.hoist(u);
@@ -452,14 +480,21 @@ impl<'a> Emit<'a> {
         (level, u)
     }
 
+    /// `u` in the width this program's scalars count in.
+    fn widened(&self, u: Arc<UOp>) -> Arc<UOp> {
+        u.cast(self.index.clone())
+    }
+
     fn sc(&mut self, id: ScalarId) -> Arc<UOp> {
         self.scalar(id).1
     }
 
     /// The block's index along grid `axis`: the hardware's, or on a target
     /// of several dies the index of the block that the hardware's linear
-    /// position lands on under [`die_order`], so the blocks a kernel places
-    /// next to each other (sharing a panel, a head's keys) share a die's L2.
+    /// position lands on when each die's share of the dispatch is laid end
+    /// to end (the first `total % dies` dies a block more), so the blocks a
+    /// kernel places next to each other (sharing a panel, a head's keys)
+    /// share a die's L2.
     /// Every axis is derived at once and kept, listed in the prologue.
     fn block_index(&mut self, axis: usize) -> Arc<UOp> {
         if let Some(b) = &self.blocks[axis] {
@@ -472,8 +507,9 @@ impl<'a> Emit<'a> {
         let blocks = if dies > 1 {
             let linear = add(&hw[0], &mul(&ends[0], &add(&hw[1], &mul(&ends[1], &hw[2]))));
             let total = mul(&ends[0], &mul(&ends[1], &ends[2]));
-            let (base, tall) = (total.try_cdiv(&c32(dies)).expect("base"), total.try_cmod(&c32(dies)).expect("tall"));
-            let (die, local) = (linear.try_cmod(&c32(dies)).expect("die"), linear.try_cdiv(&c32(dies)).expect("local"));
+            let dies_of = total.const_like(dies);
+            let (base, tall) = (total.try_cdiv(&dies_of).expect("base"), total.try_cmod(&dies_of).expect("tall"));
+            let (die, local) = (linear.try_cmod(&dies_of).expect("die"), linear.try_cdiv(&dies_of).expect("local"));
             // `min(die, tall)`: the dies before `tall` hold a block more.
             let extra = add(&die, &tall).try_sub(&die.try_max(&tall).expect("max")).expect("min");
             let ordered = self.hoist(add(&add(&mul(&die, &base), &extra), &local));
@@ -637,7 +673,7 @@ impl<'a> Emit<'a> {
         }
     }
 
-    fn block(&mut self, block: &Block) -> Result<()> {
+    fn block(&mut self, block: &Block<Laid>) -> Result<()> {
         self.pending.push(vec![]);
         let waited = block.0.iter().any(|s| matches!(s, Stmt::Sync(Sync::WaitProducts { .. })));
         let outer = std::mem::replace(&mut self.async_products, waited);
@@ -658,7 +694,7 @@ impl<'a> Emit<'a> {
         Ok(())
     }
 
-    fn stmt(&mut self, stmt: &Stmt) -> Result<()> {
+    fn stmt(&mut self, stmt: &Stmt<Laid>) -> Result<()> {
         match stmt {
             Stmt::Let { dst, op } => {
                 self.let_(*dst, op)?;
@@ -671,7 +707,7 @@ impl<'a> Emit<'a> {
                 Ok(())
             }
             Stmt::Loop(l) => self.loop_(l),
-            Stmt::Pipeline(_) => UnsupportedSnafu { what: "an unexpanded pipeline" }.fail(),
+            Stmt::Pipeline(never) => match *never {},
             Stmt::Warps { body } => {
                 let outer = std::mem::replace(&mut self.scope, Scope::Warp);
                 let out = self.block(body);
@@ -689,7 +725,7 @@ impl<'a> Emit<'a> {
                     // Listed like any scalar: a compare left to its first user
                     // would land inside whichever branch meets it first and not
                     // reach a later `if` on the same predicate outside it.
-                    let cond = self.hoist(pred.try_cmpne(&c32(0)).expect("predicate"));
+                    let cond = self.hoist(pred.try_cmpne(&pred.const_like(0)).expect("predicate"));
                     (cond.clone(), self.hoist(cond.not()))
                 };
                 self.divergent += divergent;
@@ -734,18 +770,18 @@ impl<'a> Emit<'a> {
     /// A rolled loop, or `unroll` copies of the body per iteration followed by
     /// a rolled remainder (skipped when a constant extent divides evenly).
     /// Whether any statement of `block`, at any depth, is a product.
-    fn holds_product(block: &Block) -> bool {
+    fn holds_product(block: &Block<Laid>) -> bool {
         block.walk().any(|(_, s)| matches!(s, Stmt::Let { op: TileOp::Mma { .. }, .. }))
     }
 
-    fn loop_(&mut self, l: &Loop) -> Result<()> {
+    fn loop_(&mut self, l: &Loop<Laid>) -> Result<()> {
         self.rolling.push(Self::holds_product(&l.body));
         let out = self.loop_inner(l);
         self.rolling.pop();
         out
     }
 
-    fn loop_inner(&mut self, l: &Loop) -> Result<()> {
+    fn loop_inner(&mut self, l: &Loop<Laid>) -> Result<()> {
         let copied: Vec<Carried> =
             l.carried.iter().filter(|c| self.root(c.init) != self.root(c.phi)).copied().collect();
         for c in copied {
@@ -763,21 +799,23 @@ impl<'a> Emit<'a> {
             let (_, u) = self.inductions.get(&iv)?;
             Some((u.vmin().try_int()?, u.vmax().try_int()?))
         };
-        if self.prog.bounds(l.extent, &bound).is_some_and(|(lo, _)| lo < 0) {
-            extent = self.hoist(extent.try_max(&c32(0)).expect("a floored extent"));
+        let bounds = self.prog.bounds(l.extent, &bound);
+        counted(&self.prog.name, bounds.map(|(_, hi)| hi))?;
+        if bounds.is_some_and(|(lo, _)| lo < 0) {
+            extent = self.hoist(extent.try_max(&extent.const_like(0)).expect("a floored extent"));
         }
         let u = l.unroll.max(1) as i64;
         let constant = self.constant(l.extent);
         if u == 1 {
             return self.loop_rolled(l, extent, |_, range| add(&start, &range));
         }
-        let main = self.hoist(extent.try_cdiv(&c32(u)).expect("trips"));
-        let rem = self.hoist(extent.try_cmod(&c32(u)).expect("remainder"));
+        let main = self.hoist(extent.try_cdiv(&extent.const_like(u)).expect("trips"));
+        let rem = self.hoist(extent.try_cmod(&extent.const_like(u)).expect("remainder"));
         if constant.is_none_or(|e| e / u > 0) {
             self.loop_unrolled(l, main.clone(), u)?;
         }
         if constant.is_none_or(|e| e % u != 0) {
-            let base = self.hoist(add(&start, &mul(&main, &c32(u))));
+            let base = self.hoist(add(&start, &mul(&main, &main.const_like(u))));
             self.loop_rolled(l, rem, move |_, range| add(&base, &range))?;
         }
         Ok(())
@@ -807,7 +845,7 @@ impl<'a> Emit<'a> {
     /// Bind the induction variable for one copy of a body: memoized scalars
     /// of this level or deeper were computed for the previous binding.
     fn bind(&mut self, iv: ScalarId, level: usize, value: Arc<UOp>) {
-        let value = self.hoist(value);
+        let value = self.hoist(self.widened(value));
         self.levels.insert(value.id, level);
         self.inductions.insert(iv, (level, value));
         self.scalars.retain(|_, (l, _)| *l < level);
@@ -817,7 +855,7 @@ impl<'a> Emit<'a> {
     /// One iteration's body; a carried value's move into its `phi` is
     /// scheduled for the end of the block that defines its `next` (see
     /// [`Self::advance`]).
-    fn body(&mut self, l: &Loop) -> Result<()> {
+    fn body(&mut self, l: &Loop<Laid>) -> Result<()> {
         self.carried.push(l.carried.clone());
         self.block(&l.body)?;
         self.carried.pop();
@@ -839,7 +877,12 @@ impl<'a> Emit<'a> {
         self.pending.last_mut().expect("an open block").extend(moves);
     }
 
-    fn loop_rolled(&mut self, l: &Loop, end: Arc<UOp>, iv: impl Fn(&mut Self, Arc<UOp>) -> Arc<UOp>) -> Result<()> {
+    fn loop_rolled(
+        &mut self,
+        l: &Loop<Laid>,
+        end: Arc<UOp>,
+        iv: impl Fn(&mut Self, Arc<UOp>) -> Arc<UOp>,
+    ) -> Result<()> {
         let range = self.open_range(end);
         let level = self.level();
         let value = iv(self, range.clone());
@@ -849,13 +892,14 @@ impl<'a> Emit<'a> {
         Ok(())
     }
 
-    fn loop_unrolled(&mut self, l: &Loop, trips: Arc<UOp>, u: i64) -> Result<()> {
+    fn loop_unrolled(&mut self, l: &Loop<Laid>, trips: Arc<UOp>, u: i64) -> Result<()> {
         let start = self.sc(l.start);
         let range = self.open_range(trips);
         let level = self.level();
-        let base = add(&start, &mul(&range, &c32(u)));
+        let wide_range = self.widened(range.clone());
+        let base = add(&start, &mul(&wide_range, &wide_range.const_like(u)));
         for copy in 0..u {
-            self.bind(l.iv, level, add(&base, &c32(copy)));
+            self.bind(l.iv, level, add(&base, &base.const_like(copy)));
             self.body(l)?;
         }
         self.close_range(range);
@@ -920,7 +964,7 @@ fn lane_of(u: &Arc<UOp>) -> Option<(&Arc<UOp>, u32)> {
 }
 
 /// Whether scalar `id` is a multiple of `m` whatever its inputs.
-fn multiple_of(prog: &Program, id: ScalarId, m: i64) -> bool {
+fn multiple_of(prog: &Program<Laid>, id: ScalarId, m: i64) -> bool {
     match prog.scalar(id) {
         Scalar::Const(v) => v % m == 0,
         Scalar::Bin(BinOp::Add | BinOp::Sub | BinOp::Min | BinOp::Max, a, b) => {
@@ -932,7 +976,7 @@ fn multiple_of(prog: &Program, id: ScalarId, m: i64) -> bool {
 }
 
 /// Whether scalar `id` reads [`Scalar::Row`], memoized in `memo`.
-fn reads_row(prog: &Program, id: ScalarId, memo: &mut Vec<Option<bool>>) -> bool {
+fn reads_row(prog: &Program<Laid>, id: ScalarId, memo: &mut Vec<Option<bool>>) -> bool {
     if let Some(known) = memo[id.index()] {
         return known;
     }

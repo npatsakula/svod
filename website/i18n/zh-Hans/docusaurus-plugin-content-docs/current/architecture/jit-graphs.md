@@ -75,7 +75,7 @@ jit_wrapper! {
 
 ## 数组槽位、批变量与状态
 
-声明的块形式增加了流式模型所需的三样东西。它们都是可选的；按旧的扁平形式编写的包装器无需修改即可继续工作。
+声明的块形式增加了流式模型所需的三样东西。它们都是可选的，上面的扁平形式依然有效。
 
 ```rust
 jit_wrapper! {
@@ -97,7 +97,7 @@ jit_wrapper! {
 }
 ```
 
-**`[Tensor; N]` 槽位**把 N 个缓冲区放在一个名字之下：`prepare` 接收 `[InputSpec; N]`，build 闭包接收 `[&Tensor; N]`，生成的访问器接收一个叶子索引——`jit.taps_view_mut::<f32>(1)?`。输出同样可以是数组。输入索引越界会返回 `JitError::InputBufferNotFound`；输出索引越界则会 panic。
+**`[Tensor; N]` 槽位**把 N 个缓冲区放在一个名字之下：`prepare` 接收 `[InputSpec; N]`，build 闭包接收 `[&Tensor; N]`，生成的访问器接收一个叶子索引——`jit.taps_host_write::<f32>(1)?`。输出同样可以是数组。输入索引越界会返回 `JitError::InputBufferNotFound`；输出索引越界则会 panic。
 
 **`batch_var b: (min, max)`** 声明一个符号变量，*并且*在占位张量实体化后把每个批处理输入的第 0 维收缩到它，从而让一个计划服务一系列批大小。`#[unbatched]` 让某个输入退出这一行为——例如共享的 bias，或首轴不是批维的表——而状态槽位从不收缩。每次调用通过生成的 `execute_bound(4)` 绑定它。
 
@@ -145,7 +145,7 @@ jit.execute_bound(batch as i64, time as i64)?;   // same thing, positionally
 | `prepare(input1: InputSpec, ..., state1: InputSpec, ...)` | 一次性 | 构建图、运行模式、编译内核、分配缓冲区；读取 `PrepareConfig::from_env()` |
 | `prepare_with_config(..., &PrepareConfig)` | 一次性 | 与 `prepare` 相同，但使用显式配置 |
 | `<input>_mut([i]) -> Result<&mut Buffer>` | 每步 | 每个声明的输入或状态槽位的原始缓冲区（数组槽位需 `i`） |
-| `<input>_view_mut::<T>([i]) -> Result<ArrayViewMutD<T>>` | 每步 | 输入缓冲区上的类型化写视图，带 dtype 检查 |
+| `<input>_host_write::<T>([i]) -> Result<HostWrite<T>>` | 每步 | 宿主可见输入缓冲区上的独占类型化宿主写守卫，带 dtype 检查；drop 时发布写入，守卫存活期间 `execute*` 会失败 |
 | `output() -> Result<&Buffer>` | 每步 | 计划的第一个输出 |
 | `<output>([i])` / `<output>_shape()` / `_view::<T>()` / `_to_vec::<T>()` | 每步 | 具名输出缓冲区、其实时形状及读取，按当前变量绑定解析 |
 | `reset() -> Result<()>` | 每步 | 将每个 `state` 槽位清零（仅在有 `state` 时生成） |
@@ -174,7 +174,7 @@ jit.execute_bound(batch as i64, time as i64)?;   // same thing, positionally
 
 ## `InputSpec`
 
-`InputSpec`、`JitError` 以及宏展开所用的缓冲区辅助函数都位于 `svod_tensor::jit`，因此承载 `jit_wrapper!` 的 crate 只需这一个依赖（`svod_model::jit` 为历史路径重新导出了它们）。
+`InputSpec`、`JitError` 以及宏展开所用的缓冲区辅助函数都位于 `svod_tensor::jit`，因此承载 `jit_wrapper!` 的 crate 只需这一个依赖（`svod_model::jit` 将它们重新导出为该 crate 自身包装器所用的 `crate::jit::…` 路径）。
 
 `prepare()` 为每个声明的输入和状态槽位接收一个 `InputSpec`——数组槽位则接收一个 `[InputSpec; N]`：
 
@@ -208,12 +208,12 @@ impl InputSpec {
 
 | 后端 | 机制 | 说明 |
 |---|---|---|
-| CUDA | `cuGraphAddKernelNode` DAG, `cuGraphInstantiate`, `cuGraphLaunch` | 默认开启；`cuGraphExecKernelNodeSetParams` 只修补参数发生变化的节点；缓冲区别名关系的变化会触发重新捕获 |
-| AMD | 一条链接起来的 HCQ/PM4 命令流，内核参数存储归图所有，通过单次 doorbell 重放 | AQL 队列（多 XCC 型号，或 `SVOD_AMD_AQL=1`）默认捕获；PM4 捕获需通过 `SVOD_PM4_GRAPH=1` 显式开启 |
+| CUDA | `cuGraphAddKernelNode` DAG, `cuGraphInstantiate`, `cuGraphLaunch` | 默认开启；`cuGraphExecKernelNodeSetParams` 只修补参数发生变化的节点；若重放时缓冲区的别名关系与捕获时不同，则改走按捕获顺序串联的链，而不是 DAG |
+| AMD | 一条链接起来的 HCQ 命令流（AQL 包或 PM4），内核参数存储归图所有，通过单次 doorbell 重放 | AQL 队列（多 XCC 型号，或 `SVOD_AMD_AQL=1`）默认捕获；PM4 捕获需通过 `SVOD_PM4_GRAPH=1` 显式开启 |
 | Metal | 带逐命令屏障的 `MTLIndirectCommandBuffer`，每次重放一次 `executeCommandsInBuffer` | 任一内核接收标量参数或处于虚拟化 GPU 上时放弃捕获；重新绑定前等待上一次重放完成 |
 | CPU | — | 没有图工厂；直接调用内核 |
 
-**回退路径。** 不使用图时，AMD 计划——包括动态形状的计划——会被捕获为*链接计划*：一条命令流，其内核参数和启动维度在每次重放时重新打包。在其他所有情况下，计划按层级顺序遍历，并把每个内核提交到计划自己的队列（在 GPU 上是异步的；只在结尾 `wait`）。`execute_profiled` 在存在图时使用图的剖析变体，否则使用逐次派发的时间戳。
+**回退路径。** 不使用图时，只要所有内核参数和复制端点都位于计划所在的设备上，AMD 计划（包括动态形状的计划）就会作为*链接计划*重放：一条命令流，其内核参数和启动维度在每次重放时重新打包。否则，计划按层级顺序遍历，并把每个内核提交到计划自己的队列（在 GPU 上是异步的；只在结尾 `wait`）。`execute_profiled` 在存在图时使用图的剖析变体，否则使用逐次派发的时间戳。
 
 ---
 
@@ -224,9 +224,7 @@ impl InputSpec {
 ```rust
 jit.reset()?;                                    // zero the state, new sequence
 for chunk in chunks {
-    for (slot, v) in jit.x_view_mut::<f32>()?.iter_mut().zip(chunk) {
-        *slot = v;                               // per-step input, written in place
-    }
+    jit.x_host_write::<f32>()?.copy_from(&chunk)?; // per-step input, written in place
     jit.execute()?;                              // reads state, writes it back
     let frame = jit.emitted_to_vec::<f32>()?;    // only the emitted head crosses
 }
@@ -303,7 +301,7 @@ jit.prepare_with_config(
 )?;
 ```
 
-随后 `VadInference::probs` 以 `FEATURE_BATCH` 大小的派发遍历波形——打包 `chunks_view_mut::<f32>()`、`execute()`、对有效行执行 `copyout_prefix`——并把门值交给 `VadHead::scan`，这是一个以主机 CPU 所具备的最宽 SIMD 宽度向量化的 LSTM 加 sigmoid 头。这种拆分取代了原先每个窗口一次微小派发的路径，后者的往返延迟主导了整个模型。
+随后 `VadInference::probs` 以 `FEATURE_BATCH` 大小的派发遍历波形——打包 `chunks_host_write::<f32>()`、`execute()`、对有效行执行 `copyout_prefix`——并把门值交给 `VadHead::scan`，这是一个以主机 CPU 所具备的最宽 SIMD 宽度向量化的 LSTM 加 sigmoid 头。
 
 ---
 
@@ -333,12 +331,12 @@ jit.prepare_with_config(
 | `InputAliased` | 某个输入解析到了另一个计划的缓冲区——并发的 `prepare` 破坏了其图标识 |
 | `Build` | build 闭包返回了 `Err`；内部错误以 `Box<dyn Error + Send + Sync>` 形式保留 |
 | `Tensor` | 张量操作在 `prepare` 期间或 build 闭包中失败 |
-| `Device` | 设备或缓冲区操作失败 |
+| `Device` | 设备或缓冲区操作失败——例如同一存储上的第二个守卫返回 `HostWriteLive`，对设备本地输入调用 `_host_write` 返回 `NotCpuAccessible` |
 | `OutputCountMismatch` | 包装器声明了 N 个输出加状态槽位，但编译后的计划保留的数量不同 |
 | `DtypeMismatch` | 类型化视图或读取请求的 dtype 与缓冲区实际持有的不符 |
 | `ViewOutOfBounds` | 某个输出的实时形状所需字节数超过其缓冲区容量——绑定的变量超出了计划编译时的范围 |
 | `InferredOutputDim` | 某个输出形状带有 `-1` 维度，没有可替换的实时值 |
-| `Runtime` | 内核执行失败，或某个变量被绑定到其 `[min, max]` 之外 |
+| `Runtime` | 内核执行失败、某个变量被绑定到其 `[min, max]` 之外，或计划缓冲区上的宿主写守卫仍然存活 |
 
 符号变量 setter（`with_<var>_*`）上的配置错误会在调用处直接 panic 而不是返回错误，因为它们发生在任何计划存在之前。
 

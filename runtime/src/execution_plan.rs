@@ -506,6 +506,16 @@ impl ExecutionPlan {
         Ok(())
     }
 
+    /// Refuse to launch while a host write into any bound storage is live:
+    /// the GPU would read stores still in flight. One load per buffer, outside
+    /// the poisoning epoch, so the plan stays usable once the guard drops.
+    fn check_no_host_writes(&self) -> Result<()> {
+        for buffer in &self.buffers {
+            buffer.ensure_no_host_write("launch").context(ExecSnafu { context: "bind plan buffers" })?;
+        }
+        Ok(())
+    }
+
     fn poison_hcq<T>(&self, result: Result<T>) -> Result<T> {
         if let Err(error) = &result {
             let _ = self.hcq_poison.set(error.to_string());
@@ -653,7 +663,11 @@ impl ExecutionPlan {
                             })
                         })
                         .collect::<Result<Vec<_>>>()?;
-                    let (global_size, local_size) = Self::kernel_launch_sizes(kernel)?;
+                    let Some((global_size, local_size)) = Self::kernel_launch_sizes(kernel)? else {
+                        return Ok(NativeReplayOutcome::Declined(NativeReplayDecline::EmptyLaunch {
+                            operation: kernel.id,
+                        }));
+                    };
                     CallValues::Program {
                         program: kernel.kernel.program.as_ref(),
                         buffers,
@@ -798,7 +812,9 @@ impl ExecutionPlan {
         }
     }
 
-    fn kernel_launch_sizes(kernel: &PreparedKernel) -> Result<RuntimeLaunchSizes> {
+    /// `None` when the grid is empty: no thread would run, so the kernel is
+    /// skipped rather than submitted (CUDA rejects an empty grid).
+    fn kernel_launch_sizes(kernel: &PreparedKernel) -> Result<Option<RuntimeLaunchSizes>> {
         let mut vars: HashMap<&str, i64> =
             HashMap::with_capacity(kernel.kernel.var_names.len() + kernel.fixedvars.len());
         for (idx, name) in kernel.kernel.var_names.iter().enumerate() {
@@ -819,7 +835,7 @@ impl ExecutionPlan {
         let dims =
             ProgramSpec::resolve_launch_dims(&kernel.kernel.global_size, kernel.kernel.local_size.as_ref(), &vars)
                 .context(ExecSnafu { context: format!("kernel {} launch dimensions", kernel.id) })?;
-        Ok((Some(dims.global_size), dims.local_size))
+        Ok((!dims.is_empty()).then_some((Some(dims.global_size), dims.local_size)))
     }
 
     /// Lazily capture all kernels into a backend replay graph. Only backends
@@ -896,7 +912,8 @@ impl ExecutionPlan {
         for level in &self.op_levels {
             for &idx in level {
                 let PreparedOp::CompiledProgram(k) = &self.ops[idx] else { return Ok(None) };
-                let (global_size, local_size) = Self::kernel_launch_sizes(k)?;
+                // Static dims never change, so an empty kernel keeps the plan per-call.
+                let Some((global_size, local_size)) = Self::kernel_launch_sizes(k)? else { return Ok(None) };
                 let e = kernels.len();
 
                 let current_addresses = k
@@ -971,7 +988,7 @@ impl ExecutionPlan {
                     .context(ExecSnafu { context: format!("resolve replay buffer for kernel {}", kernel.id) })
             })
             .collect::<Result<_>>()?;
-        let (global_size, local_size) = Self::kernel_launch_sizes(kernel)?;
+        let Some((global_size, local_size)) = Self::kernel_launch_sizes(kernel)? else { return Ok(None) };
         let program = kernel.kernel.program.as_ref();
         // Backends that expose a reusable context dispatch through it so all the
         // plan's kernels share one queue. Others (CPU) return `None` and fall
@@ -1327,6 +1344,7 @@ impl ExecutionPlan {
     /// `test_execute_walks_op_levels_in_level_order`.
     pub fn execute(&self) -> Result<()> {
         self.check_hcq_poison()?;
+        self.check_no_host_writes()?;
         // One plan has one mutable replay epoch regardless of backend path.
         // Native, graph, direct, and profiled execution share this lock.
         let mut executor = self
@@ -1434,6 +1452,7 @@ impl ExecutionPlan {
     /// as one opaque submission and would report no counters at all.
     fn execute_profiled_inner(&self, per_dispatch: bool) -> Result<Vec<KernelProfile>> {
         self.check_hcq_poison()?;
+        self.check_no_host_writes()?;
         let mut finalizer = SubmissionProfileFinalizer::with_capacity(self.op_order.len());
         let mut executor = self
             .hcq_executor
@@ -1704,7 +1723,7 @@ impl ExecutionPlan {
     /// Storage ids this plan writes: kernel outputs, copy destinations,
     /// custom-function arguments (no outs list — conservatively all written,
     /// mirroring `hcq_operations`), and the plan's declared outputs.
-    fn written_storage_ids(&self) -> HashSet<BufferId> {
+    pub fn written_storage_ids(&self) -> HashSet<BufferId> {
         self.written_indices.iter().filter_map(|&index| self.buffers.get(index).map(Buffer::storage_id)).collect()
     }
 

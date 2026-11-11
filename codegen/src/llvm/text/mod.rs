@@ -5,10 +5,10 @@
 //!
 //! # Kernel Signature
 //!
-//! Generates a single function with direct typed parameters and `noalias align 32`
-//! buffer annotations:
+//! Generates a single function with direct typed parameters; buffers are
+//! `noalias align 32`, plus `readonly` where the kernel only reads them:
 //! ```llvm
-//! define void @kernel(ptr noalias align 32 %buf0, ..., i32 %N) #0 { ... }
+//! define void @kernel(ptr noalias readonly align 32 %data0, ptr noalias align 32 %data1, ..., i32 %N) #0 { ... }
 //! ```
 
 use std::sync::Arc;
@@ -161,7 +161,8 @@ impl Renderer for LlvmTextRenderer {
             };
             let source_name = format!("%data{}", arg.slot);
             if arg.addrspace.is_some() {
-                inner_params.push(format!("ptr noalias align 32 {source_name}"));
+                let readonly = if arg.readonly { " readonly" } else { "" };
+                inner_params.push(format!("ptr noalias{readonly} align 32 {source_name}"));
             } else {
                 inner_params.push(format!("{} {source_name}", ldt(&param.dtype())));
             }
@@ -170,6 +171,9 @@ impl Renderer for LlvmTextRenderer {
 
         // -- Build function body --
         kernel.push("".to_string());
+        if self.target.is_amd() {
+            amd::ops::render_swizzled_params(&abi_params, &mut ctx, &mut kernel);
+        }
         if self.target.is_nvptx() {
             nvptx::ops::plan_shared_memory(&nodes, &mut ctx);
         }

@@ -48,16 +48,18 @@ by the `alloc_*_tagged` call sites:
 | Tag | Covers |
 |---|---|
 | `Vram` | General device VRAM — tensor data, code objects, EOP/ctx-save |
-| `Gtt` | Host-visible control memory — GTT, and the graph / linked-plan IB and control buffers |
-| `Kernarg` | Kernarg arenas (host-visible VRAM) — the per-dispatch, graph, and linked-plan argument pages |
+| `Gtt` | Other host-visible control memory in uncached GTT (the default for an untagged `UncachedGtt` allocation) |
+| `Kernarg` | Kernarg arenas (VRAM on multi-XCC parts, uncached GTT elsewhere) — the per-dispatch, graph, and linked-plan argument pages |
+| `CommandBuffer` | Graph and linked-plan command buffers — PM4 IBs and AQL control programs (VRAM on multi-XCC parts, uncached GTT elsewhere) |
 | `SignalPool` | The GTT signal-slot pool |
-| `QueueRing` / `QueueGart` / `QueueInactive` | A queue's ring, GART page, and queue-inactive signal |
+| `QueueRing` / `QueueGart` / `QueueInactive` | A queue's ring, GART page, and error words (the AQL `queue_inactive_signal` and the `ErrorReason` word) |
 | `Staging` | The GTT SDMA bounce buffer |
-| `Scratch` | Register-spill scratch — GPU-only VRAM, realloc'd per kernel |
+| `Scratch` | Register-spill scratch — GPU-only VRAM, realloc'd when a kernel needs more than the lane holds |
+| `HdpReadback` | The host-visible VRAM word the host reads back to flush HDP where KFD gives no MMIO-remap page |
 
 The distinction that matters is **scratch vs everything else**: scratch is the
-only shared, GPU-only, dynamically realloc'd-and-freed region, and the historical
-`NotPresent` culprit. The per-process KFD event page is allocated outside
+only shared, GPU-only, dynamically realloc'd-and-freed region, and so the first
+suspect for a `NotPresent` fault. The per-process KFD event page is allocated outside
 `alloc_raw` and is not tracked: a fault there classifies as unmapped.
 
 ### Classification
@@ -108,10 +110,30 @@ fault — logging every time would spam. It is then returned as a typed
 `Error::GpuFault`, whose `Display` is the string above; the poison latch
 records that text and re-throws it as an `Error::Runtime` (prefixed
 `runtime error: `) at every later entry point. A wait that expires without a
-fault is a distinct `Error::TimelineTimeout`.
+fault or a queue error is a distinct `Error::TimelineTimeout`.
 (A hardware-exception event, slot `[2]`, reports
 `reset_type`/`reset_cause`/`memory_lost` instead — those have no faulting VA to
 classify.)
+
+### Queue errors
+
+A compute queue can also stop without a memory fault. Each one has a GTT
+allocation (`QueueInactive`) holding two words:
+
+- the AQL `queue_inactive_signal`, where the CP writes a halt code as it stops
+  the queue (for example `0x401`, insufficient scratch);
+- the `ErrorReason` word that every CWSR header points at, where KFD sets the
+  bits of a queue exception (a wave trap, a failed preemption, …).
+
+PM4 queues use only `ErrorReason`. Both words raise the device's queue event, so
+a waiter sleeping in `WAIT_EVENTS` wakes. A wait reads every lane's words when it
+wakes from `WAIT_EVENTS` and when it times out. The first error it finds poisons
+the device and returns as `Error::AmdQueueError`, carrying the queue id, the word
+that reported it, the raw code and the decoded cause:
+
+```text
+AMD compute queue 3 stopped: insufficient scratch (queue_inactive_signal 0x401)
+```
 
 ---
 
@@ -126,8 +148,8 @@ dispatch and synchronize entry point:
 - `is_poisoned()` is the hot-path gate;
 - `poison_error()` returns the recorded `Error::Runtime` if poisoned;
 - `poll_faults_nonblocking()` issues `wait_events(0)` when a signal wait
-  reaches its deadline (30 s for dispatch, copy and lane acquisition), so the
-  real error is attached to the timeout rather than a bare deadline. (The
+  reaches its deadline (30 s for dispatch, copy and lane acquisition), and the
+  wait also reads the queues' error words, so the real error is attached to the timeout rather than a bare deadline. (The
   spin-escalation path also breaks out early on a fault, but through a short
   *blocking* `wait_events` instead of this poll.) `poison()` also wakes every
   thread parked on the lane pool.
@@ -148,7 +170,8 @@ points, both in `device/src/amd/program.rs`:
   does *not* populate (which would make the kernel read garbage pointers and
   fault).
 - **`[dispatch tv=…]`** — per dispatch: kernel name, `grid`, `local`, `is_pm4`,
-  the kernarg GPU VA, the scratch VA, and each buffer's VA.
+  the scratch VA, and each buffer's VA. (Kernargs get their ring slot later,
+  inside the submission, so the dump has no kernarg VA.)
 
 This is the fastest way to see exactly which VAs a faulting dispatch touched, to
 cross-reference against the registry's classification.
@@ -193,7 +216,7 @@ When a `NotPresent` fault recurs, the workflow is:
 2. Re-run with `SVOD_DEBUG_DISPATCH` set to see the exact VAs of the dispatch
    that faulted, and `RUST_LOG=svod_device=debug` to see the alloc/free history
    leading up to it.
-3. Cross-reference the faulting VA against the dumped scratch/kernarg/buffer VAs.
+3. Cross-reference the faulting VA against the dumped scratch and buffer VAs.
 
 The prime suspect for `NotPresent` is **scratch** (per the `Scratch` tag) — the
 only shared, GPU-only, dynamically realloc'd-and-freed region, where a
@@ -203,8 +226,7 @@ realloc-vs-dispatch race can leave a kernel pointed at a freed buffer.
 
 ## Why this matters
 
-Before the registry, a fault gave you a hex address and nothing else. Now the
-fault *message itself* says whether the VA is live scratch, a freed/stale VA, or
+The fault *message itself* says whether the VA is live scratch, a freed/stale VA, or
 wild — turning a blind hunt into a directed one. Paired with the poison latch
 (which stops the device cleanly rather than letting corrupted state propagate)
 and the dispatch dumps, the backend can localize a memory fault without

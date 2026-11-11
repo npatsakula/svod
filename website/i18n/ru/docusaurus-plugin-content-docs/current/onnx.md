@@ -100,13 +100,13 @@ let plan = Tensor::prepare_batch(outputs.values())?;   // schedule + compile, on
 plan.execute()?;
 
 for batch in batches {
-    image.array_view_mut::<f32>()?.as_slice_mut().unwrap().copy_from_slice(&batch);
+    image.with_host_write::<f32, _>(|w| w.copy_from(&batch))?;
     plan.execute()?;                                   // replay: no tracing, no compilation
     let logits = outputs["output"].as_vec::<f32>()?;
 }
 ```
 
-`array_view_mut` — представление `ndarray` без копирования поверх отображения
+`with_host_write` пишет прямо в отображение
 входа на хост; `prepare_batch` связывает каждый выходной тензор с буфером
 плана, поэтому `as_vec` / `as_ndarray` читают результат последнего запуска.
 
@@ -116,7 +116,7 @@ for batch in batches {
 внешние данные. Её входы — заглушки: сделайте `assign` значения той же формы и
 выполните (realize) вход *до* выходов. Заглушка сохраняет один буфер во всех
 планах, поэтому подготовленный план видит и последующие `assign` + `realize`,
-и записи через `array_view_mut`.
+и записи через `with_host_write`.
 
 ```rust
 let OnnxModel { mut inputs, outputs, .. } = OnnxImporter::new().import("model.onnx", &[])?;
@@ -334,7 +334,7 @@ ONNX как источник происхождения, поэтому проф
 | Аспект | Подробности |
 |---|---|
 | **Точки входа** | `import(path, dims)`, `import_model_with_inputs(proto, inputs, dims)`, `import_model(proto, dims)` |
-| **Входы во время выполнения** | Создайте тензоры, передайте их в `import_model_with_inputs`, между запусками пишите через `array_view_mut` |
+| **Входы во время выполнения** | Создайте тензоры, передайте их в `import_model_with_inputs`, между запусками пишите через `with_host_write` |
 | **Динамические размерности** | Привязка при импорте: `&[("batch", 8)]`; один импорт на каждый размер батча |
 | **Операторы** | 162 из 200 ([таблица соответствия](https://github.com/npatsakula/svod/blob/main/onnx/PARITY.md)) |
 | **Соответствие стандарту** | 1357 тестов узлов на Clang и LLVM; AMD и CUDA через `SVOD_DEVICE` |

@@ -15,14 +15,13 @@ implement और unit-tested हैं, bring-up एक बार एक live GP
 `SVOD_AMD_BACKEND=am` reject होता है (`unknown SVOD_AMD_BACKEND=am (only 'kfd'
 supported)`, `device/src/amd/device.rs`): `am/` में कुछ भी [`AmdIface`](./overview.md) seam
 implement नहीं करता, इसलिए `AmdDevice` इसका उपयोग नहीं कर सकता। code केवल standalone
-`device/examples/am_*.rs` programs के माध्यम से पहुँचा जा सकता है। इसका अंतिम functional
-बदलाव जून 2026 का है; बाद के commits cleanups हैं। नीचे के स्थिति-कथन बताते हैं कि उस commit
-ने क्या परखा, कोई चालू गारंटी नहीं — इसके लिए कोई CI या hardware test नहीं है।
+`device/examples/am_*.rs` programs के माध्यम से पहुँचा जा सकता है। नीचे के स्थिति-कथन
+बताते हैं कि इसके एकमात्र hardware run ने क्या परखा, कोई चालू गारंटी नहीं — इसके लिए कोई CI या hardware test नहीं है।
 :::
 
 module हर Unix host पर compile होता है (`cfg(unix)`, बाकी बैकएंड की तरह), इसलिए यह हमेशा
 type-checked, linted होता है, और इसका logic unit-tested है (`device/src/test/unit/amd/am/`
-के अंतर्गत लगभग 40 tests: page tables, TLSF, memory manager, register tables, discovery
+के अंतर्गत unit tests: page tables, TLSF, memory manager, register tables, discovery
 parser)।
 
 ---
@@ -87,8 +86,8 @@ hardware counters उपयोग करते हैं (`amd/pmc.rs`)।
 
 ## Examples
 
-हर `device/examples/am_*.rs` program एक standalone bring-up oracle है। जून 2026 के run ने
-क्या स्थापित किया:
+हर `device/examples/am_*.rs` program एक standalone bring-up oracle है। इसके एकमात्र hardware
+run ने क्या स्थापित किया:
 
 | Example | क्या करता है | परिणाम |
 |---|---|---|
@@ -122,11 +121,10 @@ VF पर do-not-call mark है और `am_compute` में commented out �
 
 ## यह यहाँ क्यों है
 
-प्रेरणा kernel scheduler है: single-XCC gfx11+ parts पर, aggressive multi-queue dispatch CP
-micro-engines को ऐसे waits में अटका सकता है जिन्हें MES firmware preempt नहीं कर सकता, यही
-कारण है कि [lane pool](./queues-and-dispatch.md) conservative रहता है। GPU का स्वामी बनना
+प्रेरणा kernel scheduler है: KFD के अंतर्गत हर user queue को kernel और MES/HWS firmware
+बनाते, map करते और preempt करते हैं, इसलिए dispatch उतना ही कर सकता है जितना वे अनुमति दें। GPU का स्वामी बनना
 kernel को dispatch path से बाहर कर देगा। वह तर्क अभी उस पर लागू नहीं होता जिसे AM support करता
 है — VF पर host अब भी scheduling, world-switch और doorbells का स्वामी है — और bare metal पर
 वहाँ पहुँचने का अर्थ है मौजूदा चीज़ों के ऊपर PSP, SMU, interrupts और seam implementation। आज
 design का मूल्य ख़ुद seam है: यदि कभी कोई AM बैकएंड आता है, तो वह `KfdIface` जैसे ही पाँच
-methods और तीन hooks implement करेगा, और seam के ऊपर कुछ नहीं बदलेगा।
+methods और चार hooks implement करेगा, और seam के ऊपर कुछ नहीं बदलेगा।

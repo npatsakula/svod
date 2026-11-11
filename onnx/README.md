@@ -38,7 +38,7 @@ let plan = Tensor::prepare_batch(outputs.values())?; // schedule + compile, once
 plan.execute()?;
 
 for batch in batches {
-    input.array_view_mut::<f32>()?.as_slice_mut().unwrap().copy_from_slice(&batch);
+    input.with_host_write::<f32, _>(|w| w.copy_from(&batch))?;
     plan.execute()?; // replay: no tracing, no compilation
 }
 ```

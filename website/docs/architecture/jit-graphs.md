@@ -105,8 +105,7 @@ would silently misalign, so `prepare()` fails with
 ## Array slots, batch variables and state
 
 The block forms of the declaration add three things a streaming model needs.
-All of them are optional; a wrapper written against the older flat form keeps
-working unchanged.
+All of them are optional, and the flat form above stays valid.
 
 ```rust
 jit_wrapper! {
@@ -130,7 +129,7 @@ jit_wrapper! {
 
 **`[Tensor; N]` slots** put N buffers behind one name: `prepare` takes
 `[InputSpec; N]`, the build closure receives `[&Tensor; N]`, and the generated
-accessors take a leaf index — `jit.taps_view_mut::<f32>(1)?`. Outputs may be
+accessors take a leaf index — `jit.taps_host_write::<f32>(1)?`. Outputs may be
 arrays too. An input index out of range is `JitError::InputBufferNotFound`; an
 output index out of range panics.
 
@@ -206,7 +205,7 @@ The macro emits one method group per phase of the wrapper's life cycle:
 | `prepare(input1: InputSpec, ..., state1: InputSpec, ...)` | one-time | build graph, run patterns, compile kernels, allocate buffers; reads `PrepareConfig::from_env()` |
 | `prepare_with_config(..., &PrepareConfig)` | one-time | same as `prepare` with an explicit config |
 | `<input>_mut([i]) -> Result<&mut Buffer>` | per step | raw buffer for each declared input or state slot (`i` for array slots) |
-| `<input>_view_mut::<T>([i]) -> Result<ArrayViewMutD<T>>` | per step | typed write view over an input buffer, dtype-checked |
+| `<input>_host_write::<T>([i]) -> Result<HostWrite<T>>` | per step | exclusive typed host write guard over a host-visible input buffer, dtype-checked; its stores are published when it drops, and `execute*` fails while it is alive |
 | `output() -> Result<&Buffer>` | per step | the plan's first output |
 | `<output>([i])` / `<output>_shape()` / `_view::<T>()` / `_to_vec::<T>()` | per step | named output buffer, its live shape and reads, resolved against the current variable bindings |
 | `reset() -> Result<()>` | per step | zero every `state` slot (generated only with `state`) |
@@ -243,7 +242,7 @@ work.
 
 `InputSpec`, `JitError` and the buffer helpers the macro expands to live in
 `svod_tensor::jit`, so a crate hosting a `jit_wrapper!` needs only that
-dependency (`svod_model::jit` re-exports them for the historical paths).
+dependency (`svod_model::jit` re-exports them as the `crate::jit::…` paths its own wrappers use).
 
 `prepare()` takes one `InputSpec` per declared input and state slot — or one
 `[InputSpec; N]` per array slot:
@@ -297,14 +296,15 @@ memory planner packs intermediates into arena views that alias.
 
 | Backend | Mechanism | Notes |
 |---|---|---|
-| CUDA | `cuGraphAddKernelNode` DAG, `cuGraphInstantiate`, `cuGraphLaunch` | on by default; `cuGraphExecKernelNodeSetParams` patches only nodes whose arguments changed; a buffer-aliasing change re-captures |
-| AMD | one linked HCQ/PM4 command stream with graph-owned kernarg storage, replayed by a single doorbell | AQL queues (multi-XCC parts, or `SVOD_AMD_AQL=1`) capture by default; PM4 capture is opt-in with `SVOD_PM4_GRAPH=1` |
+| CUDA | `cuGraphAddKernelNode` DAG, `cuGraphInstantiate`, `cuGraphLaunch` | on by default; `cuGraphExecKernelNodeSetParams` patches only nodes whose arguments changed; a replay whose buffers alias differently from the capture runs a capture-order chain instead of the DAG |
+| AMD | one linked HCQ command stream (AQL packets or PM4) with graph-owned kernarg storage, replayed by a single doorbell | AQL queues (multi-XCC parts, or `SVOD_AMD_AQL=1`) capture by default; PM4 capture is opt-in with `SVOD_PM4_GRAPH=1` |
 | Metal | `MTLIndirectCommandBuffer` with per-command barriers, one `executeCommandsInBuffer` per replay | declines when any kernel takes scalar arguments or on a virtualized GPU; waits for the previous replay before rebinding |
 | CPU | — | no graph factory; kernels are called directly |
 
-**Fallbacks.** When no graph is used, AMD plans — including dynamic-shape ones —
-are captured as a *linked plan*: one command stream whose kernel arguments and
-launch dimensions are repacked on every replay. Everywhere else the plan walks
+**Fallbacks.** When no graph is used, an AMD plan — dynamic-shape ones included
+— replays as a *linked plan* as long as every kernel argument and copy endpoint
+lives on the plan's device: one command stream whose kernel arguments and launch
+dimensions are repacked on every replay. Otherwise the plan walks
 its levels in order and submits each kernel to the plan's own queue
 (asynchronously on GPUs; `wait` only at the end). `execute_profiled` uses the
 graph's profiled variant when one exists, otherwise per-dispatch timestamps.
@@ -320,9 +320,7 @@ helper.
 ```rust
 jit.reset()?;                                    // zero the state, new sequence
 for chunk in chunks {
-    for (slot, v) in jit.x_view_mut::<f32>()?.iter_mut().zip(chunk) {
-        *slot = v;                               // per-step input, written in place
-    }
+    jit.x_host_write::<f32>()?.copy_from(&chunk)?; // per-step input, written in place
     jit.execute()?;                              // reads state, writes it back
     let frame = jit.emitted_to_vec::<f32>()?;    // only the emitted head crosses
 }
@@ -432,11 +430,9 @@ jit.prepare_with_config(
 ```
 
 `VadInference::probs` then walks the waveform in `FEATURE_BATCH`-sized
-dispatches — pack `chunks_view_mut::<f32>()`, `execute()`, `copyout_prefix` the
+dispatches — pack `chunks_host_write::<f32>()`, `execute()`, `copyout_prefix` the
 valid rows — and hands the gates to `VadHead::scan`, an LSTM plus sigmoid head
-vectorized at the widest SIMD width the host CPU has. That split replaced a
-one-tiny-dispatch-per-window path whose round-trip latency dominated the whole
-model.
+vectorized at the widest SIMD width the host CPU has.
 
 ---
 
@@ -487,12 +483,12 @@ unrecoverable and indicate a usage bug rather than a transient condition.
 | `InputAliased` | an input resolved to a foreign plan buffer — a concurrent `prepare` corrupted its graph identity |
 | `Build` | the build closure returned `Err`; the inner error is preserved as `Box<dyn Error + Send + Sync>` |
 | `Tensor` | tensor op failed during `prepare` or in the build closure |
-| `Device` | a device or buffer operation failed |
+| `Device` | a device or buffer operation failed — e.g. `HostWriteLive` for a second guard on the same storage, `NotCpuAccessible` for `_host_write` on a device-local input |
 | `OutputCountMismatch` | a wrapper declared N output plus state slots but the compiled plan kept a different number |
 | `DtypeMismatch` | a typed view or read asked for a dtype the buffer does not hold |
 | `ViewOutOfBounds` | a live output shape needs more bytes than its buffer holds — the bound variables exceed what the plan was compiled for |
 | `InferredOutputDim` | an output shape carried a `-1` dimension, which has no live value to substitute |
-| `Runtime` | kernel execution failed, or a variable was bound outside its `[min, max]` |
+| `Runtime` | kernel execution failed, a variable was bound outside its `[min, max]`, or a host write guard into a plan buffer was still alive |
 
 Configuration mistakes on the symbolic-variable setters (`with_<var>_*`)
 panic at the call site instead of returning an error, since they happen

@@ -116,6 +116,7 @@ pub fn specific_ptr(ptr: &Arc<UOp>, space: AddrSpace) -> Arc<UOp> {
         AddrSpace::Global => 1,
         AddrSpace::Local => 3,
         AddrSpace::Reg => unreachable!("register scratch has no address-space form"),
+        AddrSpace::Swizzled { .. } => unreachable!("a descriptor's accesses are its own"),
     };
     let dtype = DType::Void.ptr(None, space).expect("void is not a pointer");
     UOp::custom(smallvec![ptr.clone()], format!("addrspacecast ptr {{0}} to ptr addrspace({num})"), dtype)

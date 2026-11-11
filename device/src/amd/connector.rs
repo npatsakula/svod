@@ -1,7 +1,7 @@
 //! Exclusive AMD compute lanes and logical execution contexts.
 //!
 //! A `PoolQueue` bundles the dispatch state that backs a single KFD compute
-//! queue: the queue itself (ring + doorbell), a kernarg bump arena, the scratch
+//! queue: the queue itself (ring + doorbell), the device's kernarg ring, the scratch
 //! backing, the compute timeline counter, and linked-plan finalizers. A queue is
 //! published through only while a non-clone `QueueLease` owns its lane bit.
 //! Uncontended acquisition is one atomic compare-exchange; bounded contention
@@ -32,8 +32,9 @@ use crate::sync::TimelineSignal;
 /// One hardware compute lane, retained by [`QueuePool`] and published through
 /// only by its current [`QueueLease`].
 ///
-/// Owns: KFD compute queue, kernarg arena, scratch backing, PM4 completion
-/// counter, and lane-level linked-plan finalizers.
+/// Owns: KFD compute queue, scratch backing, PM4 completion counter, AQL
+/// retirement count, and lane-level linked-plan finalizers; shares the
+/// device's kernarg ring.
 #[derive(Debug)]
 pub(crate) struct PoolQueue {
     /// Shared immutable identity. Cloned across all queues backed by the same
@@ -42,11 +43,10 @@ pub(crate) struct PoolQueue {
     /// The KFD compute queue: ring, doorbell, and GART. Its backend-local mutex
     /// is uncontended because publication requires the lane's unique lease.
     queue: Box<AmdComputeQueue>,
-    /// Kernel-argument bump arena (16 MiB GTT). One per DEVICE, shared by every
-    /// lane: the wrap path drains all of them through
-    /// `AmdDeviceCore::synchronize_all`, so a wrapped slot is provably free
-    /// whichever lane wrote it. Freed by `Drop for KernargArena` once the last
-    /// sharing queue drops, after `Drop for PoolQueue` has drained.
+    /// Kernel-argument ring (16 MiB; VRAM on multi-XCC parts, uncached GTT
+    /// elsewhere, see `Hdp`). One per DEVICE, shared by every lane: each slot
+    /// retires with the submission that reads it, whichever lane that is. Freed by `Drop for KernargArena` once
+    /// the last sharing queue drops, after `Drop for PoolQueue` has drained.
     arena: Arc<KernargArena>,
     /// Scratch backing. Grown on demand by [`ensure_has_local_memory`](Self::ensure_has_local_memory)
     /// while the lane's exclusive lease is held.
@@ -56,6 +56,14 @@ pub(crate) struct PoolQueue {
     /// has its own separate `Timeline`; this one is untouched by SDMA.) AQL
     /// carries this timeline's waits and stores through vendor IB packets.
     pm4_counter: Arc<Timeline>,
+    /// AQL lanes only: the submissions every XCC is done with. The timeline
+    /// store above runs on XCC0 from an IB in the submission's own memory,
+    /// which the other XCCs may still be reading when it lands, so that memory
+    /// is reused only once this counts the submission: its last packet names
+    /// the signal as its AQL completion signal, which the CP decrements once
+    /// the packet retired on every XCC (ROCr retires kernargs and IBs the same
+    /// way).
+    retired: Option<Arc<Timeline>>,
     /// Pool-level in-flight linked-plan finalizers (FIFO) for all owners.
     /// `synchronize_all` drains them via the core's `Weak<PoolQueue>` registry
     /// without touching the queue.
@@ -66,6 +74,9 @@ pub(crate) struct PoolQueue {
     /// hence one cache per lane rather than a fresh
     /// `CommandBufferCache::default()` at every link site, which never hit.
     link_cache: Mutex<crate::hcq::CommandBufferCache>,
+    /// The device's count of stores behind the GPU caches (`Hdp`) this lane
+    /// last invalidated its caches after.
+    caches_invalidated_at: AtomicU64,
 }
 
 /// Atomic lane claims, split from queue construction so exclusivity can be
@@ -270,6 +281,9 @@ pub(crate) struct SubmissionFinalizer {
     value: u64,
     progress: Vec<Arc<AmdSignal>>,
     _timestamps: Option<Arc<AmdSignal>>,
+    /// Where an AQL submission's memory retires, past `value`; see
+    /// `PoolQueue::retired`.
+    retired: OnceLock<(Arc<AmdSignal>, u64)>,
     publication: Mutex<PublicationState>,
     publication_changed: Condvar,
     code: Mutex<Vec<Arc<crate::amd::program::CodeObject>>>,
@@ -289,6 +303,7 @@ impl SubmissionFinalizer {
             value,
             progress: Vec::new(),
             _timestamps: timestamps,
+            retired: OnceLock::new(),
             publication: Mutex::new(PublicationState::Published),
             publication_changed: Condvar::new(),
             code: Mutex::new(Vec::new()),
@@ -301,10 +316,16 @@ impl SubmissionFinalizer {
             value,
             progress,
             _timestamps: None,
+            retired: OnceLock::new(),
             publication: Mutex::new(PublicationState::Prepared),
             publication_changed: Condvar::new(),
             code: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Retire this submission only at `point` too. Set before it is published.
+    pub(crate) fn retire_at(&self, point: (Arc<AmdSignal>, u64)) {
+        self.retired.set(point).expect("a submission retires at one point");
     }
 
     pub(crate) fn mark_published(&self) {
@@ -349,8 +370,12 @@ impl SubmissionFinalizer {
                 drop(publication);
                 // Whatever the publication wait consumed comes off the signal
                 // wait's budget; never hand it 0, which means "no timeout".
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now()).as_millis() as u64;
-                self.signal.wait_signal_value_with_progress(self.value, remaining.max(1), &self.progress)
+                let remaining = || deadline.saturating_duration_since(std::time::Instant::now()).as_millis() as u64;
+                self.signal.wait_signal_value_with_progress(self.value, remaining().max(1), &self.progress)?;
+                match self.retired.get() {
+                    Some((signal, value)) => signal.wait_signal_value(*value, remaining().max(1)),
+                    None => Ok(()),
+                }
             }
             PublicationState::Failed => Err(Error::Runtime {
                 message: "AMD submission failed before its terminal timeline point was published".into(),
@@ -359,9 +384,18 @@ impl SubmissionFinalizer {
         }
     }
 
+    /// Play XCC0 storing this submission's timeline point. Test-only.
+    #[cfg(test)]
+    pub(crate) fn land_timeline(&self) {
+        self.signal.set(self.value);
+    }
+
     pub(crate) fn retired(&self) -> bool {
         match *self.publication.lock() {
-            PublicationState::Published => self.signal.value() >= self.value,
+            PublicationState::Published => {
+                self.signal.value() >= self.value
+                    && self.retired.get().is_none_or(|(signal, value)| signal.value() >= *value)
+            }
             PublicationState::Failed => true,
             PublicationState::Prepared => false,
         }
@@ -394,8 +428,8 @@ impl PoolQueue {
         self.link_cache.lock().link_for_context(self as *const Self as u64, &device, lowered, values)
     }
 
-    /// Build a pool queue with its own KFD compute queue + kernarg arena +
-    /// pre-reserved scratch. The PM4 counter signal is acquired from the core's
+    /// Build a pool queue with its own KFD compute queue and pre-reserved
+    /// scratch, sharing the device's kernarg ring. The PM4 counter signal is acquired from the core's
     /// shared `SignalPool` (which the factory must have installed first —
     /// `AmdDeviceCore::install_signal_pool`).
     ///
@@ -427,6 +461,15 @@ impl PoolQueue {
                 .into(),
         })?;
         let pm4_counter = Timeline::new(Arc::new(pool.acquire()?));
+        let retired = match queue.aql_read_pointer() {
+            Some(read) => {
+                pm4_counter.signal().watch_queue(read);
+                let retired = pool.acquire()?.counting_down(core.queue_event_mailbox());
+                retired.watch_queue(read);
+                Some(Timeline::new(Arc::new(retired)))
+            }
+            None => None,
+        };
         // Pre-reserve a generous scratch buffer once (ROCr-style stable pool): the
         // mid-stream `set_aql_scratch` REALLOC (new VA + KFD-unmap of the old) on a
         // live multi-XCC queue silently wedges the CP. Pre-sizing here so no typical
@@ -445,8 +488,10 @@ impl PoolQueue {
                 size: scratch_size,
             }),
             pm4_counter,
+            retired,
             inflight: Mutex::new(VecDeque::new()),
             link_cache: Mutex::default(),
+            caches_invalidated_at: AtomicU64::new(0),
         });
         // Register in the core so `synchronize_all` can drain this queue's
         // in-flight work via `Weak<PoolQueue>`, reading only signal slots and
@@ -468,6 +513,19 @@ impl PoolQueue {
     #[inline]
     pub fn queue(&self) -> &AmdComputeQueue {
         &self.queue
+    }
+
+    /// Whether this lane's next dispatch must invalidate its caches, always
+    /// when `force`d: `Some` count of stores behind them it would cover, to
+    /// hand to [`Self::caches_invalidated`] once that dispatch is published.
+    pub(crate) fn cache_invalidate(&self, force: bool) -> Option<u64> {
+        let writes = self.core.hdp().writes_behind_caches();
+        (force || writes > self.caches_invalidated_at.load(Ordering::Relaxed)).then_some(writes)
+    }
+
+    /// A published dispatch invalidated this lane's caches after `writes`.
+    pub(crate) fn caches_invalidated(&self, writes: u64) {
+        self.caches_invalidated_at.fetch_max(writes, Ordering::Relaxed);
     }
 
     /// Borrow this queue's kernarg arena.
@@ -497,6 +555,15 @@ impl PoolQueue {
         self.pm4_counter.rollback(reserved)
     }
 
+    /// The AQL retirement count; see the field.
+    pub(crate) fn retired(&self) -> Option<&Arc<Timeline>> {
+        self.retired.as_ref()
+    }
+
+    pub(crate) fn aql_retired(&self) -> &Arc<Timeline> {
+        self.retired().expect("an AQL lane counts its retired submissions")
+    }
+
     /// Highest submitted PM4 counter value (the value the next `signal` packet
     /// would write). A drain waits until the GPU has written `value - 1`.
     pub fn pm4_value(&self) -> u64 {
@@ -522,8 +589,11 @@ impl PoolQueue {
         if let Some(err) = self.core.poison_error() {
             return Err(err);
         }
-        // Drain the monotonic PM4 counter (PM4 / SDMA-style work)...
-        self.pm4_counter.drain(30_000).inspect_err(|e| self.core.poison(&e.to_string()))?;
+        // Drain the monotonic PM4 counter (PM4 / SDMA-style work) and, on AQL,
+        // until every XCC is done with what it ran...
+        for timeline in std::iter::once(&self.pm4_counter).chain(&self.retired) {
+            timeline.drain(30_000).inspect_err(|e| self.core.poison(&e.to_string()))?;
+        }
         // ...then every in-flight linked-plan timeline.
         // Snapshot under the lock, wait outside it, then drop the retired ones —
         // `retain` keeps any signal a concurrent dispatch armed after the
@@ -569,6 +639,7 @@ impl PoolQueue {
     pub fn ensure_pm4_headroom(&self) -> Result<()> {
         if self.pm4_counter.current() > TIMELINE_WRAP_WATERMARK {
             self.drain_all()?;
+            self.arena.retire_timeline(self.pm4_signal());
             self.pm4_counter.reset_after_drain();
         }
         Ok(())
@@ -577,17 +648,28 @@ impl PoolQueue {
     /// Ensure the queue's scratch backing has at least `private_segment_size`
     /// bytes per thread, growing it on demand. The old scratch buffer is freed
     /// (drain → unmap → munmap → free).
+    ///
+    /// A grow at least doubles the per-thread size, up to what the scratch
+    /// registers describe: on AQL each grow remaps the queue twice, and every
+    /// remap preempts every queue of the process on the device, so a run of
+    /// ever larger kernels (a fresh tuning store's spilling candidates) remaps
+    /// a logarithmic number of times rather than once per kernel.
     pub fn ensure_has_local_memory(&self, private_segment_size: u32) -> Result<()> {
         // One check is enough: `QueueLease` is the exclusive publication
         // authority for this lane, so no concurrent grow can land between the
         // read and the replacement below, and no publisher can enqueue the
         // stale scratch VA during the transaction.
-        if private_segment_size <= self.scratch_state.lock().size_per_thread {
+        let current = self.scratch_state.lock().size_per_thread;
+        if private_segment_size <= current {
             return Ok(());
         }
+        let grown = current
+            .saturating_mul(2)
+            .min(crate::amd::device::max_scratch_per_thread(&self.core.arch))
+            .max(private_segment_size);
         self.drain_all()?;
         let (va, size, tmpring, rounded, handle, aql_desc) =
-            alloc_scratch(self.core.iface(), &self.core.node, &self.core.arch, private_segment_size)?;
+            alloc_scratch(self.core.iface(), &self.core.node, &self.core.arch, grown)?;
         let old = {
             let mut state = self.scratch_state.lock();
             let old = (state.gpu_va, state.size, state.handle);
@@ -690,6 +772,12 @@ impl OwnerCtx {
     /// in the owner-local `synchronize`).
     pub fn set_newest(&self, finalizer: Arc<SubmissionFinalizer>) {
         *self.newest.lock() = Some(finalizer);
+    }
+
+    /// This owner's newest finalizer. Test-only.
+    #[cfg(test)]
+    pub(crate) fn newest(&self) -> Option<Arc<SubmissionFinalizer>> {
+        self.newest.lock().clone()
     }
 
     /// This owner's newest finalizer as a scoped-sync completion token. A new

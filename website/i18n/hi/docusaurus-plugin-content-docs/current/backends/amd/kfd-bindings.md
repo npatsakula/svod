@@ -25,7 +25,7 @@ history के साथ पूरी)। उससे build time पर `bindge
   `<linux/types.h>`) plus एक stub `<drm/drm.h>` (vestigial — body केवल `__u32 drm_fd` fields
   का उपयोग करता है) — ये ख़ुद `device/include/` के अंतर्गत vendored हैं, और `build.rs`
   `-I<crate>/include` pass करता है ताकि bindgen इन्हें `/usr/include` के बजाय resolve करे।
-  जनरेट की गई फ़ाइल में 60 structs और 34 constants हैं। (bindgen को `libclang` चाहिए, जो
+  (bindgen को `libclang` चाहिए, जो
   macOS पर Xcode CLT के साथ आता है।)
 
   यह ठीक-ठीक उन KFD types और constants को allow-list करता है जिनकी बैकएंड को ज़रूरत है:
@@ -34,8 +34,9 @@ history के साथ पूरी)। उससे build time पर `bindge
   allowlist_type:  kfd_ioctl_.*_args, kfd_process_device_apertures,
                    kfd_event_data, kfd_hsa_signal_event_data,
                    kfd_hsa_memory_exception_data, kfd_hsa_hw_exception_data,
-                   kfd_memory_exception_failure, __u\d+, __s\d+
-  allowlist_var:   KFD_IOC_.*, KFD_MAX_QUEUE_PERCENTAGE, AMDKFD_IOC_.*
+                   kfd_memory_exception_failure, kfd_mmio_remap, __u\d+, __s\d+
+  allowlist_var:   KFD_IOC_.*, KFD_MAX_QUEUE_PERCENTAGE,
+                   KFD_RUNTIME_ENABLE_MODE_ENABLE_MASK, AMDKFD_IOC_.*
   ```
 
   (`AMDKFD_IOC_*` request codes allow-listed हैं पर कभी materialize नहीं होते: bindgen उनके
@@ -85,11 +86,11 @@ sites हैं:
 | `kfd_destroy_event` | `0x09` | `Drop` पर तीनों events को tear down करें |
 | `kfd_wait_events` | `0x0C` | `wait_events` — completion / fault events पर block करें |
 | `kfd_acquire_vm` | `0x15` | GPU के लिए DRM render fd को इस process के VM के रूप में register करें |
-| `kfd_alloc_memory_of_gpu` | `0x16` | `alloc_raw` — VRAM/GTT allocate करें |
+| `kfd_alloc_memory_of_gpu` | `0x16` | `alloc_raw` — VRAM/GTT allocate करें; MMIO-remap page भी |
 | `kfd_free_memory_of_gpu` | `0x17` | `free_raw` |
 | `kfd_map_memory_to_gpu` | `0x18` | एक allocation को GPU page table में bind करें |
 | `kfd_unmap_memory_from_gpu` | `0x19` | `free_raw` |
-| `kfd_runtime_enable` | `0x25` | runtime enable करें (केवल KFD ABI ≥ 1.14) |
+| `kfd_runtime_enable` | `0x25` | enable bit के साथ KFD runtime enable करें, प्रति process एक बार (केवल KFD ABI ≥ 1.14) |
 
 पाँच और (`set_memory_policy`, `get_clock_counters`, `get_process_apertures`,
 `set_event`, `reset_event`) completeness के लिए declare किए गए हैं लेकिन फ़िलहाल call नहीं
@@ -105,17 +106,24 @@ flowchart TD
   A["open /dev/kfd (process-shared, one fd)"] --> B["open /dev/dri/renderD(minor) (per node — the DRM render fd)"]
   B --> C["GET_VERSION: capture ABI version"]
   C --> D["ACQUIRE_VM(drm_fd): register this fd as the process VM for the GPU"]
-  D --> E["RUNTIME_ENABLE: only if ABI is at least 1.14"]
+  D --> E["RUNTIME_ENABLE(ENABLE_MASK): once per process, only if ABI is at least 1.14"]
   E --> F["event page: alloc + bind once per process, map per device"]
   F --> G["CREATE_EVENT x 3: queue-signal, memory-fault, hw-exception"]
+  G --> H["HDP flush: ALLOC(MMIO_REMAP) + mmap from /dev/kfd, else a VRAM readback word"]
 ```
 
 यह chain सख़्ती से ordered है: `ACQUIRE_VM` को किसी भी allocation से पहले आना ही होगा, और
-event page को पहले `CREATE_QUEUE` से पहले bind होना ही होगा।
+event page को पहले `CREATE_QUEUE` से पहले bind होना ही होगा। `RUNTIME_ENABLE` को भी process की
+पहली queue से पहले आना होगा, जिसके बाद KFD इसे reject करता है, इसलिए process के लिए runtime
+पहला खुलने वाला device enable करता है और बाद वाला device उसे पहले से enabled पाता है।
 
 DRM render fd दिलचस्प है: यहाँ **कोई DRM ioctls नहीं** हैं। `drm_fd` को केवल दो तरीक़ों से
 उपयोग किया जाता है — `ACQUIRE_VM` में *by number* pass किया जाता है, और host-visible
-mappings के लिए `mmap` fd के रूप में। doorbell, इसके विपरीत, KFD fd से `mmap` किया जाता है।
+mappings के लिए `mmap` fd के रूप में। doorbell, इसके विपरीत, KFD fd से `mmap` किया जाता है, और KFD का MMIO-remap page भी: host
+उसके `HDP_MEM_FLUSH_CNTL` register में लिखकर उसे वापस पढ़ता है और इस तरह HDP flush करता है।
+जहाँ KFD remap page नहीं देता (4 KiB से बड़े host pages, या कोई KFD जो allocation reject कर दे,
+जैसे SR-IOV VF पर), वहाँ device उसकी जगह एक host-visible VRAM word रखता है और उसमें store करके
+उसे वापस पढ़कर flush करता है।
 
 ---
 
@@ -176,15 +184,16 @@ compose होते हैं:
 
 | `AllocKind` | Flags | किसके लिए उपयोग होता है |
 |---|---|---|
-| `DeviceVram { executable }` | `VRAM \| WRITABLE \| NO_SUBSTITUTE` (+ code के लिए `EXECUTABLE`, + host-visible होने पर `PUBLIC`) | Tensor data, code objects, scratch; host-visible kernarg arenas और graph / linked-plan control buffers |
-| `UncachedGtt` | `GTT \| WRITABLE \| EXECUTABLE \| NO_SUBSTITUTE \| PUBLIC \| COHERENT \| UNCACHED` | Command rings, GART pages, signal slots, SDMA staging buffer |
+| `DeviceVram { executable }` | `VRAM \| WRITABLE \| NO_SUBSTITUTE` (+ code के लिए `EXECUTABLE`, + host-visible होने पर `PUBLIC`) | Tensor data, code objects, scratch; multi-XCC parts पर kernarg arenas और graph / linked-plan control buffers; जहाँ KFD remap page नहीं देता वहाँ HDP readback word |
+| `UncachedGtt` | `GTT \| WRITABLE \| EXECUTABLE \| NO_SUBSTITUTE \| PUBLIC \| COHERENT \| UNCACHED` | Command rings, GART pages, signal slots, SDMA staging buffer; बाकी parts पर kernarg arenas और control buffers |
 
 `UNCACHED | COHERENT` GTT flavor मायने रखता है: command ring और signal slots CPU और GPU के
 बीच तुरंत visible होने चाहिए, वरना host एक ऐसे completion value पर हमेशा के लिए spin करता
 रहता है जो GPU L2 में अटका रह जाता है। KFD एक plain-VRAM ring पर `CREATE_QUEUE` को `EINVAL`
-के साथ reject कर देता है। `alloc_raw` के बाहर का एकमात्र allocation per-process event page है
-(`device.rs` में `alloc_event_page`), जो वही uncached-GTT flags raw ioctls के साथ compose
-करता है और इसलिए [VA registry](./debugging.md) में नहीं है।
+के साथ reject कर देता है। दो allocations `alloc_raw` को bypass करते हैं: per-process event
+page (`device.rs` में `alloc_event_page`), जो वही uncached-GTT flags raw ioctls के साथ compose
+करता है, और per-device MMIO-remap page (`iface.rs` में `MmioRemapPage::map`)। दोनों में से कोई
+भी [VA registry](./debugging.md) में नहीं है।
 
 ### `cpu_access` copy queue का अनुसरण करता है
 
@@ -197,10 +206,11 @@ intermediate **device-only** VRAM हो सकता है और copies DMA �
 copy queue मौजूद न हो, `has_sdma_queue()` `false` होता है, इसलिए हर buffer को ज़बरन
 host-visible बना दिया जाता है और copies scoped `wait_storage` के बाद एक सादे host `memmove` पर
 वापस आ जाती हैं। generic `LruAllocator` (`device/src/allocator.rs`) freed buffers को `(size,
-BufferSpec)` के अनुसार pool करता है; code objects, EOP / CWSR context-save buffers, rings,
-GART pages, signal slots और scratch कभी उस pool में प्रवेश नहीं करते — वे `AmdAllocator` को
-सीधे call करते हैं (`alloc_uncached_tagged` / `alloc_host_visible_tagged` /
-`alloc_scratch`) और सीधे seam तक जाते हैं।
+BufferSpec)` के अनुसार pool करता है; code objects, kernarg arenas, graph / linked-plan command
+buffers, EOP / CWSR context-save buffers, rings, GART pages, queue error words, signal slots और
+scratch कभी उस pool में प्रवेश नहीं करते। code objects `nolru` के साथ `AmdAllocator::alloc` से
+माँगे जाते हैं; बाक़ी tagged entry points (`alloc_submission_tagged`, `alloc_uncached_tagged`,
+`alloc_host_visible_tagged`) या `alloc_scratch` को सीधे call करते हैं और सीधे seam तक जाते हैं।
 
 :::note[Process-shared state]
 `/dev/kfd` प्रति process एक बार खोला जाता है और सभी devices द्वारा साझा होता है (events को

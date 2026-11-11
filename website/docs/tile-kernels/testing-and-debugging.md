@@ -32,7 +32,7 @@ threads or barriers, so ordering bugs show up only on the device.
 | File (`test/unit/`) | Level | What it checks |
 |---|---|---|
 | `atoms.rs`, `layout.rs`, `layouts.rs` | host | Every atom's operand layouts against the vendor ISA lane formulas, F2 algebra laws, inference, relayouts and swizzles |
-| `build.rs`, `interp.rs`, `schedule.rs`, `sync.rs`, `emit.rs` | host | Builder records, interpreter semantics, pipeline expansion, the barrier pass, the emitted list |
+| `build.rs`, `interp.rs`, `schedule.rs`, `sync.rs`, `emit.rs` | host | Builder records, interpreter semantics, pipeline expansion, the barrier pass, the emitted list and the lowering's refusals |
 | `ops_plan.rs` | host | Every op's `Plan` and error per shape, dtype and target |
 | `offline.rs` | host | Card targets and costs read from a copied tune store |
 | `targets.rs` | host + device | Every kernel family per target lowered, interpreted before and after lowering and compiled (`ptxas`, clang); on the GPU, the device gate |
@@ -40,6 +40,8 @@ threads or barriers, so ordering bugs show up only on the device.
 | `attention.rs`, `heads.rs`, `rows.rs`, `conv.rs`, `gather.rs` | host + device | Program against an f64 reference, then the lowered kernel against the program |
 | `device.rs`, `parts.rs` | device | GEMM end to end, and the parts attention composes (on `cp.async` devices) |
 | `ops.rs` | device | Every op against its graph fallback on awkward shapes |
+| `nearest.rs` | host + device | The nearest-neighbour family against an f64 reference; on the GPU, every ranked config and the op against its graph |
+| `tail.rs`, `raster.rs` | host | A GEMM's tail split and raster: every tile covered once, the programs in the interpreter, the planner's offers |
 | `tune.rs` | host + device | Store round trip, key stability, a real GEMM tuning |
 
 ## Running the suite
@@ -104,7 +106,7 @@ card, whose probe lines price the ranking; without it the guessed costs do. `--c
 N-th ranked config, `--out DIR` names the output directory (`tk_dump`).
 
 `--op` takes `gemm` (`--shape MxNxK`), `attention` (`BxHxTxD`), `norm` (`RxD`), `conv`
-(`BxHxWxCINxCOUT`) or `heads` (`BxTxHxKVxD`), each through the op layer's own shape gate and
+(`BxHxWxCINxCOUT`), `heads` (`BxTxHxKVxD`) or `nearest` (`NxMxD`, `--metric`, `--k K`), each through the op layer's own shape gate and
 tuning. `--cfg tuned` emits the config the tuner chose on the card, read from the `--store`
 copy without writing to it: a stored line matches by op, device, dtype, shape and the config list
 the op layer keys it by, whatever compiler or kernel build wrote it, and the dump prints each key

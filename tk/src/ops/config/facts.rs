@@ -1,9 +1,9 @@
-//! Layer 0 of the config rework: what the device says about itself, queried
-//! once per device beside its measured [`Costs`](crate::atoms::Costs) —
-//! identity, limits, caches and clocks. This phase captures and exposes the
-//! facts; every hand value the planner runs on today (the register cap, the
-//! occupancy numbers, the smem tables) still drives it unchanged until the
-//! model's derivations switch (phase D).
+//! The device's layer-0 description: what the device says about itself,
+//! queried once per device beside its measured
+//! [`Costs`](crate::atoms::Costs) — identity, limits, caches and clocks.
+//! The facts are captured and exposed; nothing the planner prices reads
+//! them: its hand values (the register cap, the occupancy numbers, the smem
+//! tables) drive it.
 //!
 //! Every field is `None` where its vendor offers no query (the KFD topology
 //! answers no bus width), never a guess: the fact is absent or it was asked.

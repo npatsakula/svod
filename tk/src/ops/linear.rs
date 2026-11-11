@@ -8,15 +8,17 @@ use svod_dtype::DType;
 use svod_ir::SInt;
 use svod_tensor::Tensor;
 
-use super::config::{GemmProblem, Planner};
+use super::config::{Planner, distinct_configs};
 use super::shape::{self, Plan, extent, shape_of};
 use super::{
-    Act, DEVICE_TEST, DtypeSnafu, GraphSnafu, LaunchSnafu, Result, ShapeSnafu, Tuner, batch_of, fmt_shape, output,
-    typed,
+    Act, DEVICE_TEST, DtypeSnafu, GraphSnafu, LaunchSnafu, Result, ShapeSnafu, Tuner, batch_of, fmt_shape,
+    kernel_buffer, output, typed,
 };
-use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Rope, Scale, gemm};
+use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Rope, Scale, TailSpec, gemm, gemm_tail};
+use crate::kernels::{Admits, Admitted, Batch};
 use crate::launch;
-use crate::tune::TuneStore;
+use crate::lower::Lowering;
+use crate::tune::{Candidate, TuneStore};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Linear<'a> {
@@ -89,8 +91,18 @@ pub fn linear(x: &Tensor, w: &Tensor, opts: Linear) -> Result<Tensor> {
     let planner = super::planner(&x.device());
     let dtypes: Vec<_> =
         [Some(x), Some(w), opts.bias, opts.residual].into_iter().flatten().map(Tensor::dtype).collect();
+    // The rope joins once the tables' positions are known.
+    let epilogue = Epilogue {
+        bias: opts.bias.is_some(),
+        act: opts.act,
+        gated: opts.gated,
+        residual: opts.residual.is_some(),
+        scale: opts.scale.map(Scale::new),
+        out_f32: false,
+        rope: None,
+    };
     let plan = match n.as_const() {
-        Some(n) => shape::linear(planner.as_deref(), &dtypes, ext.as_ref(), n, opts.gated),
+        Some(n) => shape::linear(planner.as_deref(), &dtypes, ext.as_ref(), n, &epilogue),
         None => Plan::Graph(shape::Fallback::Symbolic),
     };
     let Some(cfgs) = super::kernel(OP, plan) else { return graph(x, w, opts).context(GraphSnafu { op: OP }) };
@@ -113,73 +125,126 @@ pub fn linear(x: &Tensor, w: &Tensor, opts: Linear) -> Result<Tensor> {
     let cfgs: Vec<GemmCfg> = match rope {
         Some(rope) => {
             let batches = if var.is_some() { lead[0] } else { 1 };
-            planner.gemm_ranked_rope(batches, m, n, k, opts.gated, Some(rope)).to_vec()
+            planner.gemm_ranked(batches, m, n, k, &Epilogue { rope: Some(rope), ..epilogue }).to_vec()
         }
         None => cfgs.to_vec(),
+    };
+    // A tail split runs a single static batch: a bound one of a single row
+    // walks each tile whole.
+    let cfgs = match var {
+        Some(_) => distinct_configs(&cfgs.iter().map(|c| GemmCfg { tail: None, ..*c }).collect::<Vec<_>>()),
+        None => cfgs,
     };
     if let Some(r) = opts.rope.filter(|_| rope.is_none() || cfgs.is_empty()) {
         tracing::debug!(target: super::PLAN, op = OP, "graph rotation: no tile turns");
         let y = linear(x, w, Linear { rope: None, ..opts })?;
         return turned(&y, r).context(GraphSnafu { op: OP });
     }
-    let epilogue = Epilogue {
-        bias: opts.bias.is_some(),
-        act: opts.act,
-        gated: opts.gated,
-        residual: opts.residual.is_some(),
-        scale: opts.scale.map(Scale::new),
-        out_f32: false,
-        rope,
-    };
-    let spec = GemmSpec { m, n, k, batch: batch_of(&var, 1), epilogue, cfg: cfgs[0] };
-    let spec = tuned(TuneStore::global(), &planner, x.dtype(), &cfgs, spec);
-    super::ran(OP, "gemm", spec.cfg);
+    let epilogue = Epilogue { rope, ..epilogue };
+    let batch = batch_of(&var, 1);
+    let spec = tuned(TuneStore::global(), &planner, x.dtype(), &cfgs, GemmSpec { m, n, k, batch, epilogue });
+    super::ran(OP, "gemm", spec.cfg());
     let y = output(&[lead, &[n]].concat(), &var, x.dtype()).context(GraphSnafu { op: OP })?;
     // The tables bind only where the kernel turns: `epilogue.rope` is the
     // kernel's own word for it (`opts.rope` may have fallen back to the
     // graph's rotation).
     let (cos, sin) = spec.epilogue.rope.zip(opts.rope).map(|(_, r)| (r.cos, r.sin)).unzip();
-    let ins: Vec<&Tensor> =
-        [Some(x), Some(w), opts.bias, opts.residual, cos, sin, Some(&y)].into_iter().flatten().collect();
-    launch::graph_launch(typed!(x.dtype(), gemm, &spec), &spec.cfg.lowering(&planner.device), &ins)
-        .context(LaunchSnafu { op: OP })
+    let mut programs = programs(&spec, &x.dtype(), &planner);
+    match tail(&spec, &planner) {
+        Some(tail) => launched_tail(programs, &tail, [x, w], opts.bias, opts.residual, &y),
+        None => {
+            let (prog, lowering) = programs.remove(0);
+            let ins: Vec<&Tensor> =
+                [Some(x), Some(w), opts.bias, opts.residual, cos, sin, Some(&y)].into_iter().flatten().collect();
+            launch::graph_launch(prog, &lowering, &ins).context(LaunchSnafu { op: OP })
+        }
+    }
+}
+
+/// A tail split's programs ([`gemm_tail`]) launched in order over the
+/// operands `[x, w]` and the epilogue's into `y`: the whole waves' tiles
+/// into `y`, the tail's partials, then their merge into the rest of `y`.
+pub(crate) fn launched_tail(
+    programs: Candidate,
+    tail: &TailSpec,
+    [x, w]: [&Tensor; 2],
+    bias: Option<&Tensor>,
+    residual: Option<&Tensor>,
+    y: &Tensor,
+) -> Result<Tensor> {
+    let launch = |(prog, lowering): (_, Lowering), ins: &[Option<&Tensor>]| {
+        let ins: Vec<&Tensor> = ins.iter().copied().flatten().collect();
+        launch::graph_launch(prog, &lowering, &ins).context(LaunchSnafu { op: OP })
+    };
+    let mut programs = programs.into_iter();
+    let y = match tail.plan.waves {
+        Some(_) => launch(programs.next().expect("the waves"), &[Some(x), Some(w), bias, residual, Some(y)])?,
+        None => y.clone(),
+    };
+    let partial = kernel_buffer(&[SInt::Const(tail.partials())], DType::Float32).context(GraphSnafu { op: OP })?;
+    let partial = launch(programs.next().expect("the tail's partials"), &[Some(x), Some(w), Some(&partial)])?;
+    launch(programs.next().expect("the merge"), &[Some(&partial), bias, residual, Some(&y)])
+}
+
+/// The programs `spec` launches in order with their lowerings: its GEMM,
+/// or its tail split's ([`gemm_tail`]).
+pub(crate) fn programs(spec: &Admitted<GemmSpec>, dtype: &DType, planner: &Planner) -> Candidate {
+    let lowering = spec.cfg().lowering(&planner.device);
+    let Some(tail) = tail(spec, planner) else { return vec![(typed!(dtype, gemm, spec), lowering)] };
+    let mut programs: Vec<_> = typed!(dtype, gemm_tail, &tail).into_iter().map(|p| (p, lowering.clone())).collect();
+    programs.last_mut().expect("the merge").1 = Lowering::new(&planner.device);
+    programs
+}
+
+/// The tail split `spec`'s config runs, as the planner plans it for the shape.
+fn tail<'t>(spec: &Admitted<'t, GemmSpec>, planner: &Planner) -> Option<TailSpec<'t>> {
+    let cfg = spec.cfg();
+    cfg.tail.filter(|_| spec.batch == Batch::Static(1))?;
+    let plan = spec.problem().tail_plan(planner, &cfg).expect("an admitted tail split runs its problem");
+    Some(TailSpec { gemm: spec.clone(), plan })
 }
 
 /// `spec` under the config [`linear`] launches for its shape and epilogue:
-/// the tuner's pick among `ranked`, through `store`.
-pub fn tuned(store: &TuneStore, planner: &Planner, dtype: DType, ranked: &[GemmCfg], spec: GemmSpec) -> GemmSpec {
+/// the tuner's pick among `ranked` (the planner's ranking for `spec`),
+/// through `store`, admitted.
+pub fn tuned<'t>(
+    store: &TuneStore,
+    planner: &'t Planner,
+    dtype: DType,
+    ranked: &[GemmCfg],
+    spec: GemmSpec,
+) -> Admitted<'t, GemmSpec> {
     let salt = (&spec.batch, spec.epilogue);
     tune(store, planner, dtype, ranked, (OP, salt), spec.clone())
 }
 
 /// [`tuned`] as the device tests and GEMM probes tune: under the kernel's
 /// name and [`DEVICE_TEST`].
-pub fn probed(store: &TuneStore, planner: &Planner, dtype: DType, ranked: &[GemmCfg], spec: GemmSpec) -> GemmSpec {
+pub fn probed<'t>(
+    store: &TuneStore,
+    planner: &'t Planner,
+    dtype: DType,
+    ranked: &[GemmCfg],
+    spec: GemmSpec,
+) -> Admitted<'t, GemmSpec> {
     tune(store, planner, dtype, ranked, ("gemm", DEVICE_TEST), spec)
 }
 
-fn tune(
+fn tune<'t>(
     store: &TuneStore,
-    planner: &Planner,
+    planner: &'t Planner,
     dtype: DType,
     ranked: &[GemmCfg],
     (op, salt): (&'static str, impl Debug),
     spec: GemmSpec,
-) -> GemmSpec {
+) -> Admitted<'t, GemmSpec> {
     let shape = [spec.batch.capacity(), spec.m, spec.n, spec.k];
-    let build = |cfg| vec![(typed!(dtype, gemm, &GemmSpec { cfg, ..spec.clone() }), cfg.lowering(&planner.device))];
-    let problem = GemmProblem {
-        batches: spec.batch.capacity().max(1),
-        m: spec.m,
-        n: spec.n,
-        k: spec.k,
-        halves: usize::from(spec.epilogue.gated) + 1,
-        rope: spec.epilogue.rope,
-    };
+    let problem = spec.problem();
+    let build = |cfg: GemmCfg| programs(&spec.clone().admit_ranked(planner, cfg), &dtype, planner);
     let cfg = Tuner::new(store, &planner.device, dtype.clone(), &shape, salt, build)
         .floored(|cfg| planner.floor_of(&problem, cfg))
         .tuned(op, ranked, <[_]>::to_vec);
-    GemmSpec { cfg, ..spec }
+    spec.admit_ranked(planner, cfg)
 }
 
 /// The generic graph of the same op; the input is materialized, since a lazy

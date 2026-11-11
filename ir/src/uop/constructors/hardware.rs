@@ -208,6 +208,16 @@ impl UOp {
         ops: impl IntoIterator<Item = Arc<Self>>,
         target: svod_dtype::DeviceSpec,
     ) -> Result<Arc<Self>> {
+        Ok(Self::listed_program(info, ops, target)?.0)
+    }
+
+    /// [`Self::linear_program`] with the LINEAR stage it holds, for a caller
+    /// that renders or counts the list without taking the program apart.
+    pub fn listed_program(
+        info: crate::KernelInfo,
+        ops: impl IntoIterator<Item = Arc<Self>>,
+        target: svod_dtype::DeviceSpec,
+    ) -> Result<(Arc<Self>, Arc<Self>)> {
         use std::collections::HashSet;
 
         let ops = Self::commit_param_shapes(ops.into_iter().collect());
@@ -260,7 +270,8 @@ impl UOp {
         let sink = Self::sink_with_info(roots, info);
         list.push(sink.clone());
         let program_info = crate::ProgramInfo::from_sink(&sink, target);
-        Ok(Self::program(sink, program_info, Some(Self::linear(list.into())), None, None))
+        let linear = Self::linear(list.into());
+        Ok((Self::program(sink, program_info, Some(linear.clone()), None, None), linear))
     }
 
     /// The dtype a program commits a weak integer constant of a shape to:
@@ -270,6 +281,20 @@ impl UOp {
             Some(v) if i32::try_from(v).is_err() => DType::Int64,
             _ => DType::Int32,
         }
+    }
+
+    /// This parameter, its storage reached under `addrspace`.
+    pub fn with_addrspace(self: &Arc<Self>, addrspace: svod_dtype::AddrSpace) -> Arc<Self> {
+        let Op::Param(ops::Param { shape, arg }) = self.op() else { panic!("a parameter's address space") };
+        let arg = Box::new(crate::ParamArg { addrspace: Some(addrspace), ..(**arg).clone() });
+        Self::new(Op::Param(ops::Param { shape: shape.clone(), arg }), self.dtype())
+    }
+
+    /// This PARAM declared read-only: no store of the kernel reaches it.
+    pub fn with_readonly(self: &Arc<Self>) -> Arc<Self> {
+        let Op::Param(ops::Param { shape, arg }) = self.op() else { panic!("a parameter's access") };
+        let arg = Box::new(crate::ParamArg { readonly: true, ..(**arg).clone() });
+        Self::new(Op::Param(ops::Param { shape: shape.clone(), arg }), self.dtype())
     }
 
     /// This PARAM or BUFFER with the weak constants of its shape committed,

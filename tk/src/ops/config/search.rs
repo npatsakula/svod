@@ -10,10 +10,11 @@ use svod_dtype::GpuArch;
 
 use crate::atoms::Core;
 use crate::atoms::Target;
-use crate::kernels::attention::{FaCfg, Forms, WARP_ROWS};
+use crate::ir::Schedule;
+use crate::kernels::attention::{FaCfg, Forms, WARP_ROWS, narrowest_warp_rows};
 use crate::kernels::conv::ConvCfg;
-use crate::kernels::gemm::GemmCfg;
-use crate::kernels::nearest::{LaneQueue, NearestCfg, SelectCfg};
+use crate::kernels::gemm::{GemmCfg, TailSplit, TileOrder};
+use crate::kernels::nearest::{LaneQueue, NearestCfg, Pow2, SelectCfg, Way};
 use crate::kernels::rows::NormCfg;
 use crate::tune::Compiled;
 
@@ -31,22 +32,40 @@ pub fn has_kernels(target: &Target) -> bool {
     }
 }
 
-/// Why a ranking leaves a config out.
+/// Why a ranking leaves a config out: what the target and the problem's
+/// static part decide, settled once per
+/// [`Family::Static`](super::cost::Family::Static)
+/// ([`Planner::feasible`](super::cost::Planner::feasible)), or what its
+/// shape does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Rejected {
+    Target(TargetRejected),
+    Shape(ShapeRejected),
+}
+
+impl From<TargetRejected> for Rejected {
+    fn from(why: TargetRejected) -> Self {
+        Self::Target(why)
+    }
+}
+
+impl From<ShapeRejected> for Rejected {
+    fn from(why: ShapeRejected) -> Self {
+        Self::Shape(why)
+    }
+}
+
+/// Why a config runs no problem of its statics on the target, whatever the
+/// shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetRejected {
     /// It does not lower on the target: no matrix core, a warp grid that
     /// does not tile the core's atoms, a fill that does not split into whole
-    /// 16-byte chunks per thread ([`fills_in_chunks`]), a ring depth the
-    /// fill does not run ([`Fill::runs`]), lists or key warps the kernel
+    /// 16-byte chunks per thread ([`fills_in_chunks`](crate::layouts::fills_in_chunks)), a ring depth the
+    /// fill does not run ([`Fill::runs`](crate::atoms::Fill::runs)), lists or key warps the kernel
     /// refuses ([`NearestCfg::lists`], [`FaCfg::shares_keys`]), or lane
     /// queues past the search's bounds.
     Lowers,
-    /// Its step is shallower than two matrix-core depths where the
-    /// reduction allows one.
-    Shallow,
-    /// Its step does not divide the reduction (a nearest chunk: is deeper
-    /// than the whole reduction, a product over zeros).
-    Divides,
     /// Its shared memory passes the block's.
     Smem { need: usize, have: usize },
     /// Its tiles have no register layout.
@@ -55,6 +74,27 @@ pub enum Rejected {
     Registers { need: u32, have: u32 },
     /// It keeps more least scores a row than a register list holds.
     TopK { k: usize, most: usize },
+}
+
+/// Why a feasible config is left out of one problem's ranking: its shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShapeRejected {
+    /// Its step is shallower than two matrix-core depths where the
+    /// reduction allows one.
+    Shallow,
+    /// Its step does not divide the reduction (a nearest chunk: is deeper
+    /// than the whole reduction, a product over zeros; a convolution's: a
+    /// tap).
+    Divides,
+    /// Its tiles pad the output past what a convolution bears.
+    Padding,
+    /// Its tail split does not run the problem: a batched, gated or turned
+    /// GEMM (or a convolution), a tile the merge's does not divide, a split
+    /// that does not divide the trips, or whole waves that leave no tail.
+    Tail,
+    /// Its tail split's f32 partials take more bytes than a call may
+    /// allocate beside its operands: an eighth of device memory.
+    Partials { need: usize, most: usize },
 }
 
 /// A ranking: its configs with their costs ([`Planner::price`] ns of SM
@@ -146,15 +186,8 @@ pub(crate) fn prune<C: Tiled>(ranked: &mut Vec<(f64, u32, C)>) {
 /// Search bound: the configs of a ranking logged with their costs.
 const LOGGED: usize = 16;
 /// Search bound: a config this factor past the cheapest one's cost cannot
-/// win. Over the shortlists sm_86 timed (GEMMs from 1024³ to 8192²×768,
-/// attention, nearest from 8192² to 16384² at depths 128–1024) the measured
-/// best was predicted within 1.19 of the cheapest, every config within the
-/// tuner's contender band ([`crate::tune::CONTENDER`]) within 1.63. On
-/// gfx1201 and gfx1151 (nearest at 16384², depths 256–1024, a 4096³ GEMM,
-/// attention) the best was predicted within 1.09, though the model errs
-/// wider there: a pruned config ran 1.23 times the best on gfx1201 and 1.08
-/// on gfx1151, never within the tuner's drift. Nearest's small candidate
-/// blocks run 3.5 to 6 times its best, seconds a launch at 65536² rows.
+/// win: the measured best and every config within the tuner's contender
+/// band ([`crate::tune::CONTENDER`]) sit well inside it.
 pub(crate) const PRUNED_PAST: f64 = 2.5;
 /// Search bound: the tiles a ranking keeps whatever their cost, so a shortlist
 /// whose cheapest tiles fail to compile clean still holds some to time.
@@ -201,41 +234,18 @@ pub(crate) fn spread<C: Tiled, K: Eq + Hash>(ranked: Vec<(f64, C)>, class: impl 
 
 /// Search bound: the tiles the tune store measures per shape, their
 /// pipelines compiled in parallel ([`Search`]): timing a tile costs about
-/// 20 ms once the device's clock is up and the ranking cannot be trusted
-/// to put the best within a few (see the module docs). 56, measured down
-/// from 64 (2026-10-27) by the winners the format-6 stores name: over
-/// every replayed choice line of the three cards' stores (162 lines — the
-/// phase-E fresh nearest stores, the local sm_86 store and the
-/// device-suite stores' gemm, attention and conv lines), the share whose
-/// measured winner's tile sits in the model's top N. At 56 that is 161 of
-/// 162 (99.4 %): every family and card whole — nearest (the expensive
-/// family, 16384² rows at depths 128–768) from 24 tiles on sm_86, gemm at
-/// 32, attention and conv at 16 — but one int8 line of gfx1151's six,
-/// whose winner sat at the 62nd tile. 48, tried first, holds only 95 %
-/// (five conv lines and a nearest line of sm_86's out at 49–54) and the
-/// battery refused it: the gelu GEMM's winner (704×2048×512, its tile at
-/// 54 — a warp grid the cheaper [2,2] form of the same tile hides from
-/// the tile count) fell out of the shortlist and the row read 4–5 % over
-/// four alternating tunes; at 56 the winner is timed again and picked by
-/// both (70.4–70.8 µs the base, 71.7–72.5 the tip, one tile — the runs'
-/// own noise). The rest of the battery at 48 was already same-or-better
-/// than 64 (every nearest, gemm, attention and rerank row on sm_86 and
-/// gfx1201, the conv classes within +1.9 %), and 56 sits between the two.
-/// The tuning wall-clock is unmoved on sm_86 at any of 48, 56 and 64
-/// (17.5–20.5 s at 16384² d128 k64 — the measurement discipline, the
-/// clock warm-up and the runs to a stable minimum, dominates the count)
-/// and 10–20 % less on gfx1201 (8.9–9.6 s at 48 against 11.5–11.6 at 64,
-/// whose clang compiles the shorter list does not pay), with 25–12 %
-/// fewer compiles in flight everywhere.
+/// a run budget ([`crate::tune::RUN_BUDGET`]) once the device's clock is
+/// up, and the ranking cannot be trusted
+/// to put the best within a few (see the module docs). Chosen so that the
+/// tiles of the stored winners of every family and card sit within the
+/// model's top [`SHORTLIST`].
 pub(crate) const SHORTLIST: usize = 56;
 /// Search bound: the most tiles of a timing whose other pipelines are
 /// timed after it, among those within the tuner's contender band
 /// ([`crate::tune::CONTENDER`]) of the leader: a tile enters the shortlist
-/// as its first clean pipeline, on gfx1201 the 4096³ GEMM's measured best
-/// entered 8 % behind its best and its standing drifts between fourth and
-/// tenth across runs while the top ten sit within 10 %, so a fixed depth
-/// cut it on some runs. Over three cards' exhaustive sweeps eight reaches
-/// every tile a deeper stage would.
+/// as its first clean pipeline, which may sit well behind its best one, and
+/// its standing drifts across runs, so a fixed depth would cut it on some
+/// runs.
 pub(crate) const TWIN_TILES: usize = 8;
 
 /// A config's tile: all of it but its pipeline (ring depth, unrolling),
@@ -243,7 +253,7 @@ pub(crate) const TWIN_TILES: usize = 8;
 /// refuse, so the shortlist holds one config per tile, its first clean
 /// pipeline ([`shortlist`]); the tile that wins has its other pipelines,
 /// its [`twins`](Self::twins), timed after.
-pub(crate) trait Tiled: Copy + Eq + Hash + Send {
+pub(crate) trait Tiled: Copy + Eq + Hash + Send + Field {
     fn tile(&self) -> Self;
 
     /// The configs of `ranked` sharing this tile, each under this config's
@@ -258,111 +268,255 @@ pub(crate) trait Tiled: Copy + Eq + Hash + Send {
     }
 
     /// The config as the compact code a store line carries beside its
-    /// index ([`super::super::tune`]'s format 6): its fields in a fixed
-    /// order, numbers and markers, `~` a `None` — a family's own form,
-    /// round-trip tested per family, so a line's candidates read without
-    /// re-deriving the list their digest names.
-    fn code(&self) -> String;
+    /// index ([`super::super::tune`]'s format): its [`Field`]s in order
+    /// between commas, so a line's candidates read without re-deriving the
+    /// list their digest names.
+    fn code(&self) -> String {
+        let mut out = vec![];
+        self.put(&mut out);
+        out.join(",")
+    }
 
     /// The config a [`code`](Self::code) holds; `None` where it is not the
     /// family's form.
-    fn of_code(code: &str) -> Option<Self>;
+    fn of_code(code: &str) -> Option<Self> {
+        let mut fields = code.split(',').peekable();
+        let cfg = Self::take(&mut fields)?;
+        fields.next().is_none().then_some(cfg)
+    }
 }
 
-/// The numbers of a `code` split on commas, `~` a `None` field.
-fn fields(code: &str) -> Option<Vec<Option<usize>>> {
-    code.split(',')
-        .map(|f| match f {
-            "~" => Some(None),
-            n => Some(Some(n.parse::<usize>().ok()?)),
-        })
-        .collect()
+/// A code's fields between its commas.
+type Fields<'a> = std::iter::Peekable<std::str::Split<'a, char>>;
+
+/// A field of a config's code: the tokens it writes, and what it reads back
+/// from them (`None` where they are not its form).
+pub(crate) trait Field: Sized {
+    fn put(&self, out: &mut Vec<String>);
+    fn take(fields: &mut Fields<'_>) -> Option<Self>;
 }
 
-/// The code of `fields`: `~` a `None`, a number the rest.
-fn coded(fields: &[Option<usize>]) -> String {
-    fields
-        .iter()
-        .map(|f| match f {
-            Some(n) => n.to_string(),
-            None => "~".into(),
-        })
-        .collect::<Vec<_>>()
-        .join(",")
+macro_rules! number {
+    ($($ty:ty),*) => {$(
+        impl Field for $ty {
+            fn put(&self, out: &mut Vec<String>) {
+                out.push(self.to_string());
+            }
+            fn take(fields: &mut Fields<'_>) -> Option<Self> {
+                fields.next()?.parse().ok()
+            }
+        }
+    )*};
 }
+number!(usize, u32);
+
+impl Field for bool {
+    fn put(&self, out: &mut Vec<String>) {
+        out.push(u8::from(*self).to_string());
+    }
+    fn take(fields: &mut Fields<'_>) -> Option<Self> {
+        match fields.next()? {
+            "1" => Some(true),
+            "0" => Some(false),
+            _ => None,
+        }
+    }
+}
+
+/// `~` a `None`, else the value's own fields.
+impl<T: Field> Field for Option<T> {
+    fn put(&self, out: &mut Vec<String>) {
+        match self {
+            Some(v) => v.put(out),
+            None => out.push("~".into()),
+        }
+    }
+    fn take(fields: &mut Fields<'_>) -> Option<Self> {
+        if fields.peek() == Some(&"~") {
+            fields.next();
+            return Some(None);
+        }
+        T::take(fields).map(Some)
+    }
+}
+
+impl Field for Pow2 {
+    fn put(&self, out: &mut Vec<String>) {
+        self.get().put(out);
+    }
+    fn take(fields: &mut Fields<'_>) -> Option<Self> {
+        Pow2::new(usize::take(fields)?)
+    }
+}
+
+/// `~` in registers, `q16` queued, `m` then the listing a score matrix.
+impl Field for Way {
+    fn put(&self, out: &mut Vec<String>) {
+        match self {
+            Way::Registers => out.push("~".into()),
+            Way::Queued(q) => out.push(format!("q{}", q.get())),
+            Way::Matrix(select) => {
+                out.push("m".into());
+                select.put(out);
+            }
+        }
+    }
+    fn take(fields: &mut Fields<'_>) -> Option<Self> {
+        match fields.next()? {
+            "~" => Some(Way::Registers),
+            "m" => SelectCfg::take(fields).map(Way::Matrix),
+            q => Pow2::new(q.strip_prefix('q')?.parse().ok()?).map(Way::Queued),
+        }
+    }
+}
+
+impl<T: Field, const N: usize> Field for [T; N] {
+    fn put(&self, out: &mut Vec<String>) {
+        self.iter().for_each(|v| v.put(out));
+    }
+    fn take(fields: &mut Fields<'_>) -> Option<Self> {
+        let mut out = Vec::with_capacity(N);
+        for _ in 0..N {
+            out.push(T::take(fields)?);
+        }
+        out.try_into().ok()
+    }
+}
+
+/// `w`, `x` or `g`.
+impl Field for Core {
+    fn put(&self, out: &mut Vec<String>) {
+        out.push(
+            match self {
+                Core::Warp => "w",
+                Core::Wide => "x",
+                Core::Group => "g",
+            }
+            .into(),
+        );
+    }
+    fn take(fields: &mut Fields<'_>) -> Option<Self> {
+        match fields.next()? {
+            "w" => Some(Core::Warp),
+            "x" => Some(Core::Wide),
+            "g" => Some(Core::Group),
+            _ => None,
+        }
+    }
+}
+
+/// A ring `r<depth>`, `u` after it when unrolled; two crews `p<kslice>`.
+impl Field for Schedule {
+    fn put(&self, out: &mut Vec<String>) {
+        out.push(match self {
+            Schedule::Ring { depth, unroll } => format!("r{depth}{}", if *unroll { "u" } else { "" }),
+            Schedule::PingPong { kslice } => format!("p{kslice}"),
+        });
+    }
+    fn take(fields: &mut Fields<'_>) -> Option<Self> {
+        let field = fields.next()?;
+        let (kind, rest) = field.split_at(field.len().min(1));
+        match kind {
+            "r" => {
+                let (depth, unroll) = rest.strip_suffix('u').map_or((rest, false), |depth| (depth, true));
+                Some(Schedule::Ring { depth: depth.parse().ok()?, unroll })
+            }
+            "p" => Some(Schedule::PingPong { kslice: rest.parse().ok()? }),
+            _ => None,
+        }
+    }
+}
+
+/// `g` and the group's tile rows.
+impl Field for TileOrder {
+    fn put(&self, out: &mut Vec<String>) {
+        out.push(format!("g{}", self.rows()));
+    }
+    fn take(fields: &mut Fields<'_>) -> Option<Self> {
+        TileOrder::grouped(fields.next()?.strip_prefix('g')?.parse().ok()?)
+    }
+}
+
+/// `t` and the blocks a tail tile splits over.
+impl Field for TailSplit {
+    fn put(&self, out: &mut Vec<String>) {
+        out.push(format!("t{}", self.split()));
+    }
+    fn take(fields: &mut Fields<'_>) -> Option<Self> {
+        TailSplit::new(fields.next()?.strip_prefix('t')?.parse().ok()?)
+    }
+}
+
+/// A config's code: its fields in order, each a [`Field`]; the comment
+/// gives a code.
+macro_rules! coded {
+    ($(#[$doc:meta])* $ty:ident { $($field:ident),* }) => {
+        $(#[$doc])*
+        impl Field for $ty {
+            fn put(&self, out: &mut Vec<String>) {
+                $(self.$field.put(out);)*
+            }
+            fn take(fields: &mut Fields<'_>) -> Option<Self> {
+                Some(Self { $($field: Field::take(fields)?),* })
+            }
+        }
+    };
+}
+coded!(SelectCfg { warps, queue, filter });
+coded!(LaneQueue { width, depth, passes });
+coded!(Forms { truncate_p, sum_after, skip_rescale, raw_max, bias_direct });
+coded!(
+    /// `w,128,256,64,2,4,r3u,g8,~` (`t4` for a tail split four ways)
+    GemmCfg { core, tile, warps, schedule, order, tail }
+);
+coded!(
+    /// `w,64,64,32,2,2,r2,g8,~,4`
+    ConvCfg { gemm, split }
+);
+coded!(
+    /// `64,64,r3,1,1,0,0,1,1,1,16,g`
+    FaCfg { bq, bkv, schedule, splits, forms, key_warps, warp_rows, core }
+);
+coded!(
+    /// `4`
+    NormCfg { br }
+);
+coded!(
+    /// `64,64,r2,16,~,1,~,4,2,0` (`q16` queued, `m,4,2,0` a score matrix)
+    NearestCfg { bq, bkv, schedule, warp_rows, bk, splits, list, lanes }
+);
 
 /// The configs of `ranked` that may stand for their tiles, in order.
 pub(crate) fn representatives<C: Tiled>(ranked: &[C]) -> Vec<C> {
     ranked.iter().copied().filter(Tiled::represents).collect()
 }
 
+/// A tile's raster and tail split are variants of it, as its pipelines
+/// are: the planner walks every tile at the default raster and offers a
+/// tile's split beside its unsplit pipelines where it prices the split
+/// cheaper or near ([`GemmProblem::ranked`](super::GemmProblem)), timed only
+/// as a twin of a contender tile; a config read back from a code may carry
+/// another raster.
 impl Tiled for GemmCfg {
     fn tile(&self) -> Self {
-        GemmCfg { tile: [self.tile[0], self.tile[1], 0], stages: 0, unroll: false, ..*self }
-    }
-
-    /// `w|g` (the core), the tile, the ring, the warp grid, unrolling and
-    /// crews: `w,128,256,64,3,2,4,0,1`.
-    fn code(&self) -> String {
-        format!(
-            "{},{}",
-            match self.core {
-                Core::Warp => "w",
-                Core::Group => "g",
-            },
-            coded(&[
-                Some(self.tile[0]),
-                Some(self.tile[1]),
-                Some(self.tile[2]),
-                Some(self.stages),
-                Some(self.warps[0] as usize),
-                Some(self.warps[1] as usize),
-                Some(self.unroll as usize),
-                Some(self.crews as usize),
-            ])
-        )
-    }
-
-    fn of_code(code: &str) -> Option<Self> {
-        let (core, rest) = code.split_once(',')?;
-        let core = match core {
-            "w" => Core::Warp,
-            "g" => Core::Group,
-            _ => return None,
-        };
-        let f = fields(rest)?;
-        if f.len() != 8 {
-            return None;
-        }
-        let n = |i: usize| f.get(i).copied().flatten();
-        Some(GemmCfg {
-            core,
-            tile: [n(0)?, n(1)?, n(2)?],
-            stages: n(3)?,
-            warps: [n(4)? as u32, n(5)? as u32],
-            unroll: n(6)? == 1,
-            crews: n(7)? as u32,
-        })
+        let tile = [self.tile[0], self.tile[1], 0];
+        GemmCfg { tile, schedule: self.schedule.tile(), order: TileOrder::DEFAULT, tail: None, ..*self }
     }
 
     fn twins(&self, ranked: &[Self]) -> Vec<Self> {
         ranked.iter().filter(|c| c.tile() == self.tile()).copied().collect()
+    }
+
+    /// A split stands for no tile: it runs only where the tuner timed it
+    /// against its unsplit pipeline, never as the untuned first pick.
+    fn represents(&self) -> bool {
+        self.tail.is_none()
     }
 }
 
 impl Tiled for ConvCfg {
     fn tile(&self) -> Self {
         ConvCfg { gemm: self.gemm.tile(), ..*self }
-    }
-
-    /// Its GEMM's code, the split last: `w,64,64,32,2,2,2,0,1,4`.
-    fn code(&self) -> String {
-        format!("{},{}", self.gemm.code(), self.split)
-    }
-
-    fn of_code(code: &str) -> Option<Self> {
-        let (gemm, split) = code.rsplit_once(',')?;
-        Some(ConvCfg { gemm: GemmCfg::of_code(gemm)?, split: split.parse().ok()? })
     }
 
     /// A split's twins keep its depth as well as its split: a partial
@@ -385,69 +539,7 @@ impl Tiled for ConvCfg {
 /// pipelines are: the one-row config represents the tile.
 impl Tiled for FaCfg {
     fn tile(&self) -> Self {
-        FaCfg { stages: 0, unroll: false, warp_rows: WARP_ROWS, ..*self }
-    }
-
-    /// The blocks, ring, splits, unrolling, the softmax forms as their five
-    /// bits (`truncate_p, sum_after, skip_rescale, raw_max, bias_direct`),
-    /// the key warps, rows a warp and the core:
-    /// `64,64,3,1,0,9,1,2,g`.
-    fn code(&self) -> String {
-        let forms = self.forms;
-        let bits = [forms.truncate_p, forms.sum_after, forms.skip_rescale, forms.raw_max, forms.bias_direct]
-            .iter()
-            .enumerate()
-            .map(|(i, &b)| usize::from(b) << i)
-            .sum::<usize>();
-        coded(&[
-            Some(self.bq),
-            Some(self.bkv),
-            Some(self.stages),
-            Some(self.splits),
-            Some(self.unroll as usize),
-            Some(bits),
-            Some(self.key_warps),
-            Some(self.warp_rows),
-        ]) + &format!(
-            ",{}",
-            match self.core {
-                Core::Warp => "w",
-                Core::Group => "g",
-            }
-        )
-    }
-
-    fn of_code(code: &str) -> Option<Self> {
-        let (rest, core) = code.rsplit_once(',')?;
-        let core = match core {
-            "w" => Core::Warp,
-            "g" => Core::Group,
-            _ => return None,
-        };
-        let f = fields(rest)?;
-        if f.len() != 8 {
-            return None;
-        }
-        let n = |i: usize| f.get(i).copied().flatten();
-        let bits = n(5)?;
-        let bit = |i: usize| (bits >> i & 1) == 1;
-        Some(FaCfg {
-            bq: n(0)?,
-            bkv: n(1)?,
-            stages: n(2)?,
-            splits: n(3)?,
-            unroll: n(4)? == 1,
-            forms: Forms {
-                truncate_p: bit(0),
-                sum_after: bit(1),
-                skip_rescale: bit(2),
-                raw_max: bit(3),
-                bias_direct: bit(4),
-            },
-            key_warps: n(6)?,
-            warp_rows: n(7)?,
-            core,
-        })
+        FaCfg { schedule: self.schedule.tile(), warp_rows: WARP_ROWS, ..*self }
     }
 
     fn twins(&self, ranked: &[Self]) -> Vec<Self> {
@@ -455,28 +547,20 @@ impl Tiled for FaCfg {
         ranked
             .iter()
             .filter(|c| block(c) == block(self))
-            .map(|c| FaCfg { stages: c.stages, unroll: c.unroll, warp_rows: c.warp_rows, ..*self })
+            .map(|c| FaCfg { schedule: c.schedule, warp_rows: c.warp_rows, ..*self })
             .collect()
     }
 
-    /// Two atom rows per warp are a variant of the one-row tile.
+    /// Two atom rows per warp are a variant of a tile that holds one; the
+    /// wide core offers one rows per warp a block.
     fn represents(&self) -> bool {
-        self.warp_rows == WARP_ROWS
+        self.core == Core::Wide || self.warp_rows == narrowest_warp_rows(self.core, WARP_ROWS, self.bq)
     }
 }
 
 impl Tiled for NormCfg {
     fn tile(&self) -> Self {
         *self
-    }
-
-    /// Its rows a block: `4`.
-    fn code(&self) -> String {
-        self.br.to_string()
-    }
-
-    fn of_code(code: &str) -> Option<Self> {
-        Some(NormCfg { br: code.parse().ok()? })
     }
 
     fn twins(&self, _: &[Self]) -> Vec<Self> {
@@ -491,57 +575,7 @@ impl Tiled for NormCfg {
 impl Tiled for NearestCfg {
     fn tile(&self) -> Self {
         let lanes = self.lanes.map(|l| LaneQueue { passes: false, ..l });
-        NearestCfg { stages: 0, unroll: false, lanes, ..*self }
-    }
-
-    /// The blocks, ring, rows a warp, the streamed depth, the splits, the
-    /// register list, a score-matrix listing's (`warps, queue, filter`) and
-    /// a lane queue's (`width, depth, passes`) — a `None` field `~`:
-    /// `64,64,2,0,2,~,1,~,~,~,~,4,32,0`.
-    fn code(&self) -> String {
-        coded(&[
-            Some(self.bq),
-            Some(self.bkv),
-            Some(self.stages),
-            Some(self.unroll as usize),
-            Some(self.warp_rows),
-            self.bk,
-            Some(self.splits),
-            self.queue,
-            self.select.map(|s| s.warps as usize),
-            self.select.map(|s| s.queue),
-            self.select.map(|s| usize::from(s.filter)),
-            self.lanes.map(|l| l.width),
-            self.lanes.map(|l| l.depth),
-            self.lanes.map(|l| usize::from(l.passes)),
-        ])
-    }
-
-    fn of_code(code: &str) -> Option<Self> {
-        let f = fields(code)?;
-        if f.len() != 14 {
-            return None;
-        }
-        let n = |i: usize| f.get(i).copied().flatten();
-        let select = n(8).zip(n(9)).zip(n(10)).map(|((warps, queue), filter)| SelectCfg {
-            warps: warps as u32,
-            queue,
-            filter: filter == 1,
-        });
-        let lanes =
-            n(11).zip(n(12)).zip(n(13)).map(|((width, depth), passes)| LaneQueue { width, depth, passes: passes == 1 });
-        Some(NearestCfg {
-            bq: n(0)?,
-            bkv: n(1)?,
-            stages: n(2)?,
-            unroll: n(3)? == 1,
-            warp_rows: n(4)?,
-            bk: n(5),
-            splits: n(6)?,
-            queue: n(7),
-            select,
-            lanes,
-        })
+        NearestCfg { schedule: self.schedule.tile(), lanes, ..*self }
     }
 
     /// The ranked (unsplit) pipelines of the tile, at the split the tuner
@@ -569,9 +603,7 @@ pub(crate) fn distinct_configs<C: Tiled>(list: &[C]) -> Vec<C> {
 /// after them, within the [`SHORTLIST`], the tiles none of whose pipelines
 /// compiled clean, each by its first spilling one: the compiled kernel
 /// judges what it can and the time the rest (a spilling kernel still beats
-/// the graph's, and on gfx1201 the 16384² depth-768 nearest's best tile,
-/// 128 rows by 128 candidates at 32 rows a warp, spills 196 bytes a lane
-/// and runs 86.4 Gpairs/s to the clean pick's 84.7).
+/// the graph's, and may beat the clean pick).
 /// `compiles` is handed what the [`Search`] wants as soon as it wants it
 /// (the tuner compiles in parallel, in the order handed), each verdict
 /// taken as it lands, until nothing more is wanted. `None` when nothing

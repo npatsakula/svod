@@ -19,7 +19,7 @@ for host work, `SVOD_DEVICE=CUDA` / `AMD` (or `CUDA:0`, `AMD:1`) for device work
 
 | Question | Command |
 |----------|---------|
-| Host suite (no GPU touched) | `SVOD_DEVICE=CPU cargo test -p svod-tk --release --lib` (818 passed, 12 ignored, 44 s at 2e9d5edb) |
+| Host suite (no GPU touched) | `SVOD_DEVICE=CPU cargo test -p svod-tk --release --lib` (no device needed) |
 | Host gate: every family lowers on sm_86/sm_90/gfx1201/gfx1151/gfx1100/gfx942, keeps its interpreted numbers, compiles | `SVOD_DEVICE=CPU cargo test -p svod-tk --release --lib every_family_lowers_keeps_its_numbers_and_compiles` (39 s; no clang AMDGPU / NVPTX → `skipped:`; no `ptxas` → PTX not assembled) |
 | One `test_case` variant | filter on the generated suffix: `…compiles::test_case_3_gfx1201` |
 | Device gate: each family vs the interpreter | `SVOD_DEVICE=CUDA cargo test -p svod-tk --release --lib families_match_the_interpreter_on_the_device -- --nocapture` |
@@ -41,16 +41,21 @@ optimization"), `do_linearize` returns before the `SVOD_DUMP_LINEAR` dump (`code
 
 ## Mental model
 
-1. **Tile program** (`ir.rs`, recorded by `build::Kernel`): statements in program order
+1. **Tile program** (`ir.rs`, recorded by `build::Kernel::record(name, |k| …)`; every handle and `Sc` carries the kernel's brand `'k`; `Sc`'s terms, `Kernel::intern` and the arena ids are crate-private, and a recorded `Program` is read-only outside the crate: `name()`, `params()`, `body()`): statements in program order
    (`Stmt::{Let, Copy, Loop, Pipeline, Warps, If, Sync}`) over typed tiles `Gmem<T>`/`Shared<T>`/`Regs<T>`, shared
    allocations as `SmemRef<T>`; comparisons are `k.compare(a, b, CmpOp::{Lt,Le,Eq,Ne})` → `Regs<Bool>`. No DAG.
-2. **`lower::lower`** (`lower/mod.rs`): grid check → `materialize_operands` (non-register `mma` operands become loads;
+2. **`lower::lower`** (`lower/mod.rs`): grid check → scope check (a tile read past the scope that defines it:
+   `Error::Escaped`) → shared bounds (a view past its allocation, a ring holding fewer slots than its pipeline runs:
+   `Error::SharedPast`) → `materialize_operands` (non-register `mma` operands become loads;
    on `Core::Group` shared operands stay in place) → `sync::insert_barriers` (fences from shared-memory effects) →
-   `schedule::expand` (each `Pipeline`'s `Ring { stages, unroll, crews }` under the target's `Fill`; on the warpgroup
+   `schedule::expand` (each `Pipeline`'s `Schedule` under the target's `Fill`; on the warpgroup
    core a `cp.async` ring of ≥ 3 slots whose consume only chains products leaves them in flight) → `layouts::infer`
    (F2 `TileLayout` per register tile, priced relayouts; a product whose result is dealt issues the narrow way,
-   `MmaAtom::narrow`) → `orient_shared` → `emit::emit` (`lower/emit/{mod,address,
-   copy,compute,nvptx,amdgpu}.rs`; vendor intrinsics only in the last two). `Lowering { device, core }`
+   `MmaAtom::narrow`; each shared allocation's `Storage`, its axis and bank halves) → `emit::emit` (`lower/emit/{mod,address,
+   copy,compute,nvptx,amdgpu}.rs`; vendor intrinsics only in the last two). A program's phase is its type
+   (`ir::Phase`): `Program` is authored, `expand` returns `Program<Expanded>` (no `Stmt::Pipeline`), `infer` returns
+   `Program<Laid>` (every product's `Orient`, every deal's order, `Storage`, `layouts`); `interp::run` takes any.
+   `Lowering { device, core }`
    (`Lowering::new(device)` on the warp-level core); the warp grid is the program's (`Kernel::warps`,
    `Program::warp_grid`); `layouts::Swizzle::{None,B32,B64,B128}`.
 3. **Target** (`atoms.rs`): matrix cores (`mma: Vec<MmaAtom>`, `group_mma`; `geometry()` the 16-bit atom the
@@ -66,8 +71,10 @@ optimization"), `do_linearize` returns before the `SVOD_DUMP_LINEAR` dump (`code
    `None` without an SM count).
 5. **Op layer** (`ops/`): `linear`, `attention`, `heads`, `layer_norm`/`rms_norm`/`add_*`, `conv2d` always return a
    Tensor. `ops/shape.rs` gates kernel vs graph (`Plan::Kernel(ranked)` / `Plan::Graph(Fallback::{Target, Dtype,
-   Symbolic, Shape, Config})`); `ops/config.rs` ranks a lattice (`GemmProblem::admit`, `AttentionProblem::admit`, `NearestProblem::admit` →
-   `Result<(ns, regs), Rejected>`); `ops::Tuner` admits the shortlist (compiles: the clean tiles, then the spilling
+   Symbolic, Shape, Config})`); `ops/config/` ranks a lattice (`GemmProblem::admit`, `AttentionProblem::admit`, `NearestProblem::admit` →
+   `Result<(ns, regs), Rejected>`); a kernel runs only from `kernels::Admitted<'t, S>`, a cfg-free spec with the config
+   admitted for it (`spec.admitted(&planner, cfg)`, or `unsafe Admitted::assume(spec, cfg)`; the ops' `tuned`/`probed`
+   take the spec and return one); `ops::Tuner` admits the shortlist (compiles: the clean tiles, then the spilling
    ones; a program past `Target::most_instructions` is refused by the lowering) and times it once per
    device × shape (`tune.rs`).
 6. **Launch** (`launch.rs`): `graph_launch[_all]` wraps the body in a custom kernel, lowered bodies memoized.
@@ -77,25 +84,33 @@ optimization"), `do_linearize` returns before the `SVOD_DUMP_LINEAR` dump (`code
 ## Writing a kernel
 
 Smallest real kernel: `kernels/rows.rs::norm` (one warp per row, no matrix core). Pipeline + `mma`: `kernels/gemm.rs`.
-Masks, `select_if`, `each_warp`, `smem_view_as`, `load_scalar`, `where_`, `mul_add`: `kernels/attention.rs`. Row-mapped
+Masks, `select_if`, `each_warp`, `ring_scratch`, `load_scalar` (integer params only: `I8`, `I32`), `where_`, `mul_add`: `kernels/attention.rs`. Row-mapped
 gathers (`Kernel::gather`): `kernels/conv.rs`. Builder call table: `first-kernel.md`. Full wiring: [new-kernel.md](new-kernel.md).
 
 Rules the code enforces:
-- Split `XSpec` (shapes, options, `cfg`) / `Lowering::new(&device)` (or `GemmCfg`/`FaCfg::lowering`) / `pub fn x<T: Half>(&XSpec)
-  -> Program`, dispatched on bf16/f16 by `ops::typed!` (`typed!(…, int8)` adds `I8`). `Kernel::mma` takes `T: MmaIn`
-  (bf16/f16 → f32, `I8` → i32 exact; `MmaIn::widened` to f32): `gemm` and `nearest` run over `I8`, the rest 16-bit
+- Split `XSpec` (shapes, options; a ranked family's spec holds no config) / `Lowering::new(&device)` (or
+  `GemmCfg`/`FaCfg::lowering`) / `pub fn x<T: MmaIn>(&Admitted<XSpec>) -> Program` (`spec.cfg()`; the norms and heads,
+  which rank nothing, take `&XSpec` with its `cfg`), dispatched on bf16/f16 by `ops::typed!` (`typed!(…, int8)` adds
+  `I8`). `Kernel::mma` takes `T: MmaIn` (bf16/f16 → f32, `I8` → i32 exact; `MmaIn::widened` to f32) and an `Acc` it
+  consumes and returns; `loop_`/`pipeline` carry `Acc`s (`*acc` reads one, `.into()` makes one from a `Regs`), the
+  `_vec` forms plain `Regs`. `Acc` is a lint, not an ownership guarantee: not `Copy`, so handing on a consumed
+  accumulator fails to compile, but a `*acc` copy made an `Acc` again carries a stale value unrefused, and the
+  lowering does not check it. `gemm` and `nearest` run over `I8`, the rest 16-bit
   only; f32 stays on the graph except `k_nearest_reranked` (8-bit or f16 search, f32 pass by `nearest_rescore`).
 - Effects are not declared by hand: async stages inside a `pipeline` belong to the template, `Sync` copies and shared
   stores are fenced by `sync::insert_barriers`; `k.barrier()` is the only hand-placed sync. A block barrier under a
-  branch on the warp is `lower::Error::DivergentBarrier`.
+  branch on the warp (`where_any`, `if_any`), inserted or hand-placed, is `lower::Error::DivergentBarrier`.
+- A ring is `k.ring(name, slot, schedule)` (`schedule.stages()` slots; a count is a rolled ring) or `k.ring_runs(…,
+  runs)` (one run per warp running its own pipeline); `k.pipeline(extent, ring, init, produce, consume)` and
+  `pipeline_vec` run as that ring's schedule says. `k.var(name, min, max)` panics on an empty range (`min > max`).
 - `pin` and `mma_oriented` are for probes/tests; layouts come from inference.
-- `k.warps(grid)` declares every warp of the block; `k.lone_warps(n)` adds whole copies of the grid that run only in `each_warp` bodies.
+- `k.warps(grid)` declares every warp of the block; `k.lone_warps(n)` adds whole copies of the grid that run only in `each_warp` bodies (`warps` after `lone_warps` panics).
 
 ## Checking correctness
 
 Tests live in `tk/src/test/unit/<topic>.rs` (never in-place; `test_case` tables, `proptest` shapes). Shared helpers in
 `mod.rs`: `device_target()`, `device_planner()`, `cp_async_target()`, `group_target()`, `tuned_on_device`, `measure`,
-`first_eight`, `costs()` (GUESSED, `step_group` 0), `gfx1151_costs()`, `declared`, `planner`, `rounded`, `decode`,
+`first_eight`, `costs()` (`sweep::costs`, GUESSED), `gfx1151_costs()`, `gfx1151_store_costs()`, `sm86_costs()`, `gfx1201_costs()`, `gfx942_costs()` (declared from each device's probes), `declared`, `planner`, `rounded`, `decode`,
 `assert_rel_close`, `Scratch` (a temp directory a test drops, for a tune store), `self_join` (a nearest problem). Targets: `atoms::sm86()`, `targets::hopper()`, `targets::amd(AmdArch::Gfx1201, 64)`.
 
 | Level | Example |
@@ -107,6 +122,7 @@ Tests live in `tk/src/test/unit/<topic>.rs` (never in-place; `test_case` tables,
 | Every admitted config on device | `device::every_gemm_candidate_matches_the_interpreter` (via `tuned_on_device`) |
 | Op vs graph fallback | `ops::linear_matches_the_graph` (`untuned` = `tune::scoped(false, …)`, `assert_kernel(&y, "gemm")`) |
 | Plan per shape (host) | `ops_plan::linear_plans` (`want: Result<(), Fallback>`) |
+| Split plans vs probed device times (host) | `tail::the_model_orders_the_probed_plans_as_the_device_did` (`gemm_tail_probe` rows per card: add a card's rows there) |
 | Offline card planning | `offline::a_planner_plans_for_a_card_without_it`, `offline::costs_read_from_a_copied_store` |
 | Sync pass | `sync::shipped_kernels_need_no_barriers`, `sync::a_block_barrier_under_a_branch_on_the_warp_is_refused` |
 
@@ -132,11 +148,13 @@ any target: `lower::render(prog, &lowering)` or `lower::standalone(prog, &loweri
 | `layout inference: …` | `lower::Error::Layout` (`layouts::Error`): no atom for the dtype pair, a tile that does not tile the warp grid, a carried value that changes layout in a loop |
 | `N warps over a grid of M: …` | `lower::Error::Grid` (`targets::a_grid_takes_every_warp_or_whole_grids_run_alone`) |
 | `<what> is not lowered yet` | `lower::Error::Unsupported`: cross-warp reductions, a cross-thread transpose, column-major chunk fills, odd warpgroup operands |
-| `… is a block barrier under a branch on the warp, which some warps skip` | `lower::Error::DivergentBarrier` (sync pass or a relayout through shared memory) |
+| `… is a block barrier under a branch on the warp, which some warps skip` | `lower::Error::DivergentBarrier` (sync pass, a hand-placed `k.barrier()` under `where_any`/`if_any`, or a relayout through shared memory) |
+| `a view of NAME reaches elements A..B, which holds N` | `lower::Error::SharedPast`: a shared view past its allocation, e.g. a ring with fewer slots than the pipeline's schedule runs (`emit::a_ring_shallower_than_its_pipeline_is_refused`) |
+| `tile V of SCOPE is read in SCOPE, which its definition does not dominate` | `lower::Error::Escaped`: a tile kept out of a loop body, branch or `each_warp` body and read past it |
 | `NAME emits N instructions, past the M a kernel may` | `lower::Error::TooLarge` (`Target::most_instructions`: 2^18 AMD, 2^19 CUDA): refused before any compiler sees it; the tuner rejects the config as failed |
 | `program assembly: …` / `rendering <name>: …` | `svod_ir::Error` from `UOp::linear_program` / the LLVM renderer; rerun with `SVOD_SPEC_DEBUG=1 TK_DUMP_LIST=1` |
 | `element I of NAME is accessed, which holds N` / `scalar A Div B is undefined` (also `Rem`) | `interp::Error::{OutOfBounds, Division}`; also `UnboundVar`, `ParamSize` |
-| `Rejected::{Lowers, Shallow, Divides, Smem, Layout, Registers}` | why `admit` left a lattice config out (`tk_dump` counts them, `plan.txt` lists each) |
+| `Rejected::Target(TargetRejected::{Lowers, Smem, Layout, Registers, TopK})` (settled once per family statics) and `Rejected::Shape(ShapeRejected::{Shallow, Divides, Padding, Tail, Partials})` (`Partials`: a tail split whose f32 partials outgrow an eighth of device memory) | why `admit` left a lattice config out (`tk_dump` counts them, `plan.txt` lists each) |
 | op silently runs graph kernels (`E_…`, `r_…` in a profile) | `Plan::Graph(Fallback::…)`: the `graph` line of the planner log says which |
 | RDNA4 reads past a view's bounds | transposing loads read a zero run there (`emit::a_transposed_element_past_the_bounds_reads_zero`) |
 
@@ -193,9 +211,9 @@ rocprof, or tk's probes). `llvm-mca` on AMDGPU is a one-wave, no-memory model an
 ## Tune store
 
 `$SVOD_TK_TUNE_DIR`, else `$XDG_CACHE_HOME/svod/tk_tune`, else `~/.cache/svod/tk_tune`; one file per device
-`<arch>_<sms>sm-v<crate version>.txt` (`sm_86_28sm-v0.2.0.txt`) under a `format 6` line (`tune::FORMAT`); lines
+`<arch>_<sms>sm-v<crate version>.txt` (`sm_86_28sm-v<crate version>.txt`) under a `format 11` line (`tune::FORMAT`); lines
 `choice|…` (`idx:code ns` pairs, fastest first, each candidate's config as its family's compact code —
-`Tiled::code`), `admitted|…`/`first|…` (`idx:code`), `value|…` (one number; probes in femtoseconds) keyed by op,
+`Tiled::code`, a GEMM's `w,128,256,64,2,4,r3u,g8,~` ending in its raster and tail split, `~` or `t4`, a nearest's list `~` in registers, `q16` queued or `m,4,2,0` a score matrix), `admitted|…`/`first|…` (`idx:code`), `value|…` (one number; probes in femtoseconds) keyed by op,
 device, dtype, shape, candidate digest, compiler digest and the
 fingerprint of the **emitted kernels** (lowered program + LLVM text), so only a change in what a kernel emits re-measures.
 The emitted fingerprints are memoized per build in `emitted/<build>.txt` (dropped after 7 days unused). A new FORMAT
@@ -212,6 +230,8 @@ The `#[ignore]` probes print and never assert; one at a time on an idle GPU:
 |---|---|
 | `device::gemm_throughput_probe` | 4096³ bf16 TFLOP/s per config, the tuner's pick marked |
 | `device::gemm_candidates_probe`, `device::qwen3_gemm_candidates_probe` | every admitted candidate on Nemotron / Qwen3 shapes |
+| `device::gemm_raster_probe` | every raster (`TileOrder`, groups of 1, 2, 4, … tile rows and column-major) of the tuner's pick and the planner's first, µs and × the default's beside the model's ×, on 4096³, 4096×1024×4096, 8192²×1024 (`RASTER_SHAPES=MxNxK;…`) |
+| `device::gemm_tail_probe` | data-parallel vs the model's cheapest whole split-K vs its cheapest tail split (full waves data-parallel, the last partial wave split along K), µs, TFLOP/s and × DP beside the model's ×, two passes in opposite orders, the planner's pick marked; 8192×4096×4096, 4096³, 8192²×1024, 6144×4096×8192 (`TAIL_SHAPES=MxNxK;…`) |
 | `attention::{attention_throughput_probe, attention_candidates_probe, decode_throughput_probe}` | FA d64/d128 ± causal ± bias TFLOP/s; decoder step µs |
 | `conv::conv_throughput_probe`, `rows::norm_bandwidth_probe` | YOLO conv classes vs graph µs; norm GB/s |
 | `attention::key_warp_resources_probe` | registers/LDS/spill per key-warp config |

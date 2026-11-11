@@ -1,25 +1,24 @@
 //! Flash attention forward: Q resident in registers, K/V streamed through a
 //! shared ring, the online-softmax state `(m, l, o)` carried.
 
-use std::fmt;
-
 use super::rows::NormCfg;
-use super::{Batch, batch_offset, bound, load_f32};
+use super::{Admits, Admitted, Batch, Spec, batch_offset, bound, load_f32};
 use crate::atoms::{Core, Device};
 use crate::build::*;
 use crate::ir::*;
 use crate::lower::Lowering;
+use crate::ops::config::{AttentionProblem, Planner, Rejected};
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+/// The tune store keys by this text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FaCfg {
     pub bq: usize,
     pub bkv: usize,
-    pub stages: usize,
+    /// The ring over the key blocks.
+    pub schedule: Schedule,
     /// Key splits: each is a block along grid x writing a partial result
     /// that [`combine`] merges; `1` writes the output directly.
     pub splits: usize,
-    /// The ring loop unrolled over its slots.
-    pub unroll: bool,
     pub forms: Forms,
     /// Warps sharing a block of one row-warp of queries (`bq` = [`WARP_ROWS`])
     /// by its keys: each walks its own range of key blocks through its own
@@ -39,25 +38,6 @@ pub struct FaCfg {
     /// probabilities as they stand in registers over the shared value rows
     /// (MN-major); a head wider than a 128-byte row is kept as column panels.
     pub core: Core,
-}
-
-/// The tune store keys by this text: a config of one atom row per warp on
-/// the warp-level core prints as it did before the fields existed, so its
-/// stored choices still apply.
-impl fmt::Debug for FaCfg {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut s = f.debug_struct("FaCfg");
-        s.field("bq", &self.bq).field("bkv", &self.bkv).field("stages", &self.stages);
-        s.field("splits", &self.splits).field("unroll", &self.unroll).field("forms", &self.forms);
-        s.field("key_warps", &self.key_warps);
-        if self.warp_rows != WARP_ROWS {
-            s.field("warp_rows", &self.warp_rows);
-        }
-        if self.core != Core::Warp {
-            s.field("core", &self.core);
-        }
-        s.finish()
-    }
 }
 
 /// The softmax forms: all off as planned; the tuner flips each where it
@@ -97,9 +77,23 @@ pub struct Forms {
 /// differs ([`FaCfg::fits`](FaCfg::fits)).
 pub(crate) const WARP_ROWS: usize = 16;
 
-/// Why [`attention`] refuses a config, whatever the target: what its
-/// ranking leaves out as one that does not lower
-/// ([`crate::ops::config::Rejected::Lowers`]).
+/// Search bound: the row warps a block of the warp-level core spreads over.
+const MOST_ROW_WARPS: usize = 8;
+
+/// The fewest rows a warp of a `bq`-row block owns on `core`, whose atom has
+/// `rows`: one atom row (a warpgroup's rows are the instruction's), or on a
+/// warp-level core as many as hold the block in [`MOST_ROW_WARPS`].
+pub(crate) fn narrowest_warp_rows(core: Core, rows: usize, bq: usize) -> usize {
+    match core {
+        Core::Warp | Core::Wide => rows * (bq / (MOST_ROW_WARPS * rows)).max(1),
+        Core::Group => WARP_ROWS,
+    }
+}
+
+/// The configs [`attention`] cannot build, whatever the target: the planner
+/// leaves them out as ones that do not lower
+/// ([`crate::ops::config::TargetRejected::Lowers`]), so no
+/// [`Admitted`] spec carries one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, snafu::Snafu)]
 pub enum Invalid {
     #[snafu(display("{key_warps} key warps share a block of one row warp, not {bq} rows"))]
@@ -113,7 +107,8 @@ impl FaCfg {
     /// block of one row warp, and a warp's merged output takes `16·d` f32
     /// of its 16-bit K ring.
     pub fn shares_keys(&self) -> Result<(), Invalid> {
-        let Self { bq, bkv, stages, key_warps, .. } = *self;
+        let Self { bq, bkv, key_warps, .. } = *self;
+        let stages = self.stages();
         if key_warps == 1 {
             return Ok(());
         }
@@ -130,9 +125,8 @@ impl FaCfg {
         Self {
             bq,
             bkv,
-            stages,
+            schedule: Schedule::ring(stages, false),
             splits: 1,
-            unroll: false,
             forms: Forms {
                 truncate_p: false,
                 sum_after: false,
@@ -148,6 +142,14 @@ impl FaCfg {
 
     /// One warp per [`warp_rows`](Self::warp_rows) query rows: the warps a
     /// tile is spread over.
+    pub fn stages(&self) -> usize {
+        self.schedule.stages()
+    }
+
+    pub fn unroll(&self) -> bool {
+        self.schedule.unroll()
+    }
+
     pub fn row_warps(&self) -> u32 {
         (self.bq / self.warp_rows) as u32
     }
@@ -165,7 +167,7 @@ impl FaCfg {
     /// read from global memory, which the warpgroup core's shared operands
     /// cannot.
     pub fn holds_appended(&self, appended: usize) -> bool {
-        self.bkv >= appended && (appended == 0 || self.core == Core::Warp)
+        self.bkv >= appended && (appended == 0 || self.core != Core::Group)
     }
 
     /// Whether a bias rides the ring: under a bias, unless the forms read it
@@ -180,13 +182,11 @@ impl FaCfg {
     /// where the core's accumulator cannot feed the P·V product (RDNA3), the
     /// probabilities' relayout is pinned to the lane exchange
     /// ([`crate::layouts::TileLayout::relayout`]), so a kernel of the config
-    /// declares no scratch for them. (A shared crossing, which the costs
-    /// could choose before, the card may refuse: the Strix Halo's "local
-    /// memory (73728) exceeds limit (65536)", a 32×128 block of head size 64
-    /// whose rings alone are its whole 64 KB.)
+    /// declares no scratch for them: a shared crossing would add to rings
+    /// that may already fill the block's shared memory.
     pub fn smem_bytes(&self, d: usize, bias: bool) -> usize {
         let slot = 2 * self.bkv * d + usize::from(self.bias_ring(bias)) * self.bq * self.bkv;
-        self.key_warps * self.stages * slot * 2
+        self.key_warps * self.stages() * slot * 2
     }
 }
 
@@ -263,7 +263,8 @@ pub(crate) fn key_mask_stride(tk: usize) -> usize {
 }
 
 /// `[batch, t, heads, d]` queries against `[batch, tk, kv_heads, d]` keys and
-/// values; query head `h` reads KV head `h / (heads / kv_heads)`.
+/// values; query head `h` reads KV head `h / (heads / kv_heads)`. A kernel
+/// runs it under a config admitted for it ([`AttnSpec::admitted`]).
 #[derive(Clone, Debug, PartialEq)]
 pub struct AttnSpec {
     pub batch: Batch,
@@ -280,10 +281,29 @@ pub struct AttnSpec {
     /// is `t`.
     pub packed: bool,
     pub scale: f32,
-    pub cfg: FaCfg,
+}
+
+impl Spec for AttnSpec {
+    type Cfg = FaCfg;
+}
+
+impl Admits for AttnSpec {
+    type Problem = AttentionProblem;
+
+    fn problem(&self) -> AttentionProblem {
+        let AttnSpec { t, tk, d, mask, .. } = *self;
+        let (causal, bias) = (mask.causal, mask.bias.is_some());
+        AttentionProblem { tiles: self.batch.capacity() * self.heads, t, tk, d, causal, bias }
+    }
 }
 
 impl AttnSpec {
+    /// `cfg` [admitted](Admitted) for this attention on `planner`, or why it
+    /// is not.
+    pub fn admitted(self, planner: &Planner, cfg: FaCfg) -> Result<Admitted<'_, Self>, Rejected> {
+        self.admit(planner, cfg)
+    }
+
     /// Parameters after the outputs, in order.
     pub fn extra_params(&self) -> Vec<&'static str> {
         let AttnMask { key_lens, key_mask, seg_start, .. } = self.mask;
@@ -308,40 +328,40 @@ impl AttnSpec {
 }
 
 /// The scores of a key block starting at the scalar, masked.
-type Mask<'a> = &'a dyn Fn(&mut Kernel, Regs<F32>, Sc) -> Regs<F32>;
+type Mask<'a, 'k> = &'a dyn Fn(&mut Kernel<'k>, Regs<'k, F32>, Sc<'k>) -> Regs<'k, F32>;
 
 /// The online-softmax step over one key block: `q_r` against `k_t`, the
 /// scores (plus `bias(block_start)`, in the scaled log2 units) masked by
 /// `mask(block_start)`, folded into `(m, l, o)` with `v_t`. The running
 /// maximum `m` is in the raw scores' units when [`raw_max`](Self::raw_max)
 /// holds, else in the scaled log2 units of the exponent.
-struct Step<'a, T> {
-    q_r: Regs<T>,
+struct Step<'a, 'k, T> {
+    q_r: Regs<'k, T>,
     scale_log2e: f64,
     shape: Shape,
-    bias: Option<Mask<'a>>,
-    mask: Mask<'a>,
+    bias: Option<Mask<'a, 'k>>,
+    mask: Mask<'a, 'k>,
     cfg: FaCfg,
 }
 
-impl<T> Clone for Step<'_, T> {
+impl<T> Clone for Step<'_, '_, T> {
     fn clone(&self) -> Self {
         *self
     }
 }
-impl<T> Copy for Step<'_, T> {}
+impl<T> Copy for Step<'_, '_, T> {}
 
 /// `s` plus a bias tile, in the scores' log2 units: one fused multiply-add,
 /// so the result does not depend on which product the backend would fuse
 /// into a separate add (the scaled scores' or the bias's), which varies with
 /// the layout around it.
-fn biased<T: Elem, P: TierMark>(k: &mut Kernel, s: Regs<F32>, tile: Tile<P, T>) -> Regs<F32> {
+fn biased<'k, T: Elem, P: Readable>(k: &mut Kernel<'k>, s: Regs<'k, F32>, tile: Tile<'k, P, T>) -> Regs<'k, F32> {
     let b = load_f32(k, tile);
     let log2e = k.fill::<F32>(k.shape(s), Const::Float(std::f64::consts::LOG2_E));
     k.mul_add(b, log2e, s)
 }
 
-impl<T> Step<'_, T> {
+impl<T> Step<'_, '_, T> {
     /// Whether the running maximum is kept in the raw scores' units: the
     /// planned form, where a positive scale commutes with the maximum and no
     /// bias joins the scores before it.
@@ -358,17 +378,18 @@ impl<T> Step<'_, T> {
 /// what keeps that sum finite for any value magnitude.
 const RESCALE_ABOVE: f64 = 8.0;
 
-fn step<T: Half, PK: TierMark, PV: TierMark>(
-    k: &mut Kernel,
-    st: &Step<'_, T>,
-    k_t: Tile<PK, T>,
-    v_t: Tile<PV, T>,
-    block_start: Sc,
-    [m, l, o]: [Regs<F32>; 3],
-) -> [Regs<F32>; 3] {
+fn step<'k, T: Half, PK: Readable, PV: Readable>(
+    k: &mut Kernel<'k>,
+    st: &Step<'_, 'k, T>,
+    k_t: Tile<'k, PK, T>,
+    v_t: Tile<'k, PV, T>,
+    block_start: Sc<'k>,
+    [m, l, o]: [Acc<'k, F32>; 3],
+) -> [Acc<'k, F32>; 3] {
     let zero = k.zeros::<F32>(st.shape);
-    let s = k.mma(zero, st.q_r, false, k_t, true);
+    let s = *k.mma(zero, st.q_r, false, k_t, true);
     let scale = k.fill::<F32>(st.shape, Const::Float(st.scale_log2e));
+    let (m, l) = (*m, *l);
     let rows = k.shape(m);
     // With the maximum in raw units the raw scores are masked and reduced,
     // and the scale reaches only the two row values the exponent and the
@@ -387,7 +408,7 @@ fn step<T: Half, PK: TierMark, PV: TierMark>(
         (s, k.reduce(s, Axis::Row, ReduceOp::Max))
     };
     let unit = if st.raw_max() { st.scale_log2e } else { 1.0 };
-    let scaled = |k: &mut Kernel, x: Regs<F32>| {
+    let scaled = |k: &mut Kernel<'k>, x: Regs<'k, F32>| {
         if !st.raw_max() {
             return x;
         }
@@ -415,17 +436,17 @@ fn step<T: Half, PK: TierMark, PV: TierMark>(
     // Truncated probabilities are summed as held, so the normalization stays
     // unbiased; rounded ones are summed in f32. Where the sum goes is
     // `sum_after`'s.
-    let summed = |k: &mut Kernel| {
+    let summed = |k: &mut Kernel<'k>| {
         let block_sum =
             if truncate { k.reduce_f32(p16, Axis::Row, ReduceOp::Sum) } else { k.reduce(p, Axis::Row, ReduceOp::Sum) };
         let l = k.binary(l, corr, BinaryOp::Mul);
         k.binary(l, block_sum, BinaryOp::Add)
     };
     let early = (!st.cfg.forms.sum_after).then(|| summed(k));
-    let o = if st.cfg.forms.skip_rescale { k.scale(o, corr) } else { k.binary(o, corr, BinaryOp::Mul) };
+    let o = if st.cfg.forms.skip_rescale { k.scale(*o, corr) } else { k.binary(*o, corr, BinaryOp::Mul) };
     let o = k.mma(o, p16, false, v_t, false);
     let l = early.unwrap_or_else(|| summed(k));
-    [m_new, l, o]
+    [m_new.into(), l.into(), o]
 }
 
 /// `o = softmax(q·kᵀ·scale + bias)·v`. Parameters in order: `q`, `k`, `v`
@@ -436,63 +457,68 @@ fn step<T: Half, PK: TierMark, PV: TierMark>(
 /// skipped through the first block and the trip count, the rest shared
 /// evenly by the splits; only blocks a mask edge crosses pay for the mask,
 /// except under a key mask or a bias, which every block reads.
-pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
-    let AttnSpec { ref batch, t, tk, heads, kv_heads, d, mask, cache, packed, scale, cfg } = *spec;
+pub fn attention<T: Half>(spec: &Admitted<AttnSpec>) -> Program {
+    Kernel::record(if spec.packed { "flash_attention_packed" } else { "flash_attention" }, |k| {
+        attention_body::<T>(k, spec)
+    })
+}
+
+fn attention_body<'k, T: Half>(k: &mut Kernel<'k>, spec: &Admitted<AttnSpec>) {
+    let AttnSpec { ref batch, t, tk, heads, kv_heads, d, mask, cache, packed, scale } = **spec;
     let AttnMask { causal, window, chunk, key_lens, key_mask, seg_start, bias } = mask;
-    let FaCfg { bq, bkv, stages, splits, .. } = cfg;
+    let cfg = spec.cfg();
+    let FaCfg { bq, bkv, splits, .. } = cfg;
+    let stages = cfg.stages();
     let cap = batch.capacity();
     let (kv_rows, heads_total) = cache.map_or((cap, kv_heads), |c| (c.rows, c.heads_total));
     let appended = cache.map_or(0, |c| c.appended);
     assert!(appended <= bkv, "{appended} appended rows overflow a key block of {bkv}");
     assert!(!packed || (cache.is_none() && tk == t), "a packed operand holds its own keys");
     let slots = heads + 2 * kv_heads;
-    let mut k = Kernel::new(if packed { "flash_attention_packed" } else { "flash_attention" });
     let (q, kk, v) = if packed {
-        let qkv = k.param::<T>("qkv", ParamKind::In, cap * t * slots * d);
+        let qkv = k.input::<T>("qkv", cap * t * slots * d);
         (qkv, qkv, qkv)
     } else {
-        let q = k.param::<T>("q", ParamKind::In, cap * t * heads * d);
-        let kk = k.param::<T>("k", ParamKind::In, kv_rows * tk * heads_total * d);
-        (q, kk, k.param::<T>("v", ParamKind::In, kv_rows * tk * heads_total * d))
+        let q = k.input::<T>("q", cap * t * heads * d);
+        let kk = k.input::<T>("k", kv_rows * tk * heads_total * d);
+        (q, kk, k.input::<T>("v", kv_rows * tk * heads_total * d))
     };
-    let o = (splits == 1).then(|| k.param::<T>("o", ParamKind::Out, cap * t * heads * d));
+    let o = (splits == 1).then(|| k.output::<T>("o", cap * t * heads * d));
     let parts = (splits > 1).then(|| {
-        let o = k.param::<F32>("o_part", ParamKind::Out, splits * cap * t * heads * d);
-        let m = k.param::<F32>("m_part", ParamKind::Out, splits * cap * t * heads);
-        let l = k.param::<F32>("l_part", ParamKind::Out, splits * cap * t * heads);
+        let o = k.output::<F32>("o_part", splits * cap * t * heads * d);
+        let m = k.output::<F32>("m_part", splits * cap * t * heads);
+        let l = k.output::<F32>("l_part", splits * cap * t * heads);
         (o, m, l)
     });
-    let lens = key_lens.then(|| k.param::<I32>("key_lens", ParamKind::In, cap));
+    let lens = key_lens.then(|| k.input::<I32>("key_lens", cap));
     let mask_stride = key_mask_stride(tk);
-    let masks = key_mask.then(|| k.param::<I32>("key_mask", ParamKind::In, cap * mask_stride));
-    let segs = seg_start.then(|| k.param::<I32>("seg_start", ParamKind::In, cap * t));
-    let row_map = cache.is_some_and(|c| c.row_map).then(|| k.param::<I32>("row_map", ParamKind::In, cap));
-    let head_start = cache.is_some().then(|| k.param::<I32>("head_start", ParamKind::In, 1));
+    let masks = key_mask.then(|| k.input::<I32>("key_mask", cap * mask_stride));
+    let segs = seg_start.then(|| k.input::<I32>("seg_start", cap * t));
+    let row_map = cache.is_some_and(|c| c.row_map).then(|| k.input::<I32>("row_map", cap));
+    let head_start = cache.is_some().then(|| k.input::<I32>("head_start", 1));
     let app = (appended > 0).then(|| {
-        let k_app = k.param::<T>("k_app", ParamKind::In, cap * appended * kv_heads * d);
-        let v_app = k.param::<T>("v_app", ParamKind::In, cap * appended * kv_heads * d);
+        let k_app = k.input::<T>("k_app", cap * appended * kv_heads * d);
+        let v_app = k.input::<T>("v_app", cap * appended * kv_heads * d);
         (k_app, v_app)
     });
-    let app_lens = cache.is_some_and(|c| c.app_lens).then(|| k.param::<I32>("app_lens", ParamKind::In, cap));
+    let app_lens = cache.is_some_and(|c| c.app_lens).then(|| k.input::<I32>("app_lens", cap));
     let keys = tk + appended;
     let bias_stride = key_mask_stride(keys);
     let bias = bias.map(|rows| {
         let n = if rows == Bias::Shared { 1 } else { cap };
-        (k.param::<T>("bias", ParamKind::In, n * heads * t * bias_stride), rows)
+        (k.input::<T>("bias", n * heads * t * bias_stride), rows)
     });
-    let (gz, bb) = batch.axis(&mut k);
+    let (gz, bb) = batch.axis(k);
     k.grid([Sc::from(t.div_ceil(bq) * splits), Sc::from(heads), gz]);
     let kw = cfg.key_warps;
-    if let Err(e) = cfg.shares_keys() {
-        panic!("{e}");
-    }
     k.warps(cfg.row_warps());
     k.lone_warps(cfg.warps());
-    let k_s = k.smem::<T>("k_s", kw * stages * bkv * d);
-    let v_s = k.smem::<T>("v_s", kw * stages * bkv * d);
+    let ring = Schedule::ring(stages, cfg.unroll());
+    let k_s = k.ring_runs::<T>("k_s", bkv * d, ring, kw);
+    let v_s = k.ring_runs::<T>("v_s", bkv * d, ring, kw);
     // The bias streams through a ring of its own beside K and V, unless the
     // forms read its tiles directly.
-    let bias_s = cfg.bias_ring(bias.is_some()).then(|| k.smem::<T>("bias_s", kw * stages * bq * bkv));
+    let bias_s = cfg.bias_ring(bias.is_some()).then(|| k.ring_runs::<T>("bias_s", bq * bkv, ring, kw));
 
     let (order, split, hh) = (k.block(0) / splits, k.block(0) % splits, k.block(1));
     // Where later queries see more keys (a causal mask, chunks with every
@@ -513,17 +539,8 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
     let (q_stride, kv_stride) = if packed { (slots * d, slots * d) } else { (o_stride, heads_total * d) };
     // The packed operand's keys follow its queries, its values its keys.
     let (k_first, v_first) = if packed { (heads, heads + kv_heads) } else { (0, 0) };
-    let rows = |k: &mut Kernel, p: ParamRef<T>, stride: usize| {
-        let v = k.view(
-            p,
-            batch_offset(&bb, t * stride) + hh.clone() * d,
-            [stride, 1],
-            Shape::new(bq, d),
-            [bound(t, bq), None],
-        );
-        k.at(v, q_off.clone(), 0)
-    };
-    let q_view = rows(&mut k, q, q_stride);
+    let rows = Rows { bb: bb.clone(), hh: hh.clone(), q_off: q_off.clone(), t, d, bq };
+    let q_view = rows.of(k, q, q_stride);
     let kv_row = match row_map {
         Some(map) => k.load_scalar(map, b.clone()),
         None => b.clone(),
@@ -533,8 +550,8 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
     let kv_base = kv_row * (tk * kv_stride) + (kv_head.clone() + head_start) * d;
     let kv_bound = keys_masked.then(|| len.clone());
     // A packed operand's keys follow its queries, its values its keys; an
-    // unpacked one's K and V start where they always did, with no offset to
-    // add (a `+ 0` the emitted program would carry).
+    // unpacked one's K and V start at their own parameters' origin, with no
+    // offset to add (a `+ 0` the emitted program would carry).
     let (k_base, v_base) = match (k_first, v_first) {
         (0, 0) => (kv_base.clone(), kv_base),
         (k_first, v_first) => (kv_base.clone() + k_first * d, kv_base + v_first * d),
@@ -601,7 +618,7 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
     let o0 = k.zeros::<F32>(Shape::new(bq, d));
     let scale_log2e = (scale * std::f32::consts::LOG2_E) as f64;
     // The key coordinates of a block's scores and the query rows'.
-    let coords = |k: &mut Kernel, block_start: Sc| {
+    let coords = |k: &mut Kernel<'k>, block_start: Sc<'k>| {
         let col = k.coord(shape, Axis::Col);
         let start = k.splat::<I32>(shape, block_start);
         let col = k.binary(col, start, BinaryOp::Add);
@@ -611,19 +628,19 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
     };
     // The bias tile of the key block at `col` read from global memory: the
     // appended block's, outside the ring.
-    let biased_at = |k: &mut Kernel, s: Regs<F32>, col: Sc| -> Regs<F32> {
+    let biased_at = |k: &mut Kernel<'k>, s: Regs<'k, F32>, col: Sc<'k>| -> Regs<'k, F32> {
         let Some(view) = bias_view else { return s };
         let tile = k.at(view, q_off.clone(), col);
         biased(k, s, tile)
     };
-    let hide = |k: &mut Kernel, keep: Regs<Bool>, plain: Regs<F32>| {
+    let hide = |k: &mut Kernel<'k>, keep: Regs<'k, Bool>, plain: Regs<'k, F32>| {
         let hidden = k.fill::<F32>(shape, Const::Float(f64::NEG_INFINITY));
         k.where_(keep, plain, hidden)
     };
-    let masked = |k: &mut Kernel, plain: Regs<F32>, block_start: Sc| {
+    let masked = |k: &mut Kernel<'k>, plain: Regs<'k, F32>, block_start: Sc<'k>| {
         let (col, row) = coords(k, block_start.clone());
-        let mut keep: Option<Regs<Bool>> = None;
-        let mut and = |k: &mut Kernel, cond| {
+        let mut keep: Option<Regs<'k, Bool>> = None;
+        let mut and = |k: &mut Kernel<'k>, cond| {
             keep = Some(match keep {
                 Some(keep) => k.binary(keep, cond, BinaryOp::And),
                 None => cond,
@@ -678,7 +695,7 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
         hide(k, keep.expect("a mask"), plain)
     };
     let edges = causal || keys_masked || window.is_some() || chunk.is_some() || seg.is_some();
-    let mask = |k: &mut Kernel, s: Regs<F32>, block_start: Sc| -> Regs<F32> {
+    let mask = |k: &mut Kernel<'k>, s: Regs<'k, F32>, block_start: Sc<'k>| -> Regs<'k, F32> {
         if key_mask {
             return masked(k, s, block_start);
         }
@@ -719,7 +736,7 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
     let bias_tile = bias_view.is_some().then_some(&biased_at as Mask);
     let st = Step { q_r, scale_log2e, shape, bias: bias_tile, mask: &mask, cfg };
     let app_views = app.map(|(k_app, v_app)| {
-        let app = |k: &mut Kernel, p: ParamRef<T>| {
+        let app = |k: &mut Kernel<'k>, p: ParamRef<'k, T, In>| {
             k.view(
                 p,
                 batch_offset(&bb, appended * kv_heads * d) + kv_head.clone() * d,
@@ -728,7 +745,7 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
                 [Some(Sc::from(appended)), None],
             )
         };
-        let (k_g, v_g) = (app(&mut k, k_app), app(&mut k, v_app));
+        let (k_g, v_g) = (app(k, k_app), app(k, v_app));
         let visible = match app_lens {
             Some(p) => k.load_scalar(p, b.clone()).min(appended),
             None => Sc::from(appended),
@@ -738,7 +755,7 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
     // One warp's share of the split's key blocks (`warp` is `None` for the
     // whole share), folded into `(m, l, o)`, the maximum in the exponent's
     // units at the end.
-    let run = |k: &mut Kernel, warp: Option<Sc>| -> [Regs<F32>; 3] {
+    let run = |k: &mut Kernel<'k>, warp: Option<Sc<'k>>| -> [Regs<'k, F32>; 3] {
         let (w_first, w_blocks, slot0, owner) = match &warp {
             Some(w) => (
                 s_first.clone() + blocks.clone() * w.clone() / kw,
@@ -750,28 +767,28 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
         };
         let [m, l, acc] = k.pipeline(
             w_blocks,
-            Ring { stages, unroll: cfg.unroll, crews: 1 },
+            k_s,
             [m0, l0, o0],
             |k, step, slot| {
-                let (kv_off, slot) = ((w_first.clone() + step) * bkv, slot0.clone() + slot);
+                let (kv_off, slot) = ((w_first.clone() + step) * bkv, slot.past(slot0.clone()));
                 let k_g = k.at(k_view, kv_off.clone(), 0);
                 let v_g = k.at(v_view, kv_off.clone(), 0);
-                let k_t = k.smem_slot::<T>(k_s, slot.clone(), Shape::new(bkv, d));
-                let v_t = k.smem_slot::<T>(v_s, slot.clone(), Shape::new(bkv, d));
+                let k_t = k.slot(k_s, &slot, Shape::new(bkv, d));
+                let v_t = k.slot(v_s, &slot, Shape::new(bkv, d));
                 k.stage(k_t, k_g, CopyMode::Async);
                 k.stage(v_t, v_g, CopyMode::Async);
                 if let (Some(view), Some(ring)) = (bias_view, bias_s) {
                     let b_g = k.at(view, q_off.clone(), kv_off);
-                    let b_t = k.smem_slot::<T>(ring, slot, shape);
+                    let b_t = k.slot(ring, &slot, shape);
                     k.stage(b_t, b_g, CopyMode::Async);
                 }
             },
             |k, step_, slot, carried| {
-                let slot = slot0.clone() + slot;
-                let k_t = k.smem_slot::<T>(k_s, slot.clone(), Shape::new(bkv, d));
-                let v_t = k.smem_slot::<T>(v_s, slot.clone(), Shape::new(bkv, d));
-                let b_t = bias_s.map(|ring| k.smem_slot::<T>(ring, slot, shape));
-                let from_ring = |k: &mut Kernel, s, _| biased(k, s, b_t.expect("a bias ring"));
+                let slot = slot.past(slot0.clone());
+                let k_t = k.slot(k_s, &slot, Shape::new(bkv, d));
+                let v_t = k.slot(v_s, &slot, Shape::new(bkv, d));
+                let b_t = bias_s.map(|ring| k.slot(ring, &slot, shape));
+                let from_ring = |k: &mut Kernel<'k>, s, _| biased(k, s, b_t.expect("a bias ring"));
                 let st = if b_t.is_some() { Step { bias: Some(&from_ring as Mask), ..st } } else { st };
                 step(k, &st, k_t, v_t, (w_first.clone() + step_) * bkv, carried)
             },
@@ -781,8 +798,8 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
         // as they were, and a branch would cost more than the step.
         let [m, l, acc] = match &app_views {
             Some((k_g, v_g, visible)) => {
-                let app_bias = |k: &mut Kernel, s: Regs<F32>, _: Sc| biased_at(k, s, Sc::from(tk));
-                let rows = |k: &mut Kernel, s: Regs<F32>, _: Sc| {
+                let app_bias = |k: &mut Kernel<'k>, s: Regs<'k, F32>, _: Sc<'k>| biased_at(k, s, Sc::from(tk));
+                let rows = |k: &mut Kernel<'k>, s: Regs<'k, F32>, _: Sc<'k>| {
                     let col = k.coord(shape, Axis::Col);
                     let visible = k.splat::<I32>(shape, visible.clone());
                     let seen = k.compare(col, visible, CmpOp::Lt);
@@ -800,24 +817,27 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
         };
         let m = if st.raw_max() {
             let row_scale = k.fill::<F32>(Shape::new(bq, 1), Const::Float(scale_log2e));
-            k.binary(m, row_scale, BinaryOp::Mul)
+            k.binary(*m, row_scale, BinaryOp::Mul)
         } else {
-            m
+            *m
         };
-        [m, l, acc]
+        [m, *l, *acc]
     };
     let [m, l, acc] = match kw {
-        1 => run(&mut k, None),
+        1 => run(k, None),
         // Every warp leaves its state over its own ring slots, dead once its
         // pipeline ends, as f32 views of the 16-bit rings: the output over
         // its key slots, the maximum and sum over its value slots; the block
         // then folds the regions as the split merge does.
         _ => {
             let region = stages * bkv * d * T::DTYPE.bytes() / F32::DTYPE.bytes();
-            let views = |k: &mut Kernel, at: Sc| {
-                let o = k.smem_view_as::<F32>(k_s, at.clone() * region, Shape::new(WARP_ROWS, d));
-                let m = k.smem_view_as::<F32>(v_s, at.clone() * region, Shape::new(WARP_ROWS, 1));
-                let l = k.smem_view_as::<F32>(v_s, at * region + WARP_ROWS, Shape::new(WARP_ROWS, 1));
+            // SAFETY: a warp's region is its own run of slots, and both uses
+            // come after that warp's pipeline: the warp's own stores once its
+            // pipeline ends, the block's loads after every warp's.
+            let views = |k: &mut Kernel<'k>, at: Sc<'k>| unsafe {
+                let o = k.ring_scratch::<F32>(k_s, at.clone() * region, Shape::new(WARP_ROWS, d));
+                let m = k.ring_scratch::<F32>(v_s, at.clone() * region, Shape::new(WARP_ROWS, 1));
+                let l = k.ring_scratch::<F32>(v_s, at * region + WARP_ROWS, Shape::new(WARP_ROWS, 1));
                 (o, m, l)
             };
             k.each_warp(|k| {
@@ -828,21 +848,21 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
                 k.store(m_v, m);
                 k.store(l_v, l);
             });
-            let parts: Vec<State> = (0..kw)
+            let parts: Vec<State<'k>> = (0..kw)
                 .map(|w| {
-                    let (o_v, m_v, l_v) = views(&mut k, Sc::from(w));
+                    let (o_v, m_v, l_v) = views(k, Sc::from(w));
                     State { m: k.load(m_v), l: k.load(l_v), o: k.load(o_v) }
                 })
                 .collect();
-            let State { m, l, o } = merged(&mut k, &parts);
+            let State { m, l, o } = merged(k, &parts);
             [m, l, o]
         }
     };
     match (o, parts) {
         (Some(o), _) => {
-            let out = normalized(&mut k, acc, l, bq);
+            let out = normalized(k, acc, l, bq);
             let out = k.cast::<F32, T>(out);
-            let o_view = rows(&mut k, o, o_stride);
+            let o_view = rows.of(k, o, o_stride);
             k.store(o_view, out);
         }
         (None, Some((o_part, m_part, l_part))) => {
@@ -870,7 +890,6 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
         }
         (None, None) => unreachable!("an output"),
     }
-    k.finish()
 }
 
 /// `[splits, batch, t, heads]` rows of partial results merged into
@@ -887,15 +906,15 @@ pub struct CombineSpec {
 
 /// A partial online-softmax state: the maximum in the exponent's units, the
 /// sum and the output accumulator over some of the keys.
-struct State {
-    m: Regs<F32>,
-    l: Regs<F32>,
-    o: Regs<F32>,
+struct State<'k> {
+    m: Regs<'k, F32>,
+    l: Regs<'k, F32>,
+    o: Regs<'k, F32>,
 }
 
 /// The state over every part's keys: each part rescaled to the largest
 /// maximum and summed.
-fn merged(k: &mut Kernel, parts: &[State]) -> State {
+fn merged<'k>(k: &mut Kernel<'k>, parts: &[State<'k>]) -> State<'k> {
     let mut m = parts[0].m;
     for part in &parts[1..] {
         m = k.binary(m, part.m, BinaryOp::Max);
@@ -921,7 +940,7 @@ fn merged(k: &mut Kernel, parts: &[State]) -> State {
 /// `acc / l` row by row, where a row no key reached (its sum `l` is zero,
 /// and so is its accumulator) comes out as zeros, as the graph writes it,
 /// rather than as the NaN of a division by zero.
-fn normalized(k: &mut Kernel, acc: Regs<F32>, l: Regs<F32>, rows: usize) -> Regs<F32> {
+fn normalized<'k>(k: &mut Kernel<'k>, acc: Regs<'k, F32>, l: Regs<'k, F32>, rows: usize) -> Regs<'k, F32> {
     let zero = k.zeros::<F32>(Shape::new(rows, 1));
     let one = k.fill::<F32>(Shape::new(rows, 1), Const::Float(1.0));
     let empty = k.compare(l, zero, CmpOp::Eq);
@@ -932,31 +951,53 @@ fn normalized(k: &mut Kernel, acc: Regs<F32>, l: Regs<F32>, rows: usize) -> Regs
 /// Parameters in order: `o_part`, `m_part`, `l_part` (f32, as the
 /// attention kernel writes them), `o`.
 pub fn combine<T: Elem>(spec: &CombineSpec) -> Program {
+    Kernel::record("combine_splits", |k| combine_body::<T>(k, spec))
+}
+
+fn combine_body<'k, T: Elem>(k: &mut Kernel<'k>, spec: &CombineSpec) {
     let CombineSpec { ref batch, t, heads, d, splits, cfg: NormCfg { br } } = *spec;
     let (cap, rows) = (batch.capacity(), t * heads);
-    let mut k = Kernel::new("combine_splits");
-    let o_part = k.param::<F32>("o_part", ParamKind::In, splits * cap * rows * d);
-    let m_part = k.param::<F32>("m_part", ParamKind::In, splits * cap * rows);
-    let l_part = k.param::<F32>("l_part", ParamKind::In, splits * cap * rows);
-    let o = k.param::<T>("o", ParamKind::Out, cap * rows * d);
-    let (gz, bb) = batch.axis(&mut k);
+    let o_part = k.input::<F32>("o_part", splits * cap * rows * d);
+    let m_part = k.input::<F32>("m_part", splits * cap * rows);
+    let l_part = k.input::<F32>("l_part", splits * cap * rows);
+    let o = k.output::<T>("o", cap * rows * d);
+    let (gz, bb) = batch.axis(k);
     k.grid([Sc::from(rows.div_ceil(br)), Sc::from(1), gz]);
     k.warps(br as u32);
     let row0 = k.block(0) * br;
-    let part = |k: &mut Kernel, p: ParamRef<F32>, split: usize, width: usize| {
+    let part = |k: &mut Kernel<'k>, p: ParamRef<'k, F32, In>, split: usize, width: usize| {
         let base = Sc::from(split * cap * rows * width) + batch_offset(&bb, rows * width);
         let view = k.view(p, base, [width, 1], Shape::new(br, width), [bound(rows, br), None]);
         let tile = k.at(view, row0.clone(), 0);
         k.load(tile)
     };
-    let parts: Vec<State> = (0..splits)
-        .map(|s| State { m: part(&mut k, m_part, s, 1), l: part(&mut k, l_part, s, 1), o: part(&mut k, o_part, s, d) })
+    let parts: Vec<State<'k>> = (0..splits)
+        .map(|s| State { m: part(k, m_part, s, 1), l: part(k, l_part, s, 1), o: part(k, o_part, s, d) })
         .collect();
-    let State { l, o: acc, .. } = merged(&mut k, &parts);
-    let out = normalized(&mut k, acc, l, br);
+    let State { l, o: acc, .. } = merged(k, &parts);
+    let out = normalized(k, acc, l, br);
     let out = k.cast::<F32, T>(out);
     let view = k.view(o, batch_offset(&bb, rows * d), [d, 1], Shape::new(br, d), [bound(rows, br), None]);
     let view = k.at(view, row0, 0);
     k.store(view, out);
-    k.finish()
+}
+
+/// The block's `[bq, d]` query rows of head `hh` in a `[batch·t, stride]`
+/// parameter, read or written.
+struct Rows<'k> {
+    bb: Option<Sc<'k>>,
+    hh: Sc<'k>,
+    q_off: Sc<'k>,
+    t: usize,
+    d: usize,
+    bq: usize,
+}
+
+impl<'k> Rows<'k> {
+    fn of<T: Elem, A: Access>(&self, k: &mut Kernel<'k>, p: ParamRef<'k, T, A>, stride: usize) -> Gmem<'k, T, A> {
+        let Rows { bb, hh, q_off, t, d, bq } = self;
+        let offset = batch_offset(bb, t * stride) + hh.clone() * *d;
+        let v = k.view(p, offset, [stride, 1], Shape::new(*bq, *d), [bound(*t, *bq), None]);
+        k.at(v, q_off.clone(), 0)
+    }
 }

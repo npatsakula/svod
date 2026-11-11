@@ -132,7 +132,10 @@ fn walk(prog: &Program, block: Block, mut state: State, scope: Scope, divergent:
             }
             Stmt::Sync(sync) => {
                 match sync {
-                    Sync::Barrier { .. } => state.fenced(),
+                    Sync::Barrier { scope: on } => {
+                        ensure!(!divergent || on == Scope::Warp, DivergentBarrierSnafu { what: "a barrier" });
+                        state.fenced();
+                    }
                     Sync::Fence | Sync::WaitProducts { .. } | Sync::Prio { .. } => {}
                     Sync::CommitAsync | Sync::WaitAsync { .. } => {
                         unreachable!("async groups are the templates' and this pass's own")

@@ -238,7 +238,7 @@ fn managed_host_views_wait_the_producer() {
     assert_eq!(out.as_slice::<f32>().unwrap(), &doubled(&input)[..]);
     assert!(token.retired());
     // The host write side: a view write waits readers too.
-    source.as_host_bytes_mut().unwrap()[..4].copy_from_slice(&0f32.to_le_bytes());
+    source.host_write_bytes().unwrap().copy_at(0, &0f32.to_le_bytes()).unwrap();
 }
 
 /// A recycled LRU allocation fences on the previous owner's producers.

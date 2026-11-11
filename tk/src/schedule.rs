@@ -19,14 +19,16 @@ const RAISED: u8 = 3;
 /// in flight over the next trip's fill: the ring refills the slot consumed
 /// two trips ago, and the template waits for all but the youngest chain
 /// after every consume that places no wait of its own, and for every chain
-/// after the loop ([`Sync::WaitProducts`]).
-pub fn expand(prog: &mut Program, fill: Fill, core: Core) {
-    let body = std::mem::take(&mut prog.body);
-    prog.body = Expander { prog, fill, core, scope: Scope::Block }.block(body);
+/// after the loop ([`Sync::WaitProducts`]). The result's phase has no
+/// pipeline statement.
+pub fn expand(prog: Program, fill: Fill, core: Core) -> Program<Expanded> {
+    let (mut out, body) = prog.rephase(|_, ()| (), ());
+    out.body = Expander { prog: &mut out, fill, core, scope: Scope::Block }.block(body);
+    out
 }
 
 struct Expander<'p> {
-    prog: &'p mut Program,
+    prog: &'p mut Program<Expanded>,
     fill: Fill,
     core: Core,
     /// Whose barriers a pipeline's template emits: the block's, or one
@@ -54,37 +56,36 @@ impl Expander<'_> {
         self.prog.scalars[id.index()] = s;
     }
 
-    fn block(&mut self, block: Block) -> Block {
+    fn block(&mut self, block: Block) -> Block<Expanded> {
         Block(block.0.into_iter().flat_map(|s| self.stmt(s)).collect())
     }
 
-    fn stmt(&mut self, stmt: Stmt) -> Vec<Stmt> {
-        match stmt {
-            Stmt::Pipeline(p) => self.pipeline(p),
-            mut nested => {
-                let scope = if matches!(nested, Stmt::Warps { .. }) { Scope::Warp } else { self.scope };
-                let outer = std::mem::replace(&mut self.scope, scope);
-                for b in nested.blocks_mut() {
-                    *b = self.block(std::mem::take(b));
-                }
-                self.scope = outer;
-                vec![nested]
-            }
+    /// The statement with its nested blocks expanded; a pipeline becomes
+    /// its template's statements.
+    fn stmt(&mut self, stmt: Stmt) -> Vec<Stmt<Expanded>> {
+        let scope = if matches!(stmt, Stmt::Warps { .. }) { Scope::Warp } else { self.scope };
+        let outer = std::mem::replace(&mut self.scope, scope);
+        let mapped = stmt.map(&mut |b| self.block(b), &mut |_, op| op.map(|orient| orient, |()| ()));
+        self.scope = outer;
+        match mapped {
+            Ok(stmt) => vec![stmt],
+            Err(p) => self.pipeline(p),
         }
     }
 
-    fn barrier(&self) -> Stmt {
+    fn barrier(&self) -> Stmt<Expanded> {
         Stmt::Sync(Sync::Barrier { scope: self.scope })
     }
 
-    fn pipeline(&mut self, p: Pipeline) -> Vec<Stmt> {
-        let Pipeline { extent, stages, unroll, crews, carried, produce, consume } = p;
-        let produce = Stage { body: self.block(produce.body), ..produce };
-        let consume = Stage { body: self.block(consume.body), ..consume };
-        if crews == 2 {
-            let crew = self.prog.warps / crews;
-            return self.ping_pong(extent, stages, carried, produce, consume, crew);
-        }
+    fn pipeline(&mut self, p: Pipeline) -> Vec<Stmt<Expanded>> {
+        let Pipeline { extent, schedule, carried, produce, consume } = p;
+        let produce = Stage { step: produce.step, slot: produce.slot, body: self.block(produce.body) };
+        let consume = Stage { step: consume.step, slot: consume.slot, body: self.block(consume.body) };
+        let Schedule::Ring { depth, unroll } = schedule else {
+            let crew = self.prog.warps / schedule.crews();
+            return self.ping_pong(extent, carried, produce, consume, crew);
+        };
+        let stages = depth.get();
         let in_flight = self.core == Core::Group && chains_only(&consume.body);
         let mut out = match self.fill {
             Fill::CpAsync if stages >= 3 && in_flight => {
@@ -104,7 +105,7 @@ impl Expander<'_> {
         out
     }
 
-    fn if_(pred: ScalarId, then: Vec<Stmt>) -> Stmt {
+    fn if_(pred: ScalarId, then: Vec<Stmt<Expanded>>) -> Stmt<Expanded> {
         Stmt::If { pred, then: Block(then), otherwise: Block::default(), results: vec![] }
     }
 
@@ -117,9 +118,9 @@ impl Expander<'_> {
         extent: ScalarId,
         stages: usize,
         carried: Vec<Carried>,
-        produce: Stage,
-        consume: Stage,
-    ) -> Vec<Stmt> {
+        produce: Stage<Expanded>,
+        consume: Stage<Expanded>,
+    ) -> Vec<Stmt<Expanded>> {
         let iv = self.scalar(Scalar::Induction);
         let ahead = self.c(stages as i64 - 1);
         let total = self.bin(BinOp::Add, extent, ahead);
@@ -154,9 +155,9 @@ impl Expander<'_> {
         extent: ScalarId,
         stages: usize,
         carried: Vec<Carried>,
-        produce: Stage,
-        consume: Stage,
-    ) -> Vec<Stmt> {
+        produce: Stage<Expanded>,
+        consume: Stage<Expanded>,
+    ) -> Vec<Stmt<Expanded>> {
         assert!(stages >= 3, "a chain in flight takes a slot of its own");
         let iv = self.scalar(Scalar::Induction);
         let one = self.c(1);
@@ -194,7 +195,13 @@ impl Expander<'_> {
     }
 
     /// One slot: copy, wait, consume, and fence before the slot is refilled.
-    fn single_stage(&mut self, extent: ScalarId, carried: Vec<Carried>, produce: Stage, consume: Stage) -> Vec<Stmt> {
+    fn single_stage(
+        &mut self,
+        extent: ScalarId,
+        carried: Vec<Carried>,
+        produce: Stage<Expanded>,
+        consume: Stage<Expanded>,
+    ) -> Vec<Stmt<Expanded>> {
         let iv = self.scalar(Scalar::Induction);
         let zero = self.c(0);
         for stage in [&produce, &consume] {
@@ -212,7 +219,7 @@ impl Expander<'_> {
     /// Every global→shared copy of a produce body split into its load half
     /// (into fresh staging registers) and its store half; what is not such a
     /// copy stays with the loads.
-    fn staged_halves(&mut self, body: Block) -> (Vec<Stmt>, Vec<Stmt>) {
+    fn staged_halves(&mut self, body: Block<Expanded>) -> (Vec<Stmt<Expanded>>, Vec<Stmt<Expanded>>) {
         let (mut issue, mut commit) = (vec![], vec![]);
         for stmt in body.0 {
             match stmt {
@@ -249,13 +256,11 @@ impl Expander<'_> {
     fn ping_pong(
         &mut self,
         extent: ScalarId,
-        stages: usize,
         carried: Vec<Carried>,
-        produce: Stage,
-        consume: Stage,
+        produce: Stage<Expanded>,
+        consume: Stage<Expanded>,
         crew: u32,
-    ) -> Vec<Stmt> {
-        assert_eq!(stages, 1, "ping-pong runs over one slot");
+    ) -> Vec<Stmt<Expanded>> {
         let iv = self.scalar(Scalar::Induction);
         let (zero, one, before) = (self.c(0), self.c(1), self.c(-1));
         let nonempty = self.bin(BinOp::Lt, zero, extent);
@@ -267,9 +272,9 @@ impl Expander<'_> {
         self.define(consume.slot, Scalar::Const(0));
         let (issue, commit) = self.staged_halves(produce.body);
         let barrier = self.barrier();
-        let head: Vec<Stmt> = issue.iter().chain(&commit).cloned().chain([barrier.clone()]).collect();
+        let head: Vec<Stmt<Expanded>> = issue.iter().chain(&commit).cloned().chain([barrier.clone()]).collect();
         // The clusters: the loads before each product, and the product.
-        let (mut loads, mut products): (Vec<Vec<Stmt>>, Vec<Stmt>) = (vec![vec![]], vec![]);
+        let (mut loads, mut products): (Vec<Vec<Stmt<Expanded>>>, Vec<Stmt<Expanded>>) = (vec![vec![]], vec![]);
         for stmt in consume.body.0 {
             if matches!(stmt, Stmt::Let { op: TileOp::Mma { .. }, .. }) {
                 products.push(stmt);
@@ -297,9 +302,9 @@ impl Expander<'_> {
             })
             .collect();
         let spread = sources.len().saturating_sub(1).max(1);
-        let mut commit: Vec<(usize, Stmt)> = groups.iter().flatten().copied().zip(commit).collect();
+        let mut commit: Vec<(usize, Stmt<Expanded>)> = groups.iter().flatten().copied().zip(commit).collect();
         commit.sort_by_key(|&(g, _)| g);
-        let mut front: Vec<Vec<Stmt>> = vec![vec![]; s];
+        let mut front: Vec<Vec<Stmt<Expanded>>> = vec![vec![]; s];
         for (stmt, g) in issue.into_iter().zip(groups) {
             front[g.unwrap_or(0) * (s - 2) / spread].push(stmt);
         }
@@ -322,7 +327,7 @@ impl Expander<'_> {
         let crew = self.c(i64::from(crew));
         let first = self.bin(BinOp::Lt, warp, crew);
         let second = self.bin(BinOp::Eq, first, zero);
-        let trips = |start, extent, carried, body: Vec<Stmt>| {
+        let trips = |start, extent, carried, body: Vec<Stmt<Expanded>>| {
             Stmt::Loop(Loop { iv, start, extent, carried, body: Block(body), unroll: 1 })
         };
         vec![
@@ -349,10 +354,10 @@ impl Expander<'_> {
         extent: ScalarId,
         stages: usize,
         carried: Vec<Carried>,
-        produce: Stage,
-        consume: Stage,
-    ) -> Vec<Stmt> {
-        assert!(matches!(stages, 1 | 2), "register staging runs one step ahead over one or two slots");
+        produce: Stage<Expanded>,
+        consume: Stage<Expanded>,
+    ) -> Vec<Stmt<Expanded>> {
+        assert!(matches!(stages, 1 | 2), "register staging runs one step ahead over one or two slots (`Fill::ring`)");
         let iv = self.scalar(Scalar::Induction);
         let one = self.c(1);
         let two = self.c(2);
@@ -367,14 +372,14 @@ impl Expander<'_> {
         self.define(consume.slot, slot(consume.step));
         let (issue, commit) = self.staged_halves(produce.body);
         let barrier = self.barrier();
-        let head: Vec<Stmt> = issue.iter().chain(&commit).cloned().chain([barrier.clone()]).collect();
+        let head: Vec<Stmt<Expanded>> = issue.iter().chain(&commit).cloned().chain([barrier.clone()]).collect();
         let before = if stages == 1 { barrier.clone() } else { Stmt::Sync(Sync::Fence) };
         let fenced = [before].into_iter().chain(commit).chain([barrier]);
         let issued = issue.into_iter().chain([Stmt::Sync(Sync::Fence)]);
-        let body: Vec<Stmt> = issued.chain(consume.body.0.iter().cloned()).chain(fenced).collect();
+        let body: Vec<Stmt<Expanded>> = issued.chain(consume.body.0.iter().cloned()).chain(fenced).collect();
         // The drain's carried registers hold what the steady loop left.
         let drained: Vec<Carried> = carried.iter().map(|c| Carried { init: c.phi, ..*c }).collect();
-        let trips = |start, extent, carried, body: Vec<Stmt>, unroll| {
+        let trips = |start, extent, carried, body: Vec<Stmt<Expanded>>, unroll| {
             Stmt::Loop(Loop { iv, start, extent, carried, body: Block(body), unroll })
         };
         vec![
@@ -388,7 +393,7 @@ impl Expander<'_> {
 /// Whether every product `consume` issues feeds only later products'
 /// accumulators (or leaves the consume as a carried value): nothing in the
 /// consume waits on one.
-fn chains_only(consume: &Block) -> bool {
+fn chains_only(consume: &Block<Expanded>) -> bool {
     let mut products = vec![];
     for (_, stmt) in consume.walk() {
         match stmt {

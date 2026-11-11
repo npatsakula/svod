@@ -1,11 +1,11 @@
 //! The rank harness: a tune store replayed offline, correlating the order
 //! the model predicts a shape's timed candidates with the ns the device
-//! measured for them. The instrument that gates every later model change
-//! (the config rework's §7.1): a store's `choice|` line holds every timed
+//! measured for them. The instrument that gates every model change: a
+//! store's `choice|` line holds every timed
 //! candidate of a shape, fastest first, each with its config's own code
 //! beside its index — replay prices the line's own candidates, so a store
-//! reads whatever ranking code wrote it and whatever ranks since (a model
-//! change no longer orphans a measurement). The digest in the line's key
+//! reads whatever ranking code wrote it and whatever ranks after it (a
+//! model change orphans no measurement). The digest in the line's key
 //! stays the consistency check: where the ranking code at hand re-derives
 //! the very list a line timed, the line counts as derived; the rest replay
 //! from their codes under the problem of the hypothesis whose ranking
@@ -20,18 +20,19 @@
 //! screened, and the leading tiles' pipelines timed again; a stage's lookup
 //! missing (a wrong salt) hands the shape to the next hypothesis.
 
+use crate::sweep::assumed;
 use std::collections::HashMap;
 use std::hash::Hasher;
 use std::path::Path;
 
 use svod_dtype::{AmdArch, CudaArch, GpuArch, ScalarDType};
 
-use crate::atoms::{CARDS, Target};
+use crate::atoms::{CARDS, Core, Target};
 use crate::ir::Var;
 use crate::kernels::attention::{AttnMask, Bias, FaCfg};
 use crate::kernels::conv::{ConvCfg, ConvGeom};
 use crate::kernels::gemm::{Epilogue, GemmCfg};
-use crate::kernels::nearest::{Floors, Live, Metric, NearestCfg, NearestSpec};
+use crate::kernels::nearest::{Floors, Live, Metric, NearestCfg, NearestSpec, Way};
 use crate::kernels::{Act, Batch};
 use crate::ops::DEVICE_TEST;
 use crate::ops::attention::split_ranked;
@@ -257,7 +258,7 @@ impl Configs {
             Self::Gemm { problem, list } => of(problem, &list[at]),
             Self::Attention { problem, list } => problem.admit(planner, &list[at]).ok().map(|(ns, _)| ns),
             Self::Nearest { problem, list } => problem.admit(planner, &list[at]).ok().map(|(ns, _)| ns),
-            Self::Conv { problem, list } => problem.claim(planner, &list[at].gemm).ok().map(|c| planner.price(&c)),
+            Self::Conv { problem, list } => planner.claim_of(problem, &list[at].gemm).ok().map(|c| planner.price(&c)),
         }
     }
 }
@@ -411,6 +412,7 @@ pub fn explained(device: &Device, family: &str, factor: f64) -> Vec<(&'static st
             };
             match field {
                 "step" => costs.step *= factor,
+                "step_wide" => costs.step_wide *= factor,
                 "step_i8" => costs.step_i8 *= factor,
                 "score" => costs.score *= factor,
                 "smem_byte" => costs.smem_byte *= factor,
@@ -442,8 +444,8 @@ pub fn explained(device: &Device, family: &str, factor: f64) -> Vec<(&'static st
 /// the multiplier that orders the rest best read off a geometric grid
 /// around the prior, and the held-out line predicted under it and under the
 /// prior (the multiplier 1). The fit is accepted only where the mean
-/// held-out ρ beats the prior's; enabling it anywhere is the design's
-/// phase F, so this computes and reports, never plans.
+/// held-out ρ beats the prior's. Nothing plans with it: this computes and
+/// reports.
 pub struct Fitted {
     pub family: &'static str,
     /// The multiplier each held-out fold fitted, in its line's order.
@@ -453,8 +455,8 @@ pub struct Fitted {
     pub held_out: Option<f64>,
     pub prior: Option<f64>,
     /// The multiplier that orders every line best, the one a store would
-    /// keep (regularized: the grid point nearest 1 among those within a
-    /// hundredth of the best ρ).
+    /// keep (regularized: the grid point nearest 1 among those within five
+    /// hundredths of the best ρ).
     pub overall: f64,
 }
 
@@ -787,25 +789,29 @@ fn stored<C: Tiled>(
 fn gemm(lines: &mut Lines, planner: &Planner, op: &'static str, dtype: ScalarDType, shape: &[usize]) -> Vec<Replay> {
     let [cap, m, n, k] = shape[..] else { return vec![] };
     let batches = |bound: bool| if bound { cap.max(1) } else { 1 };
-    let salts: Vec<(String, bool, bool)> = match op {
+    // The device tests' and probes' salt keeps no epilogue: theirs are plain.
+    let salts: Vec<(String, Epilogue, bool)> = match op {
         "gemm" => [false, true]
             .into_iter()
-            .flat_map(|gated| [false, true].map(move |bound| (format!("{DEVICE_TEST:?}"), gated, bound)))
+            .flat_map(|gated| {
+                let epi = Epilogue { gated, ..Epilogue::DEFAULT };
+                [false, true].map(move |bound| (format!("{DEVICE_TEST:?}"), epi, bound))
+            })
             .collect(),
         _ => batches_of(cap)
             .into_iter()
             .flat_map(|batch| {
                 let bound = matches!(batch, Batch::Var(_));
-                epilogues().into_iter().map(move |epi| (format!("{:?}", (&batch, epi)), epi.gated, bound))
+                epilogues().into_iter().map(move |epi| (format!("{:?}", (&batch, epi)), epi, bound))
             })
             .collect(),
     };
     let mut out = vec![];
     let mut problems: Vec<GemmProblem> = vec![];
-    for (salt, gated, bound) in salts {
+    for (salt, epi, bound) in salts {
         let keying = Keying::new(op, planner, dtype, shape, salt);
-        let p = GemmProblem { batches: batches(bound), m, n, k, halves: if gated { 2 } else { 1 }, rope: None };
-        let ranked = planner.gemm_ranked(p.batches, m, n, k, gated);
+        let p = GemmProblem::new(batches(bound), m, n, k, &epi);
+        let ranked = planner.gemm_ranked(p.batches, m, n, k, &epi);
         let configs = |list: Vec<GemmCfg>| Configs::Gemm { problem: p, list };
         out.extend(stages(lines, &keying, &ranked, <[_]>::to_vec, configs).into_iter().flatten());
         if !problems.contains(&p) {
@@ -946,17 +952,7 @@ fn nearest(lines: &mut Lines, planner: &Planner, dtype: ScalarDType, shape: &[us
         ] {
             for groups in [false, true] {
                 for live in &lives {
-                    let spec = NearestSpec {
-                        n,
-                        m,
-                        d,
-                        metric,
-                        floors,
-                        groups,
-                        k,
-                        cfg: NearestCfg::new(64, 64, 2),
-                        live: live.clone(),
-                    };
+                    let spec = NearestSpec { n, m, d, dtype, metric, floors, groups, k, live: live.clone() };
                     // The op layer's own salt, and the tuning probe's (a
                     // fresh store's cold tunes of these very shapes).
                     let salts =
@@ -992,24 +988,30 @@ fn nearest(lines: &mut Lines, planner: &Planner, dtype: ScalarDType, shape: &[us
 /// (the device tests' probes key its channel counts and side instead), the
 /// candidates the splits a starved grid breaks into.
 fn conv(lines: &mut Lines, planner: &Planner, dtype: ScalarDType, shape: &[usize]) -> Vec<Replay> {
-    let geoms: Vec<(ConvGeom, usize, String)> = match shape[..] {
+    // The device tests' salt keeps no epilogue: theirs run a SiLU over the
+    // bias (the graph check adds a residual's two operations).
+    let geoms: Vec<(ConvGeom, usize, Epilogue, String)> = match shape[..] {
         [cin, cout, h, w, stride] => {
             let g =
                 ConvGeom { h, w, cin, cout, kernel: [3, 3], stride: [stride, stride], pad: [1, 1], dilation: [1, 1] };
-            vec![(g, 1, format!("{DEVICE_TEST:?}"))]
+            let silu_bias = Epilogue { bias: true, act: Act::Silu, ..Epilogue::DEFAULT };
+            vec![(g, 1, silu_bias, format!("{DEVICE_TEST:?}"))]
         }
         [images, h, w, cin, cout, k0, k1, s0, s1, p0, p1, d0, d1] => {
             let g = ConvGeom { h, w, cin, cout, kernel: [k0, k1], stride: [s0, s1], pad: [p0, p1], dilation: [d0, d1] };
             batches_of(images)
                 .into_iter()
-                .flat_map(|batch| epilogues().into_iter().map(move |epi| (g, images, format!("{:?}", (&batch, epi)))))
+                .flat_map(|batch| {
+                    let plain = epilogues().into_iter().filter(|e| !e.gated);
+                    plain.map(move |epi| (g, images, epi, format!("{:?}", (&batch, epi))))
+                })
                 .collect()
         }
         _ => return vec![],
     };
     let mut out = vec![];
     let mut problems: Vec<ConvProblem> = vec![];
-    for (g, images, salt) in geoms {
+    for (g, images, epi, salt) in geoms {
         let [ho, wo] = g.out_hw();
         for bound in [false, true] {
             let salt = salt.clone();
@@ -1017,9 +1019,8 @@ fn conv(lines: &mut Lines, planner: &Planner, dtype: ScalarDType, shape: &[usize
                 false => (1, images * ho * wo),
                 true => (images, ho * wo),
             };
-            let ranked = planner.conv_ranked(batches, m, &g);
-            let p =
-                ConvProblem { gemm: GemmProblem { batches, m, n: g.cout, k: g.k(), halves: 1, rope: None }, geom: g };
+            let ranked = planner.conv_ranked(batches, m, &g, &epi);
+            let p = ConvProblem::new(batches, m, &g, &epi);
             if !problems.contains(&p) {
                 problems.push(p);
             }
@@ -1038,7 +1039,7 @@ fn conv(lines: &mut Lines, planner: &Planner, dtype: ScalarDType, shape: &[usize
         lines,
         &group,
         count,
-        |h: usize, c: &ConvCfg| problems[h].claim(planner, &c.gemm).is_ok(),
+        |h: usize, c: &ConvCfg| planner.claim_of(&problems[h], &c.gemm).is_ok(),
         |h, list| Configs::Conv { problem: problems[h], list },
     ));
     out
@@ -1059,7 +1060,21 @@ pub struct Counted {
     pub steps: usize,
     /// VALU operations (arithmetic, logic, casts).
     pub valu: usize,
+    /// The VALU operations past the last matrix instruction: a GEMM's
+    /// epilogue.
+    pub epilogue: usize,
     /// The bytes of global memory the program's loads move.
+    pub fill: usize,
+    /// What the first innermost loop holding a product does: a staged ring
+    /// peels its first and last trips into loops of their own, so the steady
+    /// trip is the one loop that both loads and multiplies.
+    pub trip: Trip,
+}
+
+/// One loop's matrix instructions and the global bytes it loads.
+#[derive(Clone, Copy, Default)]
+pub struct Trip {
+    pub steps: usize,
     pub fill: usize,
 }
 
@@ -1117,28 +1132,50 @@ pub fn counted(program: &svod_ir::UOp) -> Option<Counted> {
         },
         _ => 1,
     };
-    let mut out = Counted { instructions: list.len(), smem, steps: 0, valu: 0, fill: 0 };
+    let mut out =
+        Counted { instructions: list.len(), smem, steps: 0, valu: 0, epilogue: 0, fill: 0, trip: Trip::default() };
     // The loops the statement at hand sits in: the bytes a trip moves are
     // what a loop body loads — a block's once-over reads (its resident rows)
     // sit outside them, priced as the working set they join, not a trip's.
-    let mut loops = 0usize;
+    let mut loops: Vec<Trip> = vec![];
     for u in &list {
         match u.op() {
-            Op::Wmma(..) => out.steps += 1,
-            Op::Unary(..) | Op::Binary(..) | Op::Ternary(..) | Op::Cast(..) | Op::BitCast(..) => out.valu += 1,
-            Op::Range(..) => loops += 1,
-            Op::End(ops::End { ranges, .. }) => loops = loops.saturating_sub(ranges.len()),
-            // A `cp.async` copy moves its width's bytes from global memory
-            // without a load the list would hold; the commit and wait groups
-            // a ring lands them with move nothing.
-            Op::Custom(ops::Custom { code, .. }) if code.contains("cp.async") && code.contains("shared.global") => {
+            Op::Wmma(..) => {
+                out.steps += 1;
+                out.epilogue = 0;
+                loops.iter_mut().for_each(|l| l.steps += 1);
+            }
+            Op::Unary(..) | Op::Binary(..) | Op::Ternary(..) | Op::Cast(..) | Op::BitCast(..) => {
+                out.valu += 1;
+                out.epilogue += 1;
+            }
+            Op::Range(..) => loops.push(Trip::default()),
+            Op::End(ops::End { ranges, .. }) => {
+                for ended in loops.split_off(loops.len().saturating_sub(ranges.len())).into_iter().rev() {
+                    if out.trip.steps == 0 {
+                        out.trip = ended;
+                    }
+                }
+            }
+            // A `cp.async` copy or a transposing load moves its width's bytes
+            // from global memory without a load the list would hold; the
+            // commit and wait groups a ring lands them with move nothing.
+            Op::Custom(ops::Custom { code, .. })
+                if code.contains("global.load.tr") || code.contains("cp.async") && code.contains("shared.global") =>
+            {
                 out.fill += 16;
+                loops.iter_mut().for_each(|l| l.fill += 16);
             }
             // A plain load inside a loop body moves its access's width of
             // elements — the fill's own on a staged target, a side read's
             // beside it.
-            Op::Load(ops::Load { index, .. }) if loops > 0 && space_of(index) == Some(AddrSpace::Global) => {
-                out.fill += u.dtype().bytes() * width_of(index);
+            Op::Load(ops::Load { index, .. })
+                if !loops.is_empty()
+                    && matches!(space_of(index), Some(AddrSpace::Global | AddrSpace::Swizzled { .. })) =>
+            {
+                let bytes = u.dtype().bytes() * width_of(index);
+                out.fill += bytes;
+                loops.iter_mut().for_each(|l| l.fill += bytes);
             }
             _ => {}
         }
@@ -1183,109 +1220,153 @@ pub struct Diffed {
 const HOLDS: f64 = 0.15;
 
 /// A sample of each family's configs emitted and counted against the
-/// model's predictions — the GEMM tiles of a 4096³ plan, two attention
+/// model's predictions — the GEMM tiles of a 4096³ plan under each
+/// epilogue the models run, two attention
 /// configs, nearest at `k = 1` resident and streamed, a register list at
 /// `k = 64` and a split at `k = 8` — on `target`'s planner under the
-/// declared guessed costs. The tensors are small (the interpreter's
+/// declared guessed costs, rolled so a trip's counts sit in it once. The
+/// tensors are small (the interpreter's
 /// shapes); the tiles are those a large shape plans. Every row is the
 /// family's own claim, the same construction the ranking prices. The VALU
 /// row's units stay each family's: a nearest or attention pair's bundle in
 /// score elements (the claim's counts folded at the epilogue's unit), a
-/// GEMM's epilogue un-amortized over its trips, its tile operations an
-/// instruction a lane.
+/// GEMM's epilogue an output element's operations against the program's
+/// past its last product.
 pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
     use crate::build::{BF16, F16};
     use crate::kernels::attention::{AttnMask, AttnSpec, attention};
-    use crate::kernels::gemm::{Epilogue, GemmSpec, gemm};
+    use crate::kernels::gemm::{Epilogue, GemmSpec, Scale, gemm};
     use crate::kernels::nearest::{Live, Metric, NearestSpec, nearest};
     use crate::kernels::{Act, Batch};
 
     let device = crate::atoms::Device { target: target.clone(), costs: crate::probe::GUESSED };
     let planner = Planner::new(device.clone()).expect("an SM count");
     let lowering = crate::lower::Lowering::new(&device);
-    let atom = target.geometry().expect("a matrix core");
-    let atom_step = (atom.m as usize * atom.n as usize * atom.k as usize) as f64;
+    let atom_step = |core| {
+        let atom = target.geometry_on(core).expect("a matrix core");
+        (atom.m as usize * atom.n as usize * atom.k as usize) as f64
+    };
     // The program's list is one warp's code, its loads one thread's: the
     // block's per-trip claim divides by the warps for the steps and the
     // VALU, and its fill bytes compare against the threads' loads together.
-    let diff =
-        |name: String, claim: &config::Claim, valu: f64, warps: usize, prog: crate::ir::Program| -> Option<Diffed> {
-            let counted = counted(&crate::lower::standalone(prog, &lowering).ok()?.program)?;
-            let threads = (warps * target.wave as usize) as f64;
-            let predicted = Claim {
-                steps: claim.steps.count() * config::STEP as f64 / atom_step,
-                ops: valu,
-                fill: (claim.fill.bytes + claim.side.bytes) as usize,
-                smem: claim.smem,
-                regs: claim.regs,
-            };
-            let Claim { steps, ops, fill, smem, regs } = predicted;
-            let row = |what: &'static str, predicted: f64, program: f64| {
-                (what, predicted, program, (program - predicted).abs() <= HOLDS * predicted.max(1.0))
-            };
-            Some(Diffed {
-                name,
-                regs,
-                rows: vec![
-                    row("steps/trip", steps / warps as f64, counted.steps as f64),
-                    row("fill bytes/trip", fill as f64, counted.fill as f64 * threads),
-                    row("valu ops/trip", ops, counted.valu as f64 * warps as f64),
-                    row("smem", smem as f64, counted.smem as f64),
-                ],
-            })
+    // A sample's predicted VALU, the program's count it holds against, and
+    // what turns a warp's count into the prediction's units (the block's
+    // warps unless given).
+    type Valu = (f64, fn(&Counted) -> usize, Option<f64>);
+    let whole: fn(&Counted) -> usize = |c| c.valu;
+    let diff = |name: String,
+                claim: &config::Claim,
+                (valu, of, per): Valu,
+                warps: usize,
+                prog: crate::ir::Program,
+                core|
+     -> Option<Diffed> {
+        let lowering = crate::lower::Lowering { core, ..lowering.clone() };
+        let counted = counted(&crate::lower::standalone(prog, &lowering).ok()?.program)?;
+        let threads = (warps * target.wave as usize) as f64;
+        let predicted = Claim {
+            steps: claim.steps.count() * config::STEP as f64 / atom_step(core),
+            ops: valu,
+            fill: (claim.fill.bytes + claim.side.bytes) as usize,
+            smem: claim.smem,
+            regs: claim.regs,
         };
-    let mut out: Vec<(String, config::Claim, f64, usize, crate::ir::Program)> = vec![];
+        let Claim { steps, ops, fill, smem, regs } = predicted;
+        let row = |what: &'static str, predicted: f64, program: f64| {
+            (what, predicted, program, (program - predicted).abs() <= HOLDS * predicted.max(1.0))
+        };
+        Some(Diffed {
+            name,
+            regs,
+            rows: vec![
+                row("steps/trip", steps / warps as f64, counted.trip.steps as f64),
+                row("fill bytes/trip", fill as f64, counted.trip.fill as f64 * threads),
+                row("valu ops/trip", ops, of(&counted) as f64 * per.unwrap_or(warps as f64)),
+                row("smem", smem as f64, counted.smem as f64),
+            ],
+        })
+    };
+    // A sample's predicted VALU and the program's count it holds against.
+    let mut out: Vec<(String, config::Claim, Valu, usize, crate::ir::Program, Core)> = vec![];
     // The static decomposition rows (see the k64 list below): what the
     // program's listing adder holds against the counted parts.
     let mut statics: Vec<Diffed> = vec![];
-    // GEMM: the leading tiles of a 4096³ plan, emitted small, a gelu
-    // epilogue on the accumulator — the claim's own epilogue term, un-
-    // amortized over the trips and in the static-code units a program's
-    // instruction mix counts (the lane operations over a wave).
-    let p = GemmProblem { batches: 1, m: 4096, n: 4096, k: 4096, halves: 1, rope: None };
-    for cfg in config::distinct(&planner.gemm_ranked(1, 4096, 4096, 4096, false)).take(3) {
-        let claim = p.claim(&planner, &cfg).expect("ranked");
-        let valu = claim.ops.epilogue * (4096 / cfg.tile[2]) as f64 / target.wave as f64;
-        let spec = GemmSpec {
-            m: 130,
-            n: 192,
-            k: cfg.tile[2] * 8,
-            batch: Batch::Static(1),
-            epilogue: Epilogue { act: Act::Gelu, ..Epilogue::DEFAULT },
-            cfg,
-        };
-        out.push((
-            format!("gemm {:?}", cfg.tile),
-            claim,
-            valu,
-            (cfg.warps[0] * cfg.warps[1]) as usize,
-            gemm::<BF16>(&spec),
-        ));
+    // GEMM: the leading tiles of a 4096³ plan under each epilogue the
+    // models run, emitted small — the claim's own epilogue term, un-
+    // amortized over the trips, against the program's operations past its
+    // last product (the lane operations over a wave).
+    let plain = Epilogue::DEFAULT;
+    let epilogues = [
+        ("plain", plain),
+        ("bias", Epilogue { bias: true, ..plain }),
+        ("residual", Epilogue { residual: true, ..plain }),
+        ("f32 residual", Epilogue { residual: true, out_f32: true, ..plain }),
+        ("scale", Epilogue { scale: Some(Scale::new(0.5)), ..plain }),
+        ("gelu", Epilogue { act: Act::Gelu, ..plain }),
+        ("silu", Epilogue { act: Act::Silu, ..plain }),
+        (
+            "bias gelu scale residual",
+            Epilogue { bias: true, act: Act::Gelu, scale: Some(Scale::new(0.5)), residual: true, ..plain },
+        ),
+        ("swiglu", Epilogue { act: Act::Silu, gated: true, ..plain }),
+        ("bias geglu", Epilogue { bias: true, act: Act::Gelu, gated: true, ..plain }),
+    ];
+    for (label, epilogue) in epilogues {
+        let p = GemmProblem::new(1, 4096, 4096, 4096, &epilogue);
+        let tiles = if epilogue.act == Act::Gelu && !epilogue.gated && !epilogue.bias { 3 } else { 1 };
+        for cfg in config::distinct(&planner.gemm_ranked(1, 4096, 4096, 4096, &epilogue)).take(tiles) {
+            let claim = planner.claim_of(&p, &cfg).expect("ranked");
+            // Both an output element's: the claim's over the trips, the
+            // program's warps' over the tile.
+            let elems = (cfg.tile[0] * cfg.tile[1]) as f64;
+            let valu = claim.ops.epilogue * (4096 / cfg.tile[2]) as f64 / elems;
+            let per = (cfg.warps[0] * cfg.warps[1]) as f64 * target.wave as f64 / elems;
+            let spec = assumed(
+                GemmSpec { m: 130, n: 192, k: cfg.tile[2] * 8, batch: Batch::Static(1), epilogue },
+                GemmCfg { schedule: cfg.schedule.rolled(), ..cfg },
+            );
+            out.push((
+                format!("gemm {label} {:?}", cfg.tile),
+                claim,
+                (valu, |c| c.epilogue, Some(per)),
+                (cfg.warps[0] * cfg.warps[1]) as usize,
+                gemm::<BF16>(&spec),
+                Core::Warp,
+            ));
+        }
     }
     // Attention: two configs of a d64 causal plan, emitted small.
     let p = AttentionProblem { tiles: 8, t: 100, tk: 100, d: 64, causal: true, bias: false };
-    for cfg in config::distinct(&planner.attention_ranked(8, 100, 100, 64, true, false)).take(2) {
-        let claim = p.claim(&planner, &cfg).expect("ranked");
+    // The ranking's leaders, and the wide core's own tile where there is one.
+    let wide = target.geometry_on(Core::Wide).map(|atom| {
+        let m = atom.m as usize;
+        FaCfg { core: Core::Wide, warp_rows: m, ..FaCfg::new(4 * m, m, 2) }
+    });
+    for cfg in config::distinct(&planner.attention_ranked(8, 100, 100, 64, true, false)).take(2).chain(wide) {
+        let claim = planner.claim_of(&p, &cfg).expect("ranked");
         let valu = claim.ops.fold(config::pair_op(&device), 1.0, &config::Weights::same());
-        let spec = AttnSpec {
-            batch: Batch::Static(2),
-            t: 100,
-            tk: 100,
-            heads: 4,
-            kv_heads: 2,
-            d: 64,
-            mask: AttnMask { causal: true, ..AttnMask::default() },
-            cache: None,
-            packed: false,
-            scale: 0.125,
-            cfg,
-        };
+        let spec = assumed(
+            AttnSpec {
+                batch: Batch::Static(2),
+                t: 100,
+                tk: 100,
+                heads: 4,
+                kv_heads: 2,
+                d: 64,
+                mask: AttnMask { causal: true, ..AttnMask::default() },
+                cache: None,
+                packed: false,
+                scale: 0.125,
+            },
+            FaCfg { schedule: cfg.schedule.rolled(), ..cfg },
+        );
         out.push((
-            format!("attention {}x{}", cfg.bq, cfg.bkv),
+            format!("attention {}x{} {:?}", cfg.bq, cfg.bkv, cfg.core),
             claim,
-            valu,
+            (valu, whole, None),
             cfg.warps() as usize,
             attention::<BF16>(&spec),
+            cfg.core,
         ));
     }
     // Nearest: k = 1 resident and streamed, a register list at k = 64, a
@@ -1300,16 +1381,19 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
         groups: false,
         k,
     };
-    let spec = |cfg, k| NearestSpec {
-        n: 100,
-        m: 960,
-        d: 128,
-        metric: Metric::SquaredL2,
-        floors: Floors::default(),
-        groups: false,
-        k,
-        cfg,
-        live: Live::default(),
+    let spec = |cfg: NearestCfg, k, m| {
+        let spec = NearestSpec {
+            n: 100,
+            m,
+            d: 128,
+            dtype: ScalarDType::Float16,
+            metric: Metric::SquaredL2,
+            floors: Floors::default(),
+            groups: false,
+            k,
+            live: Live::default(),
+        };
+        assumed(spec, NearestCfg { schedule: cfg.schedule.rolled(), ..cfg })
     };
     let ranked = planner.nearest_ranked(problem(1));
     for (name, way) in [
@@ -1317,31 +1401,32 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
         ("streamed", ranked.iter().find(|c| c.bk.is_some()).copied()),
     ] {
         let Some(cfg) = way else { continue };
-        let claim = problem(1).claim(&planner, &cfg).expect("ranked");
+        let claim = planner.claim_of(&problem(1), &cfg).expect("ranked");
         let valu = claim.ops.fold(config::pair_op(&device), 1.0, &config::Weights::same());
         out.push((
             format!("nearest k1 {name} {}x{}", cfg.bq, cfg.bkv),
             claim,
-            valu,
+            (valu, whole, None),
             cfg.warps() as usize,
-            nearest::<F16>(&spec(cfg, 1)),
+            nearest::<F16>(&spec(cfg, 1, 960)),
+            Core::Warp,
         ));
     }
     let ranked = planner.nearest_ranked(problem(64));
-    if let Some(&cfg) = ranked.iter().find(|c| c.queue.is_none() && c.select.is_none()) {
-        let claim = problem(64).claim(&planner, &cfg).expect("ranked");
+    if let Some(&cfg) = ranked.iter().find(|c| c.list == Way::Registers) {
+        let claim = planner.claim_of(&problem(64), &cfg).expect("ranked");
         let valu = claim.ops.fold(config::pair_op(&device), 1.0, &config::Weights::same());
         // The listing's static decomposition beside the expected-ops row:
         // the program's listing adder (its count less the same tile's at
         // `k = 1`, where no list runs) against the parts
         // [`NearestProblem::listing_static`] counts, within ±30 % — the
         // guarded bodies, the merge network's stages, the queues' sort.
-        let twin = crate::kernels::nearest::NearestCfg { lanes: None, queue: None, select: None, ..cfg };
+        let twin = crate::kernels::nearest::NearestCfg { lanes: None, list: Way::Registers, ..cfg };
         let listing = |prog: crate::ir::Program| {
             counted(&crate::lower::standalone(prog, &lowering).ok()?.program).map(|c| c.valu as f64)
         };
-        if let Some(program) = listing(nearest::<F16>(&spec(cfg, 64)))
-            .zip(listing(nearest::<F16>(&spec(twin, 1))))
+        if let Some(program) = listing(nearest::<F16>(&spec(cfg, 64, 960)))
+            .zip(listing(nearest::<F16>(&spec(twin, 1, 960))))
             .map(|(whole, least)| whole - least)
         {
             let predicted = problem(64).listing_static(&cfg);
@@ -1359,35 +1444,35 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
         out.push((
             format!("nearest k64 list {}x{}", cfg.bq, cfg.bkv),
             claim,
-            valu,
+            (valu, whole, None),
             cfg.warps() as usize,
-            nearest::<F16>(&spec(cfg, 64)),
+            nearest::<F16>(&spec(cfg, 64, 960)),
+            Core::Warp,
         ));
     }
     let split_problem = NearestProblem { n: 256, m: 1 << 20, ..problem(8) };
     let ranked = planner.nearest_ranked(split_problem);
     let split = planner.nearest_splits(&split_problem, &config::distinct(&ranked).take(16).collect::<Vec<_>>());
     if let Some(&cfg) = split.iter().find(|c| c.splits > 1 && c.splits <= 32) {
-        let claim = split_problem.claim(&planner, &cfg).expect("ranked");
+        let claim = planner.claim_of(&split_problem, &cfg).expect("ranked");
         let valu = claim.ops.fold(config::pair_op(&device), 1.0, &config::Weights::same());
-        let mut split_spec = spec(cfg, 8);
-        split_spec.m = cfg.splits * cfg.bkv * 2;
+        let split_spec = spec(cfg, 8, cfg.splits * cfg.bkv * 2);
         out.push((
             format!("nearest k8 split {} {}x{}", cfg.splits, cfg.bq, cfg.bkv),
             claim,
-            valu,
+            (valu, whole, None),
             cfg.warps() as usize,
             nearest::<F16>(&split_spec),
+            Core::Warp,
         ));
     }
     let diffed = out
         .into_iter()
-        .filter_map(|(name, claim, gelu_ops, warps, prog)| diff(name, &claim, gelu_ops, warps, prog))
+        .filter_map(|(name, claim, valu, warps, prog, core)| diff(name, &claim, valu, warps, prog, core))
         .collect();
     (diffed, statics)
 }
 
 /// How far a program's static listing adder may sit from the parts the
-/// decomposition counts: the grid the constants were measured on holds
-/// within 27 %, the diff's own sample within 7 %.
+/// decomposition counts.
 const HOLDS_STATIC: f64 = 0.30;

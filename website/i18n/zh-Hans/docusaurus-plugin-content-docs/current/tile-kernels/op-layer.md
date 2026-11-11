@@ -10,24 +10,34 @@ sidebar_label: 算子层
 pub fn linear(x: &Tensor, w: &Tensor, opts: Linear) -> Result<Tensor>;
 pub fn conv2d(x: &Tensor, w: &Tensor, opts: Conv) -> Result<Tensor>;
 pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tensor>;
+pub fn attention_packed(qkv: &Tensor, heads: usize, kv_heads: usize, opts: Attn) -> Result<Tensor>;
 pub fn heads(qkv: &Tensor, opts: Qkv) -> Result<(Tensor, Tensor, Tensor)>;
 pub fn layer_norm(x: &Tensor, w: &Tensor, b: Option<&Tensor>, eps: f64) -> Result<Tensor>;
 pub fn add_layer_norm(x: &Tensor, residual: &Tensor, w: &Tensor, b: Option<&Tensor>, eps: f64)
     -> Result<(Tensor, Tensor)>;
 pub fn rms_norm(x: &Tensor, w: &Tensor, eps: f64) -> Result<Tensor>;
 pub fn add_rms_norm(x: &Tensor, residual: &Tensor, w: &Tensor, eps: f64) -> Result<(Tensor, Tensor)>;
+pub fn nearest(x: &Tensor, c: &Tensor, opts: Nearest) -> Result<(Tensor, Tensor)>;
+pub fn k_nearest(x: &Tensor, c: &Tensor, k: impl Into<SInt>, opts: Nearest) -> Result<(Tensor, Tensor)>;
+pub fn k_nearest_reranked(x: &Tensor, c: &Tensor, k: impl Into<SInt>, opts: Nearest, rerank: Rerank)
+    -> Result<(Tensor, Tensor)>;
 pub fn supported(device: &DeviceSpec) -> bool;
+pub fn chosen() -> Option<Chosen>;
 ```
 
 | 算子 | 形状 | 选项 |
 |---|---|---|
 | `attention` | `q [B, T, H, D]`, `k`/`v [B, Tk, H_kv, D]` → `[B, T, H, D]` | `Attn { causal, keys, window, chunk, seg_start, cache, splits, scale, bias }` |
-| `linear` | `x [lead..., K]`, `w [N, K]` → `[lead..., N]` | `Linear { bias, act, gated, residual, scale }`；门控的 `w` 为 `[2N, K]` |
+| `attention_packed` | `qkv [B, T, (H + 2·H_kv)·D]` → `[B, T, H, D]` | 不带缓存的 `Attn`；`heads`、`kv_heads` |
+| `linear` | `x [lead..., K]`, `w [N, K]` → `[lead..., N]` | `Linear { bias, act, gated, residual, scale, rope }`；门控的 `w` 为 `[2N, K]` |
 | `conv2d` | `x [B, H, W, Cin]`, `w [Cout, kh, kw, Cin / groups]` → `[B, Ho, Wo, Cout]` | `Conv { stride, pad, dilation, groups, bias, act, residual, scale, out_dtype }`；1×1 卷积即 `linear` |
 | `heads` | `qkv [B, T, (H + 2·H_kv)·D]` → `q`, `k`, `v` | `Qkv { heads, kv_heads, head_dim, q_norm, k_norm, eps, rope }` |
 | `layer_norm`, `rms_norm` | `x [..., D]`, `w`/`b [D]` | `add_*` 接收与 `x` 同形的 `residual`，返回 `(x + residual, norm)` |
+| `nearest`、`k_nearest`、`k_nearest_reranked` | `x [N, D]`、`c [M, D]` → f32 分数和 i32 索引，`[N]`（`nearest`）或 `[N, k]` | `Nearest { metric, row_floor, col_floor, groups }`；重排序搜索另有 `Rerank { margin, x8, c8, search }` |
 
 `Linear::scale` 在加上残差之前乘以激活后的值：`scale·act(x·wᵀ + bias) + residual`，因此 Conformer 的半步 `x + 0.5·ffn(x)` 只需一个 GEMM。
+
+`Linear::rope` 是 `Rotary { cos, sin, heads, head_dim }`：对 `x [B, T, K]`，输出的前 `heads` 个宽 `head_dim` 列的头在加偏置之后用 `[1, T, 1, head_dim/2]` 的 `(cos, sin)` 表旋转，头的两半按 `apply_rotary_emb` 的方式配对。与激活、残差或缩放同时使用时，整个 linear 在计算图上运行。否则，当表与 `x` 的 dtype 相同且一个 tile 的每个 warp 持有完整的头时，GEMM 在存储时完成旋转；不满足时运行普通 GEMM，由计算图旋转其输出。之后 `attention_packed` 原地读取这种投影的查询、键和值，而 `heads` 会把它们拷贝出来。
 
 `Attn::keys` 可以是 `KeyMask::None`、`KeyMask::Lens(&lens)`（`[B]` 有效键数）或 `KeyMask::Bool(&mask)`（`[B, Tk]`，被关注处为 true）。`Attn::cache` 接收 `Cache { head_start, kv_heads, row_map, appended, app_lens }`，而 `appended` 要求 `KeyMask::Lens`。`Attn::chunk` 是分块注意力（`Chunk { size, left, right }`）。`Attn::scale` 默认为 `1/√D`。`Attn::bias`（`[B, H, T, Tk]` 或 `[1, H, T, Tk]`，与数据流同一 dtype）在掩码之前加到缩放后的分数上，例如 WavLM 的相对位置偏置。`Qkv::rope` 是 `[1, T, 1, D/2]`（按位置）或 `[B, T, 1, D/2]`（按 token）的 `(cos, sin)`。掩码的说明见[注意力内核](./kernel-library#flash-attention)。
 
@@ -40,7 +50,7 @@ pub fn supported(device: &DeviceSpec) -> bool;
 | `Target` | 张量不在默认设备上，设备没有 tk 内核（`config::has_kernels`：sm_80 以下的 CUDA、Metal、CPU），或其目标未报告 SM 数量 |
 | `Dtype` | 任一操作数为 f32，或操作数没有共享同一种带矩阵核心的 16 位类型（`nearest` 和 `k_nearest` 也接受 i8 行，每行缩放系数为 1）。`conv2d`：输出类型既不是输入类型也不是 f32，或残差不是该类型 |
 | `Symbolic` | 除绑定的首维之外还有符号维度（对 `linear` 而言，符号化的 `N` 也算） |
-| `Shape` | `linear`：`N` 不是 8 的倍数或没有行。`conv2d`：`groups > 1`、`Cin` 不是 16 的倍数、`Cout` 不是 8 的倍数或输出为空。`attention`：没有适合 `D` 的配置（在 sm_86 上，32、48、64、128 和 256 能规划，40 不能）或存在空维度。`heads`：`D` 不是 16..=256 范围内的 2 的幂。归一化：`D` 不是 256..=2048 范围内的 2 的幂 |
+| `Shape` | `linear`：`N` 不是 8 的倍数或没有行。`conv2d`：`groups > 1`、`Cin` 不是 16 的倍数、`Cout` 不是 8 的倍数或输出为空。`attention`：没有适合 `D` 的配置（在 sm_86 上，32、48、64、128 和 256 能规划，40 不能）或存在空维度。`heads`：`D` 不是 16..=256 范围内的 2 的幂。归一化：`D` 不是 256..=2048 范围内 256 的倍数 |
 | `Config` | 没有合适的 tile 配置。对 `linear` 而言，`K` 不是 16 的倍数 |
 
 当追加行比所有配置的键块都宽时，`attention` 也会走计算图。
@@ -64,6 +74,8 @@ pub fn supported(device: &DeviceSpec) -> bool;
 | `Shape { op, operand, got, expected }` | 某个操作数的形状不适合该算子 |
 | `Dtype { op, operand, got, want }` | `w`（或 `k`、`v`、归一化权重、rope 表）的数据类型与输入不同 |
 | `Heads { op, heads, kv_heads }` | `heads` 不是 `kv_heads` 的倍数 |
+| `NoScores { op }` | 最近邻搜索请求了 `k = 0` |
+| `Unbound { op, got }` | `k` 既不是计数也不是绑定的变量 |
 | `Graph { op, source }` | 构建计算图回退失败 |
 | `Launch { op, source }` | 降级或绑定内核失败 |
 

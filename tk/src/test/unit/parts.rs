@@ -41,24 +41,25 @@ fn check(prog: Program, inputs: Vec<Vec<f64>>, out_elems: usize, tol: f64) {
 #[test_case(64, 64, 64; "square")]
 #[test_case(64, 32, 128; "d 128, narrow k")]
 fn qk_from_registers_and_shared(bq: usize, bkv: usize, d: usize) {
-    let mut k = Kernel::new("qk");
-    let q = k.param::<BF16>("q", ParamKind::In, bq * d);
-    let kk = k.param::<BF16>("k", ParamKind::In, bkv * d);
-    let s_out = k.param::<F32>("s", ParamKind::Out, bq * bkv);
-    k.warps((bq / 16) as u32);
-    let k_s = k.smem::<BF16>("k_s", bkv * d);
-    let q_g = k.view(q, 0, [d, 1], Shape::new(bq, d), [None, None]);
-    let q_r = k.load(q_g);
-    let k_g = k.view(kk, 0, [d, 1], Shape::new(bkv, d), [None, None]);
-    let k_t = k.smem_view::<BF16>(k_s, 0, Shape::new(bkv, d));
-    k.stage(k_t, k_g, CopyMode::Sync);
-    let zero = k.zeros::<F32>(Shape::new(bq, bkv));
-    let s = k.mma(zero, q_r, false, k_t, true);
-    let s_view = k.view(s_out, 0, [bkv, 1], Shape::new(bq, bkv), [None, None]);
-    k.store(s_view, s);
+    let prog = Kernel::record("qk", |k| {
+        let q = k.input::<BF16>("q", bq * d);
+        let kk = k.input::<BF16>("k", bkv * d);
+        let s_out = k.output::<F32>("s", bq * bkv);
+        k.warps((bq / 16) as u32);
+        let k_s = k.smem::<BF16>("k_s", bkv * d);
+        let q_g = k.view(q, 0, [d, 1], Shape::new(bq, d), [None, None]);
+        let q_r = k.load(q_g);
+        let k_g = k.view(kk, 0, [d, 1], Shape::new(bkv, d), [None, None]);
+        let k_t = k.smem_view::<BF16>(k_s, 0, Shape::new(bkv, d));
+        k.stage(k_t, k_g, CopyMode::Sync);
+        let zero = k.zeros::<F32>(Shape::new(bq, bkv));
+        let s = *k.mma(zero, q_r, false, k_t, true);
+        let s_view = k.view(s_out, 0, [bkv, 1], Shape::new(bq, bkv), [None, None]);
+        k.store(s_view, s);
+    });
     let mut seed = 1;
     let (qd, kd) = (data(bq * d, &mut seed), data(bkv * d, &mut seed));
-    check(k.finish(), vec![qd, kd], bq * bkv, 1e-3);
+    check(prog, vec![qd, kd], bq * bkv, 1e-3);
 }
 
 /// `o = p · v` with P from global memory as the A operand and V through
@@ -66,24 +67,25 @@ fn qk_from_registers_and_shared(bq: usize, bkv: usize, d: usize) {
 #[test_case(64, 64, 64; "square")]
 #[test_case(64, 32, 128; "d 128")]
 fn pv_with_a_transposed_gather(bq: usize, bkv: usize, d: usize) {
-    let mut k = Kernel::new("pv");
-    let p = k.param::<BF16>("p", ParamKind::In, bq * bkv);
-    let v = k.param::<BF16>("v", ParamKind::In, bkv * d);
-    let o_out = k.param::<F32>("o", ParamKind::Out, bq * d);
-    k.warps((bq / 16) as u32);
-    let v_s = k.smem::<BF16>("v_s", bkv * d);
-    let p_g = k.view(p, 0, [bkv, 1], Shape::new(bq, bkv), [None, None]);
-    let p_r = k.load(p_g);
-    let v_g = k.view(v, 0, [d, 1], Shape::new(bkv, d), [None, None]);
-    let v_t = k.smem_view::<BF16>(v_s, 0, Shape::new(bkv, d));
-    k.stage(v_t, v_g, CopyMode::Sync);
-    let zero = k.zeros::<F32>(Shape::new(bq, d));
-    let o = k.mma(zero, p_r, false, v_t, false);
-    let o_view = k.view(o_out, 0, [d, 1], Shape::new(bq, d), [None, None]);
-    k.store(o_view, o);
+    let prog = Kernel::record("pv", |k| {
+        let p = k.input::<BF16>("p", bq * bkv);
+        let v = k.input::<BF16>("v", bkv * d);
+        let o_out = k.output::<F32>("o", bq * d);
+        k.warps((bq / 16) as u32);
+        let v_s = k.smem::<BF16>("v_s", bkv * d);
+        let p_g = k.view(p, 0, [bkv, 1], Shape::new(bq, bkv), [None, None]);
+        let p_r = k.load(p_g);
+        let v_g = k.view(v, 0, [d, 1], Shape::new(bkv, d), [None, None]);
+        let v_t = k.smem_view::<BF16>(v_s, 0, Shape::new(bkv, d));
+        k.stage(v_t, v_g, CopyMode::Sync);
+        let zero = k.zeros::<F32>(Shape::new(bq, d));
+        let o = *k.mma(zero, p_r, false, v_t, false);
+        let o_view = k.view(o_out, 0, [d, 1], Shape::new(bq, d), [None, None]);
+        k.store(o_view, o);
+    });
     let mut seed = 2;
     let (pd, vd) = (data(bq * bkv, &mut seed), data(bkv * d, &mut seed));
-    check(k.finish(), vec![pd, vd], bq * d, 1e-3);
+    check(prog, vec![pd, vd], bq * d, 1e-3);
 }
 
 /// Row max and row sum of a `q · kᵀ` tile, and the broadcast of a row vector
@@ -91,31 +93,32 @@ fn pv_with_a_transposed_gather(bq: usize, bkv: usize, d: usize) {
 #[test]
 fn row_reductions_and_broadcast() {
     let (bq, bkv, d) = (64usize, 64usize, 64usize);
-    let mut k = Kernel::new("rows");
-    let q = k.param::<BF16>("q", ParamKind::In, bq * d);
-    let kk = k.param::<BF16>("k", ParamKind::In, bkv * d);
-    let out = k.param::<F32>("out", ParamKind::Out, bq * (bkv + 2));
-    k.warps((bq / 16) as u32);
-    let k_s = k.smem::<BF16>("k_s", bkv * d);
-    let q_g = k.view(q, 0, [d, 1], Shape::new(bq, d), [None, None]);
-    let q_r = k.load(q_g);
-    let k_g = k.view(kk, 0, [d, 1], Shape::new(bkv, d), [None, None]);
-    let k_t = k.smem_view::<BF16>(k_s, 0, Shape::new(bkv, d));
-    k.stage(k_t, k_g, CopyMode::Sync);
-    let zero = k.zeros::<F32>(Shape::new(bq, bkv));
-    let s = k.mma(zero, q_r, false, k_t, true);
-    let mx = k.reduce(s, Axis::Row, ReduceOp::Max);
-    let sum = k.reduce(s, Axis::Row, ReduceOp::Sum);
-    let centred = k.binary(s, mx, BinaryOp::Sub);
-    let s_view = k.view(out, 0, [bkv + 2, 1], Shape::new(bq, bkv), [None, None]);
-    let mx_view = k.view(out, bkv, [bkv + 2, 1], Shape::new(bq, 1), [None, None]);
-    let sum_view = k.view(out, bkv + 1, [bkv + 2, 1], Shape::new(bq, 1), [None, None]);
-    k.store(s_view, centred);
-    k.store(mx_view, mx);
-    k.store(sum_view, sum);
+    let prog = Kernel::record("rows", |k| {
+        let q = k.input::<BF16>("q", bq * d);
+        let kk = k.input::<BF16>("k", bkv * d);
+        let out = k.output::<F32>("out", bq * (bkv + 2));
+        k.warps((bq / 16) as u32);
+        let k_s = k.smem::<BF16>("k_s", bkv * d);
+        let q_g = k.view(q, 0, [d, 1], Shape::new(bq, d), [None, None]);
+        let q_r = k.load(q_g);
+        let k_g = k.view(kk, 0, [d, 1], Shape::new(bkv, d), [None, None]);
+        let k_t = k.smem_view::<BF16>(k_s, 0, Shape::new(bkv, d));
+        k.stage(k_t, k_g, CopyMode::Sync);
+        let zero = k.zeros::<F32>(Shape::new(bq, bkv));
+        let s = *k.mma(zero, q_r, false, k_t, true);
+        let mx = k.reduce(s, Axis::Row, ReduceOp::Max);
+        let sum = k.reduce(s, Axis::Row, ReduceOp::Sum);
+        let centred = k.binary(s, mx, BinaryOp::Sub);
+        let s_view = k.view(out, 0, [bkv + 2, 1], Shape::new(bq, bkv), [None, None]);
+        let mx_view = k.view(out, bkv, [bkv + 2, 1], Shape::new(bq, 1), [None, None]);
+        let sum_view = k.view(out, bkv + 1, [bkv + 2, 1], Shape::new(bq, 1), [None, None]);
+        k.store(s_view, centred);
+        k.store(mx_view, mx);
+        k.store(sum_view, sum);
+    });
     let mut seed = 3;
     let (qd, kd) = (data(bq * d, &mut seed), data(bkv * d, &mut seed));
-    check(k.finish(), vec![qd, kd], bq * (bkv + 2), 1e-3);
+    check(prog, vec![qd, kd], bq * (bkv + 2), 1e-3);
 }
 
 /// The card's empirical tensor-core ceiling: register-resident `mma.sync`
@@ -125,22 +128,23 @@ fn row_reductions_and_broadcast() {
 fn mma_peak_probe() {
     let Some(target) = super::cp_async_target() else { return };
     let (bm, bn, bk, iters, blocks) = (64usize, 64usize, 16usize, 4096i64, 28 * 16usize);
-    let mut k = Kernel::new("mma_peak");
-    let a = k.param::<BF16>("a", ParamKind::In, bm * bk);
-    let b = k.param::<BF16>("b", ParamKind::In, bn * bk);
-    let c = k.param::<F32>("c", ParamKind::Out, blocks * bm * bn);
-    k.grid([Sc::from(blocks), Sc::from(1), Sc::from(1)]);
-    k.warps(WarpGrid { rows: 2, cols: 2 });
-    let a_g = k.view(a, 0, [bk, 1], Shape::new(bm, bk), [None, None]);
-    let b_g = k.view(b, 0, [bk, 1], Shape::new(bn, bk), [None, None]);
-    let a_r = k.load(a_g);
-    let b_r = k.load(b_g);
-    let acc0 = k.zeros::<F32>(Shape::new(bm, bn));
-    let [acc] = k.loop_(iters, [acc0], |k, _, [acc]| [k.mma(acc, a_r, false, b_r, true)]);
-    let block = k.block(0);
-    let c_view = k.view(c, block * (bm * bn), [bn, 1], Shape::new(bm, bn), [None, None]);
-    k.store(c_view, acc);
-    let prog = k.finish();
+    let prog = Kernel::record("mma_peak", |k| {
+        let a = k.input::<BF16>("a", bm * bk);
+        let b = k.input::<BF16>("b", bn * bk);
+        let c = k.output::<F32>("c", blocks * bm * bn);
+        k.grid([Sc::from(blocks), Sc::from(1), Sc::from(1)]);
+        k.warps(WarpGrid { rows: 2, cols: 2 });
+        let a_g = k.view(a, 0, [bk, 1], Shape::new(bm, bk), [None, None]);
+        let b_g = k.view(b, 0, [bk, 1], Shape::new(bn, bk), [None, None]);
+        let a_r = k.load(a_g);
+        let b_r = k.load(b_g);
+        let acc0 = k.zeros::<F32>(Shape::new(bm, bn));
+        let [acc] = k.loop_(iters, [acc0], |k, _, [acc]| [k.mma(acc, a_r, false, b_r, true)]);
+        let block = k.block(0);
+        let c_view = k.view(c, block * (bm * bn), [bn, 1], Shape::new(bm, bn), [None, None]);
+        k.store(c_view, *acc);
+    });
+    let prog = prog;
     let lowering = Lowering::new(&declared(target));
     let a_t = Tensor::from_slice(vec![0.5f32; bm * bk]).cast(DType::BFloat16);
     let b_t = Tensor::from_slice(vec![0.5f32; bn * bk]).cast(DType::BFloat16);

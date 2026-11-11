@@ -480,12 +480,7 @@ fn canonical_dtype(dtype: &DType) -> CanonicalDType {
         DType::Vector { scalar, count } => CanonicalDType::Vector { scalar: scalar_name(*scalar), count: *count },
         DType::Ptr { base, addrspace, size, vcount } => CanonicalDType::Pointer {
             base: Box::new(canonical_dtype(base)),
-            address_space: match addrspace {
-                AddrSpace::Global => "global",
-                AddrSpace::Local => "local",
-                AddrSpace::Reg => "register",
-            }
-            .to_string(),
+            address_space: address_space_name(*addrspace),
             size: *size,
             count: *vcount,
         },
@@ -512,11 +507,11 @@ fn canonical_const(value: ConstValue) -> CanonicalConst {
 
 fn address_space_name(address_space: AddrSpace) -> String {
     match address_space {
-        AddrSpace::Global => "global",
-        AddrSpace::Local => "local",
-        AddrSpace::Reg => "register",
+        AddrSpace::Global => "global".to_string(),
+        AddrSpace::Local => "local".to_string(),
+        AddrSpace::Reg => "register".to_string(),
+        AddrSpace::Swizzled { stride } => format!("swizzled:{stride}"),
     }
-    .to_string()
 }
 
 fn canonical_program_value(value: &Arc<UOp>, ids: &FxHashMap<u64, usize>) -> crate::Result<CanonicalProgramValue> {

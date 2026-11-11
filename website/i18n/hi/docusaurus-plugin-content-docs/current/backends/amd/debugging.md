@@ -47,15 +47,17 @@ faulting `va`, failure flags (`NotPresent`, `ReadOnly`, `NoExecute`, `imprecise`
 | Tag | किसे cover करता है |
 |---|---|
 | `Vram` | General device VRAM — tensor data, code objects, EOP/ctx-save |
-| `Gtt` | Host-visible control memory — GTT, और graph / linked-plan IB तथा control buffers |
-| `Kernarg` | Kernarg arenas (host-visible VRAM) — per-dispatch, graph, और linked-plan argument pages |
+| `Gtt` | uncached GTT में बाक़ी host-visible control memory (बिना explicit tag वाले `UncachedGtt` allocation का default) |
+| `Kernarg` | Kernarg arenas (multi-XCC parts पर VRAM, बाकी पर uncached GTT) — per-dispatch, graph, और linked-plan argument pages |
+| `CommandBuffer` | Graph और linked-plan command buffers — PM4 IBs और AQL control programs (multi-XCC parts पर VRAM, बाकी पर uncached GTT) |
 | `SignalPool` | GTT signal-slot pool |
-| `QueueRing` / `QueueGart` / `QueueInactive` | एक queue का ring, GART page, और queue-inactive signal |
+| `QueueRing` / `QueueGart` / `QueueInactive` | एक queue का ring, GART page, और error words (AQL `queue_inactive_signal` और `ErrorReason` word) |
 | `Staging` | GTT SDMA bounce buffer |
-| `Scratch` | Register-spill scratch — GPU-only VRAM, प्रति kernel realloc'd |
+| `Scratch` | Register-spill scratch — GPU-only VRAM, तब realloc'd जब किसी kernel को lane के पास मौजूद से ज़्यादा चाहिए |
+| `HdpReadback` | वह host-visible VRAM word जिसे host HDP flush करने के लिए वापस पढ़ता है, जहाँ KFD कोई MMIO-remap page नहीं देता |
 
 जो भेद मायने रखता है वह है **scratch बनाम बाक़ी सब कुछ**: scratch एकमात्र shared, GPU-only,
-dynamically realloc'd-and-freed region है, और ऐतिहासिक `NotPresent` अपराधी। per-process KFD
+dynamically realloc'd-and-freed region है, इसलिए `NotPresent` fault का पहला संदिग्ध। per-process KFD
 event page `alloc_raw` के बाहर allocate होता है और track नहीं किया जाता: वहाँ का fault unmapped
 के रूप में classify होता है।
 
@@ -104,10 +106,30 @@ Imprecise=false ErrorType=…) — va is at offset +0x40 within a LIVE scratch �
 poll-fault calls (`wait_events(0)`) वही fault फिर से observe करती हैं — हर बार log करना spam
 करता। फिर इसे एक typed `Error::GpuFault` के रूप में return किया जाता है, जिसका `Display` ऊपर
 वाली string ही है; poison latch उस text को record करता है और हर बाद के entry point पर उसे एक
-`Error::Runtime` (prefix `runtime error: ` के साथ) के रूप में फिर से throw करता है। बिना fault के
-expire होने वाला wait एक अलग `Error::TimelineTimeout` है। (एक hardware-exception event, slot `[2]`, इसके बजाय
+`Error::Runtime` (prefix `runtime error: ` के साथ) के रूप में फिर से throw करता है। बिना fault और बिना
+queue error के expire होने वाला wait एक अलग `Error::TimelineTimeout` है। (एक hardware-exception event, slot `[2]`, इसके बजाय
 `reset_type`/`reset_cause`/`memory_lost` report करता है — उनके पास classify करने के लिए कोई
 faulting VA नहीं होती।)
+
+### Queue errors
+
+एक compute queue memory fault के बिना भी रुक सकती है। हर compute queue का एक GTT
+allocation (`QueueInactive`) होता है जिसमें दो words होते हैं:
+
+- AQL `queue_inactive_signal`, जिसमें CP queue रोकते समय एक halt code लिखता है
+  (उदाहरण के लिए `0x401`, अपर्याप्त scratch);
+- `ErrorReason` word, जिसकी ओर हर CWSR header point करता है, और जिसमें KFD किसी
+  queue exception के bits set करता है (wave trap, विफल preemption, …)।
+
+PM4 queues केवल `ErrorReason` का उपयोग करती हैं। दोनों words device का queue event raise
+करते हैं, इसलिए `WAIT_EVENTS` में सोया waiter जाग जाता है। एक wait हर lane के words तब पढ़ता
+है जब वह `WAIT_EVENTS` से जागता है और जब उसका timeout होता है। उसे मिली पहली error device
+को poison करती है और `Error::AmdQueueError` के रूप में लौटती है, जिसमें queue id, उसे report
+करने वाला word, raw code और decoded cause होते हैं:
+
+```text
+AMD compute queue 3 stopped: insufficient scratch (queue_inactive_signal 0x401)
+```
 
 ---
 
@@ -122,7 +144,8 @@ point पर check होता है:
 - `is_poisoned()` hot-path gate है;
 - `poison_error()` poisoned होने पर record किया गया `Error::Runtime` return करता है;
 - `poll_faults_nonblocking()` तब `wait_events(0)` जारी करता है जब कोई signal wait अपनी deadline
-  (dispatch, copy और lane acquisition के लिए 30 s) तक पहुँच जाए, ताकि असली error एक नंगी
+  (dispatch, copy और lane acquisition के लिए 30 s) तक पहुँच जाए, और wait queues के error
+  words भी पढ़ता है, ताकि असली error एक नंगी
   deadline के बजाय timeout से attach हो जाए। (spin-escalation path भी एक fault पर जल्दी बाहर
   निकलता है, पर इस poll के बजाय एक छोटे *blocking* `wait_events` के माध्यम से।) `poison()`
   lane pool पर parked हर thread को भी जगा देता है।
@@ -142,7 +165,8 @@ fail-fast होता है — GPU state और cached mappings अब भर
   `rsrc1/2/3`। यह उन `kernel_code_properties` bits को flag करता है जिन्हें loader populate
   *नहीं* करता (जो kernel को garbage pointers पढ़ने और fault करने पर मजबूर कर देता)।
 - **`[dispatch tv=…]`** — प्रति dispatch: kernel name, `grid`, `local`,
-  `is_pm4`, kernarg GPU VA, scratch VA, और हर buffer की VA।
+  `is_pm4`, scratch VA, और हर buffer की VA। (kernargs को ring slot बाद में, submission
+  के भीतर मिलता है, इसलिए dump में कोई kernarg VA नहीं होती।)
 
 यह ठीक-ठीक यह देखने का सबसे तेज़ तरीक़ा है कि एक faulting dispatch ने किन VAs को छुआ, ताकि
 registry की classification के विरुद्ध cross-reference किया जा सके।
@@ -184,7 +208,7 @@ driver के बजाय *compiler*-side issues (IR extraction, LLVM IR, UOp t
    tracked allocation" एक overrun है (gap आपको बताता है कि कितने से)।
 2. faulting dispatch की exact VAs देखने के लिए `SVOD_DEBUG_DISPATCH` सेट करके re-run करें, और
    उस तक ले जाने वाली alloc/free history देखने के लिए `RUST_LOG=svod_device=debug`।
-3. faulting VA को dumped scratch/kernarg/buffer VAs के विरुद्ध cross-reference करें।
+3. faulting VA को dumped scratch और buffer VAs के विरुद्ध cross-reference करें।
 
 `NotPresent` के लिए प्रमुख संदिग्ध **scratch** है (`Scratch` tag के अनुसार) — एकमात्र shared,
 GPU-only, dynamically realloc'd-and-freed region, जहाँ एक realloc-बनाम-dispatch race एक
@@ -194,7 +218,7 @@ kernel को एक freed buffer की ओर इशारा करते ह
 
 ## यह क्यों ज़रूरी है
 
-registry से पहले, एक fault आपको एक hex address देता था और कुछ नहीं। अब fault *message ख़ुद*
+fault *message ख़ुद*
 बताता है कि VA live scratch है, एक freed/stale VA है, या wild — एक अंधे शिकार को एक directed
 शिकार में बदलते हुए। poison latch (जो corrupted state को फैलने देने के बजाय device को साफ़-सुथरे
 ढंग से रोक देता है) और dispatch dumps के साथ जोड़ा जाए, तो बैकएंड GPU से एक debugger attach

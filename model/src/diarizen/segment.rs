@@ -128,8 +128,8 @@ impl DiariZenSegmenter {
             // Pack `real` window slices into input rows 0..real (each row's tail
             // past the audio end stays zero — the trailing-window pad).
             {
-                let mut view = self.jit.waveforms_view_mut::<f32>()?;
-                let slice = view.as_slice_mut().expect("contiguous waveforms buffer");
+                let mut waveforms = self.jit.waveforms_host_write::<f32>()?;
+                let slice = waveforms.as_mut_slice();
                 slice.fill(0.0);
                 for bi in 0..real {
                     let s = (start + bi) * self.hop_samples;

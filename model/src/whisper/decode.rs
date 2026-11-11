@@ -362,14 +362,12 @@ fn write_prefill_tokens(
     name: &'static str,
 ) -> Result<()> {
     let fence = jit.tokens_mut()?.clone();
-    let bytes: &[u8] = bytemuck::cast_slice(tokens);
-    copies.h2d(name, 1, bytes.len(), &fence, || -> Result<()> {
-        let dst = jit.tokens_mut()?.as_host_bytes_mut()?;
-        if dst.len() != bytes.len() {
+    copies.h2d(name, 1, size_of_val(tokens), &fence, || -> Result<()> {
+        let mut dst = jit.tokens_host_write::<i32>()?;
+        if dst.len() != tokens.len() {
             return Err(decode_err("prompt length differs from the prepared prefill graph"));
         }
-        dst.copy_from_slice(bytes);
-        Ok(())
+        Ok(dst.copy_from(tokens)?)
     })
 }
 
@@ -397,8 +395,8 @@ fn read_prefill_logits(
 
 /// Copy `count` floats from element `offset` of a device buffer over the copy
 /// engine. Reading a device-resident buffer through its host mapping faults
-/// the pages across one at a time, at a measured 0.32 GB/s; one bulk copy of
-/// the same range moves the same data as a single transfer.
+/// the pages across one at a time; one bulk copy of the same range moves the
+/// same data as a single transfer.
 pub(crate) fn read_f32(buffer: &Buffer, offset: usize, count: usize) -> Result<Vec<f32>> {
     let mut out = vec![0f32; count];
     let element = size_of::<f32>();
@@ -658,7 +656,8 @@ fn seed_attempt_rows(
         copy_device_cache_row(jit.self_v_cache_mut()?, row, self_stride, &seed.self_v)?;
     }
     let slot = i32::try_from(cross_slot).map_err(|_| decode_err("cross cache row exceeds i32"))?;
-    write_rows(jit.cross_cache_map_mut()?, &rows.iter().map(|&row| (row, slot)).collect::<Vec<_>>())
+    let rows: Vec<_> = rows.iter().map(|&row| (row, slot)).collect();
+    Ok(jit.cross_cache_map_host_write::<i32>()?.rows(&rows)?)
 }
 
 /// Append the step's K/V output for `row` at cache position `pos`.
@@ -798,8 +797,8 @@ pub(crate) fn run_fixed_slot_decode(
         if !tokens.is_empty() {
             let fence = step_jit.token_mut()?.clone();
             copies.h2d("decoder_controls", 2, tokens.len() * 2 * size_of::<i32>(), &fence, || -> Result<()> {
-                write_rows(step_jit.token_mut()?, &tokens)?;
-                write_rows(step_jit.self_key_lens_mut()?, &positions)
+                step_jit.token_host_write::<i32>()?.rows(&tokens)?;
+                Ok(step_jit.self_key_lens_host_write::<i32>()?.rows(&positions)?)
             })?;
             stats.dispatches += 1;
             stats.capacity_row_steps += capacity;
@@ -899,19 +898,6 @@ pub(crate) fn run_fixed_slot_decode(
 }
 
 // ─── Batched JIT buffer row helpers ─────────────────────────────────────────
-
-/// Write one `T` per `(row, value)` into a `[rows]` buffer of `T`.
-fn write_rows<T: bytemuck::Pod>(buf: &mut Buffer, rows: &[(usize, T)]) -> Result<()> {
-    let dst = buf.as_host_bytes_mut()?;
-    for &(row, value) in rows {
-        let bytes = bytemuck::bytes_of(&value);
-        let offset = row * bytes.len();
-        dst.get_mut(offset..offset + bytes.len())
-            .ok_or_else(|| decode_err("decoder row is out of bounds"))?
-            .copy_from_slice(bytes);
-    }
-    Ok(())
-}
 
 /// Seed one physical cache row from an immutable device-local snapshot.
 pub(crate) fn copy_device_cache_row(

@@ -148,8 +148,8 @@ fn free_batch_jit_takes_flash_attention_with_the_mask() {
     );
     let d = cfg.hidden_size;
     let mut run = |mask: &[i64]| -> Vec<f32> {
-        jit.input_ids_view_mut::<i64>().expect("ids").as_slice_mut().expect("contiguous").copy_from_slice(&ids);
-        jit.attention_mask_view_mut::<i64>().expect("mask").as_slice_mut().expect("contiguous").copy_from_slice(mask);
+        jit.input_ids_host_write::<i64>().expect("ids guard").copy_from(&ids).expect("ids");
+        jit.attention_mask_host_write::<i64>().expect("mask guard").copy_from(mask).expect("mask");
         jit.execute_bound(live as i64).expect("execute");
         // bf16 is the top half of an f32.
         let mut raw = vec![0u8; live * len * d * 2];

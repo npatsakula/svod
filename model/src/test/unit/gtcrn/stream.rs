@@ -105,8 +105,7 @@ fn run_stream(model: GtcrnStream, spec: &[f32], frames: usize) -> Vec<Vec<f32>> 
     let mut jit = GtcrnStreamJit::prepared(model).expect("prepare stream JIT");
     (0..frames)
         .map(|i| {
-            let mut view = jit.spec_view_mut::<f32>().expect("spec view");
-            view.as_slice_mut().expect("contiguous spec").copy_from_slice(&frame_of(spec, frames, i));
+            jit.spec_host_write::<f32>().expect("spec guard").copy_from(&frame_of(spec, frames, i)).expect("spec");
             jit.execute().expect("execute");
             jit.enh_to_vec::<f32>().expect("enhanced frame")
         })

@@ -163,8 +163,8 @@ impl<const W: usize> RnntBlockBackend<W> {
     }
 
     fn set_valid(&mut self, valid: &[usize]) -> crate::jit::Result<()> {
-        let mut view = self.jit.valid_view_mut::<i32>()?;
-        let slice = view.as_slice_mut().expect("contiguous valid");
+        let mut lanes = self.jit.valid_host_write::<i32>()?;
+        let slice = lanes.as_mut_slice();
         slice.fill(0);
         for (dst, &n) in slice.iter_mut().zip(valid) {
             *dst = n as i32;

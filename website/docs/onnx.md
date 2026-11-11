@@ -98,13 +98,13 @@ let plan = Tensor::prepare_batch(outputs.values())?;   // schedule + compile, on
 plan.execute()?;
 
 for batch in batches {
-    image.array_view_mut::<f32>()?.as_slice_mut().unwrap().copy_from_slice(&batch);
+    image.with_host_write::<f32, _>(|w| w.copy_from(&batch))?;
     plan.execute()?;                                   // replay: no tracing, no compilation
     let logits = outputs["output"].as_vec::<f32>()?;
 }
 ```
 
-`array_view_mut` is a zero-copy `ndarray` view over the input's host mapping;
+`with_host_write` writes straight into the input's host mapping;
 `prepare_batch` wires each output tensor to the plan's buffer, so `as_vec` /
 `as_ndarray` read the latest run.
 
@@ -114,7 +114,7 @@ for batch in batches {
 external data. Its inputs are placeholders: `assign` a value of the same shape
 and realize the input *before* the outputs. A placeholder keeps one buffer
 across plans, so a prepared plan also sees later `assign` + `realize` calls
-and `array_view_mut` writes to it.
+and `with_host_write` writes to it.
 
 ```rust
 let OnnxModel { mut inputs, outputs, .. } = OnnxImporter::new().import("model.onnx", &[])?;
@@ -322,7 +322,7 @@ node as its origin, so the profiler reports device time per node — see
 | Aspect | Detail |
 |---|---|
 | **Entry points** | `import(path, dims)`, `import_model_with_inputs(proto, inputs, dims)`, `import_model(proto, dims)` |
-| **Runtime inputs** | Build the tensors, pass them to `import_model_with_inputs`, write through `array_view_mut` between runs |
+| **Runtime inputs** | Build the tensors, pass them to `import_model_with_inputs`, write through `with_host_write` between runs |
 | **Dynamic dims** | Bind at import: `&[("batch", 8)]`; one import per batch size |
 | **Operators** | 162 / 200 ([parity table](https://github.com/npatsakula/svod/blob/main/onnx/PARITY.md)) |
 | **Conformance** | 1357 node tests on Clang and LLVM; AMD and CUDA via `SVOD_DEVICE` |

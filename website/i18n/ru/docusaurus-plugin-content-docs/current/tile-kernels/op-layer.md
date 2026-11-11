@@ -13,25 +13,41 @@ sidebar_label: Слой операций
 pub fn linear(x: &Tensor, w: &Tensor, opts: Linear) -> Result<Tensor>;
 pub fn conv2d(x: &Tensor, w: &Tensor, opts: Conv) -> Result<Tensor>;
 pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tensor>;
+pub fn attention_packed(qkv: &Tensor, heads: usize, kv_heads: usize, opts: Attn) -> Result<Tensor>;
 pub fn heads(qkv: &Tensor, opts: Qkv) -> Result<(Tensor, Tensor, Tensor)>;
 pub fn layer_norm(x: &Tensor, w: &Tensor, b: Option<&Tensor>, eps: f64) -> Result<Tensor>;
 pub fn add_layer_norm(x: &Tensor, residual: &Tensor, w: &Tensor, b: Option<&Tensor>, eps: f64)
     -> Result<(Tensor, Tensor)>;
 pub fn rms_norm(x: &Tensor, w: &Tensor, eps: f64) -> Result<Tensor>;
 pub fn add_rms_norm(x: &Tensor, residual: &Tensor, w: &Tensor, eps: f64) -> Result<(Tensor, Tensor)>;
+pub fn nearest(x: &Tensor, c: &Tensor, opts: Nearest) -> Result<(Tensor, Tensor)>;
+pub fn k_nearest(x: &Tensor, c: &Tensor, k: impl Into<SInt>, opts: Nearest) -> Result<(Tensor, Tensor)>;
+pub fn k_nearest_reranked(x: &Tensor, c: &Tensor, k: impl Into<SInt>, opts: Nearest, rerank: Rerank)
+    -> Result<(Tensor, Tensor)>;
 pub fn supported(device: &DeviceSpec) -> bool;
+pub fn chosen() -> Option<Chosen>;
 ```
 
 | Операция | Формы | Опции |
 |---|---|---|
 | `attention` | `q [B, T, H, D]`, `k`/`v [B, Tk, H_kv, D]` → `[B, T, H, D]` | `Attn { causal, keys, window, chunk, seg_start, cache, splits, scale, bias }` |
-| `linear` | `x [lead..., K]`, `w [N, K]` → `[lead..., N]` | `Linear { bias, act, gated, residual, scale }`; gated `w` имеет форму `[2N, K]` |
+| `attention_packed` | `qkv [B, T, (H + 2·H_kv)·D]` → `[B, T, H, D]` | `Attn` без кэша; `heads`, `kv_heads` |
+| `linear` | `x [lead..., K]`, `w [N, K]` → `[lead..., N]` | `Linear { bias, act, gated, residual, scale, rope }`; gated `w` имеет форму `[2N, K]` |
 | `conv2d` | `x [B, H, W, Cin]`, `w [Cout, kh, kw, Cin / groups]` → `[B, Ho, Wo, Cout]` | `Conv { stride, pad, dilation, groups, bias, act, residual, scale, out_dtype }`; свёртка 1×1 — это `linear` |
 | `heads` | `qkv [B, T, (H + 2·H_kv)·D]` → `q`, `k`, `v` | `Qkv { heads, kv_heads, head_dim, q_norm, k_norm, eps, rope }` |
 | `layer_norm`, `rms_norm` | `x [..., D]`, `w`/`b [D]` | `add_*` принимают `residual` той же формы, что `x`, и возвращают `(x + residual, norm)` |
+| `nearest`, `k_nearest`, `k_nearest_reranked` | `x [N, D]`, `c [M, D]` → оценки f32 и индексы i32, `[N]` (`nearest`) или `[N, k]` | `Nearest { metric, row_floor, col_floor, groups }`; переранжируемому поиску также `Rerank { margin, x8, c8, search }` |
 
 `Linear::scale` умножает значение после активации до прибавления residual:
 `scale·act(x·wᵀ + bias) + residual`, так что полушаг Conformer `x + 0.5·ffn(x)` — это один GEMM.
+
+`Linear::rope` — это `Rotary { cos, sin, heads, head_dim }`: первые `heads` голов выхода по
+`head_dim` столбцов поворачиваются после смещения таблицами `(cos, sin)` формы
+`[1, T, 1, head_dim/2]`, две половины головы спариваются так же, как в `apply_rotary_emb`, для
+`x [B, T, K]`. Рядом с активацией, residual или масштабом весь linear выполняется на графе. Иначе
+GEMM поворачивает их при записи, когда таблицы имеют тип `x` и тайл держит целые головы на варп,
+а если нет, работает обычный GEMM и выход поворачивает граф. Затем `attention_packed` читает
+запросы, ключи и значения такой проекции на месте, тогда как `heads` скопировал бы их.
 
 `Attn::keys` — это `KeyMask::None`, `KeyMask::Lens(&lens)` (`[B]` — число валидных ключей) или
 `KeyMask::Bool(&mask)` (`[B, Tk]`, true там, где ключ учитывается). `Attn::cache` принимает
@@ -57,7 +73,7 @@ pub fn supported(device: &DeviceSpec) -> bool;
 | `Target` | Тензор не на устройстве по умолчанию, у устройства нет ядер tk (`config::has_kernels`: CUDA ниже sm_80, Metal, CPU) или его цель не сообщает число SM |
 | `Dtype` | Какой-либо операнд в f32, или операнды не имеют общего 16-битного типа с матричным ядром (`nearest` и `k_nearest` принимают также строки i8, каждая с масштабом 1). `conv2d`: тип выхода, отличный от типа входа и от f32, или residual не в этом типе |
 | `Symbolic` | Символьна размерность, отличная от связанной ведущей (для `linear` — также символьное `N`) |
-| `Shape` | `linear`: `N` не кратно 8 или нет строк. `conv2d`: `groups > 1`, `Cin` не кратно 16, `Cout` не кратно 8 или пустой выход. `attention`: ни одна конфигурация не подходит для `D` (на sm_86 планируются 32, 48, 64, 128 и 256, а 40 — нет) или пустая размерность. `heads`: `D` не степень двойки в 16..=256. Нормализации: `D` не степень двойки в 256..=2048 |
+| `Shape` | `linear`: `N` не кратно 8 или нет строк. `conv2d`: `groups > 1`, `Cin` не кратно 16, `Cout` не кратно 8 или пустой выход. `attention`: ни одна конфигурация не подходит для `D` (на sm_86 планируются 32, 48, 64, 128 и 256, а 40 — нет) или пустая размерность. `heads`: `D` не степень двойки в 16..=256. Нормализации: `D` не кратно 256 в 256..=2048 |
 | `Config` | Ни одна тайловая конфигурация не подходит. Для `linear` — `K` не кратно 16 |
 
 `attention` также уходит на граф, когда добавленных строк больше, чем вмещает блок ключей любой
@@ -101,6 +117,8 @@ pub fn supported(device: &DeviceSpec) -> bool;
 | `Shape { op, operand, got, expected }` | Форма операнда не подходит операции |
 | `Dtype { op, operand, got, want }` | `w` (или `k`, `v`, веса нормализации, таблицы rope) по типу отличается от входа |
 | `Heads { op, heads, kv_heads }` | `heads` не кратно `kv_heads` |
+| `NoScores { op }` | Поиск ближайших запрошен с `k = 0` |
+| `Unbound { op, got }` | `k` — не число и не связанная переменная |
 | `Graph { op, source }` | Не удалось построить графовый запасной вариант |
 | `Launch { op, source }` | Не удалось понизить или привязать ядро |
 

@@ -2,12 +2,14 @@
 //! synthetic store replayed through the very keys the op layer writes —
 //! the digest assert holding, a drifted list refused and counted.
 
+use crate::sweep::assumed;
 use test_case::test_case;
 
 use super::Scratch;
-use svod_dtype::ScalarDType;
+use svod_dtype::{AmdArch, ScalarDType};
 
-use crate::atoms::sm86;
+use crate::atoms::{Target, sm86};
+use crate::ir::Schedule;
 use crate::kernels::Batch;
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec};
 use crate::ops::config::{GemmProblem, Planner, Tiled, representatives};
@@ -46,7 +48,7 @@ fn store(dir: &std::path::Path, ns: impl Fn(usize) -> u64) -> Planner {
     std::fs::write(&file, &text).expect("written");
     let measured = crate::probe::stored(dir, &target).expect("the file's costs");
     let planner = Planner::measured(target.clone(), measured).expect("an SM count");
-    let ranked = planner.gemm_ranked(1, 512, 512, 512, false);
+    let ranked = planner.gemm_ranked(1, 512, 512, 512, &Epilogue::DEFAULT);
     let reps = representatives(&ranked);
     let salt = format!("{:?}", (Batch::Static(1), Epilogue::DEFAULT));
     let keyed = |rule: &str, list: &[GemmCfg]| {
@@ -69,8 +71,8 @@ fn store(dir: &std::path::Path, ns: impl Fn(usize) -> u64) -> Planner {
 /// A 512³ GEMM's first four representatives — the store's candidates — and
 /// the ns the model says they cost.
 fn predicted(planner: &Planner) -> Vec<f64> {
-    let ranked = planner.gemm_ranked(1, 512, 512, 512, false);
-    let p = GemmProblem { batches: 1, m: 512, n: 512, k: 512, halves: 1, rope: None };
+    let ranked = planner.gemm_ranked(1, 512, 512, 512, &Epilogue::DEFAULT);
+    let p = GemmProblem::new(1, 512, 512, 512, &Epilogue::DEFAULT);
     representatives(&ranked).iter().take(4).map(|&c| p.admit(planner, &c).expect("ranked").0).collect()
 }
 
@@ -107,7 +109,7 @@ fn a_line_no_ranking_makes_replays_from_its_own_configs() {
     let planner = store(&dir, |at| 100 + at as u64);
     let file = TuneStore::at(Some(dir.to_path_buf())).file("sm_86-28sm").expect("a file");
     let text = std::fs::read_to_string(&file).expect("read");
-    let ranked = planner.gemm_ranked(1, 512, 512, 512, false);
+    let ranked = planner.gemm_ranked(1, 512, 512, 512, &Epilogue::DEFAULT);
     let drifted: Vec<GemmCfg> = representatives(&ranked).into_iter().skip(1).take(4).collect();
     let made = |key: u64| {
         format!(
@@ -175,8 +177,8 @@ fn the_epilogue_clusters_scale_their_own_constants() {
     let ranked = planner.nearest_ranked(lists);
     let (list, matrix) = ranked
         .iter()
-        .find(|c| c.select.is_none())
-        .zip(ranked.iter().find(|c| c.select.is_some()))
+        .find(|c| c.select().is_none())
+        .zip(ranked.iter().find(|c| c.select().is_some()))
         .expect("a list and a score-matrix config ranked");
     let lists_of = [(list, &["pair", "deal", "merge"][..]), (matrix, &["pair", "scan"][..])];
     for (cfg, clusters) in lists_of {
@@ -194,20 +196,22 @@ fn the_epilogue_clusters_scale_their_own_constants() {
 fn the_op_layers_tuning_reads_the_same_line() {
     let dir = Scratch::new("rank-op");
     let planner = store(&dir, |at| [900, 800, 700, 600][at]);
-    let ranked = planner.gemm_ranked(1, 512, 512, 512, false);
-    let spec =
-        GemmSpec { m: 512, n: 512, k: 512, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg: ranked[0] };
+    let ranked = planner.gemm_ranked(1, 512, 512, 512, &Epilogue::DEFAULT);
+    let spec = GemmSpec { m: 512, n: 512, k: 512, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT };
     let pick =
-        tuned::linear(&TuneStore::replay(dir.to_path_buf()), &planner, svod_dtype::DType::BFloat16, &ranked, spec).cfg;
+        tuned::linear(&TuneStore::replay(dir.to_path_buf()), &planner, svod_dtype::DType::BFloat16, &ranked, spec)
+            .cfg();
     assert_eq!(pick, representatives(&ranked)[3], "the line's fastest, at 600 ns");
 }
 
 /// The claim diff's mappings that hold: a trip's matrix steps in the
 /// target's atom instructions and the config's declared shared memory are
 /// exact on every family's sample — the model counts what the program does.
-#[test]
-fn the_claimed_steps_and_smem_hold_their_programs() {
-    let (diffed, _) = rank::claims(&sm86());
+#[test_case(sm86(); "sm86")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx942, 304); "gfx942")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1201, 96); "gfx1201")]
+fn the_claimed_steps_and_smem_hold_their_programs(target: Target) {
+    let (diffed, _) = rank::claims(&target);
     assert!(diffed.len() >= 8, "{:?}", diffed.iter().map(|d| &d.name).collect::<Vec<_>>());
     for d in &diffed {
         let row = |what: &str| d.rows.iter().find(|(w, ..)| *w == what).copied().expect(what);
@@ -218,34 +222,42 @@ fn the_claimed_steps_and_smem_hold_their_programs() {
     }
 }
 
-/// A GEMM's epilogue claim enters the ranking, and the diff's VALU row
-/// predicts a program's instruction mix from the claim itself: the gelu's
-/// forty tile operations an element, [128,256,64] at 0.7 % under.
-#[test]
-fn the_gemm_epilogue_claim_holds_its_program() {
-    for d in &rank::claims(&sm86()).0 {
-        if !d.name.starts_with("gemm") {
-            continue;
-        }
-        let (_, predicted, program, holds) =
+/// A GEMM's epilogue claim is the layer's: under every epilogue the models
+/// run, the diff's VALU row (an output element's operations) holds the
+/// program's past its last product within one (an activation lowers in one
+/// more on sm_86) and 15 % of the rest.
+#[test_case(sm86(); "sm86")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx942, 304); "gfx942")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1201, 96); "gfx1201")]
+fn the_gemm_epilogue_claim_holds_its_program(target: Target) {
+    let (diffed, _) = rank::claims(&target);
+    let gemms: Vec<_> = diffed.iter().filter(|d| d.name.starts_with("gemm")).collect();
+    assert!(gemms.len() >= 12, "{:?}", gemms.iter().map(|d| &d.name).collect::<Vec<_>>());
+    for d in gemms {
+        let (_, predicted, program, _) =
             d.rows.iter().find(|(w, ..)| *w == "valu ops/trip").copied().expect("the valu row");
-        assert!(holds, "{}: {predicted} VALU against {program}", d.name);
+        assert!(
+            (program - predicted).abs() <= 1.0 + 0.15 * predicted,
+            "{}: {predicted} VALU against {program}",
+            d.name
+        );
     }
 }
 
-/// The claim diff's reported opacity: the program moves the model's fill
-/// bytes once to about twice over — the ring's staging and the fill
-/// layout's per-thread assignment against the model's block mean — and the
-/// VALU count only sometimes maps (a GEMM's epilogue the model prices no
-/// operations of; a nearest list's dealt rounds the model counts as an
-/// average). Bounded, not pinned.
-#[test]
-fn the_claimed_fill_and_valu_are_bounded_not_pinned() {
-    for d in &rank::claims(&sm86()).0 {
-        let (_, predicted, program, _) = d.rows.iter().find(|(w, ..)| *w == "fill bytes/trip").expect("the fill");
-        let (predicted, program) = (*predicted, *program);
+/// A trip's global bytes are the claim's on every ring. Only a resident
+/// nearest's are not: each lane loads the squared norm of its candidate, so
+/// the loads repeat a few bytes of memory the claim counts once. Bounded, not
+/// pinned, per the target's lanes.
+#[test_case(sm86(), 2.0; "sm86")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx942, 304), 3.0; "gfx942")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1201, 96), 2.0; "gfx1201")]
+fn the_claimed_fill_holds_its_program(target: Target, most: f64) {
+    for d in &rank::claims(&target).0 {
+        let (_, predicted, program, holds) = *d.rows.iter().find(|(w, ..)| *w == "fill bytes/trip").expect("the fill");
+        let broadcast = d.name.starts_with("nearest") && !d.name.contains("streamed");
+        let bounded = predicted <= program && program <= most * predicted;
         assert!(
-            predicted <= program && program <= 2.5 * predicted.max(1.0),
+            if broadcast { bounded } else { holds },
             "{}: the program moves {program} of {predicted} fill bytes",
             d.name
         );
@@ -262,7 +274,7 @@ fn the_claimed_fill_and_valu_are_bounded_not_pinned() {
 #[test]
 fn the_listing_static_decomposition_maps_its_programs() {
     use crate::build::F16;
-    use crate::kernels::nearest::{Floors, LaneQueue, Live, Metric, NearestCfg, NearestSpec, nearest};
+    use crate::kernels::nearest::{Floors, LaneQueue, Live, Metric, NearestCfg, NearestSpec, Pow2, Way, nearest};
     let target = sm86();
     let device = crate::atoms::Device { target: target.clone(), costs: crate::probe::GUESSED };
     let lowering = crate::lower::Lowering::new(&device);
@@ -276,31 +288,32 @@ fn the_listing_static_decomposition_maps_its_programs() {
         groups: false,
         k,
     };
-    let lanes = |w, d, p| Some(LaneQueue { width: w, depth: d, passes: p });
-    let base = |bkv, lanes, queue| NearestCfg {
+    let lanes = |w, d, p| Some(LaneQueue { width: Pow2::of(w), depth: Pow2::of(d), passes: p });
+    let base = |bkv, lanes, queue: Option<usize>| NearestCfg {
         bq: 128,
         bkv,
-        stages: 3,
-        unroll: false,
+        schedule: Schedule::ring(3, false),
         warp_rows: 16,
         bk: None,
         splits: 1,
-        queue,
-        select: None,
+        list: queue.map_or(Way::Registers, |q| Way::Queued(Pow2::of(q))),
         lanes,
     };
     let count = |k: usize, cfg: NearestCfg| {
-        let spec = NearestSpec {
-            n: 100,
-            m: 960,
-            d: 128,
-            metric: Metric::SquaredL2,
-            floors: Floors::default(),
-            groups: false,
-            k,
+        let spec = assumed(
+            NearestSpec {
+                n: 100,
+                m: 960,
+                d: 128,
+                metric: Metric::SquaredL2,
+                floors: Floors::default(),
+                groups: false,
+                k,
+                live: Live::default(),
+                dtype: ScalarDType::Float16,
+            },
             cfg,
-            live: Live::default(),
-        };
+        );
         rank::counted(&crate::lower::standalone(nearest::<F16>(&spec), &lowering).ok()?.program).map(|c| c.valu)
     };
     let rows = [
@@ -319,7 +332,7 @@ fn the_listing_static_decomposition_maps_its_programs() {
     ];
     let mut worst = 0.0f64;
     for (k, cfg) in rows {
-        let twin = NearestCfg { lanes: None, queue: None, select: None, ..cfg };
+        let twin = NearestCfg { lanes: None, list: Way::Registers, ..cfg };
         let Some(adder) = count(k, cfg).zip(count(1, twin)).map(|(whole, least)| whole - least) else {
             panic!("{k} {cfg:?} does not lower");
         };

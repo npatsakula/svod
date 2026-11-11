@@ -12,25 +12,41 @@ shapes किसी कर्नेल में फ़िट होते ह�
 pub fn linear(x: &Tensor, w: &Tensor, opts: Linear) -> Result<Tensor>;
 pub fn conv2d(x: &Tensor, w: &Tensor, opts: Conv) -> Result<Tensor>;
 pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tensor>;
+pub fn attention_packed(qkv: &Tensor, heads: usize, kv_heads: usize, opts: Attn) -> Result<Tensor>;
 pub fn heads(qkv: &Tensor, opts: Qkv) -> Result<(Tensor, Tensor, Tensor)>;
 pub fn layer_norm(x: &Tensor, w: &Tensor, b: Option<&Tensor>, eps: f64) -> Result<Tensor>;
 pub fn add_layer_norm(x: &Tensor, residual: &Tensor, w: &Tensor, b: Option<&Tensor>, eps: f64)
     -> Result<(Tensor, Tensor)>;
 pub fn rms_norm(x: &Tensor, w: &Tensor, eps: f64) -> Result<Tensor>;
 pub fn add_rms_norm(x: &Tensor, residual: &Tensor, w: &Tensor, eps: f64) -> Result<(Tensor, Tensor)>;
+pub fn nearest(x: &Tensor, c: &Tensor, opts: Nearest) -> Result<(Tensor, Tensor)>;
+pub fn k_nearest(x: &Tensor, c: &Tensor, k: impl Into<SInt>, opts: Nearest) -> Result<(Tensor, Tensor)>;
+pub fn k_nearest_reranked(x: &Tensor, c: &Tensor, k: impl Into<SInt>, opts: Nearest, rerank: Rerank)
+    -> Result<(Tensor, Tensor)>;
 pub fn supported(device: &DeviceSpec) -> bool;
+pub fn chosen() -> Option<Chosen>;
 ```
 
 | Op | Shapes | Options |
 |---|---|---|
 | `attention` | `q [B, T, H, D]`, `k`/`v [B, Tk, H_kv, D]` → `[B, T, H, D]` | `Attn { causal, keys, window, chunk, seg_start, cache, splits, scale, bias }` |
-| `linear` | `x [lead..., K]`, `w [N, K]` → `[lead..., N]` | `Linear { bias, act, gated, residual, scale }`; gated `w` `[2N, K]` है |
+| `attention_packed` | `qkv [B, T, (H + 2·H_kv)·D]` → `[B, T, H, D]` | cache के बिना `Attn`; `heads`, `kv_heads` |
+| `linear` | `x [lead..., K]`, `w [N, K]` → `[lead..., N]` | `Linear { bias, act, gated, residual, scale, rope }`; gated `w` `[2N, K]` है |
 | `conv2d` | `x [B, H, W, Cin]`, `w [Cout, kh, kw, Cin / groups]` → `[B, Ho, Wo, Cout]` | `Conv { stride, pad, dilation, groups, bias, act, residual, scale, out_dtype }`; 1×1 `linear` है |
 | `heads` | `qkv [B, T, (H + 2·H_kv)·D]` → `q`, `k`, `v` | `Qkv { heads, kv_heads, head_dim, q_norm, k_norm, eps, rope }` |
 | `layer_norm`, `rms_norm` | `x [..., D]`, `w`/`b [D]` | `add_*` `x` जैसा `residual` लेते हैं और `(x + residual, norm)` लौटाते हैं |
+| `nearest`, `k_nearest`, `k_nearest_reranked` | `x [N, D]`, `c [M, D]` → f32 scores और i32 indices, `[N]` (`nearest`) या `[N, k]` | `Nearest { metric, row_floor, col_floor, groups }`; reranked search के लिए साथ में `Rerank { margin, x8, c8, search }` |
 
 `Linear::scale` residual जोड़ने से पहले activated मान को गुणा करता है:
 `scale·act(x·wᵀ + bias) + residual`, इसलिए Conformer का half-step `x + 0.5·ffn(x)` एक ही GEMM है।
+
+`Linear::rope` `Rotary { cos, sin, heads, head_dim }` है: `x [B, T, K]` के लिए output के पहले
+`heads` heads, हर एक `head_dim` columns का, bias के बाद `[1, T, 1, head_dim/2]` की `(cos, sin)`
+tables से घुमाए जाते हैं, head के दोनों halves वैसे ही जोड़े जाते हैं जैसे `apply_rotary_emb`
+जोड़ता है। Activation, residual या scale के साथ पूरा linear graph पर चलता है। वरना, जब tables का
+dtype `x` का हो और एक tile हर warp में पूरे heads रखे, GEMM उन्हें अपने store में घुमाता है; न हो तो
+साधारण GEMM चलता है और graph उसका output घुमाता है। फिर `attention_packed` ऐसे projection के
+queries, keys और values वहीं से पढ़ता है, जहाँ `heads` उन्हें copy करता।
 
 `Attn::keys` `KeyMask::None`, `KeyMask::Lens(&lens)` (`[B]` वैध key गिनतियाँ) या
 `KeyMask::Bool(&mask)` (`[B, Tk]`, जहाँ attend हो वहाँ true) है। `Attn::cache`
@@ -50,21 +66,21 @@ compile होते हैं (या, अगर हर एक spill करे,
 भेजते)। `Plan::Graph(Fallback)` बताता है कि ग्राफ़ क्यों चलता है, और planner log उसका नाम लेता है
 (`RUST_LOG=svod_tk::plan=debug`)।
 
-`ops::chosen()` उस op का फ़ैसला एक value के रूप में लौटाता है जो इस thread ने आख़िरी चलाया:
-`Chosen::Kernel { op, family, cfg }` — kernel का नाम (`family`) और उसकी pick का Debug text
-(`cfg`, जो एक nearest pick का path बताता है: score matrix, queue, splits) — या
-`Chosen::Graph { op, why }`। `k_nearest_reranked` का record उसकी search का है: जीतने वाली
-rows का dtype उसके config के साथ।
-
 | `Fallback` | कब |
 |---|---|
 | `Target` | Tensor default device पर नहीं है, device के पास कोई tk kernels नहीं हैं (`config::has_kernels`: sm_80 से नीचे का CUDA, Metal, CPU), या उसका target कोई SM count नहीं बताता |
 | `Dtype` | कोई operand f32 है, या सभी operands matrix core वाला एक ही 16-bit type साझा नहीं करते (`nearest` और `k_nearest` i8 rows भी लेते हैं, हर एक 1 से scaled)। `conv2d`: input के type या f32 के अलावा कोई output type, या ऐसा residual जो उस type में न हो |
 | `Symbolic` | Bound leading dim के अलावा कोई dim symbolic है (`linear` के लिए symbolic `N` भी) |
-| `Shape` | `linear`: `N` 8 का गुणज नहीं या कोई rows नहीं। `conv2d`: `groups > 1`, `Cin` 16 का गुणज नहीं, `Cout` 8 का गुणज नहीं, या ख़ाली output। `attention`: कोई config `D` पर फ़िट नहीं होता (sm_86 पर 32, 48, 64, 128 और 256 plan होते हैं और 40 नहीं) या कोई ख़ाली dim। `heads`: `D` 16..=256 में दो की घात नहीं। Norms: `D` 256..=2048 में दो की घात नहीं |
+| `Shape` | `linear`: `N` 8 का गुणज नहीं या कोई rows नहीं। `conv2d`: `groups > 1`, `Cin` 16 का गुणज नहीं, `Cout` 8 का गुणज नहीं, या ख़ाली output। `attention`: कोई config `D` पर फ़िट नहीं होता (sm_86 पर 32, 48, 64, 128 और 256 plan होते हैं और 40 नहीं) या कोई ख़ाली dim। `heads`: `D` 16..=256 में दो की घात नहीं। Norms: `D` 256..=2048 में 256 का गुणज नहीं |
 | `Config` | कोई tile config फ़िट नहीं होता। `linear` के लिए, `K` 16 का गुणज नहीं है |
 
 जब appended rows हर config के key block से चौड़ी हों, तब भी `attention` ग्राफ़ लेता है।
+
+`ops::chosen()` उस op का फ़ैसला एक value के रूप में लौटाता है जो इस thread ने आख़िरी चलाया:
+`Chosen::Kernel { op, family, cfg }` — kernel का नाम (`family`) और उसकी pick का Debug text
+(`cfg`, जो एक nearest pick का path बताता है: score matrix, queue, splits) — या
+`Chosen::Graph { op, why }`। `k_nearest_reranked` का record उसकी search का है: जीतने वाली
+rows का dtype उसके config के साथ।
 
 :::note[f32 ग्राफ़ पर क्यों रहता है]
 कर्नेल 16-bit operands लेते हैं (और nearest-neighbour search के लिए 8-bit integers)। किसी f32 मॉडल
@@ -95,6 +111,8 @@ buffer को ही bind करता है, और उसे छोटा क
 | `Shape { op, operand, got, expected }` | किसी operand का shape op में फ़िट नहीं होता |
 | `Dtype { op, operand, got, want }` | `w` (या `k`, `v`, norm weights, rope tables) का dtype input से अलग है |
 | `Heads { op, heads, kv_heads }` | `heads` `kv_heads` का गुणज नहीं है |
+| `NoScores { op }` | nearest search में `k = 0` माँगा गया |
+| `Unbound { op, got }` | `k` न कोई गिनती है न bound variable |
 | `Graph { op, source }` | Graph fallback बनाना विफल रहा |
 | `Launch { op, source }` | कर्नेल को lower या bind करना विफल रहा |
 
