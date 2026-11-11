@@ -82,9 +82,9 @@ pub trait AmdIface: Send + Sync + std::fmt::Debug {
         None
     }
 
-    /// Hold the device at a stable power state until the returned guard drops
-    /// (for SQTT). Backends without an amdgpu DRM context refuse.
-    fn hold_stable_pstate(&self) -> Result<Box<dyn Send + Sync>> {
+    /// Hold the device at `mode` until the returned guard drops (for SQTT).
+    /// Backends without an amdgpu DRM context refuse.
+    fn hold_stable_pstate(&self, _mode: crate::profile::StablePstate) -> Result<Box<dyn Send + Sync>> {
         crate::error::SqttUnsupportedSnafu { reason: "no amdgpu DRM context on this backend" }.fail()
     }
 
@@ -644,8 +644,8 @@ impl AmdIface for KfdIface {
         Some(QueueEventMailbox { address: self.queue_event_mailbox_ptr, event_id: self.queue_event_id })
     }
 
-    fn hold_stable_pstate(&self) -> Result<Box<dyn Send + Sync>> {
-        Ok(Box::new(crate::amd::sqtt::DrmStablePstate::acquire(&self.drm_fd)?))
+    fn hold_stable_pstate(&self, mode: crate::profile::StablePstate) -> Result<Box<dyn Send + Sync>> {
+        Ok(Box::new(crate::amd::sqtt::DrmStablePstate::acquire(&self.drm_fd, mode)?))
     }
 
     fn alloc_raw(

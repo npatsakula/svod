@@ -1,0 +1,100 @@
+== sqtt gemm gfx1201 candidate_ns=147280 cfg=[256, 128, 32] s2 [4, 2] unroll=true Warp crews=1 kernel=gemm op=gemm shape=1500x1280x5120
+== verdict: largest share first; cycles are a traced wave's, a trip (2 an iteration, model.trips)
+ 1 barrier            27.4%  719 cycles a trip in barriers (approx: perturbed)
+   knob: balance the waves' work between barriers or drop one; the late arriver is not attributed yet
+ 2 lds_exposed        13.8%  97 cycles a trip waiting, 266 stalled issuing (approx: perturbed)
+   0x9b8 stalled 74/trip before issue, exposed 18  ds_load_b128 v[180:183], v141 offset:16384
+   0x764 stalled 74/trip before issue, exposed 18  ds_load_b128 v[180:183], v141
+   0x78c stalled 8/trip before issue, exposed 1  ds_load_b128 v[200:203], v141 offset:1024
+   0x9e0 stalled 8/trip before issue, exposed 1  ds_load_b128 v[200:203], v141 offset:17408
+   0xba8 exposed 6/trip, cover med 5 of latency med 47, 632/632 stalled, distance 0:632  ds_store_b128 v146, v[176:179]
+   0x954 exposed 5/trip, cover med 5 of latency med 63, 632/632 stalled, distance 0:632  ds_store_b128 v146, v[176:179] offset:8192
+   knob: LDS: more work between a ds load and its use, fewer and wider ds ops, a conflict-free layout
+ 3 load_exposed       12.1%  291 cycles a trip waiting, 25 stalled issuing (approx: perturbed)
+   0x9a0 exposed 47/trip, cover med 1694 of latency med 1848, 302/632 stalled, distance 0:632  global_load_b128 v[172:175], v[252:253], off offset:128
+   0x96c exposed 45/trip, cover med 1578 of latency med 1678, 132/632 stalled, distance 0:632  global_load_b128 v[156:159], v[244:245], off offset:128
+   0x9ac exposed 13/trip, cover med 1697 of latency med 1893, 252/632 stalled, distance 0:632  global_load_b128 v[176:179], v[252:253], off offset:82048
+   0x978 exposed 5/trip, cover med 1715 of latency med 1749, 75/632 stalled, distance 0:632  global_load_b128 v[160:163], v[246:247], off offset:128
+   knob: latency: more work between a load and its wait (issue it earlier: prefetch distance, ring slots)
+note       the traced run took 1.60x the untraced (pinned standard: its lower clock moves cycle shares)
+kernel     175920 ns untraced, 281000 ns traced (1.60x), wave span 449625 cycles, sclk ~1600 MHz, pstate standard
+traced     se0 sa0 wgp0 simd0 (4 waves), se1 sa0 wgp0 simd0 (4 waves) of 4 SEs
+waves      8 traced (8 complete) of 240 on the traced SEs, occupancy peak 120; lifetime min 440661 med 443915 max 444371 cycles
+records    125032 stitched of 125032
+== time by class (traced SIMD, cycles summed over waves)
+class           hits      cycles  share       stall        exec
+matrix         40960     1002182  33.3%      346822      655360
+valu           13104       15733   0.5%        2309       13424
+salu            3680        4194   0.1%         386        3808
+lds            28160      399648  13.3%      340768       58880
+vmem_load       7680       48316   1.6%       32956       15360
+vmem_store       960        2880   0.1%           0        2880
+smem              16          17   0.0%           1          16
+branch          1656        1656   0.1%           0        1656
+wait_vmem       7680      421589  14.0%      413909        7680
+wait_lgkm      16624      174856   5.8%      158232       16624
+immediate       1936        4552   0.2%        2616        1936
+barrier         2560      933417  31.0%      449499      483918
+message           16        1630   0.1%           0        1630
+total         125032     3010670 100.0%     1747498     1263172
+== occupancy: resident waves mean/peak over the steady window (the SE at 90% of its p95 or more)
+limit      - (no kernel resources and workgroup in the capture)
+se0        120.0/120 (p95 120) over 99% of the span; 30 SIMDs 4.0/4; traced 4.0/4
+  busy     matrix 73.8% valu 56.9% vmem 17.4% scalar 0.4% any 83.7%
+se1        120.0/120 (p95 120) over 98% of the span; 30 SIMDs 4.0/4; traced 4.0/4
+  busy     matrix 74.3% valu 57.1% vmem 17.3% scalar 0.4% any 83.8%
+se2        120.0/120 (p95 120) over 99% of the span; 30 SIMDs 4.0/4
+se3        120.0/120 (p95 120) over 99% of the span; 30 SIMDs 4.0/4
+== main loop 0x6ac..=0xbd0 (matrix)
+iterations/wave  min 79 med 79 max 79 (waves 8)
+cycles/iteration min 4809 med 4825 p90 5839 max 11078 (n 624)
+trips      2 an iteration (model.trips), 1264 in the loop over 8 waves
+== main loop cycles a trip: a traced wave's, each cycle once (issue and stall by class)
+bucket                     all   share       se0       se1
+issue matrix             483.0   18.4%     483.0     483.0
+issue valu                 5.0    0.2%       5.0       5.0
+issue salu                 1.0    0.0%       1.0       1.0
+issue lds                 42.1    1.6%      42.3      42.0
+issue vmem_load           10.0    0.4%      10.0      10.0
+issue branch               0.5    0.0%       0.5       0.5
+issue immediate            1.5    0.1%       1.5       1.5
+stall matrix               1.5    0.1%       1.5       1.5
+stall valu                 0.0    0.0%       0.0       0.0
+stall lds                266.2   10.1%     266.2     266.2
+stall vmem_load           25.4    1.0%      25.4      25.4
+stall immediate            2.0    0.1%       2.0       2.0
+wait load                291.5   11.1%     307.5     275.5
+wait ds                   96.5    3.7%      94.1      98.9
+barrier                  719.2   27.4%     712.9     725.6
+idle                     680.4   25.9%     676.7     684.1
+total                   2625.8  100.0%    2629.4    2622.2
+== main loop: top 8 by stall
+      pc    hits    cycles   lat/hit stall/hit  expo/hit  asm
+   0x964     632    450131     712.2     711.2      65.8  s_barrier_wait 0xffff
+   0xb98     632    169543     268.3     267.3      94.7  s_wait_loadcnt 0x1
+   0xb68     632     96856     153.3     152.3      89.5  s_wait_loadcnt 0x5
+   0x9b8     632     94308     149.2     148.2      36.9  ds_load_b128 v[180:183], v141 offset:16384
+   0x764     632     94301     149.2     148.2      36.6  ds_load_b128 v[180:183], v141
+   0x95c     632     43660      69.1      68.1       9.1  s_wait_dscnt 0x0
+   0x944     632     41325      65.4      64.4       8.0  s_wait_loadcnt 0x1
+   0xbb0     632     33586      53.1      52.1      11.8  s_wait_dscnt 0x0
+== waits: 24304 on 8 waves (0 skipped), 0 unbound, 0 approximate; top 8 bindings by stall
+      pc   waits stalled     stall lat med lat p90     wait distance      asm
+   0x9a0     632     302    168911    1848    3286    0xb98 0:632         global_load_b128 v[172:175], v[252:253], off offset:128
+   0x96c     632     132     96224    1678    3176    0xb68 0:632         global_load_b128 v[156:159], v[244:245], off offset:128
+   0x954     632     632     43028      63     190    0x95c 0:632         ds_store_b128 v146, v[176:179] offset:8192
+   0x74c     632     154     40693    1269    2333    0x944 0:632         global_load_b128 v[172:175], v[252:253], off offset:64
+   0x2e4       8       8     37878    6154    7969    0x604 0:8           global_load_b128 v[148:151], v[129:130], off
+   0x1c0       8       8     37830    4902    5122    0x268 0:8           s_load_b128 s[0:3], s[0:1], 0x0
+   0xba8     632     632     32954      47      65    0xbb0 0:632         ds_store_b128 v146, v[176:179]
+   0x9ac     632     252     23921    1893    3098    0xba4 0:632         global_load_b128 v[176:179], v[252:253], off offset:82048
+== hottest 8 by cycles
+      pc    hits    cycles   lat/hit stall/hit  expo/hit  asm
+   0xbcc     632    457711     724.2       0.0       0.0  s_barrier_wait 0xffff
+   0x964     632    450131     712.2     711.2      65.8  s_barrier_wait 0xffff
+   0xb98     632    169543     268.3     267.3      94.7  s_wait_loadcnt 0x1
+   0xb68     632     96856     153.3     152.3      89.5  s_wait_loadcnt 0x5
+   0x9b8     632     94308     149.2     148.2      36.9  ds_load_b128 v[180:183], v141 offset:16384
+   0x764     632     94301     149.2     148.2      36.6  ds_load_b128 v[180:183], v141
+   0x95c     632     43660      69.1      68.1       9.1  s_wait_dscnt 0x0
+   0x944     632     41325      65.4      64.4       8.0  s_wait_loadcnt 0x1

@@ -44,6 +44,7 @@
 //!   under `DIR` (`./sqtt`) and its report printed (`--top` rows a table,
 //!   `--json` one line); `--attribute` sets the model's terms (`price` less
 //!   each) beside the traced SIMD's cycles of their counterparts.
+//!   `SVOD_SQTT_PSTATE=standard|peak` pins the traced pass's clock.
 //!   `sqtt --load DIR [--json] [--attribute]` re-reads a saved trace, no GPU.
 
 use std::collections::BTreeMap;
@@ -689,7 +690,9 @@ fn sqtt_bench(args: &Args) -> Result<()> {
         let cfg = cfg?;
         let untraced = timed_candidates(vec![gemm_candidate(&planner, shape, epilogue, cfg)?]).pop().and_then(|t| t.1);
         let dir = out.join(format!("gemm_{m}x{n}x{k}_{i}"));
-        let opts = ProfileOptions { iters: 3, static_analysis: false, sqtt: Some(dir.clone()), ..Default::default() };
+        // `SVOD_SQTT_PSTATE` pins the traced pass's clock (`ProfileOptions::from_env`).
+        let opts =
+            ProfileOptions { iters: 3, static_analysis: false, sqtt: Some(dir.clone()), ..ProfileOptions::from_env() };
         let profiles = tune::profile(gemm_candidate(&planner, shape, epilogue, cfg)?, &opts)
             .ok_or_else(|| format!("{}: failed to build or run", gemm_label(&cfg)))?;
         let traces: Vec<_> = profiles.iter().flat_map(|p| &p.stages).flat_map(|s| &s.sqtt).collect();
@@ -780,8 +783,7 @@ fn attribution(a: &Analysis) -> Result<String> {
     let per_sm = label("model.blocks_per_sm").unwrap_or(f64::NAN);
     let main_loop = a.main_loop.as_ref();
     let iteration = main_loop.and_then(|l| l.cycles).map(|c| c.median as f64);
-    // A wave runs the loop body once more than it takes the back edge.
-    let unroll = main_loop.and_then(|l| l.iterations).map(|i| (trips / (i.median as f64 + 1.0)).round().max(1.0));
+    let unroll = main_loop.filter(|l| l.trips.labelled).map(|l| f64::from(l.trips.per_iteration));
     let per_trip = iteration.zip(unroll).map(|(c, u)| c / u);
     writeln!(
         o,

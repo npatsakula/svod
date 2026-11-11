@@ -721,8 +721,8 @@ impl Drop for PoolQueue {
     }
 }
 
-/// An armed thread trace and, when the DRM context pinned it, the stable power
-/// state it holds until disarmed.
+/// An armed thread trace and, when its config asked the DRM context to pin
+/// one, the stable power state it holds until disarmed.
 struct ArmedSqtt {
     config: crate::profile::SqttConfig,
     pstate: Option<Box<dyn Send + Sync>>,
@@ -957,9 +957,10 @@ impl crate::device::PlanContext for OwnerCtx {
         crate::profile::AmdCounter::all().into_iter().map(crate::profile::PmcCounter::Amd).collect()
     }
 
-    /// Arming checks the target and queue kind, then pins a stable power state
-    /// through a DRM context held while armed; a device already pinned in
-    /// sysfs (`profile_standard`) needs none.
+    /// Arming checks the target and queue kind, then, where the config asks
+    /// for one, pins a stable power state through a DRM context held while
+    /// armed; a device already pinned in sysfs (`profile_standard`) needs none
+    /// for `Standard`. A held pin carries over a re-arm at the same state.
     fn set_sqtt(&self, config: Option<crate::profile::SqttConfig>) -> Result<()> {
         let mut armed = self.sqtt.lock();
         let Some(config) = config else {
@@ -968,11 +969,15 @@ impl crate::device::PlanContext for OwnerCtx {
         };
         crate::amd::sqtt::check_target(self.core.arch, self.core.pm4_queues())?;
         crate::amd::sqtt::check_config(&config)?;
-        let pstate = match armed.take().and_then(|armed| armed.pstate) {
-            Some(held) => Some(held),
-            None => match self.core.iface().hold_stable_pstate() {
+        // A pin at another state is released before the new one is taken: the
+        // kernel refuses a second level while one context holds the device.
+        let held = armed.take().filter(|armed| armed.config.pstate == config.pstate).and_then(|armed| armed.pstate);
+        let pstate = match (config.pstate, held) {
+            (None, _) => None,
+            (Some(_), Some(held)) => Some(held),
+            (Some(mode), None) => match self.core.iface().hold_stable_pstate(mode) {
                 Ok(held) => Some(held),
-                Err(_) if crate::amd::pmc::stable_pstate() => None,
+                Err(_) if mode == crate::profile::StablePstate::Standard && crate::amd::pmc::stable_pstate() => None,
                 Err(error) => return Err(error).context(crate::error::SqttPowerStateSnafu),
             },
         };

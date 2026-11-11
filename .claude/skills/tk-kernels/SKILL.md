@@ -279,11 +279,17 @@ of AMD's rocprof-trace-decoder, checked against its control CSVs) over `llvm-obj
   traced ns, labels: cfg, shape, `model.*` terms). `tk_bench sqtt --load DIR [--json] [--attribute]` or
   `svod_runtime::sqtt::Analysis::load(dir)` re-analyze with no GPU (`llvm-objdump` only if `kernel.s` is gone).
 - **Reading the report** (`Analysis::text`, fixed format, `== ` a section; `--json` is one line):
-  `!! TRUNCATED` (buffer filled: totals undercount) or `!! UNSTITCHED` first; `kernel` untraced/traced ns, wave span,
-  sclk (span over the traced ns); `traced` the SIMD (`sa wgp simd`); `waves`; `time by class` (cycles summed over the
+  `!! TRUNCATED` (buffer filled: totals undercount) or `!! UNSTITCHED` first; `verdict` (ranked findings
+  `matrix_bound`/`load_exposed`/`lds_exposed`/`barrier`/`occupancy_limited`/`loop_overhead`/`issue_bound`, each with its
+  share of the main loop's wave-cycles, evidence (binding loads with cover vs latency and exposed cycles a trip, stalled
+  ops, divergent branches) and knob; `approx` = perturbed (traced > 1.2× untraced), untimed_matrix (gfx11: no
+  matrix/issue-bound finding), approx_bindings; thresholds are consts in `runtime/src/sqtt/verdict.rs`); `kernel`
+  untraced/traced ns and ratio, wave span, sclk (span over the traced ns), pstate; `traced` each SE's SIMD; `waves`; `time by class` (cycles summed over the
   traced SIMD's waves, `stall` the wait before issue, `exec` the rest: a barrier's or waitcnt's wait sits in `exec`
   where AMD's model books it as latency); `main loop` (innermost backward branch holding a `v_wmma`/`v_mfma`, else the
-  hottest; iterations a wave = back-edge executions, cycles/iteration = gaps between them) with its top rows by stall;
+  hottest; iterations a wave = back-edge executions, cycles/iteration = gaps between them; trips an iteration from the
+  `model.trips` label, else per-iteration units; the loop's wave-cycles a trip split exactly into issue/stall by class,
+  waits by counter, barrier and idle, per SE) with its top rows by stall;
   `hottest` by cycles. PCs are ELF addresses, as in `kernel.s`.
 - **`--attribute`** (report only): each `Planner::price` term as `price − price with its costs zeroed` (`steps`,
   `reads`, `fill`, `wait`, `lone_trip`, `trip`; they overlap, so they need not sum) beside the traced cycles of its
@@ -291,8 +297,9 @@ of AMD's rocprof-trace-decoder, checked against its control CSVs) over `llvm-obj
   wait ↔ barrier + message; then model ns a trip vs a wave's cycles an iteration. Model ns is the busiest SM's time;
   measured cycles are one SIMD's summed over its waves: compare shares and the per-iteration pace, not totals.
 - **Caveats**: one traced SIMD per SE (`SqttConfig::simd`, WGP 0 of SA 0), so a grid that misses it traces nothing
-  there (`limit_cu`); arming pins `profile_standard` through a DRM context (sysfs `stable_std` also works), so the traced
-  clock is not the untraced one; tracing perturbs timing: never compare a traced ns with an untraced one.
+  there (`limit_cu`); arming leaves the clock to the device unless `SVOD_SQTT_PSTATE=standard|peak` (or
+  `SqttConfig::pstate`) pins one through a DRM context, which lowers the traced clock (`meta.json` records `pstate`);
+  tracing perturbs timing: never compare a traced ns with an untraced one.
 
 ## Performance-regression protocol
 

@@ -186,7 +186,7 @@ fn strix_prefetches_across_the_back_edge() {
     let s = stitched("svod/strix_smoke");
     let w = Waits::new(&s.waves(), &s.lines(), s.layout, s.base);
     let b = w.bindings.iter().find(|b| b.pc == 0x93c).unwrap();
-    assert_eq!((b.distance.clone(), b.waits.clone()), (vec![(1, b.count)], vec![(0x5fc, b.count)]));
+    assert_eq!((b.distance.clone(), b.waits.clone()), (vec![(1, b.count)], vec![(0x5fc, b.count, b.stall)]));
 }
 
 /// Over every fixture: instances and stall add up between sites and bindings, and every binding is a
@@ -219,6 +219,12 @@ fn fixtures_add_up(fixture: &str) {
         );
         assert!(b.stalled <= b.count && b.approx <= b.count);
         assert_eq!(b.waits.iter().map(|w| w.1).sum::<usize>(), b.count);
+        assert_eq!(b.waits.iter().map(|w| w.2).sum::<i64>(), b.stall);
+        assert_eq!(b.cover.n, b.count);
+        assert!(
+            b.latency.is_none_or(|l| l.max > b.cover.min),
+            "{fixture} {b:?}: a stalled wait arrived before release"
+        );
         assert_eq!(b.distance.iter().map(|d| d.1).sum::<usize>(), b.count);
         assert_eq!(b.by_outstanding.iter().map(|(_, l)| l.n).sum::<usize>(), b.stalled);
     }

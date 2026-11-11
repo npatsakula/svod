@@ -196,11 +196,11 @@ pub enum Error {
     #[snafu(display("SQTT thread trace unsupported: {reason}"))]
     SqttUnsupported { reason: String },
 
-    /// SQTT needs a stable power state: the DRM context could not pin one and
-    /// the device is not already in `profile_standard`.
+    /// The trace asked for a stable power state the DRM context could not pin,
+    /// and the device is not already in `profile_standard`.
     #[snafu(display(
-        "SQTT requires a stable power state (pinning it through the DRM context failed: {source}); \
-         run `amd-smi set -l stable_std`"
+        "SQTT could not pin the requested stable power state through the DRM context: {source}; \
+         trace unpinned (no `SqttConfig::pstate`) or run `amd-smi set -l stable_std`"
     ))]
     SqttPowerState {
         #[snafu(source(from(Error, Box::new)))]

@@ -71,7 +71,7 @@ fn topology(se: u32) -> SqttTopology {
 }
 
 fn config(se_mask: u32) -> SqttConfig {
-    SqttConfig { se_mask, simd: 2, bytes_per_se: WINDOW, limit_cu: false }
+    SqttConfig { se_mask, simd: 2, bytes_per_se: WINDOW, limit_cu: false, pstate: None }
 }
 
 fn streams(arch: AmdArch, se: u32, config: &SqttConfig) -> (Vec<Packet>, Vec<Packet>) {
@@ -319,6 +319,34 @@ fn set_sqtt_refuses_aql_queues() {
     owner.set_sqtt(None).unwrap();
 }
 
+/// Arming pins no clock by default; a requested state is held once while re-armed at it, and taken
+/// again once another state or a disarm released it.
+#[test]
+fn set_sqtt_pins_only_a_requested_pstate() {
+    use crate::profile::StablePstate::{Peak, Standard};
+    let (iface, allocator) = mock_device(1);
+    let owner = OwnerCtx::new(Arc::clone(allocator.dev.core()), allocator);
+    let pinned = |pstate| Some(SqttConfig { pstate, ..SqttConfig::default() });
+    assert_eq!(SqttConfig::default().pstate, None, "a trace runs at the untraced clock by default");
+    owner.set_sqtt(pinned(None)).unwrap();
+    assert_eq!(iface.pstate_holds(), []);
+    owner.set_sqtt(pinned(Some(Standard))).unwrap();
+    owner.set_sqtt(pinned(Some(Standard))).unwrap();
+    assert_eq!(iface.pstate_holds(), [Standard], "a held pin carries over a re-arm");
+    owner.set_sqtt(pinned(Some(Peak))).unwrap();
+    owner.set_sqtt(None).unwrap();
+    owner.set_sqtt(pinned(Some(Peak))).unwrap();
+    assert_eq!(iface.pstate_holds(), [Standard, Peak, Peak]);
+    assert_eq!(owner.sqtt_config(), pinned(Some(Peak)));
+}
+
+#[test_case("standard" => Ok(crate::profile::StablePstate::Standard))]
+#[test_case(" peak\n" => Ok(crate::profile::StablePstate::Peak))]
+#[test_case("min_sclk" => Err("\"min_sclk\": standard or peak".to_string()))]
+fn pstate_parses(s: &str) -> Result<crate::profile::StablePstate, String> {
+    s.parse()
+}
+
 #[test]
 fn set_sqtt_arms_disarms_and_retains_code() {
     let (_iface, allocator) = mock_device(1);
@@ -344,7 +372,7 @@ fn handle_reads_each_se_window_after_retirement() {
     let signal = Arc::new(pool.acquire().unwrap());
     let finalizer = SubmissionFinalizer::timeline(Arc::clone(&signal), 1, None);
     let code = CodeImage { elf: b"\x7fELF".to_vec(), load_base: 0x1000, entry_pc: 0x1100 };
-    let cfg = SqttConfig { se_mask: 0b1, simd: 0, bytes_per_se: 4096, limit_cu: false };
+    let cfg = SqttConfig { se_mask: 0b1, simd: 0, bytes_per_se: 4096, limit_cu: false, pstate: None };
     let capture = Capture::new(&allocator, cfg, 1, Some(code.clone())).unwrap();
     let copies: Vec<u64> = decode(&capture.stop)
         .into_iter()

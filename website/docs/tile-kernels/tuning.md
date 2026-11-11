@@ -167,8 +167,10 @@ kernels together (a split's merge, a tail's partials) and an op's plan alike.
 
 On an AMD RDNA3 or RDNA4 card, `tk_bench sqtt` records an SQ thread trace (SQTT) of a GEMM
 config: the config is timed untraced first, then run once more with tracing on. Each kernel's
-trace is saved in its own directory under `--out` (`./sqtt` by default), and a report is printed:
-the traced SIMD's cycles by instruction class, the main loop's iterations and cycles per
+trace is saved in its own directory under `--out` (`./sqtt` by default), and a report is printed.
+It opens with a verdict: what limits the main loop, largest share of its cycles first, each finding
+with the instructions behind it and the knob to turn. Then come the traced SIMD's cycles by
+instruction class, the main loop's iterations and cycles per
 iteration, and the instructions that stall most. `--attribute` adds the cost model's terms next to
 the traced cycles of the instructions each term prices. `--load` reads a saved directory again,
 with no GPU:
@@ -179,6 +181,7 @@ cargo run --release -p svod-tk --example tk_bench -- sqtt --load <DIR>
 ```
 
 Only one SIMD per shader engine records instructions, so the per-instruction numbers describe the
-waves on that SIMD. Tracing pins a stable power state and slows the traced run: never compare a
-traced time with an untraced one. `SVOD_SQTT=1` traces any profiled plan the same way
+waves on that SIMD. Tracing leaves the clock to the device; `SVOD_SQTT_PSTATE=standard` (or `peak`)
+pins a stable power state for repeatable cycle counts and slows the traced run. Tracing perturbs
+the run either way: never compare a traced time with an untraced one. `SVOD_SQTT=1` traces any profiled plan the same way
 (`ExecutionPlan::profile`, saved under `SVOD_SQTT_DIR`).

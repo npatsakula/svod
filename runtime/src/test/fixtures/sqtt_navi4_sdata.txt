@@ -1,6 +1,9 @@
 == sqtt _Z9vectoropsv gfx1200 fixture=amd/navi4_sdata
-kernel     - ns untraced, - ns traced, wave span 123811 cycles, sclk - MHz
-traced     sa0 wgp1 simd3 on se0 of 1 SEs
+== verdict: largest share first; cycles are a traced wave's, an iteration (no model.trips label)
+ 1 barrier            26.3%  1816 cycles an iteration in barriers
+   knob: balance the waves' work between barriers or drop one; the late arriver is not attributed yet
+kernel     - ns untraced, - ns traced, wave span 123811 cycles, sclk - MHz, pstate unrecorded
+traced     se0 sa0 wgp1 simd3 (8 waves) of 1 SEs
 waves      8 traced (8 complete) of 256 on the traced SEs, occupancy peak 256; lifetime min 114079 med 118980 max 122448 cycles
 records    62512 stitched of 62512
 == time by class (traced SIMD, cycles summed over waves)
@@ -17,13 +20,26 @@ immediate         32          48   0.0%          16          32
 barrier          160      234837  34.9%           0      234837
 message           32         455   0.1%         220         235
 total          62512      672665 100.0%      339361      333304
-== occupancy: resident waves mean/peak over the steady window (the SE at 90% of its peak or more)
+== occupancy: resident waves mean/peak over the steady window (the SE at 90% of its p95 or more)
 limit      - (no kernel resources and workgroup in the capture)
-se0        255.8/256 over 93% of the span; 32 SIMDs 8.0/8; traced 8.0/8
+se0        255.8/256 (p95 256) over 93% of the span; 32 SIMDs 8.0/8; traced 8.0/8
   busy     matrix 0.0% valu 39.0% vmem 0.3% scalar 41.4% any 58.6%
 == main loop 0x1afc..=0x2590 (hottest, no matrix op)
 iterations/wave  min 16 med 16 max 16 (waves 8)
 cycles/iteration min 2070 med 7960 p90 11645 max 12355 (n 120)
+trips      1 an iteration (no model.trips label: per-trip figures are per iteration), 128 in the loop over 8 waves
+== main loop cycles an iteration: a traced wave's, each cycle once (issue and stall by class)
+bucket                     all   share       se0
+issue valu               324.0    4.7%     324.0
+issue salu               278.1    4.0%     278.1
+issue vmem_store           1.0    0.0%       1.0
+issue branch               2.5    0.0%       2.5
+stall valu              2250.9   32.6%    2250.9
+stall salu                47.9    0.7%      47.9
+stall vmem_store           1.8    0.0%       1.8
+barrier                 1816.0   26.3%    1816.0
+idle                    2187.3   31.7%    2187.3
+total                   6909.5  100.0%    6909.5
 == main loop: top 8 by stall
       pc    hits    cycles   lat/hit stall/hit  expo/hit  asm
   0x1b68     128     12384      96.8      95.8      51.8  v_add_nc_u32_e32 v2, -1, v1

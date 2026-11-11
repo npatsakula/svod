@@ -169,11 +169,36 @@ pub struct SqttConfig {
     /// Narrow `COMPUTE_STATIC_THREAD_MGMT_SE*` so a small grid lands on the
     /// traced WGP (restored after the dispatch).
     pub limit_cu: bool,
+    /// The stable power state held while armed; `None` traces at the clock the
+    /// device picks, as an untraced run does (a pin slows the traced run by its
+    /// lower shader clock alone).
+    pub pstate: Option<StablePstate>,
 }
 
 impl Default for SqttConfig {
     fn default() -> Self {
-        Self { se_mask: 0b11, simd: 0, bytes_per_se: 64 << 20, limit_cu: false }
+        Self { se_mask: 0b11, simd: 0, bytes_per_se: 64 << 20, limit_cu: false, pstate: None }
+    }
+}
+
+/// An amdgpu stable power state (`AMDGPU_CTX_STABLE_PSTATE_*`): fixed clocks for
+/// repeatable cycle counts, `Standard` below the boost clock, `Peak` at it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StablePstate {
+    Standard,
+    Peak,
+}
+
+impl std::str::FromStr for StablePstate {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.trim() {
+            "standard" => Ok(Self::Standard),
+            "peak" => Ok(Self::Peak),
+            other => Err(format!("{other:?}: standard or peak")),
+        }
     }
 }
 

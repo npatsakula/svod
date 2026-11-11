@@ -105,6 +105,7 @@ struct MockAmdState {
     ctx_save_areas: Vec<(u64, u32)>,
     hdp_flush_register: bool,
     during_hdp_flush: Option<Box<dyn FnOnce() + Send>>,
+    pstate_holds: Vec<crate::profile::StablePstate>,
 }
 
 /// Host-only AMD backend with page-aligned, stable allocations and explicit
@@ -156,6 +157,11 @@ impl MockAmdIface {
     /// writes after its VRAM stores; without it the flush is skipped.
     pub(crate) fn set_hdp_flush_register(&self) {
         self.state.lock().hdp_flush_register = true;
+    }
+
+    /// The stable power states SQTT arming asked to hold, in order.
+    pub(crate) fn pstate_holds(&self) -> Vec<crate::profile::StablePstate> {
+        self.state.lock().pstate_holds.clone()
     }
 
     /// Run `hook` inside the next HDP flush, after its write and before it lands.
@@ -420,7 +426,8 @@ impl AmdIface for MockAmdIface {
         self.state.lock().queue_event_mailbox
     }
 
-    fn hold_stable_pstate(&self) -> Result<Box<dyn Send + Sync>> {
+    fn hold_stable_pstate(&self, mode: crate::profile::StablePstate) -> Result<Box<dyn Send + Sync>> {
+        self.state.lock().pstate_holds.push(mode);
         Ok(Box::new(()))
     }
 

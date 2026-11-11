@@ -9,6 +9,7 @@ use svod_device::hcq::{
     DeviceQueue, QueueKind, QueueMergeLimits, SemanticLinkedPlan, TopologyOperation, TopologyOperationKind,
     TopologyResource, schedule_device_lanes,
 };
+use svod_device::profile::StablePstate;
 use svod_device::{AmdCounter, CounterSet, CudaCounter, PmcCounter};
 use svod_dtype::DeviceSpec;
 use svod_ir::UOp;
@@ -110,6 +111,25 @@ fn from_env_parses_the_origin_depth(value: Option<&str>, expected: Option<usize>
     let parsed = ProfileOptions::from_env().origin_depth;
     unsafe { std::env::remove_var("SVOD_ORIGIN_DEPTH") };
     assert_eq!(parsed, expected, "SVOD_ORIGIN_DEPTH={value:?}");
+}
+
+/// `SVOD_SQTT_PSTATE` picks the traced pass's pin; unset or unknown leaves the clock to the device.
+#[test_case(None, None; "unset")]
+#[test_case(Some("standard"), Some(StablePstate::Standard); "standard")]
+#[test_case(Some("peak"), Some(StablePstate::Peak); "peak")]
+#[test_case(Some("min_sclk"), None; "unknown")]
+fn from_env_parses_the_sqtt_pstate(value: Option<&str>, expected: Option<StablePstate>) {
+    static ENV: Mutex<()> = Mutex::new(());
+    let _guard = ENV.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    unsafe {
+        match value {
+            Some(value) => std::env::set_var("SVOD_SQTT_PSTATE", value),
+            None => std::env::remove_var("SVOD_SQTT_PSTATE"),
+        }
+    }
+    let parsed = ProfileOptions::from_env().sqtt_pstate;
+    unsafe { std::env::remove_var("SVOD_SQTT_PSTATE") };
+    assert_eq!(parsed, expected, "SVOD_SQTT_PSTATE={value:?}");
 }
 
 #[test]

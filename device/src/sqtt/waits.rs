@@ -85,6 +85,8 @@ struct Bound {
     pc: u64,
     /// The binding's issue to the wait's release.
     latency: i64,
+    /// The binding's issue to the wait's arrival: the other work that covered its latency.
+    cover: i64,
     /// Back edges the wave took between the binding's issue and the wait.
     distance: u32,
     outstanding: u32,
@@ -106,10 +108,13 @@ pub struct Binding {
     /// `(instructions in flight on its counter at its issue, itself included; latency)` over the stalled
     /// waits: flat means latency-bound, rising means queueing.
     pub by_outstanding: Vec<(u32, Spread)>,
+    /// Its issue to the arrival of each wait it bound: the cycles of other work that covered its
+    /// latency, the hiding window. A wait that stalled arrived `latency - cover` early.
+    pub cover: Spread,
     /// The stall cycles of the waits it bound: its exposed latency.
     pub stall: i64,
-    /// `(wait pc, instances)`.
-    pub waits: Vec<(u64, usize)>,
+    /// `(wait pc, instances, stall)`.
+    pub waits: Vec<(u64, usize, i64)>,
     /// `(loop back edges taken between its issue and the wait, instances)`: the prefetch distance.
     pub distance: Vec<(u32, usize)>,
 }
@@ -174,9 +179,10 @@ impl Waits {
             count: usize,
             approx: usize,
             latency: Vec<i64>,
+            cover: Vec<i64>,
             by_outstanding: BTreeMap<u32, Vec<i64>>,
             stall: i64,
-            waits: BTreeMap<u64, usize>,
+            waits: BTreeMap<u64, (usize, i64)>,
             distance: BTreeMap<u32, usize>,
         }
         let (mut bindings, mut sites) = (BTreeMap::<u64, Acc>::new(), BTreeMap::<u64, Site>::new());
@@ -201,12 +207,14 @@ impl Waits {
                 acc.latency.push(b.latency);
                 acc.by_outstanding.entry(b.outstanding).or_default().push(b.latency);
             }
+            acc.cover.push(b.cover);
             acc.stall += hit.stall;
-            *acc.waits.entry(hit.pc - base).or_default() += 1;
+            let wait = acc.waits.entry(hit.pc - base).or_default();
+            (wait.0, wait.1) = (wait.0 + 1, wait.1 + hit.stall);
             *acc.distance.entry(b.distance).or_default() += 1;
         }
         for (&pc, acc) in &bindings {
-            for (&wait, &n) in &acc.waits {
+            for (&wait, &(n, _)) in &acc.waits {
                 sites.get_mut(&(wait + base)).expect("a bound wait's site").bindings.push((pc - base, n));
             }
         }
@@ -223,8 +231,9 @@ impl Waits {
                 approx: acc.approx,
                 latency: Spread::of(acc.latency),
                 by_outstanding: acc.by_outstanding.into_iter().map(|(n, l)| (n, spread(l))).collect(),
+                cover: spread(acc.cover),
                 stall: acc.stall,
-                waits: acc.waits.into_iter().collect(),
+                waits: acc.waits.into_iter().map(|(pc, (n, stall))| (pc, n, stall)).collect(),
                 distance: acc.distance.into_iter().collect(),
             })
             .collect();
@@ -289,6 +298,7 @@ fn retire(queues: &mut [VecDeque<Pending>], wait: Wait, record: &Instruction, ed
     bound.map(|p| Bound {
         pc: p.pc,
         latency: release - p.issue,
+        cover: record.time - p.issue,
         distance: edges - p.edges,
         outstanding: p.outstanding,
         approx,

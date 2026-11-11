@@ -1,5 +1,5 @@
 //! Resident waves over time from a shader engine's occupancy events, which cover every wave of the SE:
-//! per SIMD and in all, over the steady window where the dispatch keeps the SE near its peak; and the
+//! per SIMD and in all, over the steady window where the dispatch keeps the SE near its robust peak; and the
 //! traced SIMD's pipe busy shares over that window from [`hidden::Pipes`](super::hidden::Pipes).
 
 use std::collections::{BTreeMap, HashSet};
@@ -10,8 +10,12 @@ use super::Unit;
 use super::hidden::{Busy, Pipes};
 use super::wave::{Cause, Occupancy};
 
-/// The steady window holds the SE at this share of its peak resident waves or more.
+/// The steady window holds the SE at this share of its robust peak or more.
 pub const STEADY: (u32, u32) = (9, 10);
+/// The robust peak: the resident waves the SE holds or fewer for this share of its span. The true
+/// peak passes the kernel's limit where waves free their registers (`MSG_DEALLOC_VGPRS`) before they
+/// end and the next workgroup starts beside their tails, which would narrow the window to its spikes.
+pub const ROBUST: (u32, u32) = (95, 100);
 
 /// A SIMD's resident waves over the steady window: their sum over its cycles, and the most at once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,7 +42,9 @@ impl Simd {
 pub struct Residency {
     /// Waves resident on the SE at once, at most.
     pub peak: u32,
-    /// `[from, to)`: from the SE first holding [`STEADY`] of `peak` to it last dropping below.
+    /// The time-weighted [`ROBUST`] percentile of the SE's resident waves over its span.
+    pub robust_peak: u32,
+    /// `[from, to)`: from the SE first holding [`STEADY`] of `robust_peak` to it last dropping below.
     pub window: (i64, i64),
     /// The SE's resident waves summed over the window's cycles.
     pub wave_cycles: i64,
@@ -72,7 +78,8 @@ impl Residency {
         let ends: Vec<i64> = segments.iter().skip(1).map(|s| s.0).collect();
         let held: Vec<_> = segments.iter().zip(ends).map(|(s, to)| (s.0, to, s.1, &s.2)).collect();
         let peak = held.iter().map(|s| s.2).max().filter(|&p| p > 0)?;
-        let steady = |total: u32| total * STEADY.1 >= peak * STEADY.0;
+        let robust_peak = percentile(held.iter().map(|s| (s.2, s.1 - s.0)), ROBUST).max(1);
+        let steady = |total: u32| total * STEADY.1 >= robust_peak * STEADY.0;
         let from = held.iter().find(|s| steady(s.2))?.0;
         let to = held.iter().rev().find(|s| steady(s.2))?.1;
         let mut simds = BTreeMap::<Key, (i64, u32)>::new();
@@ -92,7 +99,7 @@ impl Residency {
             .into_iter()
             .map(|((sa, wgp, simd), (wave_cycles, peak))| Simd { sa, wgp, simd, wave_cycles, cycles: to - from, peak })
             .collect();
-        Some(Self { peak, window: (from, to), wave_cycles: total, simds })
+        Some(Self { peak, robust_peak, window: (from, to), wave_cycles: total, simds })
     }
 
     /// The SE's time-weighted mean resident waves over the window.
@@ -103,6 +110,22 @@ impl Residency {
     pub fn simd(&self, sa: u8, wgp: u8, simd: u8) -> Option<&Simd> {
         self.simds.iter().find(|s| (s.sa, s.wgp, s.simd) == (sa, wgp, simd))
     }
+}
+
+/// The `(num, den)` time-weighted percentile of `(value, cycles)` held segments: the least value the
+/// segments at or below it hold for that share of their cycles.
+fn percentile(segments: impl Iterator<Item = (u32, i64)>, (num, den): (u32, u32)) -> u32 {
+    let mut segments: Vec<(u32, i64)> = segments.filter(|s| s.1 > 0).collect();
+    segments.sort_unstable();
+    let span: i64 = segments.iter().map(|s| s.1).sum();
+    let mut held = 0;
+    for (value, cycles) in segments {
+        held += cycles;
+        if held * i64::from(den) >= span * i64::from(num) {
+            return value;
+        }
+    }
+    0
 }
 
 /// Each pipe's busy cycles within a window of `cycles`, from AMD's utilisation intervals: a run of

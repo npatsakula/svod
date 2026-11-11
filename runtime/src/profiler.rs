@@ -23,7 +23,8 @@
 //!   degrades to timing-only (Tiers 1–3).
 //! - **Tier 5 — thread trace.** An AMD SQTT capture of one extra pass
 //!   ([`ProfileOptions::sqtt`], `SVOD_SQTT=1`): each kernel's trace saved under
-//!   its own directory and summarized ([`crate::sqtt::Analysis`]). Tracing
+//!   its own directory and summarized ([`crate::sqtt::Analysis`]). The trace
+//!   runs at the device's own clock unless `SVOD_SQTT_PSTATE` pins one; it
 //!   perturbs the dispatch, so the timing columns never come from that pass.
 //!
 //! **Accumulate-and-min policy.** Repeated runs of the same plan are merged per
@@ -403,18 +404,28 @@ pub struct ProfileOptions {
     /// under this directory ([`StageProfile::sqtt`]). The pass synchronizes
     /// after each kernel and drops its trace buffers before the next.
     pub sqtt: Option<PathBuf>,
+    /// The stable power state the traced pass pins; `None` leaves the clock to
+    /// the device, as the untimed passes do.
+    pub sqtt_pstate: Option<svod_device::profile::StablePstate>,
 }
 
 impl Default for ProfileOptions {
     fn default() -> Self {
-        Self { iters: 1, static_analysis: true, counters: PmcSelection::None, origin_depth: None, sqtt: None }
+        Self {
+            iters: 1,
+            static_analysis: true,
+            counters: PmcSelection::None,
+            origin_depth: None,
+            sqtt: None,
+            sqtt_pstate: None,
+        }
     }
 }
 
 impl ProfileOptions {
     /// Build from the `SVOD_PROFILE_ITERS` / `SVOD_PMC` / `SVOD_ORIGIN_DEPTH`
-    /// / `SVOD_SQTT` (`1`, saved under `SVOD_SQTT_DIR`, default `./sqtt`) env
-    /// vars (defaults otherwise). This is the single place profiling env vars
+    /// / `SVOD_SQTT` (`1`, saved under `SVOD_SQTT_DIR`, default `./sqtt`) /
+    /// `SVOD_SQTT_PSTATE` (`standard` or `peak`) env vars (defaults otherwise). This is the single place profiling env vars
     /// are read; callers that want explicit control construct [`ProfileOptions`]
     /// directly.
     pub fn from_env() -> Self {
@@ -428,6 +439,9 @@ impl ProfileOptions {
         o.origin_depth = parse_origin_depth(&std::env::var("SVOD_ORIGIN_DEPTH").unwrap_or_default());
         if std::env::var("SVOD_SQTT").as_deref() == Ok("1") {
             o.sqtt = Some(std::env::var_os("SVOD_SQTT_DIR").map_or_else(|| "sqtt".into(), PathBuf::from));
+        }
+        if let Ok(v) = std::env::var("SVOD_SQTT_PSTATE") {
+            o.sqtt_pstate = v.parse().inspect_err(|e| eprintln!("SVOD_SQTT_PSTATE={e}; tracing unpinned")).ok();
         }
         o
     }

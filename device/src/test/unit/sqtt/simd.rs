@@ -31,15 +31,26 @@ fn steady_window_skips_orphans_and_context_switches() {
         event(90, 0, 2, false, Wave),
     ];
     let r = Residency::new(&events).unwrap();
-    assert_eq!((r.peak, r.window, r.wave_cycles), (4, (30, 60), 4 * 30));
+    assert_eq!((r.peak, r.robust_peak, r.window, r.wave_cycles), (4, 4, (30, 60), 4 * 30));
     let simd = |simd| Simd { sa: 0, wgp: 1, simd, wave_cycles: 2 * 30, cycles: 30, peak: 2 };
     assert_eq!(r.simds, [simd(0), simd(1)]);
     assert_eq!((r.mean(), r.simd(0, 1, 1).unwrap().mean()), (4.0, 2.0));
     assert!(Residency::new(&events[..1]).is_none(), "an orphan alone is no wave");
 }
 
+/// Four waves through `[0, 100)` and a fifth for two cycles: the spike sets the peak, the window
+/// spans the four.
+#[test]
+fn robust_peak_ignores_a_spike() {
+    let mut events: Vec<Occupancy> = (0..4).map(|w| event(0, w, 0, true, Cause::Wave)).collect();
+    events.extend([event(50, 0, 1, true, Cause::Wave), event(52, 0, 1, false, Cause::Wave)]);
+    events.extend((0..4).map(|w| event(100, w, 0, false, Cause::Wave)));
+    let r = Residency::new(&events).unwrap();
+    assert_eq!((r.peak, r.robust_peak, r.window, r.wave_cycles), (5, 4, (0, 100), 4 * 100 + 2));
+}
+
 /// svod's GEMMs: v1 and v3 hold 4 waves on each of an SE's 30 busy SIMDs through the window; the
-/// Strix GEMM 4 on average and 8 at a workgroup's handover.
+/// Strix GEMM 4 on average (a few SIMDs drain early, 3.9) and 8 at a workgroup's handover.
 #[test_case("svod/rdna4_gemm_v1", 120, 30, 4)]
 #[test_case("svod/rdna4_gemm_v3", 120, 30, 4)]
 #[test_case("svod/strix_smoke", 184, 40, 8)]
@@ -48,7 +59,8 @@ fn fixture_residency(name: &str, max_peak: u32, simds: usize, simd_peak: u32) {
     for trace in &s.traces {
         let r = Residency::new(&trace.occupancy).unwrap();
         assert!(r.peak <= max_peak && r.simds.len() == simds, "{r:?}");
-        assert!(r.simds.iter().all(|x| (x.mean() - 4.0).abs() < 0.05 && x.peak <= simd_peak), "{name}");
+        let means: Vec<f64> = r.simds.iter().map(Simd::mean).collect();
+        assert!(r.simds.iter().all(|x| (x.mean() - 4.0).abs() < 0.1 && x.peak <= simd_peak), "{name}: {means:?}");
         let h = trace.header;
         if !trace.waves.is_empty() {
             assert!(r.simd(h.dsa, h.dwgp, h.dsimd).is_some(), "the traced SIMD held waves");
@@ -83,7 +95,7 @@ proptest! {
         let (lo, hi) = (raw.iter().map(|e| e.0).min().unwrap(), raw.iter().map(|e| e.0).max().unwrap());
         prop_assert!(lo <= r.window.0 && r.window.0 < r.window.1 && r.window.1 <= hi);
         prop_assert_eq!(r.simds.iter().map(|s| s.wave_cycles).sum::<i64>(), r.wave_cycles);
-        prop_assert!(r.mean() <= f64::from(r.peak) && r.peak > 0);
+        prop_assert!(r.mean() <= f64::from(r.peak) && r.peak > 0 && (1..=r.peak).contains(&r.robust_peak));
         prop_assert!(r.simds.iter().all(|s| s.mean() <= f64::from(s.peak) && s.peak <= r.peak));
     }
 }

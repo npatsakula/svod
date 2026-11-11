@@ -9,7 +9,8 @@ use test_case::test_case;
 
 use svod_device::amd::occupancy::Limiter;
 
-use super::{Analysis, Capture, Class, Spread};
+use super::verdict::Buckets;
+use super::{Analysis, Approx, Capture, Class, Evidence, FindingKind, Partition, Pstate, Spread};
 
 fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../device/src/test/fixtures/sqtt")
@@ -50,6 +51,7 @@ fn capture(fixture: &str) -> Capture {
         resources: None,
         workgroup: None,
         grid: None,
+        pstate: None,
     }
 }
 
@@ -93,6 +95,25 @@ fn summarizes(fixture: &str) {
     assert!(a.summary().starts_with(&a.kernel));
     assert_eq!(a.waits.waves + a.waits.skipped, a.waves);
     assert!(text.contains("== waits: "));
+    assert_eq!(
+        a.traced.iter().map(|t| (t.waves, t.complete)).fold((0, 0), |s, t| (s.0 + t.0, s.1 + t.1)),
+        (a.waves, a.complete)
+    );
+    assert!(a.verdict.windows(2).all(|w| w[0].share >= w[1].share), "largest share first");
+    assert!(text.lines().nth(1).unwrap().starts_with("== verdict"), "the verdict leads: {text}");
+    if let Some(l) = &a.main_loop {
+        let p = &l.partition;
+        assert_eq!(p.buckets(), p.cycles, "{fixture}: every loop cycle in one bucket");
+        let mut sum = Partition::default();
+        l.ses.iter().for_each(|s| sum.add(&s.partition));
+        assert_eq!(&sum, p, "the SEs' partitions add up");
+        let edges = a.pcs.iter().find(|r| r.pc == l.back_edge).unwrap().hits;
+        assert_eq!(
+            (l.trips.total, l.trips.labelled, l.trips.per_iteration),
+            (edges, false, 1),
+            "unlabelled: per iteration"
+        );
+    }
 }
 
 /// The waits report ELF PCs, as the rest of the analysis: v3's select pulls the ring fill's first wait
@@ -143,10 +164,14 @@ fn finds_the_main_loop() {
 }
 
 /// The text an agent reads, fixed: `SVOD_SQTT_BLESS=1` rewrites the expected file after a deliberate change.
-#[test]
-fn text_is_stable() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/test/fixtures/sqtt_navi4_sdata.txt");
-    let text = replayed("amd/navi4_sdata").text(8);
+#[test_case("amd/navi4_sdata", "sqtt_navi4_sdata.txt")]
+#[test_case("svod/rdna4_gemm_v1", "sqtt_rdna4_gemm_v1.txt")]
+fn text_is_stable(fixture: &str, golden: &str) {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/test/fixtures").join(golden);
+    let text = match fixture.strip_prefix("svod/") {
+        Some(name) => Analysis::load(&fixtures().join("svod").join(name)).unwrap().text(8),
+        None => replayed(fixture).text(8),
+    };
     if std::env::var_os("SVOD_SQTT_BLESS").is_some() {
         std::fs::write(&path, &text).unwrap();
     }
@@ -310,8 +335,10 @@ fn occupancy_beside_the_limit(name: &str, grid: [u32; 3], by: &[Limiter], peak: 
     assert_eq!(occ.ses.len(), a.ses.len(), "every SE's residency");
     for se in &occ.ses {
         let r = &se.residency;
-        let se_peak = a.ses.iter().find(|s| s.se == se.se).unwrap().occupancy_peak;
-        assert!(r.window.0 < r.window.1 && r.mean() <= r.peak as f64 && r.peak as usize <= se_peak);
+        let s = a.ses.iter().find(|s| s.se == se.se).unwrap();
+        assert!(r.window.0 < r.window.1 && r.mean() <= r.peak as f64 && r.peak as usize <= s.occupancy_peak);
+        let window = (r.window.1 - r.window.0) as f64 / s.span as f64;
+        assert!(window > 0.9, "{name} se{}: the robust peak's window spans the dispatch, {window:.2}", se.se);
         let simds: i64 = r.simds.iter().map(|s| s.wave_cycles).sum();
         assert_eq!(simds, r.wave_cycles, "the SIMDs' waves add up to the SE's");
         assert_eq!(se.busy.is_some(), se.traced.is_some());
@@ -346,4 +373,179 @@ fn rows_carry_hidden_latency() {
         assert!((0..=r.latency - r.stall).contains(&r.hidden_issue), "{r:?}");
     }
     assert!(a.pcs.iter().any(|r| r.hidden_stall > 0 && r.hidden_issue > 0));
+}
+
+fn verdict_of(name: &str) -> Analysis {
+    Analysis::load(&fixtures().join("svod").join(name)).unwrap()
+}
+
+/// The VALU and SALU cycles a trip in the main loop, their stall included.
+fn alu_per_trip(a: &Analysis) -> f64 {
+    let l = a.main_loop.as_ref().unwrap();
+    let alu = [Class::Valu, Class::Salu];
+    (l.partition.issued(&alu) + l.partition.stalled(&alu)) as f64 / l.trips.total as f64
+}
+
+fn loads(a: &Analysis, kind: FindingKind) -> (f64, Vec<super::Load>) {
+    let f = a.verdict.iter().find(|f| f.kind == kind).unwrap_or_else(|| panic!("{kind:?} in {:?}", a.verdict));
+    let Evidence::Waits { loads, .. } = &f.evidence else { panic!("{f:?}") };
+    (f.share, loads.clone())
+}
+
+/// svod's ring GEMM (160 K-trips of 32, unrolled by 2): v1 waits on its A/B fill after the trip's
+/// matrix work, so the loads' latency is mostly covered and the barriers lead; v3's select pulls
+/// the waits up to just after issue (cover ~nothing of a ~1000-cycle latency), so its exposed loads
+/// lead and its guard arithmetic adds ~280 VALU cycles a trip. All three captures pinned the clock
+/// at the standard pstate and ran over 1.2x the untraced time.
+#[test]
+fn verdict_names_the_ring_gemm_limiters() {
+    let (v1, v3, strix) = (verdict_of("rdna4_gemm_v1"), verdict_of("rdna4_gemm_v3"), verdict_of("strix_smoke"));
+    for a in [&v1, &v3, &strix] {
+        let t = a.main_loop.as_ref().unwrap().trips;
+        assert_eq!((t.per_iteration, t.labelled), (2, true), "160 trips over 79 iterations and the head's");
+        assert_eq!(a.pstate, Some(Pstate::Standard));
+        assert!(a.verdict.iter().all(|f| f.approx.contains(&Approx::Perturbed)), "{:?}", a.verdict);
+    }
+    assert!(matches!(v1.verdict[0].kind, FindingKind::Barrier | FindingKind::LoadExposed), "{:?}", v1.verdict);
+    let (v1_share, v1_loads) = loads(&v1, FindingKind::LoadExposed);
+    let pcs: Vec<u64> = v1_loads.iter().map(|l| l.pc).collect();
+    assert_eq!(pcs[..2], [0x9a0, 0x96c], "the A/B fill's last loads");
+    for l in &v1_loads {
+        let latency = l.latency.unwrap().median;
+        assert!(l.distance == [(0, l.waits)] && l.cover.median * 10 > latency * 8, "mostly covered: {l:?}");
+    }
+    let (v3_share, v3_loads) = loads(&v3, FindingKind::LoadExposed);
+    assert_eq!(v3.verdict[0].kind, FindingKind::LoadExposed);
+    assert!(v3_share > 2.0 * v1_share, "{v3_share} vs {v1_share}");
+    let top = &v3_loads[0];
+    assert_eq!((top.pc, top.stalled, top.waits), (0xa64, 316, 316));
+    assert!(top.cover.median * 10 < top.latency.unwrap().median, "waited right after issue: {top:?}");
+    let added = alu_per_trip(&v3) - alu_per_trip(&v1);
+    assert!((260.0..300.0).contains(&added), "v3's guards: {added:.1} VALU+SALU cycles a trip");
+    assert!(v3.verdict.iter().any(|f| f.kind == FindingKind::LoopOverhead));
+    assert!(!v1.verdict.iter().any(|f| f.kind == FindingKind::LoopOverhead), "{:?}", v1.verdict);
+    let bound = [FindingKind::MatrixBound, FindingKind::IssueBound];
+    assert!(strix.occupancy.untimed_matrix && !strix.verdict.iter().any(|f| bound.contains(&f.kind)));
+    let overhead = strix.verdict.iter().find(|f| f.kind == FindingKind::LoopOverhead).unwrap();
+    let Evidence::Overhead { divergent, .. } = &overhead.evidence else { panic!("{overhead:?}") };
+    assert!(divergent.iter().any(|(pc, asm)| *pc == 0x920 && asm.starts_with("s_cbranch_execz")), "{divergent:?}");
+    assert!(strix.text(4).contains("note       gfx11 traces matrix ops as 1-cycle tokens"));
+}
+
+fn record(time: i64, duration: i64, stall: i64, pc: u64) -> svod_device::sqtt::wave::Instruction {
+    svod_device::sqtt::wave::Instruction { time, category: svod_device::sqtt::Category::Valu, duration, stall, pc }
+}
+
+fn wave(instructions: Vec<svod_device::sqtt::wave::Instruction>) -> svod_device::sqtt::wave::Wave {
+    svod_device::sqtt::wave::Wave {
+        unit: svod_device::sqtt::Unit { sa: 0, wgp: 0, simd: 0, wave: 0 },
+        me: 0,
+        pipe: 0,
+        begin: 0,
+        end: 0,
+        complete: true,
+        contexts: 0,
+        exclude_barrier_wait: false,
+        instructions,
+        pcs: vec![],
+    }
+}
+
+/// A loop at 0x10..=0x20 of a VALU op, a wait, a barrier: overlapping records count once, a stall
+/// apart from its issue, gaps as idle; records before the loop and after its last record don't count.
+#[test]
+fn partition_counts_each_cycle_once() {
+    let lines = [
+        (0x0, "v_mov_b32 v0, 0"),
+        (0x10, "v_add_f32 v0, v1, v2"),
+        (0x14, "s_wait_loadcnt 0x0"),
+        (0x18, "s_barrier_wait 0xffff"),
+        (0x20, "s_cbranch_scc0 65530"),
+    ];
+    let records = vec![
+        record(0, 5, 0, 0x0),
+        record(10, 6, 2, 0x10),
+        record(14, 4, 4, 0x14),
+        record(20, 10, 0, 0x18),
+        record(25, 1, 0, 0x20),
+        record(40, 3, 0, 0x0),
+    ];
+    let p = Buckets::new(&lines).partition(&[wave(records)], 0x10..=0x20);
+    let expect = Partition {
+        waves: 1,
+        cycles: 20,
+        issue: vec![(Class::Valu, 4)],
+        stall: vec![(Class::Valu, 2)],
+        wait: vec![(svod_device::sqtt::asm::Counter::Load, 2)],
+        barrier: 10,
+        idle: 2,
+    };
+    assert_eq!(p, expect);
+}
+
+proptest! {
+    /// Whatever the records, the buckets add up to the cycles from each wave's first loop record to
+    /// the latest end of its records through its last.
+    #[test]
+    fn partition_adds_up(
+        waves in prop::collection::vec(
+            prop::collection::vec((-20i64..200, 0i64..40, 0i64..40, 0usize..5), 1..40),
+            1..4,
+        ),
+    ) {
+        let lines = [
+            (0x0, "v_mov_b32 v0, 0"),
+            (0x10, "ds_load_b128 v[0:3], v4"),
+            (0x14, "s_waitcnt vmcnt(0) lgkmcnt(0)"),
+            (0x18, "s_barrier"),
+            (0x20, "s_cbranch_scc0 65530"),
+        ];
+        let pcs = [0x0, 0x10, 0x14, 0x18, 0x20];
+        let waves: Vec<_> = waves
+            .iter()
+            .map(|w| wave(w.iter().map(|&(t, d, s, pc)| record(t, d, s.min(d), pcs[pc])).collect()))
+            .collect();
+        let p = Buckets::new(&lines).partition(&waves, 0x10..=0x20);
+        prop_assert_eq!(p.buckets(), p.cycles);
+        let expected: i64 = waves
+            .iter()
+            .filter_map(|w| {
+                let inside = |i: &svod_device::sqtt::wave::Instruction| i.pc != 0;
+                let (first, last) = (w.instructions.iter().position(inside)?, w.instructions.iter().rposition(inside)?);
+                let records = &w.instructions[first..=last];
+                Some(records.iter().map(|r| r.time + r.duration).max().unwrap().max(records[0].time) - records[0].time)
+            })
+            .sum();
+        prop_assert_eq!(p.cycles, expected);
+    }
+}
+
+/// The findings no fixture reaches, from v1 with its pipes or residency moved past their thresholds:
+/// a busy matrix pipe is matrix-bound on gfx12 alone, a busy SIMD mostly not on matrix work is
+/// issue-bound, and one wave a SIMD cannot hide the loop's stall.
+#[test]
+fn busy_and_occupancy_findings_fire_past_their_thresholds() {
+    use FindingKind::{IssueBound, MatrixBound, OccupancyLimited};
+    let kinds = |a: &Analysis| super::verdict::rank(a).iter().map(|f| f.kind).collect::<Vec<_>>();
+    let mut a = verdict_of("rdna4_gemm_v1");
+    assert!(!kinds(&a).iter().any(|k| [MatrixBound, IssueBound, OccupancyLimited].contains(k)), "{:?}", a.verdict);
+    let busy = |a: &mut Analysis, matrix: i64, any: i64| {
+        for b in a.occupancy.ses.iter_mut().filter_map(|s| s.busy.as_mut()) {
+            (b.matrix, b.any) = (b.cycles * matrix / 100, b.cycles * any / 100);
+        }
+    };
+    busy(&mut a, 90, 95);
+    assert_eq!(kinds(&a)[0], MatrixBound);
+    a.occupancy.untimed_matrix = true;
+    assert!(!kinds(&a).contains(&MatrixBound), "gfx11 cannot tell");
+    a.occupancy.untimed_matrix = false;
+    busy(&mut a, 30, 95);
+    assert!(kinds(&a).contains(&IssueBound) && !kinds(&a).contains(&MatrixBound));
+    for t in a.occupancy.ses.iter_mut().filter_map(|s| s.traced.as_mut()) {
+        t.wave_cycles = t.cycles;
+    }
+    let f = super::verdict::rank(&a).into_iter().find(|f| f.kind == OccupancyLimited).unwrap();
+    let Evidence::Occupancy { observed, need, .. } = f.evidence else { panic!("{f:?}") };
+    assert!(observed == 1.0 && need > 1.5 && f.share > 0.0 && f.approx == [Approx::Perturbed], "{f:?}");
+    assert!(f.knob.contains("more workgroups"), "no limit known: {}", f.knob);
 }

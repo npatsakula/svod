@@ -1568,8 +1568,10 @@ impl ExecutionPlan {
         self.poison_hcq(result)
     }
 
-    /// Profile the plan: run the per-dispatch path `opts.iters.max(1)` times,
-    /// keeping each kernel's minimum device time (robust to outliers). Returns
+    /// Profile the plan: on a GPU, lift its clock first
+    /// ([`warm_clock`](crate::benchmark::warm_clock)), then run the
+    /// per-dispatch path `opts.iters.max(1)` times, keeping each kernel's
+    /// minimum device time (robust to outliers). Returns
     /// a single-stage [`RunProfile`]; render it with [`RunProfile::render_table`].
     ///
     /// Tier-2/3 static analysis (`opts.static_analysis`) and Tier-4 hardware
@@ -1579,6 +1581,14 @@ impl ExecutionPlan {
     /// Counter collection perturbs the dispatch it measures, so a counted run
     /// adds one disarmed pass and reports its timing alongside the counters.
     pub fn profile(&self, opts: &ProfileOptions) -> Result<RunProfile> {
+        // A GPU idles its clock between runs; timed cold, the passes measure the clock lifting.
+        if self.device != DeviceSpec::Cpu {
+            crate::benchmark::warm_clock(crate::benchmark::CLOCK_WARMUP, || {
+                let kernels = self.execute_profiled_inner(false, false).ok()?;
+                let ns: Option<Vec<u64>> = kernels.iter().map(|k| k.gpu_end_ns?.checked_sub(k.gpu_start_ns?)).collect();
+                ns.filter(|ns| !ns.is_empty()).map(|ns| std::time::Duration::from_nanos(ns.iter().sum()))
+            });
+        }
         let start = Instant::now();
         // Tier-4: arm hardware counters on the plan's context when requested and
         // the backend supports it in a stable power state. Degrade gracefully
@@ -1656,7 +1666,7 @@ impl ExecutionPlan {
             }
         }
         if let Some(dir) = &opts.sqtt {
-            report.stages[0].sqtt = self.trace(dir, &report.stages[0].kernels)?;
+            report.stages[0].sqtt = self.trace(dir, opts.sqtt_pstate, &report.stages[0].kernels)?;
         }
         Ok(report)
     }
@@ -1678,12 +1688,19 @@ impl ExecutionPlan {
         first_program.and_then(|p| self.plan_ctx(p).ok().flatten())
     }
 
-    /// Tier 5: one more pass with the plan's context tracing (AMD SQTT), each
-    /// kernel's trace saved under `dir/<index>_<entry point>` beside its
-    /// untraced time in `untraced`. A context that cannot trace leaves a note.
-    fn trace(&self, dir: &std::path::Path, untraced: &[KernelProfile]) -> Result<Vec<SqttKernel>> {
+    /// Tier 5: one more pass with the plan's context tracing (AMD SQTT) at
+    /// `pstate` (`None`: the device's own clock), each kernel's trace saved
+    /// under `dir/<index>_<entry point>` beside its untraced time in
+    /// `untraced`. A context that cannot trace leaves a note.
+    fn trace(
+        &self,
+        dir: &std::path::Path,
+        pstate: Option<svod_device::profile::StablePstate>,
+        untraced: &[KernelProfile],
+    ) -> Result<Vec<SqttKernel>> {
         let Some(ctx) = self.first_ctx() else { return Ok(vec![]) };
-        if let Err(error) = ctx.set_sqtt(Some(svod_device::profile::SqttConfig::default())) {
+        let config = svod_device::profile::SqttConfig { pstate, ..Default::default() };
+        if let Err(error) = ctx.set_sqtt(Some(config)) {
             eprintln!("SVOD_SQTT: no thread trace on this device ({error}); skipped");
             return Ok(vec![]);
         }
@@ -1714,6 +1731,7 @@ impl ExecutionPlan {
                 profile.gpu_end_ns.zip(profile.gpu_start_ns).and_then(|(end, start)| end.checked_sub(start));
             let analysis = crate::sqtt::Capture::new(*trace, ns).and_then(|mut capture| {
                 capture.traced_ns = traced_ns;
+                capture.pstate = Some(pstate.into());
                 capture.labels.insert("kernel".into(), entry.clone());
                 capture.resources = profile.kernel.program.resource_usage();
                 capture.grid = dims.and_then(|d| d.0).map(axes);

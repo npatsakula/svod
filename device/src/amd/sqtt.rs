@@ -20,7 +20,7 @@ use crate::amd::regwrite::RegWriter;
 use crate::amd::sys::{drm, ioctl, pm4};
 use crate::amd::topology::AmdNode;
 use crate::error::{Error, Result, SqttUnsupportedSnafu};
-use crate::profile::{CodeImage, SeTrace, SqttConfig, SqttTrace};
+use crate::profile::{CodeImage, SeTrace, SqttConfig, SqttTrace, StablePstate};
 use crate::sync::DispatchTimestamps;
 
 /// `SQ_TT_RT_FREQ_4096_CLK` (gfx11 `soc` enum): a timestamp token every 4096 clocks.
@@ -392,9 +392,9 @@ impl DispatchTimestamps for SqttHandle {
     }
 }
 
-/// An amdgpu DRM context holding the device at `AMDGPU_CTX_STABLE_PSTATE_STANDARD`
-/// (Mesa RADV's route for SQTT). Freeing the context restores the level the
-/// device had. The kernel's `amdgpu_ctx_ioctl` checks no capability for it;
+/// An amdgpu DRM context holding the device at a stable power state (Mesa
+/// RADV's route for SQTT). Freeing the context restores the level the device
+/// had. The kernel's `amdgpu_ctx_ioctl` checks no capability for it;
 /// it refuses with `EBUSY` while another context holds the level.
 pub(crate) struct DrmStablePstate {
     fd: OwnedFd,
@@ -402,7 +402,7 @@ pub(crate) struct DrmStablePstate {
 }
 
 impl DrmStablePstate {
-    pub(crate) fn acquire(render: &OwnedFd) -> Result<Self> {
+    pub(crate) fn acquire(render: &OwnedFd, mode: StablePstate) -> Result<Self> {
         let fd = render
             .try_clone()
             .map_err(|e| Error::AmdIoctl { ioctl: "dup(render node)", errno: e.raw_os_error().unwrap_or(0) })?;
@@ -416,7 +416,10 @@ impl DrmStablePstate {
         let mut args = drm::drm_amdgpu_ctx {
             in_: drm::drm_amdgpu_ctx_in {
                 op: drm::AMDGPU_CTX_OP_SET_STABLE_PSTATE,
-                flags: drm::AMDGPU_CTX_STABLE_PSTATE_STANDARD,
+                flags: match mode {
+                    StablePstate::Standard => drm::AMDGPU_CTX_STABLE_PSTATE_STANDARD,
+                    StablePstate::Peak => drm::AMDGPU_CTX_STABLE_PSTATE_PEAK,
+                },
                 ctx_id,
                 ..Default::default()
             },

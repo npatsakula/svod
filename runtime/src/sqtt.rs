@@ -11,16 +11,19 @@ use std::process::{Command, Stdio};
 use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt, Snafu};
 use svod_device::amd::occupancy::{Cu, Limit, limits};
-use svod_device::profile::{CodeImage, KernelResources, SeTrace, SqttTrace};
+use svod_device::profile::{CodeImage, KernelResources, SeTrace, SqttTrace, StablePstate};
 use svod_device::sqtt::asm::{self, Access, Counter, Kind, Memory, Space};
 use svod_device::sqtt::hidden::{self, Hidden, Pipes};
 pub use svod_device::sqtt::report::Spread;
 use svod_device::sqtt::report::{Report, Stats};
-use svod_device::sqtt::simd::{PipeBusy, Residency, STEADY, Simd};
+use svod_device::sqtt::simd::{PipeBusy, ROBUST, Residency, STEADY, Simd};
 use svod_device::sqtt::stitch::{Stitcher, branch, objdump_lines};
 use svod_device::sqtt::waits::Waits;
 use svod_device::sqtt::{Layout, decode, wave};
 use svod_dtype::AmdArch;
+
+mod verdict;
+pub use verdict::{Approx, Evidence, Finding, FindingKind, Load, Partition, Stall};
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
@@ -89,6 +92,38 @@ pub struct Capture {
     pub resources: Option<KernelResources>,
     pub workgroup: Option<[u32; 3]>,
     pub grid: Option<[u32; 3]>,
+    /// The power state the traced dispatch ran at; `None` where the capture predates the record.
+    pub pstate: Option<Pstate>,
+}
+
+/// The power state a traced dispatch ran at: the device's own clock, or a stable state pinned
+/// through the DRM context ([`StablePstate`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Pstate {
+    Unpinned,
+    Standard,
+    Peak,
+}
+
+impl From<Option<StablePstate>> for Pstate {
+    fn from(pin: Option<StablePstate>) -> Self {
+        match pin {
+            None => Self::Unpinned,
+            Some(StablePstate::Standard) => Self::Standard,
+            Some(StablePstate::Peak) => Self::Peak,
+        }
+    }
+}
+
+impl Pstate {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Unpinned => "unpinned",
+            Self::Standard => "standard",
+            Self::Peak => "peak",
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -108,6 +143,8 @@ struct Meta {
     workgroup: Option<[u32; 3]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     grid: Option<[u32; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pstate: Option<Pstate>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -134,6 +171,7 @@ impl Capture {
             resources: None,
             workgroup: None,
             grid: None,
+            pstate: None,
         })
     }
 
@@ -163,6 +201,7 @@ impl Capture {
             resources: self.resources,
             workgroup: self.workgroup,
             grid: self.grid,
+            pstate: self.pstate,
         };
         let path = dir.join("meta.json");
         write("meta.json", serde_json::to_string_pretty(&meta).context(JsonSnafu { path })?.as_bytes())
@@ -201,6 +240,7 @@ impl Capture {
             resources: meta.resources,
             workgroup: meta.workgroup,
             grid: meta.grid,
+            pstate: meta.pstate,
         })
     }
 
@@ -307,12 +347,15 @@ pub struct Se {
     pub span: i64,
 }
 
-/// The SIMD whose instructions an SE traced.
+/// The SIMD whose instructions an SE traced, and its waves (those whose end the trace holds).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Traced {
+    pub se: u32,
     pub sa: u8,
     pub wgp: u8,
     pub simd: u8,
+    pub waves: usize,
+    pub complete: usize,
 }
 
 /// One instruction's cycles summed over the traced waves; `pc` is its ELF address.
@@ -342,7 +385,7 @@ pub struct ClassTime {
 }
 
 /// The innermost loop (a backward branch's span) issuing a matrix instruction, else the hottest one.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MainLoop {
     /// ELF addresses of the loop head and its back edge.
     pub head: u64,
@@ -352,6 +395,31 @@ pub struct MainLoop {
     pub iterations: Option<Spread>,
     /// Cycles between a wave's consecutive back edges.
     pub cycles: Option<Spread>,
+    pub trips: Trips,
+    /// The traced waves' cycles in the loop, over every traced SE.
+    pub partition: Partition,
+    /// The same, SE by SE.
+    pub ses: Vec<SeLoop>,
+}
+
+/// The unit per-trip figures are in: a trip of the kernel's reduction (`model.trips`, the trips a
+/// wave runs, labels the capture), else one loop iteration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Trips {
+    /// Trips an iteration runs: `model.trips` over a wave's iterations plus the one its head and
+    /// drain run between them, else 1.
+    pub per_iteration: u32,
+    pub labelled: bool,
+    /// Trips the traced waves ran in the loop: their back-edge executions times `per_iteration`.
+    pub total: u64,
+}
+
+/// One traced SE's waves in the main loop.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeLoop {
+    pub se: u32,
+    pub trips: u64,
+    pub partition: Partition,
 }
 
 /// How many waves the kernel's resources let a SIMD hold, and how many the trace saw resident.
@@ -378,16 +446,22 @@ pub struct SeOccupancy {
     pub busy: Option<PipeBusy>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A trace's reading. Its JSON ([`Self::to_json`]) keeps these key names, which a reader may rely
+/// on: `verdict` (ranked [`Finding`]s: `kind`, `share`, `evidence`, `knob`, `approx`), `main_loop`
+/// (`trips`; `partition` with `waves`, `cycles`, `issue`, `stall`, `wait`, `barrier`, `idle`; the
+/// same per SE in `ses`), `occupancy`, `waits`, `pcs`, `classes`, `traced`, `ses`, `pstate` and
+/// the header fields.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Analysis {
     pub kernel: String,
     pub arch: String,
     pub labels: BTreeMap<String, String>,
     pub kernel_ns: Option<u64>,
     pub traced_ns: Option<u64>,
+    pub pstate: Option<Pstate>,
     pub ses: Vec<Se>,
-    /// The traced SIMD of the first instruction-traced SE.
-    pub traced: Traced,
+    /// Each instruction-traced SE's traced SIMD.
+    pub traced: Vec<Traced>,
     /// Waves on the traced SIMDs, and those whose end the trace holds.
     pub waves: usize,
     pub complete: usize,
@@ -405,6 +479,8 @@ pub struct Analysis {
     /// What the traced waves' waits waited for.
     pub waits: Waits,
     pub occupancy: Occupancy,
+    /// What limits the main loop, largest share first.
+    pub verdict: Vec<Finding>,
 }
 
 /// The `<name>` of an `llvm-objdump` label line, `0000000000001700 <name>:`, with its address.
@@ -434,7 +510,10 @@ impl Analysis {
         let base = code.load_base;
         let lines: Vec<(u64, &str)> =
             objdump_lines(&capture.disassembly).into_iter().map(|(pc, line)| (pc + base, line)).collect();
-        let (mut ses, mut traced, mut waves, mut pcs) = (vec![], None, vec![], BTreeMap::<u64, Stats>::new());
+        let (mut ses, mut traced, mut layout) = (vec![], vec![], None);
+        // The traced SEs' waves, SE by SE: `(se, range)` into `waves`.
+        let (mut waves, mut by_se) = (vec![], vec![]);
+        let mut pcs = BTreeMap::<u64, Stats>::new();
         let matrix = hidden::matrix_pcs(&lines);
         let (mut hidden, mut occupancy) = (BTreeMap::<u64, Hidden>::new(), vec![]);
 
@@ -459,7 +538,7 @@ impl Analysis {
                 span,
             });
             let residency = Residency::new(&trace.occupancy);
-            let layout = match trace.header.version {
+            let se_layout = match trace.header.version {
                 3 => Layout::Rdna3,
                 4 => Layout::Rdna4,
                 _ => continue,
@@ -475,8 +554,8 @@ impl Analysis {
                 continue;
             }
             let h = trace.header;
-            traced.get_or_insert((Traced { sa: h.dsa, wgp: h.dwgp, simd: h.dsimd }, layout));
-            let mut stitcher = Stitcher::new(&lines, layout);
+            layout.get_or_insert(se_layout);
+            let mut stitcher = Stitcher::new(&lines, se_layout);
             for wave in &mut trace.waves {
                 stitcher.stitch(wave);
             }
@@ -494,9 +573,18 @@ impl Analysis {
                 (at.hits, at.latency, at.stall, at.idle) =
                     (at.hits + s.hits, at.latency + s.latency, at.stall + s.stall, at.idle + s.idle);
             }
+            traced.push(Traced {
+                se: se.se,
+                sa: h.dsa,
+                wgp: h.dwgp,
+                simd: h.dsimd,
+                waves: trace.waves.len(),
+                complete: trace.waves.iter().filter(|w| w.complete).count(),
+            });
+            by_se.push((se.se, waves.len()..waves.len() + trace.waves.len()));
             waves.append(&mut trace.waves);
         }
-        let (traced, layout) = traced.context(NoItraceSnafu)?;
+        let layout = layout.context(NoItraceSnafu)?;
         let text: BTreeMap<u64, &str> = lines.iter().copied().collect();
         let rows: Vec<Row> = pcs
             .iter()
@@ -541,15 +629,19 @@ impl Analysis {
             .zip(capture.resources)
             .zip(capture.workgroup)
             .and_then(|((cu, resources), workgroup)| limits(&resources, workgroup.iter().product(), &cu));
-        Ok(Self {
+        let model_trips = capture.labels.get("model.trips").and_then(|t| t.parse().ok());
+        let traced_waves = by_se.iter().map(|(se, range)| (*se, &waves[range.clone()]));
+        let main_loop = main_loop(&lines, &pcs, traced_waves, model_trips, base);
+        let mut analysis = Self {
             kernel: kernel.to_string(),
             arch: capture.trace.arch.to_string(),
             labels: capture.labels.clone(),
             kernel_ns: capture.kernel_ns,
             traced_ns: capture.traced_ns,
-            traced,
+            pstate: capture.pstate,
             waves: waves.len(),
             complete: waves.iter().filter(|w| w.complete).count(),
+            traced,
             lifetime: Spread::of(lifetime),
             sclk_mhz: capture
                 .traced_ns
@@ -559,12 +651,15 @@ impl Analysis {
             records: waves.iter().map(|w| w.instructions.len()).sum(),
             stitched: waves.iter().flat_map(|w| &w.instructions).filter(|i| i.pc != 0).count(),
             classes: classes.into_values().collect(),
-            main_loop: main_loop(&lines, &pcs, &waves, base),
+            main_loop,
             waits: Waits::new(&waves, &lines, layout, base),
             occupancy: Occupancy { cu, limit, untimed_matrix, ses: occupancy },
             ses,
             pcs: rows,
-        })
+            verdict: vec![],
+        };
+        analysis.verdict = verdict::rank(&analysis);
+        Ok(analysis)
     }
 
     /// The rows of [`Self::main_loop`]'s body.
@@ -598,25 +693,23 @@ impl Analysis {
             let _ =
                 writeln!(o, "!! UNSTITCHED {} of {} records have no PC", self.records - self.stitched, self.records);
         }
+        verdict::text(self, &mut o);
         let ns = |ns: Option<u64>| ns.map_or("-".into(), |ns| ns.to_string());
         let span = self.ses.iter().filter(|s| s.itrace).map(|s| s.span).max().unwrap_or(0);
         let sclk = self.sclk_mhz.map_or("-".into(), |mhz| format!("~{mhz}"));
         let (untraced, traced) = (ns(self.kernel_ns), ns(self.traced_ns));
+        let ratio = verdict::slowdown(self).map_or(String::new(), |r| format!(" ({r:.2}x)"));
+        let pstate = self.pstate.map_or("unrecorded", Pstate::name);
         let _ = writeln!(
             o,
-            "kernel     {untraced} ns untraced, {traced} ns traced, wave span {span} cycles, sclk {sclk} MHz"
+            "kernel     {untraced} ns untraced, {traced} ns traced{ratio}, wave span {span} cycles, sclk {sclk} MHz, pstate {pstate}"
         );
-        let itrace: Vec<String> = self.ses.iter().filter(|s| s.itrace).map(|s| format!("se{}", s.se)).collect();
-        let t = self.traced;
-        let _ = writeln!(
-            o,
-            "traced     sa{} wgp{} simd{} on {} of {} SEs",
-            t.sa,
-            t.wgp,
-            t.simd,
-            itrace.join(","),
-            self.ses.len()
-        );
+        let traced: Vec<String> = self
+            .traced
+            .iter()
+            .map(|t| format!("se{} sa{} wgp{} simd{} ({} waves)", t.se, t.sa, t.wgp, t.simd, t.waves))
+            .collect();
+        let _ = writeln!(o, "traced     {} of {} SEs", traced.join(", "), self.ses.len());
         let lifetime = self.lifetime.map_or("-".into(), |l| format!("min {} med {} max {}", l.min, l.median, l.max));
         let starts: usize = self.ses.iter().filter(|s| s.itrace).map(|s| s.waves).sum();
         let peak = self.ses.iter().map(|s| s.occupancy_peak).max().unwrap_or(0);
@@ -666,6 +759,7 @@ impl Analysis {
                 };
                 let _ = writeln!(o, "iterations/wave  {}", spread(l.iterations, false));
                 let _ = writeln!(o, "cycles/iteration {}", spread(l.cycles, true));
+                partition_text(&mut o, l);
                 let mut rows: Vec<&Row> = self.loop_rows().collect();
                 rows.sort_by_key(|r| (std::cmp::Reverse(r.stall), r.pc));
                 let _ = writeln!(o, "== main loop: top {top} by stall");
@@ -688,8 +782,9 @@ impl Analysis {
         let (num, den) = STEADY;
         let _ = writeln!(
             o,
-            "== occupancy: resident waves mean/peak over the steady window (the SE at {}% of its peak or more)",
-            100 * num / den
+            "== occupancy: resident waves mean/peak over the steady window (the SE at {}% of its p{} or more)",
+            100 * num / den,
+            100 * ROBUST.0 / ROBUST.1
         );
         match &occ.limit {
             Some(l) => {
@@ -710,10 +805,12 @@ impl Analysis {
             let traced = se.traced.map_or(String::new(), |t| format!("; traced {:.1}/{}", t.mean(), t.peak));
             let _ = writeln!(
                 o,
-                "se{:<8} {:.1}/{} over {window:.0}% of the span; {} SIMDs {mean:.1}/{peak}{traced}",
+                "se{:<8} {:.1}/{} (p{} {}) over {window:.0}% of the span; {} SIMDs {mean:.1}/{peak}{traced}",
                 se.se,
                 r.mean(),
                 r.peak,
+                100 * ROBUST.0 / ROBUST.1,
+                r.robust_peak,
                 r.simds.len()
             );
             if let Some(b) = se.busy {
@@ -752,7 +849,7 @@ impl Analysis {
         );
         let asm: BTreeMap<u64, &str> = self.pcs.iter().map(|r| (r.pc, r.asm.as_str())).collect();
         for b in w.bindings.iter().take(top) {
-            let wait = b.waits.iter().max_by_key(|&&(pc, n)| (n, std::cmp::Reverse(pc))).map_or(0, |w| w.0);
+            let wait = b.waits.iter().max_by_key(|&&(pc, n, _)| (n, std::cmp::Reverse(pc))).map_or(0, |w| w.0);
             let distance: Vec<String> = b.distance.iter().map(|(d, n)| format!("{d}:{n}")).collect();
             let (med, p90) = b.latency.map_or(("-".into(), "-".into()), |l| (l.median.to_string(), l.p90.to_string()));
             let asm = asm.get(&b.pc).copied().unwrap_or_default();
@@ -797,6 +894,44 @@ impl Analysis {
     }
 }
 
+/// The main loop's partition a trip: every bucket, its share, and each traced SE's.
+fn partition_text(o: &mut String, l: &MainLoop) {
+    use std::fmt::Write;
+    let t = l.trips;
+    let unit = if t.labelled { "a trip" } else { "an iteration" };
+    let _ = writeln!(
+        o,
+        "trips      {} an iteration ({}), {} in the loop over {} waves",
+        t.per_iteration,
+        if t.labelled { "model.trips" } else { "no model.trips label: per-trip figures are per iteration" },
+        t.total,
+        l.partition.waves
+    );
+    let ses: String = l.ses.iter().map(|s| format!(" {:>9}", format!("se{}", s.se))).collect();
+    let _ = writeln!(o, "== main loop cycles {unit}: a traced wave's, each cycle once (issue and stall by class)");
+    let _ = writeln!(o, "{:<20} {:>9} {:>7}{ses}", "bucket", "all", "share");
+    let per = |cycles: i64, trips: u64| cycles as f64 / trips.max(1) as f64;
+    let p = &l.partition;
+    let row = |o: &mut String, name: String, of: &dyn Fn(&Partition) -> i64| {
+        let all = of(p);
+        let ses: String = l.ses.iter().map(|s| format!(" {:>9.1}", per(of(&s.partition), s.trips))).collect();
+        let share = 100.0 * all as f64 / p.cycles.max(1) as f64;
+        let _ = writeln!(o, "{name:<20} {:>9.1} {share:>6.1}%{ses}", per(all, t.total));
+    };
+    for &(class, _) in &p.issue {
+        row(o, format!("issue {}", class.name()), &|p| p.issued(&[class]));
+    }
+    for &(class, _) in &p.stall {
+        row(o, format!("stall {}", class.name()), &|p| p.stalled(&[class]));
+    }
+    for &(counter, _) in &p.wait {
+        row(o, format!("wait {counter:?}").to_lowercase(), &|p| p.waited(&[counter]));
+    }
+    row(o, "barrier".into(), &|p| p.barrier);
+    row(o, "idle".into(), &|p| p.idle);
+    row(o, "total".into(), &|p| p.cycles);
+}
+
 impl std::fmt::Display for Analysis {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.text(10))
@@ -804,8 +939,15 @@ impl std::fmt::Display for Analysis {
 }
 
 /// The innermost executed backward branch whose span issues a matrix instruction, else the most
-/// executed one; its waves' trips and the cycles between their back edges.
-fn main_loop(lines: &[(u64, &str)], pcs: &BTreeMap<u64, Stats>, waves: &[wave::Wave], base: u64) -> Option<MainLoop> {
+/// executed one; its waves' trips and the cycles between their back edges, and how the traced waves'
+/// cycles in it split, SE by SE. `model_trips`: the trips a wave runs, where the capture says.
+fn main_loop<'a>(
+    lines: &[(u64, &str)],
+    pcs: &BTreeMap<u64, Stats>,
+    ses: impl Iterator<Item = (u32, &'a [wave::Wave])> + Clone,
+    model_trips: Option<u64>,
+    base: u64,
+) -> Option<MainLoop> {
     let edges = lines
         .iter()
         .filter_map(|&(pc, line)| Some((branch(pc, line).filter(|&target| target <= pc)?, pc)))
@@ -819,19 +961,36 @@ fn main_loop(lines: &[(u64, &str)], pcs: &BTreeMap<u64, Stats>, waves: &[wave::W
         None => *edges.iter().max_by_key(|(_, pc)| pcs[pc].hits)?,
     };
     let (mut trips, mut cycles) = (vec![], vec![]);
-    for wave in waves {
+    for wave in ses.clone().flat_map(|(_, waves)| waves) {
         let times: Vec<i64> = wave.instructions.iter().filter(|i| i.pc == edge).map(|i| i.time).collect();
         if !times.is_empty() {
             trips.push(times.len() as i64);
             cycles.extend(times.windows(2).map(|w| w[1] - w[0]));
         }
     }
+    let iterations = Spread::of(trips);
+    // A wave runs one iteration's trips more than its loop does: its head's and drain's.
+    let labelled = model_trips.zip(iterations).map(|(t, i)| (t as f64 / (i.median + 1) as f64).round().max(1.0));
+    let per_iteration = labelled.map_or(1, |u| u as u32);
+    let buckets = verdict::Buckets::new(lines);
+    let ses: Vec<SeLoop> = ses
+        .map(|(se, waves)| {
+            let edges = waves.iter().flat_map(|w| &w.instructions).filter(|i| i.pc == edge).count() as u64;
+            SeLoop { se, trips: edges * u64::from(per_iteration), partition: buckets.partition(waves, head..=edge) }
+        })
+        .filter(|s| s.partition.waves > 0)
+        .collect();
+    let mut partition = Partition::default();
+    ses.iter().for_each(|s| partition.add(&s.partition));
     Some(MainLoop {
         head: head - base,
         back_edge: edge - base,
         matrix: matrix(&(head, edge)),
-        iterations: Spread::of(trips),
+        iterations,
         cycles: Spread::of(cycles),
+        trips: Trips { per_iteration, labelled: labelled.is_some(), total: ses.iter().map(|s| s.trips).sum() },
+        partition,
+        ses,
     })
 }
 
