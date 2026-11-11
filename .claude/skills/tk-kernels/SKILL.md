@@ -236,6 +236,7 @@ Benchmarks run as the `tk_bench` example on the default device, one at a time on
 | `raster [--shape MxNxK,…]` | every raster (`TileOrder`, groups of 1, 2, 4, … tile rows and column-major) of the tuner's pick and the planner's first, × the default's beside the model's ×, on 4096³, 4096×1024×4096, 8192²×1024 by default |
 | `fit [--only LABEL,…] [--picks]` | the cost model against the device on a few GEMM (4096³, Nemotron, Qwen3, Whisper projections), attention and nearest shapes: `costs\|…`, a `fit\|label\|rank\|verdict\|ns predicted\|ns measured\|cfg` line a ranked config, `pick\|label\|ns\|cfg` and `tune\|label\|s` (the tuner's wall time; cold on a store of the device's probes alone); `--picks` times the picks alone, an A/B across builds |
 | `trips` | `residency\|op\|blocks\|trip\|wall\|spread\|base\|measurable` of the trip probes at 1–48 blocks an SM (`probe::trip_at`): what `TRIP_HIDING` is fitted to |
+| `pin --cfg BMxBNxBK:S:WRxWC[:rolled],… [--shape MxNxK,…] [--residual] [--gated]` | `pin\|shape\|cfg\|blocks\|measured\|model\|less latency\|less lone trip\|less step` a pinned GEMM config (3-part code unrolled; Whisper's fc2 1500×1280×5120 by default, `--gated` a SwiGLU epilogue): the model's ns with each term zeroed beside the measured ns |
 
 The `#[ignore]` probe tests left print and never assert:
 `-- --ignored --nocapture --test-threads=1`.

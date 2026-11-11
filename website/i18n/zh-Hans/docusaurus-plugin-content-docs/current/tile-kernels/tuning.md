@@ -82,5 +82,6 @@ SVOD_DEVICE=CUDA cargo run --release -p svod-tk --example tk_bench -- gemm --top
 | `raster [--shape MxNxK,…]` | 调优器的 GEMM 选择和规划器第一个配置的每种光栅顺序，与默认顺序对比，并列出代价模型对每种顺序的估价 |
 | `fit [--only LABEL,…] [--picks]` | 代价模型与设备的对比：若干 GEMM、注意力和 nearest 形状上每个排名配置的预测时间与实测时间、调优器的选择及调优器的墙钟时间；`--picks` 只为选择计时 |
 | `trips` | 每个 SM 驻留 1 到 48 个块时的流水线迭代探针 |
+| `pin --cfg BMxBNxBK:S:WRxWC[:rolled],… [--shape MxNxK,…] [--residual] [--gated]` | 每个固定的 GEMM 配置的时间（默认为 Whisper 的 fc2），旁边是模型的价格，以及分别将内存延迟、单独行程或矩阵核步骤置零后的价格：每一项占该配置时间的多少 |
 
 `--metric` 可取 `squared-l2`、`l2` 或 `neg-dot`。每个命令都接受 `--rounds R`，即计时轮数（默认 20，`fit` 为 2）。
