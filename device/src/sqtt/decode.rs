@@ -28,10 +28,12 @@ enum Code {
     TsDeltaOrMark,
     LayoutHeader,
     Inst,
+    ShaderDataShort,
 }
 
 /// A packet type: the low `width` bits of the register equal `enc`; the packet spans `nibbles` and its
-/// delta field is `delta = (lo, width)`, both indexed by layout (RDNA3, RDNA4).
+/// delta field is `delta = (lo, width)`, both indexed by layout (RDNA3, RDNA4). Zero nibbles: the layout
+/// lacks the type.
 struct Spec {
     code: Code,
     enc: u8,
@@ -44,16 +46,17 @@ const fn spec(code: Code, enc: u8, width: u8, nibbles: [u8; 2], delta: [(u8, u8)
     Spec { code, enc, width, nibbles, delta }
 }
 
-/// In rocprof type-ID order, which breaks ties in the opcode table.
+/// In rocprof type-ID order, which breaks ties in the opcode table. Sizes follow AMD's rocprof-trace-decoder
+/// (`gfx10token.cpp`, overridden by `gfx11token.cpp`/`gfx12token.cpp`) where it and tinygrad disagree.
 #[rustfmt::skip]
-const SPECS: [Spec; 24] = [
+const SPECS: [Spec; 25] = [
     spec(Code::ValuInst, 0b011, 3, [3, 3], [(3, 3), (3, 3)]),
     spec(Code::VmemExec, 0b1111, 4, [2, 2], [(4, 2), (4, 2)]),
     spec(Code::AluExec, 0b1110, 4, [2, 2], [(4, 2), (4, 2)]),
     spec(Code::Immediate, 0b1101, 4, [3, 3], [(4, 3), (4, 3)]),
     spec(Code::ImmediateMask, 0b00100, 5, [6, 6], [(5, 3), (5, 3)]),
     spec(Code::WaveRdy, 0b10100, 5, [6, 6], [(5, 3), (5, 3)]),
-    spec(Code::TsDeltaS8W3, 0b0100001, 7, [18, 18], [(8, 3), (8, 3)]),
+    spec(Code::TsDeltaS8W3, 0b0100001, 7, [16, 18], [(8, 3), (8, 3)]),
     spec(Code::WaveEnd, 0b10101, 5, [5, 5], [(5, 3), (5, 3)]),
     spec(Code::WaveStart, 0b01100, 5, [8, 8], [(5, 2), (5, 2)]),
     spec(Code::TsDeltaS5W2, 0b11100, 5, [12, 10], [(5, 2), (5, 2)]),
@@ -71,28 +74,33 @@ const SPECS: [Spec; 24] = [
     spec(Code::TsDeltaOrMark, 0b0000001, 7, [12, 16], [(12, 36), (12, 52)]),
     spec(Code::LayoutHeader, 0b0010001, 7, [16, 16], [(0, 0), (0, 0)]),
     spec(Code::Inst, 0b010, 3, [5, 5], [(4, 3), (3, 3)]),
+    spec(Code::ShaderDataShort, 0b1000110, 7, [0, 8], [(0, 0), (7, 3)]),
 ];
 
 const NOP: u8 = 15;
 
-/// Low register byte -> index into [`SPECS`]: the widest matching encoding, the first on a tie, NOP when
-/// none matches. Encodings are the same in both layouts.
-const OPCODES: [u8; 256] = {
-    let mut table = [NOP; 256];
-    let mut byte = 0;
-    while byte < 256 {
-        let (mut i, mut best) = (0, 0);
-        while i < SPECS.len() {
-            let s = &SPECS[i];
-            if s.width > best && (byte as u8) & ((1u16 << s.width) - 1) as u8 == s.enc {
-                table[byte] = i as u8;
-                best = s.width;
+/// Per layout, low register byte -> index into [`SPECS`]: the widest matching encoding the layout has, the
+/// first on a tie, NOP when none matches.
+const OPCODES: [[u8; 256]; 2] = {
+    let mut tables = [[NOP; 256]; 2];
+    let mut layout = 0;
+    while layout < 2 {
+        let mut byte = 0;
+        while byte < 256 {
+            let (mut i, mut best) = (0, 0);
+            while i < SPECS.len() {
+                let s = &SPECS[i];
+                if s.nibbles[layout] > 0 && s.width > best && (byte as u8) & ((1u16 << s.width) - 1) as u8 == s.enc {
+                    tables[layout][byte] = i as u8;
+                    best = s.width;
+                }
+                i += 1;
             }
-            i += 1;
+            byte += 1;
         }
-        byte += 1;
+        layout += 1;
     }
-    table
+    tables
 };
 
 fn bits(reg: u64, hi: u32, lo: u32) -> u64 {
@@ -111,8 +119,9 @@ pub fn decode(data: &[u8]) -> Decoder<'_> {
 /// The packet iterator over one SQTT blob.
 ///
 /// The register is a 64-bit window over the nibble stream; each step shifts out the previous packet's
-/// nibbles. A packet wider than the window (`TS_DELTA_S8_W3`, 18 nibbles) shifts at most eight bytes in
-/// and skips the rest, as tinygrad does.
+/// nibbles. A packet wider than the window (RDNA4 `TS_DELTA_S8_W3`, AMD's 72-bit `NEW_PC`) leaves the
+/// window at its last 16 nibbles and the next packet right after it, unlike tinygrad, which lands two
+/// nibbles short and drops two nibbles 14 nibbles later.
 pub struct Decoder<'a> {
     data: &'a [u8],
     pos: usize,
@@ -145,12 +154,14 @@ impl Decoder<'_> {
         }
         let byte_count = need >> 1;
         if byte_count > 0 {
+            // Bytes past the window's 8 would be shifted straight out again.
             let read = byte_count.min(8);
+            self.pos += byte_count - read;
             let mut chunk = [0u8; 8];
             chunk[..read].copy_from_slice(&data[self.pos..self.pos + read]);
             let chunk = u64::from_le_bytes(chunk);
             self.reg = if read == 8 { chunk } else { (self.reg >> (read * 8)) | (chunk << (64 - read * 8)) };
-            self.pos += byte_count;
+            self.pos += read;
         }
         self.nib_off = need & 1;
         if self.nib_off == 1 {
@@ -168,8 +179,8 @@ impl Iterator for Decoder<'_> {
         }
         self.shift_in();
         let reg = self.reg;
-        let spec = &SPECS[usize::from(OPCODES[(reg & 0xff) as usize])];
         let li = self.layout as usize;
+        let spec = &SPECS[usize::from(OPCODES[li][(reg & 0xff) as usize])];
         let (lo, width) = spec.delta[li];
         let delta = if width == 0 { 0 } else { bits(reg, u32::from(lo + width - 1), u32::from(lo)) };
         let kind = kind(spec.code, reg, self.layout, delta);
@@ -265,6 +276,18 @@ fn kind(code: Code, r: u64, layout: Layout, delta: u64) -> Kind {
         Code::TsDeltaS5W2 => Kind::TsDeltaS5W2 { delta },
         Code::TsDeltaS5W3 => Kind::TsDeltaS5W3 { delta },
         Code::TsDeltaS8W3 => Kind::TsDeltaS8W3 { delta },
+        Code::ShaderDataShort => {
+            let (wgp, sa) = (b(16, 13), b(10, 10));
+            Kind::ShaderDataShort {
+                sa: sa as u8,
+                simd: b(12, 11) as u8,
+                wgp: wgp as u8,
+                cu: cu(wgp, sa),
+                wave: b(21, 17) as u8,
+                data: b(29, 22) as u8,
+                private: b(31, 30) != 0,
+            }
+        }
         Code::TsDeltaOrMark if rdna4 => Kind::TsDeltaOrMark { delta, rt: flag(r, 7), pl: flag(r, 8), tl: flag(r, 9) },
         Code::TsDeltaOrMark => Kind::TsDeltaOrMark { delta, pl: flag(r, 8), rt: flag(r, 9), tl: false },
     }

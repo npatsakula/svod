@@ -115,8 +115,20 @@ pub enum Kind {
     TsDeltaS5W3 {
         delta: u64,
     },
+    /// AMD's `NEW_PC` (a wave's PC after an indirect branch): 16 nibbles on RDNA3, 18 on RDNA4.
     TsDeltaS8W3 {
         delta: u64,
+    },
+    /// RDNA4 `s_ttracedata_imm` (AMD's `SHADER_DATA_SHORT`, 7-bit encoding `0b1000110`); tinygrad lacks it.
+    /// `cu` as in [`Kind::WaveStart`].
+    ShaderDataShort {
+        sa: u8,
+        simd: u8,
+        wgp: u8,
+        cu: u8,
+        wave: u8,
+        data: u8,
+        private: bool,
     },
     /// `tl` exists on RDNA4 only. A marker (`rt && !pl`) adds nothing to the time.
     TsDeltaOrMark {

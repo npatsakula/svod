@@ -35,6 +35,7 @@ fn tinygrad_name(kind: &Kind, layout: Layout) -> String {
         Kind::TsDeltaS5W3 { .. } => "TS_DELTA_S5_W3",
         Kind::TsDeltaS8W3 { .. } => "TS_DELTA_S8_W3",
         Kind::TsDeltaOrMark { .. } => "TS_DELTA_OR_MARK",
+        Kind::ShaderDataShort { .. } => return "SHADER_DATA_SHORT".into(),
     };
     let rdna4_class = matches!(
         kind,
@@ -108,6 +109,15 @@ fn fields(kind: &Kind, layout: Layout) -> BTreeMap<&'static str, String> {
         Kind::UtilCtr { ctr } => vec![("ctr", ctr.to_string())],
         Kind::Perf { arg } => vec![("arg", arg.to_string())],
         Kind::TsWaveState { coarse } => vec![("coarse", coarse.to_string())],
+        Kind::ShaderDataShort { sa, simd, wgp, cu, wave, data, private } => vec![
+            ("sa", sa.to_string()),
+            ("simd", simd.to_string()),
+            ("wgp", wgp.to_string()),
+            ("cu", cu.to_string()),
+            ("wave", wave.to_string()),
+            ("data", data.to_string()),
+            ("private", b(private)),
+        ],
         Kind::TsDeltaShort { delta }
         | Kind::TsDeltaS5W2 { delta }
         | Kind::TsDeltaS5W3 { delta }
@@ -294,6 +304,55 @@ fn delta_or_mark(layout: u64, flags: u64, nibbles: usize, time: u64) {
     assert!(matches!(packets[1].kind, Kind::TsDeltaOrMark { delta: 100, .. }));
     assert_eq!(packets[1].time, time);
     assert_eq!(packets[2].time, time + 4);
+}
+
+fn inst(layout: u64, wave: u64, delta: u64) -> (u64, usize) {
+    let raw = if layout == 4 { 0b010 | delta << 3 | wave << 7 } else { 0b010 | delta << 4 | wave << 8 };
+    (raw, 5)
+}
+
+fn waves(packets: &[Packet]) -> Vec<(u64, u8)> {
+    packets
+        .iter()
+        .filter_map(|p| if let Kind::Inst { wave, .. } = p.kind { Some((p.time, wave)) } else { None })
+        .collect()
+}
+
+// AMD's `NEW_PC` is 64 bits on gfx11 and 72 on gfx12 (rocprof-trace-decoder `gfx10token.cpp`,
+// `gfx12token.cpp`); tinygrad sizes it 18 nibbles on both and, past the 64-bit window, lands two
+// nibbles short, which desynchronised its decoding of AMD's navi4_cwsr/setpc/sdata traces.
+#[test_case(3, 16 ; "rdna3")]
+#[test_case(4, 18 ; "rdna4")]
+fn new_pc_spans_its_width(layout: u64, nibbles: usize) {
+    // Ones above the delta, so a misaligned window decodes other packets.
+    let new_pc = 0b0100001 | 2 << 8 | !0u64 << 11;
+    let mut packets = vec![header(layout), (new_pc, 16)];
+    if nibbles > 16 {
+        packets.push((0xff, nibbles - 16));
+    }
+    packets.extend((0..8).map(|i| inst(layout, i + 1, 1)));
+    let decoded = timed(&stream(&packets));
+    assert_eq!(decoded[1], Packet { time: 2, kind: Kind::TsDeltaS8W3 { delta: 2 } });
+    assert_eq!(waves(&decoded[2..]), (0..8).map(|i| (3 + i, i as u8 + 1)).collect::<Vec<_>>());
+    assert_eq!(decoded.len(), 10);
+}
+
+#[test]
+fn rdna4_shader_data_short() {
+    let raw = 0b1000110 | 1 << 7 | 1 << 10 | 2 << 11 | 3 << 13 | 4 << 17 | 0xab << 22 | 1 << 30;
+    let decoded = timed(&stream(&[header(4), (raw, 8), inst(4, 7, 2)]));
+    assert_eq!(
+        decoded[1],
+        Packet {
+            time: 1,
+            kind: Kind::ShaderDataShort { sa: 1, simd: 2, wgp: 3, cu: 19, wave: 4, data: 0xab, private: true }
+        }
+    );
+    assert_eq!(waves(&decoded[2..]), [(3, 7)]);
+    // RDNA3 has no 7-bit split: the low five bits make it a 13-nibble `TS_DELTA_S5_W3`.
+    let decoded = timed(&stream(&[header(3), (raw, 13), inst(3, 7, 2)]));
+    assert!(matches!(decoded[1].kind, Kind::TsDeltaS5W3 { .. }), "{:?}", decoded[1]);
+    assert_eq!(waves(&decoded[2..]), [(decoded[1].time + 2, 7)]);
 }
 
 #[test_case(Layout::Rdna3, 0b0000_0010 | 5 << 8 | 0x03 << 13, 5, true ; "rdna3 jump")]
