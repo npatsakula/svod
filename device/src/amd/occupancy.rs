@@ -78,3 +78,108 @@ pub(crate) fn vgpr_limited_occupancy(vgprs: u32, wave_size: u32, target_major: u
     let waves = (file / alloc).min(max_waves);
     Some(waves as f32 / max_waves as f32)
 }
+
+/// What one compute unit holds at once, in CU mode (svod builds with `-mcumode`: a workgroup's waves
+/// stay on one CU's two SIMDs and its LDS half).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Cu {
+    pub simds: u32,
+    /// Wave slots a SIMD schedules.
+    pub waves_per_simd: u32,
+    /// Wave32 VGPRs a SIMD's file holds, and the granule a wave allocates them in.
+    pub vgprs: u32,
+    pub vgpr_granule: u32,
+    /// LDS bytes a CU's workgroups share, and the granule a workgroup allocates them in.
+    pub lds_bytes: u32,
+    pub lds_granule: u32,
+    /// Barriers: a workgroup of more than one wave takes one.
+    pub barriers: u32,
+}
+
+impl Cu {
+    /// RDNA3/RDNA4 (gfx11/gfx12) in CU mode, wave32: LLVM's `getMaxWavesPerEU` (16 from gfx10.3),
+    /// `getTotalNumVGPRs`/`getVGPRAllocGranule` (1536 in granules of 24 under `Feature1536VGPRs`:
+    /// gfx1100, gfx1101, gfx1151, gfx12; 1024 in 16 elsewhere), `getLocalMemorySize` (a WGP's
+    /// 128 KiB halved in CU mode), `getMaxWorkGroupsPerCU` (16 barriers), and the
+    /// `COMPUTE_PGM_RSRC2.LDS_SIZE` granule of 128 dwords (AMDGPUUsage, GFX7–GFX12).
+    pub fn rdna(arch: svod_dtype::AmdArch) -> Option<Self> {
+        use svod_dtype::AmdArch::*;
+        let (vgprs, vgpr_granule) = match arch {
+            Gfx942 | Gfx950 => return None,
+            Gfx1102 => (1024, 16),
+            Gfx1100 | Gfx1101 | Gfx1151 | Gfx1200 | Gfx1201 => (1536, 24),
+        };
+        Some(Self {
+            simds: 2,
+            waves_per_simd: 16,
+            vgprs,
+            vgpr_granule,
+            lds_bytes: 64 << 10,
+            lds_granule: 512,
+            barriers: 16,
+        })
+    }
+}
+
+/// The resource that stops a CU holding more of a kernel's workgroups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Limiter {
+    /// The SIMDs' register files.
+    Vgpr,
+    /// The CU's LDS.
+    Lds,
+    /// The SIMDs' wave slots.
+    Waves,
+    /// The CU's barriers.
+    Workgroups,
+}
+
+impl Limiter {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Vgpr => "vgpr",
+            Self::Lds => "lds",
+            Self::Waves => "waves",
+            Self::Workgroups => "workgroups",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Limit {
+    pub workgroups_per_cu: u32,
+    /// Waves a SIMD holds at once with the CU full of workgroups.
+    pub waves_per_simd: u32,
+    /// Every resource that allows no more, in the order VGPRs, LDS, barriers, wave slots: freeing
+    /// one alone gains nothing while another stays.
+    pub by: Vec<Limiter>,
+}
+
+/// How many workgroups of `workgroup_threads` threads a CU holds at once, and what stops more: `None`
+/// where the resources leave the VGPRs unknown, the wave is not wave32 or the workgroup is empty.
+/// A workgroup's waves split evenly over the CU's SIMDs.
+pub fn limits(resources: &KernelResources, workgroup_threads: u32, cu: &Cu) -> Option<Limit> {
+    if resources.wave_size != 32 || workgroup_threads == 0 {
+        return None;
+    }
+    let waves = workgroup_threads.div_ceil(32);
+    let alloc = resources.vgprs?.max(1).next_multiple_of(cu.vgpr_granule);
+    let per_simd = (cu.vgprs / alloc).clamp(1, cu.waves_per_simd);
+    let by_vgpr = (per_simd < cu.waves_per_simd).then_some(cu.simds * per_simd / waves);
+    let lds = resources.lds_bytes.next_multiple_of(cu.lds_granule);
+    let by_lds = (lds > 0).then(|| cu.lds_bytes / lds);
+    let by_barriers = (waves > 1).then_some(cu.barriers);
+    let by_waves = Some(cu.simds * cu.waves_per_simd / waves);
+    let bounds = [
+        (by_vgpr, Limiter::Vgpr),
+        (by_lds, Limiter::Lds),
+        (by_barriers, Limiter::Workgroups),
+        (by_waves, Limiter::Waves),
+    ];
+    let bounds: Vec<(u32, Limiter)> = bounds.into_iter().filter_map(|(n, by)| Some((n?, by))).collect();
+    let workgroups_per_cu = bounds.iter().map(|b| b.0).min().expect("the wave slots always bound");
+    let by = bounds.into_iter().filter(|b| b.0 == workgroups_per_cu).map(|b| b.1).collect();
+    let waves_per_simd = (workgroups_per_cu * waves).div_ceil(cu.simds).min(per_simd);
+    Some(Limit { workgroups_per_cu, waves_per_simd, by })
+}

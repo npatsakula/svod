@@ -1689,9 +1689,23 @@ impl ExecutionPlan {
         }
         let traced = self.execute_profiled_inner(true, true);
         ctx.set_sqtt(None).context(ExecSnafu { context: "disarm the thread trace" })?;
+        // Profiles come in dispatch order, the compiled kernels in op_levels order: one-to-one, as
+        // the static analysis pairs them; a pair whose programs differ gets no launch dimensions.
+        let compiled: Vec<&PreparedKernel> = self
+            .op_levels
+            .iter()
+            .flatten()
+            .filter_map(|&idx| match &self.ops[idx] {
+                PreparedOp::CompiledProgram(k) => Some(k),
+                _ => None,
+            })
+            .collect();
         let mut kernels = vec![];
         for (index, mut profile) in traced?.into_iter().enumerate() {
             let Some(trace) = profile.sqtt.take() else { continue };
+            let prepared = compiled.get(index).filter(|k| Arc::ptr_eq(&k.kernel, &profile.kernel));
+            let dims = prepared.and_then(|k| Self::kernel_launch_sizes(k).ok());
+            let axes = |size: [usize; 3]| size.map(|n| u32::try_from(n).unwrap_or(u32::MAX));
             let entry = profile.kernel.entry_point.clone();
             let name: String = entry.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
             let dir = dir.join(format!("{index:03}_{name}"));
@@ -1701,6 +1715,10 @@ impl ExecutionPlan {
             let analysis = crate::sqtt::Capture::new(*trace, ns).and_then(|mut capture| {
                 capture.traced_ns = traced_ns;
                 capture.labels.insert("kernel".into(), entry.clone());
+                capture.resources = profile.kernel.program.resource_usage();
+                capture.grid = dims.and_then(|d| d.0).map(axes);
+                // A kernel without a local size dispatches workgroups of one thread.
+                capture.workgroup = dims.map(|d| axes(d.1.unwrap_or([1, 1, 1])));
                 capture.save(&dir)?;
                 capture.analyze()
             });

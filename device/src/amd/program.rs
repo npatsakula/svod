@@ -45,6 +45,21 @@ pub struct ParsedKernel {
     pub kd: AmdHsaKernelDescriptor,
 }
 
+/// The registers, LDS and wave size of a code object's kernel, read off its descriptor on the host as
+/// a loaded program's `resource_usage` reports them.
+pub fn kernel_resources(bytes: &[u8], kernel_name: &str, target_major: u32) -> Result<crate::profile::KernelResources> {
+    let kd = parse_kernel(bytes, kernel_name)?.kd;
+    let wave_size = if kd.kernel_code_properties & 0x400 != 0 { 32 } else { 64 };
+    Ok(crate::amd::occupancy::decode_resources(
+        kd.compute_pgm_rsrc1,
+        kd.compute_pgm_rsrc3,
+        kd.group_segment_fixed_size,
+        kd.private_segment_fixed_size,
+        wave_size,
+        target_major,
+    ))
+}
+
 /// Parse an AMDGPU code-object ELF and resolve the named kernel descriptor.
 ///
 /// PT_LOAD segments stay at their declared file offsets, no-vaddr sections get

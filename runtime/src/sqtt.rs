@@ -10,10 +10,13 @@ use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt, Snafu};
-use svod_device::profile::{CodeImage, SeTrace, SqttTrace};
+use svod_device::amd::occupancy::{Cu, Limit, limits};
+use svod_device::profile::{CodeImage, KernelResources, SeTrace, SqttTrace};
 use svod_device::sqtt::asm::{self, Access, Counter, Kind, Memory, Space};
+use svod_device::sqtt::hidden::{self, Hidden, Pipes};
 pub use svod_device::sqtt::report::Spread;
 use svod_device::sqtt::report::{Report, Stats};
+use svod_device::sqtt::simd::{PipeBusy, Residency, STEADY, Simd};
 use svod_device::sqtt::stitch::{Stitcher, branch, objdump_lines};
 use svod_device::sqtt::waits::Waits;
 use svod_device::sqtt::{Layout, decode, wave};
@@ -81,6 +84,11 @@ pub struct Capture {
     pub traced_ns: Option<u64>,
     /// Free-form context (`cfg`, shape) carried into the report header.
     pub labels: BTreeMap<String, String>,
+    /// The kernel's registers and LDS, its workgroup's threads along each axis and the grid's
+    /// workgroups along each: what bounds how many waves a SIMD holds.
+    pub resources: Option<KernelResources>,
+    pub workgroup: Option<[u32; 3]>,
+    pub grid: Option<[u32; 3]>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -94,6 +102,12 @@ struct Meta {
     ses: Vec<SeMeta>,
     #[serde(default)]
     labels: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resources: Option<KernelResources>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workgroup: Option<[u32; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    grid: Option<[u32; 3]>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -111,7 +125,16 @@ impl Capture {
     /// Disassembles the trace's code image.
     pub fn new(trace: SqttTrace, kernel_ns: Option<u64>) -> Result<Self> {
         let disassembly = disassemble(&trace.code.as_ref().context(NoCodeSnafu)?.elf)?;
-        Ok(Self { trace, disassembly, kernel_ns, traced_ns: None, labels: BTreeMap::new() })
+        Ok(Self {
+            trace,
+            disassembly,
+            kernel_ns,
+            traced_ns: None,
+            labels: BTreeMap::new(),
+            resources: None,
+            workgroup: None,
+            grid: None,
+        })
     }
 
     /// `se<N>.att` (raw streams), `kernel.co`, `kernel.s` and `meta.json` under `dir`.
@@ -137,6 +160,9 @@ impl Capture {
                 .map(|s| SeMeta { se: s.se, itrace: s.itrace, truncated: s.truncated })
                 .collect(),
             labels: self.labels.clone(),
+            resources: self.resources,
+            workgroup: self.workgroup,
+            grid: self.grid,
         };
         let path = dir.join("meta.json");
         write("meta.json", serde_json::to_string_pretty(&meta).context(JsonSnafu { path })?.as_bytes())
@@ -172,6 +198,9 @@ impl Capture {
             kernel_ns: meta.kernel_ns,
             traced_ns: meta.traced_ns,
             labels: meta.labels,
+            resources: meta.resources,
+            workgroup: meta.workgroup,
+            grid: meta.grid,
         })
     }
 
@@ -296,6 +325,11 @@ pub struct Row {
     pub latency: i64,
     pub stall: i64,
     pub idle: i64,
+    /// Of `idle`, `stall` and the issue cycles (`latency - stall`), those another pipe's activity on
+    /// the SIMD overlapped: AMD's hidden latency. `stall - hidden_stall` is the exposed stall.
+    pub hidden_idle: i64,
+    pub hidden_stall: i64,
+    pub hidden_issue: i64,
 }
 
 /// A class's cycles on the traced SIMD; `latency` includes `stall`.
@@ -318,6 +352,30 @@ pub struct MainLoop {
     pub iterations: Option<Spread>,
     /// Cycles between a wave's consecutive back edges.
     pub cycles: Option<Spread>,
+}
+
+/// How many waves the kernel's resources let a SIMD hold, and how many the trace saw resident.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Occupancy {
+    /// The CU the limit is for, and the kernel's limit there: where the capture records the kernel's
+    /// resources and workgroup on an RDNA arch.
+    pub cu: Option<Cu>,
+    pub limit: Option<Limit>,
+    /// The trace gives matrix ops one issue cycle (gfx11 sends them as VALU tokens): matrix and VALU
+    /// busy undercount.
+    pub untimed_matrix: bool,
+    pub ses: Vec<SeOccupancy>,
+}
+
+/// One SE's resident waves over its steady window; on an instruction-traced SE whose traced SIMD
+/// held waves, that SIMD's and its pipes' busy cycles in the window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeOccupancy {
+    pub se: u32,
+    pub itrace: bool,
+    pub residency: Residency,
+    pub traced: Option<Simd>,
+    pub busy: Option<PipeBusy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -346,6 +404,7 @@ pub struct Analysis {
     pub pcs: Vec<Row>,
     /// What the traced waves' waits waited for.
     pub waits: Waits,
+    pub occupancy: Occupancy,
 }
 
 /// The `<name>` of an `llvm-objdump` label line, `0000000000001700 <name>:`, with its address.
@@ -376,6 +435,8 @@ impl Analysis {
         let lines: Vec<(u64, &str)> =
             objdump_lines(&capture.disassembly).into_iter().map(|(pc, line)| (pc + base, line)).collect();
         let (mut ses, mut traced, mut waves, mut pcs) = (vec![], None, vec![], BTreeMap::<u64, Stats>::new());
+        let matrix = hidden::matrix_pcs(&lines);
+        let (mut hidden, mut occupancy) = (BTreeMap::<u64, Hidden>::new(), vec![]);
 
         for se in &capture.trace.per_se {
             let mut trace = wave::analyze(decode(&se.bytes));
@@ -397,12 +458,20 @@ impl Analysis {
                 occupancy_peak: peak,
                 span,
             });
+            let residency = Residency::new(&trace.occupancy);
             let layout = match trace.header.version {
                 3 => Layout::Rdna3,
                 4 => Layout::Rdna4,
                 _ => continue,
             };
             if !se.itrace {
+                occupancy.extend(residency.map(|residency| SeOccupancy {
+                    se: se.se,
+                    itrace: false,
+                    residency,
+                    traced: None,
+                    busy: None,
+                }));
                 continue;
             }
             let h = trace.header;
@@ -411,6 +480,15 @@ impl Analysis {
             for wave in &mut trace.waves {
                 stitcher.stitch(wave);
             }
+            for (pc, h) in hidden::analyze([(se.se, &trace)], &matrix).by_pc {
+                *hidden.entry(pc).or_default() += h;
+            }
+            occupancy.extend(residency.map(|residency| {
+                let traced = residency.simd(h.dsa, h.dwgp, h.dsimd).copied();
+                let pipes = || Pipes::new(&trace.waves, &trace.other_simd, &matrix);
+                let busy = traced.map(|_| PipeBusy::of(&pipes(), residency.window));
+                SeOccupancy { se: se.se, itrace: true, traced, busy, residency }
+            }));
             for (pc, s) in Report::new(&trace.waves).pcs {
                 let at = pcs.entry(pc).or_default();
                 (at.hits, at.latency, at.stall, at.idle) =
@@ -425,7 +503,19 @@ impl Analysis {
             .map(|(&pc, s)| {
                 let line = text.get(&pc).copied().unwrap_or_default();
                 let (asm, class) = (asm(line), Class::of(line));
-                Row { pc: pc - base, asm, class, hits: s.hits, latency: s.latency, stall: s.stall, idle: s.idle }
+                let h = hidden.get(&pc).copied().unwrap_or_default();
+                Row {
+                    pc: pc - base,
+                    asm,
+                    class,
+                    hits: s.hits,
+                    latency: s.latency,
+                    stall: s.stall,
+                    idle: s.idle,
+                    hidden_idle: h.idle,
+                    hidden_stall: h.stall,
+                    hidden_issue: h.issue,
+                }
             })
             .collect();
         let mut classes = BTreeMap::<Class, ClassTime>::new();
@@ -444,6 +534,13 @@ impl Analysis {
             .map_or("?", |l| l.1);
         let span = ses.iter().filter(|s| s.itrace).map(|s| s.span).max().unwrap_or(0);
         let lifetime = waves.iter().filter(|w| w.complete).map(|w| w.end - w.begin).collect();
+        let mut matrix_issue = waves.iter().flat_map(|w| &w.instructions).filter(|i| matrix.contains(&i.pc));
+        let untimed_matrix = matrix_issue.clone().next().is_some() && matrix_issue.all(|i| i.duration - i.stall <= 1);
+        let cu = Cu::rdna(capture.trace.arch).filter(|_| capture.resources.is_some() && capture.workgroup.is_some());
+        let limit = cu
+            .zip(capture.resources)
+            .zip(capture.workgroup)
+            .and_then(|((cu, resources), workgroup)| limits(&resources, workgroup.iter().product(), &cu));
         Ok(Self {
             kernel: kernel.to_string(),
             arch: capture.trace.arch.to_string(),
@@ -464,6 +561,7 @@ impl Analysis {
             classes: classes.into_values().collect(),
             main_loop: main_loop(&lines, &pcs, &waves, base),
             waits: Waits::new(&waves, &lines, layout, base),
+            occupancy: Occupancy { cu, limit, untimed_matrix, ses: occupancy },
             ses,
             pcs: rows,
         })
@@ -540,12 +638,18 @@ impl Analysis {
         }
         let (hits, stall): (u64, i64) = self.classes.iter().fold((0, 0), |(h, s), c| (h + c.hits, s + c.stall));
         let _ = writeln!(o, "{:<11} {hits:>8} {total:>11} {:>5.1}% {stall:>11} {:>11}", "total", 100.0, total - stall);
+        self.occupancy_text(&mut o);
         let table = |o: &mut String, rows: Vec<&Row>| {
-            let _ = writeln!(o, "{:>8} {:>7} {:>9} {:>9} {:>9}  asm", "pc", "hits", "cycles", "lat/hit", "stall/hit");
+            let _ = writeln!(
+                o,
+                "{:>8} {:>7} {:>9} {:>9} {:>9} {:>9}  asm",
+                "pc", "hits", "cycles", "lat/hit", "stall/hit", "expo/hit"
+            );
             for r in rows {
                 let per = |c: i64| c as f64 / r.hits.max(1) as f64;
-                let (l, s) = (per(r.latency), per(r.stall));
-                let _ = writeln!(o, "{:>#8x} {:>7} {:>9} {l:>9.1} {s:>9.1}  {}", r.pc, r.hits, r.latency, r.asm);
+                let (l, s, e) = (per(r.latency), per(r.stall), per(r.stall - r.hidden_stall));
+                let _ =
+                    writeln!(o, "{:>#8x} {:>7} {:>9} {l:>9.1} {s:>9.1} {e:>9.1}  {}", r.pc, r.hits, r.latency, r.asm);
             }
         };
         match &self.main_loop {
@@ -574,6 +678,61 @@ impl Analysis {
         let _ = writeln!(o, "== hottest {top} by cycles");
         table(&mut o, rows.into_iter().take(top).collect());
         o
+    }
+
+    /// The kernel's limit on resident waves, and per SE the waves resident over its steady window
+    /// (`mean/peak`, the SE's and its SIMDs'), with the traced SIMD's and its pipes' busy shares.
+    fn occupancy_text(&self, o: &mut String) {
+        use std::fmt::Write;
+        let occ = &self.occupancy;
+        let (num, den) = STEADY;
+        let _ = writeln!(
+            o,
+            "== occupancy: resident waves mean/peak over the steady window (the SE at {}% of its peak or more)",
+            100 * num / den
+        );
+        match &occ.limit {
+            Some(l) => {
+                let by: Vec<&str> = l.by.iter().map(|b| b.name()).collect();
+                let (waves, groups, by) = (l.waves_per_simd, l.workgroups_per_cu, by.join("+"));
+                let _ = writeln!(o, "limit      {waves} waves/SIMD, {groups} workgroups/CU, by {by}");
+            }
+            None => {
+                let _ = writeln!(o, "limit      - (no kernel resources and workgroup in the capture)");
+            }
+        }
+        for se in &occ.ses {
+            let r = &se.residency;
+            let span = self.ses.iter().find(|s| s.se == se.se).map_or(0, |s| s.span).max(1);
+            let window = 100.0 * (r.window.1 - r.window.0) as f64 / span as f64;
+            let peak = r.simds.iter().map(|s| s.peak).max().unwrap_or(0);
+            let mean = r.simds.iter().map(Simd::mean).sum::<f64>() / r.simds.len().max(1) as f64;
+            let traced = se.traced.map_or(String::new(), |t| format!("; traced {:.1}/{}", t.mean(), t.peak));
+            let _ = writeln!(
+                o,
+                "se{:<8} {:.1}/{} over {window:.0}% of the span; {} SIMDs {mean:.1}/{peak}{traced}",
+                se.se,
+                r.mean(),
+                r.peak,
+                r.simds.len()
+            );
+            if let Some(b) = se.busy {
+                let pct = |c: i64| 100.0 * b.share(c);
+                let _ = writeln!(
+                    o,
+                    "  busy     matrix {:.1}% valu {:.1}% vmem {:.1}% scalar {:.1}% any {:.1}%",
+                    pct(b.matrix),
+                    pct(b.valu),
+                    pct(b.vmem),
+                    pct(b.scalar),
+                    pct(b.any)
+                );
+            }
+        }
+        if occ.untimed_matrix {
+            let _ =
+                writeln!(o, "note       matrix ops trace as 1-cycle VALU tokens here: matrix and valu busy undercount");
+        }
     }
 
     /// The bindings whose waits stalled longest: `stalled` of `waits` stalled (latency over those),

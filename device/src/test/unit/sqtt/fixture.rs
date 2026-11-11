@@ -16,6 +16,8 @@ pub struct Stitched {
     /// `(pc, llvm-objdump line)`, the line's `// address: words` comment kept.
     pub code: BTreeMap<u64, String>,
     pub layout: Layout,
+    /// The instruction-traced SEs, `traces` in their order.
+    pub ses: Vec<u32>,
     pub traces: Vec<Trace>,
 }
 
@@ -47,29 +49,31 @@ pub fn stitched(name: &str) -> Stitched {
     let dir = root().join(name);
     let text = |file: &str| String::from_utf8(read(&dir, file)).unwrap();
     let json = |file: &str| serde_json::from_str::<Value>(&text(file)).unwrap();
-    let (base, dump, streams): (u64, String, Vec<Vec<u8>>) = match name.split_once('/').unwrap().0 {
+    let se = |v: &Value| v["se"].as_u64().unwrap() as u32;
+    let (base, dump, streams): (u64, String, Vec<(u32, Vec<u8>)>) = match name.split_once('/').unwrap().0 {
         "amd" => {
             let base = u64::from_str_radix(text("base.txt").trim().trim_start_matches("0x"), 16).unwrap();
-            (base, text("code_object.s"), vec![read(&dir, "se0.att")])
+            (base, text("code_object.s"), vec![(0, read(&dir, "se0.att"))])
         }
         "svod" => {
             let meta = json("meta.json");
             let ses = meta["ses"].as_array().unwrap().iter().filter(|s| s["itrace"].as_bool().unwrap());
-            let streams = ses.map(|s| read(&dir, &format!("se{}.att", s["se"]))).collect();
+            let streams = ses.map(|s| (se(s), read(&dir, &format!("se{}.att", se(s))))).collect();
             (meta["load_base"].as_u64().unwrap(), text("kernel.s"), streams)
         }
         _ => {
             let golden = json("golden.json");
             let events = golden["events"].as_array().unwrap().iter().filter(|e| e["itrace"].as_bool().unwrap());
-            let streams = events.map(|e| read(&dir, &format!("trace{}.bin", e["index"]))).collect();
+            let streams = events.map(|e| (se(e), read(&dir, &format!("trace{}.bin", e["index"])))).collect();
             (golden["base"].as_u64().unwrap(), text("kernel.s"), streams)
         }
     };
     let code: Vec<(u64, &str)> = objdump_lines(&dump).into_iter().map(|(pc, line)| (pc + base, line)).collect();
     let mut layout = Layout::Rdna3;
+    let ses = streams.iter().map(|(se, _)| *se).collect();
     let traces = streams
         .iter()
-        .map(|bytes| {
+        .map(|(_, bytes)| {
             let mut trace = wave::analyze(decode(bytes));
             layout = if trace.header.version == 4 { Layout::Rdna4 } else { Layout::Rdna3 };
             let mut stitcher = Stitcher::new(&code, layout);
@@ -78,5 +82,5 @@ pub fn stitched(name: &str) -> Stitched {
         })
         .collect();
     let code = code.into_iter().map(|(pc, line)| (pc, line.to_string())).collect();
-    Stitched { base, code, layout, traces }
+    Stitched { base, code, layout, ses, traces }
 }

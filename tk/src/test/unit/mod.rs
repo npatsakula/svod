@@ -15,6 +15,7 @@ mod isa;
 mod layout;
 mod layouts;
 mod nearest;
+mod occupancy;
 mod offline;
 mod ops;
 mod ops_plan;

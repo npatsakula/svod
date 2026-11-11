@@ -1,6 +1,8 @@
 //! Unit tests for static kernel-resource + occupancy decoding.
 
-use crate::amd::occupancy::{decode_resources, vgpr_limited_occupancy};
+use svod_dtype::AmdArch;
+
+use crate::amd::occupancy::{Cu, Limiter, decode_resources, limits, vgpr_limited_occupancy};
 
 #[test]
 fn decodes_vgpr_sgpr_segments_wave32() {
@@ -65,4 +67,56 @@ fn occupancy_unknown_arch_is_none() {
 fn gfx9_splits_the_unified_file_at_the_accumulator_offset(rsrc1: u32, rsrc3: u32) -> (u32, u32) {
     let r = decode_resources(rsrc1, rsrc3, 0, 0, 64, 9);
     (r.vgprs.unwrap(), r.agprs.unwrap())
+}
+
+fn resources(vgprs: Option<u32>, lds_bytes: u32, wave_size: u32) -> crate::profile::KernelResources {
+    crate::profile::KernelResources {
+        vgprs,
+        agprs: None,
+        sgprs: Some(32),
+        lds_bytes,
+        scratch_bytes: Some(0),
+        wave_size,
+        occupancy: None,
+    }
+}
+
+/// A CU's workgroups at once and their waves a SIMD, by the first resource that runs out.
+#[test_case::test_case(AmdArch::Gfx1201, 128, 256, 0 => Some((2, 8, vec![Limiter::Vgpr])); "128 VGPRs take 144: ten waves a SIMD")]
+#[test_case::test_case(AmdArch::Gfx1201, 96, 256, 40000 => Some((1, 4, vec![Limiter::Lds])); "40000 LDS bytes take 40448")]
+#[test_case::test_case(AmdArch::Gfx1201, 96, 256, 32768 => Some((2, 8, vec![Limiter::Lds])); "two halves of the CU's LDS")]
+#[test_case::test_case(AmdArch::Gfx1201, 64, 64, 1024 => Some((16, 16, vec![Limiter::Workgroups, Limiter::Waves])); "barriers and slots alike")]
+#[test_case::test_case(AmdArch::Gfx1151, 32, 32, 0 => Some((32, 16, vec![Limiter::Waves])); "a lone wave takes no barrier")]
+#[test_case::test_case(AmdArch::Gfx1102, 128, 256, 0 => Some((2, 8, vec![Limiter::Vgpr])); "gfx1102's 1024-VGPR file")]
+#[test_case::test_case(AmdArch::Gfx1100, 256, 512, 0 => Some((0, 0, vec![Limiter::Vgpr])); "sixteen waves of 264 do not fit")]
+#[test_case::test_case(AmdArch::Gfx1201, 256, 256, 49152 => Some((1, 4, vec![Limiter::Vgpr, Limiter::Lds])); "v1: registers and LDS alike")]
+#[test_case::test_case(AmdArch::Gfx1201, 200, 96, 0 => Some((4, 6, vec![Limiter::Vgpr])); "three-wave groups: seven a SIMD, six used")]
+fn cu_limits(arch: AmdArch, vgprs: u32, threads: u32, lds: u32) -> Option<(u32, u32, Vec<Limiter>)> {
+    let cu = Cu::rdna(arch).expect("RDNA");
+    limits(&resources(Some(vgprs), lds, 32), threads, &cu).map(|l| (l.workgroups_per_cu, l.waves_per_simd, l.by))
+}
+
+#[test]
+fn cu_limits_need_wave32_vgprs_and_threads() {
+    let cu = Cu::rdna(AmdArch::Gfx1201).unwrap();
+    assert_eq!(limits(&resources(None, 0, 32), 256, &cu), None);
+    assert_eq!(limits(&resources(Some(64), 0, 64), 256, &cu), None);
+    assert_eq!(limits(&resources(Some(64), 0, 32), 0, &cu), None);
+    assert_eq!(Cu::rdna(AmdArch::Gfx942), None);
+}
+
+proptest::proptest! {
+    /// The CU never holds more than any one resource allows, and holds as many as the limiter allows.
+    #[test]
+    fn cu_limits_respect_every_resource(vgprs in 1u32..=256, threads in 1u32..=1024, lds in 0u32..=65536) {
+        let cu = Cu::rdna(AmdArch::Gfx1201).unwrap();
+        let l = limits(&resources(Some(vgprs), lds, 32), threads, &cu).unwrap();
+        let waves = threads.div_ceil(32);
+        let alloc = vgprs.next_multiple_of(24);
+        proptest::prop_assert!(l.workgroups_per_cu * waves <= cu.simds * cu.waves_per_simd);
+        proptest::prop_assert!(l.workgroups_per_cu * lds.next_multiple_of(512) <= cu.lds_bytes);
+        proptest::prop_assert!(l.waves_per_simd * alloc <= cu.vgprs);
+        proptest::prop_assert!(waves == 1 || l.workgroups_per_cu <= cu.barriers);
+        proptest::prop_assert!(l.waves_per_simd <= cu.waves_per_simd);
+    }
 }

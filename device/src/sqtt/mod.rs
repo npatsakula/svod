@@ -6,11 +6,14 @@
 //! a disassembly, and [`report::Report`] aggregates per-PC hit, latency, stall and idle cycles. Token and
 //! field names follow AMD's; tinygrad's `renderer/amd/sqtt.py` adds the `ALU_EXEC`/`VMEM_EXEC` tokens AMD
 //! leaves unknown. On top, [`asm::classify`] reads what a disassembly line does and [`waits::Waits`]
-//! binds each executed wait to the instruction it waited for.
+//! binds each executed wait to the instruction it waited for; [`hidden`] ports AMD's hidden-latency
+//! analysis and [`simd`] reduces resident waves and pipe busy shares over the steady window.
 
 pub mod asm;
 mod decode;
+pub mod hidden;
 pub mod report;
+pub mod simd;
 pub mod stitch;
 pub mod waits;
 pub mod wave;

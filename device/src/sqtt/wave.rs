@@ -43,6 +43,18 @@ pub struct Occupancy {
     pub start: bool,
     pub pc: u64,
     pub dispatch: u64,
+    pub cause: Cause,
+}
+
+/// What filled or emptied a slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cause {
+    /// A wave launched or ended.
+    Wave,
+    /// A context save emptied it or a restore refilled it.
+    Context,
+    /// A wave ended whose start the trace missed: AMD inserts the start at time 0.
+    Orphan,
 }
 
 /// A dispatch starting (`REG_INIT`) or, with `end`, its last wave retiring after `COMPUTE_DISPATCH_END`.
@@ -155,8 +167,8 @@ impl Model {
         unit.sa_wgp() == (h.dsa << 7 | h.dwgp) && unit.simd == h.dsimd
     }
 
-    fn occupy(&mut self, time: i64, unit: Unit, start: bool, run: Running) {
-        self.trace.occupancy.push(Occupancy { time, unit, start, pc: run.pc, dispatch: run.dispatch });
+    fn occupy(&mut self, time: i64, unit: Unit, start: bool, run: Running, cause: Cause) {
+        self.trace.occupancy.push(Occupancy { time, unit, start, pc: run.pc, dispatch: run.dispatch, cause });
     }
 
     fn dispatch_end(&mut self, me: u8, pipe_id: u8, id: u64, time: i64) {
@@ -261,14 +273,14 @@ impl Model {
             }
             if save {
                 if let Some(&saved) = self.running.get(&loc) {
-                    self.occupy(time, unit, false, saved);
+                    self.occupy(time, unit, false, saved, Cause::Context);
                     self.saved.insert(loc, saved);
                 }
             } else if restore {
                 let pc = self.saved.remove(&loc).map_or(0, |saved| saved.pc);
                 let run = Running { pc, ..run };
                 self.running.insert(loc, run);
-                self.occupy(time, unit, true, run);
+                self.occupy(time, unit, true, run, Cause::Context);
             }
             return;
         }
@@ -276,7 +288,7 @@ impl Model {
         if dispatch > 0 {
             *pipe(&mut self.active, me, pipe_id) += 1;
         }
-        self.occupy(time, unit, true, run);
+        self.occupy(time, unit, true, run, Cause::Wave);
         if target {
             while self.slots[slot].last().is_some_and(|state| state.wave.complete) {
                 let state = self.slots[slot].pop().expect("non-empty");
@@ -291,11 +303,11 @@ impl Model {
             self.with(unit.wave, |state| state.complete(time));
         }
         let run = self.running.remove(&location(unit)).unwrap_or_else(|| {
-            let orphan = Occupancy { time: 0, unit, start: true, pc: 0, dispatch: 0 };
+            let orphan = Occupancy { time: 0, unit, start: true, pc: 0, dispatch: 0, cause: Cause::Orphan };
             self.trace.occupancy.insert(0, orphan);
             Running::default()
         });
-        self.occupy(time, unit, false, run);
+        self.occupy(time, unit, false, run, Cause::Wave);
         if run.dispatch > 0 {
             let active = pipe(&mut self.active, run.me, run.pipe);
             *active -= 1;

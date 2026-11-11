@@ -132,7 +132,7 @@ pub struct CounterSet {
 /// Per-kernel static GPU resource usage, decoded from the compiled program
 /// (AMD: the kernel descriptor; Metal: the pipeline state). Pure static — no
 /// runtime cost. Fields a backend cannot see are `None`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct KernelResources {
     /// Vector GPRs allocated per lane (AMD).
     pub vgprs: Option<u32>,

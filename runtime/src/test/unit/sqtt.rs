@@ -7,6 +7,8 @@ use svod_device::sqtt::stitch::objdump_lines;
 use svod_dtype::AmdArch;
 use test_case::test_case;
 
+use svod_device::amd::occupancy::Limiter;
+
 use super::{Analysis, Capture, Class, Spread};
 
 fn fixtures() -> PathBuf {
@@ -45,6 +47,9 @@ fn capture(fixture: &str) -> Capture {
         kernel_ns: None,
         traced_ns: None,
         labels: BTreeMap::from([("fixture".into(), fixture.into())]),
+        resources: None,
+        workgroup: None,
+        grid: None,
     }
 }
 
@@ -266,4 +271,79 @@ proptest! {
             let _ = a.text(5);
         }
     }
+}
+
+/// One of svod's own captures with what a capture now records beside the trace: its kernel's
+/// resources (read off `kernel.co`), the 8-wave workgroup of its `[4, 2]` warps and its grid.
+fn svod_capture(name: &str, grid: [u32; 3]) -> Capture {
+    let mut capture = Capture::load(&fixtures().join("svod").join(name)).unwrap();
+    assert_eq!((capture.resources, capture.workgroup, capture.grid), (None, None, None), "older captures load");
+    let elf = &capture.trace.code.as_ref().unwrap().elf;
+    let major = capture.trace.arch.gfx_major();
+    capture.resources = Some(svod_device::amd::program::kernel_resources(elf, "gemm", major).unwrap());
+    (capture.workgroup, capture.grid) = (Some([256, 1, 1]), Some(grid));
+    capture
+}
+
+#[test]
+fn capture_keeps_resources_and_launch() {
+    let capture = svod_capture("rdna4_gemm_v1", [10, 6, 1]);
+    let dir = tempfile::tempdir().unwrap();
+    capture.save(dir.path()).unwrap();
+    let back = Capture::load(dir.path()).unwrap();
+    assert_eq!((back.resources, back.workgroup, back.grid), (capture.resources, capture.workgroup, capture.grid));
+    assert_eq!(back.analyze().unwrap(), capture.analyze().unwrap());
+}
+
+/// The kernel's limit beside the waves the trace saw. v1 and v3 (256 VGPRs, 48 KiB LDS) and the
+/// Strix GEMM (208 VGPRs) fit one 8-wave workgroup a CU, 4 waves a SIMD, and the traced SIMDs hold
+/// that through the window. Strix's peak passes it: its waves free their VGPRs
+/// (`MSG_DEALLOC_VGPRS`) before they end, so the next workgroup starts beside their tails.
+#[test_case("rdna4_gemm_v1", [10, 6, 1], &[Limiter::Vgpr, Limiter::Lds], 4)]
+#[test_case("rdna4_gemm_v3", [10, 6, 1], &[Limiter::Vgpr, Limiter::Lds], 4)]
+#[test_case("strix_smoke", [10, 12, 1], &[Limiter::Vgpr], 8)]
+fn occupancy_beside_the_limit(name: &str, grid: [u32; 3], by: &[Limiter], peak: u32) {
+    let a = svod_capture(name, grid).analyze().unwrap();
+    let occ = &a.occupancy;
+    let limit = occ.limit.clone().expect("resources and workgroup known");
+    assert_eq!((limit.waves_per_simd, limit.workgroups_per_cu, limit.by.as_slice()), (4, 1, by));
+    assert_eq!(occ.ses.len(), a.ses.len(), "every SE's residency");
+    for se in &occ.ses {
+        let r = &se.residency;
+        let se_peak = a.ses.iter().find(|s| s.se == se.se).unwrap().occupancy_peak;
+        assert!(r.window.0 < r.window.1 && r.mean() <= r.peak as f64 && r.peak as usize <= se_peak);
+        let simds: i64 = r.simds.iter().map(|s| s.wave_cycles).sum();
+        assert_eq!(simds, r.wave_cycles, "the SIMDs' waves add up to the SE's");
+        assert_eq!(se.busy.is_some(), se.traced.is_some());
+        assert!(se.itrace || se.traced.is_none());
+        if let Some(b) = se.busy {
+            let parts = [b.matrix, b.valu, b.vmem, b.scalar];
+            assert!(b.any <= b.cycles && parts.iter().all(|&c| (0..=b.any).contains(&c)), "{b:?}");
+        }
+        if let Some(t) = se.traced {
+            assert!((t.mean() - 4.0).abs() < 0.05 && t.peak == peak, "{name} se{}: {t:?}", se.se);
+        }
+    }
+    assert!(occ.ses.iter().any(|se| se.traced.is_some()));
+    let text = a.text(4);
+    assert!(
+        text.contains("== occupancy") && text.contains("limit      4 waves/SIMD, 1 workgroups/CU, by vgpr"),
+        "{text}"
+    );
+    assert_eq!(occ.untimed_matrix, a.arch.starts_with("gfx11"), "gfx11 traces WMMA as 1-cycle VALU tokens");
+}
+
+/// AMD's hidden latency folded into the rows: hidden stall and issue stay within the row's own.
+/// Hidden idle is measured from the previous record's own end, not the latest end so far as `idle`
+/// is, so it may pass `idle` where records overlap.
+#[test]
+fn rows_carry_hidden_latency() {
+    let a = Analysis::load(&fixtures().join("svod/rdna4_gemm_v1")).unwrap();
+    assert_eq!(a.occupancy.limit, None, "no resources recorded");
+    assert!(a.text(4).contains("limit      - "));
+    for r in &a.pcs {
+        assert!(r.hidden_idle >= 0 && (0..=r.stall).contains(&r.hidden_stall), "{r:?}");
+        assert!((0..=r.latency - r.stall).contains(&r.hidden_issue), "{r:?}");
+    }
+    assert!(a.pcs.iter().any(|r| r.hidden_stall > 0 && r.hidden_issue > 0));
 }
