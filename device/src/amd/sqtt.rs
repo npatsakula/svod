@@ -30,8 +30,6 @@ const WTYPE_INCLUDE_CS: u32 = 1 << 6;
 /// `SQ_TT_TOKEN_MASK_{SQDEC,SHDEC,GFXUDEC,COMP,CONTEXT}_BIT`: the register writes
 /// a trace records.
 const REG_INCLUDE: u32 = 0x1F;
-/// `1 << SQ_TT_TOKEN_EXCLUDE_PERF_SHIFT`, excluded on gfx11.
-const TOKEN_EXCLUDE_PERF: u32 = 1 << 11;
 /// `1 << SQ_TT_TOKEN_EXCLUDE_{VMEMEXEC,ALUEXEC,VALUINST,IMMEDIATE,INST}_SHIFT`:
 /// the instruction tokens an SE outside the `se_mask` leaves out.
 const TOKEN_EXCLUDE_ITRACE: u32 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 5) | (1 << 8);
@@ -129,8 +127,9 @@ pub fn build_streams(
         );
         let itrace = (config.se_mask >> se) & 1 == 1;
         let token_exclude = match (gfx12, itrace) {
-            (false, true) => TOKEN_EXCLUDE_PERF,
-            (false, false) => TOKEN_EXCLUDE_PERF | TOKEN_EXCLUDE_ITRACE,
+            // gfx11's 11-bit `token_exclude` has no PERF bit: tinygrad's `1 << 11` lands on `ttrace_exec`.
+            (false, true) => 0,
+            (false, false) => TOKEN_EXCLUDE_ITRACE,
             (true, true) => 0,
             (true, false) => TOKEN_EXCLUDE_NO_ITRACE_GFX12,
         };

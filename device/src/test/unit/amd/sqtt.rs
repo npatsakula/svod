@@ -58,7 +58,7 @@ fn decode(stream: &[u32]) -> Vec<Packet> {
     out
 }
 
-const BUF: u64 = 0x0001_2345_6780_0000;
+const BUF: u64 = 0x0000_9234_5678_0000; // 48-bit, so gfx11 packs 0x9 into BUF0_SIZE.base_hi
 const WPTRS: u64 = 0x0000_7000_0000_1000;
 const WINDOW: usize = 1 << 20;
 
@@ -179,8 +179,9 @@ fn gfx12_buf0_splits_the_base_over_two_registers() {
 
 /// Only the SEs of `se_mask` record instruction tokens; gfx12 also leaves out
 /// barrier waits. MASK traces CS waves on the configured SIMD of WGP 0, SA 0.
-#[test_case(AmdArch::Gfx1151, 0b01, &[0x1F_1800, 0x1F_1927]; "gfx11 se0")]
-#[test_case(AmdArch::Gfx1151, 0b10, &[0x1F_1927, 0x1F_1800]; "gfx11 se1")]
+/// gfx11 sets no `ttrace_exec` (bit 11): its 11-bit `token_exclude` has no PERF bit.
+#[test_case(AmdArch::Gfx1151, 0b01, &[0x1F_1000, 0x1F_1127]; "gfx11 se0")]
+#[test_case(AmdArch::Gfx1151, 0b10, &[0x1F_1127, 0x1F_1000]; "gfx11 se1")]
 #[test_case(AmdArch::Gfx1201, 0b0101, &[0x1F_6000, 0x1F_6927, 0x1F_6000, 0x1F_6927]; "gfx12 even")]
 #[test_case(AmdArch::Gfx1201, 0, &[0x1F_6927; 4]; "gfx12 none")]
 fn token_mask_follows_the_itrace_ses(arch: AmdArch, se_mask: u32, expected: &[u32]) {
