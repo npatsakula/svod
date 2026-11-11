@@ -1,0 +1,35 @@
+{
+  "arch": "gfx1151",
+  "load_base": 140081866227712,
+  "entry_pc": 140081866227712,
+  "kernel_ns": 687160,
+  "traced_ns": 2893720,
+  "ses": [
+    {
+      "se": 0,
+      "itrace": true,
+      "truncated": false
+    },
+    {
+      "se": 1,
+      "itrace": true,
+      "truncated": false
+    }
+  ],
+  "labels": {
+    "candidate_ns": "804360",
+    "cfg": "[128, 128, 32] s2 [4, 2] unroll=true Warp crews=1",
+    "kernel": "gemm",
+    "model.blocks_per_sm": "3",
+    "model.fill": "52773",
+    "model.lone_trip": "-65689",
+    "model.ns": "617099",
+    "model.reads": "17070",
+    "model.steps": "314604",
+    "model.trip": "-71162",
+    "model.trips": "160",
+    "model.wait": "123092",
+    "op": "gemm",
+    "shape": "1500x1280x5120"
+  }
+}
