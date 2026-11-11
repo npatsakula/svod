@@ -141,7 +141,7 @@ pub fn tuned(store: &TuneStore, planner: &Planner, dtype: DType, ranked: &[NormC
 | op vs graph fallback | `ops::linear_matches_the_graph`, `ops::norms_match_the_graph` (`untuned(f)` = `tune::scoped(false, f)` behind the device gate, `assert_kernel(&y, "<name>")`) |
 | batch variable | `ops::norm_under_a_batch_variable` |
 | no barrier added to the shipped kernel | `sync::shipped_kernels_need_no_barriers` (add a `test_case`) |
-| perf benchmark | a `tk_bench` command (`tk/examples/tk_bench.rs`: `gemm_bench` plans programs on `Buffers`, times them with `best_of`), printing, never asserting; an `#[ignore = "perf probe: needs a GPU"]` test only when its rows feed a fit (`device::gemm_tail_probe`) |
+| perf benchmark | a `tk_bench` command (`tk/examples/tk_bench.rs`: `gemm_bench` builds each config's candidate with `ops::candidates`, times it with `tune::measure`), printing, never asserting; an `#[ignore = "perf probe: needs a GPU"]` test only when its rows feed a fit (`device::gemm_tail_probe`) |
 
 Host IR of the new kernel for any target, no GPU: `crate::lower::render(prog, &lowering)`; compile it for AMD with
 `svod_runtime::amd::compile_ir_to_amd_object(&ir, arch)` / to PTX with `svod_runtime::cuda::compile_ir_to_ptx(&ir, arch)`,

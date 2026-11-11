@@ -1,7 +1,7 @@
 //! Device benchmarks of tk's kernels on the default device (`SVOD_DEVICE`),
-//! every time the fastest stamped run of the device's own clock (its kernels
-//! summed) after the clock has lifted, plans timed round-robin so drift hits
-//! each alike ([`best_of`]).
+//! every time as the tuner times its candidates ([`tune::measure`]): a
+//! config's programs (a split's merge, a tail's partials included) and an
+//! op's plan alike, on the device's own clock.
 //!
 //! ```text
 //! cargo run -p svod-tk --release --example tk_bench -- <command> [options]
@@ -37,30 +37,24 @@
 //!   timed beside the model's price and that price with one term zeroed at
 //!   a time (the memory latency, the lone trip, the matrix step): what each
 //!   term holds of the config's time.
-//!
-//! `--rounds R` sets the timed rounds (default 20; `fit` 2).
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use svod_dtype::default_device::default_device;
 use svod_dtype::{DType, ScalarDType};
 use svod_runtime::ExecutionPlan;
-use svod_runtime::benchmark::{CLOCK_WARMUP, round_robin_min, warm_clock};
 use svod_tensor::Tensor;
 use svod_tk::atoms::{Core, Costs, Device};
-use svod_tk::build::{BF16, F16};
-use svod_tk::ir::{ParamKind, Program, Schedule};
-use svod_tk::kernels::attention::{AttnMask, AttnSpec, Bias, attention};
-use svod_tk::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, TileOrder, gemm};
-use svod_tk::kernels::nearest::{Floors, Metric, NearestSpec, nearest};
+use svod_tk::ir::Schedule;
+use svod_tk::kernels::attention::{AttnMask, AttnSpec, Bias};
+use svod_tk::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, TileOrder};
+use svod_tk::kernels::nearest::{Floors, Metric, NearestSpec};
 use svod_tk::kernels::{Act, Batch};
-use svod_tk::lower::Lowering;
 use svod_tk::ops::config::{AttentionProblem, GemmProblem, NearestProblem, Planner};
 use svod_tk::ops::shape::{self, Extent, Plan};
-use svod_tk::ops::{self, Attn, Nearest, Quantized, Rerank, Search, tuned};
-use svod_tk::tune::TuneStore;
+use svod_tk::ops::{self, Attn, Nearest, Quantized, Rerank, Search, candidates, tuned};
+use svod_tk::tune::{self, Candidate, Compiled, TuneStore};
 
 type Result<T, E = Box<dyn std::error::Error>> = std::result::Result<T, E>;
 
@@ -128,10 +122,6 @@ impl Args<'_> {
             Some(other) => return Err(format!("--metric {other}: squared-l2, l2 or neg-dot").into()),
         })
     }
-
-    fn rounds(&self, default: usize) -> Result<usize> {
-        self.num("--rounds", default)
-    }
 }
 
 /// The op layer's planner of the default device: its cost probes measured
@@ -140,52 +130,14 @@ fn planner() -> Result<Arc<Planner>> {
     ops::planner(&default_device()).ok_or_else(|| "no GPU tk has kernels for: set SVOD_DEVICE".into())
 }
 
-/// One run's device time, its kernels' stamps summed; `None` when it failed
-/// or a kernel lost a stamp.
-fn stamped(plan: &ExecutionPlan) -> Option<Duration> {
-    let kernels = plan.execute_profiled().ok()?;
-    let ns: Option<u64> = kernels.iter().map(|k| k.gpu_end_ns?.checked_sub(k.gpu_start_ns?)).sum();
-    (!kernels.is_empty()).then_some(Duration::from_nanos(ns?))
+/// Each candidate's best device time, as the tuner times it.
+fn timed_candidates(candidates: Vec<Candidate>) -> Vec<(Compiled, Option<Duration>)> {
+    tune::measure(candidates).into_iter().map(|(verdict, ns)| (verdict, ns.map(Duration::from_nanos))).collect()
 }
 
-/// Each plan's fastest [`stamped`] run over `rounds` round-robin rounds,
-/// after the first lifted the clock.
-fn best_of(plans: &[ExecutionPlan], rounds: usize) -> Vec<Option<Duration>> {
-    if let Some(first) = plans.first() {
-        warm_clock(CLOCK_WARMUP, || stamped(first));
-    }
-    round_robin_min(plans.len(), rounds, None, |i| stamped(&plans[i]))
-}
-
-/// Realized tensors of drawn values for the programs a bench launches,
-/// shared by every program naming a parameter alike, outputs included.
-#[derive(Default)]
-struct Buffers(HashMap<(String, ScalarDType, usize), Tensor>);
-
-impl Buffers {
-    fn of(&mut self, prog: &Program) -> Result<Vec<Tensor>> {
-        prog.params()
-            .iter()
-            .map(|p| {
-                let key = (p.name.clone(), p.dtype, p.elems);
-                if let Some(t) = self.0.get(&key) {
-                    return Ok(t.clone());
-                }
-                let t = match p.kind {
-                    ParamKind::In => drawn(&[p.elems], DType::Scalar(p.dtype))?,
-                    _ => Tensor::empty(&[p.elems], DType::Scalar(p.dtype)),
-                };
-                Ok(self.0.entry(key).or_insert(t).clone())
-            })
-            .collect()
-    }
-
-    /// `prog` launched under `lowering` on these buffers, prepared.
-    fn plan(&mut self, prog: Program, lowering: &Lowering) -> Result<ExecutionPlan> {
-        let tensors = self.of(&prog)?;
-        let refs: Vec<&Tensor> = tensors.iter().collect();
-        Ok(svod_tk::launch::graph_launch(prog, lowering, &refs)?.prepare()?)
-    }
+/// Each op plan's best device time, timed as a candidate is.
+fn timed_plans(plans: Vec<ExecutionPlan>) -> Vec<Option<Duration>> {
+    tune::measure_plans(plans).into_iter().map(|ns| ns.map(Duration::from_nanos)).collect()
 }
 
 /// A realized tensor of uniform values in `dtype`.
@@ -207,11 +159,11 @@ fn gemm_label(c: &GemmCfg) -> String {
     format!("{:?} s{} {:?} unroll={} {:?} crews={}", c.tile, c.stages(), c.warps, c.unroll(), c.core, c.crews())
 }
 
-/// A plain bf16 GEMM at `cfg`, admitted.
-fn gemm_program(planner: &Planner, [m, n, k]: [usize; 3], epilogue: Epilogue, cfg: GemmCfg) -> Result<Program> {
+/// A bf16 GEMM at `cfg`, admitted: the programs the op launches.
+fn gemm_candidate(planner: &Planner, [m, n, k]: [usize; 3], epilogue: Epilogue, cfg: GemmCfg) -> Result<Candidate> {
     let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue };
     let spec = spec.admitted(planner, cfg).map_err(|why| format!("{cfg:?}: {why:?}"))?;
-    Ok(gemm::<BF16>(&spec))
+    Ok(candidates::gemm(&spec, &DType::BFloat16, planner))
 }
 
 /// The tuner's GEMM pick for `shape`, as the device tests and GEMM probes
@@ -222,7 +174,7 @@ fn gemm_pick(planner: &Planner, [m, n, k]: [usize; 3], epilogue: Epilogue, ranke
 }
 
 fn gemm_bench(args: &Args) -> Result<()> {
-    let (top, rounds) = (args.num("--top", 0)?, args.rounds(20)?);
+    let top = args.num("--top", 0)?;
     let planner = planner()?;
     for [m, n, k] in args.shapes::<3>("4096x4096x4096")? {
         let ranked = planner.gemm_ranked(1, m, n, k, &Epilogue::DEFAULT);
@@ -231,15 +183,12 @@ fn gemm_bench(args: &Args) -> Result<()> {
         if !cfgs.contains(&pick) {
             cfgs.push(pick);
         }
-        let mut buffers = Buffers::default();
-        let plans = cfgs
+        let candidates = cfgs
             .iter()
-            .map(|&c| {
-                buffers.plan(gemm_program(&planner, [m, n, k], Epilogue::DEFAULT, c)?, &c.lowering(&planner.device))
-            })
+            .map(|&c| gemm_candidate(&planner, [m, n, k], Epilogue::DEFAULT, c))
             .collect::<Result<Vec<_>>>()?;
         println!("== gemm {m}x{n}x{k} bf16");
-        for (c, t) in cfgs.iter().zip(best_of(&plans, rounds)) {
+        for (c, (_, t)) in cfgs.iter().zip(timed_candidates(candidates)) {
             let mark = if *c == pick { " (tuner's pick)" } else { "" };
             println!("  {}: {}{mark}", gemm_label(c), rate(t, 2.0 * (m * n * k) as f64, "TFLOP/s"));
         }
@@ -248,7 +197,7 @@ fn gemm_bench(args: &Args) -> Result<()> {
 }
 
 fn attention_bench(args: &Args) -> Result<()> {
-    let (top, rounds) = (args.num("--top", 0)?, args.rounds(20)?);
+    let top = args.num("--top", 0)?;
     let cases: Vec<([usize; 4], bool, bool)> = match args.opt("--shape") {
         Some(_) => args.shapes::<4>("")?.into_iter().map(|s| (s, args.flag("--causal"), args.flag("--bias"))).collect(),
         None => [
@@ -276,7 +225,7 @@ fn attention_bench(args: &Args) -> Result<()> {
             other => format!("{other:?}"),
         };
         let mut labels = vec![format!("the op: {launched}")];
-        let mut plans = vec![o.prepare()?];
+        let mut times = timed_plans(vec![o.prepare()?]);
         let mask = AttnMask { causal, bias: bias.then_some(Bias::PerBatch), ..AttnMask::default() };
         let spec = AttnSpec {
             batch: Batch::Static(b),
@@ -290,15 +239,16 @@ fn attention_bench(args: &Args) -> Result<()> {
             packed: false,
             scale: 1.0 / (d as f32).sqrt(),
         };
-        let mut buffers = Buffers::default();
+        let mut ranked = vec![];
         for &c in planner.attention_ranked(b * h, t, t, d, causal, bias).iter().take(top) {
             let admitted = spec.clone().admitted(&planner, c).map_err(|why| format!("{c:?}: {why:?}"))?;
-            plans.push(buffers.plan(attention::<BF16>(&admitted), &c.lowering(&planner.device))?);
+            ranked.push(candidates::attention(&admitted, &[t], &DType::BFloat16, &planner));
             labels.push(format!("ranked {c:?}"));
         }
+        times.extend(timed_candidates(ranked).into_iter().map(|(_, t)| t));
         let flops = 4.0 * (b * h * t * t * d) as f64 / if causal { 2.0 } else { 1.0 };
         println!("== attention b{b} h{h} t{t} d{d} causal={causal} bias={bias}");
-        for (label, time) in labels.iter().zip(best_of(&plans, rounds)) {
+        for (label, time) in labels.iter().zip(times) {
             println!("  {}: {label}", rate(time, flops, "TFLOP/s"));
         }
     }
@@ -306,7 +256,7 @@ fn attention_bench(args: &Args) -> Result<()> {
 }
 
 fn nearest_bench(args: &Args) -> Result<()> {
-    let (n, k, rounds) = (args.num("--rows", 1 << 16)?, args.num("--k", 1)?, args.rounds(20)?);
+    let (n, k) = (args.num("--rows", 1 << 16)?, args.num("--k", 1)?);
     let depths = args.counts("--depths", "16,32,64,128")?;
     let both = Floors { row: true, col: true };
     let none = Floors { row: false, col: false };
@@ -328,7 +278,7 @@ fn nearest_bench(args: &Args) -> Result<()> {
             };
             let (_, index) = if k == 1 { ops::nearest(&x, &x, opts)? } else { ops::k_nearest(&x, &x, k, opts)? };
             let chosen = ops::chosen();
-            let [time] = best_of(&[index.prepare()?], rounds)[..] else { unreachable!("one plan") };
+            let [time] = timed_plans(vec![index.prepare()?])[..] else { unreachable!("one plan") };
             let pairs = (n * n) as f64;
             let flops = time
                 .map_or("".into(), |t| format!(" {:6.2} TFLOP/s", 2.0 * d as f64 * pairs / t.as_nanos() as f64 / 1e3));
@@ -342,7 +292,7 @@ fn nearest_bench(args: &Args) -> Result<()> {
 }
 
 fn rerank_bench(args: &Args) -> Result<()> {
-    let (n, rounds) = (args.num("--rows", 16384)?, args.rounds(20)?);
+    let n = args.num("--rows", 16384)?;
     let m = args.num("--candidates", n)?;
     let (depths, ks) = (args.counts("--depths", "128,256,512,768")?, args.counts("--ks", "1,16,64")?);
     let metric = args.metric()?.unwrap_or(Metric::NegDot);
@@ -369,7 +319,7 @@ fn rerank_bench(args: &Args) -> Result<()> {
                 plans.push(index.prepare()?);
                 picks.push(ops::chosen());
             }
-            let times = best_of(&plans, rounds);
+            let times = timed_plans(plans);
             let pairs = (n * m) as f64;
             let ratio =
                 |t: Option<Duration>| times[0].zip(t).map_or(f64::NAN, |(f, t)| f.as_secs_f64() / t.as_secs_f64());
@@ -387,7 +337,6 @@ fn rerank_bench(args: &Args) -> Result<()> {
 }
 
 fn raster_bench(args: &Args) -> Result<()> {
-    let rounds = args.rounds(20)?;
     let planner = planner()?;
     for [m, n, k] in args.shapes::<3>("4096x4096x4096,4096x1024x4096,8192x8192x1024")? {
         let ranked = planner.gemm_ranked(1, m, n, k, &Epilogue::DEFAULT);
@@ -402,18 +351,11 @@ fn raster_bench(args: &Args) -> Result<()> {
             let gm = m.div_ceil(cfg.tile[0]);
             let heights = (0..).map(|b| 1usize << b).take_while(|&g| g < gm).chain([gm]);
             let orders: Vec<TileOrder> = heights.filter_map(TileOrder::grouped).collect();
-            let mut buffers = Buffers::default();
-            let plans = orders
+            let candidates = orders
                 .iter()
-                .map(|&order| {
-                    let cfg = GemmCfg { order, ..cfg };
-                    buffers.plan(
-                        gemm_program(&planner, [m, n, k], Epilogue::DEFAULT, cfg)?,
-                        &cfg.lowering(&planner.device),
-                    )
-                })
+                .map(|&order| gemm_candidate(&planner, [m, n, k], Epilogue::DEFAULT, GemmCfg { order, ..cfg }))
                 .collect::<Result<Vec<_>>>()?;
-            let times = best_of(&plans, rounds);
+            let times: Vec<_> = timed_candidates(candidates).into_iter().map(|(_, t)| t).collect();
             let default = TileOrder::DEFAULT.group(gm);
             let base = orders.iter().position(|o| o.group(gm) == default).and_then(|i| times[i]);
             let priced = |order| p.admit(&planner, &GemmCfg { order, ..cfg }).map_or(f64::NAN, |(ns, _)| ns);
@@ -472,14 +414,6 @@ const FIT_ATTENTION: [(&str, usize, usize, usize, usize, bool); 6] = [
 const FIT_NEAREST: [(&str, usize, usize); 4] =
     [("nn_d256", 16384, 256), ("nn_d512", 16384, 512), ("nn_d768", 16384, 768), ("nn_d1024", 16384, 1024)];
 
-/// What compiling a config showed, as the tuner names it.
-#[derive(Debug)]
-enum Verdict {
-    Failed,
-    Spilled,
-    Clean,
-}
-
 /// One shape of the fit: its ranked configs' predicted ns, programs and
 /// pick, timed and printed.
 struct Fit<'a, C> {
@@ -491,33 +425,25 @@ struct Fit<'a, C> {
 }
 
 impl<C: Copy + PartialEq + std::fmt::Debug> Fit<'_, C> {
-    fn run(self, picks: bool, rounds: usize, program: impl Fn(C) -> Result<(Program, Lowering)>) {
+    fn run(self, picks: bool, candidate: impl Fn(C) -> Result<Candidate>) {
         let Fit { label, ranked, predicted, pick, tuning } = self;
         println!("tune|{label}|{:.2}", tuning.as_secs_f64());
         let timed: &[C] = if picks { &[] } else { &ranked };
-        let mut buffers = Buffers::default();
-        let (mut plans, mut verdicts, mut at) = (vec![], vec![], vec![]);
-        for &c in timed.iter().chain([&pick]) {
-            match program(c).and_then(|(prog, lowering)| buffers.plan(prog, &lowering)) {
-                Ok(plan) => {
-                    let spilled = plan
-                        .kernels()
-                        .filter_map(|k| k.program.resource_usage())
-                        .any(|r| r.scratch_bytes.is_some_and(|b| b > 0));
-                    verdicts.push(if spilled { Verdict::Spilled } else { Verdict::Clean });
-                    at.push(Some(plans.len()));
-                    plans.push(plan);
-                }
-                Err(_) => {
-                    verdicts.push(Verdict::Failed);
-                    at.push(None);
-                }
+        let (built, at): (Vec<Candidate>, Vec<Option<usize>>) = {
+            let (mut built, mut at) = (vec![], vec![]);
+            for &c in timed.iter().chain([&pick]) {
+                at.push(candidate(c).ok().map(|programs| {
+                    built.push(programs);
+                    built.len() - 1
+                }));
             }
-        }
-        let times = best_of(&plans, rounds);
-        let ns = |i: usize| at[i].and_then(|p| times[p]).map_or("-".into(), |t| t.as_nanos().to_string());
+            (built, at)
+        };
+        let times = timed_candidates(built);
+        let verdict = |i: usize| at[i].map_or(Compiled::Failed, |b| times[b].0);
+        let ns = |i: usize| at[i].and_then(|b| times[b].1).map_or("-".into(), |t| t.as_nanos().to_string());
         for (rank, c) in timed.iter().enumerate() {
-            println!("fit|{label}|{rank}|{:?}|{:.1}|{}|{c:?}", verdicts[rank], predicted[rank], ns(rank));
+            println!("fit|{label}|{rank}|{:?}|{:.1}|{}|{c:?}", verdict(rank), predicted[rank], ns(rank));
         }
         println!("pick|{label}|{}|{pick:?}", ns(timed.len()));
     }
@@ -530,7 +456,7 @@ fn timed<T>(f: impl FnOnce() -> T) -> (T, Duration) {
 }
 
 fn fit_bench(args: &Args) -> Result<()> {
-    let (picks, rounds) = (args.flag("--picks"), args.rounds(2)?);
+    let picks = args.flag("--picks");
     let only: Option<Vec<&str>> = args.opt("--only").map(|o| o.split(',').collect());
     let wanted = |label: &str| only.as_ref().is_none_or(|o| o.contains(&label));
     let planner = planner()?;
@@ -541,8 +467,7 @@ fn fit_bench(args: &Args) -> Result<()> {
         let p = GemmProblem::new(1, m, n, k, &epilogue);
         let predicted = ranked.iter().map(|c| p.admit(&planner, c).map_or(f64::NAN, |a| a.0)).collect();
         let (pick, tuning) = timed(|| gemm_pick(&planner, [m, n, k], epilogue, &ranked));
-        Fit { label, ranked, predicted, pick, tuning }
-            .run(picks, rounds, |c| Ok((gemm_program(&planner, [m, n, k], epilogue, c)?, c.lowering(&planner.device))));
+        Fit { label, ranked, predicted, pick, tuning }.run(picks, |c| gemm_candidate(&planner, [m, n, k], epilogue, c));
     }
     for (label, b, h, t, d, causal) in FIT_ATTENTION.into_iter().filter(|s| wanted(s.0)) {
         let ranked = planner.attention_ranked(b * h, t, t, d, causal, false).to_vec();
@@ -563,9 +488,9 @@ fn fit_bench(args: &Args) -> Result<()> {
         };
         let (pick, tuning) =
             timed(|| tuned::attention(store, &planner, DType::BFloat16, &ranked, spec.clone(), None).cfg());
-        Fit { label, ranked, predicted, pick, tuning }.run(picks, rounds, |c| {
+        Fit { label, ranked, predicted, pick, tuning }.run(picks, |c| {
             let admitted = spec.clone().admitted(&planner, c).map_err(|why| format!("{c:?}: {why:?}"))?;
-            Ok((attention::<BF16>(&admitted), c.lowering(&planner.device)))
+            Ok(candidates::attention(&admitted, &[t], &DType::BFloat16, &planner))
         });
     }
     for (label, rows, depth) in FIT_NEAREST.into_iter().filter(|s| wanted(s.0)) {
@@ -594,9 +519,9 @@ fn fit_bench(args: &Args) -> Result<()> {
             live: Default::default(),
         };
         let (pick, tuning) = timed(|| tuned::nearest(store, &planner, DType::Float16, &ranked, spec.clone()).cfg());
-        Fit { label, ranked, predicted, pick, tuning }.run(picks, rounds, |c| {
+        Fit { label, ranked, predicted, pick, tuning }.run(picks, |c| {
             let admitted = spec.clone().admitted(&planner, c).map_err(|why| format!("{c:?}: {why:?}"))?;
-            Ok((nearest::<F16>(&admitted), Lowering::new(&planner.device)))
+            Ok(candidates::nearest(&planner, DType::Float16, &admitted))
         });
     }
     Ok(())
@@ -646,7 +571,6 @@ fn pinned(code: &str) -> Result<GemmCfg> {
 }
 
 fn pin_bench(args: &Args) -> Result<()> {
-    let rounds = args.rounds(20)?;
     let planner = planner()?;
     let gated = args.flag("--gated");
     let act = if gated { Act::Silu } else { Act::None };
@@ -664,12 +588,9 @@ fn pin_bench(args: &Args) -> Result<()> {
     println!("costs|{costs:?}");
     for [m, n, k] in args.shapes::<3>("1500x1280x5120")? {
         let p = GemmProblem::new(1, m, n, k, &epilogue);
-        let mut buffers = Buffers::default();
-        let plans = cfgs
-            .iter()
-            .map(|&c| buffers.plan(gemm_program(&planner, [m, n, k], epilogue, c)?, &c.lowering(&planner.device)))
-            .collect::<Result<Vec<_>>>()?;
-        for (c, t) in cfgs.iter().zip(best_of(&plans, rounds)) {
+        let candidates =
+            cfgs.iter().map(|&c| gemm_candidate(&planner, [m, n, k], epilogue, c)).collect::<Result<Vec<_>>>()?;
+        for (c, (_, t)) in cfgs.iter().zip(timed_candidates(candidates)) {
             let priced = |planner: &Planner| p.admit(planner, c).map_or(f64::NAN, |a| a.0);
             let blocks = m.div_ceil(c.tile[0]) * n.div_ceil(c.tile[1]);
             let less: Vec<String> = zeroed.iter().map(|(term, z)| format!("less {term} {:.0}", priced(z))).collect();

@@ -224,8 +224,8 @@ re-running: `grep '^value|probe:' <file>`; indices point into the ranked list: t
 ## Measuring
 
 Benchmarks run as the `tk_bench` example on the default device, one at a time on an idle GPU:
-`SVOD_DEVICE=… cargo run --release -p svod-tk --example tk_bench -- <command> [flags]`. Every command takes `--rounds R`
-(timed round-robin rounds, default 20, `fit` 2); `RUST_LOG=svod_tk=debug` adds the tuner's picks and round times.
+`SVOD_DEVICE=… cargo run --release -p svod-tk --example tk_bench -- <command> [flags]`. Every command times as the tuner
+does (`tune::measure`: a config's programs from `ops::candidates`, its merge or tail included); `RUST_LOG=svod_tk=debug` adds the tuner's picks and round times.
 
 | Command | Prints |
 |---|---|

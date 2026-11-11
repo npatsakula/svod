@@ -159,5 +159,5 @@ SVOD_DEVICE=CUDA cargo run --release -p svod-tk --example tk_bench -- gemm --top
 | `trips` | The pipeline-trip probes at 1 to 48 blocks per SM |
 | `pin --cfg BMxBNxBK:S:WRxWC[:rolled],… [--shape MxNxK,…] [--residual] [--gated]` | Each pinned GEMM config's time (Whisper's fc2 by default) beside the model's price and that price with the memory latency, the lone trip or the matrix step zeroed: what each term holds of the config's time |
 
-`--metric` takes `squared-l2`, `l2` or `neg-dot`. Every command takes `--rounds R`, the timed
-rounds (20 by default, 2 for `fit`).
+`--metric` takes `squared-l2`, `l2` or `neg-dot`. Every command times as the tuner does: a config's
+kernels together (a split's merge, a tail's partials) and an op's plan alike.

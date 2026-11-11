@@ -62,6 +62,15 @@ pub mod tuned {
     pub use super::norm::tuned as norm;
 }
 
+/// Each ranked family's programs for an admitted spec, the candidate the
+/// tuner times ([`crate::tune::measure`]): the kernel with the kernels its
+/// config adds (a split's merge, a tail's partials).
+pub mod candidates {
+    pub use super::attention::programs as attention;
+    pub use super::linear::programs as gemm;
+    pub use super::nearest::programs as nearest;
+}
+
 /// The tracing target of the planner's decisions, at debug: an op that
 /// takes the graph and why, a ranking's front with each config's predicted
 /// ns and how many it left out, on a store miss what compiling each config
