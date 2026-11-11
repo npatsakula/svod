@@ -41,6 +41,7 @@ pub mod isa;
 pub mod metal;
 pub mod profile;
 pub mod registry;
+pub mod sqtt;
 pub mod sync;
 
 pub use buffer::{Buffer, BufferId, HostWrite};

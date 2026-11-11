@@ -1,0 +1,395 @@
+{
+"target": "gfx1200",
+"base": 35184388890624,
+"events": [
+{
+"index": 0,
+"se": 0,
+"itrace": true,
+"bytes": 2240,
+"packets": 1021,
+"kinds": {
+"LAYOUT_HEADER": 1,
+"NOP": 712,
+"REG": 166,
+"SNAPSHOT": 5,
+"TS_DELTA_OR_MARK_RDNA4": 22,
+"TS_DELTA_SHORT": 7,
+"TS_WAVE_STATE": 108
+},
+"last_time": 239217,
+"sha256_kind_time": "b83caa0880cb6bc4299b9b1e800405d911fa664013328c6b552984bff1de9172",
+"head": [
+[
+"LAYOUT_HEADER",
+0,
+{
+"flag4": 1,
+"group": 0,
+"layout": 4,
+"sel_a": 6,
+"sel_b": 4,
+"simd": 0
+}
+],
+[
+"TS_DELTA_OR_MARK_RDNA4",
+1032,
+{
+"delta": 1032,
+"pl": 0,
+"rt": 0,
+"tl": 0
+}
+],
+[
+"REG",
+1032,
+{
+"hi_byte": 130,
+"slot": 4,
+"subop": 30,
+"val32": 1
+}
+],
+[
+"NOP",
+1032,
+{}
+],
+[
+"NOP",
+1032,
+{}
+],
+[
+"NOP",
+1032,
+{}
+],
+[
+"NOP",
+1032,
+{}
+],
+[
+"NOP",
+1032,
+{}
+],
+[
+"NOP",
+1032,
+{}
+],
+[
+"NOP",
+1032,
+{}
+],
+[
+"NOP",
+1032,
+{}
+],
+[
+"NOP",
+1032,
+{}
+]
+],
+"sha256_fields": "a4404dd3fa2b7abee9f85539c086fb528a00fe8d9c7797f8af6ae534adab4a7e"
+},
+{
+"index": 1,
+"se": 1,
+"itrace": true,
+"bytes": 2272,
+"packets": 1008,
+"kinds": {
+"LAYOUT_HEADER": 1,
+"NOP": 689,
+"REG": 166,
+"SNAPSHOT": 5,
+"TS_DELTA_OR_MARK_RDNA4": 25,
+"TS_DELTA_SHORT": 8,
+"TS_WAVE_STATE": 112,
+"WAVEEND_RDNA4": 1,
+"WAVESTART_RDNA4": 1
+},
+"last_time": 238895,
+"sha256_kind_time": "00186f5c3227202386471b07a401e7509b41b88a62e060d46985baee3db52e0f",
+"head": [
+[
+"LAYOUT_HEADER",
+0,
+{
+"flag4": 1,
+"group": 0,
+"layout": 4,
+"sel_a": 6,
+"sel_b": 4,
+"simd": 0
+}
+],
+[
+"TS_DELTA_OR_MARK_RDNA4",
+710,
+{
+"delta": 710,
+"pl": 0,
+"rt": 0,
+"tl": 0
+}
+],
+[
+"REG",
+710,
+{
+"hi_byte": 130,
+"slot": 4,
+"subop": 30,
+"val32": 1
+}
+],
+[
+"NOP",
+710,
+{}
+],
+[
+"NOP",
+710,
+{}
+],
+[
+"NOP",
+710,
+{}
+],
+[
+"NOP",
+710,
+{}
+],
+[
+"NOP",
+710,
+{}
+],
+[
+"NOP",
+710,
+{}
+],
+[
+"NOP",
+710,
+{}
+],
+[
+"NOP",
+710,
+{}
+],
+[
+"NOP",
+710,
+{}
+]
+],
+"sha256_fields": "563ba94a9047b8740b1fafcc699561fc38fbeb58815d9a818d0f0e7888071cd5"
+},
+{
+"index": 2,
+"se": 2,
+"itrace": false,
+"bytes": 2272,
+"packets": 1052,
+"kinds": {
+"LAYOUT_HEADER": 1,
+"NOP": 741,
+"REG": 167,
+"SNAPSHOT": 5,
+"TS_DELTA_OR_MARK_RDNA4": 22,
+"TS_DELTA_SHORT": 7,
+"TS_WAVE_STATE": 109
+},
+"last_time": 239742,
+"sha256_kind_time": "0d004f7eb25e6dac3612d374cad28c49d0557babe1471fc98759b89ec36c6da8",
+"head": [
+[
+"LAYOUT_HEADER",
+0,
+{
+"flag4": 1,
+"group": 0,
+"layout": 4,
+"sel_a": 6,
+"sel_b": 4,
+"simd": 0
+}
+],
+[
+"TS_WAVE_STATE",
+385,
+{
+"coarse": 0
+}
+],
+[
+"REG",
+385,
+{
+"hi_byte": 130,
+"slot": 4,
+"subop": 30,
+"val32": 1
+}
+],
+[
+"NOP",
+385,
+{}
+],
+[
+"NOP",
+385,
+{}
+],
+[
+"NOP",
+385,
+{}
+],
+[
+"NOP",
+385,
+{}
+],
+[
+"NOP",
+385,
+{}
+],
+[
+"NOP",
+385,
+{}
+],
+[
+"NOP",
+385,
+{}
+],
+[
+"NOP",
+385,
+{}
+],
+[
+"NOP",
+385,
+{}
+]
+],
+"sha256_fields": "a5d06ec41c5df5ea5e191ca86b595aedc14427e3974f32288778cec0d8591354"
+},
+{
+"index": 3,
+"se": 3,
+"itrace": false,
+"bytes": 2304,
+"packets": 1071,
+"kinds": {
+"LAYOUT_HEADER": 1,
+"NOP": 756,
+"REG": 169,
+"SNAPSHOT": 5,
+"TS_DELTA_OR_MARK_RDNA4": 23,
+"TS_DELTA_SHORT": 7,
+"TS_WAVE_STATE": 110
+},
+"last_time": 241426,
+"sha256_kind_time": "7ec47f391a66799bb55971fa92dd6f4d30b535947b4cd39ef7a995583720ad92",
+"head": [
+[
+"LAYOUT_HEADER",
+0,
+{
+"flag4": 1,
+"group": 0,
+"layout": 4,
+"sel_a": 6,
+"sel_b": 4,
+"simd": 0
+}
+],
+[
+"TS_WAVE_STATE",
+63,
+{
+"coarse": 0
+}
+],
+[
+"REG",
+63,
+{
+"hi_byte": 130,
+"slot": 4,
+"subop": 30,
+"val32": 1
+}
+],
+[
+"NOP",
+63,
+{}
+],
+[
+"NOP",
+63,
+{}
+],
+[
+"NOP",
+63,
+{}
+],
+[
+"NOP",
+63,
+{}
+],
+[
+"NOP",
+63,
+{}
+],
+[
+"NOP",
+63,
+{}
+],
+[
+"NOP",
+63,
+{}
+],
+[
+"NOP",
+63,
+{}
+],
+[
+"NOP",
+63,
+{}
+]
+],
+"sha256_fields": "deb6c5e6316bcc6a91cb700853931633b6a2cdadfc2d2dce8e7d96627f66609f"
+}
+],
+"mapped": []
+}

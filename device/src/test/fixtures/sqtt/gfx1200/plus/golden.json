@@ -1,0 +1,492 @@
+{
+"target": "gfx1200",
+"base": 35184388898816,
+"events": [
+{
+"index": 0,
+"se": 0,
+"itrace": true,
+"bytes": 2208,
+"packets": 942,
+"kinds": {
+"LAYOUT_HEADER": 1,
+"NOP": 632,
+"REG": 166,
+"SNAPSHOT": 5,
+"TS_DELTA_OR_MARK_RDNA4": 23,
+"TS_DELTA_SHORT": 7,
+"TS_WAVE_STATE": 108
+},
+"last_time": 182663,
+"sha256_kind_time": "922745e3144478d94b2ba8231c084045065d94c5a0efd34c8e5579ce13455f1f",
+"head": [
+[
+"LAYOUT_HEADER",
+0,
+{
+"flag4": 1,
+"group": 0,
+"layout": 4,
+"sel_a": 6,
+"sel_b": 4,
+"simd": 0
+}
+],
+[
+"TS_DELTA_OR_MARK_RDNA4",
+1032,
+{
+"delta": 1032,
+"pl": 0,
+"rt": 0,
+"tl": 0
+}
+],
+[
+"REG",
+1032,
+{
+"hi_byte": 130,
+"slot": 4,
+"subop": 30,
+"val32": 1
+}
+],
+[
+"NOP",
+1032,
+{}
+],
+[
+"NOP",
+1032,
+{}
+],
+[
+"NOP",
+1032,
+{}
+],
+[
+"NOP",
+1032,
+{}
+],
+[
+"NOP",
+1032,
+{}
+],
+[
+"NOP",
+1032,
+{}
+],
+[
+"NOP",
+1032,
+{}
+],
+[
+"NOP",
+1032,
+{}
+],
+[
+"NOP",
+1032,
+{}
+]
+],
+"sha256_fields": "ec0dd2eeded630d1501339d8c18672094a34c7b6651b1a406443d72f1aa52e3f"
+},
+{
+"index": 1,
+"se": 1,
+"itrace": true,
+"bytes": 2432,
+"packets": 1004,
+"kinds": {
+"ALUEXEC": 4,
+"IMMEDIATE": 5,
+"INST_RDNA4": 6,
+"LAYOUT_HEADER": 1,
+"NOP": 632,
+"REG": 166,
+"SNAPSHOT": 5,
+"TS_DELTA_OR_MARK_RDNA4": 38,
+"TS_DELTA_SHORT": 12,
+"TS_WAVE_STATE": 128,
+"VALUINST": 2,
+"VMEMEXEC": 3,
+"WAVEEND_RDNA4": 1,
+"WAVESTART_RDNA4": 1
+},
+"last_time": 182341,
+"sha256_kind_time": "a5fc1a7fd27f44f4074ce1331e3eea02e015bde7121996acdad1ad03d2198929",
+"head": [
+[
+"LAYOUT_HEADER",
+0,
+{
+"flag4": 1,
+"group": 0,
+"layout": 4,
+"sel_a": 6,
+"sel_b": 4,
+"simd": 0
+}
+],
+[
+"TS_DELTA_OR_MARK_RDNA4",
+710,
+{
+"delta": 710,
+"pl": 0,
+"rt": 0,
+"tl": 0
+}
+],
+[
+"REG",
+710,
+{
+"hi_byte": 130,
+"slot": 4,
+"subop": 30,
+"val32": 1
+}
+],
+[
+"NOP",
+710,
+{}
+],
+[
+"NOP",
+710,
+{}
+],
+[
+"NOP",
+710,
+{}
+],
+[
+"NOP",
+710,
+{}
+],
+[
+"NOP",
+710,
+{}
+],
+[
+"NOP",
+710,
+{}
+],
+[
+"NOP",
+710,
+{}
+],
+[
+"NOP",
+710,
+{}
+],
+[
+"NOP",
+710,
+{}
+]
+],
+"sha256_fields": "48f2545519f07bf0e9b1f774b8a6c591e68b166a6c7171ced8ee17ffef0ac982"
+},
+{
+"index": 2,
+"se": 2,
+"itrace": false,
+"bytes": 2240,
+"packets": 973,
+"kinds": {
+"LAYOUT_HEADER": 1,
+"NOP": 661,
+"REG": 167,
+"SNAPSHOT": 5,
+"TS_DELTA_OR_MARK_RDNA4": 23,
+"TS_DELTA_SHORT": 7,
+"TS_WAVE_STATE": 109
+},
+"last_time": 183188,
+"sha256_kind_time": "9d50874d1b77393c92bf5e05f49cfb21b5f76dd74293e9926e0d4e2aa4aeee6f",
+"head": [
+[
+"LAYOUT_HEADER",
+0,
+{
+"flag4": 1,
+"group": 0,
+"layout": 4,
+"sel_a": 6,
+"sel_b": 4,
+"simd": 0
+}
+],
+[
+"TS_WAVE_STATE",
+385,
+{
+"coarse": 0
+}
+],
+[
+"REG",
+385,
+{
+"hi_byte": 130,
+"slot": 4,
+"subop": 30,
+"val32": 1
+}
+],
+[
+"NOP",
+385,
+{}
+],
+[
+"NOP",
+385,
+{}
+],
+[
+"NOP",
+385,
+{}
+],
+[
+"NOP",
+385,
+{}
+],
+[
+"NOP",
+385,
+{}
+],
+[
+"NOP",
+385,
+{}
+],
+[
+"NOP",
+385,
+{}
+],
+[
+"NOP",
+385,
+{}
+],
+[
+"NOP",
+385,
+{}
+]
+],
+"sha256_fields": "a1411718fd3d87b72d3c12c15d5b7b4a3297051a7885f9df959ca1d209c6b57b"
+},
+{
+"index": 3,
+"se": 3,
+"itrace": false,
+"bytes": 2272,
+"packets": 992,
+"kinds": {
+"LAYOUT_HEADER": 1,
+"NOP": 676,
+"REG": 169,
+"SNAPSHOT": 5,
+"TS_DELTA_OR_MARK_RDNA4": 24,
+"TS_DELTA_SHORT": 7,
+"TS_WAVE_STATE": 110
+},
+"last_time": 184872,
+"sha256_kind_time": "7743c79d900fef867683e8f324c4f38bf4db91304b8fc9bc75602ea53525a0aa",
+"head": [
+[
+"LAYOUT_HEADER",
+0,
+{
+"flag4": 1,
+"group": 0,
+"layout": 4,
+"sel_a": 6,
+"sel_b": 4,
+"simd": 0
+}
+],
+[
+"TS_WAVE_STATE",
+63,
+{
+"coarse": 0
+}
+],
+[
+"REG",
+63,
+{
+"hi_byte": 130,
+"slot": 4,
+"subop": 30,
+"val32": 1
+}
+],
+[
+"NOP",
+63,
+{}
+],
+[
+"NOP",
+63,
+{}
+],
+[
+"NOP",
+63,
+{}
+],
+[
+"NOP",
+63,
+{}
+],
+[
+"NOP",
+63,
+{}
+],
+[
+"NOP",
+63,
+{}
+],
+[
+"NOP",
+63,
+{}
+],
+[
+"NOP",
+63,
+{}
+],
+[
+"NOP",
+63,
+{}
+]
+],
+"sha256_fields": "d4bc6be6791515153b358dec4c445ca5613f90d6f982a2f271e88e57aa4100a4"
+}
+],
+"mapped": [
+[
+1,
+"IMMEDIATE",
+28178,
+0,
+5632
+],
+[
+1,
+"INST_RDNA4",
+28179,
+0,
+5636
+],
+[
+1,
+"INST_RDNA4",
+28180,
+0,
+5644
+],
+[
+1,
+"VALUINST",
+28181,
+0,
+5652
+],
+[
+1,
+"IMMEDIATE",
+29881,
+0,
+5656
+],
+[
+1,
+"IMMEDIATE",
+29882,
+0,
+5660
+],
+[
+1,
+"INST_RDNA4",
+29883,
+0,
+5664
+],
+[
+1,
+"INST_RDNA4",
+29884,
+0,
+5676
+],
+[
+1,
+"IMMEDIATE",
+30965,
+0,
+5688
+],
+[
+1,
+"VALUINST",
+30966,
+0,
+5692
+],
+[
+1,
+"INST_RDNA4",
+30983,
+0,
+5696
+],
+[
+1,
+"IMMEDIATE",
+30991,
+0,
+5708
+],
+[
+1,
+"INST_RDNA4",
+30992,
+0,
+5712
+]
+]
+}
