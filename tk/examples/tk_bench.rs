@@ -689,27 +689,24 @@ fn sqtt_bench(args: &Args) -> Result<()> {
         return Ok(());
     }
     let positional: Vec<&str> = args.0.iter().map(String::as_str).take_while(|a| !a.starts_with("--")).collect();
-    let usage = "sqtt gemm M N K [--cfg I|tuned|BMxBNxBK:S:WRxWC[:rolled],…], sqtt --load DIR or sqtt --compare A B";
-    let ["gemm", m, n, k] = positional[..] else { return Err(usage.into()) };
-    let shape = [m.parse()?, n.parse()?, k.parse()?];
-    let [m, n, k] = shape;
-    let (planner, epilogue) = (planner()?, epilogue(args));
-    let ranked = planner.gemm_ranked(1, m, n, k, &epilogue);
-    let cfgs = args.opt("--cfg").unwrap_or("tuned").split(',').map(|c| match (c, c.parse::<usize>()) {
-        ("tuned", _) => Ok(gemm_pick(&planner, shape, epilogue, &ranked)),
-        (_, Ok(i)) => ranked.get(i).copied().ok_or_else(|| format!("--cfg {i}: {} ranked", ranked.len()).into()),
-        (code, _) => pinned(code),
-    });
+    let usage = "sqtt gemm M N K [--cfg I|tuned|BMxBNxBK:S:WRxWC[:rolled],…], \
+                 sqtt attention B H T D [--causal] [--bias] [--cfg I|tuned,…], sqtt --load DIR or sqtt --compare A B";
+    let planner = planner()?;
+    let traced: Vec<Traced> = match positional[..] {
+        ["gemm", m, n, k] => gemm_traced(&planner, [m.parse()?, n.parse()?, k.parse()?], args)?,
+        ["attention", b, h, t, d] => {
+            attention_traced(&planner, [b.parse()?, h.parse()?, t.parse()?, d.parse()?], args)?
+        }
+        _ => return Err(usage.into()),
+    };
     let out = PathBuf::from(args.opt("--out").unwrap_or("sqtt"));
-    for (i, cfg) in cfgs.enumerate() {
-        let cfg = cfg?;
-        let untraced = timed_candidates(vec![gemm_candidate(&planner, shape, epilogue, cfg)?]).pop().and_then(|t| t.1);
-        let dir = out.join(format!("gemm_{m}x{n}x{k}_{i}"));
+    for Traced { name, candidate, labels } in traced {
+        let untraced = timed_candidates(vec![candidate()?]).pop().and_then(|t| t.1);
+        let dir = out.join(&name);
         // `SVOD_SQTT_PSTATE` pins the traced pass's clock (`ProfileOptions::from_env`).
         let opts =
             ProfileOptions { iters: 3, static_analysis: false, sqtt: Some(dir.clone()), ..ProfileOptions::from_env() };
-        let profiles = tune::profile(gemm_candidate(&planner, shape, epilogue, cfg)?, &opts)
-            .ok_or_else(|| format!("{}: failed to build or run", gemm_label(&cfg)))?;
+        let profiles = tune::profile(candidate()?, &opts).ok_or_else(|| format!("{name}: failed to build or run"))?;
         // `SVOD_PMC` adds the hardware counters of the untraced passes.
         if opts.counters != svod_runtime::profiler::PmcSelection::None {
             profiles.iter().for_each(|p| print!("{}", p.render_table()));
@@ -718,15 +715,14 @@ fn sqtt_bench(args: &Args) -> Result<()> {
         if traces.is_empty() {
             return Err("no thread trace: SQTT needs an AMD RDNA3/RDNA4 device (SVOD_DEVICE=AMD)".into());
         }
-        let mut labels = gemm_model(&planner, shape, epilogue, cfg);
-        labels.insert("candidate_ns".into(), untraced.map_or("-".into(), |t| t.as_nanos().to_string()));
-        let candidate = gemm_candidate(&planner, shape, epilogue, cfg)?;
+        let candidate = candidate()?;
         for trace in traces {
             if let Err(error) = &trace.analysis {
                 return Err(format!("{}: {error}", trace.dir.display()).into());
             }
             let mut capture = Capture::load(&trace.dir)?;
             capture.labels.extend(labels.clone());
+            capture.labels.insert("candidate_ns".into(), untraced.map_or("-".into(), |t| t.as_nanos().to_string()));
             // The statements, from a host build with a line table whose code is the traced one.
             match tune::twin(&candidate, &mut capture) {
                 None => capture.labels.insert("lines".into(), "twin".into()),
@@ -742,6 +738,96 @@ fn sqtt_bench(args: &Args) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// One configuration `sqtt` traces: its capture directory, its candidate
+/// (built afresh for each pass) and the labels its capture carries.
+struct Traced<'a> {
+    name: String,
+    candidate: Box<dyn Fn() -> Result<Candidate> + 'a>,
+    labels: BTreeMap<String, String>,
+}
+
+fn gemm_traced<'a>(planner: &'a Planner, shape: [usize; 3], args: &Args) -> Result<Vec<Traced<'a>>> {
+    let [m, n, k] = shape;
+    let epilogue = epilogue(args);
+    let ranked = planner.gemm_ranked(1, m, n, k, &epilogue);
+    let cfgs = args.opt("--cfg").unwrap_or("tuned").split(',').map(|c| match (c, c.parse::<usize>()) {
+        ("tuned", _) => Ok(gemm_pick(planner, shape, epilogue, &ranked)),
+        (_, Ok(i)) => ranked.get(i).copied().ok_or_else(|| format!("--cfg {i}: {} ranked", ranked.len()).into()),
+        (code, _) => pinned(code),
+    });
+    cfgs.enumerate()
+        .map(|(i, cfg)| {
+            let cfg = cfg?;
+            Ok(Traced {
+                name: format!("gemm_{m}x{n}x{k}_{i}"),
+                candidate: Box::new(move || gemm_candidate(planner, shape, epilogue, cfg)),
+                labels: gemm_model(planner, shape, epilogue, cfg),
+            })
+        })
+        .collect()
+}
+
+/// Attention over `[B, T, H, D]` bf16 operands; `--cfg tuned` (the default)
+/// is the configuration the op launches, an index one of the planner's ranking.
+fn attention_traced<'a>(planner: &'a Planner, [b, h, t, d]: [usize; 4], args: &Args) -> Result<Vec<Traced<'a>>> {
+    let (causal, bias) = (args.flag("--causal"), args.flag("--bias"));
+    let ranked = planner.attention_ranked(b * h, t, t, d, causal, bias);
+    let spec = AttnSpec {
+        batch: Batch::Static(b),
+        t,
+        tk: t,
+        heads: h,
+        kv_heads: h,
+        d,
+        mask: AttnMask { causal, bias: bias.then_some(Bias::PerBatch), ..AttnMask::default() },
+        cache: None,
+        packed: false,
+        scale: 1.0 / (d as f32).sqrt(),
+    };
+    let tuned = || -> Result<usize> {
+        let operand = || drawn(&[b, t, h, d], DType::BFloat16);
+        let scores = if bias { Some(drawn(&[b, h, t, t], DType::BFloat16)?) } else { None };
+        ops::attention(
+            &operand()?,
+            &operand()?,
+            &operand()?,
+            Attn { causal, bias: scores.as_ref(), ..Attn::default() },
+        )?
+        .realize()?;
+        let launched = match ops::chosen() {
+            Some(ops::Chosen::Kernel { cfg, .. }) => cfg,
+            other => return Err(format!("the op launched no tile kernel: {other:?}").into()),
+        };
+        let at = ranked.iter().position(|c| format!("{c:?}") == launched);
+        at.ok_or_else(|| format!("the op's {launched} is not in the planner's ranking").into())
+    };
+    let picks = args.opt("--cfg").unwrap_or("tuned").split(',').map(|c| match c {
+        "tuned" => tuned(),
+        i => Ok(i.parse::<usize>()?),
+    });
+    picks
+        .map(|i| {
+            let i = i?;
+            let cfg = *ranked.get(i).ok_or_else(|| format!("--cfg {i}: {} ranked", ranked.len()))?;
+            let admitted = spec.clone().admitted(planner, cfg).map_err(|why| format!("{cfg:?}: {why:?}"))?;
+            let labels = BTreeMap::from([
+                ("op".into(), "attention".into()),
+                ("shape".into(), format!("b{b} h{h} t{t} d{d} causal={causal} bias={bias}")),
+                ("cfg".into(), format!("{cfg:?}")),
+            ]);
+            Ok(Traced {
+                name: format!(
+                    "attention_b{b}h{h}t{t}d{d}{}{}_{i}",
+                    ["", "c"][causal as usize],
+                    ["", "b"][bias as usize]
+                ),
+                candidate: Box::new(move || Ok(candidates::attention(&admitted, &[t], &DType::BFloat16, planner))),
+                labels,
+            })
+        })
+        .collect()
 }
 
 fn sqtt_print(capture: &Capture, args: &Args, top: usize) -> Result<()> {
