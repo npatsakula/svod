@@ -251,6 +251,26 @@ pub enum Configs {
 }
 
 impl Configs {
+    /// The problem the list ranks under, as its debug text.
+    pub fn problem(&self) -> String {
+        match self {
+            Self::Gemm { problem, .. } => format!("{problem:?}"),
+            Self::Attention { problem, .. } => format!("{problem:?}"),
+            Self::Nearest { problem, .. } => format!("{problem:?}"),
+            Self::Conv { problem, .. } => format!("{problem:?}"),
+        }
+    }
+
+    /// The code of the list's `at`.
+    pub fn code(&self, at: usize) -> String {
+        match self {
+            Self::Gemm { list, .. } => list[at].code(),
+            Self::Attention { list, .. } => list[at].code(),
+            Self::Nearest { list, .. } => list[at].code(),
+            Self::Conv { list, .. } => list[at].code(),
+        }
+    }
+
     /// The ns of SM time the model ranks `at` of the list at.
     fn cost(&self, planner: &Planner, at: usize) -> Option<f64> {
         let of = |problem: &GemmProblem, cfg: &_| problem.admit(planner, cfg).ok().map(|(ns, _)| ns);
@@ -274,17 +294,25 @@ impl Replay {
         self.timed.iter().map(|&(_, ns)| ns as f64).collect()
     }
 
-    /// Whether the model's best is the measured winner: the pick the tuner
-    /// would have made without timing.
-    pub fn top1(&self, planner: &Planner) -> bool {
+    /// The position in [`Self::timed`] of the model's best: the pick the
+    /// tuner would have made without timing.
+    pub fn picked(&self, planner: &Planner) -> usize {
         let predicted = self.predicted(planner);
-        let best = predicted
-            .iter()
-            .enumerate()
-            .min_by(|a, b| a.1.total_cmp(b.1))
-            .map(|(at, _)| self.timed[at].0)
-            .expect("a timed line holds a candidate");
-        best == self.timed[0].0
+        let best = predicted.iter().enumerate().min_by(|a, b| a.1.total_cmp(b.1));
+        best.map(|(at, _)| at).expect("a timed line holds a candidate")
+    }
+
+    /// Whether the model's best is the measured winner.
+    pub fn top1(&self, planner: &Planner) -> bool {
+        self.timed[self.picked(planner)].0 == self.timed[0].0
+    }
+
+    /// The measured ns of the model's best over the winner's: what skipping
+    /// the tuner costs on this line, 1 where the model picks the winner. A
+    /// pick a hair off the winner regrets a hair, where [`Self::top1`] fails
+    /// it outright.
+    pub fn regret(&self, planner: &Planner) -> f64 {
+        self.timed[self.picked(planner)].1 as f64 / self.timed[0].1 as f64
     }
 
     /// The Spearman ρ of the model's order against the device's.
@@ -327,6 +355,14 @@ impl Family {
     pub fn top1(&self, planner: &Planner) -> Option<f64> {
         (!self.lines.is_empty())
             .then(|| self.lines.iter().filter(|l| l.top1(planner)).count() as f64 / self.lines.len() as f64)
+    }
+
+    /// The geometric mean of the lines' [`Replay::regret`]s and the worst
+    /// of them.
+    pub fn regret(&self, planner: &Planner) -> Option<(f64, f64)> {
+        let regrets: Vec<f64> = self.lines.iter().map(|l| l.regret(planner)).collect();
+        let worst = regrets.iter().copied().reduce(f64::max)?;
+        Some(((regrets.iter().map(|r| r.ln()).sum::<f64>() / regrets.len() as f64).exp(), worst))
     }
 
     /// The timed candidates over the lines.

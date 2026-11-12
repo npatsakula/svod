@@ -100,6 +100,9 @@ fn a_store_replays_through_the_op_layers_keys(ns: fn(f64) -> u64) {
     let rho = family.lines[0].rho(&devices[0].planner).expect("the costs give the order variance");
     assert!(if agreed { rho > 0.99 } else { rho < -0.99 }, "{rho}");
     assert_eq!(family.lines[0].top1(&devices[0].planner), agreed);
+    let regret = if agreed { 1.0 } else { ns(p[0]) as f64 / ns(p[3]) as f64 };
+    assert_eq!(family.lines[0].regret(&devices[0].planner), regret);
+    assert_eq!(family.regret(&devices[0].planner), Some((regret, regret)));
 }
 
 /// A choice line whose candidates digest no ranking of the shape makes — a
