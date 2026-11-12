@@ -70,7 +70,7 @@ use svod_tk::atoms::{Core, Costs, Device};
 use svod_tk::ir::Schedule;
 use svod_tk::kernels::attention::{AttnMask, AttnSpec, Bias, FaCfg};
 use svod_tk::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, TileOrder};
-use svod_tk::kernels::nearest::{Floors, Metric, NearestSpec};
+use svod_tk::kernels::nearest::{Floors, Metric, NearestCfg, NearestSpec};
 use svod_tk::kernels::{Act, Batch};
 use svod_tk::ops::config::{AttentionProblem, GemmProblem, NearestProblem, Planner};
 use svod_tk::ops::shape::{self, Extent, Plan};
@@ -695,7 +695,7 @@ fn sqtt_bench(args: &Args) -> Result<()> {
     let positional: Vec<&str> = args.0.iter().map(String::as_str).take_while(|a| !a.starts_with("--")).collect();
     let usage = "sqtt gemm M N K [--cfg I|tuned|BMxBNxBK:S:WRxWC[:rolled],…], \
                  sqtt attention B H T D [--causal] [--bias] [--cfg I|tuned,…], \
-                 sqtt nearest N D K [--metric M] [--cfg I|tuned,…], sqtt --load DIR or sqtt --compare A B";
+                 sqtt nearest N D K [--metric M] [--cfg I|tuned|ranked,…] [--splits S], sqtt --load DIR or sqtt --compare A B";
     let planner = planner()?;
     let traced: Vec<Traced> = match positional[..] {
         ["gemm", m, n, k] => gemm_traced(&planner, [m.parse()?, n.parse()?, k.parse()?], args)?,
@@ -890,7 +890,12 @@ fn nearest_traced<'a>(planner: &'a Planner, [n, depth, k]: [usize; 3], args: &Ar
     });
     picks
         .map(|pick: Result<_>| {
-            let (i, admitted) = pick?;
+            let (mut i, mut admitted) = pick?;
+            if let Some(splits) = args.opt("--splits") {
+                let cfg = NearestCfg { splits: splits.parse()?, ..admitted.cfg() };
+                admitted = spec.clone().admitted(planner, cfg).map_err(|why| format!("{cfg:?}: {why:?}"))?;
+                i = format!("{i}_s{splits}");
+            }
             let labels = BTreeMap::from([
                 ("op".into(), "nearest".into()),
                 ("shape".into(), format!("n{n} d{depth} k{k} {metric:?}")),
