@@ -332,6 +332,11 @@ fn scaled<'t>(spec: Admitted<'t, AttnSpec>, scale: f32) -> Admitted<'t, AttnSpec
     spec.map(|s| AttnSpec { scale, ..s })
 }
 
+/// `spec` with its bias tiles read directly, a step ahead, not through a ring.
+fn direct(spec: Admitted<AttnSpec>) -> Admitted<AttnSpec> {
+    reassumed(spec, |c| FaCfg { forms: Forms { bias_direct: true, ..c.forms }, ..c })
+}
+
 fn with(cfg: FaCfg, spec: Admitted<AttnSpec>) -> Admitted<AttnSpec> {
     assumed(spec.into_spec(), cfg)
 }
@@ -359,6 +364,16 @@ fn with(cfg: FaCfg, spec: Admitted<AttnSpec>) -> Admitted<AttnSpec> {
 #[test_case(masked(99, 99, 64, 64, 64, LENS_BIAS), &[99, 41]; "bias with key lengths, odd keys")]
 #[test_case(masked(128, 128, 128, 64, 32, LENS_BIAS), &[128, 70]; "d 128 bias with key lengths")]
 #[test_case(masked(128, 128, 64, 64, 32, EVERY_BIAS), &[128, 100]; "every mask and a bias")]
+#[test_case(direct(masked(128, 192, 64, 64, 64, PER_BATCH)), &[192, 192]; "direct bias per batch, three key blocks")]
+#[test_case(direct(masked(100, 130, 64, 64, 64, SHARED)), &[130, 130]; "direct shared bias, ragged")]
+#[test_case(direct(masked(128, 128, 64, 64, 32, CAUSAL_BIAS)), &[128, 128]; "direct causal bias")]
+#[test_case(direct(masked(99, 99, 64, 64, 64, LENS_BIAS)), &[99, 41]; "direct bias with key lengths, odd keys")]
+#[test_case(direct(masked(128, 128, 64, 64, 32, EVERY_BIAS)), &[128, 100]; "direct bias under every mask")]
+#[test_case(direct(with(key_warps(4, 16), masked(16, 128, 64, 16, 16, PER_BATCH))), &[128, 128]; "direct bias, four key warps")]
+#[test_case(direct(with(rows32(128, 64), masked(100, 150, 64, 128, 64, AttnMask { key_lens: true, ..PER_BATCH }))), &[150, 77]; "direct bias, two atom rows a warp")]
+#[test_case(direct(biased(cached(1, 200, [4, 4, 64], false, 0, 4))), &[200, 70]; "direct bias, four splits")]
+#[test_case(direct(biased(cached(1, 100, [4, 2, 64], true, 1, 1))), &[100, 37]; "direct bias: row map, appended, gqa")]
+#[test_case(direct(masked(128, 128, 128, 64, 32, LENS_BIAS)), &[128, 70]; "direct bias, d 128 with key lengths")]
 #[test_case(spec(128, 128, 64, 64, 64, false, true), &[100, 0]; "a lane with no keys")]
 #[test_case(spec(128, 128, 64, 64, 32, true, true), &[0, 50]; "causal, a lane with no keys")]
 #[test_case(scaled(spec(128, 128, 64, 64, 32, true, true), 0.3), &[128, 50]; "a larger scale")]

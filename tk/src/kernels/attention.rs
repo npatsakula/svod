@@ -765,34 +765,57 @@ fn attention_body<'k, T: Half>(k: &mut Kernel<'k>, spec: &Admitted<AttnSpec>) {
             ),
             None => (s_first.clone(), blocks.clone(), Sc::from(0), split.clone().eq(splits - 1)),
         };
-        let [m, l, acc] = k.pipeline(
-            w_blocks,
-            k_s,
-            [m0, l0, o0],
-            |k, step, slot| {
-                let (kv_off, slot) = ((w_first.clone() + step) * bkv, slot.past(slot0.clone()));
-                let k_g = k.at(k_view, kv_off.clone(), 0);
-                let v_g = k.at(v_view, kv_off.clone(), 0);
-                let k_t = k.slot(k_s, &slot, Shape::new(bkv, d));
-                let v_t = k.slot(v_s, &slot, Shape::new(bkv, d));
-                k.stage(k_t, k_g, CopyMode::Async);
-                k.stage(v_t, v_g, CopyMode::Async);
-                if let (Some(view), Some(ring)) = (bias_view, bias_s) {
-                    let b_g = k.at(view, q_off.clone(), kv_off);
-                    let b_t = k.slot(ring, &slot, shape);
-                    k.stage(b_t, b_g, CopyMode::Async);
-                }
-            },
-            |k, step_, slot, carried| {
+        let produce = |k: &mut Kernel<'k>, step: Sc<'k>, slot: Filling<'k, '_>| {
+            let (kv_off, slot) = ((w_first.clone() + step) * bkv, slot.past(slot0.clone()));
+            let k_g = k.at(k_view, kv_off.clone(), 0);
+            let v_g = k.at(v_view, kv_off.clone(), 0);
+            let k_t = k.slot(k_s, &slot, Shape::new(bkv, d));
+            let v_t = k.slot(v_s, &slot, Shape::new(bkv, d));
+            k.stage(k_t, k_g, CopyMode::Async);
+            k.stage(v_t, v_g, CopyMode::Async);
+            if let (Some(view), Some(ring)) = (bias_view, bias_s) {
+                let b_g = k.at(view, q_off.clone(), kv_off);
+                let b_t = k.slot(ring, &slot, shape);
+                k.stage(b_t, b_g, CopyMode::Async);
+            }
+        };
+        let [m, l, acc] = match bias_view.filter(|_| bias_s.is_none()) {
+            // A directly read bias tile is loaded a step ahead of the step it
+            // serves, so its load has a whole step to land: a block's own,
+            // read where its scores need it, would wait right behind its issue.
+            // The last step reads its successor's (or its own) tile in vain.
+            Some(view) => {
+                let last = keys.div_ceil(bkv) - 1;
+                let tile = |k: &mut Kernel<'k>, block: Sc<'k>| {
+                    let at = k.at(view, q_off.clone(), block.min(last) * bkv);
+                    k.load(at)
+                };
+                let first = tile(k, w_first.clone());
+                let (acc, _) =
+                    k.pipeline_with(w_blocks, k_s, [m0, l0, o0], [first], produce, |k, step_, slot, carried, [b]| {
+                        let next = tile(k, w_first.clone() + step_.clone() + 1);
+                        let slot = slot.past(slot0.clone());
+                        let (k_t, v_t) =
+                            (k.slot(k_s, &slot, Shape::new(bkv, d)), k.slot(v_s, &slot, Shape::new(bkv, d)));
+                        let ahead = |k: &mut Kernel<'k>, s: Regs<'k, F32>, _| {
+                            let b = k.cast::<T, F32>(b);
+                            let log2e = k.fill::<F32>(k.shape(s), Const::Float(std::f64::consts::LOG2_E));
+                            k.mul_add(b, log2e, s)
+                        };
+                        let st = Step { bias: Some(&ahead as Mask), ..st };
+                        (step(k, &st, k_t, v_t, (w_first.clone() + step_) * bkv, carried), [next])
+                    });
+                acc
+            }
+            None => k.pipeline(w_blocks, k_s, [m0, l0, o0], produce, |k, step_, slot, carried| {
                 let slot = slot.past(slot0.clone());
-                let k_t = k.slot(k_s, &slot, Shape::new(bkv, d));
-                let v_t = k.slot(v_s, &slot, Shape::new(bkv, d));
+                let (k_t, v_t) = (k.slot(k_s, &slot, Shape::new(bkv, d)), k.slot(v_s, &slot, Shape::new(bkv, d)));
                 let b_t = bias_s.map(|ring| k.slot(ring, &slot, shape));
                 let from_ring = |k: &mut Kernel<'k>, s, _| biased(k, s, b_t.expect("a bias ring"));
                 let st = if b_t.is_some() { Step { bias: Some(&from_ring as Mask), ..st } } else { st };
                 step(k, &st, k_t, v_t, (w_first.clone() + step_) * bkv, carried)
-            },
-        );
+            }),
+        };
         // The appended rows, a block of keys that every split and key warp
         // scores and all but the last hide: a hidden block leaves `(m, l, o)`
         // as they were, and a branch would cost more than the step.
