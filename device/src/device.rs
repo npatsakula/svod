@@ -239,11 +239,13 @@ pub trait PlanContext: Send + Sync {
 
     /// Arm hardware performance counters for subsequent profiling dispatches on
     /// this context (empty disables), returning how many of `counters` this
-    /// backend collects: those naming another backend are dropped. Default
-    /// collects none. Counters are reported via
+    /// backend collects: those naming another backend are dropped. A device
+    /// whose target or queues cannot count its own backend's counters refuses
+    /// ([`Error::PmcUnsupported`](crate::Error::PmcUnsupported)) and arms
+    /// nothing. Default collects none. Counters are reported via
     /// [`DispatchTimestamps::counters`](crate::DispatchTimestamps::counters).
-    fn set_pmc(&self, _counters: &[crate::profile::PmcCounter]) -> usize {
-        0
+    fn set_pmc(&self, _counters: &[crate::profile::PmcCounter]) -> Result<usize> {
+        Ok(0)
     }
 
     /// Whether hardware counter collection is currently available on this

@@ -72,7 +72,11 @@ pub fn check_target(arch: AmdArch, pm4_queues: bool) -> Result<()> {
 }
 
 pub fn check_config(config: &SqttConfig) -> Result<()> {
-    ensure!(config.simd < 4, SqttUnsupportedSnafu { reason: format!("simd {} (a WGP SIMD is 0-3)", config.simd) });
+    let simds = config.simds.0;
+    ensure!(
+        simds.iter().all(|&s| s < 4),
+        SqttUnsupportedSnafu { reason: format!("simds {simds:?} (a WGP SIMD is 0-3)") }
+    );
     // BUF0_SIZE holds the window in 4 KiB units in a 22-bit field.
     ensure!(
         config.bytes_per_se > 0
@@ -123,7 +127,12 @@ pub fn build_streams(
         gc.wreg(
             &mut start,
             "regSQ_THREAD_TRACE_MASK",
-            &[("wtype_include", WTYPE_INCLUDE_CS), ("simd_sel", config.simd as u32), ("wgp_sel", 0), ("sa_sel", 0)],
+            &[
+                ("wtype_include", WTYPE_INCLUDE_CS),
+                ("simd_sel", config.simds.of(se).into()),
+                ("wgp_sel", 0),
+                ("sa_sel", 0),
+            ],
         );
         let itrace = (config.se_mask >> se) & 1 == 1;
         let token_exclude = match (gfx12, itrace) {
@@ -261,6 +270,7 @@ pub(crate) struct Capture {
     arch: AmdArch,
     ses: u32,
     code: Option<CodeImage>,
+    mclk_mhz: Option<u64>,
 }
 
 impl Capture {
@@ -290,7 +300,8 @@ impl Capture {
         let (trace_va, trace_host) = host_visible(trace.buffer())?;
         let (wptr_va, wptrs_host) = host_visible(wptrs.buffer())?;
         let (start, stop) = build_streams(&config, arch, &topology, workgroups, trace_va, wptr_va)?;
-        Ok(Self { trace, trace_host, wptrs, wptrs_host, start, stop, config, arch, ses: topology.se, code })
+        let mclk_mhz = current_mclk_mhz(core.node.drm_render_minor);
+        Ok(Self { trace, trace_host, wptrs, wptrs_host, start, stop, config, arch, ses: topology.se, code, mclk_mhz })
     }
 
     /// The handle that reads the trace once `finalizer` retired, delegating
@@ -311,8 +322,22 @@ impl Capture {
             arch: self.arch,
             ses: self.ses,
             code: self.code,
+            mclk_mhz: self.mclk_mhz,
         }
     }
+}
+
+/// The memory clock level the render node's `pp_dpm_mclk` marks current.
+fn current_mclk_mhz(render_minor: u32) -> Option<u64> {
+    let path = format!("/sys/class/drm/renderD{render_minor}/device/pp_dpm_mclk");
+    current_dpm_mhz(&std::fs::read_to_string(path).ok()?)
+}
+
+/// The first `*`-marked level of a `pp_dpm_*` listing (`1: 1800Mhz *`); some cards mark two.
+pub fn current_dpm_mhz(levels: &str) -> Option<u64> {
+    let line = levels.lines().find(|l| l.trim_end().ends_with('*'))?;
+    let (_, level) = line.split_once(':')?;
+    level.split_whitespace().next()?.to_ascii_lowercase().strip_suffix("mhz")?.parse().ok()
 }
 
 fn host_visible(buffer: &RawBuffer) -> Result<(u64, NonNull<u8>)> {
@@ -335,6 +360,7 @@ pub struct SqttHandle {
     arch: AmdArch,
     ses: u32,
     code: Option<CodeImage>,
+    mclk_mhz: Option<u64>,
 }
 
 // SAFETY: the host pointers map allocations the handle owns; they are read
@@ -388,7 +414,7 @@ impl DispatchTimestamps for SqttHandle {
                 SeTrace { se, itrace: (self.config.se_mask >> se) & 1 == 1, bytes, truncated }
             })
             .collect();
-        Some(SqttTrace { arch: self.arch, per_se, code: self.code.clone() })
+        Some(SqttTrace { arch: self.arch, per_se, code: self.code.clone(), mclk_mhz: self.mclk_mhz })
     }
 }
 

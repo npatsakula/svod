@@ -1603,15 +1603,22 @@ impl ExecutionPlan {
                     // Arming follows what it kept, so a list it drops entirely
                     // costs neither the counted passes nor graph replay.
                     let counters = opts.counters.resolve(&ctx.pmc_default());
-                    let collected = ctx.set_pmc(&counters);
-                    if collected < counters.len() {
-                        eprintln!(
-                            "SVOD_PMC: {} of {} requested counters are not collected on this backend",
-                            counters.len() - collected,
-                            counters.len()
-                        );
+                    match ctx.set_pmc(&counters) {
+                        Ok(collected) => {
+                            if collected < counters.len() {
+                                eprintln!(
+                                    "SVOD_PMC: {} of {} requested counters are not collected on this backend",
+                                    counters.len() - collected,
+                                    counters.len()
+                                );
+                            }
+                            (collected > 0).then_some(ctx)
+                        }
+                        Err(error) => {
+                            eprintln!("SVOD_PMC: {error}; reporting timing only");
+                            None
+                        }
                     }
-                    (collected > 0).then_some(ctx)
                 }
                 Some(_) => {
                     eprintln!(
@@ -1643,7 +1650,7 @@ impl ExecutionPlan {
             // kernel rather than the profiler; `merge_min` keeps its time and the
             // counted pass's counters.
             if let Some(ctx) = armed_ctx {
-                ctx.set_pmc(&[]);
+                ctx.set_pmc(&[]).context(ExecSnafu { context: "disarm the counters" })?;
                 report.merge_min(run(self.execute_profiled_inner(true, false)?));
             }
             Ok(report)
@@ -1651,7 +1658,7 @@ impl ExecutionPlan {
         // Disarm so later non-profiled executions on this context don't pay for
         // (or perturb from) counter programming.
         if let Some(ctx) = armed_ctx {
-            ctx.set_pmc(&[]);
+            ctx.set_pmc(&[]).context(ExecSnafu { context: "disarm the counters" })?;
         }
         let mut report = result?;
         if opts.static_analysis {
@@ -1666,7 +1673,12 @@ impl ExecutionPlan {
             }
         }
         if let Some(dir) = &opts.sqtt {
-            report.stages[0].sqtt = self.trace(dir, opts.sqtt_pstate, &report.stages[0].kernels)?;
+            let config = svod_device::profile::SqttConfig {
+                pstate: opts.sqtt_pstate,
+                simds: opts.sqtt_simds,
+                ..Default::default()
+            };
+            report.stages[0].sqtt = self.trace(dir, config, &report.stages[0].kernels)?;
         }
         Ok(report)
     }
@@ -1688,18 +1700,17 @@ impl ExecutionPlan {
         first_program.and_then(|p| self.plan_ctx(p).ok().flatten())
     }
 
-    /// Tier 5: one more pass with the plan's context tracing (AMD SQTT) at
-    /// `pstate` (`None`: the device's own clock), each kernel's trace saved
+    /// Tier 5: one more pass with the plan's context tracing (AMD SQTT) as
+    /// `config` asks, each kernel's trace saved
     /// under `dir/<index>_<entry point>` beside its untraced time in
     /// `untraced`. A context that cannot trace leaves a note.
     fn trace(
         &self,
         dir: &std::path::Path,
-        pstate: Option<svod_device::profile::StablePstate>,
+        config: svod_device::profile::SqttConfig,
         untraced: &[KernelProfile],
     ) -> Result<Vec<SqttKernel>> {
         let Some(ctx) = self.first_ctx() else { return Ok(vec![]) };
-        let config = svod_device::profile::SqttConfig { pstate, ..Default::default() };
         if let Err(error) = ctx.set_sqtt(Some(config)) {
             eprintln!("SVOD_SQTT: no thread trace on this device ({error}); skipped");
             return Ok(vec![]);
@@ -1731,7 +1742,7 @@ impl ExecutionPlan {
                 profile.gpu_end_ns.zip(profile.gpu_start_ns).and_then(|(end, start)| end.checked_sub(start));
             let analysis = crate::sqtt::Capture::new(*trace, ns).and_then(|mut capture| {
                 capture.traced_ns = traced_ns;
-                capture.pstate = Some(pstate.into());
+                capture.pstate = Some(config.pstate.into());
                 capture.labels.insert("kernel".into(), entry.clone());
                 capture.resources = profile.kernel.program.resource_usage();
                 capture.grid = dims.and_then(|d| d.0).map(axes);

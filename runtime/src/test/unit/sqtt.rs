@@ -46,7 +46,7 @@ fn capture(fixture: &str) -> Capture {
         (read("kernel.co"), text("kernel.s"), golden["base"].as_u64().unwrap(), ses.collect())
     };
     let code = Some(CodeImage { elf, load_base, entry_pc: 0 });
-    let trace = SqttTrace { arch: arch(&disassembly), per_se, code };
+    let trace = SqttTrace { arch: arch(&disassembly), per_se, code, mclk_mhz: None };
     Capture {
         trace,
         disassembly,
@@ -328,6 +328,7 @@ proptest! {
 fn svod_capture(name: &str, grid: [u32; 3]) -> Capture {
     let mut capture = Capture::load(&fixtures().join("svod").join(name)).unwrap();
     assert_eq!((capture.resources, capture.workgroup, capture.grid), (None, None, None), "older captures load");
+    assert_eq!(capture.trace.mclk_mhz, None);
     let elf = &capture.trace.code.as_ref().unwrap().elf;
     let major = capture.trace.arch.gfx_major();
     capture.resources = Some(svod_device::amd::program::kernel_resources(elf, "gemm", major).unwrap());
@@ -336,13 +337,17 @@ fn svod_capture(name: &str, grid: [u32; 3]) -> Capture {
 }
 
 #[test]
-fn capture_keeps_resources_and_launch() {
-    let capture = svod_capture("rdna4_gemm_v1", [10, 6, 1]);
+fn capture_keeps_resources_launch_and_mclk() {
+    let mut capture = svod_capture("rdna4_gemm_v1", [10, 6, 1]);
+    capture.trace.mclk_mhz = Some(1800);
     let dir = tempfile::tempdir().unwrap();
     capture.save(dir.path()).unwrap();
     let back = Capture::load(dir.path()).unwrap();
     assert_eq!((back.resources, back.workgroup, back.grid), (capture.resources, capture.workgroup, capture.grid));
-    assert_eq!(back.analyze().unwrap(), capture.analyze().unwrap());
+    assert_eq!(back.trace.mclk_mhz, Some(1800));
+    let a = back.analyze().unwrap();
+    assert_eq!(a, capture.analyze().unwrap());
+    assert!(a.text(1).lines().any(|l| l.starts_with("kernel ") && l.contains("MHz, mclk 1800 MHz, pstate")));
 }
 
 /// The kernel's limit beside the waves the trace saw. v1 and v3 (256 VGPRs, 48 KiB LDS) and the

@@ -24,8 +24,9 @@
 //! - **Tier 5 — thread trace.** An AMD SQTT capture of one extra pass
 //!   ([`ProfileOptions::sqtt`], `SVOD_SQTT=1`): each kernel's trace saved under
 //!   its own directory and summarized ([`crate::sqtt::Analysis`]). The trace
-//!   runs at the device's own clock unless `SVOD_SQTT_PSTATE` pins one; it
-//!   perturbs the dispatch, so the timing columns never come from that pass.
+//!   runs at the device's own clock unless `SVOD_SQTT_PSTATE` pins one, on the
+//!   SIMDs `SVOD_SQTT_SIMD` picks; it perturbs the dispatch, so the timing
+//!   columns never come from that pass.
 //!
 //! **Accumulate-and-min policy.** Repeated runs of the same plan are merged per
 //! kernel by keeping the minimum device time ([`RunProfile::merge_min`]), which
@@ -407,6 +408,8 @@ pub struct ProfileOptions {
     /// The stable power state the traced pass pins; `None` leaves the clock to
     /// the device, as the untimed passes do.
     pub sqtt_pstate: Option<svod_device::profile::StablePstate>,
+    /// The SIMD each SE's trace follows.
+    pub sqtt_simds: svod_device::profile::SqttSimds,
 }
 
 impl Default for ProfileOptions {
@@ -418,6 +421,7 @@ impl Default for ProfileOptions {
             origin_depth: None,
             sqtt: None,
             sqtt_pstate: None,
+            sqtt_simds: Default::default(),
         }
     }
 }
@@ -425,7 +429,8 @@ impl Default for ProfileOptions {
 impl ProfileOptions {
     /// Build from the `SVOD_PROFILE_ITERS` / `SVOD_PMC` / `SVOD_ORIGIN_DEPTH`
     /// / `SVOD_SQTT` (`1`, saved under `SVOD_SQTT_DIR`, default `./sqtt`) /
-    /// `SVOD_SQTT_PSTATE` (`standard` or `peak`) env vars (defaults otherwise). This is the single place profiling env vars
+    /// `SVOD_SQTT_PSTATE` (`standard` or `peak`) / `SVOD_SQTT_SIMD` (a SIMD, or a
+    /// comma list repeated over the SEs) env vars (defaults otherwise). This is the single place profiling env vars
     /// are read; callers that want explicit control construct [`ProfileOptions`]
     /// directly.
     pub fn from_env() -> Self {
@@ -442,6 +447,12 @@ impl ProfileOptions {
         }
         if let Ok(v) = std::env::var("SVOD_SQTT_PSTATE") {
             o.sqtt_pstate = v.parse().inspect_err(|e| eprintln!("SVOD_SQTT_PSTATE={e}; tracing unpinned")).ok();
+        }
+        if let Ok(v) = std::env::var("SVOD_SQTT_SIMD") {
+            match v.parse() {
+                Ok(simds) => o.sqtt_simds = simds,
+                Err(e) => eprintln!("SVOD_SQTT_SIMD={e}; tracing the default SIMDs"),
+            }
         }
         o
     }

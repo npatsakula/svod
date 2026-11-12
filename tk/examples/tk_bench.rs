@@ -45,6 +45,7 @@
 //!   `--json` one line); `--attribute` sets the model's terms (`price` less
 //!   each) beside the traced SIMD's cycles of their counterparts.
 //!   `SVOD_SQTT_PSTATE=standard|peak` pins the traced pass's clock.
+//!   `SVOD_SQTT_SIMD=S[,S...]` picks each SE's traced SIMD (default `0,1`).
 //!   `sqtt --load DIR [--json] [--attribute]` re-reads a saved trace, no GPU;
 //!   `sqtt --compare DIR_A DIR_B [--json] [--top N]` sets B's trace against
 //!   A's ([`Diff`]).

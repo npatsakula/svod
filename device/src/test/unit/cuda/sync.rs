@@ -121,7 +121,7 @@ fn plan_context_captures_hardware_counters() {
 
     let counters = ctx.pmc_default();
     assert!(counters.contains(&PmcCounter::Cuda(CudaCounter::SmWarpsLaunched)));
-    ctx.set_pmc(&counters);
+    ctx.set_pmc(&counters).unwrap();
     let handle = unsafe {
         ctx.dispatch(
             &program,
@@ -148,7 +148,7 @@ fn plan_context_captures_hardware_counters() {
     assert_eq!(set.values[&PmcCounter::Cuda(CudaCounter::SmPipeTensorCyclesActive)], 0);
 
     // Disarming restores timing-only dispatches.
-    ctx.set_pmc(&[]);
+    ctx.set_pmc(&[]).unwrap();
     let plain = unsafe {
         ctx.dispatch(
             &program,

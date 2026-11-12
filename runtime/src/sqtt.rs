@@ -150,6 +150,8 @@ struct Meta {
     grid: Option<[u32; 3]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pstate: Option<Pstate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mclk_mhz: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -207,6 +209,7 @@ impl Capture {
             workgroup: self.workgroup,
             grid: self.grid,
             pstate: self.pstate,
+            mclk_mhz: self.trace.mclk_mhz,
         };
         let path = dir.join("meta.json");
         write("meta.json", serde_json::to_string_pretty(&meta).context(JsonSnafu { path })?.as_bytes())
@@ -237,7 +240,7 @@ impl Capture {
         };
         let code = Some(CodeImage { elf, load_base: meta.load_base, entry_pc: meta.entry_pc });
         Ok(Self {
-            trace: SqttTrace { arch, per_se, code },
+            trace: SqttTrace { arch, per_se, code, mclk_mhz: meta.mclk_mhz },
             disassembly,
             kernel_ns: meta.kernel_ns,
             traced_ns: meta.traced_ns,
@@ -482,6 +485,9 @@ pub struct Analysis {
     pub lifetime: Option<Spread>,
     /// Shader clock: the longest instruction-traced SE's wave span over `traced_ns`, else `kernel_ns`.
     pub sclk_mhz: Option<u64>,
+    /// Memory clock level current when the dispatch was armed.
+    #[serde(default)]
+    pub mclk_mhz: Option<u64>,
     /// Instruction records of the traced waves, and those a PC was attributed to.
     pub records: usize,
     pub stitched: usize,
@@ -672,6 +678,7 @@ impl Analysis {
                 .or(capture.kernel_ns)
                 .filter(|&ns| ns > 0 && span > 0)
                 .map(|ns| span as u64 * 1000 / ns),
+            mclk_mhz: capture.trace.mclk_mhz,
             records: waves.iter().map(|w| w.instructions.len()).sum(),
             stitched: waves.iter().flat_map(|w| &w.instructions).filter(|i| i.pc != 0).count(),
             classes: classes.into_values().collect(),
@@ -721,12 +728,13 @@ impl Analysis {
         let ns = |ns: Option<u64>| ns.map_or("-".into(), |ns| ns.to_string());
         let span = self.ses.iter().filter(|s| s.itrace).map(|s| s.span).max().unwrap_or(0);
         let sclk = self.sclk_mhz.map_or("-".into(), |mhz| format!("~{mhz}"));
+        let mclk = self.mclk_mhz.map_or(String::new(), |mhz| format!(", mclk {mhz} MHz"));
         let (untraced, traced) = (ns(self.kernel_ns), ns(self.traced_ns));
         let ratio = verdict::slowdown(self).map_or(String::new(), |r| format!(" ({r:.2}x)"));
         let pstate = self.pstate.map_or("unrecorded", Pstate::name);
         let _ = writeln!(
             o,
-            "kernel     {untraced} ns untraced, {traced} ns traced{ratio}, wave span {span} cycles, sclk {sclk} MHz, pstate {pstate}"
+            "kernel     {untraced} ns untraced, {traced} ns traced{ratio}, wave span {span} cycles, sclk {sclk} MHz{mclk}, pstate {pstate}"
         );
         let traced: Vec<String> = self
             .traced

@@ -117,7 +117,7 @@ impl PlanContext for CudaPlanCtx {
         self.stream.synchronize()
     }
 
-    fn set_pmc(&self, counters: &[PmcCounter]) -> usize {
+    fn set_pmc(&self, counters: &[PmcCounter]) -> Result<usize> {
         let mut armed = self.pmc.lock();
         *armed = counters
             .iter()
@@ -129,7 +129,7 @@ impl PlanContext for CudaPlanCtx {
         // The session pins one metric set at construction, so a changed
         // selection needs a fresh one.
         *self.session.lock() = None;
-        armed.len()
+        Ok(armed.len())
     }
 
     fn pmc_available(&self) -> bool {

@@ -8,16 +8,16 @@ use test_case::test_case;
 use super::test_support::{mock_device, mock_device_queues};
 use crate::amd::connector::{OwnerCtx, SubmissionFinalizer};
 use crate::amd::regwrite::RegWriter;
-use crate::amd::sqtt::{Capture, SqttTopology, build_streams, check_target, cu_masks, trace_bytes};
+use crate::amd::sqtt::{Capture, SqttTopology, build_streams, check_target, cu_masks, current_dpm_mhz, trace_bytes};
 use crate::amd::sys::pm4;
 use crate::device::PlanContext;
 use crate::error::Error;
-use crate::profile::{CodeImage, SqttConfig};
+use crate::profile::{CodeImage, SqttConfig, SqttSimds};
 use crate::sync::DispatchTimestamps;
 
 /// A PM4 packet of the profiler streams, register writes at absolute dwords.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Packet {
+pub(super) enum Packet {
     Reg(u32, u32),
     WaitReg { reg: u32, mask: u32 },
     Event(u32),
@@ -25,7 +25,7 @@ enum Packet {
     Acquire,
 }
 
-fn decode(stream: &[u32]) -> Vec<Packet> {
+pub(super) fn decode(stream: &[u32]) -> Vec<Packet> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < stream.len() {
@@ -71,7 +71,7 @@ fn topology(se: u32) -> SqttTopology {
 }
 
 fn config(se_mask: u32) -> SqttConfig {
-    SqttConfig { se_mask, simd: 2, bytes_per_se: WINDOW, limit_cu: false, pstate: None }
+    SqttConfig { se_mask, simds: SqttSimds::default(), bytes_per_se: WINDOW, limit_cu: false, pstate: None }
 }
 
 fn streams(arch: AmdArch, se: u32, config: &SqttConfig) -> (Vec<Packet>, Vec<Packet>) {
@@ -80,7 +80,7 @@ fn streams(arch: AmdArch, se: u32, config: &SqttConfig) -> (Vec<Packet>, Vec<Pac
 }
 
 /// Writes to `name` in stream order.
-fn writes(gc: &RegWriter, packets: &[Packet], name: &str) -> Vec<u32> {
+pub(super) fn writes(gc: &RegWriter, packets: &[Packet], name: &str) -> Vec<u32> {
     let addr = gc.addr(name);
     packets
         .iter()
@@ -178,8 +178,7 @@ fn gfx12_buf0_splits_the_base_over_two_registers() {
 }
 
 /// Only the SEs of `se_mask` record instruction tokens; gfx12 also leaves out
-/// barrier waits. MASK traces CS waves on the configured SIMD of WGP 0, SA 0.
-/// gfx11 sets no `ttrace_exec` (bit 11): its 11-bit `token_exclude` has no PERF bit.
+/// barrier waits. gfx11 sets no `ttrace_exec` (bit 11): its 11-bit `token_exclude` has no PERF bit.
 #[test_case(AmdArch::Gfx1151, 0b01, &[0x1F_1000, 0x1F_1127]; "gfx11 se0")]
 #[test_case(AmdArch::Gfx1151, 0b10, &[0x1F_1127, 0x1F_1000]; "gfx11 se1")]
 #[test_case(AmdArch::Gfx1201, 0b0101, &[0x1F_6000, 0x1F_6927, 0x1F_6000, 0x1F_6927]; "gfx12 even")]
@@ -188,7 +187,38 @@ fn token_mask_follows_the_itrace_ses(arch: AmdArch, se_mask: u32, expected: &[u3
     let gc = gfx(arch);
     let (start, _) = streams(arch, expected.len() as u32, &config(se_mask));
     assert_eq!(writes(&gc, &start, "regSQ_THREAD_TRACE_TOKEN_MASK"), expected);
-    assert_eq!(writes(&gc, &start, "regSQ_THREAD_TRACE_MASK"), vec![(0x40 << 10) | 2; expected.len()]);
+}
+
+/// MASK traces CS waves on each SE's SIMD of WGP 0, SA 0: by default SIMDs 0 and 1 (CU 0's)
+/// alternate over the SEs; a list repeats over them.
+#[test_case(AmdArch::Gfx1151, SqttSimds::default(), &[0, 1]; "gfx11 default")]
+#[test_case(AmdArch::Gfx1201, SqttSimds::default(), &[0, 1, 0, 1]; "gfx12 default")]
+#[test_case(AmdArch::Gfx1151, SqttSimds::cycle(&[3]), &[3, 3]; "gfx11 one simd")]
+#[test_case(AmdArch::Gfx1201, SqttSimds::cycle(&[2, 3, 0]), &[2, 3, 0, 2]; "gfx12 list repeats")]
+fn mask_traces_each_se_simd(arch: AmdArch, simds: SqttSimds, expected: &[u32]) {
+    let gc = gfx(arch);
+    let (start, _) = streams(arch, expected.len() as u32, &SqttConfig { simds, ..config(0b11) });
+    let masks: Vec<u32> = expected.iter().map(|&simd| (0x40 << 10) | simd).collect();
+    assert_eq!(writes(&gc, &start, "regSQ_THREAD_TRACE_MASK"), masks);
+}
+
+#[test_case("1" => Ok(SqttSimds([1; 8])); "one for every se")]
+#[test_case(" 0, 1 " => Ok(SqttSimds::default()); "the default list")]
+#[test_case("2,3,0" => Ok(SqttSimds([2, 3, 0, 2, 3, 0, 2, 3])); "repeated")]
+#[test_case("" => Err("\"\": a SIMD or a comma list of up to 8".to_string()); "empty")]
+#[test_case("0,x" => Err("\"0,x\": a SIMD or a comma list of up to 8".to_string()); "garbage")]
+#[test_case("0,1,2,3,0,1,2,3,0" => Err("\"0,1,2,3,0,1,2,3,0\": a SIMD or a comma list of up to 8".to_string()); "past 8 ses")]
+fn simds_parse(s: &str) -> Result<SqttSimds, String> {
+    s.parse()
+}
+
+#[test_case("0: 1000Mhz \n1: 1800Mhz *\n2: 1800Mhz *\n" => Some(1800); "two marked")]
+#[test_case("0: 96Mhz *\n1: 456Mhz\n" => Some(96); "lowest")]
+#[test_case("0: 96Mhz\n1: 456Mhz\n" => None; "none marked")]
+#[test_case("S: 19Mhz *\n" => Some(19); "deep sleep")]
+#[test_case("0: fast *\n" => None; "garbage")]
+fn dpm_level_parses(levels: &str) -> Option<u64> {
+    current_dpm_mhz(levels)
 }
 
 /// CTRL starts each SE in mode 1 and the stop returns it to mode 0; gfx11
@@ -287,7 +317,7 @@ fn streams_refuse_cdna() {
     ));
 }
 
-#[test_case(SqttConfig { simd: 4, ..config(1) }; "simd")]
+#[test_case(SqttConfig { simds: SqttSimds::cycle(&[0, 4]), ..config(1) }; "simd")]
 #[test_case(SqttConfig { bytes_per_se: 0, ..config(1) }; "empty window")]
 #[test_case(SqttConfig { bytes_per_se: 4096 + 32, ..config(1) }; "unaligned window")]
 #[test_case(SqttConfig { bytes_per_se: 16 << 30, ..config(1) }; "window past the size field")]
@@ -354,7 +384,7 @@ fn set_sqtt_arms_disarms_and_retains_code() {
     let owner = OwnerCtx::new(Arc::clone(&core), allocator);
     assert!(!core.retains_code());
     assert!(matches!(
-        owner.set_sqtt(Some(SqttConfig { simd: 9, ..SqttConfig::default() })),
+        owner.set_sqtt(Some(SqttConfig { simds: SqttSimds::cycle(&[9]), ..SqttConfig::default() })),
         Err(Error::SqttUnsupported { .. })
     ));
     owner.set_sqtt(Some(SqttConfig::default())).unwrap();
@@ -372,7 +402,7 @@ fn handle_reads_each_se_window_after_retirement() {
     let signal = Arc::new(pool.acquire().unwrap());
     let finalizer = SubmissionFinalizer::timeline(Arc::clone(&signal), 1, None);
     let code = CodeImage { elf: b"\x7fELF".to_vec(), load_base: 0x1000, entry_pc: 0x1100 };
-    let cfg = SqttConfig { se_mask: 0b1, simd: 0, bytes_per_se: 4096, limit_cu: false, pstate: None };
+    let cfg = SqttConfig { bytes_per_se: 4096, se_mask: 0b1, ..SqttConfig::default() };
     let capture = Capture::new(&allocator, cfg, 1, Some(code.clone())).unwrap();
     let copies: Vec<u64> = decode(&capture.stop)
         .into_iter()
@@ -399,6 +429,7 @@ fn handle_reads_each_se_window_after_retirement() {
     let trace = handle.sqtt().expect("retired");
     assert_eq!(trace.arch, AmdArch::Gfx1100);
     assert_eq!(trace.code, Some(code));
+    assert_eq!(trace.mclk_mhz, None, "the synthetic device has no render node");
     let [se] = &trace.per_se[..] else { panic!("one SE") };
     assert_eq!((se.se, se.itrace, se.truncated), (0, true, false));
     assert_eq!(se.bytes, vec![0xAB; 96]);

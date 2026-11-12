@@ -162,8 +162,8 @@ pub struct KernelResources {
 pub struct SqttConfig {
     /// SEs that emit instruction tokens (bit `i` = SE `i`).
     pub se_mask: u32,
-    /// The SIMD (0-3) of WGP 0, SA 0 whose instructions each SE traces.
-    pub simd: u8,
+    /// The SIMD of WGP 0, SA 0 whose instructions each SE traces.
+    pub simds: SqttSimds,
     /// Trace buffer per SE, a multiple of 4 KiB.
     pub bytes_per_se: usize,
     /// Narrow `COMPUTE_STATIC_THREAD_MGMT_SE*` so a small grid lands on the
@@ -177,7 +177,44 @@ pub struct SqttConfig {
 
 impl Default for SqttConfig {
     fn default() -> Self {
-        Self { se_mask: 0b11, simd: 0, bytes_per_se: 64 << 20, limit_cu: false, pstate: None }
+        Self { se_mask: 0b11, simds: SqttSimds::default(), bytes_per_se: 64 << 20, limit_cu: false, pstate: None }
+    }
+}
+
+/// The SIMD (0-3) each SE traces, SE `i` the `i % 8`th. The default alternates SIMDs 0 and 1:
+/// on RDNA3/4 SIMD bit 1 picks the WGP's CU, so the SEs between them sample both SIMDs of CU 0,
+/// which hold a CU-mode workgroup's waves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SqttSimds(pub [u8; 8]);
+
+impl SqttSimds {
+    /// `list` repeated over the SEs.
+    pub fn cycle(list: &[u8]) -> Self {
+        assert!(!list.is_empty(), "a SIMD list names at least one SIMD");
+        Self(std::array::from_fn(|se| list[se % list.len()]))
+    }
+
+    pub fn of(self, se: u32) -> u8 {
+        self.0[se as usize % self.0.len()]
+    }
+}
+
+impl Default for SqttSimds {
+    fn default() -> Self {
+        Self::cycle(&[0, 1])
+    }
+}
+
+/// A SIMD for every SE, or a comma list repeated over the SEs.
+impl std::str::FromStr for SqttSimds {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        let list = s.split(',').map(|v| v.trim().parse::<u8>()).collect::<Result<Vec<_>, _>>();
+        match list {
+            Ok(list) if (1..=8).contains(&list.len()) => Ok(Self::cycle(&list)),
+            _ => Err(format!("{s:?}: a SIMD or a comma list of up to 8")),
+        }
     }
 }
 
@@ -229,4 +266,6 @@ pub struct SqttTrace {
     pub per_se: Vec<SeTrace>,
     /// `None` when the program was loaded before tracing was first armed.
     pub code: Option<CodeImage>,
+    /// The memory clock level current when the dispatch was armed (`pp_dpm_mclk`), where sysfs has one.
+    pub mclk_mhz: Option<u64>,
 }

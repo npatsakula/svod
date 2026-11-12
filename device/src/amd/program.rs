@@ -699,7 +699,8 @@ impl AmdProgram {
 
         let queue = pool.queue();
         let is_pm4 = queue.is_pm4();
-        let pmc_counters = if profile && is_pm4 && self.target_major == 11 { owner.pmc_counters() } else { Vec::new() };
+        // Arming refused targets without counters (`pmc::check_target`).
+        let pmc_counters = if profile && is_pm4 { owner.pmc_counters() } else { Vec::new() };
         let pmc = if pmc_counters.is_empty() {
             None
         } else {
@@ -711,7 +712,7 @@ impl AmdProgram {
                 crate::allocator::RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
                 _ => return Err(Error::Runtime { message: "PMC readback buffer not host-visible".into() }),
             };
-            let (start, read) = crate::amd::pmc::build_streams(&pmc_counters, &grid, gpu);
+            let (start, read) = crate::amd::pmc::build_streams(self.dev.arch, &pmc_counters, &grid, gpu);
             Some((buf, host, grid, start, read))
         };
         let sqtt = match owner.sqtt_config().filter(|_| profile && is_pm4) {

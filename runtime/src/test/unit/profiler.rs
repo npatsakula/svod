@@ -9,7 +9,7 @@ use svod_device::hcq::{
     DeviceQueue, QueueKind, QueueMergeLimits, SemanticLinkedPlan, TopologyOperation, TopologyOperationKind,
     TopologyResource, schedule_device_lanes,
 };
-use svod_device::profile::StablePstate;
+use svod_device::profile::{SqttSimds, StablePstate};
 use svod_device::{AmdCounter, CounterSet, CudaCounter, PmcCounter};
 use svod_dtype::DeviceSpec;
 use svod_ir::UOp;
@@ -130,6 +130,25 @@ fn from_env_parses_the_sqtt_pstate(value: Option<&str>, expected: Option<StableP
     let parsed = ProfileOptions::from_env().sqtt_pstate;
     unsafe { std::env::remove_var("SVOD_SQTT_PSTATE") };
     assert_eq!(parsed, expected, "SVOD_SQTT_PSTATE={value:?}");
+}
+
+/// `SVOD_SQTT_SIMD` picks each SE's traced SIMD; unset or unparsable keeps CU 0's two SIMDs alternating.
+#[test_case(None, SqttSimds::default(); "unset")]
+#[test_case(Some("3"), SqttSimds([3; 8]); "one")]
+#[test_case(Some("1,0"), SqttSimds::cycle(&[1, 0]); "list")]
+#[test_case(Some("x"), SqttSimds::default(); "unknown")]
+fn from_env_parses_the_sqtt_simds(value: Option<&str>, expected: SqttSimds) {
+    static ENV: Mutex<()> = Mutex::new(());
+    let _guard = ENV.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    unsafe {
+        match value {
+            Some(value) => std::env::set_var("SVOD_SQTT_SIMD", value),
+            None => std::env::remove_var("SVOD_SQTT_SIMD"),
+        }
+    }
+    let parsed = ProfileOptions::from_env().sqtt_simds;
+    unsafe { std::env::remove_var("SVOD_SQTT_SIMD") };
+    assert_eq!(parsed, expected, "SVOD_SQTT_SIMD={value:?}");
 }
 
 #[test]
@@ -765,6 +784,7 @@ impl svod_device::DispatchTimestamps for TracedHandle {
             arch: svod_dtype::AmdArch::Gfx1201,
             per_se: vec![],
             code: None,
+            mclk_mhz: None,
         })
     }
 }

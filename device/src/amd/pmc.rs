@@ -1,9 +1,11 @@
-//! AMD SQ hardware performance-counter programming (PMC) for gfx11 (RDNA3.5).
+//! AMD SQ hardware performance-counter programming (PMC) for gfx11 and gfx12
+//! (RDNA3/4) on PM4 queues.
 //!
 //! The PM4 sequence: program `SQ_PERFCOUNTER*_SELECT`, start/stop the perfmon via
-//! `CP_PERFMON_CNTL`, and `COPY_DATA` the per-WGP counters into a GTT buffer —
-//! summed across the SE/SA/WGP grid when read back. gfx11-only; callers gate on
-//! `target_major == 11` and stable power state (`profile_standard`).
+//! `CP_PERFMON_CNTL` (`CP_PERFMON_CNTL_1` on gfx12, same address and fields), and
+//! `COPY_DATA` the per-WGP counters into a GTT buffer — summed across the
+//! SE/SA/WGP grid when read back. Arming refuses other targets ([`check_target`]);
+//! values need a stable power state (`profile_standard`).
 
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -14,7 +16,10 @@ use crate::amd::regwrite::RegWriter;
 use crate::amd::signal::AmdSignal;
 use crate::amd::sys::pm4;
 use crate::amd::topology::AmdNode;
+use crate::error::{PmcUnsupportedSnafu, Result};
 use crate::profile::{AmdCounter, CounterSet, PmcCounter};
+use snafu::ensure;
+use svod_dtype::AmdArch;
 
 /// Whether any AMD GPU is pinned to a stable power state (`profile_standard`),
 /// required for meaningful perf-counter values. Scans the DRM sysfs nodes; on a
@@ -29,18 +34,30 @@ pub fn stable_pstate() -> bool {
     })
 }
 
-/// gfx11 SQ perf-counter selector (perf_sel) for each [`AmdCounter`].
-fn sq_perf_sel(c: AmdCounter) -> u32 {
+/// Refuse what the counters do not cover: CDNA (gfx9 counts per SE, not per
+/// WGP) and AQL queues, whose dispatch the CP launches without our PM4.
+pub fn check_target(arch: AmdArch, pm4_queues: bool) -> Result<()> {
+    ensure!(
+        matches!(arch.gfx_major(), 11 | 12),
+        PmcUnsupportedSnafu { reason: format!("{arch} (only gfx11 and gfx12 are counted)") }
+    );
+    ensure!(pm4_queues, PmcUnsupportedSnafu { reason: "AQL queues (counters need PM4 queues)" });
+    Ok(())
+}
+
+/// The SQ perf-counter selector (`perf_sel`) of each [`AmdCounter`], from
+/// rocprofiler's counter definitions (Tinygrad `autogen/am/pmc.py`).
+fn sq_perf_sel(arch: AmdArch, c: AmdCounter) -> u32 {
     match c {
         AmdCounter::SqBusyCycles => 3,
         AmdCounter::SqWaves => 4,
+        AmdCounter::SqInstsValu if arch.gfx_major() >= 12 => 50,
         AmdCounter::SqInstsValu => 62,
     }
 }
 
-/// PMC is gfx11-only; every gfx11 part shares 11.5's SQ perf-counter registers.
-fn gc() -> RegWriter {
-    RegWriter::gc((11, 5, 0)).expect("gfx11 GC registers are vendored")
+fn perfmon_cntl(arch: AmdArch) -> &'static str {
+    if arch.gfx_major() >= 12 { "regCP_PERFMON_CNTL_1" } else { "regCP_PERFMON_CNTL" }
 }
 
 /// The SE/SA/WGP grid to iterate for SQ counters, derived from KFD topology.
@@ -82,31 +99,35 @@ pub fn readback_bytes(n_counters: usize, grid: &PmcGrid) -> usize {
 /// profiled kernel (sub-second), and it keeps the per-dispatch PM4 stream within
 /// the ring's single-dispatch budget. The read emits `GRBM_GFX_INDEX` once per
 /// instance, then copies every counter at that instance.
-pub fn build_streams(counters: &[AmdCounter], grid: &PmcGrid, buf_va: u64) -> (Vec<u32>, Vec<u32>) {
+///
+/// Panics on a target [`check_target`] refuses.
+pub fn build_streams(arch: AmdArch, counters: &[AmdCounter], grid: &PmcGrid, buf_va: u64) -> (Vec<u32>, Vec<u32>) {
+    check_target(arch, true).expect("PMC arming refuses targets without SQ counter streams");
     let instances = grid.instances();
-    let gc = gc();
+    let gc = RegWriter::for_arch(arch).expect("gfx11 and gfx12 GC registers are vendored");
+    let cntl = perfmon_cntl(arch);
 
     // ── start: stop, program SELECTs + CTRL, enable, start ──
     let mut start = Vec::new();
     gc.grbm_broadcast(&mut start);
-    gc.wreg(&mut start, "regCP_PERFMON_CNTL", &[("perfmon_state", 0)]);
+    gc.wreg(&mut start, cntl, &[("perfmon_state", 0)]);
     gc.wreg(&mut start, "regSQ_PERFCOUNTER_CTRL", &[("cs_en", 1), ("ps_en", 1), ("gs_en", 1), ("hs_en", 1)]);
     gc.wreg(&mut start, "regSQ_PERFCOUNTER_CTRL2", &[("force_en", 1), ("vmid_en", 0xffff)]);
     for (i, &c) in counters.iter().enumerate() {
         // gfx11 SQ uses even-numbered SELECT registers; readback uses index i.
-        gc.wreg(&mut start, &format!("regSQ_PERFCOUNTER{}_SELECT", i * 2), &[("perf_sel", sq_perf_sel(c))]);
+        gc.wreg(&mut start, &format!("regSQ_PERFCOUNTER{}_SELECT", i * 2), &[("perf_sel", sq_perf_sel(arch, c))]);
     }
     gc.wreg(&mut start, "regCOMPUTE_PERFCOUNT_ENABLE", &[("perfcount_enable", 1)]);
     gc.grbm_broadcast(&mut start);
-    gc.wreg(&mut start, "regCP_PERFMON_CNTL", &[("perfmon_state", 0)]);
-    gc.wreg(&mut start, "regCP_PERFMON_CNTL", &[("perfmon_state", 1)]);
+    gc.wreg(&mut start, cntl, &[("perfmon_state", 0)]);
+    gc.wreg(&mut start, cntl, &[("perfmon_state", 1)]);
 
     // ── read: sample, then copy each counter's _LO at every instance ──
     let los: Vec<u32> =
         counters.iter().enumerate().map(|(i, _)| gc.addr(&format!("regSQ_PERFCOUNTER{i}_LO"))).collect();
     let mut read = Vec::new();
     gc.grbm_broadcast(&mut read);
-    gc.wreg(&mut read, "regCP_PERFMON_CNTL", &[("perfmon_state", 1), ("perfmon_sample_enable", 1)]);
+    gc.wreg(&mut read, cntl, &[("perfmon_state", 1), ("perfmon_sample_enable", 1)]);
     let mut j = 0u32;
     for se in 0..grid.se {
         for sa in 0..grid.sa {
@@ -123,7 +144,7 @@ pub fn build_streams(counters: &[AmdCounter], grid: &PmcGrid, buf_va: u64) -> (V
     // Stop the perfmon after the final sample so it doesn't keep counting on the
     // GPU after profiling (global CP state — leaving it on perturbs other work).
     gc.grbm_broadcast(&mut read);
-    gc.wreg(&mut read, "regCP_PERFMON_CNTL", &[("perfmon_state", 0)]);
+    gc.wreg(&mut read, cntl, &[("perfmon_state", 0)]);
     (start, read)
 }
 

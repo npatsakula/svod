@@ -192,6 +192,10 @@ pub enum Error {
     #[snafu(display("allocator does not support operation: {op}"))]
     Unsupported { op: &'static str },
 
+    /// Hardware counters cannot be collected on this target or queue.
+    #[snafu(display("hardware counters unsupported: {reason}"))]
+    PmcUnsupported { reason: String },
+
     /// SQTT thread tracing cannot run on this target, queue or configuration.
     #[snafu(display("SQTT thread trace unsupported: {reason}"))]
     SqttUnsupported { reason: String },

@@ -937,16 +937,23 @@ impl crate::device::PlanContext for OwnerCtx {
         Ok(crate::device::NativeReplayOutcome::Executed)
     }
 
-    fn set_pmc(&self, counters: &[crate::profile::PmcCounter]) -> usize {
+    /// AMD counters on a target or queue without counter streams are refused
+    /// and leave nothing armed.
+    fn set_pmc(&self, counters: &[crate::profile::PmcCounter]) -> Result<usize> {
         let mut armed = self.pmc.lock();
-        *armed = counters
+        armed.clear();
+        let amd: Vec<_> = counters
             .iter()
             .filter_map(|c| match c {
                 crate::profile::PmcCounter::Amd(c) => Some(*c),
                 _ => None,
             })
             .collect();
-        armed.len()
+        if !amd.is_empty() {
+            crate::amd::pmc::check_target(self.core.arch, self.core.pm4_queues())?;
+        }
+        *armed = amd;
+        Ok(armed.len())
     }
 
     fn pmc_available(&self) -> bool {
