@@ -48,7 +48,8 @@
 //!   each) beside the traced SIMD's cycles of their counterparts.
 //!   `sqtt attention B H T D [--causal] [--bias] [--cfg I|tuned,…]` traces
 //!   attention over `[B, T, H, D]` bf16 the same way; `--flip FORM,…` flips
-//!   those softmax forms (`Forms` fields) of each picked config.
+//!   those softmax forms (`Forms` fields) of each picked config, `--ring S`
+//!   sets its ring's slots.
 //!   `SVOD_SQTT_PSTATE=standard|peak` pins the traced pass's clock.
 //!   `SVOD_SQTT_SIMD=S[,S...]` picks each SE's traced SIMD (default `0,1`).
 //!   `sqtt --load DIR [--json] [--attribute]` re-reads a saved trace, no GPU;
@@ -67,7 +68,7 @@ use svod_runtime::{ExecutionPlan, ProfileOptions};
 use svod_tensor::Tensor;
 use svod_tk::atoms::{Core, Costs, Device};
 use svod_tk::ir::Schedule;
-use svod_tk::kernels::attention::{AttnMask, AttnSpec, Bias};
+use svod_tk::kernels::attention::{AttnMask, AttnSpec, Bias, FaCfg};
 use svod_tk::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, TileOrder};
 use svod_tk::kernels::nearest::{Floors, Metric, NearestSpec};
 use svod_tk::kernels::{Act, Batch};
@@ -819,6 +820,12 @@ fn attention_traced<'a>(planner: &'a Planner, [b, h, t, d]: [usize; 4], args: &A
                 }
                 admitted = spec.clone().admitted(planner, cfg).map_err(|why| format!("{cfg:?}: {why:?}"))?;
                 i = format!("{i}_{}", flips.replace(',', "+"));
+            }
+            if let Some(depth) = args.opt("--ring") {
+                let cfg = admitted.cfg();
+                let cfg = FaCfg { schedule: Schedule::ring(depth.parse()?, cfg.unroll()), ..cfg };
+                admitted = spec.clone().admitted(planner, cfg).map_err(|why| format!("{cfg:?}: {why:?}"))?;
+                i = format!("{i}_ring{depth}");
             }
             let cfg = admitted.cfg();
             let labels = BTreeMap::from([
