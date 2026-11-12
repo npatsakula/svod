@@ -773,7 +773,8 @@ fn conv_opts<'a>(k: usize, s: usize, bias: &'a Tensor, residual: Option<&'a Tens
 #[test_case([1, 32, 32, 32], 48, 3, 2, 1, false, Some("conv"); "stride 2 on 48 wide")]
 #[test_case([1, 9, 9, 64], 64, 1, 1, 1, true, Some("gemm"); "pointwise is a linear")]
 #[test_case([1, 16, 16, 64], 64, 3, 1, 64, false, None; "depthwise keeps the graph")]
-#[test_case([1, 16, 16, 8], 32, 3, 1, 1, false, None; "eight channels keep the graph")]
+#[test_case([1, 32, 32, 8], 64, 3, 1, 1, false, Some("conv"); "eight channels pad to a run")]
+#[test_case([2, 34, 30, 3], 96, 3, 2, 1, true, Some("conv"); "a stem's three channels pad to a run")]
 fn conv2d_matches_the_graph(
     x: [usize; 4],
     cout: usize,

@@ -138,6 +138,10 @@ pub fn linear(
     })
 }
 
+/// The input channels a convolution's kernel reduces over come in runs of
+/// this many; [`super::conv2d`] pads others with zeros.
+pub const CONV_CIN: usize = 16;
+
 /// `x [b, h, w, cin]` ⊛ `geom`'s weight; `dtypes` are those of `x`, `w` and
 /// the bias, `out` the output type and `residual` the residual's. A static
 /// batch folds into the GEMM rows, a bound one walks grid z; the ranking
@@ -165,7 +169,7 @@ pub fn conv2d(
         if groups != 1 || !geom.cout.is_multiple_of(8) || pixels == 0 || x.dims[0] == 0 {
             return Err(Fallback::Shape);
         }
-        if !geom.cin.is_multiple_of(16) {
+        if !geom.cin.is_multiple_of(CONV_CIN) {
             return Err(Fallback::Shape);
         }
         let (batches, m) = conv_grid(x, geom);

@@ -6,7 +6,7 @@ use svod_ir::SInt;
 use svod_tensor::Tensor;
 
 use super::config::Planner;
-use super::shape::{self, extent, shape_of};
+use super::shape::{self, Plan, extent, shape_of};
 use super::{
     Act, DtypeSnafu, GraphSnafu, LaunchSnafu, Linear, Result, ShapeSnafu, Tuner, batch_of, fmt_shape, kernel_buffer,
     output,
@@ -120,16 +120,22 @@ pub fn conv2d(x: &Tensor, w: &Tensor, opts: Conv) -> Result<Tensor> {
         out_f32: out_dtype != x.dtype(),
         rope: None,
     };
-    let plan = shape::conv2d(
-        planner.as_deref(),
-        &dtypes,
-        out_dtype.clone(),
-        residual_dtype,
-        ext.as_ref(),
-        &geom,
-        groups,
-        &epilogue,
-    );
+    let plan_of = |g: &ConvGeom| {
+        let residual = residual_dtype.clone();
+        shape::conv2d(planner.as_deref(), &dtypes, out_dtype.clone(), residual, ext.as_ref(), g, groups, &epilogue)
+    };
+    let plan = plan_of(&geom);
+    // Zero channels add nothing: a stem's few channels pad to the least run
+    // the target's reduction tiles plan a kernel for.
+    if groups == 1 && !cin.is_multiple_of(shape::CONV_CIN) {
+        let runs = [1, 2, 4].map(|r| cin.next_multiple_of(r * shape::CONV_CIN));
+        let padded = runs.into_iter().find(|&c| matches!(plan_of(&ConvGeom { cin: c, ..geom }), Plan::Kernel(_)));
+        if let Some(padded) = padded {
+            let pad = [(0, 0), (0, 0), (0, 0), (0, (padded - cin) as isize)];
+            let (x, w) = (x.try_pad(&pad), w.try_pad(&pad));
+            return conv2d(&x.context(GraphSnafu { op: OP })?, &w.context(GraphSnafu { op: OP })?, opts);
+        }
+    }
     let Some(cfgs) = super::kernel(OP, plan) else { return graph(x, w, opts).context(GraphSnafu { op: OP }) };
     let (ext, var, planner) = (ext.expect("planned"), var.flatten(), planner.expect("planned"));
     let images = ext.dims[0];
