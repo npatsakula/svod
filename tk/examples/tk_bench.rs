@@ -708,6 +708,10 @@ fn sqtt_bench(args: &Args) -> Result<()> {
             ProfileOptions { iters: 3, static_analysis: false, sqtt: Some(dir.clone()), ..ProfileOptions::from_env() };
         let profiles = tune::profile(gemm_candidate(&planner, shape, epilogue, cfg)?, &opts)
             .ok_or_else(|| format!("{}: failed to build or run", gemm_label(&cfg)))?;
+        // `SVOD_PMC` adds the hardware counters of the untraced passes.
+        if opts.counters != svod_runtime::profiler::PmcSelection::None {
+            profiles.iter().for_each(|p| print!("{}", p.render_table()));
+        }
         let traces: Vec<_> = profiles.iter().flat_map(|p| &p.stages).flat_map(|s| &s.sqtt).collect();
         if traces.is_empty() {
             return Err("no thread trace: SQTT needs an AMD RDNA3/RDNA4 device (SVOD_DEVICE=AMD)".into());
