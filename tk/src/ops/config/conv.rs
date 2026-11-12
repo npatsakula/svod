@@ -39,6 +39,12 @@ impl ConvProblem {
         Self { gemm: GemmProblem::new(batches, m, g.cout, g.k(), epilogue), geom: *g }
     }
 
+    /// `cfg`'s predicted ns and registers for this convolution on `planner`,
+    /// or why it is not admitted.
+    pub fn admit(&self, planner: &Planner, cfg: &GemmCfg) -> Result<(f64, u32), Rejected> {
+        planner.admit(self, cfg)
+    }
+
     /// The GEMM body's claim with the convolution's own fill: each input
     /// pixel is read by every tap of every output pixel within a stride of
     /// it, so the stream's distinct bytes are the image's and the weight's —

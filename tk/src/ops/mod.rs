@@ -67,6 +67,7 @@ pub mod tuned {
 /// config adds (a split's merge, a tail's partials).
 pub mod candidates {
     pub use super::attention::programs as attention;
+    pub use super::conv::programs as conv;
     pub use super::linear::programs as gemm;
     pub use super::nearest::programs as nearest;
 }

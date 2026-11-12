@@ -69,10 +69,11 @@ use svod_tensor::Tensor;
 use svod_tk::atoms::{Core, Costs, Device};
 use svod_tk::ir::Schedule;
 use svod_tk::kernels::attention::{AttnMask, AttnSpec, Bias, FaCfg};
+use svod_tk::kernels::conv::{ConvCfg, ConvGeom, ConvSpec};
 use svod_tk::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, TileOrder};
 use svod_tk::kernels::nearest::{Floors, Metric, NearestCfg, NearestSpec};
 use svod_tk::kernels::{Act, Batch};
-use svod_tk::ops::config::{AttentionProblem, GemmProblem, NearestProblem, Planner};
+use svod_tk::ops::config::{AttentionProblem, ConvProblem, GemmProblem, NearestProblem, Planner};
 use svod_tk::ops::shape::{self, Extent, Plan};
 use svod_tk::ops::{self, Attn, Nearest, Quantized, Rerank, Search, candidates, tuned};
 use svod_tk::tune::{self, Candidate, Compiled, TuneStore};
@@ -695,7 +696,9 @@ fn sqtt_bench(args: &Args) -> Result<()> {
     let positional: Vec<&str> = args.0.iter().map(String::as_str).take_while(|a| !a.starts_with("--")).collect();
     let usage = "sqtt gemm M N K [--cfg I|tuned|BMxBNxBK:S:WRxWC[:rolled],…], \
                  sqtt attention B H T D [--causal] [--bias] [--cfg I|tuned,…], \
-                 sqtt nearest N D K [--metric M] [--cfg I|tuned|ranked,…] [--splits S], sqtt --load DIR or sqtt --compare A B";
+                 sqtt nearest N D K [--metric M] [--cfg I|tuned|ranked,…] [--splits S], \
+                 sqtt conv H W CIN COUT KERNEL STRIDE [--batch B] [--residual] [--cfg I|tuned|ranked,…], \
+                 sqtt --load DIR or sqtt --compare A B";
     let planner = planner()?;
     let traced: Vec<Traced> = match positional[..] {
         ["gemm", m, n, k] => gemm_traced(&planner, [m.parse()?, n.parse()?, k.parse()?], args)?,
@@ -703,6 +706,10 @@ fn sqtt_bench(args: &Args) -> Result<()> {
             attention_traced(&planner, [b.parse()?, h.parse()?, t.parse()?, d.parse()?], args)?
         }
         ["nearest", n, d, k] => nearest_traced(&planner, [n.parse()?, d.parse()?, k.parse()?], args)?,
+        ["conv", h, w, cin, cout, kernel, stride] => {
+            let dims = [h, w, cin, cout, kernel, stride].map(str::parse::<usize>);
+            conv_traced(&planner, dims.into_iter().collect::<Result<Vec<_>, _>>()?.try_into().expect("six"), args)?
+        }
         _ => return Err(usage.into()),
     };
     let out = PathBuf::from(args.opt("--out").unwrap_or("sqtt"));
@@ -904,6 +911,71 @@ fn nearest_traced<'a>(planner: &'a Planner, [n, depth, k]: [usize; 3], args: &Ar
             Ok(Traced {
                 name: format!("nearest_n{n}d{depth}k{k}{metric:?}_{i}"),
                 candidate: Box::new(move || Ok(candidates::nearest(planner, DType::Float16, &admitted))),
+                labels,
+            })
+        })
+        .collect()
+}
+
+/// A YOLO block's f16 convolution over `[B, H, W, CIN]`, padded to keep the
+/// size at stride 1, with bias and SiLU in the epilogue (`--residual` adds
+/// one); `--cfg tuned` (the default) is the op's pick, an index one of the
+/// planner's ranking under its split, `ranked` lists the ranking.
+fn conv_traced<'a>(
+    planner: &'a Planner,
+    [h, w, cin, cout, kernel, stride]: [usize; 6],
+    args: &Args,
+) -> Result<Vec<Traced<'a>>> {
+    let images = args.num("--batch", 1)?;
+    let geom =
+        ConvGeom { h, w, cin, cout, kernel: [kernel; 2], stride: [stride; 2], pad: [kernel / 2; 2], dilation: [1; 2] };
+    let epilogue = Epilogue { bias: true, act: Act::Silu, residual: args.flag("--residual"), ..Epilogue::DEFAULT };
+    let extent = Extent { dims: vec![images], var: false };
+    let residual = epilogue.residual.then_some(DType::Float16);
+    let plan = shape::conv2d(
+        Some(planner),
+        &[DType::Float16; 3],
+        DType::Float16,
+        residual,
+        Some(&extent),
+        &geom,
+        1,
+        &epilogue,
+    );
+    let Plan::Kernel(ranked) = plan else { return Err("conv: the op takes the graph at this shape".into()) };
+    let spec = ConvSpec { batch: Batch::Static(images), geom, epilogue, split: 1 };
+    if args.opt("--cfg") == Some("ranked") {
+        let (batches, m) = shape::conv_grid(&extent, &geom);
+        let p = ConvProblem::new(batches, m, &geom, &epilogue);
+        for (i, cfg) in ranked.iter().enumerate() {
+            println!("{i:4} {:12.0} {cfg:?}", p.admit(planner, &cfg.gemm).map_or(f64::NAN, |a| a.0));
+        }
+        return Ok(vec![]);
+    }
+    let shape = format!("{h}x{w}x{cin}>{cout} k{kernel}s{stride} b{images}");
+    let picks = args.opt("--cfg").unwrap_or("tuned").split(',').map(|c| match c {
+        "tuned" => {
+            Ok(("t".to_string(), tuned::conv(TuneStore::global(), planner, DType::Float16, &ranked, spec.clone())))
+        }
+        i => {
+            let i = i.parse::<usize>()?;
+            let cfg = *ranked.get(i).ok_or_else(|| format!("--cfg {i}: {} ranked", ranked.len()))?;
+            let admitted = ConvSpec { split: cfg.split, ..spec.clone() }.admitted(planner, cfg.gemm);
+            Ok((i.to_string(), admitted.map_err(|why| format!("{cfg:?}: {why:?}"))?))
+        }
+    });
+    picks
+        .map(|pick: Result<_>| {
+            let (i, admitted) = pick?;
+            let cfg = ConvCfg { gemm: admitted.cfg(), split: admitted.split };
+            let labels = BTreeMap::from([
+                ("op".into(), "conv".into()),
+                ("shape".into(), shape.clone()),
+                ("cfg".into(), format!("{cfg:?}")),
+            ]);
+            Ok(Traced {
+                name: format!("conv_{h}x{w}x{cin}x{cout}k{kernel}s{stride}b{images}_{i}"),
+                candidate: Box::new(move || Ok(candidates::conv(&admitted, &DType::Float16, planner))),
                 labels,
             })
         })

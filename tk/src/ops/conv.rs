@@ -155,7 +155,7 @@ pub fn conv2d(x: &Tensor, w: &Tensor, opts: Conv) -> Result<Tensor> {
     launch::graph_launch(merge, &merge_lowering, &ins).context(LaunchSnafu { op: OP })
 }
 
-fn programs(spec: &Admitted<ConvSpec>, dtype: &DType, planner: &Planner) -> crate::tune::Candidate {
+pub fn programs(spec: &Admitted<ConvSpec>, dtype: &DType, planner: &Planner) -> crate::tune::Candidate {
     match dtype.scalar() {
         Some(ScalarDType::BFloat16) => spec.programs::<BF16>(&planner.device),
         Some(ScalarDType::Float16) => spec.programs::<F16>(&planner.device),
