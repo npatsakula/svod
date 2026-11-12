@@ -1193,6 +1193,51 @@ fn the_next_steps_loads_stay_above_a_vote(arch: AmdArch) {
     assert!(votes.iter().all(|(_, sunk)| !sunk), "{votes:?}:\n{asm}");
 }
 
+/// A nearest list's steady trip over two register-staged slots signals the
+/// block barrier once it has committed the next step (RDNA4), runs its vote
+/// and pushes, and waits at the trip's end: a branch lies between a signal
+/// and the next wait. RDNA3 has no split barrier (clang crashes on the
+/// halves there): its whole barrier waits at the trip's end.
+#[test_case(AmdArch::Gfx1201, true; "gfx1201")]
+#[test_case(AmdArch::Gfx1151, false; "gfx1151")]
+fn a_list_trip_signals_before_its_vote_and_waits_after(arch: AmdArch, split: bool) {
+    use crate::kernels::nearest::{LaneQueue, NearestCfg, Pow2};
+    let target = amd(arch, 64);
+    assert_eq!(target.sync.split_barrier, split);
+    let device = declared(target);
+    let lanes = LaneQueue { width: Pow2::of(2), depth: Pow2::of(4), passes: true };
+    let cfg = NearestCfg { warp_rows: 16, lanes: Some(lanes), ..NearestCfg::new(64, 16, 2) };
+    let spec = assumed(
+        NearestSpec {
+            n: 16384,
+            m: 16384,
+            d: 128,
+            metric: Metric::NegDot,
+            floors: Floors::default(),
+            groups: false,
+            k: 16,
+            live: Default::default(),
+            dtype: ScalarDType::BFloat16,
+        },
+        cfg,
+    );
+    let ir = render(nearest::<BF16>(&spec), &Lowering::new(&device));
+    assert_eq!(ir.contains("@llvm.amdgcn.s.barrier.signal"), split, "{ir}");
+    let Some(asm) = amd_asm(&ir, arch) else { return };
+    let ops: Vec<&str> = asm.lines().map(str::trim).filter(|l| !l.starts_with(';')).collect();
+    if !split {
+        assert!(ops.contains(&"s_barrier"), "the whole barrier:\n{asm}");
+        return;
+    }
+    let signals: Vec<usize> = (0..ops.len()).filter(|&i| ops[i].starts_with("s_barrier_signal ")).collect();
+    let parted = signals.iter().any(|&at| {
+        let rest = &ops[at + 1..];
+        let wait = rest.iter().position(|op| op.starts_with("s_barrier_wait")).unwrap_or(rest.len());
+        rest[..wait].iter().any(|op| op.starts_with("s_cbranch"))
+    });
+    assert!(parted, "a branch between a signal and its wait:\n{asm}");
+}
+
 /// Where the accumulator cannot feed the P·V product (RDNA3), the
 /// probabilities reach it through the lane exchange, never shared scratch,
 /// whatever the costs and whatever the masks: pinned

@@ -292,6 +292,10 @@ pub struct SyncCaps {
     pub commit_fence: bool,
     /// A wave's issue priority is settable (`Sync::Prio` → `s_setprio`): AMD.
     pub priority: bool,
+    /// A block barrier's halves are apart (`Sync::Arrive` → `s_barrier_signal`,
+    /// `Sync::Await` → `s_barrier_wait`): RDNA4. Elsewhere an arrive is
+    /// nothing and an await the whole barrier.
+    pub split_barrier: bool,
 }
 
 /// How a lane reads the register of lane `lane ^ mask`.
@@ -708,7 +712,7 @@ fn cuda(c: CudaArch) -> Target {
         shared_banks: None,
         cache_swizzle: None,
         occupancy: Occupancy { simds: 4, file: 512, waves, registers: 255, acc_file: 0, blocks },
-        sync: SyncCaps { warp_barrier: true, commit_fence: false, priority: false },
+        sync: SyncCaps { warp_barrier: true, commit_fence: false, priority: false, split_barrier: false },
         lane_move: LaneMove::Shuffle,
         hardware_exp2: false,
     }
@@ -788,7 +792,7 @@ fn amd(a: AmdArch) -> Target {
             max_stride: 8 << 10,
         }),
         occupancy,
-        sync: SyncCaps { warp_barrier: false, commit_fence: !cdna, priority: true },
+        sync: SyncCaps { warp_barrier: false, commit_fence: !cdna, priority: true, split_barrier: a.gfx_major() == 12 },
         lane_move: if cdna { LaneMove::Permute } else { LaneMove::Dpp },
         hardware_exp2: true,
     }
@@ -815,7 +819,7 @@ fn metal(f: MetalFamily) -> Target {
         shared_banks: None,
         cache_swizzle: None,
         occupancy: Occupancy { simds: 4, file: 1024, waves: 8, registers: 128, acc_file: 0, blocks: 32 },
-        sync: SyncCaps { warp_barrier: false, commit_fence: false, priority: false },
+        sync: SyncCaps { warp_barrier: false, commit_fence: false, priority: false, split_barrier: false },
         lane_move: LaneMove::SimdShuffle,
         hardware_exp2: false,
     }

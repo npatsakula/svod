@@ -30,7 +30,7 @@ fn expansion_preserves_the_result(fill: Fill, stages: usize) {
     let (m, n, k) = (64usize, 32usize, 160usize);
     let prog = super::gemm_nt(m, n, k, 32, 32, 32, stages);
     let want = run(&prog, operands(m, n, k), &[("b", 1)]).unwrap();
-    let prog = expand(prog, fill, Core::Warp);
+    let prog = expand(prog, fill, Core::Warp, false);
     let got = run(&prog, operands(m, n, k), &[("b", 1)]).unwrap();
     assert_eq!(got[2], want[2]);
     assert_eq!(count(&prog, |s| matches!(s, Stmt::Pipeline(_))), 0);
@@ -68,7 +68,7 @@ fn products_in_flight_preserve_the_result(stages: usize) {
     let (m, n, k) = (64usize, 32usize, 160usize);
     let prog = super::gemm_nt(m, n, k, 32, 32, 32, stages);
     let want = run(&prog, operands(m, n, k), &[("b", 1)]).unwrap();
-    let prog = expand(prog, Fill::CpAsync, Core::Group);
+    let prog = expand(prog, Fill::CpAsync, Core::Group, false);
     let got = run(&prog, operands(m, n, k), &[("b", 1)]).unwrap();
     assert_eq!(got[2], want[2]);
     let syncs: Vec<Sync> =
@@ -107,7 +107,7 @@ fn ping_pong_expansion_preserves_the_result(bk: usize, slices: usize) {
     let want = run(&prog, operands(m, n, k), &[("b", 1)]).unwrap();
     // As the lowering: a product's shared operands become explicit reads first.
     crate::lower::materialize_operands(&mut prog, Core::Warp);
-    let prog = expand(prog, Fill::Staged, Core::Warp);
+    let prog = expand(prog, Fill::Staged, Core::Warp, false);
     let got = run(&prog, operands(m, n, k), &[("b", 1)]).unwrap();
     assert_eq!(got[2], want[2]);
     assert_eq!(count(&prog, |s| matches!(s, Stmt::Pipeline(_))), 0);
@@ -128,7 +128,7 @@ fn ping_pong_expansion_preserves_the_result(bk: usize, slices: usize) {
 fn ping_pong_cuts_a_trip_into_clusters() {
     let mut prog = super::gemm_nt_crews(64, 64, 256, [64, 64, 64]);
     crate::lower::materialize_operands(&mut prog, Core::Warp);
-    let prog = expand(prog, Fill::Staged, Core::Warp);
+    let prog = expand(prog, Fill::Staged, Core::Warp, false);
     let kind = |s: &Stmt<Expanded>| match s {
         Stmt::Copy { dst, src, mode: CopyMode::Staged, .. } => match (&prog.value(*src).place, prog.value(*dst).tier())
         {
@@ -199,7 +199,7 @@ fn staged_halves_keep_their_copys_scope() {
     use crate::kernels::attention::{AttnMask, FaCfg, attention};
     let cfg = FaCfg { key_warps: 4, ..FaCfg::new(16, 16, 2) };
     let spec = assumed(super::attention::probe_spec(1, 1, 1, 64, 64, AttnMask::default()), cfg);
-    let prog = expand(attention::<BF16>(&spec), Fill::Staged, Core::Warp);
+    let prog = expand(attention::<BF16>(&spec), Fill::Staged, Core::Warp, false);
     fn copies(block: &Block<Expanded>, inside: bool, out: &mut Vec<(bool, Scope, CopyMode)>) {
         for s in &block.0 {
             if let Stmt::Copy { mode, scope, .. } = s {
@@ -240,7 +240,7 @@ fn register_staging_peels_the_ring_into_three_branch_free_loops(stages: usize, t
         .filter_map(|(_, s)| if let Stmt::Pipeline(p) = s { Some([p.produce.slot, p.consume.slot]) } else { None })
         .flatten()
         .collect();
-    let prog = expand(prog, Fill::Staged, Core::Warp);
+    let prog = expand(prog, Fill::Staged, Core::Warp, false);
     let constant = slots.iter().all(|&s| *prog.scalar(s) == Scalar::Const(0));
     assert!(!slots.is_empty() && constant == (stages == 1), "slot scalars constant: {constant}");
     let loops: Vec<&Loop<Expanded>> =
@@ -301,4 +301,63 @@ fn a_fill_builds_only_the_rings_it_runs() {
             assert!(fill.runs(schedule), "{name}: {schedule:?} on {fill:?}");
         }
     }
+}
+
+/// A nearest kernel of `k` scores a row over a register-staged ring of
+/// `stages` slots, lane queues two wide and four deep, as the k = 16 picks.
+fn listing(k: usize, stages: usize) -> Program {
+    use crate::kernels::nearest::{LaneQueue, Metric, NearestCfg, Pow2, nearest};
+    let lanes = LaneQueue { width: Pow2::of(2), depth: Pow2::of(4), passes: true };
+    let cfg = NearestCfg { warp_rows: 16, lanes: Some(lanes), ..NearestCfg::new(64, 16, stages) };
+    let spec = super::nearest::plain(64, 64, 32, Metric::NegDot, k, ScalarDType::BFloat16, cfg);
+    nearest::<crate::build::BF16>(&spec)
+}
+
+/// Where a block barrier's halves part, a two-slot register-staged trip
+/// whose consume ends in branches past its last shared read (a nearest
+/// list's vote and pushes) commits and arrives before them and waits after
+/// them, its lists the authored ones; one slot, a target whose halves do not
+/// part, or a tail of products alone (a GEMM's) keep the whole barrier.
+#[test_case(16, 2, true, true; "lists over two slots part")]
+#[test_case(16, 1, true, false; "one slot keeps the barrier")]
+#[test_case(16, 2, false, false; "unsplit target keeps the barrier")]
+#[test_case(0, 2, true, false; "products alone keep the barrier")]
+fn a_branching_tail_runs_between_the_barriers_halves(k: usize, stages: usize, split: bool, parted: bool) {
+    let authored = if k == 0 { super::gemm_nt(64, 32, 128, 32, 32, 32, stages) } else { listing(k, stages) };
+    let params: Vec<Vec<f64>> = authored
+        .params
+        .iter()
+        .enumerate()
+        .map(|(p, param)| (0..param.elems).map(|i| ((i * 7 + p * 5) % 23) as f64 / 8.0 - 1.0).collect())
+        .collect();
+    let want = run(&authored, params.clone(), &[]).unwrap();
+    let prog = expand(authored, Fill::Staged, Core::Warp, split);
+    assert_eq!(run(&prog, params, &[]).unwrap(), want, "the template moved a read past the commit");
+    let halves = |s: &Stmt<Expanded>| matches!(s, Stmt::Sync(Sync::Arrive | Sync::Await));
+    if !parted {
+        assert_eq!(count(&prog, halves), 0, "the whole barrier");
+        return;
+    }
+    // Unmaterialized, a product reads its shared operand itself.
+    let shared = |v: ValId| prog.value(v).tier() == Tier::Smem;
+    let reads_shared = |s: &Stmt<Expanded>| match s {
+        Stmt::Copy { src, .. } => shared(*src),
+        Stmt::Let { op, .. } => op.srcs().any(shared),
+        _ => false,
+    };
+    let commits = |s: &Stmt<Expanded>| matches!(s, Stmt::Copy { mode: CopyMode::Staged, dst, .. } if prog.value(*dst).tier() == Tier::Smem);
+    // The steady trip: the loop that both reads its slot and commits the next.
+    let steady = prog.walk().find_map(|(_, s)| match s {
+        Stmt::Loop(l) if l.body.0.iter().any(reads_shared) && l.body.0.iter().any(commits) => Some(&l.body.0),
+        _ => None,
+    });
+    let body = steady.expect("a steady trip");
+    let at = |want: &dyn Fn(&Stmt<Expanded>) -> bool| body.iter().position(want).expect("in the trip");
+    let commit = body.iter().rposition(commits).expect("a commit");
+    let arrive = at(&|s| matches!(s, Stmt::Sync(Sync::Arrive)));
+    let branch = at(&|s| matches!(s, Stmt::If { .. }));
+    assert!(commit < arrive && arrive < branch, "commit, arrive, then the branches");
+    assert!(matches!(body.last(), Some(Stmt::Sync(Sync::Await))), "the trip ends waiting");
+    assert_eq!(count(&prog, halves), 2, "one arrive and one await a trip");
+    assert!(!body[arrive..].iter().any(reads_shared), "no shared read past the arrive");
 }

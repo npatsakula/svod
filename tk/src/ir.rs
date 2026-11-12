@@ -650,6 +650,15 @@ pub enum Sync {
     /// shared-memory writes before it are visible after it. A warp's own
     /// barrier orders its lanes' shared accesses and nothing else.
     Barrier { scope: Scope },
+    /// A block barrier's first half: this thread's shared-memory accesses
+    /// before it are done and its writes visible past every thread's
+    /// [`Sync::Await`] that follows it; the thread runs on. Every thread
+    /// alternates the halves; the pair back to back is a block
+    /// [`Sync::Barrier`].
+    Arrive,
+    /// A block barrier's second half: wait until every thread of the block
+    /// has passed its [`Sync::Arrive`].
+    Await,
     /// Close the group of this thread's async copies issued since the last
     /// commit.
     CommitAsync,

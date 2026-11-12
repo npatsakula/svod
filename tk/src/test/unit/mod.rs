@@ -394,7 +394,11 @@ pub(crate) fn lane_moves_dear() -> Costs {
 /// `prog` laid for `device` on the warp core: its pipelines expanded as the
 /// target fills, then inferred, as the lowering does before it emits.
 pub(crate) fn laid(prog: Program, device: &crate::atoms::Device) -> crate::layouts::Result<Program<crate::ir::Laid>> {
-    crate::layouts::infer(crate::schedule::expand(prog, device.target.fill, Core::Warp), device, Core::Warp)
+    crate::layouts::infer(
+        crate::schedule::expand(prog, device.target.fill, Core::Warp, device.target.sync.split_barrier),
+        device,
+        Core::Warp,
+    )
 }
 
 /// A plain bf16 `c = a·bᵀ` program on a 2×4 warp grid.

@@ -104,7 +104,8 @@ pub fn lower(mut prog: Program, lowering: &Lowering, params: Vec<Arc<UOp>>, devi
     within_shared(&prog)?;
     materialize_operands(&mut prog, lowering.core);
     sync::insert_barriers(&mut prog)?;
-    let prog = schedule::expand(prog, lowering.device.target.fill, lowering.core);
+    let target = &lowering.device.target;
+    let prog = schedule::expand(prog, target.fill, lowering.core, target.sync.split_barrier);
     let laid = layouts::infer(prog, &lowering.device, lowering.core).context(LayoutSnafu)?;
     emit::ROLLED.with(|cell| cell.borrow_mut().clear());
     let (program, linear) = emit::emit(&laid, lowering, params, device)?;

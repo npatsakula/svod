@@ -50,7 +50,7 @@ fn transposing_layouts_hold_16_byte_column_runs(rows: usize, cols: usize, warps:
 fn inference_out_of_passes_is_an_error(passes: usize) -> crate::layouts::Result<()> {
     let (target, grid) = (sm86(), WarpGrid { rows: 2, cols: 4 });
     let prog = Program { warps: 8, warp_grid: grid, ..super::gemm_nt(256, 256, 256, 128, 128, 32, 3) };
-    let prog = crate::schedule::expand(prog, target.fill, Core::Warp);
+    let prog = crate::schedule::expand(prog, target.fill, Core::Warp, target.sync.split_barrier);
     crate::layouts::Infer::new(&prog, &target, grid, Core::Warp, &HashMap::new()).solve_within(passes)
 }
 

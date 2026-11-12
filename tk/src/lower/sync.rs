@@ -136,6 +136,12 @@ fn walk(prog: &Program, block: Block, mut state: State, scope: Scope, divergent:
                         ensure!(!divergent || on == Scope::Warp, DivergentBarrierSnafu { what: "a barrier" });
                         state.fenced();
                     }
+                    Sync::Arrive | Sync::Await => {
+                        ensure!(!divergent, DivergentBarrierSnafu { what: "a barrier" });
+                        if sync == Sync::Await {
+                            state.fenced();
+                        }
+                    }
                     Sync::Fence | Sync::WaitProducts { .. } | Sync::Prio { .. } => {}
                     Sync::CommitAsync | Sync::WaitAsync { .. } => {
                         unreachable!("async groups are the templates' and this pass's own")

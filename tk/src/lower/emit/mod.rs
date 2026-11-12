@@ -952,6 +952,17 @@ impl<'a> Emit<'a> {
             }
             Sync::Barrier { scope: Scope::Warp } if target.sync.warp_barrier => nvptx::warp_barrier(&self.last),
             Sync::Barrier { scope: Scope::Warp } => return Ok(()),
+            Sync::Arrive if target.sync.split_barrier => {
+                let tag = self.next_tag();
+                amdgpu::barrier_signal(&self.last).rtag(Some(smallvec![tag as usize]))
+            }
+            Sync::Await if target.sync.split_barrier => {
+                let tag = self.next_tag();
+                amdgpu::barrier_wait(&self.last).rtag(Some(smallvec![tag as usize]))
+            }
+            // Unsplit, the whole barrier waits where the second half does.
+            Sync::Arrive => return Ok(()),
+            Sync::Await => return self.sync(Sync::Barrier { scope: Scope::Block }),
             Sync::CommitAsync if target.fill == Fill::CpAsync => cp_async_commit(smallvec![]),
             Sync::WaitAsync { pending } if target.fill == Fill::CpAsync => cp_async_wait(pending, smallvec![]),
             // Without `cp.async` the copies were synchronous: nothing to wait for.

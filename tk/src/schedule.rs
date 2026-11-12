@@ -19,11 +19,14 @@ const RAISED: u8 = 3;
 /// in flight over the next trip's fill: the ring refills the slot consumed
 /// two trips ago, and the template waits for all but the youngest chain
 /// after every consume that places no wait of its own, and for every chain
-/// after the loop ([`Sync::WaitProducts`]). The result's phase has no
-/// pipeline statement.
-pub fn expand(prog: Program, fill: Fill, core: Core) -> Program<Expanded> {
+/// after the loop ([`Sync::WaitProducts`]). Where a block barrier's halves
+/// part (`split`), a register-staged ring over two slots arrives as its
+/// trip stops touching shared memory and waits at the trip's end
+/// ([`Expander::register_staged`]). The result's phase has no pipeline
+/// statement.
+pub fn expand(prog: Program, fill: Fill, core: Core, split: bool) -> Program<Expanded> {
     let (mut out, body) = prog.rephase(|_, ()| (), ());
-    out.body = Expander { prog: &mut out, fill, core, scope: Scope::Block }.block(body);
+    out.body = Expander { prog: &mut out, fill, core, split, scope: Scope::Block }.block(body);
     out
 }
 
@@ -31,6 +34,7 @@ struct Expander<'p> {
     prog: &'p mut Program<Expanded>,
     fill: Fill,
     core: Core,
+    split: bool,
     /// Whose barriers a pipeline's template emits: the block's, or one
     /// warp's own inside a [`Stmt::Warps`].
     scope: Scope,
@@ -348,7 +352,11 @@ impl Expander<'_> {
     /// as deep fits the same shared memory. The first trip only loads and
     /// the last only consumes, so each is peeled into a one-trip loop and
     /// the steady loop has no branches: a trip is one basic block, which a
-    /// machine scheduler may reorder freely between the fences.
+    /// machine scheduler may reorder freely between the fences. Where the
+    /// barrier's halves part, a two-slot consume whose tail past its last
+    /// shared access branches ([`Self::branching_tail`]) commits and arrives
+    /// before that tail and waits after it: a warp working through a branch
+    /// the others skip holds them only a trip later, at its next arrive.
     fn register_staged(
         &mut self,
         extent: ScalarId,
@@ -374,9 +382,16 @@ impl Expander<'_> {
         let barrier = self.barrier();
         let head: Vec<Stmt<Expanded>> = issue.iter().chain(&commit).cloned().chain([barrier.clone()]).collect();
         let before = if stages == 1 { barrier.clone() } else { Stmt::Sync(Sync::Fence) };
-        let fenced = [before].into_iter().chain(commit).chain([barrier]);
+        let cut = if stages == 2 { self.branching_tail(&consume.body) } else { None };
+        let (reads, tail) = consume.body.0.split_at(cut.unwrap_or(consume.body.0.len()));
+        let (arrive, wait) = match cut {
+            Some(_) => (Stmt::Sync(Sync::Arrive), vec![Stmt::Sync(Sync::Await)]),
+            None => (barrier, vec![]),
+        };
+        let fenced = [before].into_iter().chain(commit).chain([arrive]);
         let issued = issue.into_iter().chain([Stmt::Sync(Sync::Fence)]);
-        let body: Vec<Stmt<Expanded>> = issued.chain(consume.body.0.iter().cloned()).chain(fenced).collect();
+        let body: Vec<Stmt<Expanded>> =
+            issued.chain(reads.iter().cloned()).chain(fenced).chain(tail.iter().cloned()).chain(wait).collect();
         // The drain's carried registers hold what the steady loop left.
         let drained: Vec<Carried> = carried.iter().map(|c| Carried { init: c.phi, ..*c }).collect();
         let trips = |start, extent, carried, body: Vec<Stmt<Expanded>>, unroll| {
@@ -387,6 +402,28 @@ impl Expander<'_> {
             trips(one, steady, carried, body, stages as u32),
             trips(extent, nonempty, drained, consume.body.0, 1),
         ]
+    }
+}
+
+impl Expander<'_> {
+    /// Where `consume`'s tail starts — past its last top-level statement
+    /// touching shared memory — where that tail branches and the block's
+    /// barrier may part around it; `None` otherwise (a warp's own ring, a
+    /// tail of products alone, no tail).
+    fn branching_tail(&self, consume: &Block<Expanded>) -> Option<usize> {
+        if !self.split || self.scope != Scope::Block {
+            return None;
+        }
+        let shared = |v: ValId| self.prog.value(v).tier() == Tier::Smem;
+        let touches = |s: &Stmt<Expanded>| match s {
+            Stmt::Copy { dst, src, .. } => shared(*dst) || shared(*src),
+            Stmt::Let { dst, op } => shared(*dst) || op.srcs().any(shared),
+            _ => false,
+        };
+        let within = |s: &Stmt<Expanded>| touches(s) || s.blocks().any(|b| b.walk().any(|(_, s)| touches(s)));
+        let cut = consume.0.iter().rposition(within).map_or(0, |i| i + 1);
+        let branches = consume.0[cut..].iter().any(|s| matches!(s, Stmt::If { .. } | Stmt::Loop(_)));
+        branches.then_some(cut)
     }
 }
 

@@ -168,6 +168,8 @@ fn describe<'p, P: Phase>(prog: &'p Program<P>, stmt: &Stmt<P>, origin: &mut Has
         Stmt::Sync(sync) => match sync {
             Sync::Barrier { scope: Scope::Block } => "barrier".into(),
             Sync::Barrier { scope: Scope::Warp } => "warp barrier".into(),
+            Sync::Arrive => "arrive".into(),
+            Sync::Await => "await".into(),
             Sync::CommitAsync => "commit async".into(),
             Sync::WaitAsync { pending } => format!("wait async {pending}"),
             Sync::Fence => "fence".into(),
