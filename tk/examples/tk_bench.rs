@@ -871,6 +871,13 @@ fn nearest_traced<'a>(planner: &'a Planner, [n, depth, k]: [usize; 3], args: &Ar
         k,
         live: Default::default(),
     };
+    if args.opt("--cfg") == Some("ranked") {
+        let p = NearestProblem { n, m: n, d, dtype: ScalarDType::Float16, metric, floors, groups: false, k };
+        for (i, cfg) in ranked.iter().enumerate() {
+            println!("{i:4} {:12.0} {cfg:?}", p.admit(planner, cfg).map_or(f64::NAN, |a| a.0));
+        }
+        return Ok(vec![]);
+    }
     let picks = args.opt("--cfg").unwrap_or("tuned").split(',').map(|c| match c {
         "tuned" => {
             Ok(("t".to_string(), tuned::nearest(TuneStore::global(), planner, DType::Float16, &ranked, spec.clone())))
