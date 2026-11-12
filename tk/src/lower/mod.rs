@@ -9,7 +9,7 @@ use snafu::{ResultExt, Snafu, ensure};
 use svod_codegen::Renderer;
 use svod_codegen::llvm::{LlvmTextRenderer, Location};
 use svod_dtype::{DType, DeviceSpec, GpuArch};
-use svod_ir::UOp;
+use svod_ir::{Op, UOp, ops};
 
 use crate::atoms::{Core, Device, Target};
 use crate::ir::*;
@@ -151,17 +151,23 @@ fn within_shared(prog: &Program) -> Result<()> {
 }
 
 /// `prog` lowered for its lowering's target alone, its parameters declared
-/// flat: what a graph launch on the target's device would emit, with no
-/// graph and no device.
+/// flat in their order: what a launch of a lowered body on the target's
+/// device emits, with no graph and no device. A plain launch numbers them
+/// `[out, ins...]` instead ([`crate::launch::lowered_as_launched`]).
 pub fn standalone(prog: Program, lowering: &Lowering) -> Result<Lowered> {
     let params =
         prog.params.iter().enumerate().map(|(i, p)| UOp::param(i, p.elems, DType::Scalar(p.dtype), None)).collect();
-    let device = match lowering.device.target.arch {
+    lower(prog, lowering, params, standalone_device(lowering))
+}
+
+/// The first device of `lowering`'s target, which a [`standalone`] program
+/// is lowered for.
+pub(crate) fn standalone_device(lowering: &Lowering) -> DeviceSpec {
+    match lowering.device.target.arch {
         GpuArch::Cuda(_) => DeviceSpec::Cuda { device_id: 0 },
         GpuArch::Amd(_) => DeviceSpec::Amd { device_id: 0 },
         GpuArch::Metal(_) => DeviceSpec::Metal { device_id: 0 },
-    };
-    lower(prog, lowering, params, device)
+    }
 }
 
 /// The LLVM text of `prog` [`standalone`] ([`Lowered::text`]).
@@ -213,6 +219,14 @@ impl Lowered {
         at
     }
 
+    /// The LLVM text `renderer` (a device's own) makes of the program under
+    /// the name a device renders it by, its PROGRAM's function name, with a
+    /// line table over [`Self::listing`]: a device kernel's twin.
+    pub fn located_text_by(&self, renderer: LlvmTextRenderer) -> Result<String> {
+        let Op::Program(ops::Program { info, .. }) = self.program.op() else { unreachable!("emit returns a PROGRAM") };
+        self.render(renderer.locations(self.locations()), &info.function_name())
+    }
+
     fn render_text(&self, target: &Target, located: bool) -> Result<String> {
         let renderer = match target.arch {
             GpuArch::Cuda(arch) => LlvmTextRenderer::nvptx(arch),
@@ -221,11 +235,14 @@ impl Lowered {
         }
         .rolled(self.rolled.iter().copied());
         let renderer = if located { renderer.locations(self.locations()) } else { renderer };
+        self.render(renderer, &self.tile.name)
+    }
+
+    fn render(&self, renderer: LlvmTextRenderer, name: &str) -> Result<String> {
         if svod_schedule::spec::spec_enabled() {
             let nodes = self.linear.op().sources();
             svod_schedule::spec::type_verify_list(&nodes, &svod_schedule::spec::spec_program()).expect("a valid list");
         }
-        let name = &self.tile.name;
         Ok(renderer.render(&self.linear, Some(name)).context(RenderSnafu { name })?.code)
     }
 }

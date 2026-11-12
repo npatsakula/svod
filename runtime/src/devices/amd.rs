@@ -1,7 +1,7 @@
 //! AMD GPU device factory.
 //!
 //! Wires together:
-//! - `svod_codegen::llvm::LlvmTextRenderer::amd(arch)` for IR emission.
+//! - `svod_runtime::amd::renderer(arch)` for IR emission.
 //! - `svod_runtime::amd::compile_ir_to_amd_object` for clang amdgcn compile.
 //! - `svod_device::amd::AmdProgram` for ELF load + AQL dispatch.
 //!
@@ -10,7 +10,6 @@
 
 use std::sync::Arc;
 
-use svod_codegen::llvm::LlvmTextRenderer;
 use svod_device::Result;
 use svod_device::amd::{AmdAllocator, AmdCopyQueue, AmdGraph, AmdProgram, SignalPool};
 use svod_device::device::{
@@ -161,7 +160,7 @@ struct AmdRendererWrapper {
 
 impl Renderer for AmdRendererWrapper {
     fn render(&self, ast: &Arc<UOp>, name: Option<&str>) -> Result<ProgramSpec> {
-        let renderer = LlvmTextRenderer::amd(self.arch);
+        let renderer = crate::amd::renderer(self.arch);
         let rendered = svod_codegen::Renderer::render(&renderer, ast, name.or(Some("kernel")))
             .map_err(|e| svod_device::Error::Runtime { message: format!("AMD IR rendering failed: {e}") })?;
         Ok(super::program_spec(&rendered, &self.device, ast))

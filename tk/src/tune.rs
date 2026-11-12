@@ -1228,19 +1228,21 @@ pub fn profile(candidate: Candidate, opts: &ProfileOptions) -> Option<Vec<RunPro
 }
 
 /// The statements of a [`profile`]d candidate's traced kernel: each program
-/// of `candidate` lowered again with a line table over its `kernel.tk`
-/// listing and compiled on the host as the device compiles it (the offline
-/// twin), the first whose `.text` is the capture's byte for byte attached to
-/// `capture` ([`Capture::attach_twin`]). `None` once attached, else why no
-/// twin matched (the capture left without lines).
+/// of `candidate` lowered again as [`profile`] launches it
+/// ([`launch::lowered_as_launched`]), rendered by the device's renderer with
+/// a line table over its `kernel.tk` listing and compiled on the host as the
+/// device compiles it (the offline twin), the first whose `.text` is the
+/// capture's byte for byte attached to `capture` ([`Capture::attach_twin`]).
+/// `None` once attached, else why no twin matched (the capture left without
+/// lines).
 pub fn twin(candidate: &Candidate, capture: &mut Capture) -> Option<String> {
     let mut why = vec![];
     for (prog, lowering) in candidate {
         let target = &lowering.device.target;
         let GpuArch::Amd(arch) = target.arch else { return Some(format!("{}: not an AMD target", prog.name)) };
         let mut attached = || -> Result<Option<String>, String> {
-            let low = crate::lower::standalone(prog.clone(), lowering).map_err(|e| e.to_string())?;
-            let ir = low.located_text(target).map_err(|e| e.to_string())?;
+            let low = launch::lowered_as_launched(prog.clone(), lowering).map_err(|e| e.to_string())?;
+            let ir = low.located_text_by(svod_runtime::amd::renderer(arch)).map_err(|e| e.to_string())?;
             let object = svod_runtime::amd::compile_ir_to_amd_object(&ir, arch).map_err(|e| e.to_string())?;
             capture.attach_twin(&object, &low.listing()).map_err(|e| e.to_string())
         };

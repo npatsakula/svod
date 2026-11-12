@@ -232,3 +232,72 @@ fn matrix_instructions_sit_on_the_product_statement() {
     assert!(why.as_deref().is_some_and(|w| w.starts_with(".text differs")), "{why:?}");
     assert_eq!((capture.lines, capture.listing), (None, None));
 }
+
+/// `located` with its line table taken out: the `!dbg` attachments and the
+/// debug metadata [`Lowered::located_text_by`] adds.
+fn unlocated(located: &str) -> String {
+    // The debug nodes are numbered from 2^20, clear of the loop hints.
+    let node = |l: &str| l.strip_prefix('!')?.split_once(" = ")?.0.parse::<u32>().ok();
+    let debug = |l: &str| {
+        l.starts_with("!llvm.dbg.cu") || l.starts_with("!llvm.module.flags") || node(l).is_some_and(|n| n >= 1 << 20)
+    };
+    let lines = located.split_inclusive('\n').filter(|l| !debug(l)).map(|l| match l.find(", !dbg !DILocation(") {
+        Some(at) => format!("{}{}", &l[..at], &l[at + l[at..].find(')').expect("a closed location") + 1..]),
+        None => l.replace(" !dbg !1048578", ""),
+    });
+    lines.collect()
+}
+
+/// The LLVM text an AMD device renders of `prog` launched over lazy tensors
+/// of its parameters: the PROGRAM [`launch::graph_launch_once`] hands the
+/// graph, rendered as the device's renderer renders it, under its function name.
+fn launched_text(arch: AmdArch, prog: Program, lowering: &Lowering) -> String {
+    use svod_codegen::Renderer;
+    use svod_ir::{Op, ops};
+    let device = svod_dtype::DeviceSpec::Amd { device_id: 0 };
+    let out = svod_dtype::default_device::with_default_device(device, || {
+        let tensors: Vec<svod_tensor::Tensor> =
+            prog.params.iter().map(|p| svod_tensor::Tensor::empty(&[p.elems], p.dtype.into())).collect();
+        crate::launch::graph_launch_once(prog, lowering, &tensors.iter().collect::<Vec<_>>()).expect("launches")
+    });
+    let (mut stack, mut seen) = (vec![out.uop()], std::collections::HashSet::new());
+    while let Some(node) = stack.pop() {
+        if let Op::Program(ops::Program { linear: Some(linear), info, .. }) = node.op() {
+            let renderer = svod_runtime::amd::renderer(arch);
+            return renderer.render(linear, Some(&info.function_name())).expect("renders").code;
+        }
+        stack.extend(node.op().sources().into_iter().filter(|s| seen.insert(s.id)));
+    }
+    panic!("the launch holds no PROGRAM")
+}
+
+/// The twin a capture's statements come from is the kernel a launch on the
+/// device compiles: its located text, the line table taken out, is the
+/// launch's text, and the two compile to one `.text`. A launch numbers the
+/// parameters `[out, ins...]`; a twin lowered over them in declared order
+/// (the GEMM's output last) loads its kernel arguments in another order.
+#[test_case(AmdArch::Gfx1201, 64; "gfx1201")]
+#[test_case(AmdArch::Gfx1151, 40; "gfx1151")]
+fn a_twin_is_the_launched_kernel(arch: AmdArch, cus: u32) {
+    if !tooled() {
+        return;
+    }
+    let planner = planner(amd(arch, cus));
+    let tiles = [
+        ((1500, 1280, 5120), config::gemm_cfg([128, 128, 32], 2, [4, 2], false)),
+        ((1536, 1280, 5120), config::gemm_cfg([128, 128, 32], 2, [4, 2], false)),
+        ((4096, 4096, 4096), config::gemm_cfg([128, 128, 32], 2, [4, 2], true)),
+        ((1500, 1536, 512), config::gemm_cfg([256, 128, 32], 2, [4, 2], false)),
+    ];
+    tiles.into_par_iter().for_each(|((m, n, k), cfg)| {
+        let prog = gemm::<BF16>(&assumed(gemm_spec(m, n, k), cfg));
+        let lowering = cfg.lowering(&planner.device);
+        let launched = launched_text(arch, prog.clone(), &lowering);
+        let twin = crate::launch::lowered_as_launched(prog, &lowering).expect("lowers");
+        let located = twin.located_text_by(svod_runtime::amd::renderer(arch)).unwrap();
+        assert!(located.contains("!dbg !DILocation"), "{m}x{n}x{k}: no locations");
+        assert_eq!(unlocated(&located), launched, "{m}x{n}x{k} {cfg:?}");
+        let [twin, launched] = [located, launched].map(|ir| compile_ir_to_amd_object(&ir, arch).unwrap());
+        assert_eq!(text_mismatch(&launched, &twin), None, "{m}x{n}x{k} {cfg:?}");
+    });
+}

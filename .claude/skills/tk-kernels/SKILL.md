@@ -302,8 +302,11 @@ of AMD's rocprof-trace-decoder, checked against its control CSVs) over `llvm-obj
   findings appearing/gone/changed; loop buckets a trip (each side's own trips; per iteration without `model.trips`)
   by |Δ exposed|; loop rows aligned by mnemonic (LCS): inserted/removed grouped by mnemonic with ops, cycles, exposed
   a trip, then matched rows by |Δ exposed|. Golden: `runtime/src/test/fixtures/sqtt_compare_v1_v3.txt`.
-- **Statements** (`tk_bench sqtt gemm` only): after the trace, `tune::twin` lowers each program again with a line
-  table over its listing (`Lowered::located_text`, `Lowered::listing`), compiles it on the host with the device's
+- **Statements** (`tk_bench sqtt gemm` only): after the trace, `tune::twin` lowers each program again as the launch
+  did (`launch::lowered_as_launched`: parameters numbered `[out, ins...]`, not `lower::standalone`'s declared order,
+  which loads the kernel arguments in another order) and renders it through the device's renderer
+  (`svod_runtime::amd::renderer`) with a line table over its listing (`Lowered::located_text_by`,
+  `Lowered::listing`), compiles it on the host with the device's
   flags and keeps its lines when its `.text` is `kernel.co`'s byte for byte (`Capture::attach_twin`): the dir gains
   `kernel.tk` (a line a statement in `Program::walk` order: `fill a staged issue`, `lds read a_s`, `mma a_s·b_s`,
   `store c`, with `[prologue|head|steady|drain|epilogue]`) and `lines.json` (ELF address → `[line, unroll copy]`);
@@ -311,7 +314,7 @@ of AMD's rocprof-trace-decoder, checked against its control CSVs) over `llvm-obj
   (the loop's cycles a trip by line, a wait on its binding load's statement, unattributed last), evidence lines end
   in `@line text`, and `--compare` pairs rows within one statement text and diffs statements by text.
   `lines::a_line_table_leaves_the_code_alone` gates the line table (`.text` unchanged, coverage floors; the whole
-  sweep is its `#[ignore]`d twin).
+  sweep is its `#[ignore]`d twin); `lines::a_twin_is_the_launched_kernel` holds the twin to the launched IR and `.text`.
 - **`--attribute`** (report only): each `Planner::price` term as `price − price with its costs zeroed` (`steps`,
   `reads`, `fill`, `wait`, `lone_trip`, `trip`; they overlap, so they need not sum) beside the traced cycles of its
   counterpart: steps ↔ matrix issue less stall, reads ↔ `ds_*` + lgkm/ds waits, fill ↔ global memory + vm/load waits,

@@ -79,12 +79,7 @@ pub(crate) fn graph_launch_lowered(
         tensors.len() == prog.params.len(),
         AritySnafu { name: name.clone(), want: prog.params.len(), got: tensors.len() }
     );
-    let standalone = match lowering.device.target.arch {
-        svod_dtype::GpuArch::Cuda(_) => DeviceSpec::Cuda { device_id: 0 },
-        svod_dtype::GpuArch::Amd(_) => DeviceSpec::Amd { device_id: 0 },
-        svod_dtype::GpuArch::Metal(_) => DeviceSpec::Metal { device_id: 0 },
-    };
-    if default_device() != standalone || tensors.is_empty() {
+    if default_device() != lower::standalone_device(lowering) || tensors.is_empty() {
         return launch_all(prog.clone(), lowering, tensors, false);
     }
     let origin = svod_ir::origin::current();
@@ -105,6 +100,29 @@ pub(crate) fn graph_launch_lowered(
 
 pub(crate) fn first_output(prog: &Program) -> usize {
     prog.params.iter().position(|p| p.kind != ParamKind::In).expect("a program writes something")
+}
+
+/// The bases of `[out, ins...]` placeholders back in parameter order: the
+/// one at `out_at` is slot 0, the inputs slots 1.. in order.
+fn in_param_order(placeholders: &[Arc<UOp>], out_at: usize) -> Vec<Arc<UOp>> {
+    let mut ins = placeholders[1..].iter();
+    (0..placeholders.len())
+        .map(|i| if i == out_at { &placeholders[0] } else { ins.next().expect("an input") }.base())
+        .collect()
+}
+
+/// `prog` lowered for its target alone over the parameters a launch on that
+/// device binds (unlike [`lower::standalone`]'s, numbered `[out, ins...]`):
+/// the kernel [`graph_launch_once`] compiles there, whatever tensors it runs on.
+pub(crate) fn lowered_as_launched(prog: Program, lowering: &Lowering) -> lower::Result<lower::Lowered> {
+    let out_at = first_output(&prog);
+    let order = std::iter::once(out_at).chain((0..prog.params.len()).filter(|&i| i != out_at));
+    let placeholders = order
+        .enumerate()
+        .map(|(slot, i)| UOp::param(slot, prog.params[i].elems, svod_dtype::DType::Scalar(prog.params[i].dtype), None))
+        .collect::<Vec<_>>();
+    let device = lower::standalone_device(lowering);
+    lower::lower(prog, lowering, in_param_order(&placeholders, out_at), device)
 }
 
 /// [`graph_launch`] returning every parameter's tensor as it is after the
@@ -135,12 +153,7 @@ fn launch_all(prog: Program, lowering: &Lowering, tensors: &[&Tensor], memo: boo
         if let Some(program) = LOWERED.lock().expect("lowered memo").get(&key).filter(|_| memo) {
             return program.clone();
         }
-        let mut params: Vec<Arc<UOp>> = Vec::with_capacity(ph.len());
-        let mut rest = ph[1..].iter();
-        for i in 0..ph.len() {
-            params.push(if i == out_at { ph[0].base() } else { rest.next().expect("an input").base() });
-        }
-        match lower::lower(prog, lowering, params, device) {
+        match lower::lower(prog, lowering, in_param_order(&ph, out_at), device) {
             Ok(lowered) => {
                 let program = lowered.program.without_origins();
                 if memo {
