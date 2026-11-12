@@ -694,13 +694,15 @@ fn sqtt_bench(args: &Args) -> Result<()> {
     }
     let positional: Vec<&str> = args.0.iter().map(String::as_str).take_while(|a| !a.starts_with("--")).collect();
     let usage = "sqtt gemm M N K [--cfg I|tuned|BMxBNxBK:S:WRxWC[:rolled],…], \
-                 sqtt attention B H T D [--causal] [--bias] [--cfg I|tuned,…], sqtt --load DIR or sqtt --compare A B";
+                 sqtt attention B H T D [--causal] [--bias] [--cfg I|tuned,…], \
+                 sqtt nearest N D K [--metric M] [--cfg I|tuned,…], sqtt --load DIR or sqtt --compare A B";
     let planner = planner()?;
     let traced: Vec<Traced> = match positional[..] {
         ["gemm", m, n, k] => gemm_traced(&planner, [m.parse()?, n.parse()?, k.parse()?], args)?,
         ["attention", b, h, t, d] => {
             attention_traced(&planner, [b.parse()?, h.parse()?, t.parse()?, d.parse()?], args)?
         }
+        ["nearest", n, d, k] => nearest_traced(&planner, [n.parse()?, d.parse()?, k.parse()?], args)?,
         _ => return Err(usage.into()),
     };
     let out = PathBuf::from(args.opt("--out").unwrap_or("sqtt"));
@@ -840,6 +842,56 @@ fn attention_traced<'a>(planner: &'a Planner, [b, h, t, d]: [usize; 4], args: &A
                     ["", "b"][bias as usize]
                 ),
                 candidate: Box::new(move || Ok(candidates::attention(&admitted, &[t], &DType::BFloat16, planner))),
+                labels,
+            })
+        })
+        .collect()
+}
+
+/// A self-join of `N` f16 rows of depth `D` keeping `K` a row (`--metric`,
+/// NegDot by default); `--cfg tuned` (the default) is the op's pick, an index
+/// one of the shape gate's ranking.
+fn nearest_traced<'a>(planner: &'a Planner, [n, depth, k]: [usize; 3], args: &Args) -> Result<Vec<Traced<'a>>> {
+    let (metric, floors) = (args.metric()?.unwrap_or(Metric::NegDot), Floors { row: false, col: false });
+    let extent = Extent { dims: vec![n, depth], var: false };
+    let Plan::Kernel(ranked) =
+        shape::nearest(Some(planner), &[DType::Float16; 2], Some(&extent), Some(&extent), metric, floors, false, k)
+    else {
+        return Err("nearest: the op takes the graph at this shape".into());
+    };
+    let d = planner.nearest_depth(depth, ScalarDType::Float16).ok_or("no matrix core")?;
+    let spec = NearestSpec {
+        n,
+        m: n,
+        d,
+        dtype: ScalarDType::Float16,
+        metric,
+        floors,
+        groups: false,
+        k,
+        live: Default::default(),
+    };
+    let picks = args.opt("--cfg").unwrap_or("tuned").split(',').map(|c| match c {
+        "tuned" => {
+            Ok(("t".to_string(), tuned::nearest(TuneStore::global(), planner, DType::Float16, &ranked, spec.clone())))
+        }
+        i => {
+            let i = i.parse::<usize>()?;
+            let cfg = *ranked.get(i).ok_or_else(|| format!("--cfg {i}: {} ranked", ranked.len()))?;
+            Ok((i.to_string(), spec.clone().admitted(planner, cfg).map_err(|why| format!("{cfg:?}: {why:?}"))?))
+        }
+    });
+    picks
+        .map(|pick: Result<_>| {
+            let (i, admitted) = pick?;
+            let labels = BTreeMap::from([
+                ("op".into(), "nearest".into()),
+                ("shape".into(), format!("n{n} d{depth} k{k} {metric:?}")),
+                ("cfg".into(), format!("{:?}", admitted.cfg())),
+            ]);
+            Ok(Traced {
+                name: format!("nearest_n{n}d{depth}k{k}{metric:?}_{i}"),
+                candidate: Box::new(move || Ok(candidates::nearest(planner, DType::Float16, &admitted))),
                 labels,
             })
         })
