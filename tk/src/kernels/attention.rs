@@ -793,17 +793,23 @@ fn attention_body<'k, T: Half>(k: &mut Kernel<'k>, spec: &Admitted<AttnSpec>) {
                 let first = tile(k, w_first.clone());
                 let (acc, _) =
                     k.pipeline_with(w_blocks, k_s, [m0, l0, o0], [first], produce, |k, step_, slot, carried, [b]| {
-                        let next = tile(k, w_first.clone() + step_.clone() + 1);
                         let slot = slot.past(slot0.clone());
                         let (k_t, v_t) =
                             (k.slot(k_s, &slot, Shape::new(bkv, d)), k.slot(v_s, &slot, Shape::new(bkv, d)));
+                        // The next tile is loaded where this one dies: loaded
+                        // while this one lives, it takes registers of its own
+                        // and a move at the step's end, which waits for it.
+                        let next = std::cell::Cell::new(None);
                         let ahead = |k: &mut Kernel<'k>, s: Regs<'k, F32>, _| {
                             let b = k.cast::<T, F32>(b);
                             let log2e = k.fill::<F32>(k.shape(s), Const::Float(std::f64::consts::LOG2_E));
-                            k.mul_add(b, log2e, s)
+                            let s = k.mul_add(b, log2e, s);
+                            next.set(Some(tile(k, w_first.clone() + step_.clone() + 1)));
+                            s
                         };
                         let st = Step { bias: Some(&ahead as Mask), ..st };
-                        (step(k, &st, k_t, v_t, (w_first.clone() + step_) * bkv, carried), [next])
+                        let carried = step(k, &st, k_t, v_t, (w_first.clone() + step_.clone()) * bkv, carried);
+                        (carried, [next.take().expect("the step adds its bias")])
                     });
                 acc
             }
