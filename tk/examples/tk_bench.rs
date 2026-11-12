@@ -46,6 +46,8 @@
 //!   else the `lines=mismatch` label says why), and its report printed (`--top` rows a table,
 //!   `--json` one line); `--attribute` sets the model's terms (`price` less
 //!   each) beside the traced SIMD's cycles of their counterparts.
+//!   `sqtt attention B H T D [--causal] [--bias] [--cfg I|tuned,…]` traces
+//!   attention over `[B, T, H, D]` bf16 the same way.
 //!   `SVOD_SQTT_PSTATE=standard|peak` pins the traced pass's clock.
 //!   `SVOD_SQTT_SIMD=S[,S...]` picks each SE's traced SIMD (default `0,1`).
 //!   `sqtt --load DIR [--json] [--attribute]` re-reads a saved trace, no GPU;
@@ -786,32 +788,21 @@ fn attention_traced<'a>(planner: &'a Planner, [b, h, t, d]: [usize; 4], args: &A
         packed: false,
         scale: 1.0 / (d as f32).sqrt(),
     };
-    let tuned = || -> Result<usize> {
-        let operand = || drawn(&[b, t, h, d], DType::BFloat16);
-        let scores = if bias { Some(drawn(&[b, h, t, t], DType::BFloat16)?) } else { None };
-        ops::attention(
-            &operand()?,
-            &operand()?,
-            &operand()?,
-            Attn { causal, bias: scores.as_ref(), ..Attn::default() },
-        )?
-        .realize()?;
-        let launched = match ops::chosen() {
-            Some(ops::Chosen::Kernel { cfg, .. }) => cfg,
-            other => return Err(format!("the op launched no tile kernel: {other:?}").into()),
-        };
-        let at = ranked.iter().position(|c| format!("{c:?}") == launched);
-        at.ok_or_else(|| format!("the op's {launched} is not in the planner's ranking").into())
-    };
     let picks = args.opt("--cfg").unwrap_or("tuned").split(',').map(|c| match c {
-        "tuned" => tuned(),
-        i => Ok(i.parse::<usize>()?),
+        "tuned" => Ok((
+            "t".to_string(),
+            tuned::attention(TuneStore::global(), planner, DType::BFloat16, &ranked, spec.clone(), None),
+        )),
+        i => {
+            let i = i.parse::<usize>()?;
+            let cfg = *ranked.get(i).ok_or_else(|| format!("--cfg {i}: {} ranked", ranked.len()))?;
+            Ok((i.to_string(), spec.clone().admitted(planner, cfg).map_err(|why| format!("{cfg:?}: {why:?}"))?))
+        }
     });
     picks
-        .map(|i| {
-            let i = i?;
-            let cfg = *ranked.get(i).ok_or_else(|| format!("--cfg {i}: {} ranked", ranked.len()))?;
-            let admitted = spec.clone().admitted(planner, cfg).map_err(|why| format!("{cfg:?}: {why:?}"))?;
+        .map(|pick: Result<_>| {
+            let (i, admitted) = pick?;
+            let cfg = admitted.cfg();
             let labels = BTreeMap::from([
                 ("op".into(), "attention".into()),
                 ("shape".into(), format!("b{b} h{h} t{t} d{d} causal={causal} bias={bias}")),
