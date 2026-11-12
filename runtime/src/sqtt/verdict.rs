@@ -95,6 +95,38 @@ pub(super) struct Pass {
     pub raw: Partition,
     pub exposed: Partition,
     pub barriers: BTreeMap<u64, BarrierSite>,
+    /// The partition's cycles by the instruction they are charged to: a wait's to the instruction
+    /// that bound it.
+    pub charges: BTreeMap<u64, Charge>,
+}
+
+/// An instruction's cycles in the loop by bucket, `[raw, exposed]`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct Charge {
+    pub issue: [i64; 2],
+    pub stall: [i64; 2],
+    pub wait: [i64; 2],
+    pub barrier: [i64; 2],
+    pub idle: [i64; 2],
+}
+
+impl Charge {
+    pub fn add(&mut self, o: &Self) {
+        for (at, from) in [
+            (&mut self.issue, o.issue),
+            (&mut self.stall, o.stall),
+            (&mut self.wait, o.wait),
+            (&mut self.barrier, o.barrier),
+            (&mut self.idle, o.idle),
+        ] {
+            (at[0], at[1]) = (at[0] + from[0], at[1] + from[1]);
+        }
+    }
+}
+
+/// `cycles` into `at`, raw and less what `hidden` covers of them.
+fn charge(at: &mut [i64; 2], cycles: i64, hidden: i64) {
+    (at[0], at[1]) = (at[0] + cycles, at[1] + cycles - hidden.clamp(0, cycles));
 }
 
 /// Raw and exposed cycles by key.
@@ -164,6 +196,7 @@ impl Buckets {
         let (mut wait, mut barrier) = (Sums::<WaitOn>::new(), Sums::<()>::new());
         let (mut raw, mut exposed) = (Partition::default(), Partition::default());
         let mut barriers = BTreeMap::<u64, BarrierSite>::new();
+        let mut charges = BTreeMap::<u64, Charge>::new();
         let none = HashMap::new();
         for (w, wave) in waves.iter().enumerate() {
             let bound = bound.get(w).unwrap_or(&none);
@@ -185,24 +218,32 @@ impl Buckets {
                 let gap = (r.time - *cursor).max(0);
                 if gap > 0 {
                     idle.add(self.class(r.pc), gap, hidden.idle);
+                    charge(&mut charges.entry(r.pc).or_default().idle, gap, hidden.idle);
                     *cursor = r.time;
                 }
                 let end = r.time + r.duration;
                 let cycles = (end - *cursor).max(0);
-                let bucket = self.bucket(r.pc, bound.get(&seq));
+                let binder = bound.get(&seq);
+                let bucket = self.bucket(r.pc, binder);
                 let held = match bucket {
                     Bucket::Issue(class) => {
                         let stalled = ((r.time + r.stall).min(end) - *cursor).max(0);
                         stall.add(class, stalled, hidden.stall);
                         issue.add(class, cycles - stalled, hidden.issue);
+                        let at = charges.entry(r.pc).or_default();
+                        charge(&mut at.stall, stalled, hidden.stall);
+                        charge(&mut at.issue, cycles - stalled, hidden.issue);
                         stalled
                     }
                     Bucket::Wait(on) => {
                         wait.add(on, cycles, hidden.stall + hidden.issue);
+                        let at = charges.entry(binder.map_or(r.pc, |b| b.1)).or_default();
+                        charge(&mut at.wait, cycles, hidden.stall + hidden.issue);
                         cycles
                     }
                     Bucket::Barrier => {
                         barrier.add((), cycles, hidden.stall + hidden.issue);
+                        charge(&mut charges.entry(r.pc).or_default().barrier, cycles, hidden.stall + hidden.issue);
                         0
                     }
                 };
@@ -231,7 +272,7 @@ impl Buckets {
         (raw.barrier, exposed.barrier) = (b.first().map_or(0, |b| b.1), e.first().map_or(0, |e| e.1));
         exposed.waves = raw.waves;
         exposed.cycles = exposed.buckets();
-        Pass { raw, exposed, barriers }
+        Pass { raw, exposed, barriers, charges }
     }
 }
 
@@ -903,8 +944,12 @@ pub(super) fn text(a: &Analysis, o: &mut String) {
             Evidence::Waits { loads, stalls, .. } => {
                 for s in stalls {
                     let (pc, per, exposed) = (s.pc, s.per_trip, s.exposed_per_trip);
-                    let _ =
-                        writeln!(o, "   {pc:#x} stalled {per:.0}/{unit} before issue, exposed {exposed:.0}  {}", s.asm);
+                    let _ = writeln!(
+                        o,
+                        "   {pc:#x} stalled {per:.0}/{unit} before issue, exposed {exposed:.0}  {}{}",
+                        s.asm,
+                        a.at(pc)
+                    );
                 }
                 for l in loads {
                     let what = if stores(Some(&classify(&l.asm).kind)) { "store" } else { "load" };
@@ -915,7 +960,7 @@ pub(super) fn text(a: &Analysis, o: &mut String) {
                     let distance: Vec<String> = l.distance.iter().map(|(d, n)| format!("{d}:{n}")).collect();
                     let _ = writeln!(
                         o,
-                        "   {:#x} {what} exposed {:.0}/{unit} at wait {:#x} (then {}): cover med {}, {latency}, {}/{} stalled, distance {}  {}",
+                        "   {:#x} {what} exposed {:.0}/{unit} at wait {:#x} (then {}): cover med {}, {latency}, {}/{} stalled, distance {}  {}{}",
                         l.pc,
                         l.exposed_per_trip,
                         l.wait,
@@ -924,7 +969,8 @@ pub(super) fn text(a: &Analysis, o: &mut String) {
                         l.stalled,
                         l.waits,
                         distance.join(","),
-                        l.asm
+                        l.asm,
+                        a.at(l.pc)
                     );
                 }
             }
@@ -935,17 +981,24 @@ pub(super) fn text(a: &Analysis, o: &mut String) {
                         .causes
                         .iter()
                         .take(EVIDENCE)
-                        .map(|(pc, n)| format!("{pc:#x} {} x{n}", asm.get(pc).copied().unwrap_or("?")))
+                        .map(|(pc, n)| format!("{pc:#x} {} x{n}{}", asm.get(pc).copied().unwrap_or("?"), a.at(*pc)))
                         .collect();
                     let after =
                         if causes.is_empty() { String::new() } else { format!(", after {}", causes.join("; ")) };
                     let share = 100.0 * s.last as f64 / s.hits.max(1) as f64;
-                    let _ = writeln!(o, "   {:#x} arrived last {}/{} ({share:.0}%){after}", s.pc, s.last, s.hits);
+                    let _ = writeln!(
+                        o,
+                        "   {:#x} arrived last {}/{} ({share:.0}%){after}{}",
+                        s.pc,
+                        s.last,
+                        s.hits,
+                        a.at(s.pc)
+                    );
                 }
             }
             Evidence::Overhead { divergent, .. } => {
                 for (pc, asm) in divergent {
-                    let _ = writeln!(o, "   {pc:#x} {asm}");
+                    let _ = writeln!(o, "   {pc:#x} {asm}{}", a.at(*pc));
                 }
             }
             _ => {}

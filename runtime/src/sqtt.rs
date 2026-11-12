@@ -23,8 +23,14 @@ use svod_device::sqtt::{Layout, decode, wave};
 use svod_dtype::AmdArch;
 
 mod compare;
+mod lines;
+mod statements;
 mod verdict;
-pub use compare::{BucketDelta, Caution, Diff, FindingDelta, LoopRow, Rows, SLOWDOWN_SPREAD, Side, Unit, align};
+pub use compare::{
+    BucketDelta, Caution, Diff, FindingDelta, LoopRow, Rows, SLOWDOWN_SPREAD, Side, StatementDelta, Unit, align,
+};
+pub use lines::{LineRow, Lines, Stmt, debug_line, locate, parse_debug_line, text_mismatch, text_section};
+pub use statements::Statement;
 pub use verdict::{
     Approx, BarrierSite, Ceiling, Cycles, Demand, Evidence, Finding, FindingKind, Load, Partition, Stall, Verdict,
     WaitOn,
@@ -33,12 +39,12 @@ pub use verdict::{
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
-    #[snafu(display("llvm-objdump not found beside clang or on PATH: {source}"))]
-    Objdump { source: Box<crate::Error> },
-    #[snafu(display("llvm-objdump: {source}"))]
-    Spawn { source: std::io::Error },
-    #[snafu(display("llvm-objdump failed: {stderr}"))]
-    Disassemble { stderr: String },
+    #[snafu(display("{tool} not found beside clang or on PATH: {source}"))]
+    Tool { tool: &'static str, source: Box<crate::Error> },
+    #[snafu(display("{tool}: {source}"))]
+    Spawn { tool: &'static str, source: std::io::Error },
+    #[snafu(display("{tool} failed: {stderr}"))]
+    Failed { tool: &'static str, stderr: String },
     #[snafu(display("{}: {source}", path.display()))]
     Io { source: std::io::Error, path: PathBuf },
     #[snafu(display("{}: {source}", path.display()))]
@@ -55,26 +61,31 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// `llvm-objdump -d` of a code object, the tool found beside the clang svod compiles with.
 pub fn disassemble(elf: &[u8]) -> Result<String> {
-    let tool = crate::clang::ClangToolchain::discover(None)
-        .and_then(|clang| clang.sibling("llvm-objdump"))
+    run_tool("llvm-objdump", &["-d", "-"], elf)
+}
+
+/// The output of LLVM's `tool`, found beside the clang svod compiles with, run on `input`.
+fn run_tool(tool: &'static str, args: &[&str], input: &[u8]) -> Result<String> {
+    let path = crate::clang::ClangToolchain::discover(None)
+        .and_then(|clang| clang.sibling(tool))
         .map_err(Box::new)
-        .context(ObjdumpSnafu)?;
-    let mut child = Command::new(tool)
-        .args(["-d", "-"])
+        .context(ToolSnafu { tool })?;
+    let mut child = Command::new(path)
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context(SpawnSnafu)?;
+        .context(SpawnSnafu { tool })?;
     let mut stdin = child.stdin.take().expect("piped stdin");
     let output = std::thread::scope(|s| {
-        // A pipe objdump closed early is its failure to report, not the writer's.
-        s.spawn(move || drop(stdin.write_all(elf)));
+        // A pipe the tool closed early is its failure to report, not the writer's.
+        s.spawn(move || drop(stdin.write_all(input)));
         child.wait_with_output()
     })
-    .context(SpawnSnafu)?;
+    .context(SpawnSnafu { tool })?;
     if !output.status.success() {
-        return DisassembleSnafu { stderr: String::from_utf8_lossy(&output.stderr).into_owned() }.fail();
+        return FailedSnafu { tool, stderr: String::from_utf8_lossy(&output.stderr).into_owned() }.fail();
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
@@ -99,6 +110,10 @@ pub struct Capture {
     pub grid: Option<[u32; 3]>,
     /// The power state the traced dispatch ran at; `None` where the capture predates the record.
     pub pstate: Option<Pstate>,
+    /// Each instruction's tile-program statement, and `kernel.tk`, the listing whose lines they
+    /// name: from an offline twin build ([`Self::attach_twin`]); `None` where none matched.
+    pub lines: Option<Lines>,
+    pub listing: Option<String>,
 }
 
 /// The power state a traced dispatch ran at: the device's own clock, or a stable state pinned
@@ -179,10 +194,13 @@ impl Capture {
             workgroup: None,
             grid: None,
             pstate: None,
+            lines: None,
+            listing: None,
         })
     }
 
-    /// `se<N>.att` (raw streams), `kernel.co`, `kernel.s` and `meta.json` under `dir`.
+    /// `se<N>.att` (raw streams), `kernel.co`, `kernel.s` and `meta.json` under `dir`; with
+    /// statements, `lines.json` (ELF address to `[line, column]`) and `kernel.tk`.
     pub fn save(&self, dir: &Path) -> Result<()> {
         let code = self.trace.code.as_ref().context(NoCodeSnafu)?;
         io(dir, std::fs::create_dir_all(dir))?;
@@ -192,6 +210,11 @@ impl Capture {
         }
         write("kernel.co", &code.elf)?;
         write("kernel.s", self.disassembly.as_bytes())?;
+        if let Some((lines, listing)) = self.lines.as_ref().zip(self.listing.as_ref()) {
+            let path = dir.join("lines.json");
+            write("lines.json", serde_json::to_string(lines).context(JsonSnafu { path })?.as_bytes())?;
+            write("kernel.tk", listing.as_bytes())?;
+        }
         let meta = Meta {
             arch: self.trace.arch.to_string(),
             load_base: code.load_base,
@@ -239,6 +262,14 @@ impl Capture {
             false => disassemble(&elf)?,
         };
         let code = Some(CodeImage { elf, load_base: meta.load_base, entry_pc: meta.entry_pc });
+        let (lines, listing) = match dir.join("lines.json").exists() && dir.join("kernel.tk").exists() {
+            true => {
+                let path = dir.join("lines.json");
+                let lines: Lines = serde_json::from_slice(&read("lines.json")?).context(JsonSnafu { path })?;
+                (Some(lines), Some(String::from_utf8_lossy(&read("kernel.tk")?).into_owned()))
+            }
+            false => (None, None),
+        };
         Ok(Self {
             trace: SqttTrace { arch, per_se, code, mclk_mhz: meta.mclk_mhz },
             disassembly,
@@ -249,6 +280,8 @@ impl Capture {
             workgroup: meta.workgroup,
             grid: meta.grid,
             pstate: meta.pstate,
+            lines,
+            listing,
         })
     }
 
@@ -381,6 +414,9 @@ pub struct Row {
     pub hidden_idle: i64,
     pub hidden_stall: i64,
     pub hidden_issue: i64,
+    /// Its tile-program statement `(line, column)` in `kernel.tk`, where the capture has lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stmt: Option<Stmt>,
 }
 
 /// A class's cycles on the traced SIMD; `latency` includes `stall`.
@@ -414,6 +450,9 @@ pub struct MainLoop {
     pub barriers: Vec<BarrierSite>,
     /// What the loop's waits waited for: [`Waits::bindings`] over the waits in the loop alone.
     pub bindings: Vec<Binding>,
+    /// The loop's cycles by statement, where the capture has lines.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub statements: Vec<Statement>,
 }
 
 /// The unit per-trip figures are in: a trip of the kernel's reduction (`model.trips`, the trips a
@@ -500,6 +539,9 @@ pub struct Analysis {
     pub occupancy: Occupancy,
     /// What limits the main loop.
     pub verdict: Verdict,
+    /// `kernel.tk`, line by line, where the capture has lines.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub listing: Vec<String>,
 }
 
 /// The `<name>` of an `llvm-objdump` label line, `0000000000001700 <name>:`, with its address.
@@ -623,6 +665,7 @@ impl Analysis {
                     hidden_idle: h.idle,
                     hidden_stall: h.stall,
                     hidden_issue: h.issue,
+                    stmt: capture.lines.as_ref().and_then(|l| l.get(&(pc - base)).copied()),
                 }
             })
             .collect();
@@ -661,7 +704,9 @@ impl Analysis {
             bound: &bound[range.clone()],
             hiding,
         });
-        let main_loop = main_loop(&lines, &pcs, traced_waves, &replay, model_trips, base);
+        let listing: Vec<String> = capture.listing.iter().flat_map(|l| l.lines()).map(str::to_string).collect();
+        let statements = capture.lines.as_ref().map(|lines| (lines, listing.as_slice()));
+        let main_loop = main_loop(&lines, &pcs, traced_waves, &replay, model_trips, base, statements);
         let mut analysis = Self {
             kernel: kernel.to_string(),
             arch: capture.trace.arch.to_string(),
@@ -688,6 +733,7 @@ impl Analysis {
             ses,
             pcs: rows,
             verdict: Verdict::default(),
+            listing,
         };
         analysis.verdict = verdict::rank(&analysis);
         Ok(analysis)
@@ -792,6 +838,7 @@ impl Analysis {
                 let _ = writeln!(o, "iterations/wave  {}", spread(l.iterations, false));
                 let _ = writeln!(o, "cycles/iteration {}", spread(l.cycles, true));
                 partition_text(&mut o, l);
+                statements::text(self, &mut o, top);
                 let mut rows: Vec<&Row> = self.loop_rows().collect();
                 rows.sort_by_key(|r| (std::cmp::Reverse(r.stall), r.pc));
                 let _ = writeln!(o, "== main loop: top {top} by stall");
@@ -983,7 +1030,8 @@ struct SeWaves<'a> {
 
 /// The innermost executed backward branch whose span issues a matrix instruction, else the most
 /// executed one; its waves' trips and the cycles between their back edges, and how the traced waves'
-/// cycles in it split, SE by SE. `model_trips`: the trips a wave runs, where the capture says.
+/// cycles in it split, SE by SE, and by the statement `stmts` gives each instruction. `model_trips`:
+/// the trips a wave runs, where the capture says.
 fn main_loop<'a>(
     lines: &[(u64, &str)],
     pcs: &BTreeMap<u64, Stats>,
@@ -991,6 +1039,7 @@ fn main_loop<'a>(
     replay: &Replay,
     model_trips: Option<u64>,
     base: u64,
+    stmts: Option<(&Lines, &[String])>,
 ) -> Option<MainLoop> {
     let edges = lines
         .iter()
@@ -1017,12 +1066,15 @@ fn main_loop<'a>(
     let labelled = model_trips.zip(iterations).map(|(t, i)| (t as f64 / (i.median + 1) as f64).round().max(1.0));
     let per_iteration = labelled.map_or(1, |u| u as u32);
     let buckets = verdict::Buckets::new(lines);
-    let mut sites = vec![];
+    let (mut sites, mut charges) = (vec![], BTreeMap::<u64, verdict::Charge>::new());
     let ses: Vec<SeLoop> = ses
         .map(|s| {
             let edges = s.waves.iter().flat_map(|w| &w.instructions).filter(|i| i.pc == edge).count() as u64;
             let pass = buckets.partition(s.waves, s.bound, head..=edge, s.hiding);
             sites.extend(pass.barriers.into_values());
+            for (pc, c) in pass.charges {
+                charges.entry(pc - base).or_default().add(&c);
+            }
             SeLoop { se: s.se, trips: edges * u64::from(per_iteration), partition: pass.raw, exposed: pass.exposed }
         })
         .filter(|s| s.partition.waves > 0)
@@ -1032,18 +1084,23 @@ fn main_loop<'a>(
         partition.add(&s.partition);
         exposed.add(&s.exposed);
     });
+    let trips = Trips { per_iteration, labelled: labelled.is_some(), total: ses.iter().map(|s| s.trips).sum() };
+    let body = lines.iter().map(|l| l.0).filter(|pc| (head..=edge).contains(pc)).map(|pc| pc - base);
+    let statements =
+        stmts.map_or(vec![], |(stmts, listing)| statements::rollup(&charges, body, stmts, listing, trips.total));
     Some(MainLoop {
         head: head - base,
         back_edge: edge - base,
         matrix: matrix(&(head, edge)),
         iterations,
         cycles: Spread::of(cycles),
-        trips: Trips { per_iteration, labelled: labelled.is_some(), total: ses.iter().map(|s| s.trips).sum() },
+        trips,
         partition,
         exposed,
         ses,
         barriers: BarrierSite::merge(sites, base),
         bindings: replay.waits(base, |pc| (head..=edge).contains(&pc)).bindings,
+        statements,
     })
 }
 

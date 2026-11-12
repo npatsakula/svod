@@ -1,6 +1,7 @@
 //! Two traces of a kernel side by side ([`Analysis::compare`]): their untraced times and clocks, the
-//! main loop's buckets and rows a trip, and how the verdict moved. Rows pair by aligning the two
-//! loops' mnemonic sequences (a longest common subsequence), so a register reallocation still pairs.
+//! main loop's buckets, statements and rows a trip, and how the verdict moved. Rows pair by aligning
+//! the two loops' mnemonic sequences (a longest common subsequence), so a register reallocation still
+//! pairs; where both captures have lines, a row pairs only within the statement of the same text.
 
 use std::collections::BTreeMap;
 use std::fmt::Write;
@@ -111,10 +112,13 @@ pub struct LoopRow {
     pub cycles: f64,
     pub stall: f64,
     pub exposed: f64,
+    /// Its statement's `kernel.tk` text, where the capture has lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statement: Option<String>,
 }
 
 impl LoopRow {
-    fn of(r: &Row, units: u64) -> Self {
+    fn of(r: &Row, units: u64, listing: &[String]) -> Self {
         let per = |c: i64| c as f64 / units.max(1) as f64;
         let issue = r.latency - r.stall;
         let exposed = r.idle - r.hidden_idle.clamp(0, r.idle) + r.stall - r.hidden_stall.clamp(0, r.stall) + issue
@@ -127,6 +131,7 @@ impl LoopRow {
             cycles: per(r.latency + r.idle),
             stall: per(r.stall),
             exposed: per(exposed),
+            statement: r.stmt.and_then(|(line, _)| Some(listing.get(line as usize - 1)?.trim().to_string())),
         }
     }
 
@@ -147,9 +152,19 @@ pub struct Rows {
     pub matched: Vec<[LoopRow; 2]>,
 }
 
+/// A statement's loop cycles a unit on each side, by its `kernel.tk` text (two programs number
+/// their lines apart); 0 where a side has no such statement.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StatementDelta {
+    pub statement: String,
+    pub raw: [f64; 2],
+    pub exposed: [f64; 2],
+}
+
 /// Capture B against capture A. Its JSON keeps these key names: `a`, `b`, `unit`, `cautions`,
 /// `buckets` (`bucket`, `raw`, `exposed`, each `[a, b]`), `findings` (`kind`, `share`), `rows`
-/// (`inserted`, `removed`, `matched`).
+/// (`inserted`, `removed`, `matched`), and where both captures have lines `statements`
+/// (`statement`, `raw`, `exposed`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Diff {
     pub a: Side,
@@ -159,6 +174,8 @@ pub struct Diff {
     pub buckets: Vec<BucketDelta>,
     pub findings: Vec<FindingDelta>,
     pub rows: Rows,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub statements: Vec<StatementDelta>,
 }
 
 /// `K / model.trips` of a GEMM capture's `shape` label (`MxNxK`).
@@ -225,11 +242,17 @@ pub fn align<T: PartialEq>(a: &[T], b: &[T]) -> Vec<(Option<usize>, Option<usize
     pairs
 }
 
+/// Whether both captures have lines: rows then pair within a statement.
+fn lined(a: &Analysis, b: &Analysis) -> bool {
+    [a, b].iter().all(|x| x.main_loop.as_ref().is_some_and(|l| !l.statements.is_empty()))
+}
+
 fn rows(a: &Analysis, b: &Analysis, units: [u64; 2]) -> Rows {
-    let ra: Vec<LoopRow> = a.loop_rows().map(|r| LoopRow::of(r, units[0])).collect();
-    let rb: Vec<LoopRow> = b.loop_rows().map(|r| LoopRow::of(r, units[1])).collect();
-    let (ma, mb): (Vec<&str>, Vec<&str>) =
-        (ra.iter().map(LoopRow::mnemonic).collect(), rb.iter().map(LoopRow::mnemonic).collect());
+    let ra: Vec<LoopRow> = a.loop_rows().map(|r| LoopRow::of(r, units[0], &a.listing)).collect();
+    let rb: Vec<LoopRow> = b.loop_rows().map(|r| LoopRow::of(r, units[1], &b.listing)).collect();
+    let by_statement = lined(a, b);
+    let key = |r: &LoopRow| (by_statement.then(|| r.statement.clone()).flatten(), r.mnemonic().to_string());
+    let (ma, mb): (Vec<_>, Vec<_>) = (ra.iter().map(key).collect(), rb.iter().map(key).collect());
     let mut rows = Rows::default();
     for pair in align(&ma, &mb) {
         match pair {
@@ -269,6 +292,25 @@ fn buckets(a: &Analysis, b: &Analysis, units: [u64; 2]) -> Vec<BucketDelta> {
     buckets.sort_by(|x, y| key(y).0.total_cmp(&key(x).0).then(key(y).1.total_cmp(&key(x).1)));
     buckets.extend(total);
     buckets
+}
+
+/// Each statement of either side by text, largest |Δ exposed| first; none unless both have lines.
+fn statements(a: &Analysis, b: &Analysis, units: [u64; 2]) -> Vec<StatementDelta> {
+    if !lined(a, b) {
+        return vec![];
+    }
+    let mut by = BTreeMap::<String, StatementDelta>::new();
+    for (side, (x, units)) in [(a, units[0]), (b, units[1])].into_iter().enumerate() {
+        for (text, (raw, exposed)) in super::statements::by_text(x, units) {
+            let at =
+                by.entry(text.clone()).or_insert(StatementDelta { statement: text, raw: [0.0; 2], exposed: [0.0; 2] });
+            (at.raw[side], at.exposed[side]) = (raw, exposed);
+        }
+    }
+    let delta = |d: &StatementDelta| (d.exposed[1] - d.exposed[0]).abs();
+    let mut out: Vec<StatementDelta> = by.into_values().collect();
+    out.sort_by(|x, y| delta(y).total_cmp(&delta(x)).then(x.statement.cmp(&y.statement)));
+    out
 }
 
 fn findings(a: &Analysis, b: &Analysis) -> Vec<FindingDelta> {
@@ -313,6 +355,7 @@ impl Analysis {
             buckets: buckets(self, b, units),
             findings: findings(self, b),
             rows: rows(self, b, units),
+            statements: statements(self, b, units),
             a: sa,
             b: sb,
         }
@@ -330,6 +373,10 @@ fn grouped(rows: &[LoopRow]) -> Vec<(&str, usize, f64, f64, f64)> {
     let mut groups: Vec<_> = by.into_iter().map(|(m, (n, h, c, e))| (m, n, h, c, e)).collect();
     groups.sort_by(|x, y| y.3.total_cmp(&x.3).then(x.0.cmp(y.0)));
     groups
+}
+
+fn statement(r: &LoopRow) -> String {
+    r.statement.as_ref().map_or(String::new(), |s| format!("  @ {s}"))
 }
 
 fn signed(x: f64) -> String {
@@ -430,6 +477,7 @@ impl Diff {
             let _ = writeln!(o, "{what:<10} {:<17} {:>6} -> {:>6}", f.kind.name(), pct(f.share[0]), pct(f.share[1]));
         }
         self.buckets_text(&mut o);
+        self.statements_text(&mut o, top);
         self.rows_text(&mut o, top);
         o
     }
@@ -472,15 +520,41 @@ impl Diff {
         }
     }
 
+    fn statements_text(&self, o: &mut String, top: usize) {
+        if self.statements.is_empty() {
+            return;
+        }
+        let _ = writeln!(o, "== statements {} by kernel.tk text: top {top} by |Δ exposed|", self.unit.name());
+        let _ = writeln!(
+            o,
+            "{:>8} {:>8} {:>8} {:>8} {:>8} {:>8}  statement",
+            "A raw", "B raw", "Δ raw", "A exp", "B exp", "Δ exp"
+        );
+        for d in self.statements.iter().take(top) {
+            let _ = writeln!(
+                o,
+                "{:>8.1} {:>8.1} {:>8} {:>8.1} {:>8.1} {:>8}  {}",
+                d.raw[0],
+                d.raw[1],
+                signed(d.raw[1] - d.raw[0]),
+                d.exposed[0],
+                d.exposed[1],
+                signed(d.exposed[1] - d.exposed[0]),
+                d.statement
+            );
+        }
+    }
+
     fn rows_text(&self, o: &mut String, top: usize) {
         let r = &self.rows;
         if self.cautions.contains(&Caution::NoLoop) {
             return;
         }
         let unit = self.unit.name();
+        let by = if self.statements.is_empty() { "mnemonic" } else { "statement and mnemonic" };
         let _ = writeln!(
             o,
-            "== loop rows aligned by mnemonic: {} matched, {} inserted in B, {} removed from A; ops, cycles, exposed {unit}",
+            "== loop rows aligned by {by}: {} matched, {} inserted in B, {} removed from A; ops, cycles, exposed {unit}",
             r.matched.len(),
             r.inserted.len(),
             r.removed.len()
@@ -502,8 +576,14 @@ impl Diff {
             for x in rows.into_iter().take(top.min(3)) {
                 let _ = writeln!(
                     o,
-                    "{:>8} {:>#7x} {:>5.1} ops {:>6.1} cycles {:>6.1} exposed  {}",
-                    "", x.pc, x.hits, x.cycles, x.exposed, x.asm
+                    "{:>8} {:>#7x} {:>5.1} ops {:>6.1} cycles {:>6.1} exposed  {}{}",
+                    "",
+                    x.pc,
+                    x.hits,
+                    x.cycles,
+                    x.exposed,
+                    x.asm,
+                    statement(x)
                 );
             }
         }
@@ -516,8 +596,15 @@ impl Diff {
         for [x, y] in r.matched.iter().take(top) {
             let _ = writeln!(
                 o,
-                "{:>#7x} {:>#7x} {:>8.1} {:>8.1} {:>8.1} {:>8.1}  {}",
-                x.pc, y.pc, x.cycles, y.cycles, x.exposed, y.exposed, y.asm
+                "{:>#7x} {:>#7x} {:>8.1} {:>8.1} {:>8.1} {:>8.1}  {}{}",
+                x.pc,
+                y.pc,
+                x.cycles,
+                y.cycles,
+                x.exposed,
+                y.exposed,
+                y.asm,
+                statement(y)
             );
         }
     }

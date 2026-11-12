@@ -41,7 +41,9 @@
 //!   [--out DIR] [--json] [--attribute] [--residual] [--gated]`: each config
 //!   (the tuner's pick by default, `I` the planner's `I`th) timed untraced,
 //!   then traced once on an AMD RDNA3/RDNA4 card (SQTT), its trace saved
-//!   under `DIR` (`./sqtt`) and its report printed (`--top` rows a table,
+//!   under `DIR` (`./sqtt`) with its tile statements where a host build with
+//!   a line table compiles to the traced code (`kernel.tk`, `lines.json`;
+//!   else the `lines=mismatch` label says why), and its report printed (`--top` rows a table,
 //!   `--json` one line); `--attribute` sets the model's terms (`price` less
 //!   each) beside the traced SIMD's cycles of their counterparts.
 //!   `SVOD_SQTT_PSTATE=standard|peak` pins the traced pass's clock.
@@ -718,12 +720,22 @@ fn sqtt_bench(args: &Args) -> Result<()> {
         }
         let mut labels = gemm_model(&planner, shape, epilogue, cfg);
         labels.insert("candidate_ns".into(), untraced.map_or("-".into(), |t| t.as_nanos().to_string()));
+        let candidate = gemm_candidate(&planner, shape, epilogue, cfg)?;
         for trace in traces {
             if let Err(error) = &trace.analysis {
                 return Err(format!("{}: {error}", trace.dir.display()).into());
             }
             let mut capture = Capture::load(&trace.dir)?;
             capture.labels.extend(labels.clone());
+            // The statements, from a host build with a line table whose code is the traced one.
+            match tune::twin(&candidate, &mut capture) {
+                None => capture.labels.insert("lines".into(), "twin".into()),
+                Some(why) => {
+                    eprintln!("{}: no statements: {why}", trace.dir.display());
+                    capture.labels.insert("lines.why".into(), why);
+                    capture.labels.insert("lines".into(), "mismatch".into())
+                }
+            };
             capture.save(&trace.dir)?;
             println!("saved {}", trace.dir.display());
             sqtt_print(&capture, args, top)?;

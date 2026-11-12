@@ -28,10 +28,11 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use svod_dtype::default_device::{default_device, with_default_device};
-use svod_dtype::{DType, DeviceSpec, ScalarDType};
+use svod_dtype::{DType, DeviceSpec, GpuArch, ScalarDType};
 use svod_ir::SInt;
 use svod_ir::UOp;
 use svod_runtime::benchmark::{CLOCK_WARMUP, round_robin_min, warm_clock};
+use svod_runtime::sqtt::Capture;
 use svod_runtime::{ExecutionPlan, KernelResources, ProfileOptions, RunProfile};
 use svod_tensor::{PrepareConfig, Tensor};
 
@@ -1224,6 +1225,32 @@ pub fn profile(candidate: Candidate, opts: &ProfileOptions) -> Option<Vec<RunPro
         plan.profile(&ProfileOptions { sqtt, ..opts.clone() }).ok()
     });
     profiled.collect()
+}
+
+/// The statements of a [`profile`]d candidate's traced kernel: each program
+/// of `candidate` lowered again with a line table over its `kernel.tk`
+/// listing and compiled on the host as the device compiles it (the offline
+/// twin), the first whose `.text` is the capture's byte for byte attached to
+/// `capture` ([`Capture::attach_twin`]). `None` once attached, else why no
+/// twin matched (the capture left without lines).
+pub fn twin(candidate: &Candidate, capture: &mut Capture) -> Option<String> {
+    let mut why = vec![];
+    for (prog, lowering) in candidate {
+        let target = &lowering.device.target;
+        let GpuArch::Amd(arch) = target.arch else { return Some(format!("{}: not an AMD target", prog.name)) };
+        let mut attached = || -> Result<Option<String>, String> {
+            let low = crate::lower::standalone(prog.clone(), lowering).map_err(|e| e.to_string())?;
+            let ir = low.located_text(target).map_err(|e| e.to_string())?;
+            let object = svod_runtime::amd::compile_ir_to_amd_object(&ir, arch).map_err(|e| e.to_string())?;
+            capture.attach_twin(&object, &low.listing()).map_err(|e| e.to_string())
+        };
+        match attached() {
+            Ok(None) => return None,
+            Ok(Some(differs)) => why.push(format!("{}: {differs}", prog.name)),
+            Err(e) => why.push(format!("{}: {e}", prog.name)),
+        }
+    }
+    Some(why.join("; "))
 }
 
 /// Each prepared plan's best device time in ns, timed as [`measure`] times a

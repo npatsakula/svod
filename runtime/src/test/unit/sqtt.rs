@@ -11,10 +11,12 @@ use test_case::test_case;
 
 use svod_device::amd::occupancy::Limiter;
 
-use super::verdict::{Buckets, load_bytes};
+use super::statements::rollup;
+use super::verdict::{Buckets, Charge, load_bytes};
 use super::{
-    Analysis, Approx, BucketDelta, Capture, Caution, Class, Diff, Evidence, Finding, FindingKind, LoopRow, Partition,
-    Pstate, Spread, Unit, WaitOn, align,
+    Analysis, Approx, BucketDelta, Capture, Caution, Class, Diff, Evidence, Finding, FindingKind, LineRow, Lines,
+    LoopRow, Partition, Pstate, Spread, Statement, Stmt, Unit, WaitOn, align, locate, parse_debug_line, text_mismatch,
+    text_section,
 };
 
 fn fixtures() -> PathBuf {
@@ -57,6 +59,8 @@ fn capture(fixture: &str) -> Capture {
         workgroup: None,
         grid: None,
         pstate: None,
+        lines: None,
+        listing: None,
     }
 }
 
@@ -256,7 +260,7 @@ fn disassembles_without_kernel_s() {
     std::fs::remove_file(dir.path().join("kernel.s")).unwrap();
     match Capture::load(dir.path()) {
         Ok(loaded) => assert_eq!(objdump_lines(&loaded.disassembly), objdump_lines(&c.disassembly)),
-        Err(super::Error::Objdump { .. }) => eprintln!("no llvm-objdump: skipped"),
+        Err(super::Error::Tool { .. }) => eprintln!("no llvm-objdump: skipped"),
         Err(e) => panic!("{e}"),
     }
 }
@@ -871,4 +875,190 @@ proptest! {
         }
         prop_assert_eq!(matched.len(), lcs[a.len()][b.len()]);
     }
+}
+
+const DWARFDUMP: &str = "\
+.debug_line contents:
+debug_line[0x00000000]
+Line table prologue:
+    total_length: 0x000006f5
+include_directories[  0] = \"\"
+file_names[  0]:
+           name: \"kernel.tk\"
+
+Address            Line   Column File   ISA Discriminator OpIndex Flags
+------------------ ------ ------ ------ --- ------------- ------- -------------
+0x0000000000000000      3      0      0   0             0       0  is_stmt prologue_end
+0x000000000000004c      4      2      0   0             0       0  is_stmt
+0x0000000000000050      0      0      0   0             0       0
+0x0000000000000058      7      1      0   0             0       0  is_stmt
+0x0000000000000060      7      1      0   0             0       0  is_stmt end_sequence
+";
+
+#[test]
+fn parses_debug_line_rows() {
+    let row = |address, line, column, end| LineRow { address, line, column, end };
+    assert_eq!(
+        parse_debug_line(DWARFDUMP),
+        [
+            row(0, 3, 0, false),
+            row(0x4c, 4, 2, false),
+            row(0x50, 0, 0, false),
+            row(0x58, 7, 1, false),
+            row(0x60, 7, 1, true)
+        ]
+    );
+    // LLVM before 17 prints no OpIndex column; the rows read the same.
+    let old = "0x0000000000000010      9      3      0   0             0  is_stmt\n";
+    assert_eq!(parse_debug_line(old), [row(0x10, 9, 3, false)]);
+    assert!(parse_debug_line("Address Line Column\n---- ----\n").is_empty());
+}
+
+#[test_case(0x0, Some((3, 0)); "a sequence's first row")]
+#[test_case(0x48, Some((3, 0)); "the row before it")]
+#[test_case(0x4c, Some((4, 2)); "its own row")]
+#[test_case(0x54, None; "line 0 is no statement")]
+#[test_case(0x5c, Some((7, 1)); "the last row")]
+#[test_case(0x60, None; "the sequence's end")]
+#[test_case(0x64, None; "past it")]
+fn locates_an_instruction(pc: u64, stmt: Option<Stmt>) {
+    assert_eq!(locate(&parse_debug_line(DWARFDUMP), [pc]).get(&pc).copied(), stmt);
+}
+
+/// Two sequences meeting at one address: the second's start wins over the first's end.
+#[test]
+fn a_sequence_start_wins_over_an_end() {
+    let row = |address, line, end| LineRow { address, line, column: 0, end };
+    let rows = [row(0x20, 5, false), row(0x0, 2, false), row(0x20, 0, true), row(0x40, 0, true)];
+    assert_eq!(locate(&rows, [0x10, 0x20, 0x30, 0x40]), Lines::from([(0x10, (2, 0)), (0x20, (5, 0)), (0x30, (5, 0))]));
+}
+
+#[test]
+fn text_mismatch_names_the_first_byte() {
+    let elf = capture("gfx1200/gemm").trace.code.unwrap().elf;
+    assert_eq!(text_mismatch(&elf, &elf), None);
+    let (at, text) = text_section(&elf).unwrap();
+    let offset = elf.windows(text.len()).position(|w| w == text).unwrap();
+    let mut other = elf.clone();
+    other[offset + 8] ^= 1;
+    assert_eq!(at, 0x1700, "a linked object's .text sits past its headers");
+    assert_eq!(text_mismatch(&elf, &other), Some(format!(".text differs: {0} vs {0} bytes, first at 0x8", text.len())));
+    assert_eq!(text_mismatch(&elf, b"not an elf").as_deref(), Some("a code object has no .text"));
+}
+
+/// Synthetic statements over a capture's instructions, by what they do: products, global loads,
+/// LDS ops, the rest; waits and barriers on none.
+fn with_lines(mut c: Capture) -> Capture {
+    let lines = objdump_lines(&c.disassembly)
+        .into_iter()
+        .filter_map(|(pc, line)| {
+            let stmt = match Class::of(line) {
+                Class::Matrix => 1,
+                Class::VmemLoad => 2,
+                Class::Lds => 3,
+                Class::WaitVmem | Class::WaitLgkm | Class::Barrier => return None,
+                _ => 4,
+            };
+            Some((pc, (stmt, 1 + (pc as u32 / 4) % 2)))
+        })
+        .collect();
+    c.lines = Some(lines);
+    c.listing = Some("mma a_s·b_s [steady]\n  fill a staged issue [steady]\n  lds read a_s [steady]\nother\n".into());
+    c
+}
+
+/// A capture with lines saves `lines.json` and `kernel.tk` and loads them back; its rows carry their
+/// statements, and its loop's cycles split over them exactly as over the partition's buckets, the
+/// waits on the statements of the loads that bound them.
+#[test]
+fn statements_split_the_loop_exactly() {
+    let c = with_lines(Capture::load(&fixtures().join("svod/rdna4_gemm_v3")).unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    c.save(dir.path()).unwrap();
+    assert!(dir.path().join("lines.json").exists() && dir.path().join("kernel.tk").exists());
+    let back = Capture::load(dir.path()).unwrap();
+    assert_eq!((&back.lines, &back.listing), (&c.lines, &c.listing));
+    let a = back.analyze().unwrap();
+    assert_eq!(a, c.analyze().unwrap());
+    assert!(a.pcs.iter().filter(|r| r.class == Class::Matrix).all(|r| r.stmt.is_some_and(|s| s.0 == 1)));
+    assert_eq!(a.listing.len(), 4);
+    let l = a.main_loop.as_ref().unwrap();
+    let trips = l.trips.total as f64;
+    let raw: f64 = l.statements.iter().map(Statement::raw).sum();
+    let exposed: f64 = l.statements.iter().map(Statement::exposed).sum();
+    assert!((raw - l.partition.cycles as f64 / trips).abs() < 1e-6, "{raw} vs {}", l.partition.cycles as f64 / trips);
+    assert!((exposed - l.exposed.cycles as f64 / trips).abs() < 1e-6);
+    let at = |line: u32| l.statements.iter().find(|s| s.line == line).unwrap();
+    let matrix = l.partition.issued(&[Class::Matrix]) as f64 / trips;
+    assert!((at(1).issue.raw - matrix).abs() < 1e-6, "the products' issue is the mma statement's");
+    let waits = l.partition.waited(|_| true) as f64 / trips;
+    let bound = at(2).wait.raw + at(3).wait.raw;
+    assert!(bound > 0.9 * waits, "waits sit on their loads' statements: {bound:.1} of {waits:.1}");
+    assert_eq!(at(0).text, "unattributed");
+    assert_eq!(l.statements.last().unwrap().line, 0, "the unattributed last");
+    let text = a.text(4);
+    assert!(text.contains("== statements: main loop cycles a trip by kernel.tk line"), "{text}");
+    assert!(text.contains("fill a staged issue [steady]") && text.contains("unattributed"), "{text}");
+    assert!(text.lines().any(|l| l.contains(" load exposed ") && l.contains("@2 fill a staged issue")), "{text}");
+    let json: serde_json::Value = serde_json::from_str(&a.to_json()).unwrap();
+    assert!(json["main_loop"]["statements"].is_array() && json["pcs"][0].get("stmt").is_some());
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&verdict_of("rdna4_gemm_v3").to_json()).unwrap()["pcs"][0]
+            .get("stmt")
+            .is_none()
+    );
+}
+
+/// Two captures with lines compare by statement text, and their rows pair within a statement.
+#[test]
+fn compare_aligns_by_statement() {
+    let load = |name: &str| with_lines(Capture::load(&fixtures().join("svod").join(name)).unwrap()).analyze().unwrap();
+    let d = load("rdna4_gemm_v1").compare(&load("rdna4_gemm_v3"));
+    let texts: Vec<&str> = d.statements.iter().map(|s| s.statement.as_str()).collect();
+    assert!(texts.contains(&"fill a staged issue [steady]") && texts.contains(&"unattributed"), "{texts:?}");
+    let fill = d.statements.iter().find(|s| s.statement == "fill a staged issue [steady]").unwrap();
+    assert!(fill.exposed[1] > fill.exposed[0], "v3 pulls the fill's wait up behind its load: {fill:?}");
+    assert!(d.rows.matched.iter().all(|[a, b]| a.statement == b.statement));
+    let text = d.text(6);
+    assert!(
+        text.contains("== statements an iteration by kernel.tk text")
+            || text.contains("== statements a trip by kernel.tk text"),
+        "{text}"
+    );
+    assert!(text.contains("aligned by statement and mnemonic"), "{text}");
+    let plain = compared("rdna4_gemm_v1", "rdna4_gemm_v3");
+    assert!(plain.statements.is_empty() && plain.text(6).contains("aligned by mnemonic:"));
+}
+
+fn charge(issue: i64, stall: i64, wait: i64, idle: i64) -> Charge {
+    Charge { issue: [issue, issue / 2], stall: [stall, 0], wait: [wait, wait / 4], barrier: [0; 2], idle: [idle, idle] }
+}
+
+/// Charges roll up by line over the trips: a wait charged to its binding load lands on the load's
+/// statement, a PC with no line on the unattributed row, which sorts last; the rest by exposed.
+#[test_case(1, 6.0, 2.0; "the load's statement holds its issue and its waits")]
+#[test_case(2, 10.0, 3.0; "the product's issue and stall")]
+#[test_case(0, 2.0, 2.0; "unattributed idle")]
+fn rolls_charges_up_by_statement(line: u32, raw: f64, exposed: f64) {
+    let lines = Lines::from([(0x10, (1, 1)), (0x14, (1, 2)), (0x20, (2, 1))]);
+    let listing = ["fill a staged issue [steady]", "mma a_s·b_s [steady]"].map(String::from);
+    let charges = BTreeMap::from([
+        (0x10, charge(4, 0, 0, 0)),
+        (0x14, charge(0, 0, 8, 0)),
+        (0x20, charge(12, 8, 0, 0)),
+        (0x30, charge(0, 0, 0, 4)),
+    ]);
+    let rolled = rollup(&charges, [0x10, 0x14, 0x20, 0x24, 0x30], &lines, &listing, 2);
+    assert_eq!(rolled.iter().map(|s| s.line).collect::<Vec<_>>(), [2, 1, 0]);
+    let s = rolled.iter().find(|s| s.line == line).unwrap();
+    assert!((s.raw() - raw).abs() < 1e-9 && (s.exposed() - exposed).abs() < 1e-9, "{s:?}");
+    assert_eq!(s.pcs, [(0, 2), (1, 2), (2, 1)].iter().find(|p| p.0 == line).unwrap().1);
+    assert_eq!(
+        s.text,
+        match line {
+            0 => "unattributed",
+            1 => listing[0].as_str(),
+            _ => listing[1].as_str(),
+        }
+    );
 }

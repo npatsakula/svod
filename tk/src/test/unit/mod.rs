@@ -14,6 +14,7 @@ mod interp;
 mod isa;
 mod layout;
 mod layouts;
+mod lines;
 mod nearest;
 mod occupancy;
 mod offline;

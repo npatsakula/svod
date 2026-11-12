@@ -39,22 +39,35 @@ pub struct LlvmTextRenderer {
     /// carry the rolled hint whatever a pattern match over the nodes would
     /// find ([`Self::rolled`]).
     rolled: std::collections::HashSet<u64>,
+    /// Source locations by UOp id ([`Self::locations`]).
+    locations: Option<std::collections::HashMap<u64, Location>>,
 }
+
+/// Where an operation comes from in a synthetic source the renderer does not
+/// see: a line (nonzero) and a column (zero for none).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Location {
+    pub line: u32,
+    pub column: u32,
+}
+
+/// The first metadata id of the debug nodes, clear of the loop hints.
+const DEBUG_METADATA: usize = 1 << 20;
 
 impl LlvmTextRenderer {
     /// Renderer for the host CPU target (default for backwards compatibility).
     pub fn new() -> Self {
-        Self { target: LlvmTarget::Cpu, rolled: Default::default() }
+        Self { target: LlvmTarget::Cpu, rolled: Default::default(), locations: None }
     }
 
     /// Renderer for an AMD GPU at the named `gfx{family}` target.
     pub fn amd(arch: AmdArch) -> Self {
-        Self { target: LlvmTarget::Amd(arch), rolled: Default::default() }
+        Self { target: LlvmTarget::Amd(arch), rolled: Default::default(), locations: None }
     }
 
     /// Renderer for an NVIDIA GPU at the named `sm_XY` compute capability.
     pub fn nvptx(arch: CudaArch) -> Self {
-        Self { target: LlvmTarget::Nvptx(arch), rolled: Default::default() }
+        Self { target: LlvmTarget::Nvptx(arch), rolled: Default::default(), locations: None }
     }
 
     /// The loops whose ranges `ids` name, kept rolled by the schedule that
@@ -65,9 +78,17 @@ impl LlvmTextRenderer {
         self
     }
 
+    /// Line-tables-only debug info over a synthetic `file`: every
+    /// instruction of an operation `locations` names carries its line and
+    /// column, the rest none.
+    pub fn locations(mut self, locations: std::collections::HashMap<u64, Location>) -> Self {
+        self.locations = Some(locations);
+        self
+    }
+
     /// Construct with an explicit target.
     pub fn with_target(target: LlvmTarget) -> Self {
-        Self { target, rolled: Default::default() }
+        Self { target, rolled: Default::default(), locations: None }
     }
 
     pub fn target(&self) -> LlvmTarget {
@@ -120,6 +141,8 @@ impl Renderer for LlvmTextRenderer {
         }
         let mut kernel: Vec<String> = Vec::new();
         let mut operations = Vec::new();
+        // Attached once the declarations are read off the call sites.
+        let mut located = Vec::new();
         let mut buffer_args: Vec<BufferArg> = Vec::new();
         let mut var_names: Vec<String> = Vec::new();
 
@@ -201,6 +224,9 @@ impl Renderer for LlvmTextRenderer {
             if let Some(err) = ctx.take_error() {
                 return Err(err);
             }
+            if let Some(&at) = self.locations.as_ref().and_then(|l| l.get(&node.id)) {
+                located.push((first_line..kernel.len(), at));
+            }
             operations.push(RenderedOperation {
                 uop_id: node.id,
                 op: node.op().as_ref().to_string(),
@@ -259,6 +285,9 @@ impl Renderer for LlvmTextRenderer {
         // CUSTOM body line; LLVM forbids redefining a function, so keep only
         // the first occurrence of each identical declaration.
         let module_prefix = dedup_declares(module_blocks.join("\n\n"));
+        for (lines, at) in located {
+            kernel[lines].iter_mut().for_each(|line| attach_location(line, at));
+        }
 
         let target_triple_line = match self.target {
             LlvmTarget::Cpu => String::new(),
@@ -276,19 +305,23 @@ impl Renderer for LlvmTextRenderer {
             }
         };
 
+        let (subprogram, debug_metadata) = match &self.locations {
+            Some(_) => (format!(" !dbg !{}", DEBUG_METADATA + 2), debug_metadata(kernel_name)),
+            None => (String::new(), String::new()),
+        };
         let ir = format!(
             r#"; ModuleID = '{kernel_name}'
 source_filename = "{kernel_name}"
 {target_triple_line}
 {module_prefix}
 
-define {abi} @{kernel_name}({inner_params}) #0 {{
+define {abi} @{kernel_name}({inner_params}) #0{subprogram} {{
 entry:
 {inner_body}
 }}
 
 attributes #0 = {{ {attrs} }}
-{loop_metadata}"#,
+{loop_metadata}{debug_metadata}"#,
             module_prefix = module_prefix,
             inner_params = inner_params.join(", "),
             inner_body = kernel.join("\n"),
@@ -322,6 +355,48 @@ attributes #0 = {{ {attrs} }}
     fn decompositor(&self) -> Option<TypedPatternMatcher<()>> {
         None
     }
+}
+
+/// `line` with a `!dbg` location at `at` when it is an instruction: not a
+/// label, a comment or a blank. A custom body's several lines each take one.
+fn attach_location(line: &mut String, at: Location) {
+    let located = line
+        .split('\n')
+        .map(|l| {
+            let t = l.trim();
+            let instruction = !t.is_empty() && !t.starts_with(';') && !t.ends_with(':') && !t.starts_with("declare ");
+            if instruction {
+                format!(
+                    "{l}, !dbg !DILocation(line: {}, column: {}, scope: !{})",
+                    at.line,
+                    at.column,
+                    DEBUG_METADATA + 2
+                )
+            } else {
+                l.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    *line = located;
+}
+
+/// The line-tables-only compile unit, its `kernel.tk` file and the
+/// kernel's subprogram, numbered from [`DEBUG_METADATA`].
+fn debug_metadata(kernel_name: &str) -> String {
+    let [cu, file, sp, ty, dwarf, version] = std::array::from_fn(|i| DEBUG_METADATA + i);
+    format!(
+        "!llvm.dbg.cu = !{{!{cu}}}\n\
+         !llvm.module.flags = !{{!{dwarf}, !{version}}}\n\
+         !{cu} = distinct !DICompileUnit(language: DW_LANG_C99, file: !{file}, producer: \"svod\", isOptimized: true, \
+         runtimeVersion: 0, emissionKind: LineTablesOnly)\n\
+         !{file} = !DIFile(filename: \"kernel.tk\", directory: \"\")\n\
+         !{sp} = distinct !DISubprogram(name: \"{kernel_name}\", scope: !{file}, file: !{file}, line: 1, type: !{ty}, \
+         scopeLine: 1, spFlags: DISPFlagDefinition | DISPFlagOptimized, unit: !{cu})\n\
+         !{ty} = !DISubroutineType(types: !{{}})\n\
+         !{dwarf} = !{{i32 7, !\"Dwarf Version\", i32 5}}\n\
+         !{version} = !{{i32 2, !\"Debug Info Version\", i32 3}}\n"
+    )
 }
 
 /// The first `@llvm.nvvm.*` / `@llvm.amdgcn.*` reference in a CUSTOM body

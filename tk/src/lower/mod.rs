@@ -2,11 +2,12 @@
 //! shared-memory effects, expand the schedule template, give every register
 //! tile a layout, then emit the instruction list in program order.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use snafu::{ResultExt, Snafu, ensure};
 use svod_codegen::Renderer;
-use svod_codegen::llvm::LlvmTextRenderer;
+use svod_codegen::llvm::{LlvmTextRenderer, Location};
 use svod_dtype::{DType, DeviceSpec, GpuArch};
 use svod_ir::UOp;
 
@@ -16,6 +17,7 @@ use crate::layouts;
 use crate::schedule;
 
 pub mod emit;
+pub mod listing;
 mod scopes;
 pub mod sync;
 
@@ -81,6 +83,9 @@ pub struct Lowered {
     /// holds a product), which [`Lowered::text`] hints every target against
     /// unrolling further.
     pub rolled: Vec<u64>,
+    /// Each instruction's statement and unroll copy as emitted, first first
+    /// ([`Self::locations`]).
+    located: Vec<(u64, Location)>,
 }
 
 /// `params` are the flat buffer UOps in `prog.params()` order (placeholders on
@@ -104,7 +109,8 @@ pub fn lower(mut prog: Program, lowering: &Lowering, params: Vec<Arc<UOp>>, devi
     emit::ROLLED.with(|cell| cell.borrow_mut().clear());
     let (program, linear) = emit::emit(&laid, lowering, params, device)?;
     let rolled = emit::ROLLED.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
-    Ok(Lowered { program, linear, tile: laid, rolled })
+    let located = emit::LOCATIONS.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+    Ok(Lowered { program, linear, tile: laid, rolled, located })
 }
 
 /// Every shared view within its allocation wherever its offset is bounded,
@@ -173,12 +179,48 @@ impl Lowered {
     /// The LLVM text of the program for `target`: what the backend's
     /// compiler is handed. Metal renders C, which has no text here.
     pub fn text(&self, target: &Target) -> Result<String> {
+        self.render_text(target, false)
+    }
+
+    /// [`Self::text`] with a line table over [`Self::listing`] (`kernel.tk`).
+    pub fn located_text(&self, target: &Target) -> Result<String> {
+        self.render_text(target, true)
+    }
+
+    /// `kernel.tk`: one line per statement of [`Self::tile`] ([`listing::listing`]).
+    pub fn listing(&self) -> String {
+        listing::listing(&self.tile)
+    }
+
+    /// Each instruction's statement (its line in [`Self::listing`]) and
+    /// unroll copy (the column, from 1; 0 outside an unrolled loop). One the
+    /// statements did not list themselves (an operand the assembly listed
+    /// before its user: a stack, a cast, a shuffle built in an expression)
+    /// takes its first user's.
+    pub fn locations(&self) -> HashMap<u64, Location> {
+        let mut at: HashMap<u64, Location> = HashMap::with_capacity(self.located.len());
+        for &(id, location) in &self.located {
+            at.entry(id).or_insert(location);
+        }
+        let given: HashSet<u64> = at.keys().copied().collect();
+        // Users follow their operands: walked backward, an earlier user overwrites a later one's.
+        for u in self.linear.op().sources().iter().rev() {
+            let Some(&location) = at.get(&u.id) else { continue };
+            for src in u.op().sources().iter().filter(|s| !given.contains(&s.id)) {
+                at.insert(src.id, location);
+            }
+        }
+        at
+    }
+
+    fn render_text(&self, target: &Target, located: bool) -> Result<String> {
         let renderer = match target.arch {
             GpuArch::Cuda(arch) => LlvmTextRenderer::nvptx(arch),
             GpuArch::Amd(arch) => LlvmTextRenderer::amd(arch),
             GpuArch::Metal(_) => return UnsupportedSnafu { what: "Metal's LLVM text" }.fail(),
         }
         .rolled(self.rolled.iter().copied());
+        let renderer = if located { renderer.locations(self.locations()) } else { renderer };
         if svod_schedule::spec::spec_enabled() {
             let nodes = self.linear.op().sources();
             svod_schedule::spec::type_verify_list(&nodes, &svod_schedule::spec::spec_program()).expect("a valid list");

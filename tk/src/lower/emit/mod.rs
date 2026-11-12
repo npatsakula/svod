@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use smallvec::smallvec;
+use svod_codegen::llvm::Location;
 use svod_codegen::llvm::nvptx::smem::{cp_async_commit, cp_async_wait};
 use svod_codegen::llvm::nvptx::wgmma;
 use svod_dtype::{AddrSpace, DType, DeviceSpec, ScalarDType};
@@ -30,6 +31,9 @@ thread_local! {
     /// [`lower`](super::lower) — a thread-local, as `emit` returns the
     /// program alone.
     pub(super) static ROLLED: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(vec![]) };
+    /// Each listed UOp's statement and unroll copy, first first, handed to
+    /// [`lower`](super::lower) as [`ROLLED`] is.
+    pub(super) static LOCATIONS: std::cell::RefCell<Vec<(u64, Location)>> = const { std::cell::RefCell::new(vec![]) };
 }
 
 /// The laid program as a pre-linearized Svod program, and the instruction
@@ -57,6 +61,7 @@ pub fn emit(
     }
     let info = KernelInfo { name: Some(prog.name.clone()), ..Default::default() };
     ROLLED.with(|cell| cell.borrow_mut().extend(e.rolled));
+    LOCATIONS.with(|cell| *cell.borrow_mut() = e.locations);
     UOp::listed_program(info, list, device).context(ProgramSnafu)
 }
 
@@ -198,6 +203,13 @@ struct Emit<'a> {
     local_slot: usize,
     tag: u64,
     last: Arc<UOp>,
+    /// Every statement's line in the listing ([`super::listing`]), by address.
+    lines: HashMap<*const Stmt<Laid>, u32>,
+    /// The location of the statement being emitted, if any.
+    at: Option<Location>,
+    /// Each instruction's location as listed or hoisted; a node hash-consed
+    /// into several statements keeps its first.
+    locations: Vec<(u64, Location)>,
 }
 
 /// A register-side view of a tiled value for addressing shared/global memory.
@@ -310,10 +322,20 @@ impl<'a> Emit<'a> {
             reg_slot: 0,
             local_slot: 0,
             tag: 0,
+            lines: prog.walk().enumerate().map(|(i, (_, s))| (s as *const _, i as u32 + 1)).collect(),
+            at: None,
+            locations: vec![],
+        }
+    }
+
+    fn locate(&mut self, id: u64) {
+        if let Some(at) = self.at {
+            self.locations.push((id, at));
         }
     }
 
     fn push(&mut self, u: Arc<UOp>) -> Arc<UOp> {
+        self.locate(u.id);
         self.list.push(u.clone());
         self.levels.insert(u.id, self.level());
         self.last = u.clone();
@@ -361,6 +383,7 @@ impl<'a> Emit<'a> {
             }
             level = level.max(self.level_of(&src));
         }
+        self.locate(u.id);
         self.list.hoist(level, u.clone());
         self.levels.insert(u.id, level);
         u
@@ -695,6 +718,15 @@ impl<'a> Emit<'a> {
     }
 
     fn stmt(&mut self, stmt: &Stmt<Laid>) -> Result<()> {
+        let line = self.lines[&(stmt as *const _)];
+        let column = self.at.map_or(0, |at| at.column);
+        let outer = self.at.replace(Location { line, column });
+        let out = self.stmt_inner(stmt);
+        self.at = outer;
+        out
+    }
+
+    fn stmt_inner(&mut self, stmt: &Stmt<Laid>) -> Result<()> {
         match stmt {
             Stmt::Let { dst, op } => {
                 self.let_(*dst, op)?;
@@ -898,10 +930,14 @@ impl<'a> Emit<'a> {
         let level = self.level();
         let wide_range = self.widened(range.clone());
         let base = add(&start, &mul(&wide_range, &wide_range.const_like(u)));
+        let outer = self.at;
         for copy in 0..u {
+            // Column: the copy among the innermost unrolled loop's, from 1.
+            self.at = outer.map(|at| Location { column: copy as u32 + 1, ..at });
             self.bind(l.iv, level, add(&base, &base.const_like(copy)));
             self.body(l)?;
         }
+        self.at = outer;
         self.close_range(range);
         Ok(())
     }
