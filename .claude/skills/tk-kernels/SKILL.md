@@ -237,7 +237,7 @@ does (`tune::measure`: a config's programs from `ops::candidates`, its merge or 
 | `fit [--only LABEL,…] [--picks]` | the cost model against the device on a few GEMM (4096³, Nemotron, Qwen3, Whisper projections), attention and nearest shapes: `costs\|…`, a `fit\|label\|rank\|verdict\|ns predicted\|ns measured\|cfg` line a ranked config, `pick\|label\|ns\|cfg` and `tune\|label\|s` (the tuner's wall time; cold on a store of the device's probes alone); `--picks` times the picks alone, an A/B across builds |
 | `trips` | `residency\|op\|blocks\|trip\|wall\|spread\|base\|measurable` of the trip probes at 1–48 blocks an SM (`probe::trip_at`): what `TRIP_HIDING` is fitted to |
 | `pin --cfg BMxBNxBK:S:WRxWC[:rolled],… [--shape MxNxK,…] [--residual] [--gated]` | `pin\|shape\|cfg\|blocks\|measured\|model\|less latency\|less lone trip\|less step` a pinned GEMM config (3-part code unrolled; Whisper's fc2 1500×1280×5120 by default, `--gated` a SwiGLU epilogue): the model's ns with each term zeroed beside the measured ns |
-| `sqtt gemm M N K [--cfg I\|tuned\|CODE,…] [--top N] [--out DIR] [--json] [--attribute]`, `sqtt --load DIR` | AMD RDNA3/RDNA4 thread trace of each config; see [Thread trace (SQTT)](#thread-trace-sqtt) |
+| `sqtt gemm M N K [--cfg I\|tuned\|CODE,…] [--top N] [--out DIR] [--json] [--attribute]`, `sqtt --load DIR`, `sqtt --compare DIR_A DIR_B [--json] [--top N]` | AMD RDNA3/RDNA4 thread trace of each config; see [Thread trace (SQTT)](#thread-trace-sqtt) |
 
 The `#[ignore]` probe tests left print and never assert:
 `-- --ignored --nocapture --test-threads=1`.
@@ -296,6 +296,12 @@ of AMD's rocprof-trace-decoder, checked against its control CSVs) over `llvm-obj
   `model.trips` label, else per-iteration units; the loop's wave-cycles a trip, raw and exposed, split exactly into
   issue/stall by class, waits by what bound them, barrier and idle by the class after it, per SE) with its top rows by stall;
   `hottest` by cycles. PCs are ELF addresses, as in `kernel.s`.
+- **`--compare DIR_A DIR_B`** (`Diff::load(a, b)`, `Analysis::compare`; Δ = B − A): header with both cfg/shape,
+  untraced ns and Δ%, traced/untraced ratios, sclk, pstate, `!! PSTATE`/`!! PERTURBATION` (ratios >10% apart: shares
+  compare less)/`!! TRIPS` (different K a trip: read the `Δ/k exp` column); occupancy, ceiling and bound A → B;
+  findings appearing/gone/changed; loop buckets a trip (each side's own trips; per iteration without `model.trips`)
+  by |Δ exposed|; loop rows aligned by mnemonic (LCS): inserted/removed grouped by mnemonic with ops, cycles, exposed
+  a trip, then matched rows by |Δ exposed|. Golden: `runtime/src/test/fixtures/sqtt_compare_v1_v3.txt`.
 - **`--attribute`** (report only): each `Planner::price` term as `price − price with its costs zeroed` (`steps`,
   `reads`, `fill`, `wait`, `lone_trip`, `trip`; they overlap, so they need not sum) beside the traced cycles of its
   counterpart: steps ↔ matrix issue less stall, reads ↔ `ds_*` + lgkm/ds waits, fill ↔ global memory + vm/load waits,

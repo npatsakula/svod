@@ -22,7 +22,9 @@ use svod_device::sqtt::waits::{Binding, Replay, Waits};
 use svod_device::sqtt::{Layout, decode, wave};
 use svod_dtype::AmdArch;
 
+mod compare;
 mod verdict;
+pub use compare::{BucketDelta, Caution, Diff, FindingDelta, LoopRow, Rows, SLOWDOWN_SPREAD, Side, Unit, align};
 pub use verdict::{
     Approx, BarrierSite, Ceiling, Cycles, Demand, Evidence, Finding, FindingKind, Load, Partition, Stall, Verdict,
     WaitOn,
@@ -937,10 +939,15 @@ fn partition_text(o: &mut String, l: &MainLoop) {
     let _ = writeln!(o, "{:<20} {:>9} {:>7} {:>9} {:>7}{ses}", "bucket", "all", "share", "exposed", "share");
     let per = |cycles: i64, trips: u64| cycles as f64 / trips.max(1) as f64;
     let (p, e) = (&l.partition, &l.exposed);
-    let row = |o: &mut String, name: String, of: &dyn Fn(&Partition) -> i64| {
-        let ses: String = l.ses.iter().map(|s| format!(" {:>9.1}", per(of(&s.partition), s.trips))).collect();
+    let lookup = |p: &Partition, name: &str| {
+        if name == "total" { p.cycles } else { p.named().into_iter().find(|b| b.0 == name).map_or(0, |b| b.1) }
+    };
+    let names = p.named().into_iter().map(|b| b.0).chain(["total".to_string()]);
+    for name in names {
+        let ses: String =
+            l.ses.iter().map(|s| format!(" {:>9.1}", per(lookup(&s.partition, &name), s.trips))).collect();
         let share = |c: i64| 100.0 * c as f64 / p.cycles.max(1) as f64;
-        let (all, exposed) = (of(p), of(e));
+        let (all, exposed) = (lookup(p, &name), lookup(e, &name));
         let _ = writeln!(
             o,
             "{name:<20} {:>9.1} {:>6.1}% {:>9.1} {:>6.1}%{ses}",
@@ -949,21 +956,7 @@ fn partition_text(o: &mut String, l: &MainLoop) {
             per(exposed, t.total),
             share(exposed)
         );
-    };
-    for &(class, _) in &p.issue {
-        row(o, format!("issue {}", class.name()), &|p| p.issued(&[class]));
     }
-    for &(class, _) in &p.stall {
-        row(o, format!("stall {}", class.name()), &|p| p.stalled(&[class]));
-    }
-    for &(on, _) in &p.wait {
-        row(o, format!("wait {}", on.name()), &|p| p.waited(|w| w == on));
-    }
-    row(o, "barrier".into(), &|p| p.barrier);
-    for &(class, _) in &p.idle {
-        row(o, format!("idle {}", class.name()), &|p| p.idled(&[class]));
-    }
-    row(o, "total".into(), &|p| p.cycles);
 }
 
 impl std::fmt::Display for Analysis {

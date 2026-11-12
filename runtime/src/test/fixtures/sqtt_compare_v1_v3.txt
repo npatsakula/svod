@@ -1,0 +1,59 @@
+== sqtt compare: B against A; loop cycles are a traced wave's, a trip of each; Δ = B - A
+A          gemm shape=1500x1280x5120 cfg=[256, 128, 32] s2 [4, 2] unroll=true Warp crews=1
+B          gemm shape=1500x1280x5120 cfg=[256, 128, 32] s2 [4, 2] unroll=true Warp crews=1
+time       175920 -> 203880 ns untraced (+15.9%); traced/untraced 1.60x -> 1.74x; sclk ~1600 -> ~1591 MHz; pstate standard -> standard
+occupancy  4.0 -> 4.0 waves a traced SIMD; limit - -> -
+ceiling    matrix pipe busy 74.1% -> 58.4%; bound matrix_bound+occupancy_limited -> occupancy_limited
+== findings: share of the loop's cycles exposed (bound: of the steady window)
+gone       matrix_bound       74.1% ->      -
+appears    load_exposed           - ->  21.1%
+changed    occupancy_limited  16.2% ->  29.6%
+changed    barrier             5.4% ->   3.5%
+appears    loop_overhead          - ->   1.2%
+== loop cycles a trip by bucket, largest Δ exposed first (7 within ±2 omitted)
+bucket                A raw    B raw    Δ raw    A exp    B exp    Δ exp
+wait load             291.5   1032.5   +741.1    118.1    718.5   +600.4
+issue valu              5.0     44.0    +39.0      5.0     40.6    +35.6
+issue matrix          483.0    447.5    -35.5    483.0    447.5    -35.5
+barrier               719.2    820.1   +100.8    141.7    119.1    -22.7
+stall lds             266.2     43.4   -222.8     43.9     21.7    -22.2
+wait ds                35.4     59.0    +23.6      0.0     21.5    +21.5
+idle valu              45.8    216.6   +170.8     31.6     50.3    +18.7
+idle matrix           464.5    159.5   -304.9     14.2      2.0    -12.2
+wait ds store          61.1     78.1    +17.0     10.8     19.6     +8.8
+stall valu              0.0    241.3   +241.3      0.0      5.8     +5.8
+idle lds              156.4    146.8     -9.6     22.4     26.7     +4.3
+issue lds              42.1     29.1    -13.1     13.7     16.0     +2.3
+idle salu               4.0     36.3    +32.4      1.4      2.8     +1.4
+stall vmem_load        25.4     12.7    -12.6      0.0      0.0     +0.0
+stall matrix            1.5      8.1     +6.6      0.0      0.0     +0.0
+total                2625.8   3399.8   +774.0    901.4   1503.1   +601.7
+== loop rows aligned by mnemonic: 165 matched, 82 inserted in B, 13 removed from A; ops, cycles, exposed a trip
+inserted mnemonic                rows       ops    cycles   exposed
+         s_wait_loadcnt             8       4.0     994.4     687.5
+         v_cndmask_b32_e64         30      15.0     257.2      22.3
+         v_add_co_ci_u32_e64        5       2.5     101.9      29.3
+         s_add_co_i32               1       0.5      32.8       2.4
+         v_add_nc_u32_e32           9       4.5      31.8       8.5
+         v_cndmask_b32_e32          4       2.0      26.8       2.4
+         total                     82      41.0    1494.0     769.1
+           0xab0   0.5 ops  693.8 cycles  489.2 exposed  s_wait_loadcnt 0x5
+           0x74c   0.5 ops  240.8 cycles  158.2 exposed  s_wait_loadcnt 0x5
+           0x77c   0.5 ops   24.7 cycles   16.5 exposed  s_wait_loadcnt 0x1
+removed  mnemonic                rows       ops    cycles   exposed
+         s_wait_loadcnt            10       5.0     142.7      58.0
+         v_add_co_ci_u32_e64        1       0.5       8.5       6.2
+         v_add_co_u32               1       0.5       6.4       5.7
+         s_add_nc_u64               1       0.5       0.5       0.2
+         total                     13       6.5     158.1      70.1
+           0xb68   0.5 ops   76.6 cycles   44.8 exposed  s_wait_loadcnt 0x5
+           0x6bc   0.5 ops    8.5 cycles    6.2 exposed  v_add_co_ci_u32_e64 v245, null, s3, v155, vcc_lo
+           0x6b0   0.5 ops    6.4 cycles    5.7 exposed  v_add_co_u32 v244, vcc_lo, v154, s2
+== matched rows: top 6 by |Δ exposed| a trip
+   pc A    pc B    A cyc    B cyc    A exp    B exp  asm (B)
+  0xbcc   0xd48    362.1    391.2    108.0     74.7  s_barrier_wait 0xffff
+  0x9b8   0xb30     90.9     15.2     26.9      6.1  ds_load_b128 v[168:171], v137 offset:16384
+  0xb98   0xd00    134.1     34.6     47.5     27.4  s_wait_loadcnt 0x1
+  0x764   0x874     90.8     20.5     26.9     11.5  ds_load_b128 v[168:171], v137
+  0x7e4   0x8f4     16.5     31.2      0.0     11.8  s_wait_dscnt 0xe
+  0x964   0xa5c    356.1    427.9     33.4     43.9  s_barrier_wait 0xffff

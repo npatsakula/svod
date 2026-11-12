@@ -12,7 +12,10 @@ use test_case::test_case;
 use svod_device::amd::occupancy::Limiter;
 
 use super::verdict::{Buckets, load_bytes};
-use super::{Analysis, Approx, Capture, Class, Evidence, Finding, FindingKind, Partition, Pstate, Spread, WaitOn};
+use super::{
+    Analysis, Approx, BucketDelta, Capture, Caution, Class, Diff, Evidence, Finding, FindingKind, LoopRow, Partition,
+    Pstate, Spread, Unit, WaitOn, align,
+};
 
 fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../device/src/test/fixtures/sqtt")
@@ -724,4 +727,143 @@ fn class_findings_fire_past_their_thresholds() {
     busy(&mut capped, 30, 80);
     let f = super::verdict::rank(&capped).bound.into_iter().find(|f| f.kind == OccupancyLimited).unwrap();
     assert!(f.knob.contains("resources cap the waves"), "4 of 4 waves: {}", f.knob);
+}
+
+fn compared(a: &str, b: &str) -> Diff {
+    Diff::load(&fixtures().join("svod").join(a), &fixtures().join("svod").join(b)).unwrap()
+}
+
+fn bucket<'a>(d: &'a Diff, name: &str) -> &'a BucketDelta {
+    d.buckets.iter().find(|b| b.bucket == name).unwrap_or_else(|| panic!("{name}: {:?}", d.buckets))
+}
+
+fn finding_delta(d: &Diff, kind: FindingKind) -> [Option<f64>; 2] {
+    d.findings.iter().find(|f| f.kind == kind).map_or([None; 2], |f| f.share)
+}
+
+/// The same GEMM at the same pinned clock: v3's zero-select on loaded data pulls the ring fill's
+/// wait up behind its load (+~740 load-wait cycles a trip, ~600 of them exposed) and inserts 34
+/// `v_cndmask` rows (17 ops a trip, ~250 cycles a trip with their stall); load_exposed appears.
+#[test]
+fn compare_v1_v3_shows_the_select() {
+    let d = compared("rdna4_gemm_v1", "rdna4_gemm_v3");
+    assert_eq!(d.unit, Unit::Trip);
+    assert!(d.cautions.is_empty(), "both standard, ratios 1.60x and 1.74x: {:?}", d.cautions);
+    assert_eq!((d.a.kernel_ns, d.b.kernel_ns), (Some(175920), Some(203880)));
+    let wait = bucket(&d, "wait load");
+    assert!((280.0..300.0).contains(&wait.raw[0]) && (1020.0..1045.0).contains(&wait.raw[1]), "{wait:?}");
+    assert!((720.0..760.0).contains(&wait.delta_raw()) && (580.0..620.0).contains(&wait.delta_exposed()), "{wait:?}");
+    assert_eq!(d.buckets[0].bucket, "wait load", "the largest exposed delta leads");
+    assert_eq!(d.buckets.last().unwrap().bucket, "total");
+    let alu = ["issue valu", "stall valu", "issue salu"].map(|n| bucket(&d, n).delta_raw()).iter().sum::<f64>();
+    assert!((260.0..300.0).contains(&alu), "v3's guards: {alu:.1} VALU+SALU cycles a trip");
+    let cnd: Vec<&LoopRow> = d.rows.inserted.iter().filter(|r| r.asm.starts_with("v_cndmask_b32")).collect();
+    let (ops, cycles) = cnd.iter().fold((0.0, 0.0), |(h, c), r| (h + r.hits, c + r.cycles));
+    assert_eq!(cnd.len(), 34);
+    assert!((ops - 17.0f64).abs() < 1e-9 && (250.0..300.0).contains(&cycles), "{ops} ops, {cycles:.1} cycles");
+    let valu: f64 = d.rows.inserted.iter().filter(|r| r.class == Class::Valu).map(|r| r.hits).sum();
+    assert!((30.0..40.0).contains(&valu), "v1's 5 VALU ops a trip grow to 40: {valu} inserted");
+    assert!(!d.rows.matched.iter().any(|[a, _]| a.asm.starts_with("v_cndmask")), "v1's loop has no select");
+    assert!(d.rows.matched.iter().all(|[a, b]| a.asm.split(' ').next() == b.asm.split(' ').next()));
+    assert!(matches!(finding_delta(&d, FindingKind::LoadExposed), [None, Some(s)] if s > 0.10));
+    assert!(matches!(finding_delta(&d, FindingKind::MatrixBound), [Some(_), None]));
+    let busy = d.a.matrix_busy.zip(d.b.matrix_busy).unwrap();
+    assert!(busy.1 < busy.0, "{busy:?}");
+}
+
+/// The 1500-row twin guards its ragged rows: exec-mask branches inserted in the loop, loop_overhead
+/// appears. Both ran unpinned at ~1.04x: no caution.
+#[test]
+fn compare_1536_1500_shows_the_guards() {
+    let d = compared("rdna4_gemm_1536", "rdna4_gemm_1500");
+    assert!(d.cautions.is_empty(), "{:?}", d.cautions);
+    let inserted = |m: &str| d.rows.inserted.iter().filter(|r| r.asm.starts_with(m)).count();
+    assert_eq!((inserted("s_and_saveexec_b32"), inserted("s_cbranch_execz")), (4, 4));
+    let removed = |m: &str| d.rows.removed.iter().filter(|r| r.asm.starts_with(m)).count();
+    assert_eq!(removed("s_and_saveexec") + removed("s_cbranch_exec"), 0);
+    assert!(matches!(finding_delta(&d, FindingKind::LoopOverhead), [None, Some(_)]));
+    assert!(bucket(&d, "stall valu").delta_raw() > 200.0, "{:?}", bucket(&d, "stall valu"));
+    let a = d.a.limit.as_ref().unwrap();
+    assert_eq!((a.waves_per_simd, &a.by), (8, &d.b.limit.as_ref().unwrap().by));
+}
+
+/// A capture against itself: nothing inserted or removed, every delta zero.
+#[test]
+fn compare_with_itself_is_empty() {
+    let d = compared("rdna4_gemm_v1", "rdna4_gemm_v1");
+    assert!(d.rows.inserted.is_empty() && d.rows.removed.is_empty() && d.cautions.is_empty());
+    assert!(d.rows.matched.iter().all(|[a, b]| a == b));
+    assert!(d.buckets.iter().all(|b| b.delta_raw() == 0.0 && b.delta_exposed() == 0.0));
+    assert!(d.findings.iter().all(|f| f.share[0] == f.share[1]));
+}
+
+/// Different clocks and perturbation, and trips over different K: each named in the header.
+#[test]
+fn compare_cautions() {
+    let (v1, control) = (verdict_of("rdna4_gemm_v1"), verdict_of("rdna4_gemm_1536"));
+    let d = v1.compare(&control);
+    assert!(d.cautions.contains(&Caution::Pstate { a: Some(Pstate::Standard), b: Some(Pstate::Unpinned) }));
+    assert!(d.cautions.iter().any(|c| matches!(c, Caution::Slowdown { .. })), "{:?}", d.cautions);
+    let mut wide = control.clone();
+    wide.labels.insert("model.trips".into(), "80".into());
+    let d = control.compare(&wide);
+    assert_eq!(d.cautions, [Caution::TripsDiffer { a: 32.0, b: 64.0 }]);
+    assert!(d.text(4).contains("Δ/k exp"));
+    let mut unlabelled = control.clone();
+    unlabelled.main_loop.as_mut().unwrap().trips.labelled = false;
+    let d = control.compare(&unlabelled);
+    assert_eq!(d.unit, Unit::Iteration);
+    assert_eq!(d.a.units * 2, control.main_loop.as_ref().unwrap().trips.total);
+    let text = d.text(4);
+    assert!(text.contains("per loop iteration") && text.contains("an iteration of each"), "{text}");
+}
+
+/// What an agent reads, fixed: `SVOD_SQTT_BLESS=1` rewrites it after a deliberate change.
+#[test]
+fn compare_text_is_stable() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/test/fixtures/sqtt_compare_v1_v3.txt");
+    let text = compared("rdna4_gemm_v1", "rdna4_gemm_v3").text(6);
+    if std::env::var_os("SVOD_SQTT_BLESS").is_some() {
+        std::fs::write(&path, &text).unwrap();
+    }
+    assert_eq!(text, std::fs::read_to_string(&path).unwrap());
+    let json: serde_json::Value = serde_json::from_str(&compared("rdna4_gemm_v1", "rdna4_gemm_v3").to_json()).unwrap();
+    for key in ["a", "b", "unit", "cautions", "buckets", "findings", "rows"] {
+        assert!(json.get(key).is_some(), "{key}");
+    }
+}
+
+#[test_case(&[], &[], &[])]
+#[test_case(&[1, 2, 3], &[1, 2, 3], &[(Some(0), Some(0)), (Some(1), Some(1)), (Some(2), Some(2))])]
+#[test_case(&[1, 3], &[1, 2, 3], &[(Some(0), Some(0)), (None, Some(1)), (Some(1), Some(2))])]
+#[test_case(&[1, 2, 3], &[1, 3], &[(Some(0), Some(0)), (Some(1), None), (Some(2), Some(1))])]
+#[test_case(&[1, 2], &[3], &[(Some(0), None), (Some(1), None), (None, Some(0))])]
+fn aligns(a: &[u8], b: &[u8], pairs: &[(Option<usize>, Option<usize>)]) {
+    assert_eq!(align(a, b), pairs);
+}
+
+proptest! {
+    /// An alignment walks both sequences once, in order, and pairs only equal items, as many as a
+    /// longest common subsequence holds.
+    #[test]
+    fn alignment_is_a_longest_common_subsequence(
+        a in prop::collection::vec(0u8..4, 0..40),
+        b in prop::collection::vec(0u8..4, 0..40),
+    ) {
+        let pairs = align(&a, &b);
+        let left: Vec<usize> = pairs.iter().filter_map(|p| p.0).collect();
+        let right: Vec<usize> = pairs.iter().filter_map(|p| p.1).collect();
+        prop_assert_eq!(left, (0..a.len()).collect::<Vec<_>>());
+        prop_assert_eq!(right, (0..b.len()).collect::<Vec<_>>());
+        let matched: Vec<(usize, usize)> = pairs.iter().filter_map(|&(i, j)| i.zip(j)).collect();
+        prop_assert!(matched.iter().all(|&(i, j)| a[i] == b[j]));
+        // The common subsequence's length by the textbook recurrence, forward.
+        let mut lcs = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+        for i in 0..a.len() {
+            for j in 0..b.len() {
+                lcs[i + 1][j + 1] = if a[i] == b[j] { lcs[i][j] + 1 } else { lcs[i][j + 1].max(lcs[i + 1][j]) };
+            }
+        }
+        prop_assert_eq!(matched.len(), lcs[a.len()][b.len()]);
+    }
 }

@@ -338,6 +338,20 @@ impl Partition {
         of(&self.idle, classes)
     }
 
+    /// Each bucket by name (`issue valu`, `wait load`, `barrier`, ...) in report order: issue, stall,
+    /// wait, barrier, idle.
+    pub fn named(&self) -> Vec<(String, i64)> {
+        let by = |what: &str, buckets: &[(Class, i64)]| -> Vec<(String, i64)> {
+            buckets.iter().map(|&(c, n)| (format!("{what} {}", c.name()), n)).collect()
+        };
+        let mut named = by("issue", &self.issue);
+        named.extend(by("stall", &self.stall));
+        named.extend(self.wait.iter().map(|&(on, n)| (format!("wait {}", on.name()), n)));
+        named.push(("barrier".into(), self.barrier));
+        named.extend(by("idle", &self.idle));
+        named
+    }
+
     /// Every bucket's cycles: `cycles` itself.
     pub fn buckets(&self) -> i64 {
         self.issued(&[]) + self.stalled(&[]) + self.waited(|_| true) + self.barrier + self.idled(&[])
@@ -530,6 +544,12 @@ pub(super) fn slowdown(a: &Analysis) -> Option<f64> {
     a.kernel_ns.zip(a.traced_ns).filter(|&(k, _)| k > 0).map(|(k, t)| t as f64 / k as f64)
 }
 
+/// The traced SIMDs' mean resident waves over their steady windows.
+pub(super) fn observed(a: &Analysis) -> Option<f64> {
+    let traced: Vec<f64> = a.occupancy.ses.iter().filter_map(|s| s.traced).map(|t| t.mean()).collect();
+    (!traced.is_empty()).then(|| traced.iter().sum::<f64>() / traced.len() as f64)
+}
+
 /// The busy shares of the traced SIMDs' pipes, over every traced SE's window.
 fn busy(a: &Analysis) -> Option<(f64, f64, f64)> {
     let busy: Vec<_> = a.occupancy.ses.iter().filter_map(|s| s.busy).collect();
@@ -636,8 +656,7 @@ pub(super) fn rank(a: &Analysis) -> Verdict {
     };
     let mut v = Verdict { demand: demand(a), ..Verdict::default() };
     let l = a.main_loop.as_ref().filter(|l| l.partition.cycles > 0 && l.trips.total > 0);
-    let traced: Vec<f64> = a.occupancy.ses.iter().filter_map(|s| s.traced).map(|t| t.mean()).collect();
-    let observed = (!traced.is_empty()).then(|| traced.iter().sum::<f64>() / traced.len() as f64);
+    let observed = observed(a);
     let limit = a.occupancy.limit.clone();
     let occupancy_knob = |observed: f64| match &limit {
         Some(l) if observed + 0.5 >= f64::from(l.waves_per_simd) => {

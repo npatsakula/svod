@@ -45,7 +45,9 @@
 //!   `--json` one line); `--attribute` sets the model's terms (`price` less
 //!   each) beside the traced SIMD's cycles of their counterparts.
 //!   `SVOD_SQTT_PSTATE=standard|peak` pins the traced pass's clock.
-//!   `sqtt --load DIR [--json] [--attribute]` re-reads a saved trace, no GPU.
+//!   `sqtt --load DIR [--json] [--attribute]` re-reads a saved trace, no GPU;
+//!   `sqtt --compare DIR_A DIR_B [--json] [--top N]` sets B's trace against
+//!   A's ([`Diff`]).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -54,7 +56,7 @@ use std::time::{Duration, Instant};
 
 use svod_dtype::default_device::default_device;
 use svod_dtype::{DType, ScalarDType};
-use svod_runtime::sqtt::{Analysis, Capture, Class};
+use svod_runtime::sqtt::{Analysis, Capture, Class, Diff};
 use svod_runtime::{ExecutionPlan, ProfileOptions};
 use svod_tensor::Tensor;
 use svod_tk::atoms::{Core, Costs, Device};
@@ -673,8 +675,18 @@ fn sqtt_bench(args: &Args) -> Result<()> {
     if let Some(dir) = args.opt("--load") {
         return sqtt_print(&Capture::load(Path::new(dir))?, args, top);
     }
+    if let Some(at) = args.0.iter().position(|a| a == "--compare") {
+        let [a, b] = [1, 2].map(|i| args.0.get(at + i).filter(|d| !d.starts_with("--")));
+        let (Some(a), Some(b)) = (a, b) else { return Err("sqtt --compare DIR_A DIR_B [--json] [--top N]".into()) };
+        let diff = Diff::load(Path::new(a), Path::new(b))?;
+        match args.flag("--json") {
+            true => println!("{}", diff.to_json()),
+            false => print!("{}", diff.text(top)),
+        }
+        return Ok(());
+    }
     let positional: Vec<&str> = args.0.iter().map(String::as_str).take_while(|a| !a.starts_with("--")).collect();
-    let usage = "sqtt gemm M N K [--cfg I|tuned|BMxBNxBK:S:WRxWC[:rolled],…] or sqtt --load DIR";
+    let usage = "sqtt gemm M N K [--cfg I|tuned|BMxBNxBK:S:WRxWC[:rolled],…], sqtt --load DIR or sqtt --compare A B";
     let ["gemm", m, n, k] = positional[..] else { return Err(usage.into()) };
     let shape = [m.parse()?, n.parse()?, k.parse()?];
     let [m, n, k] = shape;
