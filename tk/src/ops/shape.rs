@@ -49,16 +49,13 @@ pub struct Extent {
 /// JIT `batch_var`) binds it, as the operand spells it; `None` when a dim
 /// other than a bound leading one is symbolic.
 pub fn extent(shape: &[SInt]) -> Option<(Extent, Option<SInt>)> {
-    let var = match shape.first() {
-        Some(dim @ SInt::Symbolic(_)) => {
-            bound_var(dim)?;
-            Some(dim.clone())
-        }
-        _ => None,
+    let (var, pinned) = match shape.first() {
+        Some(dim @ SInt::Symbolic(_)) => (Some(dim.clone()), bound_var(dim)?.pinned()),
+        _ => (None, false),
     };
     let dims: Option<Vec<usize>> =
         shape.iter().enumerate().map(|(i, d)| if i == 0 { d.vmax() } else { d.as_const() }).collect();
-    Some((Extent { dims: dims?, var: var.is_some() }, var))
+    Some((Extent { dims: dims?, var: var.is_some() && !pinned }, var))
 }
 
 /// The variable bound to `dim`, as a kernel binds it at launch: `None` for

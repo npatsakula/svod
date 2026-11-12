@@ -407,8 +407,8 @@ fn fmt_shape(shape: &[SInt]) -> String {
 /// variable binds it.
 fn batch_of(var: &Option<SInt>, static_batches: usize) -> Batch {
     match var.as_ref().and_then(shape::bound_var) {
-        Some(v) => Batch::Var(v),
-        None => Batch::Static(static_batches),
+        Some(v) if !v.pinned() => Batch::Var(v),
+        _ => Batch::Static(static_batches),
     }
 }
 

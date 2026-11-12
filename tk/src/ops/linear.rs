@@ -110,7 +110,7 @@ pub fn linear(x: &Tensor, w: &Tensor, opts: Linear) -> Result<Tensor> {
     let (lead, k) = (&ext.dims[..ext.dims.len() - 1], ext.dims[ext.dims.len() - 1]);
     let n = n.as_const().expect("planned");
     // A bound batch walks grid z; each batch is a GEMM over the rows behind it.
-    let m = lead[usize::from(var.is_some())..].iter().product();
+    let m = lead[usize::from(ext.var)..].iter().product();
     // A turn runs alone after the bias: beside an activation, a residual or
     // a scale the whole linear runs on the graph, which rotates before them.
     // Its tables ride the stream dtype; tiles that hold no whole heads are
@@ -124,16 +124,16 @@ pub fn linear(x: &Tensor, w: &Tensor, opts: Linear) -> Result<Tensor> {
     let rope = opts.rope.filter(|r| tables(r)).map(|r| Rope { heads: r.heads, head_dim: r.head_dim, seq });
     let cfgs: Vec<GemmCfg> = match rope {
         Some(rope) => {
-            let batches = if var.is_some() { lead[0] } else { 1 };
+            let batches = if ext.var { lead[0] } else { 1 };
             planner.gemm_ranked(batches, m, n, k, &Epilogue { rope: Some(rope), ..epilogue }).to_vec()
         }
         None => cfgs.to_vec(),
     };
     // A tail split runs a single static batch: a bound one of a single row
     // walks each tile whole.
-    let cfgs = match var {
-        Some(_) => distinct_configs(&cfgs.iter().map(|c| GemmCfg { tail: None, ..*c }).collect::<Vec<_>>()),
-        None => cfgs,
+    let cfgs = match ext.var {
+        true => distinct_configs(&cfgs.iter().map(|c| GemmCfg { tail: None, ..*c }).collect::<Vec<_>>()),
+        false => cfgs,
     };
     if let Some(r) = opts.rope.filter(|_| rope.is_none() || cfgs.is_empty()) {
         tracing::debug!(target: super::PLAN, op = OP, "graph rotation: no tile turns");

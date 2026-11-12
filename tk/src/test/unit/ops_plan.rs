@@ -1767,6 +1767,18 @@ fn extents_take_a_bound_leading_variable_only() {
     assert!(extent(&swapped.shape().unwrap()).is_none(), "a symbolic non-leading dim");
 }
 
+/// A variable pinned to one value (a JIT's `with_<var>_fixed`) plans as the
+/// constant it is, while the output keeps the operand's symbolic dim.
+#[test]
+fn a_pinned_leading_variable_plans_static() {
+    let pinned = Variable::new("b", 2, 2).bind(2).unwrap();
+    let t = Tensor::empty(&[2, 3, 5], BF16).try_shrink([Some((SInt::Const(0), pinned.as_sint())), None, None]).unwrap();
+    let (e, v) = extent(&t.shape().unwrap()).expect("a pinned batch");
+    assert_eq!(e, Extent { dims: vec![2, 3, 5], var: false });
+    assert_eq!(v, Some(pinned.as_sint()));
+    assert!(shape::bound_var(&v.unwrap()).unwrap().pinned());
+}
+
 #[test]
 fn no_device_no_kernels() {
     assert!(!tk::supported(&DeviceSpec::Cpu));

@@ -133,11 +133,7 @@ pub fn conv2d(x: &Tensor, w: &Tensor, opts: Conv) -> Result<Tensor> {
     let Some(cfgs) = super::kernel(OP, plan) else { return graph(x, w, opts).context(GraphSnafu { op: OP }) };
     let (ext, var, planner) = (ext.expect("planned"), var.flatten(), planner.expect("planned"));
     let images = ext.dims[0];
-    let batch = match var {
-        Some(_) => batch_of(&var, images),
-        None => Batch::Static(images),
-    };
-    let spec = ConvSpec { batch, geom, epilogue, split: 1 };
+    let spec = ConvSpec { batch: batch_of(&var, images), geom, epilogue, split: 1 };
     let spec = tuned(TuneStore::global(), &planner, x.dtype(), &cfgs, spec);
     super::ran(OP, "conv", ConvCfg { gemm: spec.cfg(), split: spec.split });
     let mut programs = programs(&spec, &x.dtype(), &planner).into_iter();

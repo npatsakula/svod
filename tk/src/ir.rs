@@ -785,6 +785,14 @@ pub struct Var {
     pub max: i64,
 }
 
+impl Var {
+    /// Whether the range is one value: the variable is a constant of the
+    /// launch (a JIT's pinned dim), which a kernel need not bind.
+    pub fn pinned(&self) -> bool {
+        self.min == self.max
+    }
+}
+
 /// How a cast to a narrower float rounds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Round {

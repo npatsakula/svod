@@ -837,6 +837,31 @@ fn conv2d_under_a_batch_variable() {
     });
 }
 
+/// A batch pinned to one value launches the static kernels, the outputs'
+/// dim 0 still the variable the graph around them carries.
+#[test]
+fn ops_under_a_pinned_batch() {
+    untuned(|| {
+        let n = 2;
+        let var = Variable::new("b", n as i64, n as i64).bind(n as i64).unwrap();
+        let x = rand(&[n, 32, 32, 32], 33, 1.0, DType::Float16);
+        let w = rand(&[64, 3, 3, 32], 34, 0.2, DType::Float16);
+        let b = rand(&[64], 35, 1.0, DType::Float16);
+        let y = tk::conv2d(&bound(&x, &var), &w, conv_opts(3, 1, &b, None)).unwrap();
+        let want = conv_reference(&x, &w, conv_opts(3, 1, &b, None));
+        assert_batched("pinned conv2d", &y, &var, Some("conv"), &want, 4e-3);
+
+        let (x, w) = (rand(&[n, 37, 64], 36, 1.0, DType::BFloat16), rand(&[64, 64], 37, 0.5, DType::BFloat16));
+        let y = tk::linear(&bound(&x, &var), &w, Linear::default()).unwrap();
+        assert_batched("pinned linear", &y, &var, Some("gemm"), &linear_reference(&x, &w, Linear::default()), 2e-2);
+
+        let (x, w) = (rand(&[n, 37, 512], 38, 2.0, DType::BFloat16), rand(&[512], 39, 1.0, DType::BFloat16));
+        let (_, y) = tk::add_layer_norm(&bound(&x, &var), &bound(&x, &var), &w, None, 1e-5).unwrap();
+        let (_, want) = tk::norm::graph(crate::kernels::rows::Norm::Layer, &x, Some(&x), &w, None, 1e-5).unwrap();
+        assert_batched("pinned norm", &y, &var, Some("layer_norm"), &want, 2e-2);
+    });
+}
+
 /// Shapes the graph op would reject are errors, not fallbacks.
 #[test]
 fn conv2d_rejects_mismatched_operands() {
