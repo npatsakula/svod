@@ -47,7 +47,8 @@
 //!   `--json` one line); `--attribute` sets the model's terms (`price` less
 //!   each) beside the traced SIMD's cycles of their counterparts.
 //!   `sqtt attention B H T D [--causal] [--bias] [--cfg I|tuned,…]` traces
-//!   attention over `[B, T, H, D]` bf16 the same way.
+//!   attention over `[B, T, H, D]` bf16 the same way; `--flip FORM,…` flips
+//!   those softmax forms (`Forms` fields) of each picked config.
 //!   `SVOD_SQTT_PSTATE=standard|peak` pins the traced pass's clock.
 //!   `SVOD_SQTT_SIMD=S[,S...]` picks each SE's traced SIMD (default `0,1`).
 //!   `sqtt --load DIR [--json] [--attribute]` re-reads a saved trace, no GPU;
@@ -801,7 +802,24 @@ fn attention_traced<'a>(planner: &'a Planner, [b, h, t, d]: [usize; 4], args: &A
     });
     picks
         .map(|pick: Result<_>| {
-            let (i, admitted) = pick?;
+            let (mut i, mut admitted) = pick?;
+            if let Some(flips) = args.opt("--flip") {
+                let mut cfg = admitted.cfg();
+                for name in flips.split(',') {
+                    let f = &mut cfg.forms;
+                    let form = match name {
+                        "truncate_p" => &mut f.truncate_p,
+                        "sum_after" => &mut f.sum_after,
+                        "skip_rescale" => &mut f.skip_rescale,
+                        "raw_max" => &mut f.raw_max,
+                        "bias_direct" => &mut f.bias_direct,
+                        other => return Err(format!("--flip {other}: a Forms field").into()),
+                    };
+                    *form = !*form;
+                }
+                admitted = spec.clone().admitted(planner, cfg).map_err(|why| format!("{cfg:?}: {why:?}"))?;
+                i = format!("{i}_{}", flips.replace(',', "+"));
+            }
             let cfg = admitted.cfg();
             let labels = BTreeMap::from([
                 ("op".into(), "attention".into()),
