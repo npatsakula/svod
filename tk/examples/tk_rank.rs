@@ -70,17 +70,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let lost = |l: &rank::Replay| (l.regret(planner) - 1.0) * l.timed[0].1 as f64;
             lines.sort_by(|a, b| lost(b.1).total_cmp(&lost(a.1)));
             for (family, line) in lines.into_iter().take(n) {
-                let (picked, winner) = (line.timed[line.picked(planner)], line.timed[0]);
+                let (at, predicted) = (line.picked(planner), line.predicted(planner));
+                let (picked, winner) = (line.timed[at], line.timed[0]);
                 println!(
-                    "  {family}{}: regret {:.2}, {:.1} us lost; the model's {} at {:.1} us, the winner {} at {:.1} us (#{} of {})",
+                    "  {family}{}: regret {:.2}, {:.1} us lost; the model's {} at {:.1} us (predicted {:.1}), the winner {} at {:.1} us (predicted {:.1}, #{} of {})",
                     line.rule,
                     line.regret(planner),
                     lost(line) / 1e3,
                     line.configs.code(picked.0),
                     picked.1 as f64 / 1e3,
+                    predicted[at] / 1e3,
                     line.configs.code(winner.0),
                     winner.1 as f64 / 1e3,
-                    line.picked(planner) + 1,
+                    predicted[0] / 1e3,
+                    at + 1,
                     line.timed.len(),
                 );
                 println!("    {}", line.configs.problem());
