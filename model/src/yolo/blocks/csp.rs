@@ -1,5 +1,8 @@
+use svod_dtype::DType;
+use svod_ir::SInt;
 use svod_tensor::Tensor;
 use svod_tensor::nn::Module;
+use svod_tk::ops;
 
 use super::attention::PSABlock;
 use super::bottleneck::YoloBottleneck;
@@ -9,21 +12,38 @@ use crate::yolo::error::Result;
 
 /// `cv1 → chunk(2) → chain → cat → cv2`, the forward shared by C2f and C3k2.
 /// Each link of the chain feeds the next and contributes its own output to the
-/// concatenation.
+/// concatenation. The parts live in one buffer, the concatenation: `cv1`
+/// stores its two halves into the first channels, each link reads the part
+/// before it in place and stores its own after it, and `cv2` reads the whole.
 fn forward_chain<B>(
     cv1: &YoloConv,
     cv2: &YoloConv,
     chain: &[B],
-    step: impl Fn(&B, &Tensor) -> Result<Tensor>,
+    step: impl Fn(&B, &Tensor, (&Tensor, usize)) -> Result<Tensor>,
     x: &Tensor,
 ) -> Result<Tensor> {
-    let mut parts = scoped("cv1", || cv1.forward(x))?.chunk(2, -1)?;
+    let c = cv1.weight.dim_const(0)? / 2;
+    let cat = parts(x, (2 + chain.len()) * c, cv1.emitted(x.dtype()))?;
+    let mut cat = scoped("cv1", || cv1.forward_into(x, None, (&cat, 0)))?;
     for (i, blk) in chain.iter().enumerate() {
-        let next = scoped_index("m", i, || step(blk, parts.last().expect("cv1 output is chunked in two")))?;
-        parts.push(next);
+        let last = channels(&cat, (1 + i) * c, c)?;
+        cat = scoped_index("m", i, || step(blk, &last, (&cat, (2 + i) * c)))?;
     }
-    let cat = Tensor::cat(&parts.iter().collect::<Vec<_>>(), -1)?;
     scoped("cv2", || cv2.forward(&cat))
+}
+
+/// The buffer a block's parts are stored into: `x`'s pixels, `width` channels.
+fn parts(x: &Tensor, width: usize, dtype: DType) -> Result<Tensor> {
+    let shape = x.shape()?;
+    let dims: Vec<SInt> = shape[..shape.len() - 1].iter().cloned().chain([SInt::Const(width)]).collect();
+    Ok(ops::buffer(&dims, dtype)?)
+}
+
+/// Channels `at..at + width` of `t`.
+fn channels(t: &Tensor, at: usize, width: usize) -> Result<Tensor> {
+    let rank = t.shape()?.len();
+    let range = |d: usize| (d + 1 == rank).then_some((at as isize, (at + width) as isize));
+    Ok(t.try_shrink((0..rank).map(range))?)
 }
 
 // ---------------------------------------------------------------------------
@@ -55,7 +75,7 @@ impl C2f {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        forward_chain(&self.cv1, &self.cv2, &self.m, YoloBottleneck::forward, x)
+        forward_chain(&self.cv1, &self.cv2, &self.m, YoloBottleneck::forward_into, x)
     }
 }
 
@@ -86,12 +106,31 @@ impl C3k {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let left = scoped("cv1", || self.cv1.forward(x))?;
-        let left =
-            self.m.iter().enumerate().try_fold(left, |acc, (i, blk)| scoped_index("m", i, || blk.forward(&acc)))?;
-        let right = scoped("cv2", || self.cv2.forward(x))?;
-        let cat = Tensor::cat(&[&left, &right], -1)?;
+        let cat = self.parts(x)?;
         scoped("cv3", || self.cv3.forward(&cat))
+    }
+
+    /// [`Self::forward`] stored into channels `at..` of `into`: `into` after the store.
+    pub fn forward_into(&self, x: &Tensor, into: (&Tensor, usize)) -> Result<Tensor> {
+        let cat = self.parts(x)?;
+        scoped("cv3", || self.cv3.forward_into(&cat, None, into))
+    }
+
+    /// `cv3`'s input: the bottleneck chain's output beside `cv2`'s, the
+    /// chain's last link and `cv2` storing into one buffer.
+    fn parts(&self, x: &Tensor) -> Result<Tensor> {
+        let c = self.cv1.weight.dim_const(0)?;
+        let cat = parts(x, 2 * c, self.cv1.emitted(x.dtype()))?;
+        let cat = match self.m.split_last() {
+            None => scoped("cv1", || self.cv1.forward_into(x, None, (&cat, 0)))?,
+            Some((last, chain)) => {
+                let left = scoped("cv1", || self.cv1.forward(x))?;
+                let step = |acc: Tensor, (i, blk): (usize, &YoloBottleneck)| scoped_index("m", i, || blk.forward(&acc));
+                let left = chain.iter().enumerate().try_fold(left, step)?;
+                scoped_index("m", chain.len(), || last.forward_into(&left, (&cat, 0)))?
+            }
+        };
+        scoped("cv2", || self.cv2.forward_into(x, None, (&cat, c)))
     }
 }
 
@@ -118,6 +157,15 @@ impl C3k2Inner {
                 let h = scoped("0", || b.forward(x))?;
                 scoped("1", || psa.forward(&h))
             }
+        }
+    }
+
+    /// [`Self::forward`] stored into channels `at..` of `into`: `into` after the store.
+    pub fn forward_into(&self, x: &Tensor, into: (&Tensor, usize)) -> Result<Tensor> {
+        match self {
+            C3k2Inner::Bottleneck(b) => b.forward_into(x, into),
+            C3k2Inner::C3k(c) => c.forward_into(x, into),
+            C3k2Inner::Attn(..) => Ok(ops::store_into(into.0, into.1, &self.forward(x)?)?),
         }
     }
 }
@@ -158,6 +206,6 @@ impl C3k2 {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        forward_chain(&self.cv1, &self.cv2, &self.m, C3k2Inner::forward, x)
+        forward_chain(&self.cv1, &self.cv2, &self.m, C3k2Inner::forward_into, x)
     }
 }

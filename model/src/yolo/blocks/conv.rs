@@ -156,16 +156,34 @@ impl YoloConv {
 
     /// `x` is `[B, H, W, C]`; so is the output.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        self.forward_with(x, None)
+        self.forward_with(x, None, None)
     }
 
     /// [`Self::forward`] plus `residual`, added after the activation in the
     /// convolution's epilogue.
     pub fn forward_residual(&self, x: &Tensor, residual: &Tensor) -> Result<Tensor> {
-        self.forward_with(x, Some(residual))
+        self.forward_with(x, Some(residual), None)
     }
 
-    fn forward_with(&self, x: &Tensor, residual: Option<&Tensor>) -> Result<Tensor> {
+    /// [`Self::forward`] (plus `residual`) stored into channels `at..` of
+    /// `into` ([`ops::buffer`]): `into` after the store, which the
+    /// convolution makes in place where its kernel can.
+    pub fn forward_into(&self, x: &Tensor, residual: Option<&Tensor>, into: (&Tensor, usize)) -> Result<Tensor> {
+        let (buffer, at) = into;
+        if self.out_dtype.is_some() || self.emitted(x.dtype()) != buffer.dtype() {
+            let y = self.forward_with(x, residual, None)?.cast(buffer.dtype());
+            return Ok(ops::store_into(buffer, at, &y)?);
+        }
+        self.forward_with(x, residual, Some(into))
+    }
+
+    /// The dtype this block emits over an input of `x`.
+    pub fn emitted(&self, x: DType) -> DType {
+        let input = self.in_dtype.clone().unwrap_or(x);
+        self.out_dtype.clone().or(self.acc_dtype.clone()).unwrap_or(input)
+    }
+
+    fn forward_with(&self, x: &Tensor, residual: Option<&Tensor>, into: Option<(&Tensor, usize)>) -> Result<Tensor> {
         let cast = |t: &Tensor| self.in_dtype.clone().map_or_else(|| t.clone(), |dt| t.cast(dt));
         let x = cast(x);
         // The emitted dtype, which a residual added in the epilogue must have.
@@ -182,6 +200,7 @@ impl YoloConv {
             act: if self.act { Act::Silu } else { Act::None },
             residual: residual.as_ref(),
             out_dtype: self.acc_dtype.clone(),
+            into,
             ..Default::default()
         };
         let y = ops::conv2d(&x, &w, opts)?;
