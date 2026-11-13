@@ -21,7 +21,7 @@ bon = "3.10"
 serde = { version = "1", features = ["derive"] }
 bincode = { version = "2", features = ["serde"] }
 
-z3 = { version = "0.21", optional = true }
+z3 = { version = "0.22", optional = true }
 snafu = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = [
