@@ -1358,7 +1358,14 @@ pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
             let valu = claim.ops.epilogue * (4096 / cfg.tile[2]) as f64 / elems;
             let per = (cfg.warps[0] * cfg.warps[1]) as f64 * target.wave as f64 / elems;
             let spec = assumed(
-                GemmSpec { m: 130, n: 192, k: cfg.tile[2] * 8, batch: Batch::Static(1), epilogue },
+                GemmSpec {
+                    m: 130,
+                    n: 192,
+                    k: cfg.tile[2] * 8,
+                    batch: Batch::Static(1),
+                    epilogue,
+                    windows: Default::default(),
+                },
                 GemmCfg { schedule: cfg.schedule.rolled(), ..cfg },
             );
             out.push((

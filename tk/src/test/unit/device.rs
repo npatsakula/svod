@@ -464,7 +464,7 @@ fn a_tail_split_matches_the_interpreter(wave: usize) {
     let mut programs: Vec<_> = gemm_tail::<BF16>(&tail).into_iter().map(|p| (p, lowering.clone())).collect();
     programs.last_mut().expect("the merge").1 = Lowering::new(&planner.device);
     let y = Tensor::empty(&[m * n], DType::BFloat16);
-    let got = launched_tail(programs, &tail, [&a, &b], Some(&bias), Some(&residual), &y).unwrap();
+    let got = launched_tail(programs, &tail, [&a, &b], Some(&bias), Some(&residual), &y, &Default::default()).unwrap();
     let got: Vec<f32> = got.cast(DType::Float32).to_vec::<f32>().unwrap();
     super::assert_rel_close(
         &format!("{:?}", tail.plan),
@@ -523,7 +523,10 @@ fn gemm_tail_probe() {
         let mut plans: Vec<(String, Option<TailPlan>, f64)> = vec![("data-parallel".into(), None, dp_price)];
         plans.extend(whole.map(|(price, plan)| (format!("split-K x{}", plan.split), Some(plan), price)));
         plans.extend(tailed.map(|(price, plan)| (format!("tail split x{}", plan.split), Some(plan), price)));
-        let spec = assumed(GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT }, cfg);
+        let spec = assumed(
+            GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, windows: Default::default() },
+            cfg,
+        );
         let lowering = cfg.lowering(&planner.device);
         let build = |plan: &Option<TailPlan>| match plan {
             None => vec![(gemm::<BF16>(&spec), lowering.clone())],

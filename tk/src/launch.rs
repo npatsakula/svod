@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::ops::Range;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use snafu::{ResultExt, Snafu};
@@ -51,8 +52,20 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Launch `prog` over `tensors`, one per declared parameter in order; the
 /// first `Out` parameter's tensor is returned as the lazy result.
 pub fn graph_launch(prog: Program, lowering: &Lowering, tensors: &[&Tensor]) -> Result<Tensor> {
+    graph_launch_ranged(prog, lowering, tensors, &[])
+}
+
+/// [`graph_launch`] where some parameters touch only a range of their
+/// tensor's last axis (`ranges[i]`, missing or `None`: all of it): a channel
+/// window of a buffer another parameter reads or writes another window of.
+pub fn graph_launch_ranged(
+    prog: Program,
+    lowering: &Lowering,
+    tensors: &[&Tensor],
+    ranges: &[Option<Range<usize>>],
+) -> Result<Tensor> {
     let out_at = first_output(&prog);
-    Ok(launch_all(prog, lowering, tensors, true)?.swap_remove(out_at))
+    Ok(launch_all(prog, lowering, tensors, ranges, true)?.swap_remove(out_at))
 }
 
 /// [`graph_launch`] with the body lowered for this launch alone, kept in no
@@ -60,7 +73,7 @@ pub fn graph_launch(prog: Program, lowering: &Lowering, tensors: &[&Tensor]) -> 
 /// key an op's call.
 pub(crate) fn graph_launch_once(prog: Program, lowering: &Lowering, tensors: &[&Tensor]) -> Result<Tensor> {
     let out_at = first_output(&prog);
-    Ok(launch_all(prog, lowering, tensors, false)?.swap_remove(out_at))
+    Ok(launch_all(prog, lowering, tensors, &[], false)?.swap_remove(out_at))
 }
 
 /// [`graph_launch_all`] of `body`, `prog` lowered already for its target
@@ -80,7 +93,7 @@ pub(crate) fn graph_launch_lowered(
         AritySnafu { name: name.clone(), want: prog.params.len(), got: tensors.len() }
     );
     if default_device() != lower::standalone_device(lowering) || tensors.is_empty() {
-        return launch_all(prog.clone(), lowering, tensors, false);
+        return launch_all(prog.clone(), lowering, tensors, &[], false);
     }
     let origin = svod_ir::origin::current();
     let info =
@@ -93,7 +106,7 @@ pub(crate) fn graph_launch_lowered(
         if fits { body.without_origins() } else { UOp::noop() }
     });
     if !fits {
-        return launch_all(prog.clone(), lowering, tensors, false);
+        return launch_all(prog.clone(), lowering, tensors, &[], false);
     }
     outs.context(GraphSnafu { name })
 }
@@ -128,16 +141,22 @@ pub(crate) fn lowered_as_launched(prog: Program, lowering: &Lowering) -> lower::
 /// [`graph_launch`] returning every parameter's tensor as it is after the
 /// kernel, in `prog.params()` order, so programs with several outputs can be read.
 pub fn graph_launch_all(prog: Program, lowering: &Lowering, tensors: &[&Tensor]) -> Result<Vec<Tensor>> {
-    launch_all(prog, lowering, tensors, true)
+    launch_all(prog, lowering, tensors, &[], true)
 }
 
-fn launch_all(prog: Program, lowering: &Lowering, tensors: &[&Tensor], memo: bool) -> Result<Vec<Tensor>> {
+fn launch_all(
+    prog: Program,
+    lowering: &Lowering,
+    tensors: &[&Tensor],
+    ranges: &[Option<Range<usize>>],
+    memo: bool,
+) -> Result<Vec<Tensor>> {
     let name = prog.name.clone();
     snafu::ensure!(
         tensors.len() == prog.params.len(),
         AritySnafu { name: name.clone(), want: prog.params.len(), got: tensors.len() }
     );
-    aliasing(&prog, tensors)?;
+    aliasing(&prog, tensors, ranges)?;
     let out_at = first_output(&prog);
     // `custom_kernel` hands placeholders in `[out, ins...]` order.
     let ins: Vec<&Tensor> = tensors.iter().enumerate().filter(|(i, _)| *i != out_at).map(|(_, t)| *t).collect();
@@ -177,12 +196,14 @@ fn launch_all(prog: Program, lowering: &Lowering, tensors: &[&Tensor], memo: boo
     Ok(outs)
 }
 
-/// No parameter the kernel writes shares storage with another: the body
+/// No parameter the kernel writes shares memory with another: the body
 /// declares every buffer `noalias` and every input `readonly`
-/// ([`lower::lower`]), which only parameters all read may share. Two tensors
-/// share storage as one lazy node, or as realized buffers over one allocation
-/// whose windows overlap.
-pub(crate) fn aliasing(prog: &Program, tensors: &[&Tensor]) -> Result<()> {
+/// ([`lower::lower`]), which promise only that no element one parameter
+/// writes is touched through another. Two tensors share storage as one lazy
+/// node, or as realized buffers over one allocation whose windows overlap;
+/// parameters sharing it stay apart where `ranges` gives both a range of the
+/// last axis and the ranges are disjoint (every row's elements apart).
+pub(crate) fn aliasing(prog: &Program, tensors: &[&Tensor], ranges: &[Option<Range<usize>>]) -> Result<()> {
     let shared = |a: &Tensor, b: &Tensor| {
         Arc::ptr_eq(&a.uop(), &b.uop())
             || matches!((a.buffer(), b.buffer()), (Some(x), Some(y))
@@ -190,10 +211,14 @@ pub(crate) fn aliasing(prog: &Program, tensors: &[&Tensor]) -> Result<()> {
                     && x.offset() < y.offset() + y.size()
                     && y.offset() < x.offset() + x.size())
     };
+    let range = |i: usize| ranges.get(i).cloned().flatten();
+    let apart =
+        |i: usize, j: usize| matches!((range(i), range(j)), (Some(a), Some(b)) if a.end <= b.start || b.end <= a.start);
     for (i, (a, pa)) in tensors.iter().zip(&prog.params).enumerate() {
-        for (b, pb) in tensors[i + 1..].iter().zip(&prog.params[i + 1..]) {
+        for (j, (b, pb)) in tensors.iter().zip(&prog.params).enumerate().skip(i + 1) {
             let read = pa.kind == ParamKind::In && pb.kind == ParamKind::In;
-            snafu::ensure!(read || !shared(a, b), AliasedSnafu { name: &prog.name, a: &pa.name, b: &pb.name });
+            let fine = read || apart(i, j) || !shared(a, b);
+            snafu::ensure!(fine, AliasedSnafu { name: &prog.name, a: &pa.name, b: &pb.name });
         }
     }
     Ok(())

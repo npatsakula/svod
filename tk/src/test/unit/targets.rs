@@ -662,7 +662,7 @@ fn a_launch_refuses_an_output_sharing_storage() {
     let (m, k) = (64, 32);
     let cfg = config::gemm_cfg([64, 64, 32], 1, [2, 2], false);
     let prog = gemm::<BF16>(&assumed(gemm_spec(m, m, k), cfg));
-    let aliased = |tensors: &[&Tensor]| matches!(aliasing(&prog, tensors), Err(launch::Error::Aliased { .. }));
+    let aliased = |tensors: &[&Tensor]| matches!(aliasing(&prog, tensors, &[]), Err(launch::Error::Aliased { .. }));
     let (a, b, out) = (
         Tensor::from_slice(vec![0.5f32; m * k]),
         Tensor::from_slice(vec![1.0f32; m * k]),
@@ -674,6 +674,13 @@ fn a_launch_refuses_an_output_sharing_storage() {
     assert!(aliased(&[&window, &b, &out]), "a window into the output shares its storage");
     let lazy = a.try_add(&b).unwrap();
     assert!(!aliased(&[&lazy, &lazy, &out]) && aliased(&[&lazy, &b, &lazy]), "a lazy node is itself");
+    // Channel windows of one buffer: apart only where both name their channels.
+    let ranged = |ranges: &[Option<std::ops::Range<usize>>]| {
+        matches!(aliasing(&prog, &[&out, &b, &out], ranges), Err(launch::Error::Aliased { .. }))
+    };
+    assert!(!ranged(&[Some(0..16), None, Some(16..32)]), "disjoint windows of the output's buffer");
+    assert!(ranged(&[Some(0..17), None, Some(16..32)]), "overlapping windows");
+    assert!(ranged(&[None, None, Some(16..32)]), "the whole buffer beside a window of it");
 }
 
 /// Each family lowered for its target alone and launched as that body, as
@@ -756,7 +763,13 @@ fn ranked_launches(planner: &Planner, shortlist_deep: bool) -> Vec<(Launch, (usi
         let [ho, wo] = g.out_hw();
         for c in conv_first_eight(planner, 1, ho * wo, &g, &Epilogue::DEFAULT) {
             let spec = assumed(
-                ConvSpec { batch: Batch::Static(1), geom: g, epilogue: Epilogue::DEFAULT, split: c.split },
+                ConvSpec {
+                    batch: Batch::Static(1),
+                    geom: g,
+                    epilogue: Epilogue::DEFAULT,
+                    split: c.split,
+                    windows: Default::default(),
+                },
                 c.gemm,
             );
             for (i, (prog, lowering)) in spec.programs::<F16>(&planner.device).into_iter().enumerate() {

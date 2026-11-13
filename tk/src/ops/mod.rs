@@ -19,11 +19,11 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::{Arc, LazyLock, Mutex};
 
-use snafu::Snafu;
+use snafu::{ResultExt, Snafu, ensure};
 use svod_device::BufferSpec;
 use svod_dtype::default_device::default_device;
 use svod_dtype::{DType, DeviceSpec, ScalarDType};
-use svod_ir::SInt;
+use svod_ir::{Op, SInt};
 use svod_tensor::Tensor;
 
 pub use self::attention::{Attn, Cache, Chunk, KeyMask, attention, attention_packed};
@@ -36,10 +36,10 @@ pub use self::nearest::{
 pub use self::norm::{add_layer_norm, add_rms_norm, layer_norm, rms_norm};
 use crate::atoms::{Device, Target};
 pub use crate::kernels::Act;
-use crate::kernels::Batch;
+use crate::kernels::{Batch, Window};
 use crate::tune::{self, Bench, Pass, TuneKey, TuneStore};
 use config::Planner;
-use shape::{Fallback, Plan};
+use shape::{Fallback, Plan, shape_of};
 
 /// The salt of the tunings the device tests and GEMM probes run, keyed by
 /// the kernel's name (`gemm`) rather than an op's: [`tuned::gemm_probe`]
@@ -420,6 +420,83 @@ fn output(dims: &[usize], var: &Option<SInt>, dtype: DType) -> svod_tensor::erro
         shape[0] = var.clone();
     }
     kernel_buffer(&shape, dtype)
+}
+
+/// Bytes a window's offset and row stride keep a multiple of: a row's
+/// vector loads and stores stay whole.
+const WINDOW_RUN: usize = 16;
+
+/// `t` as a kernel binds it in place: a last-axis shrink of a realized
+/// buffer (a chunk of a kernel's output) is that buffer and the shrink's
+/// window, every other tensor itself (a view the launch materializes).
+pub(crate) fn bound(t: &Tensor) -> (Tensor, Option<Window>) {
+    window_of(t).map_or_else(|| (t.clone(), None), |(base, w)| (base, Some(w)))
+}
+
+fn window_of(t: &Tensor) -> Option<(Tensor, Window)> {
+    let u = t.uop();
+    let Op::Shrink(svod_ir::ops::Shrink { src, .. }) = u.op() else { return None };
+    svod_ir::UOp::realized_base(src)?;
+    let ranges = svod_ir::shape::shrink_ranges(&u)?;
+    let full = src.shape().ok()??;
+    let ((at, _), lead) = ranges.split_last()?;
+    let whole = lead.iter().zip(full.iter()).all(|((o, size), dim)| o.as_const() == Some(0) && size == dim);
+    let (offset, ld) = (at.as_const()?, full.last()?.as_const()?);
+    let run = WINDOW_RUN / t.dtype().bytes().max(1);
+    (whole && offset.is_multiple_of(run) && ld.is_multiple_of(run))
+        .then(|| (Tensor::from_lazy(src.clone()), Window { offset, ld }))
+}
+
+/// Where `op` writes into an `out=` buffer: channels `at..at + width` of
+/// `into`, whose shape is the op's output `out` but for the last axis, of
+/// the output's dtype; the window, where a kernel may store it.
+pub(crate) fn window_into(
+    op: &'static str,
+    into: &Tensor,
+    at: usize,
+    out: &[SInt],
+    dtype: &DType,
+) -> Result<Option<Window>> {
+    use snafu::OptionExt;
+    ensure!(into.dtype() == *dtype, DtypeSnafu { op, operand: "into", got: into.dtype(), want: dtype.clone() });
+    let got = shape_of(into).context(GraphSnafu { op })?;
+    let width = out.last().and_then(SInt::as_const);
+    let expected = || format!("{} widened to hold channels {at}.. past the last axis", fmt_shape(out));
+    let shape_err = || ShapeSnafu { op, operand: "into", got: fmt_shape(&got), expected: expected() };
+    let ld = got.last().and_then(SInt::as_const).context(shape_err())?;
+    let fits = got.len() == out.len() && got[..got.len() - 1] == out[..out.len() - 1];
+    ensure!(fits && width.is_some_and(|w| at + w <= ld), shape_err());
+    let run = WINDOW_RUN / dtype.bytes().max(1);
+    Ok((at.is_multiple_of(run) && ld.is_multiple_of(run)).then_some(Window { offset: at, ld }))
+}
+
+/// The channels a windowed operand `width` wide touches of its buffer's
+/// last axis, for [`crate::launch::graph_launch_ranged`].
+pub(crate) fn channels(w: Option<Window>, width: usize) -> Option<std::ops::Range<usize>> {
+    w.map(|w| w.offset..w.offset + width)
+}
+
+/// `y` stored into channels `at..` of `into` (an `out=` buffer, as an op's
+/// `into`) by the graph: `into` after the store. What an op does where its
+/// kernel cannot store in place, and how a caller lands what no op made.
+pub fn store_into(into: &Tensor, at: usize, y: &Tensor) -> Result<Tensor> {
+    assigned(into, at, y).context(GraphSnafu { op: "store_into" })
+}
+
+pub(crate) fn assigned(into: &Tensor, at: usize, y: &Tensor) -> svod_tensor::error::Result<Tensor> {
+    let width = y.dim_const(-1)?;
+    let rank = into.shape()?.len();
+    let ranges: Vec<Option<(isize, isize)>> =
+        (0..rank).map(|d| (d + 1 == rank).then_some((at as isize, (at + width) as isize))).collect();
+    into.try_shrink(ranges)?.try_assign(y)?;
+    Ok(into.clone())
+}
+
+/// An `out=` buffer for ops to store channel windows of (their `into`):
+/// storage as an op's own output, `shape`'s leading dim a bound batch
+/// variable where it is one.
+pub fn buffer(shape: &[SInt], dtype: DType) -> Result<Tensor> {
+    kernel_buffer(shape, dtype).context(GraphSnafu { op: "buffer" })
 }
 
 /// Storage a kernel writes: device-local where the backend tells it apart

@@ -202,7 +202,16 @@ const CONV: ([usize; 3], usize, [u32; 2]) = ([64, 64, 32], 3, [2, 2]);
 fn conv_3x3((tile, stages, warps): ([usize; 3], usize, [u32; 2])) -> Program {
     let cfg = crate::ops::config::gemm_cfg(tile, stages, warps, true);
     let geom = super::conv::geom([40, 40], 192, 192, 3, 1, 1, 1);
-    let spec = assumed(ConvSpec { batch: Batch::Static(1), geom, epilogue: super::conv::SILU_BIAS, split: 1 }, cfg);
+    let spec = assumed(
+        ConvSpec {
+            batch: Batch::Static(1),
+            geom,
+            epilogue: super::conv::SILU_BIAS,
+            split: 1,
+            windows: Default::default(),
+        },
+        cfg,
+    );
     conv::<F16>(&spec)
 }
 

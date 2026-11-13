@@ -3,7 +3,7 @@
 //! and `K = kh·kw·cin` walked tap-major, one pipeline over every tap.
 
 use super::gemm::{Epilogue, GemmCfg, GemmSpec, SplitMergeSpec, Tiles, mainloop_gemm, split_merge};
-use super::{Admits, Admitted, Batch, Spec};
+use super::{Admits, Admitted, Batch, Spec, Window, Windows};
 use crate::atoms::Device;
 use crate::build::*;
 use crate::ir::*;
@@ -59,6 +59,9 @@ pub struct ConvSpec {
     /// Reduction splits over grid z (a static batch only): the kernel writes
     /// f32 partials and [`split_merge`] adds them under the epilogue.
     pub split: usize,
+    /// The input's (`a`: a pixel's `cin` channels), the residual's and the
+    /// output's windows, a pixel a row.
+    pub windows: Windows,
 }
 
 /// A convolution's tile config and reduction split, as the tune store picks them.
@@ -100,7 +103,7 @@ impl ConvSpec {
             Batch::Static(n) => (n * ho * wo, Batch::Static(1)),
             ref var => (ho * wo, var.clone()),
         };
-        GemmSpec { m, n: self.geom.cout, k: self.geom.k(), batch, epilogue: self.epilogue }
+        GemmSpec { m, n: self.geom.cout, k: self.geom.k(), batch, epilogue: self.epilogue, windows: self.windows }
     }
 
     /// The merge of a split convolution.
@@ -113,6 +116,7 @@ impl ConvSpec {
             epilogue: self.epilogue,
             tile: MERGE_TILE,
             parts: None,
+            windows: self.windows.outputs(),
         }
     }
 }
@@ -150,10 +154,12 @@ pub fn conv<T: Half>(spec: &Admitted<ConvSpec>) -> Program {
         Batch::Var(_) => 1,
     };
     let (m, slices, shape) = (gemm.m, cfg.slices(), Shape::new(cfg.tile[0], bk));
-    mainloop_gemm::<T>("conv", &gemm, images * g.h * g.w * g.cin, Tiles::Grid, spec.split, |_k, x, bb, row0| {
-        let base = bb.clone().map_or(Sc::from(0), |b| b * (g.h * g.w * g.cin));
+    let w = spec.windows.a(g.cin);
+    let image = w.elems(g.h * g.w);
+    mainloop_gemm::<T>("conv", &gemm, images * image, Tiles::Grid, spec.split, |_k, x, bb, row0| {
+        let base = w.from(bb.clone().map_or(Sc::from(0), |b| b * image));
         Box::new(move |k, step: Sc<'_>, koff| {
-            let v = im2col_view(k, x, &g, m, base.clone(), row0.clone(), step.clone(), shape);
+            let v = im2col_view(k, x, &g, w, m, base.clone(), row0.clone(), step.clone(), shape);
             if slices == 1 { v } else { k.at(v, 0, koff - step * bk) }
         })
     })
@@ -162,13 +168,15 @@ pub fn conv<T: Half>(spec: &Admitted<ConvSpec>) -> Program {
 /// The `[bm, bk]` A tile of K step `step` for output rows `row0..row0 + bm`
 /// of `m`: tap `step / (cin/bk)` at channel `(step % (cin/bk))·bk`, every
 /// row's input pixel read where it lies inside the image and zero in the
-/// padding or past `m`. The row decode reads only the row and the block, so
-/// the lowering lists it once; a step adds the tap's offset.
+/// padding or past `m`, a pixel's channels `w.ld` apart from the next's
+/// (`base` holds the window's offset). The row decode reads only the row
+/// and the block, so the lowering lists it once; a step adds the tap's offset.
 #[allow(clippy::too_many_arguments)]
 pub fn im2col_view<'k, T: Elem>(
     k: &mut Kernel<'k>,
     x: ParamRef<'k, T, In>,
     g: &ConvGeom,
+    w: Window,
     m: usize,
     base: Sc<'k>,
     row0: Sc<'k>,
@@ -184,13 +192,13 @@ pub fn im2col_view<'k, T: Elem>(
     let i = row0 + k.row();
     let rem = i.clone() % (ho * wo);
     let (iy0, ix0) = (rem.clone() / wo * sh - ph as i64, rem % wo * sw - pw as i64);
-    let start = ((i.clone() / (ho * wo) * g.h + iy0.clone()) * g.w + ix0.clone()) * g.cin;
+    let start = ((i.clone() / (ho * wo) * g.h + iy0.clone()) * g.w + ix0.clone()) * w.ld;
     let (iy, ix) = (iy0 + ky.clone(), ix0 + kx.clone());
     let inside = |v: Sc<'k>, len: usize| Sc::from(0).le(v.clone()).and(v.lt(len));
     let mut valid = inside(iy, g.h).and(inside(ix, g.w));
     if !m.is_multiple_of(shape.rows) {
         valid = valid.and(i.lt(m));
     }
-    let offset = base + (ky * g.w + kx) * g.cin + c0;
+    let offset = base + (ky * g.w + kx) * w.ld + c0;
     k.gather(x, offset, start, Some(valid), shape, None)
 }

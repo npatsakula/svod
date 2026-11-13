@@ -2,6 +2,7 @@
 //! off a gated weight; a fused projection's first heads rotated.
 
 use std::fmt::Debug;
+use std::ops::Range;
 
 use snafu::{ResultExt, ensure};
 use svod_dtype::DType;
@@ -11,11 +12,11 @@ use svod_tensor::Tensor;
 use super::config::{Planner, distinct_configs};
 use super::shape::{self, Plan, extent, shape_of};
 use super::{
-    Act, DEVICE_TEST, DtypeSnafu, GraphSnafu, LaunchSnafu, Result, ShapeSnafu, Tuner, batch_of, fmt_shape,
-    kernel_buffer, output, typed,
+    Act, DEVICE_TEST, DtypeSnafu, GraphSnafu, LaunchSnafu, Result, ShapeSnafu, Tuner, assigned, batch_of, bound,
+    channels, fmt_shape, kernel_buffer, output, typed, window_into,
 };
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Rope, Scale, TailSpec, gemm, gemm_tail};
-use crate::kernels::{Admits, Admitted, Batch};
+use crate::kernels::{Admits, Admitted, Batch, Windows};
 use crate::launch;
 use crate::lower::Lowering;
 use crate::tune::{Candidate, TuneStore};
@@ -36,6 +37,9 @@ pub struct Linear<'a> {
     /// Rotates the output's first heads after the bias, before anything
     /// else; a kernel carries it with a bias alone.
     pub rope: Option<Rotary<'a>>,
+    /// `out=`: the output stored into channels `at..at + N` of this
+    /// `[lead..., C]` tensor, which the op returns after the store.
+    pub into: Option<(&'a Tensor, usize)>,
 }
 
 /// A rotary embedding of the output's first `heads` heads of `head_dim`
@@ -54,6 +58,8 @@ pub struct Rotary<'a> {
 const OP: &str = "linear";
 
 /// `x [lead..., K]` · `w [N, K]`ᵀ → `[lead..., N]` with the epilogue `opts`.
+/// An `x` or a residual that is a channel slice of a kernel's output is read
+/// in place, and an `into` buffer is stored in place.
 pub fn linear(x: &Tensor, w: &Tensor, opts: Linear) -> Result<Tensor> {
     let shape = |t: &Tensor| shape_of(t).context(GraphSnafu { op: OP });
     let (xs, ws) = (shape(x)?, shape(w)?);
@@ -86,6 +92,18 @@ pub fn linear(x: &Tensor, w: &Tensor, opts: Linear) -> Result<Tensor> {
             ensure!(got == table, shape_err(operand, &got, fmt_shape(&table)));
         }
     }
+
+    let cw = match (opts.into, n.as_const()) {
+        (Some((into, at)), Some(_)) => match window_into(OP, into, at, &out, &x.dtype())? {
+            Some(w) => Some(w),
+            None => {
+                let y = linear(x, w, Linear { into: None, ..opts })?;
+                return assigned(into, at, &y).context(GraphSnafu { op: OP });
+            }
+        },
+        (Some(_), None) => return graph(x, w, opts).context(GraphSnafu { op: OP }),
+        (None, _) => None,
+    };
 
     let (ext, var) = extent(&xs).unzip();
     let planner = super::planner(&x.device());
@@ -137,33 +155,64 @@ pub fn linear(x: &Tensor, w: &Tensor, opts: Linear) -> Result<Tensor> {
     };
     if let Some(r) = opts.rope.filter(|_| rope.is_none() || cfgs.is_empty()) {
         tracing::debug!(target: super::PLAN, op = OP, "graph rotation: no tile turns");
-        let y = linear(x, w, Linear { rope: None, ..opts })?;
-        return turned(&y, r).context(GraphSnafu { op: OP });
+        let y = linear(x, w, Linear { rope: None, into: None, ..opts })?;
+        let y = turned(&y, r).context(GraphSnafu { op: OP })?;
+        return match opts.into {
+            Some((into, at)) => assigned(into, at, &y).context(GraphSnafu { op: OP }),
+            None => Ok(y),
+        };
     }
     let epilogue = Epilogue { rope, ..epilogue };
     let batch = batch_of(&var, 1);
-    let spec = tuned(TuneStore::global(), &planner, x.dtype(), &cfgs, GemmSpec { m, n, k, batch, epilogue });
+    let ((x, xw), residual) = (bound(x), opts.residual.map(bound));
+    let (residual, rw) = (residual.as_ref().map(|(r, _)| r), residual.as_ref().and_then(|(_, w)| *w));
+    let windows = Windows { a: xw, residual: rw, c: cw };
+    let spec = tuned(TuneStore::global(), &planner, x.dtype(), &cfgs, GemmSpec { m, n, k, batch, epilogue, windows });
     super::ran(OP, "gemm", spec.cfg());
-    let y = output(&[lead, &[n]].concat(), &var, x.dtype()).context(GraphSnafu { op: OP })?;
+    let y = match opts.into {
+        Some((into, _)) => into.clone(),
+        None => output(&[lead, &[n]].concat(), &var, x.dtype()).context(GraphSnafu { op: OP })?,
+    };
     // The tables bind only where the kernel turns: `epilogue.rope` is the
     // kernel's own word for it (`opts.rope` may have fallen back to the
     // graph's rotation).
     let (cos, sin) = spec.epilogue.rope.zip(opts.rope).map(|(_, r)| (r.cos, r.sin)).unzip();
     let mut programs = programs(&spec, &x.dtype(), &planner);
+    let ranges = Ranges { x: channels(xw, k), residual: channels(rw, n), y: channels(cw, n) };
     match tail(&spec, &planner) {
-        Some(tail) => launched_tail(programs, &tail, [x, w], opts.bias, opts.residual, &y),
+        Some(tail) => launched_tail(programs, &tail, [&x, w], opts.bias, residual, &y, &ranges),
         None => {
             let (prog, lowering) = programs.remove(0);
-            let ins: Vec<&Tensor> =
-                [Some(x), Some(w), opts.bias, opts.residual, cos, sin, Some(&y)].into_iter().flatten().collect();
-            launch::graph_launch(prog, &lowering, &ins).context(LaunchSnafu { op: OP })
+            let Ranges { x: xc, residual: rc, y: yc } = ranges;
+            let ins = [Some(&x), Some(w), opts.bias, residual, cos, sin, Some(&y)];
+            launched(prog, &lowering, &ins, [xc, None, None, rc, None, None, yc])
         }
     }
 }
 
+/// The channels of their buffers a GEMM's windowed operands touch.
+#[derive(Default)]
+pub(crate) struct Ranges {
+    x: Option<Range<usize>>,
+    residual: Option<Range<usize>>,
+    y: Option<Range<usize>>,
+}
+
+/// `prog` launched over the operands present, each beside its channels.
+fn launched<const N: usize>(
+    prog: crate::ir::Program,
+    lowering: &Lowering,
+    ins: &[Option<&Tensor>; N],
+    ranges: [Option<Range<usize>>; N],
+) -> Result<Tensor> {
+    let (ins, ranges): (Vec<&Tensor>, Vec<_>) = ins.iter().zip(ranges).filter_map(|(t, r)| Some(((*t)?, r))).unzip();
+    launch::graph_launch_ranged(prog, lowering, &ins, &ranges).context(LaunchSnafu { op: OP })
+}
+
 /// A tail split's programs ([`gemm_tail`]) launched in order over the
 /// operands `[x, w]` and the epilogue's into `y`: the whole waves' tiles
-/// into `y`, the tail's partials, then their merge into the rest of `y`.
+/// into `y`, the tail's partials, then their merge into the rest of `y`;
+/// windowed operands beside the channels `ranges` names.
 pub(crate) fn launched_tail(
     programs: Candidate,
     tail: &TailSpec,
@@ -171,19 +220,24 @@ pub(crate) fn launched_tail(
     bias: Option<&Tensor>,
     residual: Option<&Tensor>,
     y: &Tensor,
+    ranges: &Ranges,
 ) -> Result<Tensor> {
-    let launch = |(prog, lowering): (_, Lowering), ins: &[Option<&Tensor>]| {
-        let ins: Vec<&Tensor> = ins.iter().copied().flatten().collect();
-        launch::graph_launch(prog, &lowering, &ins).context(LaunchSnafu { op: OP })
-    };
+    let Ranges { x: xc, residual: rc, y: yc } = ranges;
     let mut programs = programs.into_iter();
+    let mut next = |what| programs.next().expect(what);
     let y = match tail.plan.waves {
-        Some(_) => launch(programs.next().expect("the waves"), &[Some(x), Some(w), bias, residual, Some(y)])?,
+        Some(_) => {
+            let (prog, lowering) = next("the waves");
+            let ins = [Some(x), Some(w), bias, residual, Some(y)];
+            launched(prog, &lowering, &ins, [xc.clone(), None, None, rc.clone(), yc.clone()])?
+        }
         None => y.clone(),
     };
     let partial = kernel_buffer(&[SInt::Const(tail.partials())], DType::Float32).context(GraphSnafu { op: OP })?;
-    let partial = launch(programs.next().expect("the tail's partials"), &[Some(x), Some(w), Some(&partial)])?;
-    launch(programs.next().expect("the merge"), &[Some(&partial), bias, residual, Some(&y)])
+    let (prog, lowering) = next("the tail's partials");
+    let partial = launched(prog, &lowering, &[Some(x), Some(w), Some(&partial)], [xc.clone(), None, None])?;
+    let (prog, lowering) = next("the merge");
+    launched(prog, &lowering, &[Some(&partial), bias, residual, Some(&y)], [None, None, rc.clone(), yc.clone()])
 }
 
 /// The programs `spec` launches in order with their lowerings: its GEMM,
@@ -266,8 +320,12 @@ pub(crate) fn graph(x: &Tensor, w: &Tensor, opts: Linear) -> svod_tensor::error:
         Some(scale) => y.try_mul(scale)?,
         None => y,
     };
-    match opts.residual {
-        Some(r) => y.try_add(r),
+    let y = match opts.residual {
+        Some(r) => y.try_add(r)?,
+        None => y,
+    };
+    match opts.into {
+        Some((into, at)) => assigned(into, at, &y),
         None => Ok(y),
     }
 }

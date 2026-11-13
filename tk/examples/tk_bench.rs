@@ -189,7 +189,7 @@ fn gemm_label(c: &GemmCfg) -> String {
 
 /// A bf16 GEMM at `cfg`, admitted: the programs the op launches.
 fn gemm_candidate(planner: &Planner, [m, n, k]: [usize; 3], epilogue: Epilogue, cfg: GemmCfg) -> Result<Candidate> {
-    let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue };
+    let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue, windows: Default::default() };
     let spec = spec.admitted(planner, cfg).map_err(|why| format!("{cfg:?}: {why:?}"))?;
     Ok(candidates::gemm(&spec, &DType::BFloat16, planner))
 }
@@ -197,7 +197,7 @@ fn gemm_candidate(planner: &Planner, [m, n, k]: [usize; 3], epilogue: Epilogue, 
 /// The tuner's GEMM pick for `shape`, as the device tests and GEMM probes
 /// tune ([`tuned::gemm_probe`]).
 fn gemm_pick(planner: &Planner, [m, n, k]: [usize; 3], epilogue: Epilogue, ranked: &[GemmCfg]) -> GemmCfg {
-    let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue };
+    let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue, windows: Default::default() };
     tuned::gemm_probe(TuneStore::global(), planner, DType::BFloat16, ranked, spec).cfg()
 }
 
@@ -960,7 +960,7 @@ fn conv_traced<'a>(
         &epilogue,
     );
     let Plan::Kernel(ranked) = plan else { return Err("conv: the op takes the graph at this shape".into()) };
-    let spec = ConvSpec { batch: Batch::Static(images), geom, epilogue, split: 1 };
+    let spec = ConvSpec { batch: Batch::Static(images), geom, epilogue, split: 1, windows: Default::default() };
     if args.opt("--cfg") == Some("ranked") {
         let (batches, m) = shape::conv_grid(&extent, &geom);
         let p = ConvProblem::new(batches, m, &geom, &epilogue);

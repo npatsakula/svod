@@ -33,6 +33,7 @@ mod sync;
 mod tail;
 mod targets;
 mod tune;
+mod windows;
 
 use std::sync::{Arc, LazyLock};
 
@@ -433,7 +434,7 @@ fn gemm_nt_batched(m: usize, n: usize, k: usize, tile: [usize; 3], stages: usize
 
 /// A single `m×n×k` GEMM with no epilogue.
 pub(super) fn gemm_spec(m: usize, n: usize, k: usize) -> GemmSpec {
-    GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT }
+    GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, windows: Default::default() }
 }
 
 /// The next value of a 64-bit LCG stepping `seed`, uniform in `[-1, 1)`.

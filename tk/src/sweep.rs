@@ -98,7 +98,17 @@ pub fn past_i32(target: &Target) -> Vec<Launch> {
     for (batches, stages) in [(1, 1), (2, 1), (2, 2)] {
         let base = planner.gemm_ranked(batches, m, n, k, &Epilogue::DEFAULT)[0];
         let cfg = GemmCfg { schedule: Schedule::ring(stages, base.unroll()), ..base };
-        let spec = assumed(GemmSpec { m, n, k, batch: Batch::Static(batches), epilogue: Epilogue::DEFAULT }, cfg);
+        let spec = assumed(
+            GemmSpec {
+                m,
+                n,
+                k,
+                batch: Batch::Static(batches),
+                epilogue: Epilogue::DEFAULT,
+                windows: Default::default(),
+            },
+            cfg,
+        );
         out.push((format!("gemm {batches} batches s{stages}"), gemm::<BF16>(&spec), cfg.lowering(device)));
     }
     for (n, m) in [(2_800_001, 1024), (1024, 2_800_001)] {
@@ -167,7 +177,7 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
     // for a large GEMM, so the biggest register tiles are lowered too.
     let gemm_spec = |m, n, k, epilogue: Epilogue| {
         let cfg = planner.gemm_ranked(1, 4096, 4096, k, &epilogue)[0];
-        assumed(GemmSpec { m, n, k, batch: Batch::Static(1), epilogue }, cfg)
+        assumed(GemmSpec { m, n, k, batch: Batch::Static(1), epilogue, windows: Default::default() }, cfg)
     };
     let plain = gemm_spec(130, 192, 128, Epilogue::DEFAULT);
     for (i, cfg) in first_eight(&planner.gemm_ranked(1, 4096, 4096, 4096, &plain.epilogue)).into_iter().enumerate() {
@@ -192,7 +202,10 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
     let order = TileOrder::grouped(3).expect("a group of rows");
     let cfg = GemmCfg { order, tail: Some(tail), ..config::gemm_cfg([64, 64, 64], 2, [2, 2], false) };
     let epilogue = Epilogue { bias: true, residual: true, act: Act::Gelu, ..Epilogue::DEFAULT };
-    let spec = assumed(GemmSpec { m: 200, n: 160, k: 256, batch: Batch::Static(1), epilogue }, cfg);
+    let spec = assumed(
+        GemmSpec { m: 200, n: 160, k: 256, batch: Batch::Static(1), epilogue, windows: Default::default() },
+        cfg,
+    );
     let plan = TailPlan::new(12, 5, tail).expect("a tail");
     let parts = ["waves", "partials", "merge"];
     for (part, prog) in parts.into_iter().zip(gemm_tail::<BF16>(&TailSpec { gemm: spec, plan })) {
@@ -216,7 +229,17 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
     if target.geometry_of(ScalarDType::Int8).is_some() {
         let out_f32 = Epilogue { out_f32: true, ..Epilogue::DEFAULT };
         for cfg in [config::gemm_cfg([64, 64, 64], 2, [2, 2], true), config::gemm_cfg([32, 64, 64], 1, [1, 2], false)] {
-            let spec = assumed(GemmSpec { m: 130, n: 192, k: 256, batch: Batch::Static(1), epilogue: out_f32 }, cfg);
+            let spec = assumed(
+                GemmSpec {
+                    m: 130,
+                    n: 192,
+                    k: 256,
+                    batch: Batch::Static(1),
+                    epilogue: out_f32,
+                    windows: Default::default(),
+                },
+                cfg,
+            );
             let name = format!("gemm int8 {:?}x{}", cfg.tile, cfg.stages());
             push(&name, gemm::<I8>(&spec), cfg.lowering(&planner.device));
         }
@@ -228,7 +251,10 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
     if let Some(cfg) = turning {
         let rope = crate::kernels::gemm::Rope { heads: 6, head_dim: 64, seq: 50 };
         let epilogue = Epilogue { rope: Some(rope), ..Epilogue::DEFAULT };
-        let spec = assumed(GemmSpec { m: 130, n: 576, k: 128, batch: Batch::Static(1), epilogue }, cfg);
+        let spec = assumed(
+            GemmSpec { m: 130, n: 576, k: 128, batch: Batch::Static(1), epilogue, windows: Default::default() },
+            cfg,
+        );
         push("gemm rope", gemm::<BF16>(&spec), cfg.lowering(&planner.device));
     }
 
@@ -564,8 +590,16 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
         let [ho, wo] = g.out_hw();
         let cfgs = conv_first_eight(&planner, 1, images * ho * wo, &g, &silu_bias);
         let c = cfgs.iter().find(|c| (c.split > 1) == name.ends_with("split")).unwrap_or(&cfgs[0]);
-        let spec =
-            assumed(ConvSpec { batch: Batch::Static(images), geom: g, epilogue: silu_bias, split: c.split }, c.gemm);
+        let spec = assumed(
+            ConvSpec {
+                batch: Batch::Static(images),
+                geom: g,
+                epilogue: silu_bias,
+                split: c.split,
+                windows: Default::default(),
+            },
+            c.gemm,
+        );
         for (i, (prog, lowering)) in spec.programs::<F16>(&planner.device).into_iter().enumerate() {
             push(&format!("{name} #{i}"), prog, lowering);
         }
@@ -606,7 +640,10 @@ pub(crate) fn group_families(target: &Target) -> Vec<Launch> {
             };
             assert!(cfg.fits(target), "{cfg:?} fits the warpgroup core");
             let (m, n, k) = (tile[0] + 2, tile[1] - 3, 3 * tile[2]);
-            let spec = assumed(GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT }, cfg);
+            let spec = assumed(
+                GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, windows: Default::default() },
+                cfg,
+            );
             (format!("group gemm {:?} {:?}", cfg.tile, cfg.warps), gemm::<BF16>(&spec), cfg.lowering(&planner.device))
         })
         .collect()
@@ -754,8 +791,17 @@ pub fn digested(target: &Target) -> Vec<Launch> {
             let ranked = planner.gemm_ranked(1, m, n, k, &epilogue);
             let deep = if m == 4096 { config::SHORTLIST } else { 8 };
             for cfg in config::distinct(&ranked).take(deep) {
-                let spec =
-                    assumed(GemmSpec { m: 100, n: 96, k: cfg.tile[2] * 2, batch: Batch::Static(1), epilogue }, cfg);
+                let spec = assumed(
+                    GemmSpec {
+                        m: 100,
+                        n: 96,
+                        k: cfg.tile[2] * 2,
+                        batch: Batch::Static(1),
+                        epilogue,
+                        windows: Default::default(),
+                    },
+                    cfg,
+                );
                 // A tail split's config names the kernel its tiles run whole.
                 let name = format!("gemm {m}x{n}x{k} g{gated} {:?}", GemmCfg { tail: None, ..cfg });
                 out.push((name, gemm::<BF16>(&spec), cfg.lowering(&device)));
@@ -835,7 +881,13 @@ pub fn digested(target: &Target) -> Vec<Launch> {
         let [ho, wo] = g.out_hw();
         for c in conv_first_eight(&planner, 1, ho * wo, &g, &Epilogue::DEFAULT) {
             let spec = assumed(
-                ConvSpec { batch: Batch::Static(1), geom: g, epilogue: Epilogue::DEFAULT, split: c.split },
+                ConvSpec {
+                    batch: Batch::Static(1),
+                    geom: g,
+                    epilogue: Epilogue::DEFAULT,
+                    split: c.split,
+                    windows: Default::default(),
+                },
                 c.gemm,
             );
             for (i, (prog, lowering)) in spec.programs::<F16>(&device).into_iter().enumerate() {

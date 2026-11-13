@@ -187,7 +187,15 @@ fn linear_matches_the_graph(
         let w = rand(&[rows, k], 2, 0.5, dtype.clone());
         let b = rand(&[rows], 3, 1.0, dtype.clone());
         let r = rand(&[lead, &[n]].concat(), 4, 2.0, dtype);
-        let opts = Linear { bias: bias.then_some(&b), act, gated, residual: residual.then_some(&r), scale, rope: None };
+        let opts = Linear {
+            bias: bias.then_some(&b),
+            act,
+            gated,
+            residual: residual.then_some(&r),
+            scale,
+            rope: None,
+            into: None,
+        };
         let y = tk::linear(&x, &w, opts).unwrap();
         let dims: Vec<SInt> = lead.iter().chain([&n]).map(|&d| SInt::Const(d)).collect();
         assert_eq!(y.shape().unwrap().to_vec(), dims);
@@ -261,8 +269,15 @@ fn linear_under_a_batch_variable() {
         let b = rand(&[2 * n], 13, 1.0, DType::BFloat16);
         let var = batch(cap, live);
         let [xb, rb] = [&x, &r].map(|t| bound(t, &var));
-        let opts =
-            Linear { bias: Some(&b), act: Act::Silu, gated: true, residual: Some(&rb), scale: Some(0.5), rope: None };
+        let opts = Linear {
+            bias: Some(&b),
+            act: Act::Silu,
+            gated: true,
+            residual: Some(&rb),
+            scale: Some(0.5),
+            rope: None,
+            into: None,
+        };
         let y = tk::linear(&xb, &w, opts).unwrap();
         let [xs, rs] = [&x, &r].map(|t| first(t, live));
         let want = linear_reference(&xs, &w, Linear { residual: Some(&rs), ..opts });
@@ -798,6 +813,102 @@ fn conv2d_matches_the_graph(
         }
         assert_tensors_close("conv2d", &y, &conv_reference(&xt, &w, opts), 4e-3);
     });
+}
+
+// ---- channel windows -------------------------------------------------------
+
+/// Channels `from..to` of `t`.
+fn channels(t: &Tensor, from: usize, to: usize) -> Tensor {
+    let rank = t.shape().unwrap().len();
+    t.try_shrink((0..rank).map(|d| (d + 1 == rank).then_some((from as isize, to as isize)))).unwrap()
+}
+
+/// A C2f block over `x [n, h, w, k]` with `c` hidden channels: `cv1` (1×1,
+/// `2c`), a bottleneck on its second half (3×3, 3×3 plus that half), one
+/// more 3×3, the four parts concatenated and a 1×1 over them. Windowed, the
+/// parts live in one buffer: each op reads its input (and residual) in place
+/// and stores into its own channels. Returns the concatenation and the output.
+fn c2f(x: &Tensor, ws: &[Tensor; 5], c: usize, windowed: bool) -> [Tensor; 2] {
+    let conv = |x: &Tensor, w: &Tensor, opts: Conv| tk::conv2d(x, w, opts).unwrap();
+    let k3 = || Conv { pad: [1, 1], act: Act::Silu, ..Conv::default() };
+    let k1 = || Conv { act: Act::Silu, ..Conv::default() };
+    let shape = x.shape().unwrap();
+    if windowed {
+        let lead = shape[..3].iter().cloned();
+        let cat = tk::buffer(&lead.chain([SInt::Const(4 * c)]).collect::<Vec<_>>(), x.dtype()).unwrap();
+        let cat = conv(x, &ws[0], Conv { into: Some((&cat, 0)), ..k1() });
+        let half = channels(&cat, c, 2 * c);
+        let mid = conv(&half, &ws[1], k3());
+        let cat = conv(&mid, &ws[2], Conv { residual: Some(&half), into: Some((&cat, 2 * c)), ..k3() });
+        let cat = conv(&channels(&cat, 2 * c, 3 * c), &ws[3], Conv { into: Some((&cat, 3 * c)), ..k3() });
+        let y = conv(&cat, &ws[4], k1());
+        [cat, y]
+    } else {
+        let parts = conv(x, &ws[0], k1()).chunk(2, -1).unwrap();
+        let mid = conv(&parts[1], &ws[1], k3());
+        let m0 = conv(&mid, &ws[2], Conv { residual: Some(&parts[1]), ..k3() });
+        let m1 = conv(&m0, &ws[3], k3());
+        let cat = Tensor::cat(&[&parts[0], &parts[1], &m0, &m1], -1).unwrap();
+        let y = conv(&cat, &ws[4], k1());
+        [cat, y]
+    }
+}
+
+/// The arguments of `t`'s kernel calls that are views, not buffers: what
+/// the schedule copies into a buffer of its own before the call.
+fn views_bound(t: &Tensor) -> usize {
+    fn buffer(u: &svod_ir::UOp) -> bool {
+        match u.op() {
+            Op::After(..) | Op::Buffer(..) => true,
+            Op::Reshape(ops::Reshape { src, .. }) => buffer(src),
+            _ => false,
+        }
+    }
+    let calls = t.uop().toposort();
+    let args = calls.iter().filter_map(|u| match u.op() {
+        Op::Call(ops::Call { args, .. }) => Some(args.iter()),
+        _ => None,
+    });
+    args.flatten().filter(|a| !buffer(a)).count()
+}
+
+fn c2f_weights(k: usize, c: usize, dtype: &DType) -> [Tensor; 5] {
+    let w = |shape: &[usize], seed| {
+        rand(shape, seed, 1.0 / ((shape[1..].iter().product::<usize>()) as f32).sqrt(), dtype.clone())
+    };
+    [
+        w(&[2 * c, 1, 1, k], 41),
+        w(&[c, 3, 3, c], 42),
+        w(&[c, 3, 3, c], 43),
+        w(&[c, 3, 3, c], 44),
+        w(&[2 * k, 1, 1, 4 * c], 45),
+    ]
+}
+
+/// A C2f block's parts stored into one buffer and read from it in place
+/// compute what the graph's chunk and concatenation do; with channel counts
+/// a vector run divides, no copy feeds any kernel. Off the run (`c = 12`
+/// of f16) the ops fall back to copies and stores, with the same values.
+#[test_case(&[1, 12, 10], 32, 16, true; "aligned, one image")]
+#[test_case(&[2, 9, 7], 48, 32, true; "aligned, two images")]
+#[test_case(&[1, 8, 8], 32, 12, false; "off the run")]
+fn a_c2f_block_stores_its_parts_in_place(lead: &[usize], k: usize, c: usize, aligned: bool) {
+    crate::tune::scoped(false, || c2f_in_place(lead, k, c, aligned));
+}
+
+fn c2f_in_place(lead: &[usize], k: usize, c: usize, aligned: bool) {
+    let dtype = DType::Float16;
+    let x = rand(&[lead, &[k]].concat(), 40, 1.0, dtype.clone());
+    let ws = c2f_weights(k, c, &dtype);
+    let [cat, y] = c2f(&x, &ws, c, true);
+    let [want_cat, want_y] = c2f(&x, &ws, c, false);
+    // Before anything realizes them, while the calls are in the graphs.
+    if aligned && super::device_planner().is_some() {
+        assert!(views_bound(&want_y) > 0, "the graph's chunk and concatenation copy");
+        assert_eq!(views_bound(&y), 0, "a copy feeds a kernel");
+    }
+    assert_tensors_close("c2f cat", &cat, &want_cat, 1e-2);
+    assert_tensors_close("c2f", &y, &want_y, 1e-2);
 }
 
 /// An f32 output keeps the accumulator unrounded, with an f32 residual.
