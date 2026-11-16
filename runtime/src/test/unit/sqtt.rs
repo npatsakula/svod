@@ -15,9 +15,9 @@ use svod_device::amd::occupancy::Limiter;
 use super::statements::rollup;
 use super::verdict::{Buckets, Charge, load_bytes};
 use super::{
-    Analysis, Approx, Axis, BucketDelta, Capture, Caution, Class, Diff, Evidence, Finding, FindingKind, LineRow, Lines,
-    LoopRow, Partition, Pstate, Reduction, Spread, Statement, Statements, Stmt, TwinError, Unit, WaitOn, align, locate,
-    parse_debug_line, same_text, text_section,
+    Analysis, Approx, Axis, Bucket, Capture, Caution, Class, Delta, Diff, Evidence, Finding, FindingKind, Knob,
+    LineRow, Lines, LoopRow, Partition, Pstate, Reduction, Spread, Statement, Statements, Stmt, TwinError, Unit,
+    WaitOn, align, locate, parse_debug_line, same_text, text_section,
 };
 
 fn fixtures() -> PathBuf {
@@ -72,16 +72,9 @@ fn replayed(fixture: &str) -> Analysis {
     Analysis::load(dir.path()).unwrap()
 }
 
-/// Every exposed bucket within its raw one.
-fn exposed_within(raw: &Partition, exposed: &Partition) -> bool {
-    fn within<K: PartialEq>(raw: &[(K, i64)], exposed: &[(K, i64)]) -> bool {
-        exposed.iter().all(|(k, e)| raw.iter().any(|(r, c)| r == k && (0..=*c).contains(e)))
-    }
-    within(&raw.issue, &exposed.issue)
-        && within(&raw.stall, &exposed.stall)
-        && within(&raw.wait, &exposed.wait)
-        && within(&raw.idle, &exposed.idle)
-        && (0..=raw.barrier).contains(&exposed.barrier)
+/// Every bucket's exposed cycles within its raw ones.
+fn exposed_within(p: &Partition) -> bool {
+    p.buckets.values().all(|c| (0..=c[0]).contains(&c[1]))
 }
 
 #[test_case("amd/navi4_setpc")]
@@ -126,16 +119,15 @@ fn summarizes(fixture: &str) {
     }
     assert!(text.lines().nth(1).unwrap().starts_with("== verdict"), "the verdict leads: {text}");
     if let Some(l) = &a.main_loop {
-        let (p, e) = (&l.partition, &l.exposed);
-        assert_eq!(p.buckets(), p.cycles, "{fixture}: every loop cycle in one bucket");
-        assert_eq!(e.buckets(), e.cycles, "{fixture}: the exposed cycles add up");
-        assert!(e.cycles <= p.cycles && exposed_within(p, e), "{fixture}: exposed within raw");
-        let (mut sum, mut exposed) = (Partition::default(), Partition::default());
-        l.ses.iter().for_each(|s| {
-            sum.add(&s.partition);
-            exposed.add(&s.exposed);
-        });
-        assert_eq!((&sum, &exposed), (p, e), "the SEs' partitions add up");
+        let p = &l.partition;
+        assert!(exposed_within(p), "{fixture}: exposed within raw");
+        assert!(
+            p.buckets.contains_key(&Bucket::Barrier)
+                && p.buckets.iter().all(|(&b, c)| b == Bucket::Barrier || c[0] > 0)
+        );
+        let mut sum = Partition::default();
+        l.ses.iter().for_each(|s| sum.add(&s.partition));
+        assert_eq!(&sum, p, "the SEs' partitions add up");
         let edges = a.pcs.iter().find(|r| r.pc == l.back_edge).unwrap().hits;
         assert_eq!((l.trips.total, l.trips.per_iteration), (edges, 1), "no model: per iteration");
         assert!(a.verdict.findings.iter().all(|f| f.approx.contains(&Approx::PerIteration)), "{:?}", a.verdict);
@@ -445,7 +437,7 @@ fn verdict_of(name: &str) -> Analysis {
 fn alu_per_trip(a: &Analysis) -> f64 {
     let l = a.main_loop.as_ref().unwrap();
     let alu = [Class::Valu, Class::Salu];
-    (l.partition.issued(&alu) + l.partition.stalled(&alu)) as f64 / l.trips.total as f64
+    (l.partition.issued(&alu)[0] + l.partition.stalled(&alu)[0]) as f64 / l.trips.total as f64
 }
 
 fn find(a: &Analysis, kind: FindingKind) -> Option<&Finding> {
@@ -460,8 +452,8 @@ fn kinds(findings: &[Finding]) -> Vec<FindingKind> {
 fn load_share(a: &Analysis) -> f64 {
     let l = a.main_loop.as_ref().unwrap();
     let vmem = |on: WaitOn| on.counter == Counter::Load;
-    let e = &l.exposed;
-    (e.waited(vmem) + e.stalled(&[Class::VmemLoad])) as f64 / l.partition.cycles as f64
+    let p = &l.partition;
+    (p.waited(vmem)[1] + p.stalled(&[Class::VmemLoad])[1]) as f64 / p.cycles()[0] as f64
 }
 
 /// svod's ring GEMM, its 1500- and 1536-row twins and the Strix GEMM all run 160 K-trips of 32,
@@ -497,7 +489,7 @@ fn verdict_reads_the_capture(name: &str, pstate: Option<Pstate>) {
     let d = a.verdict.demand.clone().unwrap();
     assert!(d.bytes_per_trip > 0 && d.gbs > 0.0, "{d:?}");
     let mut idle = a;
-    idle.main_loop.as_mut().unwrap().partition.cycles = 0;
+    idle.main_loop.as_mut().unwrap().partition.buckets.clear();
     assert_eq!(super::verdict::rank(&idle).demand, None, "no rate over a trip of no cycles");
 }
 
@@ -535,7 +527,9 @@ fn v3_waits_right_behind_its_load() {
     let load = &loads[0];
     assert_eq!((load.pc, load.wait, load.stalled, load.waits), (0xa64, 0xab0, 316, 316));
     assert!(load.short_cover() && load.consumer.starts_with("v_cndmask_b32"), "{load:?}");
-    assert!(top.knob.contains("0xab0 waits for 0xa64, then `v_cndmask_b32_e64 v147, 0, v147, s1`"), "{}", top.knob);
+    let consumer = "v_cndmask_b32_e64 v147, 0, v147, s1".to_string();
+    assert_eq!(top.knob, Knob::MoveUse { wait: 0xab0, load: 0xa64, consumer });
+    assert!(top.knob.to_string().contains("0xab0 waits for 0xa64, then `v_cndmask_b32_e64 v147, 0, v147, s1`"));
     assert!(!v3.verdict.findings[1..].iter().any(|f| f.share >= 0.10), "{:?}", v3.verdict.findings);
     let added = alu_per_trip(&v3) - alu_per_trip(&v1);
     assert!((260.0..300.0).contains(&added), "v3's guards: {added:.1} VALU+SALU cycles a trip");
@@ -568,7 +562,7 @@ fn strix_claims_nothing_of_its_matrix_pipe() {
     assert!(!a.verdict.bound.iter().any(|f| bound.contains(&f.kind)), "{:?}", a.verdict.bound);
     assert!(a.verdict.findings.iter().all(|f| f.approx.contains(&Approx::UntimedMatrix) && f.share == f.raw));
     let l = a.main_loop.as_ref().unwrap();
-    assert!(l.partition.stalled(&[Class::Lds]) as f64 > 0.10 * l.partition.cycles as f64, "the stall is there");
+    assert!(l.partition.stalled(&[Class::Lds])[0] as f64 > 0.10 * l.partition.cycles()[0] as f64, "the stall is there");
     assert!(find(&a, FindingKind::LdsExposed).is_none(), "{:?}", a.verdict.findings);
     let overhead = find(&a, FindingKind::LoopOverhead).unwrap();
     let Evidence::Overhead { divergent, .. } = &overhead.evidence else { panic!("{overhead:?}") };
@@ -619,7 +613,12 @@ const LOOP: [(u64, &str); 6] = [
 
 fn partition(waves: &[svod_device::sqtt::wave::Wave], bound: &[HashMap<usize, (Counter, u64)>]) -> Partition {
     let hiding = Hiding::new(waves, &[], &HashSet::new());
-    Buckets::new(&LOOP).partition(waves, bound, 0x10..=0x20, &hiding).raw
+    Buckets::new(&LOOP).partition(waves, bound, 0x10..=0x20, &hiding).partition
+}
+
+/// Each bucket's raw cycles.
+fn raw(p: &Partition) -> BTreeMap<Bucket, i64> {
+    p.buckets.iter().map(|(&b, c)| (b, c[0])).collect()
 }
 
 /// A loop at 0x10..=0x20 of a VALU op, a wait, a barrier: overlapping records count once, a stall
@@ -638,20 +637,22 @@ fn partition_counts_each_cycle_once() {
         record(100, 4, 0, 0x10),
         record(106, 4, 0, 0x14),
     ];
-    let expect = |wait: WaitOn| Partition {
-        waves: 1,
-        cycles: 30,
-        issue: vec![(Class::Valu, 8)],
-        stall: vec![(Class::Valu, 2)],
-        wait: vec![(wait, 6)],
-        barrier: 10,
-        idle: vec![(Class::WaitVmem, 2), (Class::Barrier, 2)],
+    let expect = |wait: WaitOn| {
+        BTreeMap::from([
+            (Bucket::Issue(Class::Valu), 8),
+            (Bucket::Stall(Class::Valu), 2),
+            (Bucket::Wait(wait), 6),
+            (Bucket::Barrier, 10),
+            (Bucket::Idle(Class::WaitVmem), 2),
+            (Bucket::Idle(Class::Barrier), 2),
+        ])
     };
     let unbound = WaitOn { counter: Counter::Load, store: false };
-    assert_eq!(partition(&[wave(records.clone())], &[]), expect(unbound), "unbound: its first counter");
+    let p = partition(&[wave(records.clone())], &[]);
+    assert_eq!((p.waves, p.cycles()[0], raw(&p)), (1, 30, expect(unbound)), "unbound: its first counter");
     let flush = HashMap::from([(2, (Counter::Ds, 0x8)), (7, (Counter::Ds, 0x8))]);
     let p = partition(&[wave(records)], &[flush]);
-    assert_eq!(p, expect(WaitOn { counter: Counter::Ds, store: true }), "a ds_store flush");
+    assert_eq!(raw(&p), expect(WaitOn { counter: Counter::Ds, store: true }), "a ds_store flush");
 }
 
 /// Another wave's VALU issue over a wave's wait and gap hides them: the exposed partition takes the
@@ -667,10 +668,9 @@ fn exposed_takes_off_what_other_waves_hid() {
     let waves = [waiting, busy];
     let hiding = Hiding::new(&waves, &[], &HashSet::new());
     let pass = Buckets::new(&LOOP).partition(&waves[..1], &[], 0x10..=0x20, &hiding);
-    let (raw, exposed) = (pass.raw, pass.exposed);
-    assert_eq!((raw.cycles, raw.waited(|_| true), raw.idled(&[])), (31, 10, 18));
-    assert_eq!((exposed.waited(|_| true), exposed.idled(&[]), exposed.cycles), (0, 0, exposed.buckets()));
-    assert!(exposed_within(&raw, &exposed));
+    let p = pass.partition;
+    assert_eq!((p.cycles()[0], p.waited(|_| true), p.idled(&[])), (31, [10, 0], [18, 0]));
+    assert!(exposed_within(&p));
 }
 
 /// A gfx12 barrier: the wave arrives at its signal and waits at the wait. A short wait is the last
@@ -728,16 +728,14 @@ proptest! {
             .collect();
         let hiding = Hiding::new(&waves, &[], &HashSet::new());
         let pass = Buckets::new(&lines).partition(&waves, &[], 0x10..=0x20, &hiding);
-        let (p, e) = (pass.raw, pass.exposed);
-        prop_assert_eq!(p.buckets(), p.cycles);
-        prop_assert_eq!(e.buckets(), e.cycles);
-        prop_assert!(exposed_within(&p, &e));
+        let p = pass.partition;
+        prop_assert!(exposed_within(&p));
         let expected: i64 = waves
             .iter()
             .flat_map(|w| w.instructions.chunk_by(|a, b| (a.pc != 0) == (b.pc != 0)).filter(|r| r[0].pc != 0))
             .map(|run| run.iter().map(|r| r.time + r.duration).max().unwrap().max(run[0].time) - run[0].time)
             .sum();
-        prop_assert_eq!(p.cycles, expected);
+        prop_assert_eq!(p.cycles()[0], expected);
     }
 
     /// A real capture with bytes overwritten, timestamps of up to 2^52 cycles spliced in and its tail
@@ -819,19 +817,20 @@ fn class_findings_fire_past_their_thresholds() {
     let f = super::verdict::rank(&a).bound.into_iter().find(|f| f.kind == OccupancyLimited).unwrap();
     let Evidence::Occupancy { observed, need, idle, limit: None } = f.evidence else { panic!("{f:?}") };
     assert!((f.share - 0.2).abs() < 0.01 && idle == Some(f.share) && (need - observed / 0.8).abs() < 0.01, "{f:?}");
-    assert!(f.knob.contains("no resources"), "no limit known: {}", f.knob);
+    assert_eq!(f.knob, Knob::MoreWaves, "no limit known");
     let mut capped = svod_capture("rdna4_gemm_v1", [10, 6, 1]).analyze().unwrap();
     busy(&mut capped, 30, 80);
     let f = super::verdict::rank(&capped).bound.into_iter().find(|f| f.kind == OccupancyLimited).unwrap();
-    assert!(f.knob.contains("resources cap the waves"), "4 of 4 waves: {}", f.knob);
+    assert_eq!(f.knob, Knob::FreeResources, "4 of 4 waves");
 }
 
 fn compared(a: &str, b: &str) -> Diff {
     Diff::load(&fixtures().join("svod").join(a), &fixtures().join("svod").join(b)).unwrap()
 }
 
-fn bucket<'a>(d: &'a Diff, name: &str) -> &'a BucketDelta {
-    d.buckets.iter().find(|b| b.bucket == name).unwrap_or_else(|| panic!("{name}: {:?}", d.buckets))
+fn bucket<'a>(d: &'a Diff, name: &str) -> &'a Delta {
+    let found = d.buckets.iter().find(|b| b.bucket.to_string() == name);
+    &found.unwrap_or_else(|| panic!("{name}: {:?}", d.buckets)).delta
 }
 
 fn finding_delta(d: &Diff, kind: FindingKind) -> [Option<f64>; 2] {
@@ -850,8 +849,11 @@ fn compare_v1_v3_shows_the_select() {
     let wait = bucket(&d, "wait load");
     assert!((280.0..300.0).contains(&wait.raw[0]) && (1020.0..1045.0).contains(&wait.raw[1]), "{wait:?}");
     assert!((720.0..760.0).contains(&wait.delta_raw()) && (580.0..620.0).contains(&wait.delta_exposed()), "{wait:?}");
-    assert_eq!(d.buckets[0].bucket, "wait load", "the largest exposed delta leads");
-    assert_eq!(d.buckets.last().unwrap().bucket, "total");
+    let load = WaitOn { counter: Counter::Load, store: false };
+    assert_eq!(d.buckets[0].bucket, Bucket::Wait(load), "the largest exposed delta leads");
+    let total = d.total.unwrap();
+    let sum = |side: usize| d.buckets.iter().map(|b| b.delta.raw[side]).sum::<f64>();
+    assert!((total.raw[0] - sum(0)).abs() < 1e-6 && (total.raw[1] - sum(1)).abs() < 1e-6, "{total:?}");
     let alu = ["issue valu", "stall valu", "issue salu"].map(|n| bucket(&d, n).delta_raw()).iter().sum::<f64>();
     assert!((260.0..300.0).contains(&alu), "v3's guards: {alu:.1} VALU+SALU cycles a trip");
     let cnd: Vec<&LoopRow> = d.rows.inserted.iter().filter(|r| r.asm.starts_with("v_cndmask_b32")).collect();
@@ -890,7 +892,7 @@ fn compare_with_itself_is_empty() {
     let d = compared("rdna4_gemm_v1", "rdna4_gemm_v1");
     assert!(d.rows.inserted.is_empty() && d.rows.removed.is_empty() && d.cautions.is_empty());
     assert!(d.rows.matched.iter().all(|[a, b]| a == b));
-    assert!(d.buckets.iter().all(|b| b.delta_raw() == 0.0 && b.delta_exposed() == 0.0));
+    assert!(d.buckets.iter().all(|b| b.delta.delta_raw() == 0.0 && b.delta.delta_exposed() == 0.0));
     assert!(d.findings.iter().all(|f| f.share[0] == f.share[1]));
 }
 
@@ -1087,12 +1089,13 @@ fn statements_split_the_loop_exactly() {
     let trips = l.trips.total as f64;
     let raw: f64 = l.statements.iter().map(Statement::raw).sum();
     let exposed: f64 = l.statements.iter().map(Statement::exposed).sum();
-    assert!((raw - l.partition.cycles as f64 / trips).abs() < 1e-6, "{raw} vs {}", l.partition.cycles as f64 / trips);
-    assert!((exposed - l.exposed.cycles as f64 / trips).abs() < 1e-6);
+    let [cycles, exposed_cycles] = l.partition.cycles().map(|c| c as f64 / trips);
+    assert!((raw - cycles).abs() < 1e-6, "{raw} vs {cycles}");
+    assert!((exposed - exposed_cycles).abs() < 1e-6);
     let at = |line: u32| l.statements.iter().find(|s| s.line.map_or(0, |l| l.get()) == line).unwrap();
-    let matrix = l.partition.issued(&[Class::Matrix]) as f64 / trips;
+    let matrix = l.partition.issued(&[Class::Matrix])[0] as f64 / trips;
     assert!((at(1).issue.raw - matrix).abs() < 1e-6, "the products' issue is the mma statement's");
-    let waits = l.partition.waited(|_| true) as f64 / trips;
+    let waits = l.partition.waited(|_| true)[0] as f64 / trips;
     let bound = at(2).wait.raw + at(3).wait.raw;
     assert!(bound > 0.9 * waits, "waits sit on their loads' statements: {bound:.1} of {waits:.1}");
     assert_eq!(at(0).text, "unattributed");

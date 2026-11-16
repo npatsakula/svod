@@ -9,7 +9,7 @@ use std::num::NonZeroU32;
 use serde::{Deserialize, Serialize};
 
 use super::verdict::Charge;
-use super::{Analysis, Cycles, Lines, Stmt};
+use super::{Analysis, Lines, PerTrip, Stmt};
 
 /// A `kernel.tk` line's cycles in the main loop, a traced wave's a trip. The rollup is per line: an
 /// unrolled statement's copies sum into one, each instruction's copy staying on its
@@ -22,11 +22,11 @@ pub struct Statement {
     pub text: String,
     /// The loop's instructions on it.
     pub pcs: usize,
-    pub issue: Cycles,
-    pub stall: Cycles,
-    pub wait: Cycles,
-    pub barrier: Cycles,
-    pub idle: Cycles,
+    pub issue: PerTrip,
+    pub stall: PerTrip,
+    pub wait: PerTrip,
+    pub barrier: PerTrip,
+    pub idle: PerTrip,
 }
 
 /// `listing`'s `line`, trimmed; `?` past its end.
@@ -37,11 +37,11 @@ pub(super) fn listed(listing: &[String], line: NonZeroU32) -> &str {
 impl Statement {
     fn new(line: Option<NonZeroU32>, listing: &[String]) -> Self {
         let text = line.map_or("unattributed", |l| listed(listing, l)).into();
-        let none = Cycles::default();
+        let none = PerTrip::default();
         Self { line, text, pcs: 0, issue: none, stall: none, wait: none, barrier: none, idle: none }
     }
 
-    fn parts(&self) -> [Cycles; 5] {
+    fn parts(&self) -> [PerTrip; 5] {
         [self.issue, self.stall, self.wait, self.barrier, self.idle]
     }
 
@@ -71,7 +71,7 @@ pub(super) fn rollup(
         by.entry(l).or_insert_with(|| Statement::new(l, listing)).pcs += 1;
     }
     let trips = trips.max(1) as f64;
-    let add = |to: &mut Cycles, c: [i64; 2]| {
+    let add = |to: &mut PerTrip, c: [i64; 2]| {
         (to.raw, to.exposed) = (to.raw + c[0] as f64 / trips, to.exposed + c[1] as f64 / trips)
     };
     for (pc, c) in charges {

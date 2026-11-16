@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use svod_device::amd::occupancy::Limit;
 
 use super::verdict::{observed, slowdown};
-use super::{Analysis, Class, FindingKind, Pstate, Reduction, Result, Row, Trips};
+use super::{Analysis, Bucket, Class, FindingKind, Pstate, Reduction, Result, Row, Trips};
 
 /// Traced-over-untraced ratios further apart than this share: the captures ran under different
 /// perturbation, and their cycle shares compare less.
@@ -76,15 +76,22 @@ pub enum Caution {
     NoLoop,
 }
 
-/// A partition bucket's cycles a unit, raw and exposed, on each side.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct BucketDelta {
-    pub bucket: String,
+/// Cycles a unit, raw and exposed, on each side.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct Delta {
     pub raw: [f64; 2],
     pub exposed: [f64; 2],
 }
 
-impl BucketDelta {
+/// A partition bucket's [`Delta`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BucketDelta {
+    pub bucket: Bucket,
+    #[serde(flatten)]
+    pub delta: Delta,
+}
+
+impl Delta {
     pub fn delta_raw(&self) -> f64 {
         self.raw[1] - self.raw[0]
     }
@@ -162,7 +169,8 @@ pub struct StatementDelta {
 }
 
 /// Capture B against capture A. Its JSON keeps these key names: `a`, `b`, `unit`, `cautions`,
-/// `buckets` (`bucket`, `raw`, `exposed`, each `[a, b]`), `findings` (`kind`, `share`), `rows`
+/// `buckets` (`bucket`, `raw`, `exposed`, each `[a, b]`), `total` (`raw`, `exposed`: every bucket's
+/// on each side), `findings` (`kind`, `share`), `rows`
 /// (`inserted`, `removed`, `matched`), and where both captures have lines `statements`
 /// (`statement`, `raw`, `exposed`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -172,6 +180,7 @@ pub struct Diff {
     pub unit: Unit,
     pub cautions: Vec<Caution>,
     pub buckets: Vec<BucketDelta>,
+    pub total: Option<Delta>,
     pub findings: Vec<FindingDelta>,
     pub rows: Rows,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -254,31 +263,29 @@ fn rows(a: &Analysis, b: &Analysis, units: [u64; 2]) -> Rows {
     rows
 }
 
-fn buckets(a: &Analysis, b: &Analysis, units: [u64; 2]) -> Vec<BucketDelta> {
-    let (Some(la), Some(lb)) = (&a.main_loop, &b.main_loop) else { return vec![] };
-    let mut by = BTreeMap::<String, BucketDelta>::new();
-    let mut order = vec![];
+/// Each bucket of either side, largest |Δ exposed| first, and every bucket's cycles; none unless
+/// both have a main loop.
+fn buckets(a: &Analysis, b: &Analysis, units: [u64; 2]) -> (Vec<BucketDelta>, Option<Delta>) {
+    let (Some(la), Some(lb)) = (&a.main_loop, &b.main_loop) else { return (vec![], None) };
+    let (mut by, mut order, mut total) = (BTreeMap::<Bucket, Delta>::new(), vec![], Delta::default());
     for (side, l) in [la, lb].into_iter().enumerate() {
         let per = |c: i64| c as f64 / units[side].max(1) as f64;
-        let named = |p: &super::Partition| {
-            let mut named = p.named();
-            named.push(("total".into(), p.cycles));
-            named
-        };
-        for ((name, raw), (_, exposed)) in named(&l.partition).into_iter().zip(named(&l.exposed)) {
-            let at = by.entry(name.clone()).or_insert_with(|| {
-                order.push(name.clone());
-                BucketDelta { bucket: name, raw: [0.0; 2], exposed: [0.0; 2] }
+        let set =
+            |at: &mut Delta, [raw, exposed]: [i64; 2]| (at.raw[side], at.exposed[side]) = (per(raw), per(exposed));
+        for (&bucket, &cycles) in &l.partition.buckets {
+            let at = by.entry(bucket).or_insert_with(|| {
+                order.push(bucket);
+                Delta::default()
             });
-            (at.raw[side], at.exposed[side]) = (per(raw), per(exposed));
+            set(at, cycles);
         }
+        set(&mut total, l.partition.cycles());
     }
-    let total = by.remove("total");
-    let mut buckets: Vec<BucketDelta> = order.into_iter().filter_map(|n| by.remove(&n)).collect();
-    let key = |d: &BucketDelta| (d.delta_exposed().abs(), d.delta_raw().abs());
+    let mut buckets: Vec<BucketDelta> =
+        order.into_iter().map(|bucket| BucketDelta { bucket, delta: by[&bucket] }).collect();
+    let key = |d: &BucketDelta| (d.delta.delta_exposed().abs(), d.delta.delta_raw().abs());
     buckets.sort_by(|x, y| key(y).0.total_cmp(&key(x).0).then(key(y).1.total_cmp(&key(x).1)));
-    buckets.extend(total);
-    buckets
+    (buckets, Some(total))
 }
 
 /// Each statement of either side by text, largest |Δ exposed| first; none unless both have lines.
@@ -335,10 +342,12 @@ impl Analysis {
             cautions.push(Caution::NoLoop);
         }
         let units = [sa.units, sb.units];
+        let (buckets, total) = buckets(self, b, units);
         Diff {
             unit,
             cautions,
-            buckets: buckets(self, b, units),
+            buckets,
+            total,
             findings: findings(self, b),
             rows: rows(self, b, units),
             statements: statements(self, b, units),
@@ -474,16 +483,13 @@ impl Diff {
     }
 
     fn buckets_text(&self, o: &mut String) {
-        if self.buckets.is_empty() {
-            return;
-        }
+        let Some(total) = self.total else { return };
         let per_k = self.cautions.iter().find_map(|c| match *c {
             Caution::TripsDiffer { a, b } => Some([a.elems as f64, b.elems as f64]),
             _ => None,
         });
-        let quiet =
-            |d: &BucketDelta| d.bucket != "total" && d.delta_raw().abs() < QUIET && d.delta_exposed().abs() < QUIET;
-        let omitted = self.buckets.iter().filter(|d| quiet(d)).count();
+        let quiet = |d: &Delta| d.delta_raw().abs() < QUIET && d.delta_exposed().abs() < QUIET;
+        let omitted = self.buckets.iter().filter(|d| quiet(&d.delta)).count();
         let _ = writeln!(
             o,
             "== loop cycles {} by bucket, largest Δ exposed first ({omitted} within ±{QUIET:.0} omitted)",
@@ -495,12 +501,12 @@ impl Diff {
             "{:<18} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}{k}",
             "bucket", "A raw", "B raw", "Δ raw", "A exp", "B exp", "Δ exp"
         );
-        for d in self.buckets.iter().filter(|d| !quiet(d)) {
+        let shown = self.buckets.iter().filter(|d| !quiet(&d.delta)).map(|d| (d.bucket.to_string(), &d.delta));
+        for (name, d) in shown.chain([("total".to_string(), &total)]) {
             let k = per_k.map_or(String::new(), |[ka, kb]| format!(" {:>8.2}", d.exposed[1] / kb - d.exposed[0] / ka));
             let _ = writeln!(
                 o,
-                "{:<18} {:>8.1} {:>8.1} {:>8} {:>8.1} {:>8.1} {:>8}{k}",
-                d.bucket,
+                "{name:<18} {:>8.1} {:>8.1} {:>8} {:>8.1} {:>8.1} {:>8}{k}",
                 d.raw[0],
                 d.raw[1],
                 signed(d.delta_raw()),

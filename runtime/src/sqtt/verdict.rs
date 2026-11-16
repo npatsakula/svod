@@ -68,12 +68,41 @@ impl WaitOn {
     }
 }
 
-/// What a record's cycles count as in a [`Partition`].
+/// What a record's cycles count as in a [`Partition`]: its issue (and the stall before it), a wait's
+/// or a barrier's.
 #[derive(Debug, Clone, Copy)]
-enum Bucket {
+enum Counts {
     Issue(Class),
     Wait(WaitOn),
     Barrier,
+}
+
+/// What a cycle of the main loop counts as, in report order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Bucket {
+    /// An instruction's issue, by its class.
+    Issue(Class),
+    /// The stall before it issued: a pipe or queue still busy.
+    Stall(Class),
+    /// A wait, by what it waited for.
+    Wait(WaitOn),
+    Barrier,
+    /// A gap between records, by the class of the record after it: the SIMD issuing for another
+    /// wave, or a dependency the trace does not show.
+    Idle(Class),
+}
+
+impl std::fmt::Display for Bucket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Issue(c) => write!(f, "issue {}", c.name()),
+            Self::Stall(c) => write!(f, "stall {}", c.name()),
+            Self::Wait(on) => write!(f, "wait {}", on.name()),
+            Self::Barrier => f.write_str("barrier"),
+            Self::Idle(c) => write!(f, "idle {}", c.name()),
+        }
+    }
 }
 
 fn stores(kind: Option<&Kind>) -> bool {
@@ -95,8 +124,7 @@ pub(super) struct Buckets {
 
 /// What one SE's traced waves did in the main loop.
 pub(super) struct Pass {
-    pub raw: Partition,
-    pub exposed: Partition,
+    pub partition: Partition,
     pub barriers: BTreeMap<u64, BarrierSite>,
     /// The partition's cycles by the instruction they are charged to: a wait's to the instruction
     /// that bound it.
@@ -133,27 +161,6 @@ fn charge(at: &mut [i64; 2], cycles: i64, hidden: i64) {
     (at[0], at[1]) = (at[0].saturating_add(cycles), at[1].saturating_add(cycles - hidden.clamp(0, cycles)));
 }
 
-/// Raw and exposed cycles by key.
-struct Sums<K>(BTreeMap<K, (i64, i64)>);
-
-/// Buckets' cycles by key.
-type Keyed<K> = Vec<(K, i64)>;
-
-impl<K: Ord + Copy> Sums<K> {
-    fn new() -> Self {
-        Self(BTreeMap::new())
-    }
-
-    fn add(&mut self, key: K, cycles: i64, hidden: i64) {
-        let at = self.0.entry(key).or_default();
-        (at.0, at.1) = (at.0.saturating_add(cycles), at.1.saturating_add(cycles - hidden.clamp(0, cycles)));
-    }
-
-    fn split(self) -> (Keyed<K>, Keyed<K>) {
-        self.0.into_iter().filter(|e| e.1.0 > 0).map(|(k, (r, e))| ((k, r), (k, e))).unzip()
-    }
-}
-
 impl Buckets {
     pub(super) fn new(lines: &[(u64, &str)]) -> Self {
         let signal = |line: &str| line.trim_start().starts_with("s_barrier_signal");
@@ -168,18 +175,18 @@ impl Buckets {
     }
 
     /// `binder`: the `(counter, pc)` of the instruction a wait record waited for.
-    fn bucket(&self, pc: u64, binder: Option<&(Counter, u64)>) -> Bucket {
+    fn counts(&self, pc: u64, binder: Option<&(Counter, u64)>) -> Counts {
         let kind = self.kinds.get(&pc).copied().unwrap_or(Kind::Other);
         match (Class::from(kind), kind) {
-            (Class::Barrier, _) => Bucket::Barrier,
-            (Class::WaitVmem | Class::WaitLgkm, Kind::Wait(wait)) => Bucket::Wait(match binder {
+            (Class::Barrier, _) => Counts::Barrier,
+            (Class::WaitVmem | Class::WaitLgkm, Kind::Wait(wait)) => Counts::Wait(match binder {
                 Some(&(counter, at)) => WaitOn { counter, store: stores(self.kinds.get(&at)) },
                 None => {
                     let counter = wait.counts().map(|(c, _)| c).find(|&c| c != Counter::Exp).expect("a counted wait");
                     WaitOn { counter, store: counter == Counter::Store }
                 }
             }),
-            (class, _) => Bucket::Issue(class),
+            (class, _) => Counts::Issue(class),
         }
     }
 
@@ -196,15 +203,15 @@ impl Buckets {
         body: RangeInclusive<u64>,
         hiding: &Hiding,
     ) -> Pass {
-        let (mut issue, mut stall, mut idle) = (Sums::<Class>::new(), Sums::new(), Sums::new());
-        let (mut wait, mut barrier) = (Sums::<WaitOn>::new(), Sums::<()>::new());
-        let (mut raw, mut exposed) = (Partition::default(), Partition::default());
+        let mut p = Partition { waves: 0, buckets: BTreeMap::from([(Bucket::Barrier, [0; 2])]) };
+        let mut sum = |bucket, cycles, hidden| charge(p.buckets.entry(bucket).or_default(), cycles, hidden);
+        let mut waves_in = 0;
         let mut barriers = BTreeMap::<u64, BarrierSite>::new();
         let mut charges = BTreeMap::<u64, Charge>::new();
         let none = HashMap::new();
         for (w, wave) in waves.iter().enumerate() {
             let bound = bound.get(w).unwrap_or(&none);
-            let (mut last, mut run, mut entered) = (wave.begin, None::<(i64, i64)>, false);
+            let (mut last, mut run, mut entered) = (wave.begin, None::<i64>, false);
             // The record that held the wave longest since its last barrier, `(pc, cycles)`, and that
             // as of its signal to the barrier it waits at next.
             let (mut worst, mut arrived) = (None::<(u64, i64)>, None::<(u64, i64)>);
@@ -212,41 +219,39 @@ impl Buckets {
                 let hidden = hiding.record(last, r);
                 last = r.time + r.duration;
                 if !body.contains(&r.pc) {
-                    if let Some((start, cursor)) = run.take() {
-                        raw.cycles = raw.cycles.saturating_add(cursor - start);
-                    }
+                    run = None;
                     continue;
                 }
                 entered = true;
-                let (_, cursor) = run.get_or_insert((r.time, r.time));
+                let cursor = run.get_or_insert(r.time);
                 let gap = (r.time - *cursor).max(0);
                 if gap > 0 {
-                    idle.add(self.class(r.pc), gap, hidden.idle);
+                    sum(Bucket::Idle(self.class(r.pc)), gap, hidden.idle);
                     charge(&mut charges.entry(r.pc).or_default().idle, gap, hidden.idle);
                     *cursor = r.time;
                 }
                 let end = r.time + r.duration;
                 let cycles = (end - *cursor).max(0);
                 let binder = bound.get(&seq);
-                let bucket = self.bucket(r.pc, binder);
-                let held = match bucket {
-                    Bucket::Issue(class) => {
+                let counts = self.counts(r.pc, binder);
+                let held = match counts {
+                    Counts::Issue(class) => {
                         let stalled = ((r.time + r.stall).min(end) - *cursor).max(0);
-                        stall.add(class, stalled, hidden.stall);
-                        issue.add(class, cycles - stalled, hidden.issue);
+                        sum(Bucket::Stall(class), stalled, hidden.stall);
+                        sum(Bucket::Issue(class), cycles - stalled, hidden.issue);
                         let at = charges.entry(r.pc).or_default();
                         charge(&mut at.stall, stalled, hidden.stall);
                         charge(&mut at.issue, cycles - stalled, hidden.issue);
                         stalled
                     }
-                    Bucket::Wait(on) => {
-                        wait.add(on, cycles, hidden.stall + hidden.issue);
+                    Counts::Wait(on) => {
+                        sum(Bucket::Wait(on), cycles, hidden.stall + hidden.issue);
                         let at = charges.entry(binder.map_or(r.pc, |b| b.1)).or_default();
                         charge(&mut at.wait, cycles, hidden.stall + hidden.issue);
                         cycles
                     }
-                    Bucket::Barrier => {
-                        barrier.add((), cycles, hidden.stall + hidden.issue);
+                    Counts::Barrier => {
+                        sum(Bucket::Barrier, cycles, hidden.stall + hidden.issue);
                         charge(&mut charges.entry(r.pc).or_default().barrier, cycles, hidden.stall + hidden.issue);
                         0
                     }
@@ -254,7 +259,7 @@ impl Buckets {
                 if held + gap > 0 && worst.is_none_or(|w| held + gap > w.1) {
                     worst = Some((r.pc, held + gap));
                 }
-                if let Bucket::Barrier = bucket {
+                if let Counts::Barrier = counts {
                     let held = worst.take();
                     match self.signals.contains(&r.pc) {
                         true => arrived = held,
@@ -263,20 +268,11 @@ impl Buckets {
                 }
                 *cursor += cycles;
             }
-            if let Some((start, cursor)) = run {
-                raw.cycles = raw.cycles.saturating_add(cursor - start);
-            }
-            raw.waves += usize::from(entered);
+            waves_in += usize::from(entered);
         }
-        (raw.issue, exposed.issue) = issue.split();
-        (raw.stall, exposed.stall) = stall.split();
-        (raw.wait, exposed.wait) = wait.split();
-        (raw.idle, exposed.idle) = idle.split();
-        let (b, e) = barrier.split();
-        (raw.barrier, exposed.barrier) = (b.first().map_or(0, |b| b.1), e.first().map_or(0, |e| e.1));
-        exposed.waves = raw.waves;
-        exposed.cycles = exposed.buckets();
-        Pass { raw, exposed, barriers, charges }
+        p.waves = waves_in;
+        p.buckets.retain(|&b, c| b == Bucket::Barrier || c[0] > 0);
+        Pass { partition: p, barriers, charges }
     }
 }
 
@@ -313,96 +309,94 @@ pub struct BarrierSite {
 impl BarrierSite {
     /// The SEs' sites by PC, less `base`.
     pub(super) fn merge(sites: impl IntoIterator<Item = Self>, base: u64) -> Vec<Self> {
-        let mut by_pc = BTreeMap::<u64, Self>::new();
+        let mut by_pc = BTreeMap::<u64, (Self, BTreeMap<u64, usize>)>::new();
         for s in sites {
-            let at = by_pc.entry(s.pc - base).or_insert_with(|| Self { pc: s.pc - base, ..Self::default() });
+            let site = || (Self { pc: s.pc - base, ..Self::default() }, BTreeMap::new());
+            let (at, causes) = by_pc.entry(s.pc - base).or_insert_with(site);
             (at.hits, at.last) = (at.hits + s.hits, at.last + s.last);
-            merge(&mut at.causes, &s.causes.iter().map(|&(pc, n)| (pc - base, n)).collect::<Vec<_>>());
+            s.causes.iter().for_each(|&(pc, n)| *causes.entry(pc - base).or_default() += n);
         }
-        let mut sites: Vec<Self> = by_pc.into_values().collect();
-        sites.iter_mut().for_each(|s| s.causes.sort_by_key(|&(pc, n)| (std::cmp::Reverse(n), pc)));
-        sites
+        let sites = by_pc.into_values().map(|(site, causes)| {
+            let mut causes: Vec<(u64, usize)> = causes.into_iter().collect();
+            causes.sort_by_key(|&(pc, n)| (std::cmp::Reverse(n), pc));
+            Self { causes, ..site }
+        });
+        sites.collect()
     }
 }
 
-/// The main loop's traced-wave cycles, each in exactly one bucket: an instruction's `issue` and the
-/// `stall` before it by class (a pipe or queue still busy), `wait` by what the wait waited for,
-/// `barrier`, and `idle` between records by the class of the record after the gap (the SIMD issuing
-/// for another wave, or a dependency the trace does not show). They add up to `cycles`.
+/// The main loop's traced-wave cycles, each in exactly one [`Bucket`], `[raw, exposed]`: exposed
+/// less what other pipes' work on the SIMD hid. A bucket whose raw cycles are none is left out, the
+/// barrier's kept.
 ///
 /// Records overlap where an instruction's duration passes the next one's issue: a cycle goes to the
 /// earlier record, so a matrix op's stall behind the previous matrix op lands in that one's issue.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Partition {
     pub waves: usize,
-    pub cycles: i64,
-    pub issue: Vec<(Class, i64)>,
-    pub stall: Vec<(Class, i64)>,
-    pub wait: Vec<(WaitOn, i64)>,
-    pub barrier: i64,
-    pub idle: Vec<(Class, i64)>,
+    #[serde(with = "pairs")]
+    pub buckets: BTreeMap<Bucket, [i64; 2]>,
 }
 
-fn merge<K: Ord + Copy, V: Copy + std::ops::Add<Output = V> + Default>(into: &mut Vec<(K, V)>, from: &[(K, V)]) {
-    let mut sum: BTreeMap<K, V> = into.iter().copied().collect();
-    for &(k, c) in from {
-        let at = sum.entry(k).or_default();
-        *at = *at + c;
+/// A map with non-string keys as JSON: a list of `[key, value]` pairs.
+mod pairs {
+    use std::collections::BTreeMap;
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer, K: Serialize, V: Serialize>(m: &BTreeMap<K, V>, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(m)
     }
-    *into = sum.into_iter().collect();
-}
 
-fn of<K: PartialEq>(buckets: &[(K, i64)], keys: &[K]) -> i64 {
-    buckets.iter().filter(|(k, _)| keys.is_empty() || keys.contains(k)).map(|c| c.1).sum()
+    pub fn deserialize<'de, D: Deserializer<'de>, K: Deserialize<'de> + Ord, V: Deserialize<'de>>(
+        d: D,
+    ) -> Result<BTreeMap<K, V>, D::Error> {
+        Ok(Vec::<(K, V)>::deserialize(d)?.into_iter().collect())
+    }
 }
 
 impl Partition {
     pub fn add(&mut self, o: &Self) {
-        (self.waves, self.cycles, self.barrier) =
-            (self.waves + o.waves, self.cycles + o.cycles, self.barrier + o.barrier);
-        merge(&mut self.issue, &o.issue);
-        merge(&mut self.stall, &o.stall);
-        merge(&mut self.wait, &o.wait);
-        merge(&mut self.idle, &o.idle);
+        self.waves += o.waves;
+        for (&b, c) in &o.buckets {
+            let at = self.buckets.entry(b).or_default();
+            (at[0], at[1]) = (at[0].saturating_add(c[0]), at[1].saturating_add(c[1]));
+        }
+    }
+
+    /// The cycles of the buckets `keep` keeps, `[raw, exposed]`.
+    pub fn of(&self, keep: impl Fn(Bucket) -> bool) -> [i64; 2] {
+        let kept = self.buckets.iter().filter(|(b, _)| keep(**b));
+        kept.fold([0, 0], |s, (_, c)| [s[0].saturating_add(c[0]), s[1].saturating_add(c[1])])
+    }
+
+    /// Every bucket's cycles: the waves' in the loop.
+    pub fn cycles(&self) -> [i64; 2] {
+        self.of(|_| true)
     }
 
     /// Issue cycles of `classes`; every class where empty.
-    pub fn issued(&self, classes: &[Class]) -> i64 {
-        of(&self.issue, classes)
+    pub fn issued(&self, classes: &[Class]) -> [i64; 2] {
+        self.of(|b| matches!(b, Bucket::Issue(c) if classes.is_empty() || classes.contains(&c)))
     }
 
     /// Stall cycles before an instruction of `classes` issued; every class where empty.
-    pub fn stalled(&self, classes: &[Class]) -> i64 {
-        of(&self.stall, classes)
+    pub fn stalled(&self, classes: &[Class]) -> [i64; 2] {
+        self.of(|b| matches!(b, Bucket::Stall(c) if classes.is_empty() || classes.contains(&c)))
     }
 
     /// Wait cycles on what `on` keeps.
-    pub fn waited(&self, on: impl Fn(WaitOn) -> bool) -> i64 {
-        self.wait.iter().filter(|w| on(w.0)).map(|w| w.1).sum()
+    pub fn waited(&self, on: impl Fn(WaitOn) -> bool) -> [i64; 2] {
+        self.of(|b| matches!(b, Bucket::Wait(w) if on(w)))
+    }
+
+    pub fn barrier(&self) -> [i64; 2] {
+        self.of(|b| b == Bucket::Barrier)
     }
 
     /// Idle cycles before an instruction of `classes`; every class where empty.
-    pub fn idled(&self, classes: &[Class]) -> i64 {
-        of(&self.idle, classes)
-    }
-
-    /// Each bucket by name (`issue valu`, `wait load`, `barrier`, ...) in report order: issue, stall,
-    /// wait, barrier, idle.
-    pub fn named(&self) -> Vec<(String, i64)> {
-        let by = |what: &str, buckets: &[(Class, i64)]| -> Vec<(String, i64)> {
-            buckets.iter().map(|&(c, n)| (format!("{what} {}", c.name()), n)).collect()
-        };
-        let mut named = by("issue", &self.issue);
-        named.extend(by("stall", &self.stall));
-        named.extend(self.wait.iter().map(|&(on, n)| (format!("wait {}", on.name()), n)));
-        named.push(("barrier".into(), self.barrier));
-        named.extend(by("idle", &self.idle));
-        named
-    }
-
-    /// Every bucket's cycles: `cycles` itself.
-    pub fn buckets(&self) -> i64 {
-        self.issued(&[]) + self.stalled(&[]) + self.waited(|_| true) + self.barrier + self.idled(&[])
+    pub fn idled(&self, classes: &[Class]) -> [i64; 2] {
+        self.of(|b| matches!(b, Bucket::Idle(c) if classes.is_empty() || classes.contains(&c)))
     }
 }
 
@@ -517,9 +511,17 @@ pub struct Stall {
 
 /// A trip's cycles of a bucket, and those other pipes' work did not hide.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
-pub struct Cycles {
+pub struct PerTrip {
     pub raw: f64,
     pub exposed: f64,
+}
+
+impl PerTrip {
+    /// `[raw, exposed]` cycles over `trips`.
+    pub fn of(cycles: [i64; 2], trips: u64) -> Self {
+        let trips = trips.max(1) as f64;
+        Self { raw: cycles[0] as f64 / trips, exposed: cycles[1] as f64 / trips }
+    }
 }
 
 /// The loop's instructions of `class` that stalled longest before they issued, a cycle a trip of it
@@ -546,9 +548,9 @@ pub enum Evidence {
     /// The waits on loads and on stores (an LDS flush before a barrier), the stall before the memory
     /// ops issued (a full queue), the instructions that bound the waits, most exposed first, and the
     /// ops that stalled longest before issuing.
-    Waits { load: Cycles, store: Cycles, stall: Cycles, loads: Vec<Load>, stalls: Vec<Stall> },
+    Waits { load: PerTrip, store: PerTrip, stall: PerTrip, loads: Vec<Load>, stalls: Vec<Stall> },
     /// The waves' cycles parked at barriers, and per barrier PC who arrived last and after what.
-    Barrier { cycles: Cycles, sites: Vec<BarrierSite> },
+    Barrier { cycles: PerTrip, sites: Vec<BarrierSite> },
     /// The traced SIMDs' mean resident waves beside those that would fill their idle cycles
     /// (`observed / any busy`; on gfx11 `1 + (waits and barriers) / issue`), the SIMDs' idle share
     /// of the steady window, and the kernel's limit.
@@ -560,15 +562,86 @@ pub enum Evidence {
 
 /// One limiter. `share` is of the loop's traced-wave cycles exposed (raw where `untimed_matrix`),
 /// `raw` before what other pipes hid; for a [`Verdict::bound`] finding both are the share of the
-/// steady window.
+/// steady window, which the text renders alike.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Finding {
     pub kind: FindingKind,
     pub share: f64,
     pub raw: f64,
     pub evidence: Evidence,
-    pub knob: String,
+    pub knob: Knob,
     pub approx: Vec<Approx>,
+}
+
+/// What a finding says to change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Knob {
+    /// Near the matrix pipe's throughput: less matrix work.
+    LessMatrixWork,
+    /// The SIMD issues nearly every cycle, mostly not matrix work.
+    CutIssue,
+    /// The kernel's resources cap the resident waves.
+    FreeResources,
+    /// Fewer waves resident than the kernel allows.
+    MoreWorkgroups,
+    /// More resident waves would fill the idle cycles; the capture records no resources.
+    MoreWaves,
+    /// A use right behind a load forces its wait: the wait at `wait` waits for `load`, then
+    /// `consumer` issues.
+    MoveUse { wait: u64, load: u64, consumer: String },
+    /// More work between a load and its wait.
+    Latency,
+    /// The `ds_store` flush before a barrier.
+    LdsFlush,
+    /// A ds load's use right behind it.
+    LdsUse,
+    /// The LDS queue is full before ds ops issue.
+    LdsQueue,
+    /// A barrier is worth dropping past [`BARRIER`] exposed.
+    Barrier,
+    /// Address and guard arithmetic in the loop.
+    Hoist,
+}
+
+impl std::fmt::Display for Knob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LessMatrixWork => {
+                f.write_str("near the matrix pipe's throughput: only less matrix work (a cheaper type, fewer ops) helps much")
+            }
+            Self::CutIssue => {
+                f.write_str("the SIMD issues nearly every cycle, mostly not matrix work: cut the loop's other instructions")
+            }
+            Self::FreeResources => {
+                f.write_str("the kernel's resources cap the waves: free the limiter (fewer VGPRs, less LDS a workgroup)")
+            }
+            Self::MoreWorkgroups => f.write_str("fewer waves resident than the kernel allows: more workgroups in flight"),
+            Self::MoreWaves => f.write_str(
+                "more resident waves would fill the idle cycles; the capture records no resources to tell what limits them",
+            ),
+            Self::MoveUse { wait, load, consumer } => write!(
+                f,
+                "this use forces the wait right behind the load: move or drop it ({wait:#x} waits for {load:#x}, then `{consumer}`)"
+            ),
+            Self::Latency => f.write_str("latency: more work between a load and its wait (prefetch distance, ring slots)"),
+            Self::LdsFlush => f.write_str(
+                "the ds_store flush before a barrier: fewer, wider stores, or more work between the stores and the barrier",
+            ),
+            Self::LdsUse => f.write_str(
+                "more work between a ds load and its use (load the next fragment earlier), fewer and wider ds loads",
+            ),
+            Self::LdsQueue => {
+                f.write_str("the LDS queue is full before ds ops issue: fewer and wider ds ops, a conflict-free layout")
+            }
+            Self::Barrier => {
+                write!(f, "drop or merge a barrier only if its exposed share passes {:.0}%", 100.0 * BARRIER)
+            }
+            Self::Hoist => {
+                f.write_str("hoist address and guard arithmetic out of the loop; make guards uniform (no exec branches)")
+            }
+        }
+    }
 }
 
 /// The traced SIMDs' pipe busy shares over the steady window: removing every stall gains at most
@@ -578,7 +651,7 @@ pub struct Ceiling {
     pub matrix: f64,
     pub valu: f64,
     pub any: f64,
-    pub queued: Option<Cycles>,
+    pub queued: Option<PerTrip>,
 }
 
 /// The global bytes the loop loads a trip, a traced wave's (every lane of every load), at the
@@ -690,7 +763,8 @@ pub fn load_bytes(asm: &str) -> Option<u64> {
 
 /// What the loop's global loads ask of memory at the dispatch's resident waves.
 fn demand(a: &Analysis) -> Option<Demand> {
-    let l = a.main_loop.as_ref().filter(|l| l.trips.total > 0 && l.partition.waves > 0 && l.partition.cycles > 0)?;
+    let l =
+        a.main_loop.as_ref().filter(|l| l.trips.total > 0 && l.partition.waves > 0 && l.partition.cycles()[0] > 0)?;
     let global = |r: &&Row| {
         let kind = classify(&r.asm).kind;
         r.class == Class::VmemLoad && matches!(kind, Kind::Memory(Memory { space: Space::Global | Space::Buffer, .. }))
@@ -699,7 +773,7 @@ fn demand(a: &Analysis) -> Option<Demand> {
         a.loop_rows().filter(global).filter_map(|r| Some(r.hits as f64 * load_bytes(&r.asm)? as f64)).sum();
     let bytes_per_trip = (lanes * LANES as f64 / l.trips.total as f64).round() as u64;
     let waves: f64 = a.occupancy.ses.iter().map(|s| s.residency.mean()).sum();
-    let cycles_per_trip = l.partition.cycles as f64 / l.trips.total as f64;
+    let cycles_per_trip = l.partition.cycles()[0] as f64 / l.trips.total as f64;
     let sclk_mhz = a.sclk_mhz?;
     (bytes_per_trip > 0 && waves > 0.0).then(|| Demand {
         bytes_per_trip,
@@ -730,45 +804,33 @@ pub(super) fn rank(a: &Analysis) -> Verdict {
         let unmodelled = a.model.is_none().then_some(Approx::PerIteration);
         approx(&more.iter().copied().chain(unmodelled).collect::<Vec<_>>())
     };
-    let finding = |kind, (share, raw), evidence, knob: &str, approx| Finding {
-        kind,
-        share,
-        raw,
-        evidence,
-        knob: knob.into(),
-        approx,
-    };
+    let finding = |kind, (share, raw), evidence, knob, approx| Finding { kind, share, raw, evidence, knob, approx };
     let mut v = Verdict { demand: demand(a), ..Verdict::default() };
-    let l = a.main_loop.as_ref().filter(|l| l.partition.cycles > 0 && l.trips.total > 0);
+    let l = a.main_loop.as_ref().filter(|l| l.partition.cycles()[0] > 0 && l.trips.total > 0);
     let observed = observed(a);
     let limit = a.occupancy.limit.clone();
     let occupancy_knob = |observed: f64| match &limit {
-        Some(l) if observed + 0.5 >= f64::from(l.waves_per_simd) => {
-            "the kernel's resources cap the waves: free the limiter (fewer VGPRs, less LDS a workgroup)"
-        }
-        Some(_) => "fewer waves resident than the kernel allows: more workgroups in flight",
-        None => {
-            "more resident waves would fill the idle cycles; the capture records no resources to tell what limits them"
-        }
+        Some(l) if observed + 0.5 >= f64::from(l.waves_per_simd) => Knob::FreeResources,
+        Some(_) => Knob::MoreWorkgroups,
+        None => Knob::MoreWaves,
     };
     match busy(a).filter(|_| !untimed) {
         Some((matrix, valu, any)) => {
-            let queued = l.map(|l| {
-                let trips = l.trips.total as f64;
-                let raw = l.partition.idled(&[Class::Matrix]) as f64 / trips;
-                Cycles { raw, exposed: l.exposed.idled(&[Class::Matrix]) as f64 / trips }
-            });
+            let queued = l.map(|l| PerTrip::of(l.partition.idled(&[Class::Matrix]), l.trips.total));
             v.ceiling = (matrix > 0.0).then_some(Ceiling { matrix, valu, any, queued });
             let evidence = Evidence::Busy { matrix, valu, any };
             if matrix >= MATRIX_BOUND {
-                let knob =
-                    "near the matrix pipe's throughput: only less matrix work (a cheaper type, fewer ops) helps much";
-                v.bound.push(finding(FindingKind::MatrixBound, (matrix, matrix), evidence.clone(), knob, approx(&[])));
+                let f = finding(
+                    FindingKind::MatrixBound,
+                    (matrix, matrix),
+                    evidence.clone(),
+                    Knob::LessMatrixWork,
+                    approx(&[]),
+                );
+                v.bound.push(f);
             }
             if any >= ISSUE_BOUND && matrix < ISSUE_MATRIX * any {
-                let knob =
-                    "the SIMD issues nearly every cycle, mostly not matrix work: cut the loop's other instructions";
-                v.bound.push(finding(FindingKind::IssueBound, (any, any), evidence, knob, approx(&[])));
+                v.bound.push(finding(FindingKind::IssueBound, (any, any), evidence, Knob::CutIssue, approx(&[])));
             }
             if let Some(observed) = observed.filter(|_| 1.0 - any >= SIMD_IDLE) {
                 let idle = 1.0 - any;
@@ -782,10 +844,10 @@ pub(super) fn rank(a: &Analysis) -> Verdict {
         None => {
             if let Some((l, observed)) = l.zip(observed) {
                 let p = &l.partition;
-                let (stall, issue) = (p.waited(|_| true) + p.barrier, p.issued(&[]) + p.stalled(&[]));
+                let (stall, issue) = (p.waited(|_| true)[0] + p.barrier()[0], p.issued(&[])[0] + p.stalled(&[])[0]);
                 let need = 1.0 + stall as f64 / issue.max(1) as f64;
                 if observed < need {
-                    let share = stall as f64 / p.cycles as f64 * (1.0 - observed / need);
+                    let share = stall as f64 / p.cycles()[0] as f64 * (1.0 - observed / need);
                     let evidence = Evidence::Occupancy { observed, need, idle: None, limit: limit.clone() };
                     let knob = occupancy_knob(observed);
                     let f = finding(FindingKind::OccupancyLimited, (share, share), evidence, knob, approx(raw_flag));
@@ -796,88 +858,81 @@ pub(super) fn rank(a: &Analysis) -> Verdict {
     }
     sort(&mut v.bound);
     let Some(l) = l else { return v };
-    let (p, e, trips) = (&l.partition, &l.exposed, l.trips.total as f64);
-    let share = |cycles: i64| cycles as f64 / p.cycles as f64;
-    let cycles = |raw: i64, exposed: i64| Cycles { raw: raw as f64 / trips, exposed: exposed as f64 / trips };
+    let (p, trips) = (&l.partition, l.trips.total);
+    let share = |cycles: i64| cycles as f64 / p.cycles()[0] as f64;
+    let per_trip_of = |c: [i64; 2]| PerTrip::of(c, trips);
+    let add = |a: [i64; 2], b: [i64; 2]| [a[0].saturating_add(b[0]), a[1].saturating_add(b[1])];
     // Where hidden cycles mean nothing (gfx11), a share is the raw one.
-    let ranked = |raw: i64, exposed: i64| (share(if untimed { raw } else { exposed }), share(raw));
+    let ranked = |c: [i64; 2]| (share(if untimed { c[0] } else { c[1] }), share(c[0]));
 
     let vmem = |on: WaitOn| matches!(on.counter, Counter::Load | Counter::Sample | Counter::Bvh);
-    let (waited, waited_e) = (p.waited(vmem), e.waited(vmem));
-    let (stalled, stalled_e) = (p.stalled(&[Class::VmemLoad]), e.stalled(&[Class::VmemLoad]));
-    let (s, raw) = ranked(waited + stalled, waited_e + stalled_e);
+    let (waited, stalled) = (p.waited(vmem), p.stalled(&[Class::VmemLoad]));
+    let (s, raw) = ranked(add(waited, stalled));
     if s >= LOAD_EXPOSED {
-        let loads = loads(a, Class::VmemLoad, trips);
+        let loads = loads(a, Class::VmemLoad, trips as f64);
         let knob = match loads.first().filter(|l| l.short_cover()) {
-            Some(l) => format!(
-                "this use forces the wait right behind the load: move or drop it ({:#x} waits for {:#x}, then `{}`)",
-                l.wait, l.pc, l.consumer
-            ),
-            None => "latency: more work between a load and its wait (prefetch distance, ring slots)".into(),
+            Some(l) => Knob::MoveUse { wait: l.wait, load: l.pc, consumer: l.consumer.clone() },
+            None => Knob::Latency,
         };
         let guessed = loads.iter().any(|l| l.approx > 0).then_some(Approx::ApproxBindings);
         let more: Vec<Approx> = raw_flag.iter().copied().chain(guessed).collect();
-        let store = |on: WaitOn| on.counter == Counter::Store;
         let evidence = Evidence::Waits {
-            load: cycles(waited, waited_e),
-            store: cycles(p.waited(store), e.waited(store)),
-            stall: cycles(stalled, stalled_e),
+            load: per_trip_of(waited),
+            store: per_trip_of(p.waited(|on| on.counter == Counter::Store)),
+            stall: per_trip_of(stalled),
             loads,
-            stalls: stalls(a, Class::VmemLoad, trips),
+            stalls: stalls(a, Class::VmemLoad, trips as f64),
         };
-        v.findings.push(finding(FindingKind::LoadExposed, (s, raw), evidence, &knob, per_trip(&more)));
+        v.findings.push(finding(FindingKind::LoadExposed, (s, raw), evidence, knob, per_trip(&more)));
     }
 
     let lds = |store: bool| move |on: WaitOn| matches!(on.counter, Counter::Ds | Counter::Lgkm) && on.store == store;
-    let load = cycles(p.waited(lds(false)), e.waited(lds(false)));
-    let store = cycles(p.waited(lds(true)), e.waited(lds(true)));
-    let stall = cycles(p.stalled(&[Class::Lds]), e.stalled(&[Class::Lds]));
-    let waits = (p.waited(lds(false)) + p.waited(lds(true)), e.waited(lds(false)) + e.waited(lds(true)));
+    let (load, store, stall) = (p.waited(lds(false)), p.waited(lds(true)), p.stalled(&[Class::Lds]));
+    let waits = add(load, store);
     // gfx11 leaves an untimed matrix op's cycles on the stall of the op after it: waits alone count.
     let (s, raw) = match untimed {
-        true => (share(waits.0), share(waits.0)),
-        false => ranked(waits.0 + p.stalled(&[Class::Lds]), waits.1 + e.stalled(&[Class::Lds])),
+        true => (share(waits[0]), share(waits[0])),
+        false => ranked(add(waits, stall)),
     };
     if s >= LDS_EXPOSED {
-        let pick = |c: Cycles| if untimed { c.raw } else { c.exposed };
-        let parts = [(pick(store), 0), (pick(load), 1), (if untimed { 0.0 } else { stall.exposed }, 2)];
-        let knob = match parts.into_iter().max_by(|x, y| x.0.total_cmp(&y.0)).map_or(1, |p| p.1) {
-            0 => {
-                "the ds_store flush before a barrier: fewer, wider stores, or more work between the stores and the barrier"
-            }
-            1 => "more work between a ds load and its use (load the next fragment earlier), fewer and wider ds loads",
-            _ => "the LDS queue is full before ds ops issue: fewer and wider ds ops, a conflict-free layout",
-        };
-        let (loads, stalls) = (loads(a, Class::Lds, trips), stalls(a, Class::Lds, trips));
+        let (load, store, stall) = (per_trip_of(load), per_trip_of(store), per_trip_of(stall));
+        let pick = |c: PerTrip| if untimed { c.raw } else { c.exposed };
+        let parts = [
+            (pick(store), Knob::LdsFlush),
+            (pick(load), Knob::LdsUse),
+            (if untimed { 0.0 } else { stall.exposed }, Knob::LdsQueue),
+        ];
+        let knob = parts.into_iter().max_by(|x, y| x.0.total_cmp(&y.0)).map_or(Knob::LdsUse, |p| p.1);
+        let (loads, stalls) = (loads(a, Class::Lds, trips as f64), stalls(a, Class::Lds, trips as f64));
         let evidence = Evidence::Waits { load, store, stall, loads, stalls };
         v.findings.push(finding(FindingKind::LdsExposed, (s, raw), evidence, knob, per_trip(raw_flag)));
     }
 
-    if share(p.barrier) >= BARRIER {
-        let evidence = Evidence::Barrier { cycles: cycles(p.barrier, e.barrier), sites: l.barriers.clone() };
-        let knob = "drop or merge a barrier only if its exposed share passes 10%";
-        let f = finding(FindingKind::Barrier, ranked(p.barrier, e.barrier), evidence, knob, per_trip(raw_flag));
+    let barrier = p.barrier();
+    if share(barrier[0]) >= BARRIER {
+        let evidence = Evidence::Barrier { cycles: per_trip_of(barrier), sites: l.barriers.clone() };
+        let f = finding(FindingKind::Barrier, ranked(barrier), evidence, Knob::Barrier, per_trip(raw_flag));
         v.findings.push(f);
     }
 
     let alu = [Class::Valu, Class::Salu];
-    let matrix = p.issued(&[Class::Matrix]);
+    let matrix = p.issued(&[Class::Matrix])[0];
     let divergent: Vec<(u64, String)> =
         a.loop_rows().filter(|r| divergent(&r.asm)).map(|r| (r.pc, r.asm.clone())).collect();
     // gfx11's matrix issue is a token a op: no measure to set the rest against.
-    let heavy = !untimed && matrix > 0 && p.issued(&alu) as f64 >= LOOP_OVERHEAD * matrix as f64;
+    let heavy = !untimed && matrix > 0 && p.issued(&alu)[0] as f64 >= LOOP_OVERHEAD * matrix as f64;
     if heavy || !divergent.is_empty() {
-        let knob = "hoist address and guard arithmetic out of the loop; make guards uniform (no exec branches)";
+        let trips = trips as f64;
         let valu_hits = a.loop_rows().filter(|r| r.class == Class::Valu).map(|r| r.hits).sum::<u64>() as f64 / trips;
         let evidence = Evidence::Overhead {
-            valu: p.issued(&[Class::Valu]) as f64 / trips,
-            salu: p.issued(&[Class::Salu]) as f64 / trips,
+            valu: p.issued(&[Class::Valu])[0] as f64 / trips,
+            salu: p.issued(&[Class::Salu])[0] as f64 / trips,
             matrix: matrix as f64 / trips,
             valu_hits,
             divergent,
         };
-        let s = ranked(p.issued(&alu), e.issued(&alu));
-        v.findings.push(finding(FindingKind::LoopOverhead, s, evidence, knob, per_trip(raw_flag)));
+        let s = ranked(p.issued(&alu));
+        v.findings.push(finding(FindingKind::LoopOverhead, s, evidence, Knob::Hoist, per_trip(raw_flag)));
     }
     sort(&mut v.findings);
     v
@@ -948,7 +1003,7 @@ pub(super) fn text(a: &Analysis, o: &mut String) {
         let _ = writeln!(o, "none       no loop finding passes its threshold");
     }
     let untimed = a.occupancy.untimed_matrix;
-    let c = |c: &Cycles| match untimed {
+    let c = |c: &PerTrip| match untimed {
         true => format!("{:.0}", c.raw),
         false => format!("{:.0} ({:.0} exposed)", c.raw, c.exposed),
     };

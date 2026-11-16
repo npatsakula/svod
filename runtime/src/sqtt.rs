@@ -28,15 +28,15 @@ mod lines;
 mod statements;
 mod verdict;
 pub use compare::{
-    BucketDelta, Caution, Diff, FindingDelta, LoopRow, Rows, SLOWDOWN_SPREAD, Side, StatementDelta, Unit, align,
+    BucketDelta, Caution, Delta, Diff, FindingDelta, LoopRow, Rows, SLOWDOWN_SPREAD, Side, StatementDelta, Unit, align,
 };
 pub use lines::{
     LineRow, Lines, Statements, Stmt, TwinError, debug_line, locate, parse_debug_line, same_text, text_section,
 };
 pub use statements::Statement;
 pub use verdict::{
-    Approx, BarrierSite, Ceiling, Cycles, Demand, Evidence, Finding, FindingKind, Load, Partition, Stall, Verdict,
-    WaitOn,
+    Approx, BarrierSite, Bucket, Ceiling, Demand, Evidence, Finding, FindingKind, Knob, Load, Partition, PerTrip,
+    Stall, Verdict, WaitOn,
 };
 
 #[derive(Debug, Snafu)]
@@ -523,10 +523,8 @@ pub struct MainLoop {
     /// Cycles between a wave's consecutive back edges.
     pub cycles: Option<Spread>,
     pub trips: Trips,
-    /// The traced waves' cycles in the loop, over every traced SE, and those less what other pipes'
-    /// work hid.
+    /// The traced waves' cycles in the loop, over every traced SE.
     pub partition: Partition,
-    pub exposed: Partition,
     /// The same, SE by SE.
     pub ses: Vec<SeLoop>,
     /// The loop's barriers: who arrived last and after what.
@@ -554,7 +552,6 @@ pub struct SeLoop {
     pub se: u32,
     pub trips: u64,
     pub partition: Partition,
-    pub exposed: Partition,
 }
 
 /// How many waves the kernel's resources let a SIMD hold, and how many the trace saw resident.
@@ -583,8 +580,8 @@ pub struct SeOccupancy {
 
 /// A trace's reading. Its JSON ([`Self::to_json`]) keeps these key names, which a reader may rely
 /// on: `verdict` (`ceiling`, `demand`, and ranked [`Finding`]s in `bound` and `findings`: `kind`,
-/// `share`, `raw`, `evidence`, `knob`, `approx`), `main_loop` (`trips`; `partition` and `exposed`
-/// with `waves`, `cycles`, `issue`, `stall`, `wait`, `barrier`, `idle`; the same per SE in `ses`;
+/// `share`, `raw`, `evidence`, `knob`, `approx`), `main_loop` (`trips`; `partition` with `waves` and
+/// `buckets`, `[bucket, [raw, exposed]]` pairs; the same per SE in `ses`;
 /// `barriers`, `bindings`), `occupancy`, `waits`, `pcs`, `classes`, `traced`, `ses`, `pstate`, `model`
 /// and the header fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1079,16 +1076,15 @@ fn partition_text(o: &mut String, l: &MainLoop, modelled: bool) {
     );
     let _ = writeln!(o, "{:<20} {:>9} {:>7} {:>9} {:>7}{ses}", "bucket", "all", "share", "exposed", "share");
     let per = |cycles: i64, trips: u64| cycles as f64 / trips.max(1) as f64;
-    let (p, e) = (&l.partition, &l.exposed);
-    let lookup = |p: &Partition, name: &str| {
-        if name == "total" { p.cycles } else { p.named().into_iter().find(|b| b.0 == name).map_or(0, |b| b.1) }
-    };
-    let names = p.named().into_iter().map(|b| b.0).chain(["total".to_string()]);
-    for name in names {
-        let ses: String =
-            l.ses.iter().map(|s| format!(" {:>9.1}", per(lookup(&s.partition, &name), s.trips))).collect();
-        let share = |c: i64| 100.0 * c as f64 / p.cycles.max(1) as f64;
-        let (all, exposed) = (lookup(p, &name), lookup(e, &name));
+    let p = &l.partition;
+    let total = p.cycles()[0].max(1) as f64;
+    let rows = p.buckets.keys().map(|&b| (b.to_string(), Some(b))).chain([("total".into(), None)]);
+    for (name, bucket) in rows {
+        // A bucket's cycles, else every bucket's.
+        let of = |p: &Partition| bucket.map_or(p.cycles(), |b| p.buckets.get(&b).copied().unwrap_or_default());
+        let ses: String = l.ses.iter().map(|s| format!(" {:>9.1}", per(of(&s.partition)[0], s.trips))).collect();
+        let [all, exposed] = of(p);
+        let share = |c: i64| 100.0 * c as f64 / total;
         let _ = writeln!(
             o,
             "{name:<20} {:>9.1} {:>6.1}% {:>9.1} {:>6.1}%{ses}",
@@ -1158,15 +1154,12 @@ fn main_loop<'a>(
             for (pc, c) in pass.charges {
                 charges.entry(pc - base).or_default().add(&c);
             }
-            SeLoop { se: s.se, trips: edges * u64::from(per_iteration), partition: pass.raw, exposed: pass.exposed }
+            SeLoop { se: s.se, trips: edges * u64::from(per_iteration), partition: pass.partition }
         })
         .filter(|s| s.partition.waves > 0)
         .collect();
-    let (mut partition, mut exposed) = (Partition::default(), Partition::default());
-    ses.iter().for_each(|s| {
-        partition.add(&s.partition);
-        exposed.add(&s.exposed);
-    });
+    let mut partition = Partition::default();
+    ses.iter().for_each(|s| partition.add(&s.partition));
     let trips = Trips { per_iteration, total: ses.iter().map(|s| s.trips).sum() };
     let body = lines.iter().map(|l| l.0).filter(|pc| (head..=edge).contains(pc)).map(|pc| pc - base);
     let statements =
@@ -1179,7 +1172,6 @@ fn main_loop<'a>(
         cycles: Spread::of(cycles),
         trips,
         partition,
-        exposed,
         ses,
         barriers: BarrierSite::merge(sites, base)
             .into_iter()
