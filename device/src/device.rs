@@ -266,10 +266,7 @@ pub trait PlanContext: Send + Sync {
     /// [`DispatchTimestamps::sqtt`](crate::DispatchTimestamps::sqtt). Backends
     /// without thread tracing refuse to arm.
     fn set_sqtt(&self, config: Option<crate::profile::SqttConfig>) -> Result<()> {
-        snafu::ensure!(
-            config.is_none(),
-            crate::error::SqttUnsupportedSnafu { reason: "this backend has no thread trace" }
-        );
+        snafu::ensure!(config.is_none(), crate::error::sqtt_unsupported::BackendSnafu);
         Ok(())
     }
 }

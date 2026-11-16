@@ -495,9 +495,9 @@ impl SqttOptions {
     /// The default config with `SVOD_SQTT_PSTATE` (`standard` or `peak`) pinning the clock and
     /// `SVOD_SQTT_SIMD` (a SIMD, or a comma list repeated over the SEs) picking each SE's SIMD.
     pub fn config_from_env() -> Result<svod_device::profile::SqttConfig, EnvError> {
-        fn var<T: std::str::FromStr<Err = String>>(var: &'static str) -> Result<Option<T>, EnvError> {
+        fn var<T: std::str::FromStr<Err: std::fmt::Display>>(var: &'static str) -> Result<Option<T>, EnvError> {
             let Ok(value) = std::env::var(var) else { return Ok(None) };
-            value.parse().map(Some).map_err(|why| EnvError { var, value, why })
+            value.parse().map(Some).map_err(|why: T::Err| EnvError { var, value, why: why.to_string() })
         }
         let mut config = svod_device::profile::SqttConfig { pstate: var("SVOD_SQTT_PSTATE")?, ..Default::default() };
         if let Some(simds) = var("SVOD_SQTT_SIMD")? {

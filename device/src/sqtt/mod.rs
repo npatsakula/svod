@@ -22,10 +22,11 @@ use std::borrow::Cow;
 
 pub use decode::{Decoder, decode};
 
-/// The packet layout a trace announces in its `HEADER`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// The packet layout a trace announces in its `HEADER`; a stream starts in layout 3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Layout {
     /// Layout 3: gfx11 (RDNA3, RDNA3.5).
+    #[default]
     Rdna3,
     /// Layout 4: gfx12 (RDNA4).
     Rdna4,
@@ -57,8 +58,8 @@ impl Unit {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Header {
-    /// The trace version: 3 on gfx11, 4 on gfx12.
-    pub version: u8,
+    /// The layout its version announces: 3 on gfx11, 4 on gfx12.
+    pub layout: Layout,
     /// The instruction-traced SIMD, WGP and shader array.
     pub dsimd: u8,
     pub dwgp: u8,
@@ -80,7 +81,7 @@ pub struct Header {
 impl Header {
     /// The issue cycles of a double-precision VALU op (`dprate` in AMD's `rdna_sqtt.cpp`).
     pub fn dp_cycles(self) -> u32 {
-        match self.dp_rate & if self.version < 3 { 0xf } else { 7 } {
+        match self.dp_rate & 7 {
             0 => 1,
             dpr => 1 << (dpr - 1),
         }
@@ -133,7 +134,8 @@ pub struct Popcount {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Nop,
-    Header(Header),
+    /// A `HEADER` of layout 3 or 4, else the version it announced, where decoding stops.
+    Header(Result<Header, u8>),
     /// `WAVE_START` and `WAVE_START_EXT`.
     WaveStart(WaveStart),
     WaveEnd(Unit),

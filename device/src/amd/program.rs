@@ -715,10 +715,11 @@ impl AmdProgram {
             let (start, read) = crate::amd::pmc::build_streams(self.dev.arch, &pmc_counters, &grid, gpu);
             Some((buf, host, grid, start, read))
         };
-        let sqtt = match owner.sqtt_config().filter(|_| profile && is_pm4) {
-            Some(config) => Some(crate::amd::sqtt::Capture::new(
+        let sqtt = match owner.armed_sqtt().filter(|_| profile && is_pm4) {
+            Some((config, arch)) => Some(crate::amd::sqtt::Capture::new(
                 owner.allocator(),
                 config,
+                arch,
                 (g[0] * g[1] * g[2]) as u64,
                 Arc::clone(&self.image),
             )?),

@@ -8,6 +8,10 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use snafu::OptionExt;
+
+use crate::error::{SqttUnsupported, sqtt_unsupported};
+
 /// An AMD hardware counter: the SQ block (gfx11/RDNA3.5), which answers the
 /// ILP/occupancy question: VALU instructions issued vs SQ-busy cycles, plus
 /// waves launched.
@@ -165,8 +169,8 @@ pub struct SqttConfig {
     pub se_mask: u32,
     /// The SIMD of WGP 0, SA 0 whose instructions each SE traces.
     pub simds: SqttSimds,
-    /// Trace buffer per SE, a multiple of 4 KiB.
-    pub bytes_per_se: usize,
+    /// Trace buffer per SE.
+    pub window: TraceWindow,
     /// Narrow `COMPUTE_STATIC_THREAD_MGMT_SE*` so a small grid lands on the
     /// traced WGP (restored after the dispatch).
     pub limit_cu: bool,
@@ -178,44 +182,113 @@ pub struct SqttConfig {
 
 impl Default for SqttConfig {
     fn default() -> Self {
-        Self { se_mask: 0b11, simds: SqttSimds::default(), bytes_per_se: 64 << 20, limit_cu: false, pstate: None }
+        Self {
+            se_mask: 0b11,
+            simds: SqttSimds::default(),
+            window: TraceWindow::default(),
+            limit_cu: false,
+            pstate: None,
+        }
     }
 }
 
-/// The SIMD (0-3) each SE traces, SE `i` the `i % 8`th. The default alternates SIMDs 0 and 1:
+/// One SE's trace buffer in 4 KiB pages: nonzero and below 2^22, the `BUF0_SIZE` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TraceWindow(std::num::NonZeroU32);
+
+impl TraceWindow {
+    pub const PAGE: usize = 4 << 10;
+
+    pub fn pages(self) -> u32 {
+        self.0.get()
+    }
+
+    pub fn bytes(self) -> usize {
+        self.pages() as usize * Self::PAGE
+    }
+}
+
+/// 64 MiB.
+impl Default for TraceWindow {
+    fn default() -> Self {
+        Self(std::num::NonZeroU32::new((64 << 20) / Self::PAGE as u32).expect("nonzero"))
+    }
+}
+
+impl TryFrom<u32> for TraceWindow {
+    type Error = SqttUnsupported;
+
+    /// A window of `pages` 4 KiB pages.
+    fn try_from(pages: u32) -> Result<Self, SqttUnsupported> {
+        let window = std::num::NonZeroU32::new(pages).filter(|p| p.get() < 1 << 22);
+        window.map(Self).context(sqtt_unsupported::ConfigSnafu {
+            field: "window",
+            value: format!("{pages} pages"),
+            why: "a nonzero count of 4 KiB pages below 2^22 (16 GiB)",
+        })
+    }
+}
+
+/// A SIMD of a WGP, 0-3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Simd(u8);
+
+impl Simd {
+    pub fn get(self) -> u8 {
+        self.0
+    }
+}
+
+impl TryFrom<u8> for Simd {
+    type Error = SqttUnsupported;
+
+    fn try_from(simd: u8) -> Result<Self, SqttUnsupported> {
+        snafu::ensure!(
+            simd < 4,
+            sqtt_unsupported::ConfigSnafu { field: "simd", value: simd.to_string(), why: "a WGP SIMD is 0-3" }
+        );
+        Ok(Self(simd))
+    }
+}
+
+/// The SIMD each SE traces, SE `i` the `i % 8`th. The default alternates SIMDs 0 and 1:
 /// on RDNA3/4 SIMD bit 1 picks the WGP's CU, so the SEs between them sample both SIMDs of CU 0,
 /// which hold a CU-mode workgroup's waves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SqttSimds(pub [u8; 8]);
+pub struct SqttSimds(pub [Simd; 8]);
 
 impl SqttSimds {
     /// `list` repeated over the SEs.
-    pub fn cycle(list: &[u8]) -> Self {
+    pub fn cycle(list: &[Simd]) -> Self {
         assert!(!list.is_empty(), "a SIMD list names at least one SIMD");
         Self(std::array::from_fn(|se| list[se % list.len()]))
     }
 
-    pub fn of(self, se: u32) -> u8 {
+    pub fn of(self, se: u32) -> Simd {
         self.0[se as usize % self.0.len()]
     }
 }
 
 impl Default for SqttSimds {
     fn default() -> Self {
-        Self::cycle(&[0, 1])
+        Self::cycle(&[Simd(0), Simd(1)])
     }
 }
 
-/// A SIMD for every SE, or a comma list repeated over the SEs.
+/// A SIMD for every SE, or a comma list of up to 8 repeated over the SEs.
 impl std::str::FromStr for SqttSimds {
-    type Err = String;
+    type Err = SqttUnsupported;
 
-    fn from_str(s: &str) -> Result<Self, String> {
-        let list = s.split(',').map(|v| v.trim().parse::<u8>()).collect::<Result<Vec<_>, _>>();
-        match list {
-            Ok(list) if (1..=8).contains(&list.len()) => Ok(Self::cycle(&list)),
-            _ => Err(format!("{s:?}: a SIMD or a comma list of up to 8")),
-        }
+    fn from_str(s: &str) -> Result<Self, SqttUnsupported> {
+        let bad = || sqtt_unsupported::ConfigSnafu {
+            field: "simds",
+            value: format!("{s:?}"),
+            why: "a SIMD or a comma list of up to 8",
+        };
+        let list = s.split(',').map(|v| v.trim().parse::<u8>().ok().context(bad())?.try_into());
+        let list = list.collect::<Result<Vec<Simd>, _>>()?;
+        snafu::ensure!((1..=8).contains(&list.len()), bad());
+        Ok(Self::cycle(&list))
     }
 }
 

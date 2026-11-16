@@ -20,7 +20,7 @@ use svod_device::sqtt::report::{Report, Stats};
 use svod_device::sqtt::simd::{PipeBusy, ROBUST, Residency, STEADY, Simd};
 use svod_device::sqtt::stitch::{Stitcher, branch, objdump_lines};
 use svod_device::sqtt::waits::{Binding, Replay, Waits};
-use svod_device::sqtt::{Layout, decode, wave};
+use svod_device::sqtt::{decode, wave};
 use svod_dtype::AmdArch;
 
 mod compare;
@@ -598,11 +598,7 @@ impl Analysis {
                 span,
             });
             let residency = Residency::new(&trace.occupancy);
-            let se_layout = match trace.header.version {
-                3 => Layout::Rdna3,
-                4 => Layout::Rdna4,
-                _ => continue,
-            };
+            let Some(h) = trace.header else { continue };
             if !se.itrace {
                 occupancy.extend(residency.map(|residency| SeOccupancy {
                     se: se.se,
@@ -613,9 +609,8 @@ impl Analysis {
                 }));
                 continue;
             }
-            let h = trace.header;
-            layout.get_or_insert(se_layout);
-            let mut stitcher = Stitcher::new(&lines, se_layout);
+            layout.get_or_insert(h.layout);
+            let mut stitcher = Stitcher::new(&lines, h.layout);
             for wave in &mut trace.waves {
                 stitcher.stitch(wave);
             }

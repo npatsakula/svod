@@ -19,7 +19,7 @@ use crate::amd::connector::SubmissionFinalizer;
 use crate::amd::regwrite::RegWriter;
 use crate::amd::sys::{drm, ioctl, pm4};
 use crate::amd::topology::AmdNode;
-use crate::error::{Error, Result, SqttUnsupportedSnafu};
+use crate::error::{Error, Result, SqttUnsupported, sqtt_unsupported};
 use crate::profile::{CodeImage, SeTrace, SqttConfig, SqttTrace, StablePstate};
 use crate::sync::DispatchTimestamps;
 
@@ -40,7 +40,6 @@ const TOKEN_EXCLUDE_NO_ITRACE_GFX12: u32 = 0x927;
 const WPTR_OFFSET_MASK: u32 = 0x1FFF_FFFF;
 /// `COMPUTE_STATIC_THREAD_MGMT_SE0..7`, the per-SE CU masks Tinygrad narrows.
 const THREAD_MGMT_SES: u32 = 8;
-const BUFFER_ALIGN: usize = 1 << 12;
 
 /// The shader-engine geometry the streams cover.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,53 +59,50 @@ impl SqttTopology {
     }
 }
 
-/// Refuse what the capture does not cover: CDNA (gfx9's stream and tokens
-/// differ) and AQL queues, whose dispatch the CP launches without our PM4.
-pub fn check_target(arch: AmdArch, pm4_queues: bool) -> Result<()> {
-    ensure!(
-        matches!(arch.gfx_major(), 11 | 12),
-        SqttUnsupportedSnafu { reason: format!("{arch} (only gfx11 and gfx12 are traced)") }
-    );
-    ensure!(pm4_queues, SqttUnsupportedSnafu { reason: "AQL queues (thread trace needs PM4 queues)" });
-    Ok(())
+/// A target whose thread trace the capture covers: gfx11 (RDNA3, RDNA3.5) or gfx12 (RDNA4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SqttArch {
+    Gfx11,
+    Gfx12,
 }
 
-pub fn check_config(config: &SqttConfig) -> Result<()> {
-    let simds = config.simds.0;
-    ensure!(
-        simds.iter().all(|&s| s < 4),
-        SqttUnsupportedSnafu { reason: format!("simds {simds:?} (a WGP SIMD is 0-3)") }
-    );
-    // BUF0_SIZE holds the window in 4 KiB units in a 22-bit field.
-    ensure!(
-        config.bytes_per_se > 0
-            && config.bytes_per_se.is_multiple_of(BUFFER_ALIGN)
-            && config.bytes_per_se >> 12 < 1 << 22,
-        SqttUnsupportedSnafu {
-            reason: format!("bytes_per_se {} (a nonzero multiple of 4 KiB below 16 GiB)", config.bytes_per_se)
+/// CDNA's stream and tokens are gfx9's, which the capture does not cover.
+impl TryFrom<AmdArch> for SqttArch {
+    type Error = SqttUnsupported;
+
+    fn try_from(arch: AmdArch) -> Result<Self, SqttUnsupported> {
+        match arch.gfx_major() {
+            11 => Ok(Self::Gfx11),
+            12 => Ok(Self::Gfx12),
+            _ => sqtt_unsupported::ArchSnafu { arch }.fail(),
         }
-    );
-    Ok(())
+    }
+}
+
+/// Refuse what the capture does not cover: an arch [`SqttArch`] refuses, and AQL
+/// queues, whose dispatch the CP launches without our PM4.
+pub fn check_target(arch: AmdArch, pm4_queues: bool) -> Result<SqttArch, SqttUnsupported> {
+    let arch = SqttArch::try_from(arch)?;
+    ensure!(pm4_queues, sqtt_unsupported::AqlQueuesSnafu);
+    Ok(arch)
 }
 
 /// The traced dispatch's start and stop PM4 streams.
 ///
-/// SE `i` writes the `bytes_per_se` window at `buf_va + i * bytes_per_se`
-/// (4 KiB aligned) and its final write pointer to the `u32` at `wptr_va + 4 * i`.
-/// `workgroups` sizes the CU masks of `limit_cu`.
+/// SE `i` writes the window at `buf_va + i * window` (4 KiB aligned) and its
+/// final write pointer to the `u32` at `wptr_va + 4 * i`. `workgroups` sizes
+/// the CU masks of `limit_cu`.
 pub fn build_streams(
     config: &SqttConfig,
-    arch: AmdArch,
+    arch: SqttArch,
     topology: &SqttTopology,
     workgroups: u64,
     buf_va: u64,
     wptr_va: u64,
-) -> Result<(Vec<u32>, Vec<u32>)> {
-    check_target(arch, true)?;
-    check_config(config)?;
-    let gc = RegWriter::for_arch(arch).expect("gfx11 and gfx12 GC registers are vendored");
-    let gfx12 = arch.gfx_major() >= 12;
-    let window = config.bytes_per_se as u64;
+) -> Result<(Vec<u32>, Vec<u32>), SqttUnsupported> {
+    let gc = RegWriter::from(arch);
+    let gfx12 = arch == SqttArch::Gfx12;
+    let window = config.window.bytes() as u64;
     let cu_masks = if config.limit_cu { Some(cu_masks(topology, workgroups)?) } else { None };
 
     let mut start = Vec::new();
@@ -117,11 +113,11 @@ pub fn build_streams(
         let base = buf_va + se as u64 * window;
         let (lo, hi) = ((base >> 12) as u32, (base >> 44) as u32);
         if gfx12 {
-            gc.wreg(&mut start, "regSQ_THREAD_TRACE_BUF0_SIZE", &[("size", (window >> 12) as u32)]);
+            gc.wreg(&mut start, "regSQ_THREAD_TRACE_BUF0_SIZE", &[("size", config.window.pages())]);
             gc.wreg_value(&mut start, "regSQ_THREAD_TRACE_BUF0_BASE_LO", lo);
             gc.wreg_value(&mut start, "regSQ_THREAD_TRACE_BUF0_BASE_HI", hi);
         } else {
-            gc.wreg(&mut start, "regSQ_THREAD_TRACE_BUF0_SIZE", &[("size", (window >> 12) as u32), ("base_hi", hi)]);
+            gc.wreg(&mut start, "regSQ_THREAD_TRACE_BUF0_SIZE", &[("size", config.window.pages()), ("base_hi", hi)]);
             gc.wreg_value(&mut start, "regSQ_THREAD_TRACE_BUF0_BASE", lo);
         }
         gc.wreg(
@@ -129,7 +125,7 @@ pub fn build_streams(
             "regSQ_THREAD_TRACE_MASK",
             &[
                 ("wtype_include", WTYPE_INCLUDE_CS),
-                ("simd_sel", config.simds.of(se).into()),
+                ("simd_sel", config.simds.of(se).get().into()),
                 ("wgp_sel", 0),
                 ("sa_sel", 0),
             ],
@@ -227,12 +223,10 @@ fn field_mask(r: &crate::amd::am::regs::RegDef, name: &str) -> u32 {
 
 /// Tinygrad's `SQTT_LIMIT_SE=1` masks: enough CUs per SE for `workgroups` at
 /// four waves a CU, one more on SE 0, kept to the first SA's CUs.
-pub fn cu_masks(topology: &SqttTopology, workgroups: u64) -> Result<[u32; THREAD_MGMT_SES as usize]> {
-    let sa_bits = topology.cu_per_sa / 2;
-    ensure!(
-        sa_bits > 0 && topology.cu_per_se > 0,
-        SqttUnsupportedSnafu { reason: format!("limit_cu on an unknown CU topology {topology:?}") }
-    );
+pub fn cu_masks(topology: &SqttTopology, workgroups: u64) -> Result<[u32; THREAD_MGMT_SES as usize], SqttUnsupported> {
+    let &SqttTopology { cu_per_se, cu_per_sa, .. } = topology;
+    let sa_bits = cu_per_sa / 2;
+    ensure!(sa_bits > 0 && cu_per_se > 0, sqtt_unsupported::TopologySnafu { cu_per_se, cu_per_sa });
     let ones = |bits: u64| if bits >= 128 { u128::MAX } else { (1u128 << bits) - 1 };
     let per_se = workgroups / (topology.cu_per_se as u64 * 4);
     let sa_mask = ones(sa_bits as u64);
@@ -279,14 +273,14 @@ impl Capture {
     pub(crate) fn new(
         allocator: &AmdAllocator,
         config: SqttConfig,
+        sqtt_arch: SqttArch,
         workgroups: u64,
         code: Arc<CodeImage>,
     ) -> Result<Self> {
         let core = allocator.dev.core();
         let arch = core.arch;
         let topology = SqttTopology::from_node(&core.node);
-        check_config(&config)?;
-        let bytes = config.bytes_per_se * topology.se as usize;
+        let bytes = config.window.bytes() * topology.se as usize;
         let spec = BufferSpec { cpu_access: true, nolru: true, ..Default::default() };
         let trace = match allocator.alloc(bytes, &spec, false) {
             Ok(buffer) => buffer,
@@ -299,7 +293,7 @@ impl Capture {
         let wptrs = AmdBufferGuard::new(allocator.alloc_uncached((topology.se as usize * 4).max(64))?);
         let (trace_va, trace_host) = host_visible(trace.buffer())?;
         let (wptr_va, wptrs_host) = host_visible(wptrs.buffer())?;
-        let (start, stop) = build_streams(&config, arch, &topology, workgroups, trace_va, wptr_va)?;
+        let (start, stop) = build_streams(&config, sqtt_arch, &topology, workgroups, trace_va, wptr_va)?;
         let mclk_mhz = current_mclk_mhz(core.node.drm_render_minor);
         Ok(Self { trace, trace_host, wptrs, wptrs_host, start, stop, config, arch, ses: topology.se, code, mclk_mhz })
     }
@@ -401,7 +395,7 @@ impl DispatchTimestamps for SqttHandle {
         let RawBuffer::AmdDevice { gpu_addr: trace_va, .. } = &self.trace else {
             unreachable!("an SQTT trace buffer is an AMD allocation")
         };
-        let window = self.config.bytes_per_se;
+        let window = self.config.window.bytes();
         let per_se = (0..self.ses)
             .map(|se| {
                 // SAFETY: `wptrs_host` maps `ses` u32s written by COPY_DATA before

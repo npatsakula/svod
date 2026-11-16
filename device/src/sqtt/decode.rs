@@ -132,7 +132,8 @@ impl Decoder<'_> {
         self.layout
     }
 
-    /// The version of a `HEADER` that is neither 3 nor 4 (CDNA, or not a header at all); decoding stops there.
+    /// The version of a `HEADER` that is neither 3 nor 4 (CDNA, or not a header at all): the last packet
+    /// decoded, as `Kind::Header(Err(version))`.
     pub fn unsupported_layout(&self) -> Option<u8> {
         self.unsupported
     }
@@ -176,16 +177,10 @@ impl Iterator for Decoder<'_> {
             _ => delta,
         });
         self.nibble += nibbles;
-        if let Kind::Header(header) = kind {
-            match header.version {
-                3 => self.layout = Layout::Rdna3,
-                4 => self.layout = Layout::Rdna4,
-                other => {
-                    self.unsupported = Some(other);
-                    return None;
-                }
-            }
-            self.wsm = header.wsm;
+        match kind {
+            Kind::Header(Ok(header)) => (self.layout, self.wsm) = (header.layout, header.wsm),
+            Kind::Header(Err(version)) => self.unsupported = Some(version),
+            _ => {}
         }
         Some(Packet { time: self.time, raw, kind })
     }
@@ -205,21 +200,28 @@ fn kind(token: Token, r: u64, extra: u64, layout: Layout, delta: u64) -> Kind {
     let popcount = |lo: u32| Popcount { wave: b(lo + 4, lo), count: b(lo + 11, lo + 5), valu: flag(r, lo + 12) };
     match token {
         Token::Nop => Kind::Nop,
-        Token::Header => Kind::Header(Header {
-            version: b(12, 7),
-            dsimd: b(14, 13),
-            dwgp: b(17, 15),
-            dsa: b(19, 19),
-            nsa: b(20, 20),
-            nwgp: b(23, 21),
-            wsm: b(26, 25),
-            ucf: flag(r, 27),
-            dp_rate: b(31, 28),
-            dp_derate: b(34, 33),
-            exec: flag(r, 42),
-            dbl: flag(r, 43),
-            exbarw: flag(r, 59),
-        }),
+        Token::Header => Kind::Header(
+            match b(12, 7) {
+                3 => Ok(Layout::Rdna3),
+                4 => Ok(Layout::Rdna4),
+                version => Err(version),
+            }
+            .map(|layout| Header {
+                layout,
+                dsimd: b(14, 13),
+                dwgp: b(17, 15),
+                dsa: b(19, 19),
+                nsa: b(20, 20),
+                nwgp: b(23, 21),
+                wsm: b(26, 25),
+                ucf: flag(r, 27),
+                dp_rate: b(31, 28),
+                dp_derate: b(34, 33),
+                exec: flag(r, 42),
+                dbl: flag(r, 43),
+                exbarw: flag(r, 59),
+            }),
+        ),
         Token::WaveStart | Token::WaveStartExt if rdna4 => {
             let ext = flag(r, 4) && !flag(r, 32);
             Kind::WaveStart(WaveStart {

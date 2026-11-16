@@ -725,6 +725,7 @@ impl Drop for PoolQueue {
 /// one, the stable power state it holds until disarmed.
 struct ArmedSqtt {
     config: crate::profile::SqttConfig,
+    arch: crate::amd::sqtt::SqttArch,
     pstate: Option<Box<dyn Send + Sync>>,
 }
 
@@ -761,9 +762,9 @@ impl OwnerCtx {
         self.pmc.lock().clone()
     }
 
-    /// The thread trace armed for this owner's profiling dispatches.
-    pub fn sqtt_config(&self) -> Option<crate::profile::SqttConfig> {
-        self.sqtt.lock().as_ref().map(|armed| armed.config)
+    /// The thread trace armed for this owner's profiling dispatches, and the target it was armed for.
+    pub fn armed_sqtt(&self) -> Option<(crate::profile::SqttConfig, crate::amd::sqtt::SqttArch)> {
+        self.sqtt.lock().as_ref().map(|armed| (armed.config, armed.arch))
     }
 
     #[inline]
@@ -974,8 +975,7 @@ impl crate::device::PlanContext for OwnerCtx {
             *armed = None;
             return Ok(());
         };
-        crate::amd::sqtt::check_target(self.core.arch, self.core.pm4_queues())?;
-        crate::amd::sqtt::check_config(&config)?;
+        let arch = crate::amd::sqtt::check_target(self.core.arch, self.core.pm4_queues())?;
         // A pin at another state is released before the new one is taken: the
         // kernel refuses a second level while one context holds the device.
         let held = armed.take().filter(|armed| armed.config.pstate == config.pstate).and_then(|armed| armed.pstate);
@@ -989,7 +989,7 @@ impl crate::device::PlanContext for OwnerCtx {
                 Err(error) => return Err(error).context(crate::error::SqttPowerStateSnafu),
             },
         };
-        *armed = Some(ArmedSqtt { config, pstate });
+        *armed = Some(ArmedSqtt { config, arch, pstate });
         Ok(())
     }
 

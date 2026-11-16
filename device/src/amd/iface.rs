@@ -85,7 +85,7 @@ pub trait AmdIface: Send + Sync + std::fmt::Debug {
     /// Hold the device at `mode` until the returned guard drops (for SQTT).
     /// Backends without an amdgpu DRM context refuse.
     fn hold_stable_pstate(&self, _mode: crate::profile::StablePstate) -> Result<Box<dyn Send + Sync>> {
-        crate::error::SqttUnsupportedSnafu { reason: "no amdgpu DRM context on this backend" }.fail()
+        Err(crate::error::SqttUnsupported::NoDrmContext.into())
     }
 
     /// Fault-injection checkpoint around queue publication. Production

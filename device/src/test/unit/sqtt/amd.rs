@@ -5,7 +5,7 @@ use test_case::test_case;
 
 use crate::sqtt::report::{Report, Stats};
 use crate::sqtt::stitch::{Stitcher, objdump_lines};
-use crate::sqtt::{Layout, decode, wave};
+use crate::sqtt::{decode, wave};
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/test/fixtures/sqtt/amd").join(name)
@@ -37,7 +37,7 @@ fn matches_amd(name: &str) {
     let dump = read("code_object.s");
     let code: Vec<(u64, &str)> = objdump_lines(&dump).into_iter().map(|(pc, line)| (pc + base, line)).collect();
     let mut trace = wave::analyze(decode(&std::fs::read(dir.join("se0.att")).unwrap()));
-    let layout = if trace.header.version == 4 { Layout::Rdna4 } else { Layout::Rdna3 };
+    let layout = trace.header.unwrap_or_default().layout;
     let mut stitcher = Stitcher::new(&code, layout);
     for wave in &mut trace.waves {
         let records = wave.instructions.len();

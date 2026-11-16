@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use super::{Category, EINST_JUMP, EINST_RFE, EINST_TRAP, Header, Kind, OpClass, Packet, Unit, WaveStart};
+use super::{Category, EINST_JUMP, EINST_RFE, EINST_TRAP, Header, Kind, Layout, OpClass, Packet, Unit, WaveStart};
 
 /// One traced instruction. `time` is its issue (or, after a stall, the stall's start); `pc` is 0 until
 /// a [`Stitcher`](super::stitch::Stitcher) attributes it.
@@ -78,7 +78,8 @@ pub struct OtherSimd {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Trace {
-    pub header: Header,
+    /// The SE's `HEADER`; `None` where its stream announced none the decoder reads.
+    pub header: Option<Header>,
     /// The traced SIMD's waves, in the order AMD stitches them.
     pub waves: Vec<Wave>,
     pub occupancy: Vec<Occupancy>,
@@ -99,7 +100,7 @@ pub fn analyze(packets: impl IntoIterator<Item = Packet>) -> Trace {
                 pending.drain(..).for_each(|(time, kind)| model.token(time, kind));
                 model.token(time, packet.kind);
             }
-            kind if model.trace.header.version == 4 => model.token(time, kind),
+            kind if model.header.layout == Layout::Rdna4 => model.token(time, kind),
             kind => {
                 let time = time - i64::from(matches!(kind, Kind::WaveReady { .. }));
                 match pending.back() {
@@ -137,6 +138,8 @@ fn pipe<T>(pipes: &mut Pipes<T>, me: u8, pipe: u8) -> &mut T {
 #[derive(Default)]
 struct Model {
     trace: Trace,
+    /// The SE's `HEADER`, layout 3's defaults until one is met.
+    header: Header,
     slots: [Vec<State>; SLOTS],
     pgm: Pipes<u64>,
     dispatch: Pipes<u64>,
@@ -163,7 +166,7 @@ const COMPUTE_DISPATCH_END: u16 = 0x7e;
 
 impl Model {
     fn is_target(&self, unit: Unit) -> bool {
-        let h = &self.trace.header;
+        let h = &self.header;
         unit.sa_wgp() == (h.dsa << 7 | h.dwgp) && unit.simd == h.dsimd
     }
 
@@ -189,19 +192,19 @@ impl Model {
 
     fn token(&mut self, time: i64, kind: Kind) {
         match kind {
-            Kind::Header(header) => self.trace.header = header,
+            Kind::Header(Ok(header)) => (self.header, self.trace.header) = (header, Some(header)),
             Kind::Misc { fields } if fields & 8 != 0 => {
                 self.slots.iter_mut().filter_map(|slot| slot.last_mut()).for_each(|wave| wave.standby = true);
             }
             Kind::WaveStart(start) => self.wave_start(time, start),
             Kind::WaveEnd(unit) => self.wave_end(time, unit),
             Kind::Inst { wave, op, .. } => {
-                let class = op.class(&self.trace.header);
-                let version = self.trace.header.version;
+                let class = op.class(&self.header);
+                let layout = self.header.layout;
                 if class.other_simd {
                     self.trace.other_simd.push(OtherSimd { time, category: class.category, cycles: class.cycles });
                 } else {
-                    self.with(wave, |s| s.apply_inst(time, op.code, class, version));
+                    self.with(wave, |s| s.apply_inst(time, op.code, class, layout));
                 }
             }
             Kind::ValuInst { wave, .. } => self.with(wave, |s| s.apply_valu(time)),
@@ -248,7 +251,7 @@ impl Model {
         let (loc, target, slot) = (location(unit), self.is_target(unit), usize::from(unit.wave));
         let dispatch = *pipe(&mut self.dispatch, me, pipe_id);
         let run = Running { pc: self.entry(me, pipe_id), dispatch, me: me & 1, pipe: pipe_id };
-        let exbarw = self.trace.header.version == 4 && self.trace.header.exbarw;
+        let exbarw = self.header.layout == Layout::Rdna4 && self.header.exbarw;
         if (66..90).contains(&count) {
             let save = 0b00_0011_0011u32 >> (count - 66) & 1 == 1;
             let restore = 0b11_1100_1100u32 >> (count - 66) & 1 == 1;
@@ -434,7 +437,7 @@ impl State {
         last.category = Category::Msg;
     }
 
-    fn apply_inst(&mut self, time: i64, code: u8, class: OpClass, version: u8) {
+    fn apply_inst(&mut self, time: i64, code: u8, class: OpClass, layout: Layout) {
         self.update_barrier(time);
         if code == EINST_RFE {
             self.wave.pcs.push((self.wave.instructions.len(), 0));
@@ -455,7 +458,7 @@ impl State {
         match class.category {
             Category::Immed => {
                 self.apply_immediate(time);
-                self.extend_barrier = version <= 3;
+                self.extend_barrier = layout == Layout::Rdna3;
             }
             Category::None => {}
             category => {

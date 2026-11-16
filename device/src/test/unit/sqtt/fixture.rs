@@ -75,7 +75,7 @@ pub fn stitched(name: &str) -> Stitched {
         .iter()
         .map(|(_, bytes)| {
             let mut trace = wave::analyze(decode(bytes));
-            layout = if trace.header.version == 4 { Layout::Rdna4 } else { Layout::Rdna3 };
+            layout = trace.header.unwrap_or_default().layout;
             let mut stitcher = Stitcher::new(&code, layout);
             trace.waves.iter_mut().for_each(|w| _ = stitcher.stitch(w));
             trace

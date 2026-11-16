@@ -8,11 +8,13 @@ use test_case::test_case;
 use super::test_support::{mock_device, mock_device_queues};
 use crate::amd::connector::{OwnerCtx, SubmissionFinalizer};
 use crate::amd::regwrite::RegWriter;
-use crate::amd::sqtt::{Capture, SqttTopology, build_streams, check_target, cu_masks, current_dpm_mhz, trace_bytes};
+use crate::amd::sqtt::{
+    Capture, SqttArch, SqttTopology, build_streams, check_target, cu_masks, current_dpm_mhz, trace_bytes,
+};
 use crate::amd::sys::pm4;
 use crate::device::PlanContext;
-use crate::error::Error;
-use crate::profile::{CodeImage, SqttConfig, SqttSimds};
+use crate::error::{Error, SqttUnsupported};
+use crate::profile::{CodeImage, Simd, SqttConfig, SqttSimds, TraceWindow};
 use crate::sync::DispatchTimestamps;
 
 /// A PM4 packet of the profiler streams, register writes at absolute dwords.
@@ -71,11 +73,16 @@ fn topology(se: u32) -> SqttTopology {
 }
 
 fn config(se_mask: u32) -> SqttConfig {
-    SqttConfig { se_mask, simds: SqttSimds::default(), bytes_per_se: WINDOW, limit_cu: false, pstate: None }
+    let window = TraceWindow::try_from((WINDOW / TraceWindow::PAGE) as u32).unwrap();
+    SqttConfig { se_mask, simds: SqttSimds::default(), window, limit_cu: false, pstate: None }
+}
+
+fn simds(list: &[u8]) -> SqttSimds {
+    SqttSimds::cycle(&list.iter().map(|&simd| Simd::try_from(simd).unwrap()).collect::<Vec<_>>())
 }
 
 fn streams(arch: AmdArch, se: u32, config: &SqttConfig) -> (Vec<Packet>, Vec<Packet>) {
-    let (start, stop) = build_streams(config, arch, &topology(se), 64, BUF, WPTRS).unwrap();
+    let (start, stop) = build_streams(config, arch.try_into().unwrap(), &topology(se), 64, BUF, WPTRS).unwrap();
     (decode(&start), decode(&stop))
 }
 
@@ -105,6 +112,21 @@ pub(super) fn writes(gc: &RegWriter, packets: &[Packet], name: &str) -> Vec<u32>
 #[test_case(AmdArch::Gfx942, "regGRBM_GFX_INDEX", 0x30800)]
 fn registers_land_at_their_mesa_addresses(arch: AmdArch, name: &str, byte: u32) {
     assert_eq!(gfx(arch).addr(name) * 4, byte);
+}
+
+/// A traced generation's writer is the one its arch's GC IP version selects.
+#[test_case(AmdArch::Gfx1100)]
+#[test_case(AmdArch::Gfx1101)]
+#[test_case(AmdArch::Gfx1102)]
+#[test_case(AmdArch::Gfx1151)]
+#[test_case(AmdArch::Gfx1200)]
+#[test_case(AmdArch::Gfx1201)]
+fn traced_generations_write_their_arch_registers(arch: AmdArch) {
+    let traced = RegWriter::from(SqttArch::try_from(arch).unwrap());
+    for name in ["regSQ_THREAD_TRACE_CTRL", "regGRBM_GFX_INDEX", "regCOMPUTE_STATIC_THREAD_MGMT_SE7"] {
+        assert!(std::ptr::eq(traced.reg(name), gfx(arch).reg(name)), "{name}");
+        assert_eq!(traced.addr(name), gfx(arch).addr(name), "{name}");
+    }
 }
 
 #[test_case(AmdArch::Gfx1151, 2)]
@@ -193,8 +215,8 @@ fn token_mask_follows_the_itrace_ses(arch: AmdArch, se_mask: u32, expected: &[u3
 /// alternate over the SEs; a list repeats over them.
 #[test_case(AmdArch::Gfx1151, SqttSimds::default(), &[0, 1]; "gfx11 default")]
 #[test_case(AmdArch::Gfx1201, SqttSimds::default(), &[0, 1, 0, 1]; "gfx12 default")]
-#[test_case(AmdArch::Gfx1151, SqttSimds::cycle(&[3]), &[3, 3]; "gfx11 one simd")]
-#[test_case(AmdArch::Gfx1201, SqttSimds::cycle(&[2, 3, 0]), &[2, 3, 0, 2]; "gfx12 list repeats")]
+#[test_case(AmdArch::Gfx1151, simds(&[3]), &[3, 3]; "gfx11 one simd")]
+#[test_case(AmdArch::Gfx1201, simds(&[2, 3, 0]), &[2, 3, 0, 2]; "gfx12 list repeats")]
 fn mask_traces_each_se_simd(arch: AmdArch, simds: SqttSimds, expected: &[u32]) {
     let gc = gfx(arch);
     let (start, _) = streams(arch, expected.len() as u32, &SqttConfig { simds, ..config(0b11) });
@@ -202,14 +224,32 @@ fn mask_traces_each_se_simd(arch: AmdArch, simds: SqttSimds, expected: &[u32]) {
     assert_eq!(writes(&gc, &start, "regSQ_THREAD_TRACE_MASK"), masks);
 }
 
-#[test_case("1" => Ok(SqttSimds([1; 8])); "one for every se")]
+#[test_case("1" => Ok(simds(&[1])); "one for every se")]
 #[test_case(" 0, 1 " => Ok(SqttSimds::default()); "the default list")]
-#[test_case("2,3,0" => Ok(SqttSimds([2, 3, 0, 2, 3, 0, 2, 3])); "repeated")]
-#[test_case("" => Err("\"\": a SIMD or a comma list of up to 8".to_string()); "empty")]
-#[test_case("0,x" => Err("\"0,x\": a SIMD or a comma list of up to 8".to_string()); "garbage")]
-#[test_case("0,1,2,3,0,1,2,3,0" => Err("\"0,1,2,3,0,1,2,3,0\": a SIMD or a comma list of up to 8".to_string()); "past 8 ses")]
+#[test_case("2,3,0" => Ok(simds(&[2, 3, 0, 2, 3, 0, 2, 3])); "repeated")]
+#[test_case("" => Err("simds \"\": a SIMD or a comma list of up to 8".to_string()); "empty")]
+#[test_case("0,x" => Err("simds \"0,x\": a SIMD or a comma list of up to 8".to_string()); "garbage")]
+#[test_case("0,4" => Err("simd 4: a WGP SIMD is 0-3".to_string()); "past the wgp")]
+#[test_case("0,1,2,3,0,1,2,3,0" => Err("simds \"0,1,2,3,0,1,2,3,0\": a SIMD or a comma list of up to 8".to_string()); "past 8 ses")]
 fn simds_parse(s: &str) -> Result<SqttSimds, String> {
-    s.parse()
+    s.parse().map_err(|e: SqttUnsupported| e.to_string())
+}
+
+#[test_case(0 => true)]
+#[test_case(3 => true)]
+#[test_case(4 => false)]
+#[test_case(9 => false)]
+fn simd_is_a_wgp_simd(simd: u8) -> bool {
+    Simd::try_from(simd).ok().map(Simd::get) == Some(simd)
+}
+
+/// `BUF0_SIZE` holds the window's 4 KiB pages in 22 bits.
+#[test_case(0 => None; "empty")]
+#[test_case(1 => Some(4096); "a page")]
+#[test_case((1 << 22) - 1 => Some(((1 << 22) - 1) * 4096); "the size field's last")]
+#[test_case(1 << 22 => None; "past the size field")]
+fn window_is_nonzero_pages_below_the_size_field(pages: u32) -> Option<usize> {
+    TraceWindow::try_from(pages).ok().map(TraceWindow::bytes)
 }
 
 #[test_case("0: 1000Mhz \n1: 1800Mhz *\n2: 1800Mhz *\n" => Some(1800); "two marked")]
@@ -274,7 +314,7 @@ fn limit_cu_narrows_and_restores_the_thread_masks() {
     let gc = gfx(arch);
     let topology = topology(4);
     let cfg = SqttConfig { limit_cu: true, ..config(0b1) };
-    let (start, stop) = build_streams(&cfg, arch, &topology, 100, BUF, WPTRS).unwrap();
+    let (start, stop) = build_streams(&cfg, SqttArch::Gfx12, &topology, 100, BUF, WPTRS).unwrap();
     let (start, stop) = (decode(&start), decode(&stop));
     let masks = cu_masks(&topology, 100).unwrap();
     for (se, &mask) in masks.iter().enumerate() {
@@ -299,33 +339,31 @@ fn cu_masks_follow_tinygrad(cu_per_sa: u32, workgroups: u64) -> [u32; 8] {
 #[test]
 fn limit_cu_needs_a_known_topology() {
     let unknown = SqttTopology { se: 1, cu_per_se: 1, cu_per_sa: 0 };
-    assert!(matches!(cu_masks(&unknown, 1), Err(Error::SqttUnsupported { .. })));
+    assert!(matches!(cu_masks(&unknown, 1), Err(SqttUnsupported::Topology { cu_per_se: 1, cu_per_sa: 0 })));
 }
 
-#[test_case(AmdArch::Gfx942, true; "cdna")]
-#[test_case(AmdArch::Gfx950, true; "cdna4")]
-#[test_case(AmdArch::Gfx1151, false; "aql")]
-fn unsupported_targets_are_refused(arch: AmdArch, pm4: bool) {
-    assert!(matches!(check_target(arch, pm4), Err(Error::SqttUnsupported { .. })));
+/// gfx11 and gfx12 trace; CDNA's stream and tokens are gfx9's.
+#[test_case(AmdArch::Gfx942 => None; "cdna3")]
+#[test_case(AmdArch::Gfx950 => None; "cdna4")]
+#[test_case(AmdArch::Gfx1100 => Some(SqttArch::Gfx11); "rdna3")]
+#[test_case(AmdArch::Gfx1151 => Some(SqttArch::Gfx11); "rdna3.5")]
+#[test_case(AmdArch::Gfx1201 => Some(SqttArch::Gfx12); "rdna4")]
+fn traced_archs(arch: AmdArch) -> Option<SqttArch> {
+    match SqttArch::try_from(arch) {
+        Ok(traced) => Some(traced),
+        Err(SqttUnsupported::Arch { arch: refused }) => {
+            assert_eq!(refused, arch);
+            None
+        }
+        Err(other) => panic!("{other}"),
+    }
 }
 
 #[test]
-fn streams_refuse_cdna() {
-    assert!(matches!(
-        build_streams(&config(1), AmdArch::Gfx942, &topology(1), 1, BUF, WPTRS),
-        Err(Error::SqttUnsupported { .. })
-    ));
-}
-
-#[test_case(SqttConfig { simds: SqttSimds::cycle(&[0, 4]), ..config(1) }; "simd")]
-#[test_case(SqttConfig { bytes_per_se: 0, ..config(1) }; "empty window")]
-#[test_case(SqttConfig { bytes_per_se: 4096 + 32, ..config(1) }; "unaligned window")]
-#[test_case(SqttConfig { bytes_per_se: 16 << 30, ..config(1) }; "window past the size field")]
-fn bad_configs_are_refused(cfg: SqttConfig) {
-    assert!(matches!(
-        build_streams(&cfg, AmdArch::Gfx1201, &topology(1), 1, BUF, WPTRS),
-        Err(Error::SqttUnsupported { .. })
-    ));
+fn aql_queues_are_refused() {
+    assert!(matches!(check_target(AmdArch::Gfx1151, false), Err(SqttUnsupported::AqlQueues)));
+    assert!(matches!(check_target(AmdArch::Gfx942, true), Err(SqttUnsupported::Arch { .. })));
+    assert_eq!(check_target(AmdArch::Gfx1151, true).unwrap(), SqttArch::Gfx11);
 }
 
 /// `(wptr & 0x1FFF_FFFF) * 32` bytes, truncated once the pointer reaches the
@@ -344,8 +382,9 @@ fn readback_bytes_follow_the_write_pointer(arch: AmdArch, wptr: u32, window: usi
 fn set_sqtt_refuses_aql_queues() {
     let (_iface, allocator) = mock_device_queues(1, false);
     let owner = OwnerCtx::new(Arc::clone(allocator.dev.core()), allocator);
-    assert!(matches!(owner.set_sqtt(Some(SqttConfig::default())), Err(Error::SqttUnsupported { .. })));
-    assert_eq!(owner.sqtt_config(), None);
+    let refused = owner.set_sqtt(Some(SqttConfig::default()));
+    assert!(matches!(refused, Err(Error::SqttUnsupported { source: SqttUnsupported::AqlQueues })), "{refused:?}");
+    assert_eq!(owner.armed_sqtt(), None);
     owner.set_sqtt(None).unwrap();
 }
 
@@ -367,7 +406,7 @@ fn set_sqtt_pins_only_a_requested_pstate() {
     owner.set_sqtt(None).unwrap();
     owner.set_sqtt(pinned(Some(Peak))).unwrap();
     assert_eq!(iface.pstate_holds(), [Standard, Peak, Peak]);
-    assert_eq!(owner.sqtt_config(), pinned(Some(Peak)));
+    assert_eq!(owner.armed_sqtt(), pinned(Some(Peak)).map(|config| (config, SqttArch::Gfx11)));
 }
 
 #[test_case("standard" => Ok(crate::profile::StablePstate::Standard))]
@@ -382,14 +421,10 @@ fn set_sqtt_arms_and_disarms() {
     let (_iface, allocator) = mock_device(1);
     let core = Arc::clone(allocator.dev.core());
     let owner = OwnerCtx::new(Arc::clone(&core), allocator);
-    assert!(matches!(
-        owner.set_sqtt(Some(SqttConfig { simds: SqttSimds::cycle(&[9]), ..SqttConfig::default() })),
-        Err(Error::SqttUnsupported { .. })
-    ));
     owner.set_sqtt(Some(SqttConfig::default())).unwrap();
-    assert_eq!(owner.sqtt_config(), Some(SqttConfig::default()));
+    assert_eq!(owner.armed_sqtt(), Some((SqttConfig::default(), SqttArch::Gfx11)));
     owner.set_sqtt(None).unwrap();
-    assert_eq!(owner.sqtt_config(), None);
+    assert_eq!(owner.armed_sqtt(), None);
 }
 
 /// The handle reads each SE's filled window once the dispatch retired.
@@ -400,8 +435,8 @@ fn handle_reads_each_se_window_after_retirement() {
     let signal = Arc::new(pool.acquire().unwrap());
     let finalizer = SubmissionFinalizer::timeline(Arc::clone(&signal), 1, None);
     let code = Arc::new(CodeImage { elf: b"\x7fELF"[..].into(), load_base: 0x1000, entry_pc: 0x1100 });
-    let cfg = SqttConfig { bytes_per_se: 4096, se_mask: 0b1, ..SqttConfig::default() };
-    let capture = Capture::new(&allocator, cfg, 1, Arc::clone(&code)).unwrap();
+    let cfg = SqttConfig { window: TraceWindow::try_from(1).unwrap(), se_mask: 0b1, ..SqttConfig::default() };
+    let capture = Capture::new(&allocator, cfg, SqttArch::Gfx11, 1, Arc::clone(&code)).unwrap();
     let copies: Vec<u64> = decode(&capture.stop)
         .into_iter()
         .filter_map(|p| match p {

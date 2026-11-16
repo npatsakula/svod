@@ -21,8 +21,13 @@ fn stream(tokens: &[(u128, usize)]) -> Vec<u8> {
 
 /// A `HEADER` instruction-tracing SIMD 0 of WGP 0 on shader array 0.
 fn header(h: Header) -> (u128, usize) {
+    header_of(if h.layout == Layout::Rdna4 { 4 } else { 3 }, h)
+}
+
+/// `h` announcing `version`, which [`Header::layout`] cannot hold where it is neither 3 nor 4.
+fn header_of(version: u8, h: Header) -> (u128, usize) {
     let v = 0b0010001
-        | u128::from(h.version) << 7
+        | u128::from(version) << 7
         | u128::from(h.dsimd) << 13
         | u128::from(h.dwgp) << 15
         | u128::from(h.dsa) << 19
@@ -39,7 +44,11 @@ fn header(h: Header) -> (u128, usize) {
 }
 
 fn version(v: u8) -> (u128, usize) {
-    header(Header { version: v, ..Header::default() })
+    header_of(v, Header::default())
+}
+
+fn layout(v: u8) -> Layout {
+    if v == 4 { Layout::Rdna4 } else { Layout::Rdna3 }
 }
 
 fn time(delta: u128) -> (u128, usize) {
@@ -80,7 +89,7 @@ fn packets(tokens: &[(u128, usize)]) -> Vec<Packet> {
 #[test]
 fn header_fields() {
     let h = Header {
-        version: 4,
+        layout: Layout::Rdna4,
         dsimd: 2,
         dwgp: 5,
         dsa: 1,
@@ -94,25 +103,26 @@ fn header_fields() {
         dbl: true,
         exbarw: true,
     };
-    assert_eq!(packets(&[header(h)])[0].kind, Kind::Header(h));
+    assert_eq!(packets(&[header(h)])[0].kind, Kind::Header(Ok(h)));
 }
 
-#[test_case(3, 0, 1)]
-#[test_case(3, 1, 1)]
-#[test_case(3, 2, 2)]
-#[test_case(3, 4, 8)]
-#[test_case(3, 0xf, 64 ; "masked to three bits")]
-#[test_case(2, 0xf, 16384 ; "four bits before gfx11")]
-fn dp_cycles(version: u8, dp_rate: u8, cycles: u32) {
-    assert_eq!(Header { version, dp_rate, ..Header::default() }.dp_cycles(), cycles);
+#[test_case(0, 1)]
+#[test_case(1, 1)]
+#[test_case(2, 2)]
+#[test_case(4, 8)]
+#[test_case(0xf, 64 ; "masked to three bits")]
+fn dp_cycles(dp_rate: u8, cycles: u32) {
+    assert_eq!(Header { dp_rate, ..Header::default() }.dp_cycles(), cycles);
 }
 
-#[test]
-fn foreign_version_stops_decoding() {
-    let data = stream(&[version(5), time(3)]);
+/// A `HEADER` of neither layout (CDNA's 2, or not a header at all) is the last packet, refused.
+#[test_case(2)]
+#[test_case(5)]
+fn foreign_version_stops_decoding(v: u8) {
+    let data = stream(&[version(v), time(3)]);
     let mut decoder = decode(&data);
-    assert_eq!(decoder.next(), None);
-    assert_eq!(decoder.unsupported_layout(), Some(5));
+    assert_eq!(decoder.next().map(|p| p.kind), Some(Kind::Header(Err(v))));
+    assert_eq!(decoder.unsupported_layout(), Some(v));
     assert_eq!(decoder.next(), None);
 }
 
@@ -145,7 +155,8 @@ fn timestamp_delta(v: u8, flags: u128, added: u64) {
 #[test_case(0, 12 ; "otherwise")]
 fn wave_start_ext_width_follows_wsm(wsm: u8, nibbles: usize) {
     let ext = 0b11100 | 1 << 15 | 9 << 33;
-    let decoded = packets(&[header(Header { version: 4, wsm, ..Header::default() }), (ext, nibbles), valu(3, 2)]);
+    let decoded =
+        packets(&[header(Header { layout: Layout::Rdna4, wsm, ..Header::default() }), (ext, nibbles), valu(3, 2)]);
     let Kind::WaveStart(start) = decoded[1].kind else { panic!("{:?}", decoded[1]) };
     assert_eq!((start.ext, start.wgid, start.unit.wave), (true, 9, 1));
     assert_eq!(decoded[2].kind, Kind::ValuInst { wave: 3, w64h: false });
@@ -203,7 +214,7 @@ fn truncated_tail(v: u8, count: usize) {
 #[test_case(Layout::Rdna3, 140, None, Category::None, 0, false)]
 fn inst_op_class(layout: Layout, code: u8, name: Option<&str>, category: Category, cycles: u32, other: bool) {
     let op = InstOp { layout, code };
-    let header = Header { version: 4, dp_rate: 3, dp_derate: 2, ..Header::default() };
+    let header = Header { layout: Layout::Rdna4, dp_rate: 3, dp_derate: 2, ..Header::default() };
     assert_eq!(op.name().as_deref(), name);
     let class = op.class(&header);
     assert_eq!((class.category, class.cycles, class.other_simd), (category, cycles, other));
@@ -411,9 +422,9 @@ proptest! {
         wsm in 0u8..4,
         body in prop::collection::vec(any::<u8>(), 0..4096),
     ) {
-        let mut data = stream(&[header(Header { version: v, wsm, exbarw, ..Header::default() })]);
+        let mut data = stream(&[header(Header { layout: layout(v), wsm, exbarw, ..Header::default() })]);
         data.extend(body);
-        analyzes_and_stitches(&data, if v == 4 { Layout::Rdna4 } else { Layout::Rdna3 })?;
+        analyzes_and_stitches(&data, layout(v))?;
     }
 
     /// Waves whose records straddle time jumps up to the wave model's 2^60 clamp analyze without overflow.

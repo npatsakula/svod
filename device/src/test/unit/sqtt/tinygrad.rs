@@ -172,10 +172,6 @@ fn render(name: &str, fields: &BTreeMap<&str, u64>, rdna4: bool) -> BTreeMap<Str
     fields.iter().map(|(k, v)| ((*k).to_string(), value(k, *v))).collect()
 }
 
-fn layout_of(version: u8) -> Layout {
-    if version == 4 { Layout::Rdna4 } else { Layout::Rdna3 }
-}
-
 /// Decodes `data`, pairing each packet with the layout it was decoded under.
 fn decode_with_layout(data: &[u8]) -> Vec<(Packet, Layout)> {
     let mut layout = Layout::Rdna3;
@@ -184,8 +180,8 @@ fn decode_with_layout(data: &[u8]) -> Vec<(Packet, Layout)> {
         .by_ref()
         .map(|p| {
             let at = layout;
-            if let Kind::Header(h) = p.kind {
-                layout = layout_of(h.version);
+            if let Kind::Header(Ok(h)) = p.kind {
+                layout = h.layout;
             }
             (p, at)
         })
@@ -233,7 +229,7 @@ fn matches_tinygrad(arch: &str, example: &str, layout: Layout) {
         let count = event["packets"].as_u64().unwrap() as usize;
         assert!((count..count + 16).contains(&packets.len()), "{ctx}: {} packets", packets.len());
         let packets = &packets[..count];
-        assert!(matches!(packets[0].0.kind, Kind::Header(_)), "{ctx}");
+        assert!(matches!(packets[0].0.kind, Kind::Header(Ok(_))), "{ctx}");
         assert!(packets[1..].iter().all(|(_, l)| *l == layout), "{ctx}");
         assert_eq!(packets.last().unwrap().0.time, event["last_time"].as_u64().unwrap(), "{ctx}");
 
@@ -295,7 +291,7 @@ fn stitches_tinygrad(arch: &str, example: &str) {
     for event in golden["events"].as_array().unwrap().iter().filter(|e| e["itrace"].as_bool().unwrap()) {
         let index = event["index"].as_u64().unwrap();
         let mut trace = wave::analyze(decode(&std::fs::read(dir.join(format!("trace{index}.bin"))).unwrap()));
-        let mut stitcher = Stitcher::new(&code, layout_of(trace.header.version));
+        let mut stitcher = Stitcher::new(&code, trace.header.unwrap_or_default().layout);
         for wave in &mut trace.waves {
             assert_eq!(stitcher.stitch(wave), wave.instructions.len(), "{arch}/{example} event {index}");
         }

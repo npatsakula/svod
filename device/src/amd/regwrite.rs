@@ -8,6 +8,7 @@
 use svod_dtype::AmdArch;
 
 use crate::amd::am::regs::{self, RegDef};
+use crate::amd::sqtt::SqttArch;
 use crate::amd::sys::pm4;
 
 /// `GC_BASE__INST0_SEG*` of the SOC15 parts (`vega_offsets`, gfx9).
@@ -106,6 +107,18 @@ impl RegWriter {
     /// `GRBM_GFX_INDEX` selecting SE `se`, SA 0, all instances.
     pub fn grbm_se(&self, out: &mut Vec<u32>, se: u32) {
         self.wreg(out, "regGRBM_GFX_INDEX", &[("se_index", se), ("sa_index", 0), ("instance_broadcast_writes", 1)]);
+    }
+}
+
+/// The table vendored for each traced generation: 11.5 serves every gfx11 part
+/// ([`RegWriter::gc`]), 12.0 every gfx12 one.
+impl From<SqttArch> for RegWriter {
+    fn from(arch: SqttArch) -> Self {
+        let table = match arch {
+            SqttArch::Gfx11 => regs::GC_11_5_0,
+            SqttArch::Gfx12 => regs::GC_12_0_0,
+        };
+        Self { table, bases: &GC_BASES_NAVI }
     }
 }
 

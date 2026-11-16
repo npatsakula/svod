@@ -61,7 +61,7 @@ fn fixture_residency(name: &str, max_peak: u32, simds: usize, simd_peak: u32) {
         assert!(r.peak <= max_peak && r.simds.len() == simds, "{r:?}");
         let means: Vec<f64> = r.simds.iter().map(Simd::mean).collect();
         assert!(r.simds.iter().all(|x| (x.mean() - 4.0).abs() < 0.1 && x.peak <= simd_peak), "{name}: {means:?}");
-        let h = trace.header;
+        let h = trace.header.expect("a traced SE has a header");
         if !trace.waves.is_empty() {
             assert!(r.simd(h.dsa, h.dwgp, h.dsimd).is_some(), "the traced SIMD held waves");
         }
