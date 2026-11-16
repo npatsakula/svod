@@ -27,13 +27,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
+use snafu::{OptionExt, ResultExt, Snafu};
 use svod_dtype::default_device::{default_device, with_default_device};
 use svod_dtype::{DType, DeviceSpec, GpuArch, ScalarDType};
 use svod_ir::SInt;
 use svod_ir::UOp;
 use svod_runtime::benchmark::{CLOCK_WARMUP, round_robin_min, warm_clock};
 use svod_runtime::sqtt::Capture;
-use svod_runtime::{ExecutionPlan, KernelResources, ProfileOptions, RunProfile};
+use svod_runtime::{ExecutionPlan, KernelResources, ProfileOptions, RunProfile, Sink, SqttOptions};
 use svod_tensor::{PrepareConfig, Tensor};
 
 use crate::atoms::Target;
@@ -1190,9 +1191,9 @@ fn compile_one(
             Some((store, keep)) => {
                 let (digest, body) = store.lowered(&p, &l, keep)?;
                 emitted.push(digest);
-                scratch_plan_of(p, &l, pool, Some(body))
+                scratch_plan_of(p, &l, pool, Some(body)).ok()
             }
-            None => scratch_plan(p, &l, pool),
+            None => scratch_plan(p, &l, pool).ok(),
         })
         .collect();
     let key = plans.as_ref().filter(|_| !emitted.is_empty()).map(|_| digest(&emitted));
@@ -1212,19 +1213,46 @@ pub fn measure(candidates: Vec<Candidate>) -> Vec<(Compiled, Option<u64>)> {
 
 /// A candidate's programs each [profiled](ExecutionPlan::profile) under
 /// `opts` on scratch buffers, after one untimed run, under the timing lock;
-/// [`ProfileOptions::sqtt`] goes to `<dir>/p<program>`, a thread trace
-/// a program. `None` where the candidate failed to build or run.
-pub fn profile(candidate: Candidate, opts: &ProfileOptions) -> Option<Vec<RunProfile>> {
+/// a [`Sink::Disk`] goes to `<dir>/p<program>`, a thread trace a program.
+pub fn profile(candidate: Candidate, opts: &ProfileOptions) -> Result<Vec<RunProfile>, Error> {
     let pool = ScratchPool::default();
-    let plans = compile(vec![candidate], &pool).pop()?.plans?;
+    let plans: Vec<Scratch> =
+        candidate.into_iter().map(|(p, l)| scratch_plan(p, &l, &pool)).collect::<Result<_, _>>()?;
     let _device = DEVICE.lock().unwrap_or_else(PoisonError::into_inner);
-    let profiled = plans.into_iter().enumerate().map(|(p, (mut plan, vars))| {
+    let profiled = plans.into_iter().enumerate().map(|(program, (mut plan, vars))| {
         let vars: Vec<(&str, i64)> = vars.iter().map(|(n, v)| (n.as_str(), *v)).collect();
-        plan.execute_with_vars(&vars).ok()?;
-        let sqtt = opts.sqtt.as_ref().map(|dir| dir.join(format!("p{p}")));
-        plan.profile(&ProfileOptions { sqtt, ..opts.clone() }).ok()
+        plan.execute_with_vars(&vars).context(RunSnafu { program })?;
+        let sqtt = opts.sqtt.clone().map(|sqtt| match sqtt.sink {
+            Sink::Disk(dir) => SqttOptions { sink: Sink::Disk(dir.join(format!("p{program}"))), ..sqtt },
+            Sink::Memory => sqtt,
+        });
+        plan.profile(&ProfileOptions { sqtt, ..opts.clone() }).context(RunSnafu { program })
     });
     profiled.collect()
+}
+
+/// Why a candidate's program did not build or run on scratch buffers.
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("{source}"))]
+    Launch {
+        #[snafu(source(from(launch::Error, Box::new)))]
+        source: Box<launch::Error>,
+    },
+    #[snafu(display("{name}: its graph failed to schedule"))]
+    Schedule { name: String },
+    #[snafu(display("{name}: {source}"))]
+    Prepare {
+        name: String,
+        #[snafu(source(from(svod_tensor::error::Error, Box::new)))]
+        source: Box<svod_tensor::error::Error>,
+    },
+    #[snafu(display("program {program}: {source}"))]
+    Run {
+        program: usize,
+        #[snafu(source(from(svod_runtime::Error, Box::new)))]
+        source: Box<svod_runtime::Error>,
+    },
 }
 
 /// The statements of a [`profile`]d candidate's traced kernel: each program
@@ -1505,13 +1533,18 @@ fn scratch(p: &Param) -> Tensor {
 /// measurement alone, kept in no memo or cache (it runs under scratch
 /// placeholders no op's call keys, and a shortlist of them per shape would
 /// otherwise stay for the process).
-pub(crate) fn scratch_plan(prog: Program, lowering: &Lowering, pool: &ScratchPool) -> Option<Scratch> {
+pub(crate) fn scratch_plan(prog: Program, lowering: &Lowering, pool: &ScratchPool) -> Result<Scratch, Error> {
     scratch_plan_of(prog, lowering, pool, None)
 }
 
 /// [`scratch_plan`] of `body`, the program lowered already
 /// ([`crate::lower::standalone`]) where given.
-fn scratch_plan_of(prog: Program, lowering: &Lowering, pool: &ScratchPool, body: Option<Arc<UOp>>) -> Option<Scratch> {
+fn scratch_plan_of(
+    prog: Program,
+    lowering: &Lowering,
+    pool: &ScratchPool,
+    body: Option<Arc<UOp>>,
+) -> Result<Scratch, Error> {
     let vars: Vec<(String, i64)> = prog.vars.iter().map(|v| (v.name.clone(), v.max)).collect();
     let name = prog.name.clone();
     let buffers = pool.buffers(&prog.params);
@@ -1521,15 +1554,18 @@ fn scratch_plan_of(prog: Program, lowering: &Lowering, pool: &ScratchPool, body:
             .map(|mut outs| outs.swap_remove(launch::first_output(&prog))),
         None => launch::graph_launch_once(prog, lowering, &tensors),
     }
-    .ok()?;
+    .context(LaunchSnafu)?;
     let mut config = PrepareConfig::from_env();
     config.ephemeral = true;
     // A program past what the scheduler's rewrites hold (past the rewrite
     // engine's stack) panics there: the candidate fails to build, as one
     // the compiler refuses, rather than taking the tuning down.
     let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| out.prepare_with(&config)));
-    let plan = prepared.map_err(|_| tracing::warn!(kernel = name, "a candidate's graph failed to schedule")).ok()?;
-    Some((plan.ok()?, vars))
+    let plan = prepared
+        .map_err(|_| tracing::warn!(kernel = name, "a candidate's graph failed to schedule"))
+        .ok()
+        .context(ScheduleSnafu { name: &name })?;
+    Ok((plan.context(PrepareSnafu { name })?, vars))
 }
 
 /// Runs a candidate's `plans` back to back, in order, unsynchronized, for

@@ -22,11 +22,11 @@
 //!   CUPTI with unrestricted profiling on CUDA; when that is unavailable the run
 //!   degrades to timing-only (Tiers 1–3).
 //! - **Tier 5 — thread trace.** An AMD SQTT capture of one extra pass
-//!   ([`ProfileOptions::sqtt`], `SVOD_SQTT=1`): each kernel's trace saved under
-//!   its own directory and summarized ([`crate::sqtt::Analysis`]). The trace
-//!   runs at the device's own clock unless `SVOD_SQTT_PSTATE` pins one, on the
-//!   SIMDs `SVOD_SQTT_SIMD` picks; it perturbs the dispatch, so the timing
-//!   columns never come from that pass.
+//!   ([`ProfileOptions::sqtt`], [`SqttOptions::from_env`] for `SVOD_SQTT=1`):
+//!   each kernel's trace saved under its own directory or held in memory
+//!   ([`Sink`]) and summarized ([`crate::sqtt::Analysis`]). The trace runs at
+//!   the device's own clock unless its config pins one; it perturbs the
+//!   dispatch, so the timing columns never come from that pass.
 //!
 //! **Accumulate-and-min policy.** Repeated runs of the same plan are merged per
 //! kernel by keeping the minimum device time ([`RunProfile::merge_min`]), which
@@ -38,8 +38,8 @@
 //! [`ExecutionPlan::profile`](crate::ExecutionPlan::profile) or a tensor directly
 //! with `Tensor::profile` (which wraps it). Behavior is configured
 //! through [`ProfileOptions`] (and [`ProfileOptions::from_env`], reading
-//! `SVOD_PMC`, `SVOD_PROFILE_ITERS`, `SVOD_ORIGIN_DEPTH`, `SVOD_SQTT` and
-//! `SVOD_SQTT_DIR`). The underlying
+//! `SVOD_PMC`, `SVOD_PROFILE_ITERS` and `SVOD_ORIGIN_DEPTH`; and
+//! [`SqttOptions::from_env`], reading the `SVOD_SQTT*` vars). The underlying
 //! per-kernel timing path is
 //! [`ExecutionPlan::execute_profiled`](crate::ExecutionPlan::execute_profiled).
 //! The library never prints; callers render a finished [`RunProfile`] with
@@ -51,6 +51,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Serialize;
+use snafu::Snafu;
 use svod_device::hcq::{CopyLeg, DeviceQueue, SemanticLinkedPlan};
 use svod_device::{CounterSet, KernelResources, PmcCounter};
 use svod_dtype::DeviceSpec;
@@ -401,38 +402,23 @@ pub struct ProfileOptions {
     /// are always dropped from the rollup key — they are the flat `file:line`
     /// layer under a module path, shown as per-row detail instead.
     pub origin_depth: Option<usize>,
-    /// Tier 5: trace one more pass (AMD SQTT) and save each kernel's trace
-    /// under this directory ([`StageProfile::sqtt`]). The pass synchronizes
-    /// after each kernel and drops its trace buffers before the next.
-    pub sqtt: Option<PathBuf>,
-    /// The stable power state the traced pass pins; `None` leaves the clock to
-    /// the device, as the untimed passes do.
-    pub sqtt_pstate: Option<svod_device::profile::StablePstate>,
-    /// The SIMD each SE's trace follows.
-    pub sqtt_simds: svod_device::profile::SqttSimds,
+    /// Tier 5: trace one more pass (AMD SQTT) as [`SqttOptions`] asks ([`StageProfile::sqtt`]).
+    /// The pass synchronizes after each kernel and drops its trace buffers before the next.
+    pub sqtt: Option<SqttOptions>,
 }
 
 impl Default for ProfileOptions {
     fn default() -> Self {
-        Self {
-            iters: 1,
-            static_analysis: true,
-            counters: PmcSelection::None,
-            origin_depth: None,
-            sqtt: None,
-            sqtt_pstate: None,
-            sqtt_simds: Default::default(),
-        }
+        Self { iters: 1, static_analysis: true, counters: PmcSelection::None, origin_depth: None, sqtt: None }
     }
 }
 
 impl ProfileOptions {
     /// Build from the `SVOD_PROFILE_ITERS` / `SVOD_PMC` / `SVOD_ORIGIN_DEPTH`
-    /// / `SVOD_SQTT` (`1`, saved under `SVOD_SQTT_DIR`, default `./sqtt`) /
-    /// `SVOD_SQTT_PSTATE` (`standard` or `peak`) / `SVOD_SQTT_SIMD` (a SIMD, or a
-    /// comma list repeated over the SEs) env vars (defaults otherwise). This is the single place profiling env vars
-    /// are read; callers that want explicit control construct [`ProfileOptions`]
-    /// directly.
+    /// env vars (defaults otherwise). A thread trace is never read from the
+    /// environment here: [`SqttOptions::from_env`] reads it and reports a bad
+    /// value, which this infallible constructor could not. Callers that want
+    /// explicit control construct [`ProfileOptions`] directly.
     pub fn from_env() -> Self {
         let mut o = Self::default();
         if let Ok(n) = std::env::var("SVOD_PROFILE_ITERS").unwrap_or_default().trim().parse::<u32>() {
@@ -442,19 +428,82 @@ impl ProfileOptions {
             o.counters = parse_pmc(&v);
         }
         o.origin_depth = parse_origin_depth(&std::env::var("SVOD_ORIGIN_DEPTH").unwrap_or_default());
-        if std::env::var("SVOD_SQTT").as_deref() == Ok("1") {
-            o.sqtt = Some(std::env::var_os("SVOD_SQTT_DIR").map_or_else(|| "sqtt".into(), PathBuf::from));
-        }
-        if let Ok(v) = std::env::var("SVOD_SQTT_PSTATE") {
-            o.sqtt_pstate = v.parse().inspect_err(|e| eprintln!("SVOD_SQTT_PSTATE={e}; tracing unpinned")).ok();
-        }
-        if let Ok(v) = std::env::var("SVOD_SQTT_SIMD") {
-            match v.parse() {
-                Ok(simds) => o.sqtt_simds = simds,
-                Err(e) => eprintln!("SVOD_SQTT_SIMD={e}; tracing the default SIMDs"),
-            }
-        }
         o
+    }
+}
+
+/// Tier 5: how [`ExecutionPlan::profile`](crate::ExecutionPlan::profile) traces its extra pass.
+/// The default traces unpinned and saves each kernel's capture under `./sqtt`.
+///
+/// ```no_run
+/// use svod_runtime::{ExecutionPlan, ProfileOptions, SqttOptions};
+///
+/// fn trace(plan: &ExecutionPlan) -> svod_runtime::Result<()> {
+///     // `Tensor::profile` takes the same options.
+///     let opts = ProfileOptions { sqtt: Some(SqttOptions::default()), ..Default::default() };
+///     let profile = plan.profile(&opts)?;
+///     for traced in profile.stages.iter().flat_map(|stage| &stage.sqtt) {
+///         match &traced.analysis {
+///             Ok(analysis) => println!("{}: {}", traced.kernel, analysis.summary()),
+///             Err(error) => println!("{}: {error}", traced.kernel),
+///         }
+///     }
+///     Ok(())
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SqttOptions {
+    pub config: svod_device::profile::SqttConfig,
+    pub sink: Sink,
+}
+
+/// Where a traced pass puts each kernel's [`crate::sqtt::Capture`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Sink {
+    /// Saved under `<dir>/<index>_<entry point>` and dropped, so the pass holds one capture at a time.
+    Disk(PathBuf),
+    /// Held in [`Traced::raw`]: a capture is up to 64 MiB an SE, so a whole model's may not fit.
+    Memory,
+}
+
+impl Default for Sink {
+    fn default() -> Self {
+        Self::Disk("sqtt".into())
+    }
+}
+
+/// A profiling env var whose value does not parse.
+#[derive(Debug, Snafu)]
+#[snafu(display("{var}={value:?}: {why}"))]
+pub struct EnvError {
+    pub var: &'static str,
+    pub value: String,
+    pub why: String,
+}
+
+impl SqttOptions {
+    /// `SVOD_SQTT=1` traces, saved under `SVOD_SQTT_DIR` (default `./sqtt`), as
+    /// [`Self::config_from_env`] configures; `None` where `SVOD_SQTT` is not `1`.
+    pub fn from_env() -> Result<Option<Self>, EnvError> {
+        if std::env::var("SVOD_SQTT").as_deref() != Ok("1") {
+            return Ok(None);
+        }
+        let sink = Sink::Disk(std::env::var_os("SVOD_SQTT_DIR").map_or_else(|| "sqtt".into(), PathBuf::from));
+        Ok(Some(Self { config: Self::config_from_env()?, sink }))
+    }
+
+    /// The default config with `SVOD_SQTT_PSTATE` (`standard` or `peak`) pinning the clock and
+    /// `SVOD_SQTT_SIMD` (a SIMD, or a comma list repeated over the SEs) picking each SE's SIMD.
+    pub fn config_from_env() -> Result<svod_device::profile::SqttConfig, EnvError> {
+        fn var<T: std::str::FromStr<Err = String>>(var: &'static str) -> Result<Option<T>, EnvError> {
+            let Ok(value) = std::env::var(var) else { return Ok(None) };
+            value.parse().map(Some).map_err(|why| EnvError { var, value, why })
+        }
+        let mut config = svod_device::profile::SqttConfig { pstate: var("SVOD_SQTT_PSTATE")?, ..Default::default() };
+        if let Some(simds) = var("SVOD_SQTT_SIMD")? {
+            config.simds = simds;
+        }
+        Ok(config)
     }
 }
 
@@ -788,17 +837,26 @@ pub struct StageProfile {
     /// stable across models without schema churn; consumed as-is by the UI.
     pub meta: BTreeMap<String, String>,
     /// Tier-5 thread traces of the stage's kernels.
-    pub sqtt: Vec<SqttKernel>,
+    pub sqtt: Vec<Traced>,
 }
 
-/// One kernel's saved thread trace ([`ProfileOptions::sqtt`]).
+/// One kernel's thread trace ([`ProfileOptions::sqtt`]).
 #[derive(Debug)]
-pub struct SqttKernel {
+pub struct Traced {
     /// The kernel's index among the stage's dispatches.
     pub index: usize,
     pub kernel: String,
-    pub dir: PathBuf,
-    pub analysis: crate::Result<crate::sqtt::Analysis>,
+    /// Per kernel, so one that fails to analyze leaves the rest.
+    pub analysis: Result<crate::sqtt::Analysis, crate::sqtt::Error>,
+    pub raw: Raw,
+}
+
+/// A [`Traced`] kernel's capture, as its [`Sink`] kept it.
+#[derive(Debug)]
+pub enum Raw {
+    /// The directory [`crate::sqtt::Capture::load`] reads back.
+    Saved(PathBuf),
+    Held(Box<crate::sqtt::Capture>),
 }
 
 impl StageProfile {
@@ -935,10 +993,12 @@ impl RunProfile {
                 out.push_str("thread traces (SQTT; a traced dispatch's time is perturbed):\n");
             }
             for t in &s.sqtt {
+                let at = match &t.raw {
+                    Raw::Saved(dir) => dir.display().to_string(),
+                    Raw::Held(_) => t.kernel.clone(),
+                };
                 match &t.analysis {
-                    Ok(analysis) => {
-                        out.push_str(&format!("  #{} {}: {}\n", t.index, t.dir.display(), analysis.summary()))
-                    }
+                    Ok(analysis) => out.push_str(&format!("  #{} {at}: {}\n", t.index, analysis.summary())),
                     Err(error) => out.push_str(&format!("  #{} {}: {error}\n", t.index, t.kernel)),
                 }
             }

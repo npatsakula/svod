@@ -211,17 +211,17 @@ fn text_is_stable(fixture: &str, golden: &str) {
 /// Tier 5 renders one paragraph a traced kernel under the stage's report.
 #[test]
 fn profile_report_lists_traces() {
-    let ok = crate::SqttKernel {
+    let ok = crate::Traced {
         index: 0,
         kernel: "_Z9vectoropsv".into(),
-        dir: "sqtt/000__Z9vectoropsv".into(),
         analysis: Ok(replayed("amd/navi4_sdata")),
+        raw: crate::Raw::Saved("sqtt/000__Z9vectoropsv".into()),
     };
-    let failed = crate::SqttKernel {
+    let failed = crate::Traced {
         index: 1,
         kernel: "k".into(),
-        dir: "sqtt/001_k".into(),
-        analysis: Err(super::Error::NoItrace.into()),
+        analysis: Err(super::Error::NoItrace),
+        raw: crate::Raw::Saved("sqtt/001_k".into()),
     };
     let mut stage = crate::StageProfile::host("profile", std::time::Duration::ZERO);
     stage.sqtt = vec![ok, failed];
@@ -230,7 +230,7 @@ fn profile_report_lists_traces() {
     assert!(lines[1].starts_with("thread traces (SQTT"), "{report}");
     assert!(lines[2].starts_with("  #0 sqtt/000__Z9vectoropsv: _Z9vectoropsv gfx1200: 8 traced waves; time valu 51%"));
     assert!(lines[2].ends_with("main loop 16 iterations/wave at 7960 cycles (median)."), "{report}");
-    assert!(lines[3].starts_with("  #1 k: SQTT: no instruction-traced shader engine"), "{report}");
+    assert!(lines[3].starts_with("  #1 k: no instruction-traced shader engine"), "{report}");
 }
 
 #[test]

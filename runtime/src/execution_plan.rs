@@ -32,17 +32,18 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use smallvec::SmallVec;
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt};
 use svod_device::device::ProgramSpec;
 use svod_device::{Buffer, BufferId};
 use svod_dtype::DeviceSpec;
 use svod_ir::origin::{OriginId, OriginSet};
 use svod_ir::{CustomFunctionKind, Op, UOp};
 
-use crate::error::{ExecSnafu, Result};
+use crate::error::{ExecSnafu, Result, UnsupportedSnafu};
 use crate::kernel_cache::CachedKernel;
 use crate::profiler::{
-    KernelProfile, KernelStaticInfo, ProfileOptions, RunProfile, SqttKernel, StageProfile, SubmissionProfileFinalizer,
+    KernelProfile, KernelStaticInfo, ProfileOptions, Raw, RunProfile, Sink, SqttOptions, StageProfile,
+    SubmissionProfileFinalizer, Traced,
 };
 use svod_ir::ops;
 
@@ -1583,11 +1584,13 @@ impl ExecutionPlan {
     pub fn profile(&self, opts: &ProfileOptions) -> Result<RunProfile> {
         // A GPU idles its clock between runs; timed cold, the passes measure the clock lifting.
         if self.device != DeviceSpec::Cpu {
+            let mut failed = None;
             crate::benchmark::warm_clock(crate::benchmark::CLOCK_WARMUP, || {
-                let kernels = self.execute_profiled_inner(false, false).ok()?;
+                let kernels = self.execute_profiled_inner(false, false).map_err(|e| failed = Some(e)).ok()?;
                 let ns: Option<Vec<u64>> = kernels.iter().map(|k| k.gpu_end_ns?.checked_sub(k.gpu_start_ns?)).collect();
                 ns.filter(|ns| !ns.is_empty()).map(|ns| std::time::Duration::from_nanos(ns.iter().sum()))
             });
+            failed.map_or(Ok(()), Err)?;
         }
         let start = Instant::now();
         // Tier-4: arm hardware counters on the plan's context when requested and
@@ -1672,13 +1675,8 @@ impl ExecutionPlan {
                 profile.static_info = Some(self.kernel_static_info(pk));
             }
         }
-        if let Some(dir) = &opts.sqtt {
-            let config = svod_device::profile::SqttConfig {
-                pstate: opts.sqtt_pstate,
-                simds: opts.sqtt_simds,
-                ..Default::default()
-            };
-            report.stages[0].sqtt = self.trace(dir, config, &report.stages[0].kernels)?;
+        if let Some(sqtt) = &opts.sqtt {
+            report.stages[0].sqtt = self.trace(sqtt, &report.stages[0].kernels)?;
         }
         Ok(report)
     }
@@ -1700,25 +1698,12 @@ impl ExecutionPlan {
         first_program.and_then(|p| self.plan_ctx(p).ok().flatten())
     }
 
-    /// Tier 5: one more pass with the plan's context tracing (AMD SQTT) as
-    /// `config` asks, each kernel's trace saved
-    /// under `dir/<index>_<entry point>` beside its untraced time in
-    /// `untraced`. A context that cannot trace leaves a note.
-    fn trace(
-        &self,
-        dir: &std::path::Path,
-        config: svod_device::profile::SqttConfig,
-        untraced: &[KernelProfile],
-    ) -> Result<Vec<SqttKernel>> {
-        let Some(ctx) = self.first_ctx() else { return Ok(vec![]) };
-        if let Err(error) = ctx.set_sqtt(Some(config)) {
-            eprintln!("SVOD_SQTT: no thread trace on this device ({error}); skipped");
-            return Ok(vec![]);
-        }
-        let traced = self.execute_profiled_inner(true, true);
-        ctx.set_sqtt(None).context(ExecSnafu { context: "disarm the thread trace" })?;
-        // Profiles come in dispatch order, the compiled kernels in op_levels order: one-to-one, as
-        // the static analysis pairs them; a pair whose programs differ gets no launch dimensions.
+    /// Tier 5: one more pass with the plan's context tracing (AMD SQTT) as `sqtt` asks, each
+    /// kernel's capture beside its untraced time in `untraced`, saved under
+    /// `<dir>/<index>_<entry point>` or held as its [`Sink`] says. A plan with no compiled kernel
+    /// traces nothing; a context that cannot trace, or a capture that cannot be disassembled or
+    /// saved, is the pass's error, and a capture that does not analyze is its kernel's.
+    fn trace(&self, sqtt: &SqttOptions, untraced: &[KernelProfile]) -> Result<Vec<Traced>> {
         let compiled: Vec<&PreparedKernel> = self
             .op_levels
             .iter()
@@ -1728,30 +1713,44 @@ impl ExecutionPlan {
                 _ => None,
             })
             .collect();
+        let Some(first) = compiled.first() else { return Ok(vec![]) };
+        let ctx = self.plan_ctx(first.kernel.program.as_ref())?.context(UnsupportedSnafu {
+            kind: "thread trace",
+            reason: format!("{:?} has no plan context to arm", self.device),
+        })?;
+        ctx.set_sqtt(Some(sqtt.config)).context(ExecSnafu { context: "arm the thread trace" })?;
+        let traced = self.execute_profiled_inner(true, true);
+        ctx.set_sqtt(None).context(ExecSnafu { context: "disarm the thread trace" })?;
+        // Profiles come in dispatch order, the compiled kernels in op_levels order: one-to-one, as
+        // the static analysis pairs them; a pair whose programs differ gets no launch dimensions.
         let mut kernels = vec![];
         for (index, mut profile) in traced?.into_iter().enumerate() {
             let Some(trace) = profile.sqtt.take() else { continue };
             let prepared = compiled.get(index).filter(|k| Arc::ptr_eq(&k.kernel, &profile.kernel));
             let dims = prepared.and_then(|k| Self::kernel_launch_sizes(k).ok());
             let axes = |size: [usize; 3]| size.map(|n| u32::try_from(n).unwrap_or(u32::MAX));
-            let entry = profile.kernel.entry_point.clone();
-            let name: String = entry.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
-            let dir = dir.join(format!("{index:03}_{name}"));
-            let ns = untraced.get(index).and_then(|k| k.gpu_end_ns?.checked_sub(k.gpu_start_ns?));
-            let traced_ns =
-                profile.gpu_end_ns.zip(profile.gpu_start_ns).and_then(|(end, start)| end.checked_sub(start));
-            let analysis = crate::sqtt::Capture::new(*trace, ns).and_then(|mut capture| {
-                capture.traced_ns = traced_ns;
-                capture.pstate = Some(config.pstate.into());
-                capture.labels.insert("kernel".into(), entry.clone());
-                capture.resources = profile.kernel.program.resource_usage();
-                capture.grid = dims.and_then(|d| d.0).map(axes);
-                // A kernel without a local size dispatches workgroups of one thread.
-                capture.workgroup = dims.map(|d| axes(d.1.unwrap_or([1, 1, 1])));
-                capture.save(&dir)?;
-                capture.analyze()
-            });
-            kernels.push(SqttKernel { index, kernel: entry, dir, analysis: analysis.map_err(Into::into) });
+            let kernel = profile.kernel.entry_point.clone();
+            let ns = |k: &KernelProfile| k.gpu_end_ns?.checked_sub(k.gpu_start_ns?);
+            let mut capture = crate::sqtt::Capture::new(*trace, untraced.get(index).and_then(ns))?;
+            capture.traced_ns = ns(&profile);
+            capture.pstate = Some(sqtt.config.pstate.into());
+            capture.labels.insert("kernel".into(), kernel.clone());
+            capture.resources = profile.kernel.program.resource_usage();
+            capture.grid = dims.and_then(|d| d.0).map(axes);
+            // A kernel without a local size dispatches workgroups of one thread.
+            capture.workgroup = dims.map(|d| axes(d.1.unwrap_or([1, 1, 1])));
+            let analysis = capture.analyze();
+            let raw = match &sqtt.sink {
+                Sink::Disk(dir) => {
+                    let name: String =
+                        kernel.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+                    let dir = dir.join(format!("{index:03}_{name}"));
+                    capture.save(&dir)?;
+                    Raw::Saved(dir)
+                }
+                Sink::Memory => Raw::Held(Box::new(capture)),
+            };
+            kernels.push(Traced { index, kernel, analysis, raw });
         }
         Ok(kernels)
     }

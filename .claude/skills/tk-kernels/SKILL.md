@@ -272,8 +272,9 @@ of AMD's rocprof-trace-decoder, checked against its control CSVs) over `llvm-obj
   `--gated` as `pin`). It times the config untraced (`tune::measure`), then `tune::profile` runs
   `ExecutionPlan::profile` with `ProfileOptions::sqtt`: one more pass with `set_sqtt` armed. Each kernel lands in
   `<out>/gemm_MxNxK_<i>/p<program>/<index>_<entry>/`, its path printed (`saved …`).
-- **Any plan**: `SVOD_SQTT=1` makes `ProfileOptions::from_env` add Tier 5; the profile report then ends with one
-  summary line a kernel, the dirs under `SVOD_SQTT_DIR` (`./sqtt`). The traced pass syncs after each kernel and frees its `64 MiB × SEs` before the next.
+- **Any plan**: `ProfileOptions { sqtt: Some(SqttOptions::default()), .. }` adds Tier 5 (`SqttOptions::from_env()?` reads
+  `SVOD_SQTT=1`); the profile report then ends with one summary line a kernel, the dirs under `Sink::Disk` (`./sqtt`,
+  `SVOD_SQTT_DIR`), or each capture held with `Sink::Memory`. The traced pass syncs after each kernel and frees its `64 MiB × SEs` before the next.
 - **Offline replay**: a dir holds `se<N>.att` (raw), `kernel.co`, `kernel.s`, `meta.json` (arch, load base, untraced and
   traced ns, labels: cfg, shape, `model.*` terms). `tk_bench sqtt --load DIR [--json] [--attribute]` or
   `svod_runtime::sqtt::Analysis::load(dir)` re-analyze with no GPU (`llvm-objdump` only if `kernel.s` is gone).

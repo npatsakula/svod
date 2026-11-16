@@ -325,7 +325,8 @@ fn test_profile_without_a_thread_trace_saves_nothing() {
     let plan = builder.build().expect("build plan");
 
     let dir = tempfile::tempdir().unwrap();
-    let opts = ProfileOptions { sqtt: Some(dir.path().join("sqtt")), ..Default::default() };
+    let sqtt = SqttOptions { sink: Sink::Disk(dir.path().join("sqtt")), ..Default::default() };
+    let opts = ProfileOptions { sqtt: Some(sqtt), ..Default::default() };
     let profile = plan.profile(&opts).expect("profile");
     assert!(profile.stages[0].sqtt.is_empty() && !profile.render_report().contains("SQTT"));
     assert!(!dir.path().join("sqtt").exists());

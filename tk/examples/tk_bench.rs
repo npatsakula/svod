@@ -64,7 +64,7 @@ use std::time::{Duration, Instant};
 use svod_dtype::default_device::default_device;
 use svod_dtype::{DType, ScalarDType};
 use svod_runtime::sqtt::{Analysis, Capture, Class, Diff};
-use svod_runtime::{ExecutionPlan, ProfileOptions};
+use svod_runtime::{ExecutionPlan, ProfileOptions, Raw, Sink, SqttOptions};
 use svod_tensor::Tensor;
 use svod_tk::atoms::{Core, Costs, Device};
 use svod_tk::ir::Schedule;
@@ -711,10 +711,10 @@ fn sqtt_bench(args: &Args) -> Result<()> {
     for Traced { name, candidate, labels } in traced {
         let untraced = timed_candidates(vec![candidate()?]).pop().and_then(|t| t.1);
         let dir = out.join(&name);
-        // `SVOD_SQTT_PSTATE` pins the traced pass's clock (`ProfileOptions::from_env`).
-        let opts =
-            ProfileOptions { iters: 3, static_analysis: false, sqtt: Some(dir.clone()), ..ProfileOptions::from_env() };
-        let profiles = tune::profile(candidate()?, &opts).ok_or_else(|| format!("{name}: failed to build or run"))?;
+        // `SVOD_SQTT_PSTATE` pins the traced pass's clock, `SVOD_SQTT_SIMD` picks its SIMDs.
+        let sqtt = SqttOptions { config: SqttOptions::config_from_env()?, sink: Sink::Disk(dir.clone()) };
+        let opts = ProfileOptions { iters: 3, static_analysis: false, sqtt: Some(sqtt), ..ProfileOptions::from_env() };
+        let profiles = tune::profile(candidate()?, &opts).map_err(|e| format!("{name}: {e}"))?;
         // `SVOD_PMC` adds the hardware counters of the untraced passes.
         if opts.counters != svod_runtime::profiler::PmcSelection::None {
             profiles.iter().for_each(|p| print!("{}", p.render_table()));
@@ -725,23 +725,24 @@ fn sqtt_bench(args: &Args) -> Result<()> {
         }
         let candidate = candidate()?;
         for trace in traces {
+            let Raw::Saved(dir) = &trace.raw else { unreachable!("a disk sink saves") };
             if let Err(error) = &trace.analysis {
-                return Err(format!("{}: {error}", trace.dir.display()).into());
+                return Err(format!("{}: {error}", dir.display()).into());
             }
-            let mut capture = Capture::load(&trace.dir)?;
+            let mut capture = Capture::load(dir)?;
             capture.labels.extend(labels.clone());
             capture.labels.insert("candidate_ns".into(), untraced.map_or("-".into(), |t| t.as_nanos().to_string()));
             // The statements, from a host build with a line table whose code is the traced one.
             match tune::twin(&candidate, &mut capture) {
                 None => capture.labels.insert("lines".into(), "twin".into()),
                 Some(why) => {
-                    eprintln!("{}: no statements: {why}", trace.dir.display());
+                    eprintln!("{}: no statements: {why}", dir.display());
                     capture.labels.insert("lines.why".into(), why);
                     capture.labels.insert("lines".into(), "mismatch".into())
                 }
             };
-            capture.save(&trace.dir)?;
-            println!("saved {}", trace.dir.display());
+            capture.save(dir)?;
+            println!("saved {}", dir.display());
             sqtt_print(&capture, args, top)?;
         }
     }

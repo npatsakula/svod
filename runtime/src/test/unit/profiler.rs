@@ -18,8 +18,8 @@ use test_case::test_case;
 
 use crate::kernel_cache::CachedKernel;
 use crate::profiler::{
-    KernelProfile, OperationTiming, OriginView, PmcSelection, ProfileOptions, RunProfile, StageProfile, UNATTRIBUTED,
-    aggregate_origins, analyze_execution_lanes, has_origins, parse_pmc,
+    KernelProfile, OperationTiming, OriginView, PmcSelection, ProfileOptions, RunProfile, Sink, SqttOptions,
+    StageProfile, UNATTRIBUTED, aggregate_origins, analyze_execution_lanes, has_origins, parse_pmc,
 };
 
 /// Every counter of every backend round-trips through its token, and tokens are
@@ -113,42 +113,49 @@ fn from_env_parses_the_origin_depth(value: Option<&str>, expected: Option<usize>
     assert_eq!(parsed, expected, "SVOD_ORIGIN_DEPTH={value:?}");
 }
 
-/// `SVOD_SQTT_PSTATE` picks the traced pass's pin; unset or unknown leaves the clock to the device.
-#[test_case(None, None; "unset")]
-#[test_case(Some("standard"), Some(StablePstate::Standard); "standard")]
-#[test_case(Some("peak"), Some(StablePstate::Peak); "peak")]
-#[test_case(Some("min_sclk"), None; "unknown")]
-fn from_env_parses_the_sqtt_pstate(value: Option<&str>, expected: Option<StablePstate>) {
-    static ENV: Mutex<()> = Mutex::new(());
-    let _guard = ENV.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    unsafe {
-        match value {
-            Some(value) => std::env::set_var("SVOD_SQTT_PSTATE", value),
-            None => std::env::remove_var("SVOD_SQTT_PSTATE"),
-        }
-    }
-    let parsed = ProfileOptions::from_env().sqtt_pstate;
-    unsafe { std::env::remove_var("SVOD_SQTT_PSTATE") };
-    assert_eq!(parsed, expected, "SVOD_SQTT_PSTATE={value:?}");
+/// `SVOD_SQTT*` mutate the whole process; these cases are their only readers.
+static SQTT_ENV: Mutex<()> = Mutex::new(());
+
+fn with_env<T>(vars: &[(&str, &str)], read: impl FnOnce() -> T) -> T {
+    const SQTT: [&str; 4] = ["SVOD_SQTT", "SVOD_SQTT_DIR", "SVOD_SQTT_PSTATE", "SVOD_SQTT_SIMD"];
+    let _guard = SQTT_ENV.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let clear = || SQTT.iter().for_each(|var| unsafe { std::env::remove_var(var) });
+    clear();
+    vars.iter().for_each(|(var, value)| unsafe { std::env::set_var(var, value) });
+    let read = read();
+    clear();
+    read
 }
 
-/// `SVOD_SQTT_SIMD` picks each SE's traced SIMD; unset or unparsable keeps CU 0's two SIMDs alternating.
-#[test_case(None, SqttSimds::default(); "unset")]
-#[test_case(Some("3"), SqttSimds([3; 8]); "one")]
-#[test_case(Some("1,0"), SqttSimds::cycle(&[1, 0]); "list")]
-#[test_case(Some("x"), SqttSimds::default(); "unknown")]
-fn from_env_parses_the_sqtt_simds(value: Option<&str>, expected: SqttSimds) {
-    static ENV: Mutex<()> = Mutex::new(());
-    let _guard = ENV.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    unsafe {
-        match value {
-            Some(value) => std::env::set_var("SVOD_SQTT_SIMD", value),
-            None => std::env::remove_var("SVOD_SQTT_SIMD"),
-        }
-    }
-    let parsed = ProfileOptions::from_env().sqtt_simds;
-    unsafe { std::env::remove_var("SVOD_SQTT_SIMD") };
-    assert_eq!(parsed, expected, "SVOD_SQTT_SIMD={value:?}");
+/// `SVOD_SQTT_PSTATE` picks the traced pass's pin; unset leaves the clock to the device, unknown is refused.
+#[test_case(None => Some(None); "unset")]
+#[test_case(Some("standard") => Some(Some(StablePstate::Standard)); "standard")]
+#[test_case(Some("peak") => Some(Some(StablePstate::Peak)); "peak")]
+#[test_case(Some("min_sclk") => None; "unknown")]
+fn config_from_env_parses_the_pstate(value: Option<&str>) -> Option<Option<StablePstate>> {
+    with_env(value.map(|v| ("SVOD_SQTT_PSTATE", v)).as_slice(), SqttOptions::config_from_env).ok().map(|c| c.pstate)
+}
+
+/// `SVOD_SQTT_SIMD` picks each SE's traced SIMD; unset keeps CU 0's two SIMDs alternating, unparsable is refused.
+#[test_case(None => Some(SqttSimds::default()); "unset")]
+#[test_case(Some("3") => Some(SqttSimds([3; 8])); "one")]
+#[test_case(Some("1,0") => Some(SqttSimds::cycle(&[1, 0])); "list")]
+#[test_case(Some("x") => None; "unknown")]
+fn config_from_env_parses_the_simds(value: Option<&str>) -> Option<SqttSimds> {
+    with_env(value.map(|v| ("SVOD_SQTT_SIMD", v)).as_slice(), SqttOptions::config_from_env).ok().map(|c| c.simds)
+}
+
+/// `SVOD_SQTT=1` alone traces, saved under `SVOD_SQTT_DIR`; a bad config value is an error, not a default.
+#[test]
+fn sqtt_from_env_traces_when_asked() {
+    let read = |vars: &[(&str, &str)]| with_env(vars, SqttOptions::from_env);
+    assert_eq!(read(&[("SVOD_SQTT_PSTATE", "peak")]).unwrap(), None);
+    assert_eq!(read(&[("SVOD_SQTT", "0")]).unwrap(), None);
+    assert_eq!(read(&[("SVOD_SQTT", "1")]).unwrap(), Some(SqttOptions::default()));
+    let dir = read(&[("SVOD_SQTT", "1"), ("SVOD_SQTT_DIR", "traces")]).unwrap().map(|o| o.sink);
+    assert_eq!(dir, Some(Sink::Disk("traces".into())));
+    let error = read(&[("SVOD_SQTT", "1"), ("SVOD_SQTT_SIMD", "x")]).unwrap_err();
+    assert_eq!(error.var, "SVOD_SQTT_SIMD");
 }
 
 #[test]
