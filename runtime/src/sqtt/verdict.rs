@@ -673,13 +673,51 @@ pub struct Demand {
 
 /// The main loop's limiters: the kernel's class by its pipes' busy shares over the steady window
 /// (`bound`: matrix_bound, issue_bound, occupancy_limited), then the loop's findings by exposed share
-/// (`findings`), largest first in each.
+/// (`findings`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Verdict {
     pub ceiling: Option<Ceiling>,
     pub demand: Option<Demand>,
-    pub bound: Vec<Finding>,
-    pub findings: Vec<Finding>,
+    pub bound: Findings,
+    pub findings: Findings,
+}
+
+/// Findings, the largest share first and a tie by kind.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(from = "Vec<Finding>")]
+pub struct Findings(Vec<Finding>);
+
+impl From<Vec<Finding>> for Findings {
+    fn from(mut findings: Vec<Finding>) -> Self {
+        findings.sort_by(|a, b| b.share.total_cmp(&a.share).then(a.kind.cmp(&b.kind)));
+        Self(findings)
+    }
+}
+
+impl std::ops::Deref for Findings {
+    type Target = [Finding];
+
+    fn deref(&self) -> &[Finding] {
+        &self.0
+    }
+}
+
+impl IntoIterator for Findings {
+    type Item = Finding;
+    type IntoIter = std::vec::IntoIter<Finding>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a Findings {
+    type Item = &'a Finding;
+    type IntoIter = std::slice::Iter<'a, Finding>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
 }
 
 /// Whether a time the trace states passes [`PLAUSIBLE_CYCLES`]: an SE's span, a complete wave's
@@ -812,6 +850,7 @@ pub(super) fn rank(a: &Analysis) -> Verdict {
     };
     let finding = |kind, (share, raw), evidence, knob, approx| Finding { kind, share, raw, evidence, knob, approx };
     let mut v = Verdict { demand: demand(a), ..Verdict::default() };
+    let (mut bound, mut findings) = (vec![], vec![]);
     let l = a.main_loop.as_ref().filter(|l| l.partition.cycles()[0] > 0 && l.trips.total > 0);
     let observed = observed(a);
     let limit = a.occupancy.limit.clone();
@@ -833,17 +872,17 @@ pub(super) fn rank(a: &Analysis) -> Verdict {
                     Knob::LessMatrixWork,
                     approx(&[]),
                 );
-                v.bound.push(f);
+                bound.push(f);
             }
             if any >= ISSUE_BOUND && matrix < ISSUE_MATRIX * any {
-                v.bound.push(finding(FindingKind::IssueBound, (any, any), evidence, Knob::CutIssue, approx(&[])));
+                bound.push(finding(FindingKind::IssueBound, (any, any), evidence, Knob::CutIssue, approx(&[])));
             }
             if let Some(observed) = observed.filter(|_| 1.0 - any >= SIMD_IDLE) {
                 let idle = 1.0 - any;
                 let need = observed / any.max(1e-9);
                 let evidence = Evidence::Occupancy { observed, need, idle: Some(idle), limit: limit.clone() };
                 let knob = occupancy_knob(observed);
-                v.bound.push(finding(FindingKind::OccupancyLimited, (idle, idle), evidence, knob, approx(&[])));
+                bound.push(finding(FindingKind::OccupancyLimited, (idle, idle), evidence, knob, approx(&[])));
             }
         }
         // gfx11: no busy share to trust; the waves that would hide the loop's waits behind its issue.
@@ -857,12 +896,12 @@ pub(super) fn rank(a: &Analysis) -> Verdict {
                     let evidence = Evidence::Occupancy { observed, need, idle: None, limit: limit.clone() };
                     let knob = occupancy_knob(observed);
                     let f = finding(FindingKind::OccupancyLimited, (share, share), evidence, knob, approx(raw_flag));
-                    v.bound.push(f);
+                    bound.push(f);
                 }
             }
         }
     }
-    sort(&mut v.bound);
+    v.bound = bound.into();
     let Some(l) = l else { return v };
     let (p, trips) = (&l.partition, l.trips.total);
     let share = |cycles: i64| cycles as f64 / p.cycles()[0] as f64;
@@ -889,7 +928,7 @@ pub(super) fn rank(a: &Analysis) -> Verdict {
             loads,
             stalls: stalls(a, Class::VmemLoad, trips as f64),
         };
-        v.findings.push(finding(FindingKind::LoadExposed, (s, raw), evidence, knob, per_trip(&more)));
+        findings.push(finding(FindingKind::LoadExposed, (s, raw), evidence, knob, per_trip(&more)));
     }
 
     let lds = |store: bool| move |on: WaitOn| matches!(on.counter, Counter::Ds | Counter::Lgkm) && on.store == store;
@@ -911,14 +950,14 @@ pub(super) fn rank(a: &Analysis) -> Verdict {
         let knob = parts.into_iter().max_by(|x, y| x.0.total_cmp(&y.0)).map_or(Knob::LdsUse, |p| p.1);
         let (loads, stalls) = (loads(a, Class::Lds, trips as f64), stalls(a, Class::Lds, trips as f64));
         let evidence = Evidence::Waits { load, store, stall, loads, stalls };
-        v.findings.push(finding(FindingKind::LdsExposed, (s, raw), evidence, knob, per_trip(raw_flag)));
+        findings.push(finding(FindingKind::LdsExposed, (s, raw), evidence, knob, per_trip(raw_flag)));
     }
 
     let barrier = p.barrier();
     if share(barrier[0]) >= BARRIER {
         let evidence = Evidence::Barrier { cycles: per_trip_of(barrier), sites: l.barriers.clone() };
         let f = finding(FindingKind::Barrier, ranked(barrier), evidence, Knob::Barrier, per_trip(raw_flag));
-        v.findings.push(f);
+        findings.push(f);
     }
 
     let alu = [Class::Valu, Class::Salu];
@@ -938,14 +977,10 @@ pub(super) fn rank(a: &Analysis) -> Verdict {
             divergent,
         };
         let s = ranked(p.issued(&alu));
-        v.findings.push(finding(FindingKind::LoopOverhead, s, evidence, Knob::Hoist, per_trip(raw_flag)));
+        findings.push(finding(FindingKind::LoopOverhead, s, evidence, Knob::Hoist, per_trip(raw_flag)));
     }
-    sort(&mut v.findings);
+    v.findings = findings.into();
     v
-}
-
-fn sort(findings: &mut [Finding]) {
-    findings.sort_by(|a, b| b.share.total_cmp(&a.share).then(a.kind.cmp(&b.kind)));
 }
 
 fn pct(share: f64) -> f64 {

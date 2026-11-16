@@ -128,15 +128,6 @@ fn foreign_version_stops_decoding(v: u8) {
     assert_eq!((trace.header, trace.refused), (None, Some(v)), "the wave model names it");
 }
 
-#[test_case(3, Layout::Rdna3)]
-#[test_case(4, Layout::Rdna4)]
-fn header_selects_layout(v: u8, layout: Layout) {
-    let data = stream(&[version(v)]);
-    let mut decoder = decode(&data);
-    decoder.next();
-    assert_eq!(decoder.layout(), layout);
-}
-
 // A realtime timestamp (`rt`) carries no delta; otherwise it adds its delta, lost packets (`pl`) or not.
 #[test_case(4, 1 << 7, 0 ; "rdna4 realtime")]
 #[test_case(4, 1 << 8, 100 ; "rdna4 lost packets")]
@@ -454,7 +445,7 @@ fn analyzes_and_stitches(data: &[u8], layout: Layout) -> Result<(), TestCaseErro
     let report = Report::new(&trace.waves);
     prop_assert!(report.pcs.keys().all(|pc| code.iter().any(|(line, _)| line == pc)));
     let hidden = hidden::analyze([(0, &trace)], &hidden::matrix_pcs(&code), 0);
-    prop_assert!(hidden.by_pc.keys().all(|pc| report.pcs.contains_key(pc)));
+    prop_assert!(hidden.by_pc().keys().all(|pc| report.pcs.contains_key(pc)));
     if let Some(residency) = Residency::new(&trace.occupancy) {
         prop_assert!(residency.window.0 <= residency.window.1);
     }

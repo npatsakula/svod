@@ -66,17 +66,6 @@ fn matrix_pcs_are_the_wmma_lines() {
     assert_eq!(matrix.into_iter().collect::<BTreeSet<_>>(), wmma);
 }
 
-/// The same per-PC sums, every SE at once: `by_pc` is the scopes added up.
-#[test]
-fn by_pc_sums_the_scopes() {
-    let s = stitched("svod/strix_smoke");
-    let r = hidden::analyze(s.ses.iter().copied().zip(&s.traces), &hidden::matrix_pcs(&s.lines()), s.base);
-    assert_eq!(r.by_scope.len(), 2);
-    let mut sum = BTreeMap::<u64, Hidden>::new();
-    r.by_scope.values().flatten().for_each(|(&pc, &h)| *sum.entry(pc).or_default() += h);
-    assert_eq!(sum, r.by_pc);
-}
-
 fn category() -> impl Strategy<Value = Category> {
     prop::sample::select(vec![
         Category::Valu,

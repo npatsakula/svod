@@ -257,12 +257,20 @@ pub fn scope<'a>(
     by_pc
 }
 
-/// Hidden cycles per PC less `base`, over all scopes and per `(SE, SIMD)`.
+/// Hidden cycles per PC less `base`, per `(SE, SIMD)`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HiddenLatency {
     pub base: u64,
-    pub by_pc: BTreeMap<u64, Hidden>,
     pub by_scope: BTreeMap<(u32, u8), BTreeMap<u64, Hidden>>,
+}
+
+impl HiddenLatency {
+    /// Hidden cycles per PC less `base`, every scope's added up.
+    pub fn by_pc(&self) -> BTreeMap<u64, Hidden> {
+        let mut by_pc = BTreeMap::<u64, Hidden>::new();
+        self.by_scope.values().flatten().for_each(|(&pc, &h)| *by_pc.entry(pc).or_default() += h);
+        by_pc
+    }
 }
 
 /// The PCs of `code` (`(pc, llvm-objdump line)`) that issue a matrix instruction.
@@ -277,11 +285,7 @@ pub fn analyze<'a>(ses: impl IntoIterator<Item = (u32, &'a Trace)>, matrix: &Has
         let simds: std::collections::BTreeSet<u8> = trace.waves.iter().map(|w| w.unit.simd).collect();
         for simd in simds {
             let waves = trace.waves.iter().filter(|w| w.unit.simd == simd);
-            let scope: BTreeMap<u64, Hidden> =
-                scope(waves, &trace.other_simd, matrix).into_iter().map(|(pc, h)| (pc - base, h)).collect();
-            for (&pc, &hidden) in &scope {
-                *result.by_pc.entry(pc).or_default() += hidden;
-            }
+            let scope = scope(waves, &trace.other_simd, matrix).into_iter().map(|(pc, h)| (pc - base, h)).collect();
             result.by_scope.insert((se, simd), scope);
         }
     }

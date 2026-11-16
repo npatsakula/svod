@@ -127,11 +127,6 @@ pub struct Decoder<'a> {
 }
 
 impl Decoder<'_> {
-    /// The layout the packets that follow are decoded with.
-    pub fn layout(&self) -> Layout {
-        self.layout
-    }
-
     /// The version of a `HEADER` that is neither 3 nor 4 (CDNA, or not a header at all): the last packet
     /// decoded, as `Kind::Header(Err(version))`.
     pub fn unsupported_layout(&self) -> Option<u8> {

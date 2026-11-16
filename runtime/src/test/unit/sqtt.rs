@@ -116,9 +116,6 @@ fn summarizes(fixture: &str) {
         a.traced.iter().map(|t| (t.waves, t.complete)).fold((0, 0), |s, t| (s.0 + t.0, s.1 + t.1)),
         (a.waves, a.complete)
     );
-    for findings in [&a.verdict.bound, &a.verdict.findings] {
-        assert!(findings.windows(2).all(|w| w[0].share >= w[1].share), "largest share first");
-    }
     assert!(text.lines().nth(1).unwrap().starts_with("== verdict"), "the verdict leads: {text}");
     if let Some(l) = &a.main_loop {
         let p = &l.partition;
