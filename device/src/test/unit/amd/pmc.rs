@@ -86,6 +86,15 @@ fn set_pmc_refuses_aql_queues() {
     assert_eq!(owner.set_pmc(&[]).unwrap(), 0);
 }
 
+/// Counters need this device's own pin: the synthetic device has no render node, so a pinned GPU
+/// elsewhere on the host does not make its counters available.
+#[test]
+fn pmc_needs_the_devices_own_pin() {
+    let (_iface, allocator) = mock_device(1);
+    let owner = OwnerCtx::new(Arc::clone(allocator.dev.core()), allocator);
+    assert!(!owner.pmc_available());
+}
+
 fn mock_pmc_handle()
 -> (Arc<MockAmdIface>, Arc<crate::amd::signal::SignalPool>, PmcHandle, Arc<crate::amd::signal::AmdSignal>) {
     let (iface, allocator) = mock_device(1);

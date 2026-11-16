@@ -957,7 +957,7 @@ impl crate::device::PlanContext for OwnerCtx {
     }
 
     fn pmc_available(&self) -> bool {
-        crate::amd::pmc::stable_pstate()
+        crate::amd::pmc::stable_pstate(self.core.node.drm_render_minor)
     }
 
     fn pmc_default(&self) -> Vec<crate::profile::PmcCounter> {
@@ -979,12 +979,13 @@ impl crate::device::PlanContext for OwnerCtx {
         // A pin at another state is released before the new one is taken: the
         // kernel refuses a second level while one context holds the device.
         let held = armed.take().filter(|armed| armed.config.pstate == config.pstate).and_then(|armed| armed.pstate);
+        let pinned = || crate::amd::pmc::stable_pstate(self.core.node.drm_render_minor);
         let pstate = match (config.pstate, held) {
             (None, _) => None,
             (Some(_), Some(held)) => Some(held),
             (Some(mode), None) => match self.core.iface().hold_stable_pstate(mode) {
                 Ok(held) => Some(held),
-                Err(_) if mode == crate::profile::StablePstate::Standard && crate::amd::pmc::stable_pstate() => None,
+                Err(_) if mode == crate::profile::StablePstate::Standard && pinned() => None,
                 Err(error) => return Err(error).context(crate::error::SqttPowerStateSnafu),
             },
         };

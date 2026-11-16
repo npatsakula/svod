@@ -21,17 +21,12 @@ use crate::profile::{AmdCounter, CounterSet, PmcCounter};
 use snafu::ensure;
 use svod_dtype::AmdArch;
 
-/// Whether any AMD GPU is pinned to a stable power state (`profile_standard`),
-/// required for meaningful perf-counter values. Scans the DRM sysfs nodes; on a
-/// single-GPU host this is exact. Set it with `amd-smi set -l stable_std`.
-pub fn stable_pstate() -> bool {
-    let Ok(entries) = std::fs::read_dir("/sys/class/drm") else {
-        return false;
-    };
-    entries.flatten().any(|e| {
-        std::fs::read_to_string(e.path().join("device/power_dpm_force_performance_level"))
-            .is_ok_and(|s| s.trim() == "profile_standard")
-    })
+/// Whether the GPU on render node `renderD{render_minor}` is pinned to a stable
+/// power state (`profile_standard`), required for meaningful perf-counter values.
+/// Set it with `amd-smi set -l stable_std`.
+pub fn stable_pstate(render_minor: u32) -> bool {
+    let path = format!("/sys/class/drm/renderD{render_minor}/device/power_dpm_force_performance_level");
+    std::fs::read_to_string(path).is_ok_and(|s| s.trim() == "profile_standard")
 }
 
 /// Refuse what the counters do not cover: CDNA (gfx9 counts per SE, not per
