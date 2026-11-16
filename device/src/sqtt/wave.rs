@@ -80,6 +80,9 @@ pub struct OtherSimd {
 pub struct Trace {
     /// The SE's `HEADER`; `None` where its stream announced none the decoder reads.
     pub header: Option<Header>,
+    /// The version of a `HEADER` the decoder refused (CDNA's, or a corrupt stream's): the stream
+    /// stops there.
+    pub refused: Option<u8>,
     /// The traced SIMD's waves, in the order AMD stitches them.
     pub waves: Vec<Wave>,
     pub occupancy: Vec<Occupancy>,
@@ -193,6 +196,7 @@ impl Model {
     fn token(&mut self, time: i64, kind: Kind) {
         match kind {
             Kind::Header(Ok(header)) => (self.header, self.trace.header) = (header, Some(header)),
+            Kind::Header(Err(version)) => self.trace.refused = Some(version),
             Kind::Misc { fields } if fields & 8 != 0 => {
                 self.slots.iter_mut().filter_map(|slot| slot.last_mut()).for_each(|wave| wave.standby = true);
             }

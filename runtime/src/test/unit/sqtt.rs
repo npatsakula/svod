@@ -238,6 +238,38 @@ fn flags_truncation() {
     let a = c.analyze().unwrap();
     assert!(a.text(3).lines().nth(1).unwrap().starts_with("!! TRUNCATED se0"));
     assert!(a.summary().ends_with("TRUNCATED."));
+    let mut c = Capture::load(&fixtures().join("svod/rdna4_gemm_v1")).unwrap();
+    let flagged = |c: &Capture| {
+        let v = c.analyze().unwrap().verdict;
+        let all: Vec<bool> = v.bound.iter().chain(&v.findings).map(|f| f.approx.contains(&Approx::Truncated)).collect();
+        assert!(!all.is_empty());
+        all
+    };
+    assert!(flagged(&c).iter().all(|&f| !f));
+    c.trace.per_se[1].truncated = true;
+    assert!(flagged(&c).iter().all(|&f| f), "every finding undercounts");
+}
+
+/// `version` in place of the HEADER a stream opens with, its version in bits 7..=12.
+fn foreign(bytes: &mut [u8], version: u16) {
+    let word = u16::from_le_bytes([bytes[0], bytes[1]]);
+    assert_eq!(word & 0x7f, 0b0010001, "the stream opens with its header");
+    bytes[..2].copy_from_slice(&(word & !(0x3f << 7) | version << 7).to_le_bytes());
+}
+
+/// A foreign header on an instruction-traced SE: named on the SE and in the text while another SE
+/// decodes, the error where none does.
+#[test]
+fn names_a_foreign_header() {
+    let mut c = Capture::load(&fixtures().join("svod/rdna4_gemm_v1")).unwrap();
+    foreign(&mut c.trace.per_se[1].bytes, 2);
+    let a = c.analyze().unwrap();
+    assert_eq!(a.ses.iter().map(|s| s.refused).collect::<Vec<_>>(), [None, Some(2), None, None]);
+    assert_eq!(a.traced.iter().map(|t| t.se).collect::<Vec<_>>(), [0]);
+    assert!(a.text(3).contains("!! UNSUPPORTED se1: a header of version 2;"), "{}", a.text(3));
+    let mut c = capture("amd/strix_barrier");
+    foreign(&mut c.trace.per_se[0].bytes, 5);
+    assert!(matches!(c.analyze(), Err(super::Error::Header { se: 0, version: 5 })));
 }
 
 #[test]
@@ -738,7 +770,7 @@ proptest! {
         }
         match c.analyze() {
             Ok(a) => prop_assert_eq!(serde_json::from_str::<Analysis>(&a.to_json()).unwrap(), a),
-            Err(error) => prop_assert!(matches!(error, super::Error::NoItrace), "{error}"),
+            Err(error) => prop_assert!(matches!(error, super::Error::NoItrace | super::Error::Header { .. }), "{error}"),
         }
     }
 }

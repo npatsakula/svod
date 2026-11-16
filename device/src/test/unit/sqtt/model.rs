@@ -124,6 +124,8 @@ fn foreign_version_stops_decoding(v: u8) {
     assert_eq!(decoder.next().map(|p| p.kind), Some(Kind::Header(Err(v))));
     assert_eq!(decoder.unsupported_layout(), Some(v));
     assert_eq!(decoder.next(), None);
+    let trace = analyze(decode(&data));
+    assert_eq!((trace.header, trace.refused), (None, Some(v)), "the wave model names it");
 }
 
 #[test_case(3, Layout::Rdna3)]

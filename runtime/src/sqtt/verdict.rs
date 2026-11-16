@@ -444,6 +444,8 @@ pub enum Approx {
     /// An SE's span, a wave's lifetime or an instruction's cycles passes [`PLAUSIBLE_CYCLES`]: the
     /// stream is corrupt, and its sums may have saturated.
     ImplausibleTime,
+    /// An SE's buffer filled and its tail is lost: the sums undercount.
+    Truncated,
     /// The capture has no [`Model`](super::Model): a trip is taken as one loop iteration, whatever
     /// the iteration unrolls.
     PerIteration,
@@ -456,6 +458,7 @@ impl Approx {
             Self::UntimedMatrix => "untimed_matrix",
             Self::ApproxBindings => "approx_bindings",
             Self::ImplausibleTime => "implausible_time",
+            Self::Truncated => "truncated",
             Self::PerIteration => "per_iteration",
         }
     }
@@ -700,9 +703,14 @@ fn demand(a: &Analysis) -> Option<Demand> {
 pub(super) fn rank(a: &Analysis) -> Verdict {
     let perturbed = slowdown(a).is_some_and(|r| r > PERTURBED);
     let implausible = implausible(a);
+    let truncated = a.ses.iter().any(|s| s.truncated);
     let untimed = a.occupancy.untimed_matrix;
     let approx = |more: &[Approx]| {
-        let base = [perturbed.then_some(Approx::Perturbed), implausible.then_some(Approx::ImplausibleTime)];
+        let base = [
+            perturbed.then_some(Approx::Perturbed),
+            implausible.then_some(Approx::ImplausibleTime),
+            truncated.then_some(Approx::Truncated),
+        ];
         base.into_iter().flatten().chain(more.iter().copied()).collect::<Vec<_>>()
     };
     let raw_flag: &[Approx] = if untimed { &[Approx::UntimedMatrix] } else { &[] };

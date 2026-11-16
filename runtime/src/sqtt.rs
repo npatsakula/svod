@@ -52,6 +52,8 @@ pub enum Error {
     Json { source: serde_json::Error, path: PathBuf },
     #[snafu(display("no instruction-traced shader engine has an RDNA3/RDNA4 trace header"))]
     NoItrace,
+    #[snafu(display("se{se}: a trace header of version {version}, not RDNA3's 3 or RDNA4's 4"))]
+    Header { se: u32, version: u8 },
     #[snafu(display("{arch}: not an AMD arch"))]
     Arch { arch: String },
 }
@@ -460,6 +462,8 @@ pub struct Se {
     pub itrace: bool,
     pub bytes: usize,
     pub truncated: bool,
+    /// The version of a `HEADER` the decoder refused: the stream from it on is left out.
+    pub refused: Option<u8>,
     /// Waves started on any SIMD of the SE.
     pub waves: usize,
     /// Waves resident on the SE at once, at most.
@@ -673,6 +677,7 @@ impl Analysis {
                 itrace: se.itrace,
                 bytes: se.bytes.len(),
                 truncated: se.truncated,
+                refused: trace.refused,
                 waves: starts,
                 occupancy_peak: peak,
                 span,
@@ -718,7 +723,12 @@ impl Analysis {
             by_se.push((se.se, waves.len()..waves.len() + trace.waves.len()));
             waves.append(&mut trace.waves);
         }
-        let layout = layout.context(NoItraceSnafu)?;
+        let refused = |s: &&Se| s.itrace && s.refused.is_some();
+        let layout = match (layout, ses.iter().find(refused)) {
+            (Some(layout), _) => layout,
+            (None, Some(s)) => return HeaderSnafu { se: s.se, version: s.refused.expect("refused") }.fail(),
+            (None, None) => return NoItraceSnafu.fail(),
+        };
         let text: BTreeMap<u64, &str> = lines.iter().copied().collect();
         let rows: Vec<Row> = pcs
             .iter()
@@ -838,6 +848,9 @@ impl Analysis {
         let _ = writeln!(o, "== sqtt {} {}{labels}", self.kernel, self.arch);
         for se in self.ses.iter().filter(|s| s.truncated) {
             let _ = writeln!(o, "!! TRUNCATED se{}: its buffer filled and the tail is lost; totals undercount", se.se);
+        }
+        for (se, version) in self.ses.iter().filter_map(|s| Some((s.se, s.refused?))) {
+            let _ = writeln!(o, "!! UNSUPPORTED se{se}: a header of version {version}; the stream from it is left out");
         }
         if self.stitched < self.records {
             let _ =
