@@ -37,6 +37,9 @@ pub const SIMD_IDLE: f64 = 0.10;
 /// The traced run over the untraced past this: its cycle shares no longer describe the untraced
 /// kernel (the probes of 2026-11 put an unpinned trace within a few percent of it).
 pub const PERTURBED: f64 = 1.2;
+/// Cycles no traced time spans: over a minute at 4 GHz, past any dispatch a profile traces, and far
+/// below the 2^60 the wave model clamps a corrupt stream's timestamps to.
+pub const PLAUSIBLE_CYCLES: i64 = 1 << 38;
 /// A barrier wait this short: its wave arrived last and the barrier released at once. The fixtures'
 /// waits split into a floor of 8 to 15 cycles and a tail from tens of cycles up.
 pub const LAST_ARRIVER: i64 = 16;
@@ -119,14 +122,15 @@ impl Charge {
             (&mut self.barrier, o.barrier),
             (&mut self.idle, o.idle),
         ] {
-            (at[0], at[1]) = (at[0] + from[0], at[1] + from[1]);
+            (at[0], at[1]) = (at[0].saturating_add(from[0]), at[1].saturating_add(from[1]));
         }
     }
 }
 
-/// `cycles` into `at`, raw and less what `hidden` covers of them.
+/// `cycles` into `at`, raw and less what `hidden` covers of them. Saturating, as every sum of the
+/// partition: a corrupt trace's cycles may pass `i64`.
 fn charge(at: &mut [i64; 2], cycles: i64, hidden: i64) {
-    (at[0], at[1]) = (at[0] + cycles, at[1] + cycles - hidden.clamp(0, cycles));
+    (at[0], at[1]) = (at[0].saturating_add(cycles), at[1].saturating_add(cycles - hidden.clamp(0, cycles)));
 }
 
 /// Raw and exposed cycles by key.
@@ -142,7 +146,7 @@ impl<K: Ord + Copy> Sums<K> {
 
     fn add(&mut self, key: K, cycles: i64, hidden: i64) {
         let at = self.0.entry(key).or_default();
-        (at.0, at.1) = (at.0 + cycles, at.1 + cycles - hidden.clamp(0, cycles));
+        (at.0, at.1) = (at.0.saturating_add(cycles), at.1.saturating_add(cycles - hidden.clamp(0, cycles)));
     }
 
     fn split(self) -> (Keyed<K>, Keyed<K>) {
@@ -209,7 +213,7 @@ impl Buckets {
                 last = r.time + r.duration;
                 if !body.contains(&r.pc) {
                     if let Some((start, cursor)) = run.take() {
-                        raw.cycles += cursor - start;
+                        raw.cycles = raw.cycles.saturating_add(cursor - start);
                     }
                     continue;
                 }
@@ -260,7 +264,7 @@ impl Buckets {
                 *cursor += cycles;
             }
             if let Some((start, cursor)) = run {
-                raw.cycles += cursor - start;
+                raw.cycles = raw.cycles.saturating_add(cursor - start);
             }
             raw.waves += usize::from(entered);
         }
@@ -437,6 +441,9 @@ pub enum Approx {
     UntimedMatrix,
     /// A listed binding is a guess: an out-of-order counter or a flat op.
     ApproxBindings,
+    /// An SE's span, a wave's lifetime or an instruction's cycles passes [`PLAUSIBLE_CYCLES`]: the
+    /// stream is corrupt, and its sums may have saturated.
+    ImplausibleTime,
 }
 
 impl Approx {
@@ -445,6 +452,7 @@ impl Approx {
             Self::Perturbed => "perturbed",
             Self::UntimedMatrix => "untimed_matrix",
             Self::ApproxBindings => "approx_bindings",
+            Self::ImplausibleTime => "implausible_time",
         }
     }
 }
@@ -580,6 +588,15 @@ pub struct Verdict {
     pub findings: Vec<Finding>,
 }
 
+/// Whether a time the trace states passes [`PLAUSIBLE_CYCLES`]: an SE's span, a complete wave's
+/// lifetime, or an instruction's mean cycles a hit.
+fn implausible(a: &Analysis) -> bool {
+    let per_hit = |r: &Row| [r.latency, r.idle].iter().any(|&c| c / r.hits.max(1) as i64 > PLAUSIBLE_CYCLES);
+    a.ses.iter().any(|s| s.span > PLAUSIBLE_CYCLES)
+        || a.lifetime.is_some_and(|l| l.max > PLAUSIBLE_CYCLES)
+        || a.pcs.iter().any(per_hit)
+}
+
 /// The traced run's time over the untraced one.
 pub(super) fn slowdown(a: &Analysis) -> Option<f64> {
     a.kernel_ns.zip(a.traced_ns).filter(|&(k, _)| k > 0).map(|(k, t)| t as f64 / k as f64)
@@ -657,7 +674,7 @@ pub fn load_bytes(asm: &str) -> Option<u64> {
 
 /// What the loop's global loads ask of memory at the dispatch's resident waves.
 fn demand(a: &Analysis) -> Option<Demand> {
-    let l = a.main_loop.as_ref().filter(|l| l.trips.total > 0 && l.partition.waves > 0)?;
+    let l = a.main_loop.as_ref().filter(|l| l.trips.total > 0 && l.partition.waves > 0 && l.partition.cycles > 0)?;
     let global = |r: &&Row| {
         let kind = classify(&r.asm).kind;
         r.class == Class::VmemLoad && matches!(kind, Kind::Memory(Memory { space: Space::Global | Space::Buffer, .. }))
@@ -681,10 +698,11 @@ fn demand(a: &Analysis) -> Option<Demand> {
 /// The limiters the analysis supports.
 pub(super) fn rank(a: &Analysis) -> Verdict {
     let perturbed = slowdown(a).is_some_and(|r| r > PERTURBED);
+    let implausible = implausible(a);
     let untimed = a.occupancy.untimed_matrix;
     let approx = |more: &[Approx]| {
-        let base = perturbed.then_some(Approx::Perturbed);
-        base.into_iter().chain(more.iter().copied()).collect::<Vec<_>>()
+        let base = [perturbed.then_some(Approx::Perturbed), implausible.then_some(Approx::ImplausibleTime)];
+        base.into_iter().flatten().chain(more.iter().copied()).collect::<Vec<_>>()
     };
     let raw_flag: &[Approx] = if untimed { &[Approx::UntimedMatrix] } else { &[] };
     let finding = |kind, (share, raw), evidence, knob: &str, approx| Finding {

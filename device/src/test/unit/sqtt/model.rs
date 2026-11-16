@@ -3,8 +3,11 @@
 use proptest::prelude::*;
 use test_case::test_case;
 
+use crate::sqtt::hidden;
 use crate::sqtt::report::{Report, Stats};
+use crate::sqtt::simd::Residency;
 use crate::sqtt::stitch::{Stitcher, objdump_lines};
+use crate::sqtt::waits::Replay;
 use crate::sqtt::wave::{Instruction, Wave, analyze};
 use crate::sqtt::{Category, Header, InstOp, Kind, Layout, Packet, Popcount, Unit, decode};
 
@@ -410,15 +413,42 @@ proptest! {
     ) {
         let mut data = stream(&[header(Header { version: v, wsm, exbarw, ..Header::default() })]);
         data.extend(body);
-        let trace = analyze(decode(&data));
-        let code = objdump_lines(LOOP);
-        let mut stitcher = Stitcher::new(&code, if v == 4 { Layout::Rdna4 } else { Layout::Rdna3 });
-        let mut waves = trace.waves;
-        for wave in &mut waves {
-            let records = wave.instructions.len();
-            prop_assert!(stitcher.stitch(wave) <= records);
-        }
-        let report = Report::new(&waves);
-        prop_assert!(report.pcs.keys().all(|pc| code.iter().any(|(line, _)| line == pc)));
+        analyzes_and_stitches(&data, if v == 4 { Layout::Rdna4 } else { Layout::Rdna3 })?;
     }
+
+    /// Waves whose records straddle time jumps up to the wave model's 2^60 clamp analyze without overflow.
+    #[test]
+    fn huge_time_jumps_analyze(tokens in prop::collection::vec((0u8..5, 0u128..16, 0u128..(1 << 52)), 0..512)) {
+        let mut all = vec![version(4)];
+        all.extend(tokens.into_iter().map(|(token, wave, delta)| match token {
+            0 => wave_start(true, wave, 0),
+            1 => valu(wave, delta & 0xf),
+            2 => inst(true, wave, delta & 0x7f, delta & 0x7),
+            3 => (0b0000001 | delta << 12, 16),
+            _ => wave_end(wave),
+        }));
+        analyzes_and_stitches(&stream(&all), Layout::Rdna4)?;
+    }
+}
+
+/// The wave model, the stitcher over [`LOOP`], the report, AMD's hidden latency, the residency and
+/// the wait replay over one SE's `data`, checked for consistency.
+fn analyzes_and_stitches(data: &[u8], layout: Layout) -> Result<(), TestCaseError> {
+    let mut trace = analyze(decode(data));
+    let code = objdump_lines(LOOP);
+    let mut stitcher = Stitcher::new(&code, layout);
+    for wave in &mut trace.waves {
+        let records = wave.instructions.len();
+        prop_assert!(stitcher.stitch(wave) <= records);
+    }
+    let report = Report::new(&trace.waves);
+    prop_assert!(report.pcs.keys().all(|pc| code.iter().any(|(line, _)| line == pc)));
+    let hidden = hidden::analyze([(0, &trace)], &hidden::matrix_pcs(&code));
+    prop_assert!(hidden.by_pc.keys().all(|pc| report.pcs.contains_key(pc)));
+    if let Some(residency) = Residency::new(&trace.occupancy) {
+        prop_assert!(residency.window.0 <= residency.window.1);
+    }
+    let replay = Replay::new(&trace.waves, &code, layout);
+    prop_assert!(replay.bound().all(|(wave, _, _, pc)| wave < trace.waves.len() && report.pcs.contains_key(&pc)));
+    Ok(())
 }

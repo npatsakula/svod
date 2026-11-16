@@ -89,10 +89,10 @@ impl Residency {
             if cycles <= 0 {
                 continue;
             }
-            total += i64::from(count) * cycles;
+            total = cycles.saturating_mul(count.into()).saturating_add(total);
             for (&key, &waves) in per_simd.iter().filter(|&(_, &waves)| waves > 0) {
                 let simd = simds.entry(key).or_default();
-                (simd.0, simd.1) = (simd.0 + i64::from(waves) * cycles, simd.1.max(waves));
+                (simd.0, simd.1) = (cycles.saturating_mul(waves.into()).saturating_add(simd.0), simd.1.max(waves));
             }
         }
         let simds = simds
@@ -117,11 +117,11 @@ impl Residency {
 fn percentile(segments: impl Iterator<Item = (u32, i64)>, (num, den): (u32, u32)) -> u32 {
     let mut segments: Vec<(u32, i64)> = segments.filter(|s| s.1 > 0).collect();
     segments.sort_unstable();
-    let span: i64 = segments.iter().map(|s| s.1).sum();
-    let mut held = 0;
+    let span = segments.iter().fold(0i64, |sum, s| sum.saturating_add(s.1));
+    let mut held = 0i64;
     for (value, cycles) in segments {
-        held += cycles;
-        if held * i64::from(den) >= span * i64::from(num) {
+        held = held.saturating_add(cycles);
+        if i128::from(held) * i128::from(den) >= i128::from(span) * i128::from(num) {
             return value;
         }
     }

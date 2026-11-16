@@ -462,6 +462,9 @@ fn verdict_reads_the_capture(name: &str, pstate: Option<Pstate>) {
     }
     let d = a.verdict.demand.clone().unwrap();
     assert!(d.bytes_per_trip > 0 && d.gbs > 0.0 && d.bandwidth_gbs.is_none(), "{d:?}");
+    let mut idle = a;
+    idle.main_loop.as_mut().unwrap().partition.cycles = 0;
+    assert_eq!(super::verdict::rank(&idle).demand, None, "no rate over a trip of no cycles");
 }
 
 /// v1 waits on its A/B fill after the trip's matrix work: its loads' latency is covered, and with
@@ -702,6 +705,58 @@ proptest! {
             .sum();
         prop_assert_eq!(p.cycles, expected);
     }
+
+    /// A real capture with bytes overwritten, timestamps of up to 2^52 cycles spliced in and its tail
+    /// cut, at any clocks: the analysis completes or refuses, and its JSON reads back as the same analysis.
+    #[test]
+    fn corrupt_traces_analyze_and_round_trip(
+        fixture in prop::sample::select(&["amd/navi4_barriernop", "amd/strix_barrier", "gfx1200/gemm"][..]),
+        edits in prop::collection::vec((any::<prop::sample::Index>(), any::<u8>()), 0..16),
+        jumps in prop::collection::vec((any::<prop::sample::Index>(), 0u64..1 << 52), 0..512),
+        cut in any::<Option<prop::sample::Index>>(),
+        kernel_ns in any::<Option<u64>>(),
+        traced_ns in any::<Option<u64>>(),
+    ) {
+        let mut c = capture(fixture);
+        (c.kernel_ns, c.traced_ns) = (kernel_ns, traced_ns);
+        for se in &mut c.trace.per_se {
+            let bytes = &mut se.bytes;
+            for (at, byte) in &edits {
+                let at = at.index(bytes.len());
+                bytes[at] = *byte;
+            }
+            for (at, delta) in &jumps {
+                let at = at.index(bytes.len());
+                bytes.splice(at..at, (1 | delta << 12).to_le_bytes());
+            }
+            if let Some(cut) = &cut {
+                bytes.truncate(cut.index(bytes.len()));
+            }
+        }
+        match c.analyze() {
+            Ok(a) => prop_assert_eq!(serde_json::from_str::<Analysis>(&a.to_json()).unwrap(), a),
+            Err(error) => prop_assert!(matches!(error, super::Error::NoItrace), "{error}"),
+        }
+    }
+}
+
+/// A time past [`PLAUSIBLE_CYCLES`](super::verdict::PLAUSIBLE_CYCLES), whichever states it, flags every
+/// finding; the capture as recorded flags none.
+#[test_case(|a| a.ses[0].span = 1 << 38 | 1 ; "an SE's span")]
+#[test_case(|a| a.lifetime.as_mut().unwrap().max = 1 << 38 | 1 ; "a wave's lifetime")]
+#[test_case(|a| { let r = &mut a.pcs[0]; r.idle = r.hits as i64 * ((1 << 38) + 1) } ; "an instruction's idle")]
+fn implausible_times_flag_every_finding(corrupt: fn(&mut Analysis)) {
+    let flags = |a: &Analysis| {
+        let v = super::verdict::rank(a);
+        let all: Vec<_> =
+            v.bound.iter().chain(&v.findings).map(|f| f.approx.contains(&Approx::ImplausibleTime)).collect();
+        assert!(!all.is_empty());
+        all
+    };
+    let mut a = verdict_of("rdna4_gemm_v1");
+    assert!(flags(&a).iter().all(|&f| !f));
+    corrupt(&mut a);
+    assert!(flags(&a).iter().all(|&f| f));
 }
 
 /// The class findings past their thresholds, from v1 with its pipes or residency moved: a busy matrix

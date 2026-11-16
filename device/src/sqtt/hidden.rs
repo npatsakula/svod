@@ -28,11 +28,14 @@ impl Hidden {
 
 impl AddAssign for Hidden {
     fn add_assign(&mut self, o: Self) {
-        (self.idle, self.stall, self.issue) = (self.idle + o.idle, self.stall + o.stall, self.issue + o.issue);
+        self.idle = self.idle.saturating_add(o.idle);
+        self.stall = self.stall.saturating_add(o.stall);
+        self.issue = self.issue.saturating_add(o.issue);
     }
 }
 
 /// One pipe's busy intervals `(end, cycles)`, ordered and disjoint, each starting at `end - cycles`.
+/// Its sums saturate: a corrupt trace's cycles may pass `i64`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Busy {
     intervals: Vec<(i64, i64)>,
@@ -42,8 +45,8 @@ pub struct Busy {
 
 impl Busy {
     fn new(intervals: Vec<(i64, i64)>) -> Self {
-        let sums = intervals.iter().scan(0, |sum, &(_, cycles)| {
-            *sum += cycles;
+        let sums = intervals.iter().scan(0i64, |sum, &(_, cycles)| {
+            *sum = sum.saturating_add(cycles);
             Some(*sum)
         });
         Self { prefix: std::iter::once(0).chain(sums).collect(), intervals }
@@ -56,12 +59,12 @@ impl Busy {
         let mut runs: Vec<(i64, i64)> = vec![];
         for (clock, cycles) in records {
             match runs.last_mut() {
-                Some(run) if clock <= run.0 + run.1 => run.1 += cycles,
+                Some(run) if clock <= run.0.saturating_add(run.1) => run.1 = run.1.saturating_add(cycles),
                 Some(_) => runs.push((clock, cycles)),
                 None => runs.push((clock, cycles)),
             }
         }
-        Self::new(runs.into_iter().map(|(clock, cycles)| (clock + cycles, cycles)).collect())
+        Self::new(runs.into_iter().map(|(clock, cycles)| (clock.saturating_add(cycles), cycles)).collect())
     }
 
     /// `_compute_union`: the union of two pipes' intervals.
@@ -109,7 +112,7 @@ impl Busy {
         }
         let mut covered = self.prefix[lo];
         if let Some(&(end, cycles)) = self.intervals.get(lo).filter(|&&(end, cycles)| clock > end - cycles) {
-            covered += clock.min(end) - (end - cycles);
+            covered = covered.saturating_add(clock.min(end) - (end - cycles));
         }
         covered
     }

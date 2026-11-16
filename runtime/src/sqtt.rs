@@ -630,9 +630,7 @@ impl Analysis {
             }));
             hidings.push(hiding);
             for (pc, s) in Report::new(&trace.waves).pcs {
-                let at = pcs.entry(pc).or_default();
-                (at.hits, at.latency, at.stall, at.idle) =
-                    (at.hits + s.hits, at.latency + s.latency, at.stall + s.stall, at.idle + s.idle);
+                pcs.entry(pc).or_default().add(s);
             }
             traced.push(Traced {
                 se: se.se,
@@ -671,7 +669,8 @@ impl Analysis {
         let mut classes = BTreeMap::<Class, ClassTime>::new();
         for r in &rows {
             let c = classes.entry(r.class).or_insert(ClassTime { class: r.class, hits: 0, latency: 0, stall: 0 });
-            (c.hits, c.latency, c.stall) = (c.hits + r.hits, c.latency + r.latency, c.stall + r.stall);
+            (c.hits, c.latency, c.stall) =
+                (c.hits.saturating_add(r.hits), c.latency.saturating_add(r.latency), c.stall.saturating_add(r.stall));
         }
         let first_pc = waves.iter().flat_map(|w| &w.instructions).find(|i| i.pc != 0).map(|i| i.pc - base);
         let labels: Vec<(u64, &str)> = capture.disassembly.lines().filter_map(label).collect();
@@ -721,7 +720,7 @@ impl Analysis {
                 .traced_ns
                 .or(capture.kernel_ns)
                 .filter(|&ns| ns > 0 && span > 0)
-                .map(|ns| span as u64 * 1000 / ns),
+                .and_then(|ns| (span as u128 * 1000 / u128::from(ns)).try_into().ok()),
             mclk_mhz: capture.trace.mclk_mhz,
             records: waves.iter().map(|w| w.instructions.len()).sum(),
             stitched: waves.iter().flat_map(|w| &w.instructions).filter(|i| i.pc != 0).count(),

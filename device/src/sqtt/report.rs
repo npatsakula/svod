@@ -18,11 +18,12 @@ pub struct Stats {
 }
 
 impl Stats {
-    fn add(&mut self, other: Stats) {
-        self.hits += other.hits;
-        self.latency += other.latency;
-        self.stall += other.stall;
-        self.idle += other.idle;
+    /// Saturating: a corrupt trace's cycles may pass `i64`.
+    pub fn add(&mut self, other: Stats) {
+        self.hits = self.hits.saturating_add(other.hits);
+        self.latency = self.latency.saturating_add(other.latency);
+        self.stall = self.stall.saturating_add(other.stall);
+        self.idle = self.idle.saturating_add(other.idle);
     }
 }
 
