@@ -333,8 +333,7 @@ fn svod_capture(name: &str, grid: [u32; 3]) -> Capture {
     assert_eq!((capture.resources, capture.workgroup, capture.grid), (None, None, None), "older captures load");
     assert_eq!(capture.trace.mclk_mhz, None);
     let elf = &capture.trace.code.elf;
-    let major = capture.trace.arch.gfx_major();
-    capture.resources = Some(svod_device::amd::program::kernel_resources(elf, "gemm", major).unwrap());
+    capture.resources = Some(svod_device::amd::program::kernel_resources(elf, "gemm", capture.trace.arch).unwrap());
     (capture.workgroup, capture.grid) = (Some([256, 1, 1]), Some(grid));
     capture
 }

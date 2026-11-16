@@ -75,7 +75,7 @@ fn strix_gemm_registers_by_layout_fall_short_of_the_compilers() {
     assert_eq!((c.regs, c.smem, c.waves, planner.resident(c.smem, c.regs, c.waves)), (176, 32768, 8, 2));
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../device/src/test/fixtures/sqtt/svod/strix_smoke/kernel.co");
     let elf = std::fs::read(path).expect("the fixture's code object");
-    let compiled = svod_device::amd::program::kernel_resources(&elf, "gemm", AmdArch::Gfx1151.gfx_major()).unwrap();
+    let compiled = svod_device::amd::program::kernel_resources(&elf, "gemm", AmdArch::Gfx1151).unwrap();
     assert_eq!((compiled.vgprs, compiled.lds_bytes), (Some(208), 32768));
     assert_eq!(limits(&compiled, 256, &cu).map(|l| l.workgroups_per_cu), Some(1));
 }

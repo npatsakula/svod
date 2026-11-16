@@ -9,7 +9,7 @@ fn decodes_vgpr_sgpr_segments_wave32() {
     // GRANULATED_WORKITEM_VGPR_COUNT = 24 → (24+1)*8 = 200 VGPRs (confirmed on
     // gfx1151). GRANULATED_WAVEFRONT_SGPR_COUNT = 1 → (1+1)*16 = 32 SGPRs.
     let rsrc1 = 24u32 | (1 << 6);
-    let r = decode_resources(rsrc1, 0, 4608, 0, 32, 11);
+    let r = decode_resources(rsrc1, 0, 4608, 0, 32, AmdArch::Gfx1151);
     assert_eq!(r.vgprs, Some(200));
     assert_eq!(r.agprs, None);
     assert_eq!(r.sgprs, Some(32));
@@ -26,32 +26,39 @@ fn decodes_vgpr_sgpr_segments_wave32() {
 #[test_case::test_case(97 => 12; "one past 96 rounds up to 120")]
 #[test_case::test_case(121 => 10; "one past 120 rounds up to 144")]
 fn wave32_vgpr_occupancy_matches_llc(vgprs: u32) -> u32 {
-    let waves = |major| {
-        let occ = vgpr_limited_occupancy(vgprs, 32, major).expect("gfx{major} geometry known");
-        (occ * 16.0).round() as u32
-    };
-    let (gfx11, gfx12) = (waves(11), waves(12));
-    assert_eq!(gfx11, gfx12, "gfx11 and gfx12 share the wave32 register file");
+    let waves = |arch| (vgpr_limited_occupancy(vgprs, 32, arch).expect("RDNA geometry known") * 16.0).round() as u32;
+    let (gfx11, gfx12) = (waves(AmdArch::Gfx1151), waves(AmdArch::Gfx1201));
+    assert_eq!(gfx11, gfx12, "gfx1151 and gfx1201 share the wave32 register file");
     gfx12
+}
+
+/// gfx1102's 1024-VGPR file in granules of 16 holds fewer waves than the 1536 of its siblings, and a
+/// wave64 kernel has no modelled occupancy.
+#[test_case::test_case(AmdArch::Gfx1102, 32 => Some(9); "97 VGPRs take 112 of 1024")]
+#[test_case::test_case(AmdArch::Gfx1100, 32 => Some(12); "97 VGPRs take 120 of 1536")]
+#[test_case::test_case(AmdArch::Gfx1100, 64 => None; "wave64")]
+#[test_case::test_case(AmdArch::Gfx942, 32 => None; "CDNA")]
+fn vgpr_occupancy_follows_the_arch(arch: AmdArch, wave_size: u32) -> Option<u32> {
+    vgpr_limited_occupancy(97, wave_size, arch).map(|occ| (occ * 16.0).round() as u32)
 }
 
 #[test]
 fn vgpr_limited_occupancy_gfx11() {
     // 200 VGPRs on gfx11 wave32: round_up(200,24)=216, floor(1536/216)=7 waves,
     // 7/16 = 0.4375.
-    let r = decode_resources(24, 0, 0, 0, 32, 11);
+    let r = decode_resources(24, 0, 0, 0, 32, AmdArch::Gfx1151);
     let occ = r.occupancy.expect("gfx11 occupancy known");
     assert!((occ - 7.0 / 16.0).abs() < 1e-6, "occ={occ}");
 
     // A tiny kernel (few VGPRs) saturates max waves → 100%.
-    let small = decode_resources(0, 0, 0, 0, 32, 11); // (0+1)*8 = 8 VGPRs
+    let small = decode_resources(0, 0, 0, 0, 32, AmdArch::Gfx1151); // (0+1)*8 = 8 VGPRs
     assert_eq!(small.occupancy, Some(1.0));
 }
 
 #[test]
 fn occupancy_unknown_arch_is_none() {
     // CDNA (gfx9) geometry not modeled → occupancy None, but counts still decode.
-    let r = decode_resources(24, 49, 0, 0, 64, 9);
+    let r = decode_resources(24, 49, 0, 0, 64, AmdArch::Gfx942);
     assert!(r.occupancy.is_none());
     assert_eq!(r.vgprs, Some((24 + 1) * 8)); // gfx9's unified file: blocks of 8
     assert_eq!(r.agprs, Some(0)); // the accumulator offset (49+1)*4 = 200 sits at the end
@@ -65,7 +72,7 @@ fn occupancy_unknown_arch_is_none() {
 #[test_case::test_case(7, 15 => (64, 0); "no accumulators")]
 #[test_case::test_case(13, 12 => (52, 60); "52 vector registers, 60 accumulators")]
 fn gfx9_splits_the_unified_file_at_the_accumulator_offset(rsrc1: u32, rsrc3: u32) -> (u32, u32) {
-    let r = decode_resources(rsrc1, rsrc3, 0, 0, 64, 9);
+    let r = decode_resources(rsrc1, rsrc3, 0, 0, 64, AmdArch::Gfx942);
     (r.vgprs.unwrap(), r.agprs.unwrap())
 }
 
@@ -106,6 +113,18 @@ fn cu_limits_need_wave32_vgprs_and_threads() {
 }
 
 proptest::proptest! {
+    /// The occupancy a descriptor reports is the CU's: a lone wave's workgroups fill a SIMD as far as
+    /// its registers allow.
+    #[test]
+    fn vgpr_occupancy_is_the_cus(
+        arch in proptest::sample::select(&[AmdArch::Gfx1100, AmdArch::Gfx1102, AmdArch::Gfx1151, AmdArch::Gfx1201][..]),
+        vgprs in 1u32..=512,
+    ) {
+        let occupancy = vgpr_limited_occupancy(vgprs, 32, arch).unwrap();
+        let l = limits(&resources(Some(vgprs), 0, 32), 32, &Cu::rdna(arch).unwrap()).unwrap();
+        proptest::prop_assert_eq!((occupancy * 16.0).round() as u32, l.waves_per_simd);
+    }
+
     /// The CU never holds more than any one resource allows, and holds as many as the limiter allows.
     #[test]
     fn cu_limits_respect_every_resource(vgprs in 1u32..=256, threads in 1u32..=1024, lds in 0u32..=65536) {

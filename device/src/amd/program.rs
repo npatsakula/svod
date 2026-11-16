@@ -47,7 +47,11 @@ pub struct ParsedKernel {
 
 /// The registers, LDS and wave size of a code object's kernel, read off its descriptor on the host as
 /// a loaded program's `resource_usage` reports them.
-pub fn kernel_resources(bytes: &[u8], kernel_name: &str, target_major: u32) -> Result<crate::profile::KernelResources> {
+pub fn kernel_resources(
+    bytes: &[u8],
+    kernel_name: &str,
+    arch: svod_dtype::AmdArch,
+) -> Result<crate::profile::KernelResources> {
     let kd = parse_kernel(bytes, kernel_name)?.kd;
     let wave_size = if kd.kernel_code_properties & 0x400 != 0 { 32 } else { 64 };
     Ok(crate::amd::occupancy::decode_resources(
@@ -56,7 +60,7 @@ pub fn kernel_resources(bytes: &[u8], kernel_name: &str, target_major: u32) -> R
         kd.group_segment_fixed_size,
         kd.private_segment_fixed_size,
         wave_size,
-        target_major,
+        arch,
     ))
 }
 
@@ -922,7 +926,7 @@ impl Program for AmdProgram {
             self.kd.group_segment_fixed_size,
             self.kd.private_segment_fixed_size,
             if self.wave32 { 32 } else { 64 },
-            self.target_major,
+            self.dev.arch,
         ))
     }
 }
