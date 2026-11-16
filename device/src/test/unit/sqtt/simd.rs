@@ -8,7 +8,7 @@ use crate::sqtt::simd::{PipeBusy, Residency, Simd};
 use crate::sqtt::wave::{Cause, Occupancy};
 
 fn event(time: i64, simd: u8, wave: u8, start: bool, cause: Cause) -> Occupancy {
-    Occupancy { time, unit: Unit { sa: 0, wgp: 1, simd, wave }, start, pc: 0x100, dispatch: 1, cause }
+    Occupancy { time, unit: Unit { sa: 0, wgp: 1, simd, wave }, start, cause }
 }
 
 /// Four waves at most, from 30 to 60: the orphan AMD inserts at 0 and the context save and restore

@@ -98,10 +98,6 @@ impl Busy {
         Self::new(out)
     }
 
-    pub fn intervals(&self) -> &[(i64, i64)] {
-        &self.intervals
-    }
-
     /// `_covered_until`: busy cycles before `clock`. Python's `bisect_right`, verbatim, so an unordered
     /// list searches as AMD's does.
     pub fn covered_until(&self, clock: i64) -> i64 {

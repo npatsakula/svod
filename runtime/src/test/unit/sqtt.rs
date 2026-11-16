@@ -12,12 +12,14 @@ use test_case::test_case;
 
 use svod_device::amd::occupancy::Limiter;
 
+use super::compare::align;
+use super::lines::text_section;
 use super::statements::rollup;
 use super::verdict::{Buckets, Charge, load_bytes};
 use super::{
     Analysis, Approx, Axis, Bucket, Capture, Caution, Class, Delta, Diff, Evidence, Finding, FindingKind, Knob,
     LineRow, Lines, LoopRow, Partition, Pstate, Reduction, Spread, Statement, Statements, Stmt, TwinError, Unit,
-    WaitOn, align, locate, parse_debug_line, same_text, text_section,
+    WaitOn, locate, parse_debug_line, same_text,
 };
 
 fn fixtures() -> PathBuf {

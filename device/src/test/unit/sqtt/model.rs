@@ -220,7 +220,6 @@ fn inst_op_class(layout: Layout, code: u8, name: Option<&str>, category: Categor
     assert_eq!(op.name().as_deref(), name);
     let class = op.class(&header);
     assert_eq!((class.category, class.cycles, class.other_simd), (category, cycles, other));
-    assert_eq!(op.is_other_simd(), other);
 }
 
 fn record(time: i64, category: Category, duration: i64, stall: i64) -> Instruction {
@@ -406,8 +405,6 @@ fn report_idle_is_the_gap_since_the_previous_record_ended() {
     let report = Report::new(&[w]);
     assert_eq!(report.pcs[&0xa], Stats { hits: 2, latency: 7, stall: 3, idle: 2 + 6 });
     assert_eq!(report.pcs[&0xb], Stats { hits: 1, latency: 1, stall: 0, idle: 0 });
-    assert_eq!(report.waves[0].records, 4);
-    assert_eq!(report.waves[0].stats, Stats { hits: 3, latency: 8, stall: 3, idle: 8 });
 }
 
 proptest! {

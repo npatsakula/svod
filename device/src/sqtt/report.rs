@@ -1,10 +1,9 @@
-//! Per-PC and per-wave cycle totals over stitched waves, as AMD's `code_index.py` accumulates them.
+//! Per-PC cycle totals over stitched waves, as AMD's `code_index.py` accumulates them.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::Unit;
 use super::wave::Wave;
 
 /// The cycles all waves spent on one PC. `latency` sums durations, `stall` the stalls inside them,
@@ -27,44 +26,22 @@ impl Stats {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WaveTotals {
-    pub unit: Unit,
-    pub begin: i64,
-    pub end: i64,
-    pub complete: bool,
-    /// Records, and those a PC was attributed to; only the latter count in `stats`.
-    pub records: usize,
-    pub stats: Stats,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Report {
     pub pcs: BTreeMap<u64, Stats>,
-    pub waves: Vec<WaveTotals>,
 }
 
 impl Report {
     pub fn new(waves: &[Wave]) -> Self {
         let mut report = Self::default();
         for wave in waves {
-            let mut totals = Stats::default();
             let mut prev_end = wave.begin;
             for inst in wave.instructions.iter().filter(|inst| inst.pc != 0) {
                 let stats =
                     Stats { hits: 1, latency: inst.duration, stall: inst.stall, idle: (inst.time - prev_end).max(0) };
                 prev_end = prev_end.max(inst.time + inst.duration);
                 report.pcs.entry(inst.pc).or_default().add(stats);
-                totals.add(stats);
             }
-            report.waves.push(WaveTotals {
-                unit: wave.unit,
-                begin: wave.begin,
-                end: wave.end,
-                complete: wave.complete,
-                records: wave.instructions.len(),
-                stats: totals,
-            });
         }
         report
     }

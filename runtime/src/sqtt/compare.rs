@@ -15,7 +15,7 @@ use super::{Analysis, Bucket, Class, FindingKind, Pstate, Reduction, Result, Row
 
 /// Traced-over-untraced ratios further apart than this share: the captures ran under different
 /// perturbation, and their cycle shares compare less.
-pub const SLOWDOWN_SPREAD: f64 = 0.10;
+pub(crate) const SLOWDOWN_SPREAD: f64 = 0.10;
 /// A bucket whose raw and exposed deltas are both under this many cycles a unit is left out of the
 /// text.
 const QUIET: f64 = 2.0;
@@ -213,7 +213,7 @@ fn side(a: &Analysis, unit: Unit) -> Side {
 
 /// The pairs of a longest common subsequence of `a` and `b`: `(Some(i), Some(j))` a match,
 /// `(Some(i), None)` only in `a`, `(None, Some(j))` only in `b`, in order.
-pub fn align<T: PartialEq>(a: &[T], b: &[T]) -> Vec<(Option<usize>, Option<usize>)> {
+pub(crate) fn align<T: PartialEq>(a: &[T], b: &[T]) -> Vec<(Option<usize>, Option<usize>)> {
     let (n, m) = (a.len(), b.len());
     // `lcs[i][j]`: the common subsequence of `a[i..]` and `b[j..]`.
     let mut lcs = vec![vec![0u32; m + 1]; n + 1];

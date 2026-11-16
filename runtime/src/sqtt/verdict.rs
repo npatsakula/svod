@@ -18,33 +18,33 @@ use super::{Analysis, Class, Pstate, Row, Stmt};
 
 /// Exposed vector-memory waits at a tenth of the loop's cycles: below it, moving loads or deepening
 /// the ring repays less than its register and LDS cost.
-pub const LOAD_EXPOSED: f64 = 0.10;
+pub(crate) const LOAD_EXPOSED: f64 = 0.10;
 /// The same tenth for exposed LDS waits and stall.
-pub const LDS_EXPOSED: f64 = 0.10;
+pub(crate) const LDS_EXPOSED: f64 = 0.10;
 /// Barriers at a tenth of the loop are listed; their exposed share at a tenth is worth dropping one.
-pub const BARRIER: f64 = 0.10;
+pub(crate) const BARRIER: f64 = 0.10;
 /// Non-matrix VALU and SALU issue at a tenth of the matrix issue: a loop's own bookkeeping (a few
 /// address increments a trip) stays under it, per-element guard and address arithmetic passes it.
-pub const LOOP_OVERHEAD: f64 = 0.10;
+pub(crate) const LOOP_OVERHEAD: f64 = 0.10;
 /// The matrix pipe busy for this share of the steady window or more: near its throughput.
-pub const MATRIX_BOUND: f64 = 0.70;
+pub(crate) const MATRIX_BOUND: f64 = 0.70;
 /// Any pipe busy this share of the window or more, with matrix work under [`ISSUE_MATRIX`] of it:
 /// the SIMD issues nearly every cycle, mostly not matrix work.
-pub const ISSUE_BOUND: f64 = 0.90;
-pub const ISSUE_MATRIX: f64 = 0.60;
+pub(crate) const ISSUE_BOUND: f64 = 0.90;
+pub(crate) const ISSUE_MATRIX: f64 = 0.60;
 /// The traced SIMDs idle (no pipe busy) this share of the steady window: more waves would fill it.
-pub const SIMD_IDLE: f64 = 0.10;
+pub(crate) const SIMD_IDLE: f64 = 0.10;
 /// The traced run over the untraced past this: its cycle shares no longer describe the untraced
 /// kernel (the probes of 2026-11 put an unpinned trace within a few percent of it).
-pub const PERTURBED: f64 = 1.2;
+pub(crate) const PERTURBED: f64 = 1.2;
 /// Cycles no traced time spans: over a minute at 4 GHz, past any dispatch a profile traces, and far
 /// below the 2^60 the wave model clamps a corrupt stream's timestamps to.
-pub const PLAUSIBLE_CYCLES: i64 = 1 << 38;
+pub(crate) const PLAUSIBLE_CYCLES: i64 = 1 << 38;
 /// A barrier wait this short: its wave arrived last and the barrier released at once. The fixtures'
 /// waits split into a floor of 8 to 15 cycles and a tail from tens of cycles up.
-pub const LAST_ARRIVER: i64 = 16;
+pub(crate) const LAST_ARRIVER: i64 = 16;
 /// A load whose cover is under this share of its latency waits right behind its issue.
-pub const SHORT_COVER: f64 = 0.25;
+pub(crate) const SHORT_COVER: f64 = 0.25;
 /// The loads, stalls and barrier causes a finding lists.
 const EVIDENCE: usize = 4;
 /// Lanes a wave loads for: svod's RDNA kernels run wave32.
@@ -748,7 +748,7 @@ fn divergent(asm: &str) -> bool {
 
 /// The bytes a lane moves for a vector-memory mnemonic: its `_b<bits>`, `_u8`/`_i16`/`_d16_hi` or
 /// gfx9 `_dword`/`_dwordx<n>` suffix.
-pub fn load_bytes(asm: &str) -> Option<u64> {
+pub(crate) fn load_bytes(asm: &str) -> Option<u64> {
     let mnemonic = asm.split_whitespace().next()?;
     match mnemonic.rsplit('_').next()? {
         "u8" | "i8" | "ubyte" | "sbyte" => Some(1),

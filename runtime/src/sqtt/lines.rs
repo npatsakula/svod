@@ -92,7 +92,7 @@ pub fn locate(rows: &[LineRow], pcs: impl IntoIterator<Item = u64>) -> Lines {
 }
 
 /// A code object's `.text`: its address and bytes.
-pub fn text_section(elf: &[u8]) -> Option<(u64, &[u8])> {
+pub(crate) fn text_section(elf: &[u8]) -> Option<(u64, &[u8])> {
     let file = object::File::parse(elf).ok()?;
     let text = file.section_by_name(".text")?;
     Some((text.address(), text.data().ok()?))

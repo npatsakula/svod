@@ -190,7 +190,8 @@ impl Lowered {
     }
 
     /// [`Self::text`] with a line table over [`Self::listing`] (`kernel.tk`).
-    pub fn located_text(&self, target: &Target) -> Result<String> {
+    #[cfg(test)]
+    pub(crate) fn located_text(&self, target: &Target) -> Result<String> {
         self.render_text(target, true)
     }
 

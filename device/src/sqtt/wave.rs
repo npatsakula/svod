@@ -1,8 +1,8 @@
 //! AMD's per-wave state machine (`gfx10/rdna_sqtt.cpp`, `gfx10/gfx10wave.cpp`): turns the packets of one
 //! shader engine into the instruction records of each wave on the traced SIMD, with AMD's issue time,
-//! duration and stall, plus every wave's occupancy and the dispatches.
+//! duration and stall, plus every wave's occupancy.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashSet, VecDeque};
 
 use super::{Category, EINST_JUMP, EINST_RFE, EINST_TRAP, Header, Kind, Layout, OpClass, Packet, Unit, WaveStart};
 
@@ -41,8 +41,6 @@ pub struct Occupancy {
     pub time: i64,
     pub unit: Unit,
     pub start: bool,
-    pub pc: u64,
-    pub dispatch: u64,
     pub cause: Cause,
 }
 
@@ -55,17 +53,6 @@ pub enum Cause {
     Context,
     /// A wave ended whose start the trace missed: AMD inserts the start at time 0.
     Orphan,
-}
-
-/// A dispatch starting (`REG_INIT`) or, with `end`, its last wave retiring after `COMPUTE_DISPATCH_END`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Dispatch {
-    pub time: i64,
-    pub me: u8,
-    pub pipe: u8,
-    pub id: u64,
-    pub entry: u64,
-    pub end: bool,
 }
 
 /// A memory op the traced WGP ran for a wave of another SIMD.
@@ -86,7 +73,6 @@ pub struct Trace {
     /// The traced SIMD's waves, in the order AMD stitches them.
     pub waves: Vec<Wave>,
     pub occupancy: Vec<Occupancy>,
-    pub dispatches: Vec<Dispatch>,
     pub other_simd: Vec<OtherSimd>,
 }
 
@@ -123,14 +109,6 @@ pub fn analyze(packets: impl IntoIterator<Item = Packet>) -> Trace {
 
 const SLOTS: usize = 32;
 
-#[derive(Debug, Clone, Copy, Default)]
-struct Running {
-    pc: u64,
-    dispatch: u64,
-    me: u8,
-    pipe: u8,
-}
-
 /// Per `(me & 1, pipe)`, AMD's `PipeArray`.
 type Pipes<T> = [[T; 4]; 2];
 
@@ -144,28 +122,18 @@ struct Model {
     /// The SE's `HEADER`, layout 3's defaults until one is met.
     header: Header,
     slots: [Vec<State>; SLOTS],
+    /// Each pipe's `COMPUTE_PGM`: the entry PC its next wave starts at.
     pgm: Pipes<u64>,
-    dispatch: Pipes<u64>,
-    dispatch_end: Pipes<u64>,
-    active: Pipes<i64>,
-    running: HashMap<u32, Running>,
-    saved: HashMap<u32, Running>,
+    /// The resident waves' locations.
+    running: HashSet<u32>,
 }
 
 fn location(unit: Unit) -> u32 {
     u32::from(unit.sa_wgp()) << 7 | u32::from(unit.simd) << 5 | u32::from(unit.wave)
 }
 
-fn next_dispatch(id: &mut u64) {
-    *id += 1;
-    if *id & 0x3ff == 0 {
-        *id += 1;
-    }
-}
-
 const COMPUTE_PGM_LO: u16 = 0xc;
 const COMPUTE_PGM_HI: u16 = 0xd;
-const COMPUTE_DISPATCH_END: u16 = 0x7e;
 
 impl Model {
     fn is_target(&self, unit: Unit) -> bool {
@@ -173,14 +141,8 @@ impl Model {
         unit.sa_wgp() == (h.dsa << 7 | h.dwgp) && unit.simd == h.dsimd
     }
 
-    fn occupy(&mut self, time: i64, unit: Unit, start: bool, run: Running, cause: Cause) {
-        self.trace.occupancy.push(Occupancy { time, unit, start, pc: run.pc, dispatch: run.dispatch, cause });
-    }
-
-    fn dispatch_end(&mut self, me: u8, pipe_id: u8, id: u64, time: i64) {
-        if id != 0 && id <= *pipe(&mut self.dispatch, me, pipe_id) {
-            self.trace.dispatches.push(Dispatch { time, me: me & 1, pipe: pipe_id, id, entry: 0, end: true });
-        }
+    fn occupy(&mut self, time: i64, unit: Unit, start: bool, cause: Cause) {
+        self.trace.occupancy.push(Occupancy { time, unit, start, cause });
     }
 
     fn entry(&mut self, me: u8, pipe_id: u8) -> u64 {
@@ -221,30 +183,12 @@ impl Model {
             }
             Kind::NewPc { wave, pc } => self.with(wave, |s| s.new_pc(time, pc)),
             Kind::Reg(reg) if reg.cs => {
-                let (me, pipe_id) = (reg.me, reg.pipe);
-                let pgm = pipe(&mut self.pgm, me, pipe_id);
+                let pgm = pipe(&mut self.pgm, reg.me, reg.pipe);
                 match reg.addr {
                     COMPUTE_PGM_LO => *pgm = *pgm & !0xffff_ffff | u64::from(reg.data),
                     COMPUTE_PGM_HI => *pgm = *pgm & 0xffff_ffff | u64::from(reg.data) << 32,
-                    COMPUTE_DISPATCH_END if *pipe(&mut self.dispatch, me, pipe_id) != 0 => {
-                        let end = pipe(&mut self.dispatch_end, me, pipe_id);
-                        next_dispatch(end);
-                        let end = *end;
-                        let current = pipe(&mut self.dispatch, me, pipe_id);
-                        if *current < end {
-                            *current = end;
-                        } else if *pipe(&mut self.active, me, pipe_id) == 0 {
-                            self.dispatch_end(me, pipe_id, end, time);
-                        }
-                    }
                     _ => {}
                 }
-            }
-            Kind::RegInit { me, pipe: pipe_id, ty: 2, data } if data & 1 == 1 => {
-                let id = pipe(&mut self.dispatch, me, pipe_id);
-                next_dispatch(id);
-                let (id, entry) = (*id, self.entry(me, pipe_id));
-                self.trace.dispatches.push(Dispatch { time, me: me & 1, pipe: pipe_id, id, entry, end: false });
             }
             _ => {}
         }
@@ -253,8 +197,6 @@ impl Model {
     fn wave_start(&mut self, time: i64, start: WaveStart) {
         let WaveStart { unit, me, pipe: pipe_id, count, .. } = start;
         let (loc, target, slot) = (location(unit), self.is_target(unit), usize::from(unit.wave));
-        let dispatch = *pipe(&mut self.dispatch, me, pipe_id);
-        let run = Running { pc: self.entry(me, pipe_id), dispatch, me: me & 1, pipe: pipe_id };
         let exbarw = self.header.layout == Layout::Rdna4 && self.header.exbarw;
         if (66..90).contains(&count) {
             let save = 0b00_0011_0011u32 >> (count - 66) & 1 == 1;
@@ -279,29 +221,24 @@ impl Model {
                 }
             }
             if save {
-                if let Some(&saved) = self.running.get(&loc) {
-                    self.occupy(time, unit, false, saved, Cause::Context);
-                    self.saved.insert(loc, saved);
+                if self.running.contains(&loc) {
+                    self.occupy(time, unit, false, Cause::Context);
                 }
             } else if restore {
-                let pc = self.saved.remove(&loc).map_or(0, |saved| saved.pc);
-                let run = Running { pc, ..run };
-                self.running.insert(loc, run);
-                self.occupy(time, unit, true, run, Cause::Context);
+                self.running.insert(loc);
+                self.occupy(time, unit, true, Cause::Context);
             }
             return;
         }
-        self.running.insert(loc, run);
-        if dispatch > 0 {
-            *pipe(&mut self.active, me, pipe_id) += 1;
-        }
-        self.occupy(time, unit, true, run, Cause::Wave);
+        self.running.insert(loc);
+        self.occupy(time, unit, true, Cause::Wave);
         if target {
             while self.slots[slot].last().is_some_and(|state| state.wave.complete) {
                 let state = self.slots[slot].pop().expect("non-empty");
                 self.trace.waves.push(state.wave);
             }
-            self.slots[slot].push(State::new(unit, time, run.pc, exbarw, me, pipe_id));
+            let entry = self.entry(me, pipe_id);
+            self.slots[slot].push(State::new(unit, time, entry, exbarw, me, pipe_id));
         }
     }
 
@@ -309,21 +246,10 @@ impl Model {
         if self.is_target(unit) {
             self.with(unit.wave, |state| state.complete(time));
         }
-        let run = self.running.remove(&location(unit)).unwrap_or_else(|| {
-            let orphan = Occupancy { time: 0, unit, start: true, pc: 0, dispatch: 0, cause: Cause::Orphan };
-            self.trace.occupancy.insert(0, orphan);
-            Running::default()
-        });
-        self.occupy(time, unit, false, run, Cause::Wave);
-        if run.dispatch > 0 {
-            let active = pipe(&mut self.active, run.me, run.pipe);
-            *active -= 1;
-            let idle = *active == 0;
-            *active = (*active).max(0);
-            if idle && run.dispatch <= *pipe(&mut self.dispatch_end, run.me, run.pipe) {
-                self.dispatch_end(run.me, run.pipe, run.dispatch, time);
-            }
+        if !self.running.remove(&location(unit)) {
+            self.trace.occupancy.insert(0, Occupancy { time: 0, unit, start: true, cause: Cause::Orphan });
         }
+        self.occupy(time, unit, false, Cause::Wave);
     }
 
     fn finish(mut self) -> Trace {

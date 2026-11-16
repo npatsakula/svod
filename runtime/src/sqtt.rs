@@ -27,12 +27,8 @@ mod compare;
 mod lines;
 mod statements;
 mod verdict;
-pub use compare::{
-    BucketDelta, Caution, Delta, Diff, FindingDelta, LoopRow, Rows, SLOWDOWN_SPREAD, Side, StatementDelta, Unit, align,
-};
-pub use lines::{
-    LineRow, Lines, Statements, Stmt, TwinError, debug_line, locate, parse_debug_line, same_text, text_section,
-};
+pub use compare::{BucketDelta, Caution, Delta, Diff, FindingDelta, LoopRow, Rows, Side, StatementDelta, Unit};
+pub use lines::{LineRow, Lines, Statements, Stmt, TwinError, debug_line, locate, parse_debug_line, same_text};
 pub use statements::Statement;
 pub use verdict::{
     Approx, BarrierSite, Bucket, Ceiling, Demand, Evidence, Finding, FindingKind, Knob, Load, Partition, PerTrip,
@@ -642,11 +638,6 @@ fn asm(line: &str) -> String {
 }
 
 impl Analysis {
-    /// Disassembles the trace's code object and analyzes it.
-    pub fn from_trace(trace: &SqttTrace, kernel_ns: Option<u64>) -> Result<Self> {
-        Capture::new(trace.clone(), kernel_ns)?.analyze()
-    }
-
     /// The analysis of a [`Capture::save`]d directory.
     pub fn load(dir: &Path) -> Result<Self> {
         Capture::load(dir)?.analyze()

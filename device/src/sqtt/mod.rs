@@ -364,19 +364,4 @@ impl InstOp {
         };
         OpClass { category: *category, cycles, other_simd }
     }
-
-    /// A taken branch: the wave's next instruction is the branch target.
-    pub fn is_jump(self) -> bool {
-        self.code == 3
-    }
-
-    /// A branch not taken: the wave falls through.
-    pub fn is_jump_no(self) -> bool {
-        self.code == 4
-    }
-
-    /// An op executed by a SIMD other than the traced one; it does not advance the traced wave's PC.
-    pub fn is_other_simd(self) -> bool {
-        self.row().is_some_and(|(_, other)| other)
-    }
 }
