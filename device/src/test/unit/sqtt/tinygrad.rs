@@ -274,12 +274,16 @@ fn waves_pair(packets: &[(Packet, Layout)], ctx: &str) {
 }
 
 /// Stitching tinygrad's kernels attributes to each PC as many records as tinygrad's mapper does;
-/// `s_endpgm` emits no token, and AMD synthesises at most one per wave that ran instructions.
+/// `s_endpgm` emits no token, and AMD synthesises at most one per wave that ran instructions. gfx1200's
+/// `sync` holds no `mapped`: its mapper gives `s_barrier_wait` no record, where ours gives it one a
+/// wave.
 #[test_case("gfx1100", "empty")]
 #[test_case("gfx1100", "gemm")]
 #[test_case("gfx1100", "plus")]
+#[test_case("gfx1100", "sync")]
 #[test_case("gfx1200", "empty")]
 #[test_case("gfx1200", "gemm")]
+#[test_case("gfx1200", "handwritten")]
 #[test_case("gfx1200", "plus")]
 fn stitches_tinygrad(arch: &str, example: &str) {
     let (_, golden) = fixture(arch, example);

@@ -15,16 +15,6 @@
       "se": 1,
       "itrace": true,
       "truncated": false
-    },
-    {
-      "se": 2,
-      "itrace": false,
-      "truncated": false
-    },
-    {
-      "se": 3,
-      "itrace": false,
-      "truncated": false
     }
   ],
   "pstate": "standard",

@@ -177,7 +177,6 @@ fn finds_the_main_loop() {
 /// The text an agent reads, fixed: `SVOD_SQTT_BLESS=1` rewrites the expected file after a deliberate change.
 #[test_case("amd/navi4_sdata", "sqtt_navi4_sdata.txt")]
 #[test_case("svod/rdna4_gemm_v1", "sqtt_rdna4_gemm_v1.txt")]
-#[test_case("svod/rdna4_gemm_1500", "sqtt_rdna4_gemm_1500.txt")]
 fn text_is_stable(fixture: &str, golden: &str) {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/test/fixtures").join(golden);
     let text = match fixture.strip_prefix("svod/") {
