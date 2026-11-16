@@ -589,6 +589,15 @@ impl Schedule {
         if matches!(self, Self::PingPong { .. }) { 2 } else { 1 }
     }
 
+    /// The trips one iteration of the steady loop runs: the ring's depth
+    /// where the loop is copied once per slot, else one.
+    pub fn per_iteration(self) -> usize {
+        match self {
+            Self::Ring { depth, unroll: true } => depth.get(),
+            _ => 1,
+        }
+    }
+
     pub fn kslice(self) -> Option<usize> {
         match self {
             Self::PingPong { kslice } => Some(kslice.get()),

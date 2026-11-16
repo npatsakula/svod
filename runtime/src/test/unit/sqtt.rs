@@ -15,9 +15,9 @@ use svod_device::amd::occupancy::Limiter;
 use super::statements::rollup;
 use super::verdict::{Buckets, Charge, load_bytes};
 use super::{
-    Analysis, Approx, BucketDelta, Capture, Caution, Class, Diff, Evidence, Finding, FindingKind, LineRow, Lines,
-    LoopRow, Partition, Pstate, Spread, Statement, Stmt, Unit, WaitOn, align, locate, parse_debug_line, text_mismatch,
-    text_section,
+    Analysis, Approx, Axis, BucketDelta, Capture, Caution, Class, Diff, Evidence, Finding, FindingKind, LineRow, Lines,
+    LoopRow, Partition, Pstate, Reduction, Spread, Statement, Stmt, Unit, WaitOn, align, locate, parse_debug_line,
+    text_mismatch, text_section,
 };
 
 fn fixtures() -> PathBuf {
@@ -56,6 +56,7 @@ fn capture(fixture: &str) -> Capture {
         kernel_ns: None,
         traced_ns: None,
         labels: BTreeMap::from([("fixture".into(), fixture.into())]),
+        model: None,
         resources: None,
         workgroup: None,
         grid: None,
@@ -137,11 +138,8 @@ fn summarizes(fixture: &str) {
         });
         assert_eq!((&sum, &exposed), (p, e), "the SEs' partitions add up");
         let edges = a.pcs.iter().find(|r| r.pc == l.back_edge).unwrap().hits;
-        assert_eq!(
-            (l.trips.total, l.trips.labelled, l.trips.per_iteration),
-            (edges, false, 1),
-            "unlabelled: per iteration"
-        );
+        assert_eq!((l.trips.total, l.trips.per_iteration), (edges, 1), "no model: per iteration");
+        assert!(a.verdict.findings.iter().all(|f| f.approx.contains(&Approx::PerIteration)), "{:?}", a.verdict);
     }
 }
 
@@ -346,6 +344,7 @@ fn capture_keeps_resources_launch_and_mclk() {
     capture.save(dir.path()).unwrap();
     let back = Capture::load(dir.path()).unwrap();
     assert_eq!((back.resources, back.workgroup, back.grid), (capture.resources, capture.workgroup, capture.grid));
+    assert!(back.model.is_some() && back.model == capture.model);
     assert_eq!(back.trace.mclk_mhz, Some(1800));
     let a = back.analyze().unwrap();
     assert_eq!(a, capture.analyze().unwrap());
@@ -435,7 +434,7 @@ fn load_share(a: &Analysis) -> f64 {
 }
 
 /// svod's ring GEMM, its 1500- and 1536-row twins and the Strix GEMM all run 160 K-trips of 32,
-/// unrolled by 2. v1, v3 and Strix pinned the clock at the standard pstate and ran over 1.2x the
+/// their 2-slot ring unrolled: 2 trips an iteration. v1, v3 and Strix pinned the clock at the standard pstate and ran over 1.2x the
 /// untraced time; the 1500 and 1536 captures ran unpinned at 1.04x.
 #[test_case("rdna4_gemm_v1", Some(Pstate::Standard))]
 #[test_case("rdna4_gemm_v3", Some(Pstate::Standard))]
@@ -445,11 +444,16 @@ fn load_share(a: &Analysis) -> f64 {
 fn verdict_reads_the_capture(name: &str, pstate: Option<Pstate>) {
     let a = verdict_of(name);
     let t = a.main_loop.as_ref().unwrap().trips;
-    assert_eq!((t.per_iteration, t.labelled), (2, true), "160 trips over 79 iterations and the head's");
+    let model = a.model.as_ref().unwrap();
+    assert_eq!(model.per_trip, Some(Reduction { axis: Axis::K, elems: 32 }));
+    assert_eq!((t.per_iteration, model.price.as_ref().unwrap().trips), (2, 160));
+    let edges = a.pcs.iter().find(|r| r.pc == a.main_loop.as_ref().unwrap().back_edge).unwrap().hits;
+    assert_eq!(t.total, 2 * edges);
     assert_eq!(a.pstate, pstate);
     let perturbed = pstate == Some(Pstate::Standard);
     let all = a.verdict.bound.iter().chain(&a.verdict.findings);
     assert!(all.clone().all(|f| f.approx.contains(&Approx::Perturbed) == perturbed), "{:?}", a.verdict);
+    assert!(!all.clone().any(|f| f.approx.contains(&Approx::PerIteration)), "{:?}", a.verdict);
     assert!(a.verdict.findings.iter().all(|f| f.share <= f.raw + 1e-12), "exposed within raw: {:?}", a.verdict);
     let l = a.main_loop.as_ref().unwrap();
     let signals: Vec<u64> = a.pcs.iter().filter(|r| r.asm.starts_with("s_barrier_signal")).map(|r| r.pc).collect();
@@ -460,7 +464,7 @@ fn verdict_reads_the_capture(name: &str, pstate: Option<Pstate>) {
         assert!(s.last > 0 && s.last * 2 < s.hits, "{name}: some traced wave arrives last, most don't: {s:?}");
     }
     let d = a.verdict.demand.clone().unwrap();
-    assert!(d.bytes_per_trip > 0 && d.gbs > 0.0 && d.bandwidth_gbs.is_none(), "{d:?}");
+    assert!(d.bytes_per_trip > 0 && d.gbs > 0.0, "{d:?}");
     let mut idle = a;
     idle.main_loop.as_mut().unwrap().partition.cycles = 0;
     assert_eq!(super::verdict::rank(&idle).demand, None, "no rate over a trip of no cycles");
@@ -867,12 +871,14 @@ fn compare_cautions() {
     assert!(d.cautions.contains(&Caution::Pstate { a: Some(Pstate::Standard), b: Some(Pstate::Unpinned) }));
     assert!(d.cautions.iter().any(|c| matches!(c, Caution::Slowdown { .. })), "{:?}", d.cautions);
     let mut wide = control.clone();
-    wide.labels.insert("model.trips".into(), "80".into());
+    let k = |elems| Some(Reduction { axis: Axis::K, elems });
+    wide.model.as_mut().unwrap().per_trip = k(64);
     let d = control.compare(&wide);
-    assert_eq!(d.cautions, [Caution::TripsDiffer { a: 32.0, b: 64.0 }]);
-    assert!(d.text(4).contains("Δ/k exp"));
+    assert_eq!(d.cautions, [Caution::TripsDiffer { a: k(32).unwrap(), b: k(64).unwrap() }]);
+    let text = d.text(4);
+    assert!(text.contains("Δ/k exp") && text.contains("!! TRIPS differ: 32 K vs 64 K elements a trip"), "{text}");
     let mut unlabelled = control.clone();
-    unlabelled.main_loop.as_mut().unwrap().trips.labelled = false;
+    unlabelled.model = None;
     let d = control.compare(&unlabelled);
     assert_eq!(d.unit, Unit::Iteration);
     assert_eq!(d.a.units * 2, control.main_loop.as_ref().unwrap().trips.total);

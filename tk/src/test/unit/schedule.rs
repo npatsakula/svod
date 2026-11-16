@@ -240,6 +240,7 @@ fn register_staging_peels_the_ring_into_three_branch_free_loops(stages: usize, t
         .filter_map(|(_, s)| if let Stmt::Pipeline(p) = s { Some([p.produce.slot, p.consume.slot]) } else { None })
         .flatten()
         .collect();
+    let schedule = prog.walk().find_map(|(_, s)| if let Stmt::Pipeline(p) = s { Some(p.schedule) } else { None });
     let prog = expand(prog, Fill::Staged, Core::Warp, false);
     let constant = slots.iter().all(|&s| *prog.scalar(s) == Scalar::Const(0));
     assert!(!slots.is_empty() && constant == (stages == 1), "slot scalars constant: {constant}");
@@ -267,6 +268,7 @@ fn register_staging_peels_the_ring_into_three_branch_free_loops(stages: usize, t
     assert_eq!(k[3 + computes..], tail);
     assert_eq!(kinds(drain), vec!["compute"; computes]);
     assert_eq!((head.unroll, steady.unroll, drain.unroll), (1, unroll, 1));
+    assert_eq!(schedule.map(Schedule::per_iteration), Some(unroll as usize), "a steady iteration's trips");
     assert_eq!(count(&prog, |s| matches!(s, Stmt::Sync(Sync::Fence))), stages, "fences");
     assert!(head.iv == steady.iv && steady.iv == drain.iv, "one induction variable");
     assert!(head.carried.is_empty());

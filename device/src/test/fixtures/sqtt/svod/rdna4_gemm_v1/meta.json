@@ -31,16 +31,27 @@
     "candidate_ns": "147280",
     "cfg": "[256, 128, 32] s2 [4, 2] unroll=true Warp crews=1",
     "kernel": "gemm",
-    "model.blocks_per_sm": "1",
-    "model.fill": "14440",
-    "model.lone_trip": "7570",
-    "model.ns": "181244",
-    "model.reads": "7508",
-    "model.steps": "90039",
-    "model.trip": "0",
-    "model.trips": "160",
-    "model.wait": "37890",
     "op": "gemm",
     "shape": "1500x1280x5120"
+  },
+  "model": {
+    "per_trip": {
+      "axis": "k",
+      "elems": 32
+    },
+    "per_iteration": 2,
+    "price": {
+      "ns": 181244.0,
+      "trips": 160,
+      "blocks_per_sm": 1,
+      "terms": {
+        "steps": 90039.0,
+        "reads": 7508.0,
+        "fill": 14440.0,
+        "wait": 37890.0,
+        "lone_trip": 7570.0,
+        "trip": 0.0
+      }
+    }
   }
 }

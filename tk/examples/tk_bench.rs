@@ -63,7 +63,7 @@ use std::time::{Duration, Instant};
 
 use svod_dtype::default_device::default_device;
 use svod_dtype::{DType, ScalarDType};
-use svod_runtime::sqtt::{Analysis, Capture, Class, Diff};
+use svod_runtime::sqtt::{Analysis, Axis, Capture, Class, Diff, Model, Price, Reduction, Term};
 use svod_runtime::{ExecutionPlan, ProfileOptions, Raw, Sink, SqttOptions};
 use svod_tensor::Tensor;
 use svod_tk::atoms::{Core, Costs, Device};
@@ -635,42 +635,44 @@ fn pin_bench(args: &Args) -> Result<()> {
     Ok(())
 }
 
-/// The terms `pin` prices by: each with its costs zeroed.
-fn zeroed_terms(costs: Costs) -> [(&'static str, Costs); 6] {
+/// The terms of a GEMM's price, each with its costs zeroed.
+fn zeroed_terms(costs: Costs) -> [(Term, Costs); 6] {
     [
-        ("steps", Costs { step: 0.0, step_group: 0.0, step_wide: 0.0, step_i8: 0.0, ..costs }),
-        ("reads", Costs { smem_byte: 0.0, ..costs }),
-        ("fill", Costs { global_byte: 0.0, l2_byte: 0.0, l2_bytes: 0.0, ..costs }),
-        ("wait", Costs { latency: 0.0, latency_one: 0.0, ..costs }),
-        ("lone_trip", Costs { trip_lone: 0.0, trip_one_lone: 0.0, ..costs }),
-        ("trip", Costs { trip: 0.0, trip_rolled: 0.0, trip_one: 0.0, ..costs }),
+        (Term::Steps, Costs { step: 0.0, step_group: 0.0, step_wide: 0.0, step_i8: 0.0, ..costs }),
+        (Term::Reads, Costs { smem_byte: 0.0, ..costs }),
+        (Term::Fill, Costs { global_byte: 0.0, l2_byte: 0.0, l2_bytes: 0.0, ..costs }),
+        (Term::Wait, Costs { latency: 0.0, latency_one: 0.0, ..costs }),
+        (Term::LoneTrip, Costs { trip_lone: 0.0, trip_one_lone: 0.0, ..costs }),
+        (Term::Trip, Costs { trip: 0.0, trip_rolled: 0.0, trip_one: 0.0, ..costs }),
     ]
 }
 
-/// The labels a GEMM trace carries for `--attribute`: the model's price of
-/// `cfg`, the price less each term, the trips a block runs and the blocks
-/// the busiest SM runs.
-fn gemm_model(planner: &Planner, [m, n, k]: [usize; 3], epilogue: Epilogue, cfg: GemmCfg) -> BTreeMap<String, String> {
+/// The model of a ring over `schedule` whose trip reduces `elems` of `axis`.
+fn ring_model(axis: Axis, elems: usize, schedule: Schedule) -> Model {
+    let per_iteration = schedule.per_iteration() as u32;
+    Model { per_trip: Some(Reduction { axis, elems: elems as u64 }), per_iteration, price: None }
+}
+
+/// What a GEMM trace carries for `--attribute`: the model's price of `cfg`,
+/// the price less each term, the trips a block runs and the blocks the
+/// busiest SM runs.
+fn gemm_model(planner: &Planner, [m, n, k]: [usize; 3], epilogue: Epilogue, cfg: GemmCfg) -> Model {
     let p = GemmProblem::new(1, m, n, k, &epilogue);
     let priced = |planner: &Planner| p.admit(planner, &cfg).map_or(f64::NAN, |a| a.0);
-    let model = priced(planner);
+    let ns = priced(planner);
     let target = &planner.device.target;
-    let mut labels = BTreeMap::from([
-        ("op".into(), "gemm".into()),
-        ("shape".into(), format!("{m}x{n}x{k}")),
-        ("cfg".into(), gemm_label(&cfg)),
-        ("model.ns".into(), format!("{model:.0}")),
-        ("model.trips".into(), k.div_ceil(cfg.tile[2]).to_string()),
-    ]);
-    if let Some(sms) = target.sms {
-        let blocks = m.div_ceil(cfg.tile[0]) * n.div_ceil(cfg.tile[1]);
-        labels.insert("model.blocks_per_sm".into(), blocks.div_ceil(sms as usize).to_string());
-    }
-    for (term, costs) in zeroed_terms(planner.device.costs) {
+    let blocks = m.div_ceil(cfg.tile[0]) * n.div_ceil(cfg.tile[1]);
+    let terms = zeroed_terms(planner.device.costs).map(|(term, costs)| {
         let less = Planner::new(Device { target: target.clone(), costs }).map_or(f64::NAN, |z| priced(&z));
-        labels.insert(format!("model.{term}"), format!("{:.0}", model - less));
-    }
-    labels
+        (term, (ns - less).round())
+    });
+    let price = Price {
+        ns: ns.round(),
+        trips: k.div_ceil(cfg.tile[2]) as u64,
+        blocks_per_sm: target.sms.map(|sms| blocks.div_ceil(sms as usize) as u64),
+        terms: terms.into_iter().collect(),
+    };
+    Model { price: Some(price), ..ring_model(Axis::K, cfg.tile[2], cfg.schedule) }
 }
 
 fn sqtt_bench(args: &Args) -> Result<()> {
@@ -708,7 +710,7 @@ fn sqtt_bench(args: &Args) -> Result<()> {
         _ => return Err(usage.into()),
     };
     let out = PathBuf::from(args.opt("--out").unwrap_or("sqtt"));
-    for Traced { name, candidate, labels } in traced {
+    for Traced { name, candidate, labels, model } in traced {
         let untraced = timed_candidates(vec![candidate()?]).pop().and_then(|t| t.1);
         let dir = out.join(&name);
         // `SVOD_SQTT_PSTATE` pins the traced pass's clock, `SVOD_SQTT_SIMD` picks its SIMDs.
@@ -731,6 +733,7 @@ fn sqtt_bench(args: &Args) -> Result<()> {
             }
             let mut capture = Capture::load(dir)?;
             capture.labels.extend(labels.clone());
+            capture.model = Some(model.clone());
             capture.labels.insert("candidate_ns".into(), untraced.map_or("-".into(), |t| t.as_nanos().to_string()));
             // The statements, from a host build with a line table whose code is the traced one.
             match tune::twin(&candidate, &mut capture) {
@@ -750,11 +753,13 @@ fn sqtt_bench(args: &Args) -> Result<()> {
 }
 
 /// One configuration `sqtt` traces: its capture directory, its candidate
-/// (built afresh for each pass) and the labels its capture carries.
+/// (built afresh for each pass), the labels its capture shows and the model
+/// of its main loop.
 struct Traced<'a> {
     name: String,
     candidate: Box<dyn Fn() -> Result<Candidate> + 'a>,
     labels: BTreeMap<String, String>,
+    model: Model,
 }
 
 fn gemm_traced<'a>(planner: &'a Planner, shape: [usize; 3], args: &Args) -> Result<Vec<Traced<'a>>> {
@@ -772,7 +777,12 @@ fn gemm_traced<'a>(planner: &'a Planner, shape: [usize; 3], args: &Args) -> Resu
             Ok(Traced {
                 name: format!("gemm_{m}x{n}x{k}_{i}"),
                 candidate: Box::new(move || gemm_candidate(planner, shape, epilogue, cfg)),
-                labels: gemm_model(planner, shape, epilogue, cfg),
+                labels: BTreeMap::from([
+                    ("op".into(), "gemm".into()),
+                    ("shape".into(), format!("{m}x{n}x{k}")),
+                    ("cfg".into(), gemm_label(&cfg)),
+                ]),
+                model: gemm_model(planner, shape, epilogue, cfg),
             })
         })
         .collect()
@@ -846,6 +856,7 @@ fn attention_traced<'a>(planner: &'a Planner, [b, h, t, d]: [usize; 4], args: &A
                 ),
                 candidate: Box::new(move || Ok(candidates::attention(&admitted, &[t], &DType::BFloat16, planner))),
                 labels,
+                model: ring_model(Axis::Keys, cfg.bkv, cfg.schedule),
             })
         })
         .collect()
@@ -899,15 +910,18 @@ fn nearest_traced<'a>(planner: &'a Planner, [n, depth, k]: [usize; 3], args: &Ar
                 admitted = spec.clone().admitted(planner, cfg).map_err(|why| format!("{cfg:?}: {why:?}"))?;
                 i = format!("{i}_s{splits}");
             }
+            let cfg = admitted.cfg();
             let labels = BTreeMap::from([
                 ("op".into(), "nearest".into()),
                 ("shape".into(), format!("n{n} d{depth} k{k} {metric:?}")),
-                ("cfg".into(), format!("{:?}", admitted.cfg())),
+                ("cfg".into(), format!("{cfg:?}")),
             ]);
             Ok(Traced {
                 name: format!("nearest_n{n}d{depth}k{k}{metric:?}_{i}"),
                 candidate: Box::new(move || Ok(candidates::nearest(planner, DType::Float16, &admitted))),
                 labels,
+                // A trip streams `bk` of the depth, or the rows' whole depth.
+                model: ring_model(Axis::Depth, cfg.bk.unwrap_or(d), cfg.schedule),
             })
         })
         .collect()
@@ -973,6 +987,7 @@ fn conv_traced<'a>(
                 name: format!("conv_{h}x{w}x{cin}x{cout}k{kernel}s{stride}b{images}_{i}"),
                 candidate: Box::new(move || Ok(candidates::conv(&admitted, &DType::Float16, planner))),
                 labels,
+                model: ring_model(Axis::K, cfg.gemm.tile[2], cfg.gemm.schedule),
             })
         })
         .collect()
@@ -996,9 +1011,9 @@ fn sqtt_print(capture: &Capture, args: &Args, top: usize) -> Result<()> {
 /// barriers and messages.
 fn attribution(a: &Analysis) -> Result<String> {
     use std::fmt::Write;
-    let label = |key: &str| a.labels.get(key).and_then(|v| v.parse::<f64>().ok());
-    let model =
-        label("model.ns").ok_or("no model terms in the trace's labels: a `tk_bench sqtt gemm` capture has them")?;
+    let price = a.model.as_ref().and_then(|m| m.price.as_ref());
+    let price = price.ok_or("no model price in the trace: a `tk_bench sqtt gemm` capture has one")?;
+    let model = price.ns;
     let total: i64 = a.classes.iter().map(|c| c.latency).sum::<i64>().max(1);
     let waves = a.complete.max(1) as f64;
     let ns = |cycles: f64| a.sclk_mhz.map_or("-".into(), |mhz| format!("{:.0}", cycles * 1000.0 / mhz as f64));
@@ -1014,16 +1029,17 @@ fn attribution(a: &Analysis) -> Result<String> {
         "term", "model ns", "model%", "cycles/wave", "cycles%", "ns at sclk"
     )?;
     let (matrix, matrix_stall) = a.cycles(&[Class::Matrix]);
-    let measured: [(&str, Option<(i64, &str)>); 6] = [
-        ("steps", Some((matrix - matrix_stall, "matrix issue less stall"))),
-        ("reads", Some((a.cycles(&[Class::Lds, Class::WaitLgkm]).0, "lds + wait_lgkm"))),
-        ("fill", Some((a.cycles(&[Class::VmemLoad, Class::VmemStore, Class::WaitVmem]).0, "vmem + wait_vmem"))),
-        ("wait", Some((a.cycles(&[Class::Barrier, Class::Message]).0, "barrier + message"))),
-        ("lone_trip", None),
-        ("trip", None),
+    let measured: [(Term, Option<(i64, &str)>); 6] = [
+        (Term::Steps, Some((matrix - matrix_stall, "matrix issue less stall"))),
+        (Term::Reads, Some((a.cycles(&[Class::Lds, Class::WaitLgkm]).0, "lds + wait_lgkm"))),
+        (Term::Fill, Some((a.cycles(&[Class::VmemLoad, Class::VmemStore, Class::WaitVmem]).0, "vmem + wait_vmem"))),
+        (Term::Wait, Some((a.cycles(&[Class::Barrier, Class::Message]).0, "barrier + message"))),
+        (Term::LoneTrip, None),
+        (Term::Trip, None),
     ];
     for (term, counterpart) in measured {
-        let m = label(&format!("model.{term}")).unwrap_or(f64::NAN);
+        let m = price.terms.get(&term).copied().unwrap_or(f64::NAN);
+        let term = term.name();
         let (cycles, share, at, what) = match counterpart {
             Some((c, what)) => {
                 let per_wave = c as f64 / waves;
@@ -1042,11 +1058,11 @@ fn attribution(a: &Analysis) -> Result<String> {
         100.0,
         ns(total as f64 / waves)
     )?;
-    let trips = label("model.trips").unwrap_or(f64::NAN);
-    let per_sm = label("model.blocks_per_sm").unwrap_or(f64::NAN);
+    let trips = price.trips as f64;
+    let per_sm = price.blocks_per_sm.map_or(f64::NAN, |b| b as f64);
     let main_loop = a.main_loop.as_ref();
     let iteration = main_loop.and_then(|l| l.cycles).map(|c| c.median as f64);
-    let unroll = main_loop.filter(|l| l.trips.labelled).map(|l| f64::from(l.trips.per_iteration));
+    let unroll = main_loop.map(|l| f64::from(l.trips.per_iteration));
     let per_trip = iteration.zip(unroll).map(|(c, u)| c / u);
     writeln!(
         o,

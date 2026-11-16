@@ -1,5 +1,5 @@
 == sqtt gemm gfx1201 candidate_ns=151760 cfg=[128, 128, 32] s2 [4, 2] unroll=true Warp crews=1 kernel=gemm op=gemm shape=1500x1280x5120
-== verdict: cycles are a traced wave's, a trip (2 an iteration, model.trips); exposed: not hidden by other pipes' work
+== verdict: cycles are a traced wave's, a trip (2 an iteration, the kernel's schedule); exposed: not hidden by other pipes' work
 ceiling    matrix pipe 83.8% busy over the steady window: removing every stall gains at most 1.19x; 365 cycles a trip queued for the matrix pipe, 13 exposed
 demand     1792 global bytes a trip a wave x 945 resident waves / 2131 cycles a trip at 2727 MHz: 2166 GB/s requested from L2 and DRAM
 bound      matrix_bound       83.8%  pipes busy: matrix 83.8% valu 67.5% any 91.8%
@@ -49,7 +49,7 @@ se3        236.2/240 (p95 240) over 73% of the span; 32 SIMDs 7.4/8
 == main loop 0x43c..=0x810 (matrix)
 iterations/wave  min 79 med 79 max 79 (waves 16)
 cycles/iteration min 2689 med 3566 p90 7129 max 8484 (n 1248)
-trips      2 an iteration (model.trips), 2528 in the loop over 16 waves
+trips      2 an iteration (the kernel's schedule), 2528 in the loop over 16 waves
 == main loop cycles a trip: a traced wave's, each cycle once (issue, stall and idle by class); exposed: less what other pipes hid
 bucket                     all   share   exposed   share       se0       se1
 issue matrix             221.3   10.4%     221.3   10.4%     221.8     220.8

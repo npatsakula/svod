@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use svod_device::amd::occupancy::Limit;
 
 use super::verdict::{observed, slowdown};
-use super::{Analysis, Class, FindingKind, Pstate, Result, Row, Trips};
+use super::{Analysis, Class, FindingKind, Pstate, Reduction, Result, Row, Trips};
 
 /// Traced-over-untraced ratios further apart than this share: the captures ran under different
 /// perturbation, and their cycle shares compare less.
@@ -31,8 +31,8 @@ pub struct Side {
     pub sclk_mhz: Option<u64>,
     pub pstate: Option<Pstate>,
     pub trips: Option<Trips>,
-    /// Reduction elements a trip: a GEMM's K over `model.trips`.
-    pub k_per_trip: Option<f64>,
+    /// What a trip reduces over, where the capture's model says.
+    pub per_trip: Option<Reduction>,
     /// The units the loop's figures are over: the traced waves' trips, or their iterations.
     pub units: u64,
     /// The traced SIMDs' mean resident waves, and the kernel's limit.
@@ -47,9 +47,9 @@ pub struct Side {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Unit {
-    /// A trip of the reduction (`model.trips` labels both captures).
+    /// A trip of the reduction (both captures have a model).
     Trip,
-    /// A loop iteration: a capture lacks `model.trips`.
+    /// A loop iteration: a capture has no model.
     Iteration,
 }
 
@@ -71,7 +71,7 @@ pub enum Caution {
     /// Their traced-over-untraced ratios differ past [`SLOWDOWN_SPREAD`].
     Slowdown { a: f64, b: f64 },
     /// A trip of each covers different reduction elements: compare the per-element deltas.
-    TripsDiffer { a: f64, b: f64 },
+    TripsDiffer { a: Reduction, b: Reduction },
     /// A capture has no main loop: no buckets or rows to compare.
     NoLoop,
 }
@@ -178,14 +178,6 @@ pub struct Diff {
     pub statements: Vec<StatementDelta>,
 }
 
-/// `K / model.trips` of a GEMM capture's `shape` label (`MxNxK`).
-fn k_per_trip(a: &Analysis) -> Option<f64> {
-    let label = |k: &str| a.labels.get(k).map(String::as_str);
-    let k: f64 = label("op").filter(|&op| op == "gemm").and(label("shape"))?.rsplit('x').next()?.parse().ok()?;
-    let trips: f64 = label("model.trips")?.parse().ok()?;
-    (trips > 0.0).then_some(k / trips)
-}
-
 fn side(a: &Analysis, unit: Unit) -> Side {
     let trips = a.main_loop.as_ref().map(|l| l.trips);
     let units = trips.map_or(0, |t| match unit {
@@ -194,19 +186,14 @@ fn side(a: &Analysis, unit: Unit) -> Side {
     });
     Side {
         kernel: a.labels.get("kernel").cloned().unwrap_or_else(|| a.kernel.clone()),
-        labels: a
-            .labels
-            .iter()
-            .filter(|(k, _)| !k.starts_with("model."))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
+        labels: a.labels.clone(),
         kernel_ns: a.kernel_ns,
         traced_ns: a.traced_ns,
         slowdown: slowdown(a),
         sclk_mhz: a.sclk_mhz,
         pstate: a.pstate,
         trips,
-        k_per_trip: k_per_trip(a),
+        per_trip: a.model.as_ref().and_then(|m| m.per_trip),
         units,
         occupancy: observed(a),
         limit: a.occupancy.limit.clone(),
@@ -329,8 +316,7 @@ fn findings(a: &Analysis, b: &Analysis) -> Vec<FindingDelta> {
 impl Analysis {
     /// `b` against `self` (A): Δ is B − A, every loop figure a unit of each side's own.
     pub fn compare(&self, b: &Self) -> Diff {
-        let labelled = |x: &Self| x.main_loop.as_ref().is_some_and(|l| l.trips.labelled);
-        let unit = if labelled(self) && labelled(b) { Unit::Trip } else { Unit::Iteration };
+        let unit = if self.model.is_some() && b.model.is_some() { Unit::Trip } else { Unit::Iteration };
         let (sa, sb) = (side(self, unit), side(b, unit));
         let mut cautions = vec![];
         if sa.pstate != sb.pstate {
@@ -340,10 +326,10 @@ impl Analysis {
         {
             cautions.push(Caution::Slowdown { a: ra, b: rb });
         }
-        if let (Unit::Trip, Some(ka), Some(kb)) = (unit, sa.k_per_trip, sb.k_per_trip)
-            && ka != kb
+        if let (Unit::Trip, Some(ra), Some(rb)) = (unit, sa.per_trip, sb.per_trip)
+            && ra != rb
         {
-            cautions.push(Caution::TripsDiffer { a: ka, b: kb });
+            cautions.push(Caution::TripsDiffer { a: ra, b: rb });
         }
         if self.main_loop.is_none() || b.main_loop.is_none() {
             cautions.push(Caution::NoLoop);
@@ -435,14 +421,19 @@ impl Diff {
                     "!! PERTURBATION differs: traced/untraced {a:.2}x vs {b:.2}x (over {:.0}% apart); shares compare less",
                     100.0 * SLOWDOWN_SPREAD
                 ),
-                Caution::TripsDiffer { a, b } => {
-                    writeln!(o, "!! TRIPS differ: {a:.0} vs {b:.0} K elements a trip; Δ/k is the delta a K element")
-                }
+                Caution::TripsDiffer { a, b } => writeln!(
+                    o,
+                    "!! TRIPS differ: {} {} vs {} {} elements a trip; Δ/k is the delta an element",
+                    a.elems,
+                    a.axis.name(),
+                    b.elems,
+                    b.axis.name()
+                ),
                 Caution::NoLoop => writeln!(o, "!! NO LOOP on a side: no buckets or rows"),
             };
         }
         if self.unit == Unit::Iteration {
-            let _ = writeln!(o, "note       no model.trips on a side: figures are per loop iteration");
+            let _ = writeln!(o, "note       no model on a side: figures are per loop iteration");
         }
         let occupancy = |s: &Side| s.occupancy.map_or("-".into(), |w| format!("{w:.1}"));
         let limit = |s: &Side| {
@@ -487,7 +478,7 @@ impl Diff {
             return;
         }
         let per_k = self.cautions.iter().find_map(|c| match *c {
-            Caution::TripsDiffer { a, b } => Some([a, b]),
+            Caution::TripsDiffer { a, b } => Some([a.elems as f64, b.elems as f64]),
             _ => None,
         });
         let quiet =

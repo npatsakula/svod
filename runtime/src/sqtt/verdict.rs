@@ -444,6 +444,9 @@ pub enum Approx {
     /// An SE's span, a wave's lifetime or an instruction's cycles passes [`PLAUSIBLE_CYCLES`]: the
     /// stream is corrupt, and its sums may have saturated.
     ImplausibleTime,
+    /// The capture has no [`Model`](super::Model): a trip is taken as one loop iteration, whatever
+    /// the iteration unrolls.
+    PerIteration,
 }
 
 impl Approx {
@@ -453,6 +456,7 @@ impl Approx {
             Self::UntimedMatrix => "untimed_matrix",
             Self::ApproxBindings => "approx_bindings",
             Self::ImplausibleTime => "implausible_time",
+            Self::PerIteration => "per_iteration",
         }
     }
 }
@@ -573,8 +577,6 @@ pub struct Demand {
     pub cycles_per_trip: f64,
     pub sclk_mhz: u64,
     pub gbs: f64,
-    /// The device's bandwidth a `model.bandwidth_gbs` label gives.
-    pub bandwidth_gbs: Option<f64>,
 }
 
 /// The main loop's limiters: the kernel's class by its pipes' busy shares over the steady window
@@ -691,7 +693,6 @@ fn demand(a: &Analysis) -> Option<Demand> {
         cycles_per_trip,
         sclk_mhz,
         gbs: bytes_per_trip as f64 * waves * sclk_mhz as f64 / cycles_per_trip / 1e3,
-        bandwidth_gbs: a.labels.get("model.bandwidth_gbs").and_then(|b| b.parse().ok()),
     })
 }
 
@@ -705,6 +706,11 @@ pub(super) fn rank(a: &Analysis) -> Verdict {
         base.into_iter().flatten().chain(more.iter().copied()).collect::<Vec<_>>()
     };
     let raw_flag: &[Approx] = if untimed { &[Approx::UntimedMatrix] } else { &[] };
+    // A loop finding's figures are a trip's: an iteration's where no model says what a trip is.
+    let per_trip = |more: &[Approx]| {
+        let unmodelled = a.model.is_none().then_some(Approx::PerIteration);
+        approx(&more.iter().copied().chain(unmodelled).collect::<Vec<_>>())
+    };
     let finding = |kind, (share, raw), evidence, knob: &str, approx| Finding {
         kind,
         share,
@@ -800,7 +806,7 @@ pub(super) fn rank(a: &Analysis) -> Verdict {
             loads,
             stalls: stalls(a, Class::VmemLoad, trips),
         };
-        v.findings.push(finding(FindingKind::LoadExposed, (s, raw), evidence, &knob, approx(&more)));
+        v.findings.push(finding(FindingKind::LoadExposed, (s, raw), evidence, &knob, per_trip(&more)));
     }
 
     let lds = |store: bool| move |on: WaitOn| matches!(on.counter, Counter::Ds | Counter::Lgkm) && on.store == store;
@@ -825,13 +831,14 @@ pub(super) fn rank(a: &Analysis) -> Verdict {
         };
         let (loads, stalls) = (loads(a, Class::Lds, trips), stalls(a, Class::Lds, trips));
         let evidence = Evidence::Waits { load, store, stall, loads, stalls };
-        v.findings.push(finding(FindingKind::LdsExposed, (s, raw), evidence, knob, approx(raw_flag)));
+        v.findings.push(finding(FindingKind::LdsExposed, (s, raw), evidence, knob, per_trip(raw_flag)));
     }
 
     if share(p.barrier) >= BARRIER {
         let evidence = Evidence::Barrier { cycles: cycles(p.barrier, e.barrier), sites: l.barriers.clone() };
         let knob = "drop or merge a barrier only if its exposed share passes 10%";
-        v.findings.push(finding(FindingKind::Barrier, ranked(p.barrier, e.barrier), evidence, knob, approx(raw_flag)));
+        let f = finding(FindingKind::Barrier, ranked(p.barrier, e.barrier), evidence, knob, per_trip(raw_flag));
+        v.findings.push(f);
     }
 
     let alu = [Class::Valu, Class::Salu];
@@ -851,7 +858,7 @@ pub(super) fn rank(a: &Analysis) -> Verdict {
             divergent,
         };
         let s = ranked(p.issued(&alu), e.issued(&alu));
-        v.findings.push(finding(FindingKind::LoopOverhead, s, evidence, knob, approx(raw_flag)));
+        v.findings.push(finding(FindingKind::LoopOverhead, s, evidence, knob, per_trip(raw_flag)));
     }
     sort(&mut v.findings);
     v
@@ -869,10 +876,10 @@ fn pct(share: f64) -> f64 {
 /// knob, then what makes them approximate.
 pub(super) fn text(a: &Analysis, o: &mut String) {
     let (unit, of) = match &a.main_loop {
-        Some(l) if l.trips.labelled => {
-            ("trip", format!("a trip ({} an iteration, model.trips)", l.trips.per_iteration))
+        Some(l) if a.model.is_some() => {
+            ("trip", format!("a trip ({} an iteration, the kernel's schedule)", l.trips.per_iteration))
         }
-        Some(_) => ("iteration", "an iteration (no model.trips label)".into()),
+        Some(_) => ("iteration", "an iteration (no model)".into()),
         None => ("trip", "- (no main loop)".into()),
     };
     let a_unit = if unit == "trip" { "a trip" } else { "an iteration" };
@@ -890,10 +897,9 @@ pub(super) fn text(a: &Analysis, o: &mut String) {
         );
     }
     if let Some(d) = &v.demand {
-        let ratio = d.bandwidth_gbs.map_or(String::new(), |b| format!(", {:.0}% of {b:.0} GB/s", 100.0 * d.gbs / b));
         let _ = writeln!(
             o,
-            "demand     {} global bytes {a_unit} a wave x {:.0} resident waves / {:.0} cycles {a_unit} at {} MHz: {:.0} GB/s requested from L2 and DRAM{ratio}",
+            "demand     {} global bytes {a_unit} a wave x {:.0} resident waves / {:.0} cycles {a_unit} at {} MHz: {:.0} GB/s requested from L2 and DRAM",
             d.bytes_per_trip, d.waves, d.cycles_per_trip, d.sclk_mhz, d.gbs
         );
     }

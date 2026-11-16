@@ -100,8 +100,10 @@ pub struct Capture {
     /// The traced dispatch's own device time: the same run and power state as the trace's cycles, so
     /// the clock estimate prefers it.
     pub traced_ns: Option<u64>,
-    /// Free-form context (`cfg`, shape) carried into the report header.
+    /// Free-form context (`cfg`, shape) shown in the report header, read by nothing.
     pub labels: BTreeMap<String, String>,
+    /// What the kernel's program says of its main loop; `None` where the capture is no tk kernel's.
+    pub model: Option<Model>,
     /// The kernel's registers and LDS, its workgroup's threads along each axis and the grid's
     /// workgroups along each: what bounds how many waves a SIMD holds.
     pub resources: Option<KernelResources>,
@@ -135,6 +137,80 @@ impl From<Option<StablePstate>> for Pstate {
     }
 }
 
+/// The axis a trip of a kernel's main loop reduces along.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Axis {
+    /// A GEMM's (or a convolution's implicit GEMM's) K.
+    K,
+    /// Attention's keys.
+    Keys,
+    /// A nearest search's feature depth.
+    Depth,
+}
+
+impl Axis {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::K => "K",
+            Self::Keys => "key",
+            Self::Depth => "depth",
+        }
+    }
+}
+
+/// The elements of `axis` one trip covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reduction {
+    pub axis: Axis,
+    pub elems: u64,
+}
+
+/// A term of the tile planner's GEMM price.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Term {
+    Steps,
+    Reads,
+    Fill,
+    Wait,
+    LoneTrip,
+    Trip,
+}
+
+impl Term {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Steps => "steps",
+            Self::Reads => "reads",
+            Self::Fill => "fill",
+            Self::Wait => "wait",
+            Self::LoneTrip => "lone_trip",
+            Self::Trip => "trip",
+        }
+    }
+}
+
+/// The planner's price of a GEMM: its ns on the busiest SM, the trips a block runs, the blocks that
+/// SM runs, and per term the price less that term.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Price {
+    pub ns: f64,
+    pub trips: u64,
+    pub blocks_per_sm: Option<u64>,
+    pub terms: BTreeMap<Term, f64>,
+}
+
+/// What a tk kernel's program says of its main loop: the reduction a trip covers, the trips one
+/// iteration runs (its ring's depth where the loop is unrolled over the slots), and, for a GEMM, the
+/// planner's price.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Model {
+    pub per_trip: Option<Reduction>,
+    pub per_iteration: u32,
+    pub price: Option<Price>,
+}
+
 impl Pstate {
     pub fn name(self) -> &'static str {
         match self {
@@ -156,6 +232,8 @@ struct Meta {
     ses: Vec<SeMeta>,
     #[serde(default)]
     labels: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<Model>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resources: Option<KernelResources>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -189,6 +267,7 @@ impl Capture {
             kernel_ns,
             traced_ns: None,
             labels: BTreeMap::new(),
+            model: None,
             resources: None,
             workgroup: None,
             grid: None,
@@ -227,6 +306,7 @@ impl Capture {
                 .map(|s| SeMeta { se: s.se, itrace: s.itrace, truncated: s.truncated })
                 .collect(),
             labels: self.labels.clone(),
+            model: self.model.clone(),
             resources: self.resources,
             workgroup: self.workgroup,
             grid: self.grid,
@@ -275,6 +355,7 @@ impl Capture {
             kernel_ns: meta.kernel_ns,
             traced_ns: meta.traced_ns,
             labels: meta.labels,
+            model: meta.model,
             resources: meta.resources,
             workgroup: meta.workgroup,
             grid: meta.grid,
@@ -454,14 +535,12 @@ pub struct MainLoop {
     pub statements: Vec<Statement>,
 }
 
-/// The unit per-trip figures are in: a trip of the kernel's reduction (`model.trips`, the trips a
-/// wave runs, labels the capture), else one loop iteration.
+/// The unit per-trip figures are in: a trip of the kernel's reduction where the capture has a
+/// [`Model`], else one loop iteration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Trips {
-    /// Trips an iteration runs: `model.trips` over a wave's iterations plus the one its head and
-    /// drain run between them, else 1.
+    /// Trips an iteration runs: [`Model::per_iteration`], else 1.
     pub per_iteration: u32,
-    pub labelled: bool,
     /// Trips the traced waves ran in the loop: their back-edge executions times `per_iteration`.
     pub total: u64,
 }
@@ -503,13 +582,14 @@ pub struct SeOccupancy {
 /// on: `verdict` (`ceiling`, `demand`, and ranked [`Finding`]s in `bound` and `findings`: `kind`,
 /// `share`, `raw`, `evidence`, `knob`, `approx`), `main_loop` (`trips`; `partition` and `exposed`
 /// with `waves`, `cycles`, `issue`, `stall`, `wait`, `barrier`, `idle`; the same per SE in `ses`;
-/// `barriers`, `bindings`), `occupancy`, `waits`, `pcs`, `classes`, `traced`, `ses`, `pstate` and
-/// the header fields.
+/// `barriers`, `bindings`), `occupancy`, `waits`, `pcs`, `classes`, `traced`, `ses`, `pstate`, `model`
+/// and the header fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Analysis {
     pub kernel: String,
     pub arch: String,
     pub labels: BTreeMap<String, String>,
+    pub model: Option<Model>,
     pub kernel_ns: Option<u64>,
     pub traced_ns: Option<u64>,
     pub pstate: Option<Pstate>,
@@ -685,7 +765,7 @@ impl Analysis {
             .zip(capture.resources)
             .zip(capture.workgroup)
             .and_then(|((cu, resources), workgroup)| limits(&resources, workgroup.iter().product(), &cu));
-        let model_trips = capture.labels.get("model.trips").and_then(|t| t.parse().ok());
+        let per_iteration = capture.model.as_ref().map_or(1, |m| m.per_iteration.max(1));
         let replay = Replay::new(&waves, &lines, layout);
         let mut bound: Vec<HashMap<usize, (Counter, u64)>> = vec![HashMap::new(); waves.len()];
         for (wave, seq, counter, pc) in replay.bound() {
@@ -699,11 +779,12 @@ impl Analysis {
         });
         let listing: Vec<String> = capture.listing.iter().flat_map(|l| l.lines()).map(str::to_string).collect();
         let statements = capture.lines.as_ref().map(|lines| (lines, listing.as_slice()));
-        let main_loop = main_loop(&lines, &pcs, traced_waves, &replay, model_trips, base, statements);
+        let main_loop = main_loop(&lines, &pcs, traced_waves, &replay, per_iteration, base, statements);
         let mut analysis = Self {
             kernel: kernel.to_string(),
             arch: capture.trace.arch.to_string(),
             labels: capture.labels.clone(),
+            model: capture.model.clone(),
             kernel_ns: capture.kernel_ns,
             traced_ns: capture.traced_ns,
             pstate: capture.pstate,
@@ -753,8 +834,7 @@ impl Analysis {
     pub fn text(&self, top: usize) -> String {
         use std::fmt::Write;
         let mut o = String::new();
-        let shown = self.labels.iter().filter(|(k, _)| !k.starts_with("model."));
-        let labels: String = shown.map(|(k, v)| format!(" {k}={v}")).collect();
+        let labels: String = self.labels.iter().map(|(k, v)| format!(" {k}={v}")).collect();
         let _ = writeln!(o, "== sqtt {} {}{labels}", self.kernel, self.arch);
         for se in self.ses.iter().filter(|s| s.truncated) {
             let _ = writeln!(o, "!! TRUNCATED se{}: its buffer filled and the tail is lost; totals undercount", se.se);
@@ -830,7 +910,7 @@ impl Analysis {
                 };
                 let _ = writeln!(o, "iterations/wave  {}", spread(l.iterations, false));
                 let _ = writeln!(o, "cycles/iteration {}", spread(l.cycles, true));
-                partition_text(&mut o, l);
+                partition_text(&mut o, l, self.model.is_some());
                 statements::text(self, &mut o, top);
                 let mut rows: Vec<&Row> = self.loop_rows().collect();
                 rows.sort_by_key(|r| (std::cmp::Reverse(r.stall), r.pc));
@@ -967,15 +1047,15 @@ impl Analysis {
 }
 
 /// The main loop's partition a trip: every bucket, raw and exposed, its shares, and each traced SE's.
-fn partition_text(o: &mut String, l: &MainLoop) {
+fn partition_text(o: &mut String, l: &MainLoop, modelled: bool) {
     use std::fmt::Write;
     let t = l.trips;
-    let unit = if t.labelled { "a trip" } else { "an iteration" };
+    let unit = if modelled { "a trip" } else { "an iteration" };
     let _ = writeln!(
         o,
         "trips      {} an iteration ({}), {} in the loop over {} waves",
         t.per_iteration,
-        if t.labelled { "model.trips" } else { "no model.trips label: per-trip figures are per iteration" },
+        if modelled { "the kernel's schedule" } else { "no model: per-trip figures are per iteration" },
         t.total,
         l.partition.waves
     );
@@ -1023,14 +1103,14 @@ struct SeWaves<'a> {
 
 /// The innermost executed backward branch whose span issues a matrix instruction, else the most
 /// executed one; its waves' trips and the cycles between their back edges, and how the traced waves'
-/// cycles in it split, SE by SE, and by the statement `stmts` gives each instruction. `model_trips`:
-/// the trips a wave runs, where the capture says.
+/// cycles in it split, SE by SE, and by the statement `stmts` gives each instruction; an iteration
+/// runs `per_iteration` trips.
 fn main_loop<'a>(
     lines: &[(u64, &str)],
     pcs: &BTreeMap<u64, Stats>,
     ses: impl Iterator<Item = SeWaves<'a>> + Clone,
     replay: &Replay,
-    model_trips: Option<u64>,
+    per_iteration: u32,
     base: u64,
     stmts: Option<(&Lines, &[String])>,
 ) -> Option<MainLoop> {
@@ -1055,9 +1135,6 @@ fn main_loop<'a>(
         }
     }
     let iterations = Spread::of(trips);
-    // A wave runs one iteration's trips more than its loop does: its head's and drain's.
-    let labelled = model_trips.zip(iterations).map(|(t, i)| (t as f64 / (i.median + 1) as f64).round().max(1.0));
-    let per_iteration = labelled.map_or(1, |u| u as u32);
     let buckets = verdict::Buckets::new(lines);
     let (mut sites, mut charges) = (vec![], BTreeMap::<u64, verdict::Charge>::new());
     let ses: Vec<SeLoop> = ses
@@ -1077,7 +1154,7 @@ fn main_loop<'a>(
         partition.add(&s.partition);
         exposed.add(&s.exposed);
     });
-    let trips = Trips { per_iteration, labelled: labelled.is_some(), total: ses.iter().map(|s| s.trips).sum() };
+    let trips = Trips { per_iteration, total: ses.iter().map(|s| s.trips).sum() };
     let body = lines.iter().map(|l| l.0).filter(|pc| (head..=edge).contains(pc)).map(|pc| pc - base);
     let statements =
         stmts.map_or(vec![], |(stmts, listing)| statements::rollup(&charges, body, stmts, listing, trips.total));
