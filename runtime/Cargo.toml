@@ -30,6 +30,7 @@ libffi = "5.1.0"
 smallvec = { workspace = true }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["float_roundtrip"] }
+gimli = { version = "0.34", default-features = false, features = ["read"] }
 
 [dev-dependencies]
 test-case = "3.3.1"

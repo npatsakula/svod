@@ -11,7 +11,10 @@
 
 pub mod compile;
 
-pub use compile::{assemble_gcn, compile_ir_to_amd_asm, compile_ir_to_amd_object, has_amdgpu_target};
+pub use crate::devices::amd::LocatedAmd;
+pub use compile::{
+    assemble_gcn, compile_ir_to_amd_asm, compile_ir_to_amd_object, compile_ir_to_amd_object_as, has_amdgpu_target,
+};
 
 use svod_codegen::llvm::LlvmTextRenderer;
 use svod_dtype::AmdArch;

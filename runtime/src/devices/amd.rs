@@ -155,10 +155,7 @@ struct AmdRendererWrapper {
 
 impl Renderer for AmdRendererWrapper {
     fn render(&self, ast: &Arc<UOp>, name: Option<&str>) -> Result<ProgramSpec> {
-        let renderer = crate::amd::renderer(self.arch);
-        let rendered = svod_codegen::Renderer::render(&renderer, ast, name.or(Some("kernel")))
-            .map_err(|e| svod_device::Error::Runtime { message: format!("AMD IR rendering failed: {e}") })?;
-        Ok(super::program_spec(&rendered, &self.device, ast))
+        render_amd(&crate::amd::renderer(self.arch), &self.device, ast, name)
     }
 
     fn device(&self) -> &DeviceSpec {
@@ -170,20 +167,7 @@ impl Renderer for AmdRendererWrapper {
     }
 
     fn supported_ops(&self) -> svod_ir::RendererOps {
-        // Sin must decompose (tinygrad `llvmir.py` `llvm_intrinsics` is exactly
-        // {sqrt, log2, exp2}): `@llvm.sin.f32` lowers to the hardware
-        // `v_sin_f32` behind an f32 `1/(2π)` pre-scale, which is only accurate
-        // for small arguments — sin(±1e6) comes back as ±sin(π/8) because the
-        // reduction happens in f32 revolutions. `v_exp_f32`/`v_log_f32`/
-        // `v_sqrt_f32` are ~1-ulp and stay native.
-        super::gpu_supported_ops(&[
-            svod_ir::UnaryOp::Exp,
-            svod_ir::UnaryOp::Log,
-            svod_ir::UnaryOp::Sin,
-            svod_ir::UnaryOp::Cos,
-            svod_ir::UnaryOp::Tan,
-            svod_ir::UnaryOp::Erf,
-        ])
+        amd_supported_ops()
     }
 
     fn decompositor(&self) -> Option<svod_ir::pattern::TypedPatternMatcher<()>> {
@@ -201,6 +185,75 @@ impl Renderer for AmdRendererWrapper {
     fn extra_matcher(&self) -> Option<svod_ir::pattern::TypedPatternMatcher<()>> {
         Some(svod_codegen::llvm::amd_extra_matcher())
     }
+}
+
+/// The operations an AMD renderer takes without decomposition.
+fn amd_supported_ops() -> svod_ir::RendererOps {
+    // Sin must decompose (tinygrad `llvmir.py` `llvm_intrinsics` is exactly
+    // {sqrt, log2, exp2}): `@llvm.sin.f32` lowers to the hardware
+    // `v_sin_f32` behind an f32 `1/(2π)` pre-scale, which is only accurate
+    // for small arguments — sin(±1e6) comes back as ±sin(π/8) because the
+    // reduction happens in f32 revolutions. `v_exp_f32`/`v_log_f32`/
+    // `v_sqrt_f32` are ~1-ulp and stay native.
+    super::gpu_supported_ops(&[
+        svod_ir::UnaryOp::Exp,
+        svod_ir::UnaryOp::Log,
+        svod_ir::UnaryOp::Sin,
+        svod_ir::UnaryOp::Cos,
+        svod_ir::UnaryOp::Tan,
+        svod_ir::UnaryOp::Erf,
+    ])
+}
+
+/// The renderer of an AMD device of `arch`, its text carrying a line table over `listing`
+/// ([`svod_codegen::llvm::LlvmTextRenderer::locations`]): what a pre-linearized kernel's SOURCE
+/// stage is rendered with ([`svod_codegen::program_pipeline::do_render`]) before the PROGRAM
+/// reaches the device, whose own render then skips it. It renders as the device's renderer does,
+/// and only renders: its program is past decomposition.
+pub struct LocatedAmd {
+    device: DeviceSpec,
+    arch: AmdArch,
+    renderer: svod_codegen::llvm::LlvmTextRenderer,
+}
+
+impl LocatedAmd {
+    pub fn new(
+        device: DeviceSpec,
+        arch: AmdArch,
+        locations: std::collections::HashMap<u64, svod_codegen::llvm::Location>,
+        listing: String,
+    ) -> Self {
+        Self { device, arch, renderer: crate::amd::renderer(arch).locations(locations, listing) }
+    }
+}
+
+impl Renderer for LocatedAmd {
+    fn render(&self, ast: &Arc<UOp>, name: Option<&str>) -> Result<ProgramSpec> {
+        render_amd(&self.renderer, &self.device, ast, name)
+    }
+
+    fn device(&self) -> &DeviceSpec {
+        &self.device
+    }
+
+    fn gpu_arch(&self) -> Option<svod_dtype::GpuArch> {
+        Some(svod_dtype::GpuArch::Amd(self.arch))
+    }
+
+    fn supported_ops(&self) -> svod_ir::RendererOps {
+        amd_supported_ops()
+    }
+}
+
+fn render_amd(
+    renderer: &svod_codegen::llvm::LlvmTextRenderer,
+    device: &DeviceSpec,
+    ast: &Arc<UOp>,
+    name: Option<&str>,
+) -> Result<ProgramSpec> {
+    let rendered = svod_codegen::Renderer::render(renderer, ast, name.or(Some("kernel")))
+        .map_err(|e| svod_device::Error::Runtime { message: format!("AMD IR rendering failed: {e}") })?;
+    Ok(super::program_spec(&rendered, device, ast))
 }
 
 struct AmdCompiler {
@@ -242,3 +295,7 @@ impl Compiler for AmdCompiler {
 fn runtime_as_device(error: crate::Error) -> svod_device::Error {
     svod_device::Error::Runtime { message: error.to_string() }
 }
+
+#[cfg(test)]
+#[path = "../test/unit/amd_renderer.rs"]
+mod tests;

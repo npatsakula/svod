@@ -8,7 +8,7 @@ use std::sync::Arc;
 use snafu::{ResultExt, Snafu, ensure};
 use svod_codegen::Renderer;
 use svod_codegen::llvm::{LlvmTextRenderer, Location};
-use svod_dtype::{DType, DeviceSpec, GpuArch};
+use svod_dtype::{AmdArch, DType, DeviceSpec, GpuArch};
 use svod_ir::{Op, UOp, ops};
 
 use crate::atoms::{Core, Device, Target};
@@ -36,6 +36,12 @@ pub enum Error {
         name: String,
         #[snafu(source(from(svod_codegen::Error, Box::new)))]
         source: Box<svod_codegen::Error>,
+    },
+    #[snafu(display("the SOURCE of {name}: {source}"))]
+    Source {
+        name: String,
+        #[snafu(source(from(svod_device::Error, Box::new)))]
+        source: Box<svod_device::Error>,
     },
     #[snafu(display("{what} is a block barrier under a branch on the warp, which some warps skip"))]
     DivergentBarrier { what: &'static str },
@@ -154,7 +160,7 @@ fn within_shared(prog: &Program) -> Result<()> {
 /// `prog` lowered for its lowering's target alone, its parameters declared
 /// flat in their order: what a launch of a lowered body on the target's
 /// device emits, with no graph and no device. A plain launch numbers them
-/// `[out, ins...]` instead ([`crate::launch::lowered_as_launched`]).
+/// `[out, ins...]` instead ([`crate::launch::graph_launch`]).
 pub fn standalone(prog: Program, lowering: &Lowering) -> Result<Lowered> {
     let params =
         prog.params.iter().enumerate().map(|(i, p)| UOp::param(i, p.elems, DType::Scalar(p.dtype), None)).collect();
@@ -186,13 +192,18 @@ impl Lowered {
     /// The LLVM text of the program for `target`: what the backend's
     /// compiler is handed. Metal renders C, which has no text here.
     pub fn text(&self, target: &Target) -> Result<String> {
-        self.render_text(target, false)
-    }
-
-    /// [`Self::text`] with a line table over [`Self::listing`] (`kernel.tk`).
-    #[cfg(test)]
-    pub(crate) fn located_text(&self, target: &Target) -> Result<String> {
-        self.render_text(target, true)
+        let renderer = match target.arch {
+            GpuArch::Cuda(arch) => LlvmTextRenderer::nvptx(arch),
+            GpuArch::Amd(arch) => LlvmTextRenderer::amd(arch),
+            GpuArch::Metal(_) => return UnsupportedSnafu { what: "Metal's LLVM text" }.fail(),
+        }
+        .rolled(self.rolled.iter().copied());
+        if svod_schedule::spec::spec_enabled() {
+            let nodes = self.linear.op().sources();
+            svod_schedule::spec::type_verify_list(&nodes, &svod_schedule::spec::spec_program()).expect("a valid list");
+        }
+        let name = &self.tile.name;
+        Ok(renderer.render(&self.linear, Some(name)).context(RenderSnafu { name })?.code)
     }
 
     /// `kernel.tk`: one line per statement of [`Self::tile`] ([`listing::listing`]).
@@ -226,26 +237,24 @@ impl Lowered {
     /// line table over [`Self::listing`]: a device kernel's twin.
     pub fn located_text_by(&self, renderer: LlvmTextRenderer) -> Result<String> {
         let Op::Program(ops::Program { info, .. }) = self.program.op() else { unreachable!("emit returns a PROGRAM") };
-        self.render(renderer.locations(self.locations()), &info.function_name())
+        let name = info.function_name();
+        let renderer = renderer.locations(self.locations(), self.listing());
+        Ok(renderer.render(&self.linear, Some(&name)).context(RenderSnafu { name })?.code)
     }
 
-    fn render_text(&self, target: &Target, located: bool) -> Result<String> {
-        let renderer = match target.arch {
-            GpuArch::Cuda(arch) => LlvmTextRenderer::nvptx(arch),
-            GpuArch::Amd(arch) => LlvmTextRenderer::amd(arch),
-            GpuArch::Metal(_) => return UnsupportedSnafu { what: "Metal's LLVM text" }.fail(),
-        }
-        .rolled(self.rolled.iter().copied());
-        let renderer = if located { renderer.locations(self.locations()) } else { renderer };
-        self.render(renderer, &self.tile.name)
-    }
-
-    fn render(&self, renderer: LlvmTextRenderer, name: &str) -> Result<String> {
-        if svod_schedule::spec::spec_enabled() {
-            let nodes = self.linear.op().sources();
-            svod_schedule::spec::type_verify_list(&nodes, &svod_schedule::spec::spec_program()).expect("a valid list");
-        }
-        Ok(renderer.render(&self.linear, Some(name)).context(RenderSnafu { name })?.code)
+    /// The PROGRAM an AMD device of `arch` compiles: its SOURCE stage
+    /// rendered here, by the device's renderer with a line table over
+    /// [`Self::listing`] and the listing itself as `kernel.tk`'s DWARF 5
+    /// source ([`svod_runtime::amd::LocatedAmd`]). The pipeline mints the
+    /// stage ([`do_render`](svod_codegen::program_pipeline::do_render)), with
+    /// the checks a device's render runs, and a device handed the PROGRAM
+    /// renders nothing. The line table is not meant to change the code; a
+    /// sweep over every tk kernel checks that (`a_line_table_leaves_every_kernel_alone`).
+    pub fn source(&self, arch: AmdArch) -> Result<Arc<UOp>> {
+        let Op::Program(ops::Program { info, .. }) = self.program.op() else { unreachable!("emit returns a PROGRAM") };
+        let renderer = svod_runtime::amd::LocatedAmd::new(info.target.clone(), arch, self.locations(), self.listing());
+        let rendered = svod_codegen::program_pipeline::do_render(&self.program, &renderer);
+        Ok(rendered.context(SourceSnafu { name: &self.tile.name })?.0)
     }
 }
 

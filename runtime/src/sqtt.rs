@@ -28,7 +28,10 @@ mod lines;
 mod statements;
 mod verdict;
 pub use compare::{BucketDelta, Caution, Delta, Diff, FindingDelta, LoopRow, Rows, Side, StatementDelta, Unit};
-pub use lines::{LineRow, Lines, Statements, Stmt, TwinError, debug_line, locate, parse_debug_line, same_text};
+pub use lines::{
+    DwarfError, LISTING, LineRow, LineTable, Lines, Statements, Stmt, TwinError, debug_line, line_table, locate,
+    parse_debug_line, same_text,
+};
 pub use statements::Statement;
 pub use verdict::{
     Approx, BarrierSite, Bucket, Ceiling, Demand, Evidence, Finding, FindingKind, Findings, Knob, Load, Partition,

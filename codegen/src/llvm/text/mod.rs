@@ -39,8 +39,8 @@ pub struct LlvmTextRenderer {
     /// carry the rolled hint whatever a pattern match over the nodes would
     /// find ([`Self::rolled`]).
     rolled: std::collections::HashSet<u64>,
-    /// Source locations by UOp id ([`Self::locations`]).
-    locations: Option<std::collections::HashMap<u64, Location>>,
+    /// Source locations by UOp id and the listing they name ([`Self::locations`]).
+    locations: Option<(std::collections::HashMap<u64, Location>, String)>,
 }
 
 /// Where an operation comes from in a synthetic source the renderer does not
@@ -78,11 +78,11 @@ impl LlvmTextRenderer {
         self
     }
 
-    /// Line-tables-only debug info over a synthetic `file`: every
-    /// instruction of an operation `locations` names carries its line and
-    /// column, the rest none.
-    pub fn locations(mut self, locations: std::collections::HashMap<u64, Location>) -> Self {
-        self.locations = Some(locations);
+    /// Line-tables-only debug info over `listing`, embedded as the DWARF 5
+    /// source of `kernel.tk`: every instruction of an operation `locations`
+    /// names carries its line and column, the rest none.
+    pub fn locations(mut self, locations: std::collections::HashMap<u64, Location>, listing: String) -> Self {
+        self.locations = Some((locations, listing));
         self
     }
 
@@ -224,7 +224,7 @@ impl Renderer for LlvmTextRenderer {
             if let Some(err) = ctx.take_error() {
                 return Err(err);
             }
-            if let Some(&at) = self.locations.as_ref().and_then(|l| l.get(&node.id)) {
+            if let Some(&at) = self.locations.as_ref().and_then(|(l, _)| l.get(&node.id)) {
                 located.push((first_line..kernel.len(), at));
             }
             operations.push(RenderedOperation {
@@ -306,7 +306,7 @@ impl Renderer for LlvmTextRenderer {
         };
 
         let (subprogram, debug_metadata) = match &self.locations {
-            Some(_) => (format!(" !dbg !{}", DEBUG_METADATA + 2), debug_metadata(kernel_name)),
+            Some((_, listing)) => (format!(" !dbg !{}", DEBUG_METADATA + 2), debug_metadata(kernel_name, listing)),
             None => (String::new(), String::new()),
         };
         let ir = format!(
@@ -381,22 +381,38 @@ fn attach_location(line: &mut String, at: Location) {
     *line = located;
 }
 
-/// The line-tables-only compile unit, its `kernel.tk` file and the
-/// kernel's subprogram, numbered from [`DEBUG_METADATA`].
-fn debug_metadata(kernel_name: &str) -> String {
+/// The line-tables-only compile unit, its `kernel.tk` file carrying
+/// `listing` as its source, and the kernel's subprogram, numbered from
+/// [`DEBUG_METADATA`]. The file is named alone, with no directory, so the
+/// text is the same wherever it is rendered.
+fn debug_metadata(kernel_name: &str, listing: &str) -> String {
     let [cu, file, sp, ty, dwarf, version] = std::array::from_fn(|i| DEBUG_METADATA + i);
     format!(
         "!llvm.dbg.cu = !{{!{cu}}}\n\
          !llvm.module.flags = !{{!{dwarf}, !{version}}}\n\
          !{cu} = distinct !DICompileUnit(language: DW_LANG_C99, file: !{file}, producer: \"svod\", isOptimized: true, \
          runtimeVersion: 0, emissionKind: LineTablesOnly)\n\
-         !{file} = !DIFile(filename: \"kernel.tk\", directory: \"\")\n\
+         !{file} = !DIFile(filename: \"kernel.tk\", directory: \"\", source: \"{source}\")\n\
          !{sp} = distinct !DISubprogram(name: \"{kernel_name}\", scope: !{file}, file: !{file}, line: 1, type: !{ty}, \
          scopeLine: 1, spFlags: DISPFlagDefinition | DISPFlagOptimized, unit: !{cu})\n\
          !{ty} = !DISubroutineType(types: !{{}})\n\
          !{dwarf} = !{{i32 7, !\"Dwarf Version\", i32 5}}\n\
-         !{version} = !{{i32 2, !\"Debug Info Version\", i32 3}}\n"
+         !{version} = !{{i32 2, !\"Debug Info Version\", i32 3}}\n",
+        source = metadata_string(listing),
     )
+}
+
+/// `text` as an LLVM string literal's contents: printable ASCII as is, every
+/// other byte, `"` and `\` as `\XX`.
+fn metadata_string(text: &str) -> String {
+    use std::fmt::Write;
+    text.bytes().fold(String::with_capacity(text.len()), |mut out, b| {
+        match b {
+            b' '..=b'~' if b != b'"' && b != b'\\' => out.push(b as char),
+            _ => write!(out, "\\{b:02X}").expect("a string takes writes"),
+        }
+        out
+    })
 }
 
 /// The first `@llvm.nvvm.*` / `@llvm.amdgcn.*` reference in a CUSTOM body

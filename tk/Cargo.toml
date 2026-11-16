@@ -24,6 +24,7 @@ tracing = "0.1"
 [dev-dependencies]
 half = "2.7.1"
 libm = "0.2.16"
+object = { version = "0.40", default-features = false, features = ["elf", "read"] }
 proptest = "1.9"
 test-case = "3.3.1"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

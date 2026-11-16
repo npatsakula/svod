@@ -833,3 +833,19 @@ fn an_unsigned_gep_index_is_zero_extended(index_dtype: DType, widened: Option<&s
         None => assert!(!code.contains("zext"), "{code}"),
     }
 }
+
+/// A located render embeds its listing as `kernel.tk`'s DWARF 5 source, in
+/// a directory of none: printable ASCII as is, every other byte, a quote
+/// and a backslash escaped, so any listing parses and the text is the same
+/// wherever it is rendered.
+#[test]
+fn a_located_render_embeds_its_listing() {
+    let linear =
+        UOp::linear(svod_schedule::linearize_with_cfg(UOp::sink(vec![UOp::param(0, 1, DType::Float32, None)])).into());
+    let listing = "mma a·b [steady]\n  say \"hi\" \\ there\n";
+    let renderer = LlvmTextRenderer::amd(AmdArch::Gfx1201).locations(Default::default(), listing.into());
+    let ir = renderer.render(&linear, Some("listed")).expect("renders").code;
+    let want = r#"!DIFile(filename: "kernel.tk", directory: "", source: "mma a\C2\B7b [steady]\0A  say \22hi\22 \5C there\0A")"#;
+    assert!(ir.contains(want), "{ir}");
+    assert!(!LlvmTextRenderer::amd(AmdArch::Gfx1201).render(&linear, Some("listed")).unwrap().code.contains("!DIFile"));
+}

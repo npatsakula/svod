@@ -1,20 +1,25 @@
-//! The line table over `kernel.tk`: an AMDGPU code object compiled from a
-//! lowered program's located text holds the same `.text` as one compiled
-//! without locations, a non-empty `.debug_line`, and statement lines on its
-//! main loop's instructions. The suite gates a representative kernel of
-//! each family an RDNA arch runs; the whole sweep is `#[ignore]`d.
+//! The line table over `kernel.tk`: an AMD kernel's SOURCE stage
+//! ([`Lowered::source`]) carries a line table and the listing itself, and
+//! compiles to the `.text` the device's bare render does, on every AMD
+//! target and on either side of clang's machine-sink gate, but for a pinned
+//! few whose schedule clang picks by heap addresses; the pipeline
+//! takes the stage as a device's own render; and a lowering renders it byte
+//! for byte the same each time. Every test fails, not skips, where the
+//! host's clang cannot build AMDGPU code: these re-check on every clang
+//! upgrade what a capture's statements rest on.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
 use rayon::prelude::*;
+use svod_codegen::Renderer as _;
+use svod_device::device::{ProgramSpec, Renderer};
 use svod_device::profile::{CodeImage, SqttTrace};
 use svod_device::sqtt::stitch::{branch, objdump_lines};
 use svod_dtype::AmdArch;
-use svod_runtime::amd::compile_ir_to_amd_object;
-use svod_runtime::sqtt::{
-    Capture, Class, Lines, Statements, TwinError, debug_line, disassemble, locate, parse_debug_line, same_text,
-};
+use svod_ir::{Op, UOp, ops};
+use svod_runtime::amd::{LocatedAmd, compile_ir_to_amd_object, compile_ir_to_amd_object_as};
+use svod_runtime::sqtt::{Capture, Class, Lines, Statements, TwinError, disassemble, line_table, locate, same_text};
 use test_case::test_case;
 
 use crate::build::{BF16, I8};
@@ -22,7 +27,7 @@ use crate::ir::Program;
 use crate::kernels::gemm::{Epilogue, GemmSpec, gemm};
 use crate::lower::{Lowered, Lowering, standalone};
 use crate::ops::config;
-use crate::sweep::{Launch, amd, assumed, families, planner};
+use crate::sweep::{Launch, amd, assumed, digested, planner};
 
 use super::gemm_spec;
 
@@ -37,11 +42,48 @@ const GEMM_LINED: f64 = 0.90;
 /// (`v_mov`) and spills (`scratch_*`) take no line of LLVM's.
 const OTHER_LINED: f64 = 0.60;
 
-/// The suite's families on `arch` and the GEMM tiles the suite runs on RDNA.
-fn launches(arch: AmdArch, cus: u32) -> Vec<Launch> {
-    let target = amd(arch, cus);
-    let planner = planner(target.clone());
-    let mut out = families(&target);
+/// The LLVM majors on either side of the machine-sink gate: below 23 clang
+/// compiles a matrix product with `-disable-machine-sink`.
+const GATES: [u32; 2] = [22, 23];
+
+/// The AMD targets of the sweep, by their CUs.
+const ARCHES: [(AmdArch, u32); 5] = [
+    (AmdArch::Gfx1100, 96),
+    (AmdArch::Gfx1151, 40),
+    (AmdArch::Gfx1201, 64),
+    (AmdArch::Gfx942, 304),
+    (AmdArch::Gfx950, 256),
+];
+
+/// A kernel of each template the sweep emits: the GEMM's ring, 8-bit core
+/// and tail split (its waves and partials), attention's causal ring, cache
+/// and combine, the norms, the heads, the nearest search's register, 8-bit,
+/// queued and streamed lists, its selection and merge, and a convolution;
+/// on CDNA also the GEMM's two crews.
+const FAMILIES: [&str; 17] = [
+    "gemm #0 ",
+    "gemm int8 ",
+    "gemm tail waves",
+    "gemm tail partials",
+    "attention d64 causal #0 ",
+    "attention d64 cache",
+    "attention combine",
+    "layer norm",
+    "rms norm",
+    "heads d64",
+    "nearest squared l2",
+    "nearest int8 squared l2",
+    "nearest 64 queued squared l2",
+    "nearest streamed neg dot",
+    "nearest select ",
+    "nearest merge",
+    "conv 3x3 ",
+];
+
+/// The suite's GEMM tiles: plain, unrolled, wide, ragged and 8-bit.
+fn tiles(arch: AmdArch, cus: u32) -> Vec<Launch> {
+    let planner = planner(amd(arch, cus));
+    let mut out = vec![];
     for (name, (m, n, k), cfg) in [
         ("tile 128x128x32:2:4x2", (4096, 4096, 4096), config::gemm_cfg([128, 128, 32], 2, [4, 2], false)),
         ("tile 128x128x32:2:4x2 unrolled", (4096, 4096, 4096), config::gemm_cfg([128, 128, 32], 2, [4, 2], true)),
@@ -59,25 +101,46 @@ fn launches(arch: AmdArch, cus: u32) -> Vec<Launch> {
     out
 }
 
-/// Whether this host's clang compiles AMDGPU code. The LLVM tools a line
-/// table and a disassembly are read with must be there, or the test fails:
-/// each runs, whatever it makes of no input.
-fn tooled() -> bool {
-    use svod_runtime::sqtt::Error;
-    for (tool, ran) in [("llvm-dwarfdump", debug_line(&[])), ("llvm-objdump", disassemble(&[]))] {
-        if let Err(missing @ (Error::Tool { .. } | Error::Spawn { .. })) = ran {
-            panic!("{tool}: {missing}");
-        }
-    }
-    let amdgpu = svod_runtime::amd::has_amdgpu_target();
-    if !amdgpu {
-        eprintln!("skipped: no clang AMDGPU");
-    }
-    amdgpu
+/// The first of the sweep's kernels for `arch` per [`FAMILIES`] entry (each
+/// must have one), and the suite's GEMM tiles.
+fn representatives(arch: AmdArch, cus: u32) -> Vec<Launch> {
+    let all = digested(&amd(arch, cus));
+    let crews = arch.is_cdna().then_some("gemm two crews");
+    let mut out: Vec<Launch> = FAMILIES
+        .iter()
+        .chain(&crews)
+        .map(|family| {
+            let found = all.iter().find(|(name, ..)| name.starts_with(family));
+            found.unwrap_or_else(|| panic!("{arch}: no {family:?} kernel")).clone()
+        })
+        .collect();
+    out.extend(tiles(arch, cus));
+    out
 }
 
-/// A kernel built with a line table: its lowering, code object,
-/// disassembly and its instructions' statements.
+/// The SOURCE stage's text of a PROGRAM.
+fn code(program: &Arc<UOp>) -> String {
+    let Op::Program(ops::Program { source: Some(source), .. }) = program.op() else { panic!("no SOURCE stage") };
+    let Op::Source(ops::Source { code, .. }) = source.op() else { panic!("the SOURCE stage is no SOURCE") };
+    code.clone()
+}
+
+/// The text an AMD device renders of a lowering handed bare: its renderer
+/// over the LINEAR stage, under the PROGRAM's function name.
+fn bare(low: &Lowered, arch: AmdArch) -> String {
+    let Op::Program(ops::Program { linear: Some(linear), info, .. }) = low.program.op() else { panic!("no LINEAR") };
+    svod_runtime::amd::renderer(arch).render(linear, Some(&info.function_name())).expect("renders").code
+}
+
+/// A code object's `.text`.
+fn text(elf: &[u8]) -> Vec<u8> {
+    use object::{Object, ObjectSection};
+    let file = object::File::parse(elf).expect("an ELF");
+    file.section_by_name(".text").expect("a .text").data().expect("its bytes").to_vec()
+}
+
+/// A kernel's SOURCE compiled: its lowering, code object, disassembly and
+/// its instructions' statements.
 struct Located {
     low: Lowered,
     object: Vec<u8>,
@@ -87,10 +150,11 @@ struct Located {
 
 fn located(arch: AmdArch, prog: Program, lowering: &Lowering) -> Located {
     let low = standalone(prog, lowering).expect("lowers");
-    let object = compile_ir_to_amd_object(&low.located_text(&lowering.device.target).unwrap(), arch).unwrap();
-    let disassembly = disassemble(&object).unwrap();
-    let rows = parse_debug_line(&debug_line(&object).unwrap());
-    let lines = locate(&rows, objdump_lines(&disassembly).into_iter().map(|(pc, _)| pc));
+    let object = compile_ir_to_amd_object(&code(&low.source(arch).expect("renders")), arch).expect("compiles");
+    let disassembly = disassemble(&object).expect("llvm-objdump");
+    let table = line_table(&object).expect("its DWARF reads").expect("a line table");
+    assert_eq!(table.listing.as_deref(), Some(low.listing().as_str()), "the listing rides in the code object");
+    let lines = locate(&table.rows, objdump_lines(&disassembly).into_iter().map(|(pc, _)| pc));
     Located { low, object, disassembly, lines }
 }
 
@@ -103,11 +167,20 @@ fn main_loop(disassembly: &str) -> Option<(u64, u64)> {
         .min_by_key(|(s, e)| e - s)
 }
 
-/// One kernel's gate: why it fails, if it does, and its report line.
+/// One kernel's gate: why it fails, if it does, and its report line. Its
+/// SOURCE and the bare render compile to one `.text` on either side of the
+/// machine-sink gate, its code object holds the listing and a line table,
+/// and on RDNA, which a thread trace reads, enough of its main loop's
+/// instructions carry a line (CDNA's crews and ragged edges measured 74% and
+/// 90%, past what the floors were set on).
 fn gate(arch: AmdArch, (name, prog, lowering): Launch) -> (Option<String>, String) {
     let built = located(arch, prog, &lowering);
-    let plain = compile_ir_to_amd_object(&built.low.text(&lowering.device.target).unwrap(), arch).unwrap();
-    let rows = parse_debug_line(&debug_line(&built.object).unwrap()).len();
+    let (source, plain) = (code(&built.low.source(arch).unwrap()), bare(&built.low, arch));
+    let differs = GATES.iter().find_map(|&major| {
+        let [a, b] = [&plain, &source].map(|ir| text(&compile_ir_to_amd_object_as(ir, arch, major).expect("compiles")));
+        (a != b).then(|| format!("{name}: .text differs under LLVM {major}'s flags ({} vs {} bytes)", a.len(), b.len()))
+    });
+    let rows = line_table(&built.object).unwrap().map_or(0, |t| t.rows.len());
     let ops = objdump_lines(&built.disassembly);
     let body: Vec<&(u64, &str)> = main_loop(&built.disassembly)
         .map_or(vec![], |(s, e)| ops.iter().filter(|(pc, _)| (s..=e).contains(pc)).collect());
@@ -118,11 +191,11 @@ fn gate(arch: AmdArch, (name, prog, lowering): Launch) -> (Option<String>, Strin
     let lined = body.len() - unattributed.values().sum::<usize>();
     let ring = (name.starts_with("gemm") || name.starts_with("tile")) && !name.starts_with("gemm tail");
     let floor = if ring { GEMM_LINED } else { OTHER_LINED };
-    let why = if let Err(differs) = same_text(&plain, &built.object) {
-        Some(format!("{name}: {differs}"))
+    let why = if differs.is_some() {
+        differs
     } else if rows == 0 {
         Some(format!("{name}: empty .debug_line"))
-    } else if (lined as f64) < floor * body.len() as f64 {
+    } else if !arch.is_cdna() && (lined as f64) < floor * body.len() as f64 {
         Some(format!("{name}: {lined}/{} main-loop instructions carry a line, under {floor}", body.len()))
     } else {
         None
@@ -130,36 +203,129 @@ fn gate(arch: AmdArch, (name, prog, lowering): Launch) -> (Option<String>, Strin
     (why, format!("{name}: rows {rows} | main loop {lined}/{} lined | unattributed {unattributed:?}", body.len()))
 }
 
-fn gate_all(arch: AmdArch, cus: u32, keep: impl Fn(&str) -> bool) {
-    if !tooled() {
-        return;
-    }
-    let picked: Vec<Launch> = launches(arch, cus).into_iter().filter(|l| keep(&l.0)).collect();
-    let gated: Vec<(Option<String>, String)> = picked.into_par_iter().map(|l| gate(arch, l)).collect();
+fn gate_all(arch: AmdArch, launches: Vec<Launch>) {
+    let gated: Vec<(Option<String>, String)> = launches.into_par_iter().map(|l| gate(arch, l)).collect();
     eprintln!("{}", gated.iter().map(|g| g.1.as_str()).collect::<Vec<_>>().join("\n"));
     let failed: Vec<&str> = gated.iter().filter_map(|g| g.0.as_deref()).collect();
+    assert!(failed.is_empty(), "{arch}:\n{}", failed.join("\n"));
+}
+
+#[test_case(AmdArch::Gfx1100, 96; "gfx1100")]
+#[test_case(AmdArch::Gfx1151, 40; "gfx1151")]
+#[test_case(AmdArch::Gfx1201, 64; "gfx1201")]
+#[test_case(AmdArch::Gfx942, 304; "gfx942")]
+#[test_case(AmdArch::Gfx950, 256; "gfx950")]
+fn a_line_table_leaves_the_code_alone(arch: AmdArch, cus: u32) {
+    gate_all(arch, representatives(arch, cus));
+}
+
+/// The kernels whose `.text` a line table may change, on either side of the
+/// machine-sink gate, pinned against clang 23.1.5: head-dim-48 flash
+/// attention at 16 query rows and 16 or 32 keys on RDNA, whose schedule
+/// clang picks by heap addresses. The same bare IR compiles to several
+/// `.text`s from run to run (four in five compiles of one), one `.text`
+/// each with address randomization off (`setarch -R`), where the bare and
+/// the located IR, allocating otherwise, compile apart: the same VGPRs and
+/// occupancy, other `s_waitcnt` and `s_delay_alu` counts. Which of them a
+/// sweep catches differing changes from run to run.
+fn rescheduled() -> HashSet<(AmdArch, String)> {
+    let fa = |kind: &str, bkv: u32| {
+        format!(
+            "fa {kind} FaCfg {{ bq: 16, bkv: {bkv}, schedule: Ring {{ depth: 2, unroll: true }}, splits: 1, \
+             forms: Forms {{ truncate_p: false, sum_after: false, skip_rescale: false, raw_max: false, \
+             bias_direct: false }}, key_warps: 4, warp_rows: 16, core: Warp }}"
+        )
+    };
+    let archs = [AmdArch::Gfx1100, AmdArch::Gfx1151, AmdArch::Gfx1201];
+    let kernels = ["d48 t16", "causal_d48"].into_iter().flat_map(|kind| [16, 32].map(|bkv| fa(kind, bkv)));
+    kernels.flat_map(|name| archs.map(|arch| (arch, name.clone()))).collect()
+}
+
+/// Every kernel of the sweep on every AMD target carries a line table, and
+/// compiles to the bare render's `.text` under both gates' flags but for
+/// [`rescheduled`]'s, whose code clang does not reproduce even bare.
+#[test]
+#[ignore = "every kernel of the sweep on every AMD target: ~20 minutes in release"]
+fn a_line_table_leaves_every_kernel_alone() {
+    let all: Vec<(AmdArch, Launch)> =
+        ARCHES.iter().flat_map(|&(arch, cus)| digested(&amd(arch, cus)).into_iter().map(move |l| (arch, l))).collect();
+    let known = rescheduled();
+    let failed: Vec<String> = all
+        .into_par_iter()
+        .filter_map(|(arch, (name, prog, lowering))| {
+            let low = standalone(prog, &lowering).ok()?;
+            let (source, plain) = (code(&low.source(arch).unwrap()), bare(&low, arch));
+            let mut rows = 0;
+            let differs: Vec<u32> = GATES
+                .into_iter()
+                .filter(|&major| {
+                    let [a, b] =
+                        [&plain, &source].map(|ir| compile_ir_to_amd_object_as(ir, arch, major).expect("compiles"));
+                    rows = line_table(&b).unwrap().map_or(0, |t| t.rows.len());
+                    text(&a) != text(&b)
+                })
+                .collect();
+            if rows == 0 {
+                Some(format!("{arch} {name}: no line table"))
+            } else if differs.is_empty() || known.contains(&(arch, name.clone())) {
+                None
+            } else {
+                Some(format!("{arch} {name}: .text differs under LLVM {differs:?}'s flags"))
+            }
+        })
+        .collect();
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
-/// A plain and a ragged GEMM tile, an 8-bit GEMM and a causal attention.
-const REPRESENTATIVE: [&str; 4] = [
-    "tile 128x128x32:2:4x2 unrolled",
-    "tile 128x128x32:2:4x2 ragged m1500",
-    "tile int8 64x64x64:2:2x2",
-    "attention d64 causal #0",
-];
-
-#[test_case(AmdArch::Gfx1201, 64; "gfx1201")]
-#[test_case(AmdArch::Gfx1151, 40; "gfx1151")]
-fn a_line_table_leaves_the_code_alone(arch: AmdArch, cus: u32) {
-    gate_all(arch, cus, |name| REPRESENTATIVE.iter().any(|r| name == *r || name.starts_with(&format!("{r} "))));
+/// What a device's pipeline makes of a PROGRAM: the PROGRAM it compiles,
+/// and every field of the specification it launches by but the source.
+fn specified(program: &Arc<UOp>, renderer: &dyn Renderer) -> (Arc<UOp>, String) {
+    let (rendered, spec) = svod_codegen::program_pipeline::do_render(program, renderer).expect("the pipeline takes it");
+    let ProgramSpec {
+        name, device, global_size, local_size, vars, var_names, globals, outs, ins, buf_count, abi, ..
+    } = spec;
+    let ids = |dims: &[Arc<UOp>]| dims.iter().map(|d| d.id).collect::<Vec<_>>();
+    let launch = (ids(&global_size), local_size.as_ref().map(|l| ids(l)), vars, var_names, globals, outs, ins);
+    (rendered, format!("{name} {device:?} {launch:?} {buf_count} {abi:?}"))
 }
 
+/// The pipeline takes a SOURCE stage as minted, origins stripped, and
+/// renders nothing more ([`do_render`]'s skip branch): the PROGRAM comes
+/// back as handed, launched by the specification its render would give.
+///
+/// [`do_render`]: svod_codegen::program_pipeline::do_render
 #[test_case(AmdArch::Gfx1201, 64; "gfx1201")]
-#[test_case(AmdArch::Gfx1151, 40; "gfx1151")]
-#[ignore = "every family: ~100 s in release"]
-fn a_line_table_leaves_every_kernel_alone(arch: AmdArch, cus: u32) {
-    gate_all(arch, cus, |_| true);
+#[test_case(AmdArch::Gfx942, 304; "gfx942")]
+fn the_pipeline_takes_the_source_as_rendered(arch: AmdArch, cus: u32) {
+    for (name, prog, lowering) in representatives(arch, cus) {
+        let low = standalone(prog, &lowering).expect("lowers");
+        let device = svod_dtype::DeviceSpec::Amd { device_id: 0 };
+        let renderer = LocatedAmd::new(device, arch, low.locations(), low.listing());
+        let source = low.source(arch).expect("renders").without_origins();
+        let (taken, skipped) = specified(&source, &renderer);
+        assert!(Arc::ptr_eq(&taken, &source), "{name}: a PROGRAM with its SOURCE is taken as is");
+        let (rendered, spec) = specified(&low.program, &renderer);
+        assert_eq!(code(&rendered), code(&source), "{name}");
+        assert_eq!(skipped, spec, "{name}");
+    }
+}
+
+/// Lowering and rendering a kernel again gives the same SOURCE byte for
+/// byte, its identity with it: the stage keys the kernel and object caches
+/// across processes.
+#[test]
+fn the_source_is_the_same_every_time() {
+    let arch = AmdArch::Gfx1201;
+    let stage = |p: &Arc<UOp>| match p.op() {
+        Op::Program(ops::Program { source: Some(s), .. }) => s.clone(),
+        _ => unreachable!("a SOURCE stage"),
+    };
+    for (name, prog, lowering) in representatives(arch, 64) {
+        let [a, b] =
+            [0, 1].map(|_| standalone(prog.clone(), &lowering).expect("lowers").source(arch).expect("renders"));
+        assert_eq!(code(&a), code(&b), "{name}");
+        assert!(Arc::ptr_eq(&stage(&a), &stage(&b)), "{name}: one SOURCE, hash-consed");
+    }
 }
 
 fn tile_gemm(cfg: crate::kernels::gemm::GemmCfg) -> (Program, Lowering) {
@@ -193,15 +359,12 @@ fn the_listing_names_statements_and_roles() {
     assert!(has("store c", "[epilogue]") && has("", "[prologue]"), "{listing}");
 }
 
-/// End to end on the host: a GEMM lowered with locations and compiled puts
-/// its main loop's matrix instructions on the steady loop's product
-/// statement, one unroll copy a column; a capture of that code object
-/// takes the twin's lines, and a capture of other code refuses them.
+/// End to end on the host: a GEMM's SOURCE compiled puts its main loop's
+/// matrix instructions on the steady loop's product statement, one unroll
+/// copy a column; a capture of that code object takes the twin's lines,
+/// and a capture of other code refuses them.
 #[test]
 fn matrix_instructions_sit_on_the_product_statement() {
-    if !tooled() {
-        return;
-    }
     let arch = AmdArch::Gfx1201;
     let (prog, lowering) = tile_gemm(config::gemm_cfg([128, 128, 32], 2, [4, 2], true));
     let built = located(arch, prog, &lowering);
@@ -259,8 +422,6 @@ fn unlocated(located: &str) -> String {
 /// of its parameters: the PROGRAM [`launch::graph_launch_once`] hands the
 /// graph, rendered as the device's renderer renders it, under its function name.
 fn launched_text(arch: AmdArch, prog: Program, lowering: &Lowering) -> String {
-    use svod_codegen::Renderer;
-    use svod_ir::{Op, ops};
     let device = svod_dtype::DeviceSpec::Amd { device_id: 0 };
     let out = svod_dtype::default_device::with_default_device(device, || {
         let tensors: Vec<svod_tensor::Tensor> =
@@ -286,9 +447,6 @@ fn launched_text(arch: AmdArch, prog: Program, lowering: &Lowering) -> String {
 #[test_case(AmdArch::Gfx1201, 64; "gfx1201")]
 #[test_case(AmdArch::Gfx1151, 40; "gfx1151")]
 fn a_twin_is_the_launched_kernel(arch: AmdArch, cus: u32) {
-    if !tooled() {
-        return;
-    }
     let planner = planner(amd(arch, cus));
     let tiles = [
         ((1500, 1280, 5120), config::gemm_cfg([128, 128, 32], 2, [4, 2], false)),
@@ -313,9 +471,6 @@ fn a_twin_is_the_launched_kernel(arch: AmdArch, cus: u32) {
 /// names why it cannot where the target is no AMD one.
 #[test]
 fn twin_attaches_to_the_launched_kernel() {
-    if !tooled() {
-        return;
-    }
     let arch = AmdArch::Gfx1201;
     let (prog, lowering) = tile_gemm(config::gemm_cfg([128, 128, 32], 2, [4, 2], true));
     let object = compile_ir_to_amd_object(&launched_text(arch, prog.clone(), &lowering), arch).unwrap();
