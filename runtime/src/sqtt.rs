@@ -592,6 +592,8 @@ pub struct SeOccupancy {
 pub struct Analysis {
     pub kernel: String,
     pub arch: String,
+    /// Lanes a wave runs; `None` where neither the capture's resources nor its code image say.
+    pub wave_size: Option<u32>,
     pub labels: BTreeMap<String, String>,
     pub model: Option<Model>,
     pub kernel_ns: Option<u64>,
@@ -631,6 +633,18 @@ fn label(line: &str) -> Option<(u64, &str)> {
     let (at, rest) = line.trim().split_once(' ')?;
     let name = rest.strip_prefix('<')?.strip_suffix(">:")?;
     Some((u64::from_str_radix(at, 16).ok()?, name))
+}
+
+/// The capture's resources' wave size, else (where the device crate reads AMD code objects) its code
+/// image's kernel descriptor's.
+#[cfg_attr(not(unix), allow(unused_variables))]
+fn wave_size(capture: &Capture, kernel: &str) -> Option<u32> {
+    let resources = capture.resources;
+    #[cfg(unix)]
+    let resources = resources.or_else(|| {
+        svod_device::amd::program::kernel_resources(&capture.trace.code.elf, kernel, capture.trace.arch).ok()
+    });
+    resources.map(|r| r.wave_size)
 }
 
 fn asm(line: &str) -> String {
@@ -788,6 +802,7 @@ impl Analysis {
         let mut analysis = Self {
             kernel: kernel.to_string(),
             arch: capture.trace.arch.to_string(),
+            wave_size: wave_size(capture, kernel),
             labels: capture.labels.clone(),
             model: capture.model.clone(),
             kernel_ns: capture.kernel_ns,

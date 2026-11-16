@@ -2,7 +2,7 @@
 //! shared ring, the online-softmax state `(m, l, o)` carried.
 
 use super::rows::NormCfg;
-use super::{Admits, Admitted, Batch, Spec, batch_offset, bound, load_f32};
+use super::{Admits, Admitted, Batch, Spec, batch_offset, bound};
 use crate::atoms::{Core, Device};
 use crate::build::*;
 use crate::ir::*;
@@ -351,12 +351,12 @@ impl<T> Clone for Step<'_, '_, T> {
 }
 impl<T> Copy for Step<'_, '_, T> {}
 
-/// `s` plus a bias tile, in the scores' log2 units: one fused multiply-add,
-/// so the result does not depend on which product the backend would fuse
-/// into a separate add (the scaled scores' or the bias's), which varies with
-/// the layout around it.
-fn biased<'k, T: Elem, P: Readable>(k: &mut Kernel<'k>, s: Regs<'k, F32>, tile: Tile<'k, P, T>) -> Regs<'k, F32> {
-    let b = load_f32(k, tile);
+/// `s` plus a loaded bias tile, in the scores' log2 units: one fused
+/// multiply-add, so the result does not depend on which product the backend
+/// would fuse into a separate add (the scaled scores' or the bias's), which
+/// varies with the layout around it.
+fn biased<'k, T: Elem>(k: &mut Kernel<'k>, s: Regs<'k, F32>, b: Regs<'k, T>) -> Regs<'k, F32> {
+    let b = k.cast::<T, F32>(b);
     let log2e = k.fill::<F32>(k.shape(s), Const::Float(std::f64::consts::LOG2_E));
     k.mul_add(b, log2e, s)
 }
@@ -631,7 +631,8 @@ fn attention_body<'k, T: Half>(k: &mut Kernel<'k>, spec: &Admitted<AttnSpec>) {
     let biased_at = |k: &mut Kernel<'k>, s: Regs<'k, F32>, col: Sc<'k>| -> Regs<'k, F32> {
         let Some(view) = bias_view else { return s };
         let tile = k.at(view, q_off.clone(), col);
-        biased(k, s, tile)
+        let b = k.load(tile);
+        biased(k, s, b)
     };
     let hide = |k: &mut Kernel<'k>, keep: Regs<'k, Bool>, plain: Regs<'k, F32>| {
         let hidden = k.fill::<F32>(shape, Const::Float(f64::NEG_INFINITY));
@@ -801,9 +802,7 @@ fn attention_body<'k, T: Half>(k: &mut Kernel<'k>, spec: &Admitted<AttnSpec>) {
                         // and a move at the step's end, which waits for it.
                         let next = std::cell::Cell::new(None);
                         let ahead = |k: &mut Kernel<'k>, s: Regs<'k, F32>, _| {
-                            let b = k.cast::<T, F32>(b);
-                            let log2e = k.fill::<F32>(k.shape(s), Const::Float(std::f64::consts::LOG2_E));
-                            let s = k.mul_add(b, log2e, s);
+                            let s = biased(k, s, b);
                             next.set(Some(tile(k, w_first.clone() + step_.clone() + 1)));
                             s
                         };
@@ -817,7 +816,10 @@ fn attention_body<'k, T: Half>(k: &mut Kernel<'k>, spec: &Admitted<AttnSpec>) {
                 let slot = slot.past(slot0.clone());
                 let (k_t, v_t) = (k.slot(k_s, &slot, Shape::new(bkv, d)), k.slot(v_s, &slot, Shape::new(bkv, d)));
                 let b_t = bias_s.map(|ring| k.slot(ring, &slot, shape));
-                let from_ring = |k: &mut Kernel<'k>, s, _| biased(k, s, b_t.expect("a bias ring"));
+                let from_ring = |k: &mut Kernel<'k>, s, _| {
+                    let b = k.load(b_t.expect("a bias ring"));
+                    biased(k, s, b)
+                };
                 let st = if b_t.is_some() { Step { bias: Some(&from_ring as Mask), ..st } } else { st };
                 step(k, &st, k_t, v_t, (w_first.clone() + step_) * bkv, carried)
             }),

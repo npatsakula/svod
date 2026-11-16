@@ -416,9 +416,17 @@ impl DispatchTimestamps for SqttHandle {
 /// RADV's route for SQTT). Freeing the context restores the level the device
 /// had. The kernel's `amdgpu_ctx_ioctl` checks no capability for it;
 /// it refuses with `EBUSY` while another context holds the level.
-pub(crate) struct DrmStablePstate {
+pub struct DrmStablePstate {
     fd: OwnedFd,
     ctx_id: u32,
+}
+
+/// A stable power state held until this drops.
+pub enum PstateHold {
+    Drm(DrmStablePstate),
+    /// A host mock's: nothing to release.
+    #[cfg(test)]
+    Mock,
 }
 
 impl DrmStablePstate {

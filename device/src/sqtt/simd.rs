@@ -10,11 +10,12 @@ use super::Unit;
 use super::hidden::{Busy, Pipes};
 use super::wave::{Cause, Occupancy};
 
-/// The steady window holds the SE at this share of its robust peak or more.
+/// The steady window holds the SE at this share of its robust peak or more. Heuristic.
 pub const STEADY: (u32, u32) = (9, 10);
 /// The robust peak: the resident waves the SE holds or fewer for this share of its span. The true
 /// peak passes the kernel's limit where waves free their registers (`MSG_DEALLOC_VGPRS`) before they
 /// end and the next workgroup starts beside their tails, which would narrow the window to its spikes.
+/// The share is heuristic.
 pub const ROBUST: (u32, u32) = (95, 100);
 
 /// A SIMD's resident waves over the steady window: their sum over its cycles, and the most at once.

@@ -2,6 +2,7 @@
 //! headers (`kfd`), the amdgpu DRM context ioctl (`drm`) and the HSA / AQL ABI
 //! (`hsa`), plus hand-written PM4 / SDMA packet builders.
 
+#[cfg(unix)]
 pub mod drm;
 #[cfg(unix)]
 pub mod hsa;

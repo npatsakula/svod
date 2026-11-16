@@ -16,23 +16,28 @@ use svod_device::sqtt::wave::{Instruction, Wave};
 
 use super::{Analysis, Class, Pstate, Row, Stmt};
 
-/// Exposed vector-memory waits at a tenth of the loop's cycles: below it, moving loads or deepening
-/// the ring repays less than its register and LDS cost.
+/// Exposed vector-memory waits at a tenth of the loop's cycles; below it, moving loads or deepening
+/// the ring is taken to repay less than its register and LDS cost. Heuristic.
 pub(crate) const LOAD_EXPOSED: f64 = 0.10;
-/// The same tenth for exposed LDS waits and stall.
+/// The same tenth for exposed LDS waits and stall. Heuristic.
 pub(crate) const LDS_EXPOSED: f64 = 0.10;
 /// Barriers at a tenth of the loop are listed; their exposed share at a tenth is worth dropping one.
+/// Heuristic.
 pub(crate) const BARRIER: f64 = 0.10;
 /// Non-matrix VALU and SALU issue at a tenth of the matrix issue: a loop's own bookkeeping (a few
 /// address increments a trip) stays under it, per-element guard and address arithmetic passes it.
+/// Heuristic.
 pub(crate) const LOOP_OVERHEAD: f64 = 0.10;
-/// The matrix pipe busy for this share of the steady window or more: near its throughput.
+/// The matrix pipe busy for this share of the steady window or more: near its throughput. Heuristic.
 pub(crate) const MATRIX_BOUND: f64 = 0.70;
 /// Any pipe busy this share of the window or more, with matrix work under [`ISSUE_MATRIX`] of it:
-/// the SIMD issues nearly every cycle, mostly not matrix work.
+/// the SIMD issues nearly every cycle, mostly not matrix work. Heuristic.
 pub(crate) const ISSUE_BOUND: f64 = 0.90;
+/// The matrix share of [`ISSUE_BOUND`]'s busy cycles under which they are mostly not matrix work.
+/// Heuristic.
 pub(crate) const ISSUE_MATRIX: f64 = 0.60;
 /// The traced SIMDs idle (no pipe busy) this share of the steady window: more waves would fill it.
+/// Heuristic.
 pub(crate) const SIMD_IDLE: f64 = 0.10;
 /// The traced run over the untraced past this: its cycle shares no longer describe the untraced
 /// kernel (the probes of 2026-11 put an unpinned trace within a few percent of it).
@@ -43,12 +48,13 @@ pub(crate) const PLAUSIBLE_CYCLES: i64 = 1 << 38;
 /// A barrier wait this short: its wave arrived last and the barrier released at once. The fixtures'
 /// waits split into a floor of 8 to 15 cycles and a tail from tens of cycles up.
 pub(crate) const LAST_ARRIVER: i64 = 16;
-/// A load whose cover is under this share of its latency waits right behind its issue.
+/// A load whose cover is under this share of its latency waits right behind its issue. Heuristic.
 pub(crate) const SHORT_COVER: f64 = 0.25;
 /// The loads, stalls and barrier causes a finding lists.
 const EVIDENCE: usize = 4;
-/// Lanes a wave loads for: svod's RDNA kernels run wave32.
-const LANES: u64 = 32;
+/// Mean resident waves this close under the kernel's limit count as at it: the mean rounds to the
+/// limit. Heuristic.
+const AT_LIMIT: f64 = 0.5;
 
 /// What a wait record waited for: the counter of the instruction that bound it, and whether that was
 /// a store (a `ds_store` flushed before a barrier, a global store). A wait that retired nothing, or
@@ -771,7 +777,7 @@ fn demand(a: &Analysis) -> Option<Demand> {
     };
     let lanes: f64 =
         a.loop_rows().filter(global).filter_map(|r| Some(r.hits as f64 * load_bytes(&r.asm)? as f64)).sum();
-    let bytes_per_trip = (lanes * LANES as f64 / l.trips.total as f64).round() as u64;
+    let bytes_per_trip = (lanes * f64::from(a.wave_size?) / l.trips.total as f64).round() as u64;
     let waves: f64 = a.occupancy.ses.iter().map(|s| s.residency.mean()).sum();
     let cycles_per_trip = l.partition.cycles()[0] as f64 / l.trips.total as f64;
     let sclk_mhz = a.sclk_mhz?;
@@ -810,7 +816,7 @@ pub(super) fn rank(a: &Analysis) -> Verdict {
     let observed = observed(a);
     let limit = a.occupancy.limit.clone();
     let occupancy_knob = |observed: f64| match &limit {
-        Some(l) if observed + 0.5 >= f64::from(l.waves_per_simd) => Knob::FreeResources,
+        Some(l) if observed + AT_LIMIT >= f64::from(l.waves_per_simd) => Knob::FreeResources,
         Some(_) => Knob::MoreWorkgroups,
         None => Knob::MoreWaves,
     };

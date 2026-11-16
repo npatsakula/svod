@@ -14,10 +14,10 @@ use super::verdict::{observed, slowdown};
 use super::{Analysis, Bucket, Class, FindingKind, Pstate, Reduction, Result, Row, Trips};
 
 /// Traced-over-untraced ratios further apart than this share: the captures ran under different
-/// perturbation, and their cycle shares compare less.
+/// perturbation, and their cycle shares compare less. Heuristic.
 pub(crate) const SLOWDOWN_SPREAD: f64 = 0.10;
 /// A bucket whose raw and exposed deltas are both under this many cycles a unit is left out of the
-/// text.
+/// text. Heuristic.
 const QUIET: f64 = 2.0;
 
 /// One capture's context, and the count of units its loop's figures divide by.

@@ -426,9 +426,9 @@ impl AmdIface for MockAmdIface {
         self.state.lock().queue_event_mailbox
     }
 
-    fn hold_stable_pstate(&self, mode: crate::profile::StablePstate) -> Result<Box<dyn Send + Sync>> {
+    fn hold_stable_pstate(&self, mode: crate::profile::StablePstate) -> Result<crate::amd::sqtt::PstateHold> {
         self.state.lock().pstate_holds.push(mode);
-        Ok(Box::new(()))
+        Ok(crate::amd::sqtt::PstateHold::Mock)
     }
 
     fn flush_hdp(&self) {

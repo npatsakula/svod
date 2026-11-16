@@ -726,7 +726,7 @@ impl Drop for PoolQueue {
 struct ArmedSqtt {
     config: crate::profile::SqttConfig,
     arch: crate::amd::sqtt::SqttArch,
-    pstate: Option<Box<dyn Send + Sync>>,
+    pstate: Option<crate::amd::sqtt::PstateHold>,
 }
 
 /// Logical per-plan context. Queue ownership is acquired separately through a

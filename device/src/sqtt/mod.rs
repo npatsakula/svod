@@ -8,6 +8,11 @@
 //! leaves unknown. On top, [`asm::classify`] reads what a disassembly line does and [`waits::Waits`]
 //! binds each executed wait to the instruction it waited for; [`hidden`] ports AMD's hidden-latency
 //! analysis and [`simd`] reduces resident waves and pipe busy shares over the steady window.
+//!
+//! Three classifiers stay apart on purpose. The stitcher's trie must walk a mnemonic exactly as AMD's
+//! does, quirks included, or a record lands on another PC than AMD's would; [`InstOp`]'s table is AMD's
+//! `EINST` codes, what a trace token says the hardware ran; [`asm::classify`] reads what a line does
+//! (counters, memory space, access) for the waits and the verdict, which neither of the others can say.
 
 pub mod asm;
 mod decode;

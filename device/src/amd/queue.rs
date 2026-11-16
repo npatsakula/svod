@@ -2393,7 +2393,7 @@ fn dwords_as_bytes(p: &[u32; 16]) -> &[u8] {
 /// appending into `q` (minus SQTT/PMC/dispatch_ptr).
 /// The shader entry point is pre-shifted right by 8 (COMPUTE_PGM_LO/HI hold the
 /// upper bits of a 256-byte-aligned address). `wave32` comes from
-/// `kd.kernel_code_properties & 0x400`; `cs_w32_en` is gfx11/12-only.
+/// the descriptor's `ENABLE_WAVEFRONT_SIZE32`; `cs_w32_en` is gfx11/12-only.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_exec_pm4(
     q: &mut Vec<u32>,

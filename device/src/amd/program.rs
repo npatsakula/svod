@@ -33,6 +33,10 @@ const R_AMDGPU_REL64: u32 = 5;
 const R_AMDGPU_REL32_LO: u32 = 10;
 const R_AMDGPU_REL32_HI: u32 = 11;
 
+/// The `kernel_code_properties` bit of a wave32 kernel.
+const ENABLE_WAVEFRONT_SIZE32: u16 =
+    crate::amd::sys::hsa::amd_kernel_code_properties_t_AMD_KERNEL_CODE_PROPERTIES_ENABLE_WAVEFRONT_SIZE32 as u16;
+
 /// Pre-execution metadata extracted from a single kernel's ELF.
 #[derive(Debug, Clone)]
 pub struct ParsedKernel {
@@ -53,7 +57,7 @@ pub fn kernel_resources(
     arch: svod_dtype::AmdArch,
 ) -> Result<crate::profile::KernelResources> {
     let kd = parse_kernel(bytes, kernel_name)?.kd;
-    let wave_size = if kd.kernel_code_properties & 0x400 != 0 { 32 } else { 64 };
+    let wave_size = if kd.kernel_code_properties & ENABLE_WAVEFRONT_SIZE32 != 0 { 32 } else { 64 };
     Ok(crate::amd::occupancy::decode_resources(
         kd.compute_pgm_rsrc1,
         kd.compute_pgm_rsrc3,
@@ -289,7 +293,7 @@ pub struct AmdProgram {
     rsrc1: u32,
     rsrc2: u32,
     rsrc3: u32,
-    /// `(kd.kernel_code_properties & 0x400) != 0` — true for wave32 kernels
+    /// `kd.kernel_code_properties & ENABLE_WAVEFRONT_SIZE32 != 0` — true for wave32 kernels
     /// (RDNA3/4 default). Controls the `cs_w32_en` bit in DISPATCH_INITIATOR.
     wave32: bool,
     /// gfx major version (9, 11, or 12). gfx9 (CDNA) ignores `cs_w32_en`.
@@ -375,7 +379,7 @@ impl AmdProgram {
         let rsrc1 = rsrc1_kd | (if target_major == 11 { 1u32 << 20 } else { 0 });
         let rsrc2 = rsrc2_kd | (lds_size << 15);
         let rsrc3 = rsrc3_kd;
-        let wave32 = (props & 0x400) != 0;
+        let wave32 = props & ENABLE_WAVEFRONT_SIZE32 != 0;
         let pm4_prog_addr = aql_prog_addr.wrapping_add(entry as u64);
 
         // Decode KCP bits that affect the user-SGPR pre-load layout. We only
