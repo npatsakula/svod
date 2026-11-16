@@ -166,13 +166,15 @@ kernels together (a split's merge, a tail's partials) and an op's plan alike.
 ### Thread trace
 
 On an AMD RDNA3 or RDNA4 card, `tk_bench sqtt` records an SQ thread trace (SQTT) of a GEMM
-config: the config is timed untraced first, then run once more with tracing on. Each kernel's
+config (`sqtt attention`, `sqtt nearest` and `sqtt conv` trace those ops the same way): the config
+is timed untraced first, then run once more with tracing on. Each kernel's
 trace is saved in its own directory under `--out` (`./sqtt` by default), and a report is printed.
 It opens with a verdict: what limits the main loop, largest share of its cycles first, each finding
-with the instructions behind it and the knob to turn. Then come the traced SIMD's cycles by
+with the instructions behind it and the knob to turn. Then come the traced SIMDs' cycles by
 instruction class, the main loop's iterations and cycles per
-iteration, and the instructions that stall most. `--attribute` adds the cost model's terms next to
-the traced cycles of the instructions each term prices. `--load` reads a saved directory again,
+iteration, and the instructions that stall most. For a GEMM, `--attribute` adds the cost model's
+terms next to the traced cycles of the instructions each term prices; other ops' traces carry no
+price to set beside them. `--load` reads a saved directory again,
 with no GPU:
 
 ```bash
@@ -180,8 +182,12 @@ SVOD_DEVICE=AMD cargo run --release -p svod-tk --example tk_bench -- sqtt gemm 1
 cargo run --release -p svod-tk --example tk_bench -- sqtt --load <DIR>
 ```
 
-Only one SIMD per shader engine records instructions, so the per-instruction numbers describe the
-waves on that SIMD. Tracing leaves the clock to the device; `SVOD_SQTT_PSTATE=standard` (or `peak`)
-pins a stable power state for repeatable cycle counts and slows the traced run. Tracing perturbs
-the run either way: never compare a traced time with an untraced one. `SVOD_SQTT=1` traces any profiled plan the same way
-(`ExecutionPlan::profile`, saved under `SVOD_SQTT_DIR`).
+Instruction tokens come from SE0 and SE1, one SIMD each (by default SIMD 0 on SE0 and SIMD 1 on
+SE1; `SVOD_SQTT_SIMD` sets them), so the per-instruction numbers describe the waves on those SIMDs.
+Tracing leaves the clock to the device. `SVOD_SQTT_PSTATE=standard` (or `peak`) pins a stable
+power state, which lowers the shader clock and distorts what the trace shows: use it only to
+match an older pinned capture. Tracing perturbs the run either way: never compare a traced time
+with an untraced one. From Rust, `ProfileOptions { sqtt: Some(SqttOptions::default()), .. }`
+traces any profiled plan the same way (`ExecutionPlan::profile`, `Tensor::profile`);
+`SqttOptions::from_env()` builds those options from `SVOD_SQTT=1` and `SVOD_SQTT_DIR` for a
+program that wants an environment switch.

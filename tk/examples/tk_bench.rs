@@ -44,12 +44,16 @@
 //!   under `DIR` (`./sqtt`) with its tile statements where a host build with
 //!   a line table compiles to the traced code (`kernel.tk`, `lines.json`;
 //!   else the `lines=mismatch` label says why), and its report printed (`--top` rows a table,
-//!   `--json` one line); `--attribute` sets the model's terms (`price` less
-//!   each) beside the traced SIMD's cycles of their counterparts.
+//!   `--json` one line); `--attribute` (GEMM only) sets the model's terms
+//!   (`price` less each) beside the traced SIMD's cycles of their counterparts.
 //!   `sqtt attention B H T D [--causal] [--bias] [--cfg I|tuned,…]` traces
 //!   attention over `[B, T, H, D]` bf16 the same way; `--flip FORM,…` flips
 //!   those softmax forms (`Forms` fields) of each picked config, `--ring S`
-//!   sets its ring's slots.
+//!   sets its ring's slots. `sqtt nearest N D K [--metric M] [--splits S]`
+//!   traces a self-join of `N` f16 rows at depth `D` for each row's `K`
+//!   nearest, `sqtt conv H W CIN COUT KERNEL STRIDE [--batch B] [--residual]`
+//!   a YOLO block's f16 convolution over `[B, H, W, CIN]`; both take
+//!   `--cfg I|tuned|ranked,…`, `ranked` listing the planner's ranking instead.
 //!   `SVOD_SQTT_PSTATE=standard|peak` pins the traced pass's clock.
 //!   `SVOD_SQTT_SIMD=S[,S...]` picks each SE's traced SIMD (default `0,1`).
 //!   `sqtt --load DIR [--json] [--attribute]` re-reads a saved trace, no GPU;

@@ -237,7 +237,7 @@ does (`tune::measure`: a config's programs from `ops::candidates`, its merge or 
 | `fit [--only LABEL,…] [--picks]` | the cost model against the device on a few GEMM (4096³, Nemotron, Qwen3, Whisper projections), attention and nearest shapes: `costs\|…`, a `fit\|label\|rank\|verdict\|ns predicted\|ns measured\|cfg` line a ranked config, `pick\|label\|ns\|cfg` and `tune\|label\|s` (the tuner's wall time; cold on a store of the device's probes alone); `--picks` times the picks alone, an A/B across builds |
 | `trips` | `residency\|op\|blocks\|trip\|wall\|spread\|base\|measurable` of the trip probes at 1–48 blocks an SM (`probe::trip_at`): what `TRIP_HIDING` is fitted to |
 | `pin --cfg BMxBNxBK:S:WRxWC[:rolled],… [--shape MxNxK,…] [--residual] [--gated]` | `pin\|shape\|cfg\|blocks\|measured\|model\|less latency\|less lone trip\|less step` a pinned GEMM config (3-part code unrolled; Whisper's fc2 1500×1280×5120 by default, `--gated` a SwiGLU epilogue): the model's ns with each term zeroed beside the measured ns |
-| `sqtt gemm M N K [--cfg I\|tuned\|CODE,…] [--top N] [--out DIR] [--json] [--attribute]`, `sqtt --load DIR`, `sqtt --compare DIR_A DIR_B [--json] [--top N]` | AMD RDNA3/RDNA4 thread trace of each config; see [Thread trace (SQTT)](#thread-trace-sqtt) |
+| `sqtt gemm M N K [--cfg I\|tuned\|CODE,…] [--top N] [--out DIR] [--json] [--attribute]`, `sqtt attention B H T D`, `sqtt nearest N D K`, `sqtt conv H W CIN COUT KERNEL STRIDE`, `sqtt --load DIR`, `sqtt --compare DIR_A DIR_B [--json] [--top N]` | AMD RDNA3/RDNA4 thread trace of each config; see [Thread trace (SQTT)](#thread-trace-sqtt) |
 
 The `#[ignore]` probe tests left print and never assert:
 `-- --ignored --nocapture --test-threads=1`.
@@ -271,7 +271,8 @@ of AMD's rocprof-trace-decoder, checked against its control CSVs) over `llvm-obj
   --cfg tuned,0 --attribute` (`--cfg` takes `tuned`, a rank `I` into `gemm_ranked`, or a `pin` code; `--residual`,
   `--gated` as `pin`). It times the config untraced (`tune::measure`), then `tune::profile` runs
   `ExecutionPlan::profile` with `ProfileOptions::sqtt`: one more pass with `set_sqtt` armed. Each kernel lands in
-  `<out>/gemm_MxNxK_<i>/p<program>/<index>_<entry>/`, its path printed (`saved …`).
+  `<out>/gemm_MxNxK_<i>/p<program>/<index>_<entry>/`, its path printed (`saved …`). `sqtt attention`, `sqtt nearest`
+  and `sqtt conv` trace those ops the same way (their flags: the module doc of `tk/examples/tk_bench.rs`).
 - **Any plan**: `ProfileOptions { sqtt: Some(SqttOptions::default()), .. }` adds Tier 5 (`SqttOptions::from_env()?` reads
   `SVOD_SQTT=1`); the profile report then ends with one summary line a kernel, the dirs under `Sink::Disk` (`./sqtt`,
   `SVOD_SQTT_DIR`), or each capture held with `Sink::Memory`. The traced pass syncs after each kernel and frees its `64 MiB × SEs` before the next.
@@ -303,7 +304,7 @@ of AMD's rocprof-trace-decoder, checked against its control CSVs) over `llvm-obj
   findings appearing/gone/changed; loop buckets a trip (each side's own trips; per iteration without `model.trips`)
   by |Δ exposed|; loop rows aligned by mnemonic (LCS): inserted/removed grouped by mnemonic with ops, cycles, exposed
   a trip, then matched rows by |Δ exposed|. Golden: `runtime/src/test/fixtures/sqtt_compare_v1_v3.txt`.
-- **Statements** (`tk_bench sqtt gemm` only): after the trace, `tune::twin` lowers each program again as the launch
+- **Statements** (every `tk_bench sqtt` op): after the trace, `tune::twin` lowers each program again as the launch
   did (`launch::lowered_as_launched`: parameters numbered `[out, ins...]`, not `lower::standalone`'s declared order,
   which loads the kernel arguments in another order) and renders it through the device's renderer
   (`svod_runtime::amd::renderer`) with a line table over its listing (`Lowered::located_text_by`,
@@ -316,15 +317,17 @@ of AMD's rocprof-trace-decoder, checked against its control CSVs) over `llvm-obj
   in `@line text`, and `--compare` pairs rows within one statement text and diffs statements by text.
   `lines::a_line_table_leaves_the_code_alone` gates the line table (`.text` unchanged, coverage floors; the whole
   sweep is its `#[ignore]`d twin); `lines::a_twin_is_the_launched_kernel` holds the twin to the launched IR and `.text`.
-- **`--attribute`** (report only): each `Planner::price` term as `price − price with its costs zeroed` (`steps`,
+- **`--attribute`** (report only; GEMM captures alone carry the `model.price` it reads): each `Planner::price` term as `price − price with its costs zeroed` (`steps`,
   `reads`, `fill`, `wait`, `lone_trip`, `trip`; they overlap, so they need not sum) beside the traced cycles of its
   counterpart: steps ↔ matrix issue less stall, reads ↔ `ds_*` + lgkm/ds waits, fill ↔ global memory + vm/load waits,
   wait ↔ barrier + message; then model ns a trip vs a wave's cycles an iteration. Model ns is the busiest SM's time;
   measured cycles are one SIMD's summed over its waves: compare shares and the per-iteration pace, not totals.
-- **Caveats**: one traced SIMD per SE (`SqttConfig::simd`, WGP 0 of SA 0), so a grid that misses it traces nothing
-  there (`limit_cu`); arming leaves the clock to the device unless `SVOD_SQTT_PSTATE=standard|peak` (or
-  `SqttConfig::pstate`) pins one through a DRM context, which lowers the traced clock (`meta.json` records `pstate`);
-  tracing perturbs timing: never compare a traced ns with an untraced one.
+- **Caveats**: instruction tokens come from SE0 and SE1 (`SqttConfig::se_mask`), one SIMD of WGP 0, SA 0 each
+  (`SqttConfig::simds`, default SIMD 0 on SE0 and 1 on SE1, `SVOD_SQTT_SIMD`), so a grid that misses them traces
+  nothing there (`limit_cu`); arming leaves the clock to the device unless `SVOD_SQTT_PSTATE=standard|peak` (or
+  `SqttConfig::pstate`) pins one through a DRM context, which lowers the shader clock and distorts what the trace
+  shows: pin only to match an older pinned capture (`meta.json` records `pstate`); tracing perturbs timing: never
+  compare a traced ns with an untraced one.
 
 ## Performance-regression protocol
 
