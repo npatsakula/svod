@@ -38,14 +38,9 @@ fn golden(file: &str) -> BTreeMap<String, BTreeMap<u64, Hidden>> {
 fn matches_amd(name: &str, se: u32) {
     let s = stitched(name);
     let trace = &s.traces[s.ses.iter().position(|&x| x == se).unwrap()];
-    let ours = hidden::analyze([(se, trace)], &hidden::matrix_pcs(&s.lines()));
-    let ours: BTreeMap<String, BTreeMap<u64, Hidden>> = ours
-        .by_scope
-        .into_iter()
-        .map(|((se, simd), pcs)| {
-            (format!("se{se}_simd{simd}"), pcs.into_iter().map(|(pc, h)| (pc - s.base, h)).collect())
-        })
-        .collect();
+    let ours = hidden::analyze([(se, trace)], &hidden::matrix_pcs(&s.lines()), s.base);
+    let ours: BTreeMap<String, BTreeMap<u64, Hidden>> =
+        ours.by_scope.into_iter().map(|((se, simd), pcs)| (format!("se{se}_simd{simd}"), pcs)).collect();
     let expected = golden(&format!("{}_se{se}.json", name.replace('/', "_")));
     assert_eq!(ours.keys().collect::<Vec<_>>(), expected.keys().collect::<Vec<_>>(), "{name}: scopes");
     for (scope, want) in &expected {
@@ -75,7 +70,7 @@ fn matrix_pcs_are_the_wmma_lines() {
 #[test]
 fn by_pc_sums_the_scopes() {
     let s = stitched("svod/strix_smoke");
-    let r = hidden::analyze(s.ses.iter().copied().zip(&s.traces), &hidden::matrix_pcs(&s.lines()));
+    let r = hidden::analyze(s.ses.iter().copied().zip(&s.traces), &hidden::matrix_pcs(&s.lines()), s.base);
     assert_eq!(r.by_scope.len(), 2);
     let mut sum = BTreeMap::<u64, Hidden>::new();
     r.by_scope.values().flatten().for_each(|(&pc, &h)| *sum.entry(pc).or_default() += h);

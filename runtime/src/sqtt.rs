@@ -695,7 +695,7 @@ impl Analysis {
             for wave in &mut trace.waves {
                 stitcher.stitch(wave);
             }
-            for (pc, h) in hidden::analyze([(se.se, &trace)], &matrix).by_pc {
+            for (pc, h) in hidden::analyze([(se.se, &trace)], &matrix, base).by_pc {
                 *hidden.entry(pc).or_default() += h;
             }
             let hiding = Hiding::new(&trace.waves, &trace.other_simd, &matrix);
@@ -730,10 +730,10 @@ impl Analysis {
             .iter()
             .map(|(&pc, s)| {
                 let line = text.get(&pc).copied().unwrap_or_default();
-                let (asm, class) = (asm(line), Class::of(line));
+                let (asm, class, pc) = (asm(line), Class::of(line), pc - base);
                 let h = hidden.get(&pc).copied().unwrap_or_default();
                 Row {
-                    pc: pc - base,
+                    pc,
                     asm,
                     class,
                     hits: s.hits,
@@ -743,7 +743,7 @@ impl Analysis {
                     hidden_idle: h.idle,
                     hidden_stall: h.stall,
                     hidden_issue: h.issue,
-                    stmt: capture.statements.as_ref().and_then(|s| s.lines.get(&(pc - base)).copied()),
+                    stmt: capture.statements.as_ref().and_then(|s| s.lines.get(&pc).copied()),
                 }
             })
             .collect();
@@ -772,7 +772,7 @@ impl Analysis {
             .zip(capture.workgroup)
             .and_then(|((cu, resources), workgroup)| limits(&resources, workgroup.iter().product(), &cu));
         let per_iteration = capture.model.as_ref().map_or(1, |m| m.per_iteration.max(1));
-        let replay = Replay::new(&waves, &lines, layout);
+        let replay = Replay::new(&waves, &lines, layout, base);
         let mut bound: Vec<HashMap<usize, (Counter, u64)>> = vec![HashMap::new(); waves.len()];
         for (wave, seq, counter, pc) in replay.bound() {
             bound[wave].insert(seq, (counter, pc));
@@ -809,7 +809,7 @@ impl Analysis {
             stitched: waves.iter().flat_map(|w| &w.instructions).filter(|i| i.pc != 0).count(),
             classes: classes.into_values().collect(),
             main_loop,
-            waits: replay.waits(base, |_| true),
+            waits: replay.waits(|_| true),
             occupancy: Occupancy { cu, limit, untimed_matrix, ses: occupancy },
             ses,
             pcs: rows,
@@ -1177,7 +1177,7 @@ fn main_loop<'a>(
             .into_iter()
             .map(|s| BarrierSite { stmt: stmts.and_then(|(lines, _)| lines.get(&s.pc).copied()), ..s })
             .collect(),
-        bindings: replay.waits(base, |pc| (head..=edge).contains(&pc)).bindings,
+        bindings: replay.waits(|pc| (head..=edge).contains(&pc)).bindings,
         statements,
     })
 }

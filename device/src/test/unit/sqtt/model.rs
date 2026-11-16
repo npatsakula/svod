@@ -456,12 +456,12 @@ fn analyzes_and_stitches(data: &[u8], layout: Layout) -> Result<(), TestCaseErro
     }
     let report = Report::new(&trace.waves);
     prop_assert!(report.pcs.keys().all(|pc| code.iter().any(|(line, _)| line == pc)));
-    let hidden = hidden::analyze([(0, &trace)], &hidden::matrix_pcs(&code));
+    let hidden = hidden::analyze([(0, &trace)], &hidden::matrix_pcs(&code), 0);
     prop_assert!(hidden.by_pc.keys().all(|pc| report.pcs.contains_key(pc)));
     if let Some(residency) = Residency::new(&trace.occupancy) {
         prop_assert!(residency.window.0 <= residency.window.1);
     }
-    let replay = Replay::new(&trace.waves, &code, layout);
+    let replay = Replay::new(&trace.waves, &code, layout, 0);
     prop_assert!(replay.bound().all(|(wave, _, _, pc)| wave < trace.waves.len() && report.pcs.contains_key(&pc)));
     Ok(())
 }

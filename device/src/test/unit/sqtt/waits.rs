@@ -272,12 +272,12 @@ fn combined_wait_binds_on_the_counter_that_retired() {
     .into();
     let code: Vec<(u64, &str)> = program.iter().enumerate().map(|(i, l)| (BASE + 4 * i as u64, l.as_str())).collect();
     let waves = [wave(&program, &[0, 1, 2, 3], 5), wave(&program, &[0, 1, 2, 3], 5)];
-    let replay = Replay::new(&waves, &code, Layout::Rdna4);
+    let replay = Replay::new(&waves, &code, Layout::Rdna4, BASE);
     let bound: Vec<_> = replay.bound().collect();
     let expect = |w| [(w, 1, Counter::Ds, BASE), (w, 3, Counter::Load, BASE + 8)];
     assert_eq!(bound, [expect(0), expect(1)].concat());
-    let w = replay.waits(0, |pc| pc == BASE + 4);
+    let w = replay.waits(|pc| pc == BASE + 4);
     let counters: Vec<(u64, Counter)> = w.bindings.iter().map(|b| (b.pc, b.counter)).collect();
-    assert_eq!((w.waves, w.instances, counters), (2, 2, vec![(BASE, Counter::Ds)]));
-    assert_eq!(replay.waits(BASE, |_| true), analyze(Layout::Rdna4, &program, &waves));
+    assert_eq!((w.base, w.waves, w.instances, counters), (BASE, 2, 2, vec![(0, Counter::Ds)]));
+    assert_eq!(replay.waits(|_| true), analyze(Layout::Rdna4, &program, &waves));
 }

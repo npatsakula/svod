@@ -140,6 +140,8 @@ pub struct Site {
 /// Waits and the instructions they waited for, over the fully stitched waves.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Waits {
+    /// The load address taken off every reported PC.
+    pub base: u64,
     /// Waves replayed, and those skipped: incomplete, context-switched or not wholly stitched.
     pub waves: usize,
     pub skipped: usize,
@@ -161,14 +163,15 @@ struct Line {
 /// The executed waits of the fully stitched waves, each with what it waited for.
 #[derive(Debug, Clone, Default)]
 pub struct Replay {
+    base: u64,
     waves: usize,
     skipped: usize,
     hits: Vec<Hit>,
 }
 
 impl Replay {
-    /// `code`: the `(pc, llvm-objdump line)` the waves were stitched against.
-    pub fn new(waves: &[Wave], code: &[(u64, &str)], layout: Layout) -> Self {
+    /// `code`: the `(pc, llvm-objdump line)` the waves were stitched against; reported PCs are less `base`.
+    pub fn new(waves: &[Wave], code: &[(u64, &str)], layout: Layout, base: u64) -> Self {
         let lines: HashMap<u64, Line> = code
             .iter()
             .map(|&(pc, line)| {
@@ -177,7 +180,7 @@ impl Replay {
             })
             .collect();
         let replayable = |w: &Wave| w.complete && w.contexts == 0 && w.instructions.iter().all(|i| i.pc != 0);
-        let mut replay = Self::default();
+        let mut replay = Self { base, ..Self::default() };
         for (index, wave) in waves.iter().enumerate().filter(|w| replayable(w.1)) {
             self::replay(index, &wave.instructions, &lines, layout, &mut replay.hits);
             replay.waves += 1;
@@ -192,11 +195,11 @@ impl Replay {
         self.hits.iter().filter_map(|h| h.binding.map(|b| (h.wave, h.seq, b.counter, b.pc)))
     }
 
-    /// The waits at the PCs `within` keeps; reported PCs are less `base`.
-    pub fn waits(&self, base: u64, within: impl Fn(u64) -> bool) -> Waits {
+    /// The waits at the loaded PCs `within` keeps.
+    pub fn waits(&self, within: impl Fn(u64) -> bool) -> Waits {
         let hits: Vec<Hit> = self.hits.iter().filter(|h| within(h.pc)).copied().collect();
-        let mut waits = Waits { waves: self.waves, skipped: self.skipped, ..Waits::default() };
-        waits.aggregate(&hits, base);
+        let mut waits = Waits { base: self.base, waves: self.waves, skipped: self.skipped, ..Waits::default() };
+        waits.aggregate(&hits);
         waits
     }
 }
@@ -204,10 +207,11 @@ impl Replay {
 impl Waits {
     /// `code`: the `(pc, llvm-objdump line)` the waves were stitched against; reported PCs are less `base`.
     pub fn new(waves: &[Wave], code: &[(u64, &str)], layout: Layout, base: u64) -> Self {
-        Replay::new(waves, code, layout).waits(base, |_| true)
+        Replay::new(waves, code, layout, base).waits(|_| true)
     }
 
-    fn aggregate(&mut self, hits: &[Hit], base: u64) {
+    fn aggregate(&mut self, hits: &[Hit]) {
+        let base = self.base;
         #[derive(Default)]
         struct Acc {
             counter: Option<Counter>,
