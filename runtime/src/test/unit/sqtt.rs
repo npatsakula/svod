@@ -234,6 +234,32 @@ fn flags_truncation() {
     assert!(flagged(&c).iter().all(|&f| f), "every finding undercounts");
 }
 
+/// A stream the trace window cut partway, as a full buffer leaves it: every finding is flagged, and
+/// the totals undercount the whole capture's by what the cut SE lost.
+#[test]
+fn a_cut_stream_undercounts() {
+    let full = Capture::load(&fixtures().join("svod/rdna4_gemm_v1")).unwrap();
+    let mut cut = full.clone();
+    let se = &mut cut.trace.per_se[0];
+    se.bytes.truncate(se.bytes.len() / 2);
+    se.truncated = true;
+    let (full, cut) = (full.analyze().unwrap(), cut.analyze().unwrap());
+    let all = cut.verdict.bound.iter().chain(&cut.verdict.findings);
+    assert!(all.clone().count() > 0 && all.clone().all(|f| f.approx.contains(&Approx::Truncated)), "{:?}", cut.verdict);
+    assert!(cut.ses[0].truncated && !cut.ses[1].truncated);
+    assert_eq!(cut.ses[1], full.ses[1], "the other SE as it was");
+    // SE1 holds about half of each total: SE0's cut half keeps some.
+    assert!(
+        full.records / 2 < cut.records && cut.records < full.records,
+        "{} of {} records",
+        cut.records,
+        full.records
+    );
+    assert!(cut.complete < full.complete, "SE0's waves lose their ends: {} of {}", cut.complete, full.complete);
+    let trips = |a: &Analysis| a.main_loop.as_ref().unwrap().trips.total;
+    assert!(trips(&full) / 2 < trips(&cut) && trips(&cut) < trips(&full), "{} of {} trips", trips(&cut), trips(&full));
+}
+
 /// `version` in place of the HEADER a stream opens with, its version in bits 7..=12.
 fn foreign(bytes: &mut [u8], version: u16) {
     let word = u16::from_le_bytes([bytes[0], bytes[1]]);
@@ -272,6 +298,24 @@ fn refuses_another_format(format: Option<u32>) {
     assert!(matches!(&refused, Err(super::Error::Format { found, .. }) if *found == format), "{refused:?}");
 }
 
+/// A directory without `meta.json`, or with one that is no JSON, is refused naming the file.
+#[test_case(None ; "missing")]
+#[test_case(Some("{\"format\": 1,") ; "malformed")]
+fn refuses_a_missing_or_malformed_meta(meta: Option<&str>) {
+    let dir = tempfile::tempdir().unwrap();
+    capture("amd/strix_barrier").save(dir.path()).unwrap();
+    let path = dir.path().join("meta.json");
+    match meta {
+        Some(text) => std::fs::write(&path, text).unwrap(),
+        None => std::fs::remove_file(&path).unwrap(),
+    }
+    match Capture::load(dir.path()) {
+        Err(super::Error::Io { path: at, .. }) if meta.is_none() => assert_eq!(at, path),
+        Err(super::Error::Json { path: at, .. }) if meta.is_some() => assert_eq!(at, path),
+        other => panic!("{other:?}"),
+    }
+}
+
 #[test]
 fn refuses_a_trace_without_itrace() {
     let mut c = capture("amd/strix_barrier");
@@ -279,19 +323,15 @@ fn refuses_a_trace_without_itrace() {
     assert!(matches!(c.analyze(), Err(super::Error::NoItrace)));
 }
 
-/// Where this machine has `llvm-objdump`, a loaded directory without `kernel.s` disassembles to the
-/// fixture's text.
+/// A loaded directory without `kernel.s` disassembles to the fixture's text with `llvm-objdump`.
 #[test]
 fn disassembles_without_kernel_s() {
     let dir = tempfile::tempdir().unwrap();
     let c = capture("gfx1200/gemm");
     c.save(dir.path()).unwrap();
     std::fs::remove_file(dir.path().join("kernel.s")).unwrap();
-    match Capture::load(dir.path()) {
-        Ok(loaded) => assert_eq!(objdump_lines(&loaded.disassembly), objdump_lines(&c.disassembly)),
-        Err(super::Error::Tool { .. }) => eprintln!("no llvm-objdump: skipped"),
-        Err(e) => panic!("{e}"),
-    }
+    let loaded = Capture::load(dir.path()).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(objdump_lines(&loaded.disassembly), objdump_lines(&c.disassembly));
 }
 
 /// One line for each arm of `From<Kind>`.
@@ -802,6 +842,81 @@ fn class_findings_fire_past_their_thresholds() {
     busy(&mut capped, 30, 80);
     let f = super::verdict::rank(&capped).bound.into_iter().find(|f| f.kind == OccupancyLimited).unwrap();
     assert_eq!(f.knob, Knob::FreeResources, "4 of 4 waves");
+}
+
+/// The loop findings past their thresholds, from v1 with a bucket the size of its loop added: LDS
+/// load waits are lds_exposed, its knob the use behind the load; exposed barrier cycles fire the
+/// barrier past its sink.
+#[test]
+fn loop_findings_fire_past_their_thresholds() {
+    let v1 = verdict_of("rdna4_gemm_v1");
+    let with = |bucket: Bucket, exposed: i64| {
+        let mut a = v1.clone();
+        let p = &mut a.main_loop.as_mut().unwrap().partition;
+        let cycles = p.cycles()[0];
+        *p.buckets.entry(bucket).or_default() = [cycles, exposed * cycles / 100];
+        super::verdict::rank(&a)
+    };
+    assert!(find(&v1, FindingKind::LdsExposed).is_none());
+    let lds = with(Bucket::Wait(WaitOn { counter: Counter::Ds, store: false }), 50);
+    let f = lds.findings.iter().find(|f| f.kind == FindingKind::LdsExposed).unwrap();
+    assert!((0.25..0.30).contains(&f.share) && (0.5..0.6).contains(&f.raw), "{f:?}");
+    assert_eq!(f.knob, Knob::LdsUse);
+    let Evidence::Waits { load, store, .. } = &f.evidence else { panic!("{f:?}") };
+    assert!(load.exposed < load.raw && store.raw < 0.1 * load.raw, "{f:?}");
+    let sink = find(&v1, FindingKind::Barrier).unwrap();
+    assert!(sink.share < 0.10);
+    let barrier = with(Bucket::Barrier, 100);
+    let f = barrier.findings.iter().find(|f| f.kind == FindingKind::Barrier).unwrap();
+    assert!(f.share >= 0.5 && f.share == barrier.findings[0].share, "fires and leads: {:?}", barrier.findings);
+    assert_eq!(f.knob, Knob::Barrier);
+    let Evidence::Barrier { cycles, sites } = &f.evidence else { panic!("{f:?}") };
+    assert!(cycles.exposed > 0.0 && !sites.is_empty(), "{f:?}");
+}
+
+/// A load whose binding the replay guessed flags v3's load_exposed approximate; the capture as
+/// recorded guesses none.
+#[test]
+fn guessed_bindings_flag_the_load_finding() {
+    let flagged = |a: &Analysis| {
+        let f = find(a, FindingKind::LoadExposed).unwrap();
+        f.approx.contains(&Approx::ApproxBindings)
+    };
+    let mut v3 = verdict_of("rdna4_gemm_v3");
+    assert!(!flagged(&v3));
+    v3.main_loop.as_mut().unwrap().bindings.iter_mut().for_each(|b| b.approx = 1);
+    v3.verdict = super::verdict::rank(&v3);
+    assert!(flagged(&v3));
+}
+
+/// Findings of one share order by kind, whatever order they came in.
+#[test]
+fn tied_findings_order_by_kind() {
+    let f = |kind, share| Finding {
+        kind,
+        share,
+        raw: share,
+        evidence: Evidence::Busy { matrix: 0.0, valu: 0.0, any: 0.0 },
+        knob: Knob::Hoist,
+        approx: vec![],
+    };
+    use FindingKind::{Barrier, LdsExposed, LoadExposed, LoopOverhead};
+    let findings: super::Findings =
+        vec![f(LoopOverhead, 0.2), f(Barrier, 0.2), f(LoadExposed, 0.3), f(LdsExposed, 0.2)].into();
+    assert_eq!(kinds(&findings), [LoadExposed, LdsExposed, Barrier, LoopOverhead]);
+}
+
+/// A side without a main loop: the comparison says so, pairs no rows and shows none.
+#[test]
+fn compare_without_a_loop() {
+    let v1 = verdict_of("rdna4_gemm_v1");
+    let mut flat = v1.clone();
+    flat.main_loop = None;
+    let d = v1.compare(&flat);
+    assert!(d.cautions.contains(&Caution::NoLoop), "{:?}", d.cautions);
+    assert!(d.rows.matched.is_empty() && d.rows.inserted.is_empty() && !d.rows.removed.is_empty());
+    let text = d.text(4);
+    assert!(text.contains("!! NO LOOP on a side") && !text.contains("== matched rows"), "{text}");
 }
 
 fn compared(a: &str, b: &str) -> Diff {

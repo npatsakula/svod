@@ -59,16 +59,21 @@ fn launches(arch: AmdArch, cus: u32) -> Vec<Launch> {
     out
 }
 
-/// Whether this host compiles AMDGPU code and has the LLVM tool a line
-/// table is read with (it runs, whatever it makes of no input).
+/// Whether this host's clang compiles AMDGPU code. The LLVM tools a line
+/// table and a disassembly are read with must be there, or the test fails:
+/// each runs, whatever it makes of no input.
 fn tooled() -> bool {
     use svod_runtime::sqtt::Error;
-    let dwarfdump = !matches!(debug_line(&[]), Err(Error::Tool { .. } | Error::Spawn { .. }));
-    let tooled = svod_runtime::amd::has_amdgpu_target() && dwarfdump;
-    if !tooled {
-        eprintln!("skipped: no clang AMDGPU or llvm-dwarfdump");
+    for (tool, ran) in [("llvm-dwarfdump", debug_line(&[])), ("llvm-objdump", disassemble(&[]))] {
+        if let Err(missing @ (Error::Tool { .. } | Error::Spawn { .. })) = ran {
+            panic!("{tool}: {missing}");
+        }
     }
-    tooled
+    let amdgpu = svod_runtime::amd::has_amdgpu_target();
+    if !amdgpu {
+        eprintln!("skipped: no clang AMDGPU");
+    }
+    amdgpu
 }
 
 /// A kernel built with a line table: its lowering, code object,
