@@ -1255,32 +1255,40 @@ pub enum Error {
     },
 }
 
-/// The statements of a [`profile`]d candidate's traced kernel: each program
-/// of `candidate` lowered again as [`profile`] launches it
+/// The statements of a [`profile`]d program's traced kernel: `prog`
+/// lowered again as [`profile`] launches it
 /// ([`launch::lowered_as_launched`]), rendered by the device's renderer with
 /// a line table over its `kernel.tk` listing and compiled on the host as the
-/// device compiles it (the offline twin), the first whose `.text` is the
-/// capture's byte for byte attached to `capture` ([`Capture::attach_twin`]).
-/// `None` once attached, else why no twin matched (the capture left without
-/// lines).
-pub fn twin(candidate: &Candidate, capture: &mut Capture) -> Option<String> {
-    let mut why = vec![];
-    for (prog, lowering) in candidate {
-        let target = &lowering.device.target;
-        let GpuArch::Amd(arch) = target.arch else { return Some(format!("{}: not an AMD target", prog.name)) };
-        let mut attached = || -> Result<Option<String>, String> {
-            let low = launch::lowered_as_launched(prog.clone(), lowering).map_err(|e| e.to_string())?;
-            let ir = low.located_text_by(svod_runtime::amd::renderer(arch)).map_err(|e| e.to_string())?;
-            let object = svod_runtime::amd::compile_ir_to_amd_object(&ir, arch).map_err(|e| e.to_string())?;
-            capture.attach_twin(&object, &low.listing()).map_err(|e| e.to_string())
-        };
-        match attached() {
-            Ok(None) => return None,
-            Ok(Some(differs)) => why.push(format!("{}: {differs}", prog.name)),
-            Err(e) => why.push(format!("{}: {e}", prog.name)),
-        }
-    }
-    Some(why.join("; "))
+/// device compiles it (the offline twin), attached to `capture` where its
+/// `.text` is the capture's byte for byte ([`Capture::attach_twin`]).
+pub fn twin((prog, lowering): &(Program, Lowering), capture: &mut Capture) -> Result<(), TwinError> {
+    let program = || prog.name.clone();
+    let GpuArch::Amd(arch) = lowering.device.target.arch else { return NotAmdSnafu { program: program() }.fail() };
+    let low = launch::lowered_as_launched(prog.clone(), lowering).context(LowerSnafu { program: program() })?;
+    let ir = low.located_text_by(svod_runtime::amd::renderer(arch)).context(LowerSnafu { program: program() })?;
+    let object = svod_runtime::amd::compile_ir_to_amd_object(&ir, arch).context(CompileSnafu { program: program() })?;
+    capture.attach_twin(&object, &low.listing()).context(AttachSnafu { program: program() })
+}
+
+/// Why a program's twin gave a capture no statements.
+#[derive(Debug, Snafu)]
+pub enum TwinError {
+    #[snafu(display("{program}: not an AMD target"))]
+    NotAmd { program: String },
+    #[snafu(display("{program}: {source}"))]
+    Lower {
+        program: String,
+        #[snafu(source(from(crate::lower::Error, Box::new)))]
+        source: Box<crate::lower::Error>,
+    },
+    #[snafu(display("{program}: {source}"))]
+    Compile {
+        program: String,
+        #[snafu(source(from(svod_runtime::Error, Box::new)))]
+        source: Box<svod_runtime::Error>,
+    },
+    #[snafu(display("{program}: {source}"))]
+    Attach { program: String, source: svod_runtime::sqtt::TwinError },
 }
 
 /// Each prepared plan's best device time in ns, timed as [`measure`] times a

@@ -12,7 +12,9 @@ use svod_device::profile::{CodeImage, SqttTrace};
 use svod_device::sqtt::stitch::{branch, objdump_lines};
 use svod_dtype::AmdArch;
 use svod_runtime::amd::compile_ir_to_amd_object;
-use svod_runtime::sqtt::{Capture, Class, Lines, debug_line, disassemble, locate, parse_debug_line, text_mismatch};
+use svod_runtime::sqtt::{
+    Capture, Class, Lines, Statements, TwinError, debug_line, disassemble, locate, parse_debug_line, same_text,
+};
 use test_case::test_case;
 
 use crate::build::{BF16, I8};
@@ -111,7 +113,7 @@ fn gate(arch: AmdArch, (name, prog, lowering): Launch) -> (Option<String>, Strin
     let lined = body.len() - unattributed.values().sum::<usize>();
     let ring = (name.starts_with("gemm") || name.starts_with("tile")) && !name.starts_with("gemm tail");
     let floor = if ring { GEMM_LINED } else { OTHER_LINED };
-    let why = if let Some(differs) = text_mismatch(&plain, &built.object) {
+    let why = if let Err(differs) = same_text(&plain, &built.object) {
         Some(format!("{name}: {differs}"))
     } else if rows == 0 {
         Some(format!("{name}: empty .debug_line"))
@@ -208,10 +210,10 @@ fn matrix_instructions_sit_on_the_product_statement() {
         .collect();
     assert!(!matrix.is_empty());
     for pc in &matrix {
-        let (line, _) = built.lines[pc];
+        let line = built.lines[pc].line.get();
         assert_eq!(text[line as usize - 1], "mma a_s·b_s [steady]", "{pc:#x} on line {line}");
     }
-    let columns: BTreeSet<u32> = matrix.iter().map(|pc| built.lines[pc].1).collect();
+    let columns: BTreeSet<u32> = matrix.iter().map(|pc| built.lines[pc].copy).collect();
     assert_eq!(columns, BTreeSet::from([1, 2]), "the steady loop's two unroll copies");
 
     let trace = |elf: &[u8]| SqttTrace {
@@ -221,17 +223,16 @@ fn matrix_instructions_sit_on_the_product_statement() {
         code: Arc::new(CodeImage { elf: elf.into(), load_base: 1 << 40, entry_pc: 1 << 40 }),
     };
     let mut capture = Capture::new(trace(&built.object), None).unwrap();
-    assert_eq!(capture.attach_twin(&built.object, &listing).unwrap(), None);
-    assert_eq!(capture.lines.as_ref(), Some(&built.lines));
-    assert_eq!(capture.listing.as_deref(), Some(listing.as_str()));
+    capture.attach_twin(&built.object, &listing).unwrap();
+    assert_eq!(capture.statements, Some(Statements { lines: built.lines.clone(), listing: listing.clone() }));
 
     let (prog, lowering) = tile_gemm(config::gemm_cfg([64, 64, 64], 2, [2, 2], false));
     let elsewhere =
         compile_ir_to_amd_object(&standalone(prog, &lowering).unwrap().text(&lowering.device.target).unwrap(), arch);
     let mut capture = Capture::new(trace(&elsewhere.unwrap()), None).unwrap();
-    let why = capture.attach_twin(&built.object, &listing).unwrap();
-    assert!(why.as_deref().is_some_and(|w| w.starts_with(".text differs")), "{why:?}");
-    assert_eq!((capture.lines, capture.listing), (None, None));
+    let why = capture.attach_twin(&built.object, &listing);
+    assert!(matches!(why, Err(TwinError::TextDiffers { .. })), "{why:?}");
+    assert_eq!(capture.statements, None);
 }
 
 /// `located` with its line table taken out: the `!dbg` attachments and the
@@ -299,6 +300,32 @@ fn a_twin_is_the_launched_kernel(arch: AmdArch, cus: u32) {
         assert!(located.contains("!dbg !DILocation"), "{m}x{n}x{k}: no locations");
         assert_eq!(unlocated(&located), launched, "{m}x{n}x{k} {cfg:?}");
         let [twin, launched] = [located, launched].map(|ir| compile_ir_to_amd_object(&ir, arch).unwrap());
-        assert_eq!(text_mismatch(&launched, &twin), None, "{m}x{n}x{k} {cfg:?}");
+        same_text(&launched, &twin).unwrap_or_else(|e| panic!("{m}x{n}x{k} {cfg:?}: {e}"));
     });
+}
+
+/// `tune::twin` gives a capture of the launched kernel its statements, and
+/// names why it cannot where the target is no AMD one.
+#[test]
+fn twin_attaches_to_the_launched_kernel() {
+    if !tooled() {
+        return;
+    }
+    let arch = AmdArch::Gfx1201;
+    let (prog, lowering) = tile_gemm(config::gemm_cfg([128, 128, 32], 2, [4, 2], true));
+    let object = compile_ir_to_amd_object(&launched_text(arch, prog.clone(), &lowering), arch).unwrap();
+    let trace = SqttTrace {
+        arch,
+        per_se: vec![],
+        mclk_mhz: None,
+        code: Arc::new(CodeImage { elf: object.into(), load_base: 1 << 40, entry_pc: 1 << 40 }),
+    };
+    let mut capture = Capture::new(trace, None).unwrap();
+    crate::tune::twin(&(prog.clone(), lowering.clone()), &mut capture).unwrap();
+    let statements = capture.statements.as_ref().expect("attached");
+    assert!(!statements.lines.is_empty() && statements.listing.contains("mma a_s·b_s [steady]"));
+    let cfg = config::gemm_cfg([128, 128, 32], 2, [4, 2], true);
+    let cuda = cfg.lowering(&planner(crate::sweep::hopper()).device);
+    let why = crate::tune::twin(&(prog, cuda), &mut capture);
+    assert!(matches!(why, Err(crate::tune::TwinError::NotAmd { .. })), "{why:?}");
 }

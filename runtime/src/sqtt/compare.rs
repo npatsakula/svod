@@ -131,7 +131,7 @@ impl LoopRow {
             cycles: per(r.latency + r.idle),
             stall: per(r.stall),
             exposed: per(exposed),
-            statement: r.stmt.and_then(|(line, _)| Some(listing.get(line as usize - 1)?.trim().to_string())),
+            statement: r.stmt.and_then(|s| Some(listing.get(s.line.get() as usize - 1)?.trim().to_string())),
         }
     }
 

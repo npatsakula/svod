@@ -30,7 +30,9 @@ mod verdict;
 pub use compare::{
     BucketDelta, Caution, Diff, FindingDelta, LoopRow, Rows, SLOWDOWN_SPREAD, Side, StatementDelta, Unit, align,
 };
-pub use lines::{LineRow, Lines, Stmt, debug_line, locate, parse_debug_line, text_mismatch, text_section};
+pub use lines::{
+    LineRow, Lines, Statements, Stmt, TwinError, debug_line, locate, parse_debug_line, same_text, text_section,
+};
 pub use statements::Statement;
 pub use verdict::{
     Approx, BarrierSite, Ceiling, Cycles, Demand, Evidence, Finding, FindingKind, Load, Partition, Stall, Verdict,
@@ -113,10 +115,9 @@ pub struct Capture {
     pub grid: Option<[u32; 3]>,
     /// The power state the traced dispatch ran at; `None` where the capture predates the record.
     pub pstate: Option<Pstate>,
-    /// Each instruction's tile-program statement, and `kernel.tk`, the listing whose lines they
-    /// name: from an offline twin build ([`Self::attach_twin`]); `None` where none matched.
-    pub lines: Option<Lines>,
-    pub listing: Option<String>,
+    /// Each instruction's tile-program statement, and `kernel.tk`: from an offline twin build
+    /// ([`Self::attach_twin`]); `None` where none matched.
+    pub statements: Option<Statements>,
 }
 
 /// The power state a traced dispatch ran at: the device's own clock, or a stable state pinned
@@ -274,13 +275,12 @@ impl Capture {
             workgroup: None,
             grid: None,
             pstate: None,
-            lines: None,
-            listing: None,
+            statements: None,
         })
     }
 
     /// `se<N>.att` (raw streams), `kernel.co`, `kernel.s` and `meta.json` under `dir`; with
-    /// statements, `lines.json` (ELF address to `[line, column]`) and `kernel.tk`.
+    /// statements, `lines.json` (ELF address to its [`Stmt`]) and `kernel.tk`.
     pub fn save(&self, dir: &Path) -> Result<()> {
         let code = &self.trace.code;
         io(dir, std::fs::create_dir_all(dir))?;
@@ -290,10 +290,10 @@ impl Capture {
         }
         write("kernel.co", &code.elf)?;
         write("kernel.s", self.disassembly.as_bytes())?;
-        if let Some((lines, listing)) = self.lines.as_ref().zip(self.listing.as_ref()) {
+        if let Some(s) = &self.statements {
             let path = dir.join("lines.json");
-            write("lines.json", serde_json::to_string(lines).context(JsonSnafu { path })?.as_bytes())?;
-            write("kernel.tk", listing.as_bytes())?;
+            write("lines.json", serde_json::to_string(&s.lines).context(JsonSnafu { path })?.as_bytes())?;
+            write("kernel.tk", s.listing.as_bytes())?;
         }
         let meta = Meta {
             arch: self.trace.arch.to_string(),
@@ -343,13 +343,13 @@ impl Capture {
             false => disassemble(&elf)?,
         };
         let code = Arc::new(CodeImage { elf, load_base: meta.load_base, entry_pc: meta.entry_pc });
-        let (lines, listing) = match dir.join("lines.json").exists() && dir.join("kernel.tk").exists() {
+        let statements = match dir.join("lines.json").exists() && dir.join("kernel.tk").exists() {
             true => {
                 let path = dir.join("lines.json");
                 let lines: Lines = serde_json::from_slice(&read("lines.json")?).context(JsonSnafu { path })?;
-                (Some(lines), Some(String::from_utf8_lossy(&read("kernel.tk")?).into_owned()))
+                Some(Statements { lines, listing: String::from_utf8_lossy(&read("kernel.tk")?).into_owned() })
             }
-            false => (None, None),
+            false => None,
         };
         Ok(Self {
             trace: SqttTrace { arch, per_se, code, mclk_mhz: meta.mclk_mhz },
@@ -362,8 +362,7 @@ impl Capture {
             workgroup: meta.workgroup,
             grid: meta.grid,
             pstate: meta.pstate,
-            lines,
-            listing,
+            statements,
         })
     }
 
@@ -498,7 +497,7 @@ pub struct Row {
     pub hidden_idle: i64,
     pub hidden_stall: i64,
     pub hidden_issue: i64,
-    /// Its tile-program statement `(line, column)` in `kernel.tk`, where the capture has lines.
+    /// Its tile-program statement: its `kernel.tk` line and unroll copy, where the capture has lines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stmt: Option<Stmt>,
 }
@@ -747,7 +746,7 @@ impl Analysis {
                     hidden_idle: h.idle,
                     hidden_stall: h.stall,
                     hidden_issue: h.issue,
-                    stmt: capture.lines.as_ref().and_then(|l| l.get(&(pc - base)).copied()),
+                    stmt: capture.statements.as_ref().and_then(|s| s.lines.get(&(pc - base)).copied()),
                 }
             })
             .collect();
@@ -787,8 +786,9 @@ impl Analysis {
             bound: &bound[range.clone()],
             hiding,
         });
-        let listing: Vec<String> = capture.listing.iter().flat_map(|l| l.lines()).map(str::to_string).collect();
-        let statements = capture.lines.as_ref().map(|lines| (lines, listing.as_slice()));
+        let listing: Vec<String> =
+            capture.statements.iter().flat_map(|s| s.listing.lines()).map(str::to_string).collect();
+        let statements = capture.statements.as_ref().map(|s| (&s.lines, listing.as_slice()));
         let main_loop = main_loop(&lines, &pcs, traced_waves, &replay, per_iteration, base, statements);
         let mut analysis = Self {
             kernel: kernel.to_string(),

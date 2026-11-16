@@ -721,12 +721,15 @@ fn sqtt_bench(args: &Args) -> Result<()> {
         if opts.counters != svod_runtime::profiler::PmcSelection::None {
             profiles.iter().for_each(|p| print!("{}", p.render_table()));
         }
-        let traces: Vec<_> = profiles.iter().flat_map(|p| &p.stages).flat_map(|s| &s.sqtt).collect();
+        // A program's traces, and the program they ran.
+        let traces: Vec<_> = (profiles.iter().enumerate())
+            .flat_map(|(p, profile)| profile.stages.iter().flat_map(move |s| s.sqtt.iter().map(move |t| (p, t))))
+            .collect();
         if traces.is_empty() {
             return Err("no thread trace: SQTT needs an AMD RDNA3/RDNA4 device (SVOD_DEVICE=AMD)".into());
         }
         let candidate = candidate()?;
-        for trace in traces {
+        for (program, trace) in traces {
             let Raw::Saved(dir) = &trace.raw else { unreachable!("a disk sink saves") };
             if let Err(error) = &trace.analysis {
                 return Err(format!("{}: {error}", dir.display()).into());
@@ -736,11 +739,11 @@ fn sqtt_bench(args: &Args) -> Result<()> {
             capture.model = Some(model.clone());
             capture.labels.insert("candidate_ns".into(), untraced.map_or("-".into(), |t| t.as_nanos().to_string()));
             // The statements, from a host build with a line table whose code is the traced one.
-            match tune::twin(&candidate, &mut capture) {
-                None => capture.labels.insert("lines".into(), "twin".into()),
-                Some(why) => {
+            match tune::twin(&candidate[program], &mut capture) {
+                Ok(()) => capture.labels.insert("lines".into(), "twin".into()),
+                Err(why) => {
                     eprintln!("{}: no statements: {why}", dir.display());
-                    capture.labels.insert("lines.why".into(), why);
+                    capture.labels.insert("lines.why".into(), why.to_string());
                     capture.labels.insert("lines".into(), "mismatch".into())
                 }
             };

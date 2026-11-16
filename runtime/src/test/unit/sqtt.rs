@@ -16,8 +16,8 @@ use super::statements::rollup;
 use super::verdict::{Buckets, Charge, load_bytes};
 use super::{
     Analysis, Approx, Axis, BucketDelta, Capture, Caution, Class, Diff, Evidence, Finding, FindingKind, LineRow, Lines,
-    LoopRow, Partition, Pstate, Reduction, Spread, Statement, Stmt, Unit, WaitOn, align, locate, parse_debug_line,
-    text_mismatch, text_section,
+    LoopRow, Partition, Pstate, Reduction, Spread, Statement, Statements, Stmt, TwinError, Unit, WaitOn, align, locate,
+    parse_debug_line, same_text, text_section,
 };
 
 fn fixtures() -> PathBuf {
@@ -61,8 +61,7 @@ fn capture(fixture: &str) -> Capture {
         workgroup: None,
         grid: None,
         pstate: None,
-        lines: None,
-        listing: None,
+        statements: None,
     }
 }
 
@@ -1005,6 +1004,11 @@ fn parses_debug_line_rows() {
     assert!(parse_debug_line("Address Line Column\n---- ----\n").is_empty());
 }
 
+/// The statement on `line`, unroll copy `copy`.
+fn stmt(line: u32, copy: u32) -> Stmt {
+    Stmt { line: line.try_into().unwrap(), copy }
+}
+
 #[test_case(0x0, Some((3, 0)); "a sequence's first row")]
 #[test_case(0x48, Some((3, 0)); "the row before it")]
 #[test_case(0x4c, Some((4, 2)); "its own row")]
@@ -1012,8 +1016,8 @@ fn parses_debug_line_rows() {
 #[test_case(0x5c, Some((7, 1)); "the last row")]
 #[test_case(0x60, None; "the sequence's end")]
 #[test_case(0x64, None; "past it")]
-fn locates_an_instruction(pc: u64, stmt: Option<Stmt>) {
-    assert_eq!(locate(&parse_debug_line(DWARFDUMP), [pc]).get(&pc).copied(), stmt);
+fn locates_an_instruction(pc: u64, at: Option<(u32, u32)>) {
+    assert_eq!(locate(&parse_debug_line(DWARFDUMP), [pc]).get(&pc).copied(), at.map(|(l, c)| stmt(l, c)));
 }
 
 /// Two sequences meeting at one address: the second's start wins over the first's end.
@@ -1021,20 +1025,26 @@ fn locates_an_instruction(pc: u64, stmt: Option<Stmt>) {
 fn a_sequence_start_wins_over_an_end() {
     let row = |address, line, end| LineRow { address, line, column: 0, end };
     let rows = [row(0x20, 5, false), row(0x0, 2, false), row(0x20, 0, true), row(0x40, 0, true)];
-    assert_eq!(locate(&rows, [0x10, 0x20, 0x30, 0x40]), Lines::from([(0x10, (2, 0)), (0x20, (5, 0)), (0x30, (5, 0))]));
+    let want = Lines::from([(0x10, stmt(2, 0)), (0x20, stmt(5, 0)), (0x30, stmt(5, 0))]);
+    assert_eq!(locate(&rows, [0x10, 0x20, 0x30, 0x40]), want);
 }
 
 #[test]
-fn text_mismatch_names_the_first_byte() {
+fn a_text_mismatch_names_the_first_byte() {
     let elf = capture("gfx1200/gemm").trace.code.elf.to_vec();
-    assert_eq!(text_mismatch(&elf, &elf), None);
     let (at, text) = text_section(&elf).unwrap();
+    assert_eq!(same_text(&elf, &elf).unwrap(), (at, at));
     let offset = elf.windows(text.len()).position(|w| w == text).unwrap();
     let mut other = elf.clone();
     other[offset + 8] ^= 1;
     assert_eq!(at, 0x1700, "a linked object's .text sits past its headers");
-    assert_eq!(text_mismatch(&elf, &other), Some(format!(".text differs: {0} vs {0} bytes, first at 0x8", text.len())));
-    assert_eq!(text_mismatch(&elf, b"not an elf").as_deref(), Some("a code object has no .text"));
+    let n = text.len();
+    let differs = same_text(&elf, &other);
+    assert!(matches!(differs, Err(TwinError::TextDiffers { captured, twin, at: 8 }) if captured == n && twin == n));
+    assert!(matches!(same_text(&elf, b"not an elf"), Err(TwinError::NoText)));
+    let mut c = capture("gfx1200/gemm");
+    assert!(matches!(c.attach_twin(&other, "listing"), Err(TwinError::TextDiffers { .. })));
+    assert_eq!(c.statements, None, "the capture left as it was");
 }
 
 /// Synthetic statements over a capture's instructions, by what they do: products, global loads,
@@ -1043,18 +1053,18 @@ fn with_lines(mut c: Capture) -> Capture {
     let lines = objdump_lines(&c.disassembly)
         .into_iter()
         .filter_map(|(pc, line)| {
-            let stmt = match Class::of(line) {
+            let line = match Class::of(line) {
                 Class::Matrix => 1,
                 Class::VmemLoad => 2,
                 Class::Lds => 3,
                 Class::WaitVmem | Class::WaitLgkm | Class::Barrier => return None,
                 _ => 4,
             };
-            Some((pc, (stmt, 1 + (pc as u32 / 4) % 2)))
+            Some((pc, stmt(line, 1 + (pc as u32 / 4) % 2)))
         })
         .collect();
-    c.lines = Some(lines);
-    c.listing = Some("mma a_s·b_s [steady]\n  fill a staged issue [steady]\n  lds read a_s [steady]\nother\n".into());
+    let listing = "mma a_s·b_s [steady]\n  fill a staged issue [steady]\n  lds read a_s [steady]\nother\n".into();
+    c.statements = Some(Statements { lines, listing });
     c
 }
 
@@ -1068,10 +1078,10 @@ fn statements_split_the_loop_exactly() {
     c.save(dir.path()).unwrap();
     assert!(dir.path().join("lines.json").exists() && dir.path().join("kernel.tk").exists());
     let back = Capture::load(dir.path()).unwrap();
-    assert_eq!((&back.lines, &back.listing), (&c.lines, &c.listing));
+    assert_eq!(back.statements, c.statements);
     let a = back.analyze().unwrap();
     assert_eq!(a, c.analyze().unwrap());
-    assert!(a.pcs.iter().filter(|r| r.class == Class::Matrix).all(|r| r.stmt.is_some_and(|s| s.0 == 1)));
+    assert!(a.pcs.iter().filter(|r| r.class == Class::Matrix).all(|r| r.stmt.is_some_and(|s| s.line.get() == 1)));
     assert_eq!(a.listing.len(), 4);
     let l = a.main_loop.as_ref().unwrap();
     let trips = l.trips.total as f64;
@@ -1131,7 +1141,7 @@ fn charge(issue: i64, stall: i64, wait: i64, idle: i64) -> Charge {
 #[test_case(2, 10.0, 3.0; "the product's issue and stall")]
 #[test_case(0, 2.0, 2.0; "unattributed idle")]
 fn rolls_charges_up_by_statement(line: u32, raw: f64, exposed: f64) {
-    let lines = Lines::from([(0x10, (1, 1)), (0x14, (1, 2)), (0x20, (2, 1))]);
+    let lines = Lines::from([(0x10, stmt(1, 1)), (0x14, stmt(1, 2)), (0x20, stmt(2, 1))]);
     let listing = ["fill a staged issue [steady]", "mma a_s·b_s [steady]"].map(String::from);
     let charges = BTreeMap::from([
         (0x10, charge(4, 0, 0, 0)),

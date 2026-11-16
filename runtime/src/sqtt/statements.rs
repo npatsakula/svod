@@ -59,7 +59,7 @@ pub(super) fn rollup(
     listing: &[String],
     trips: u64,
 ) -> Vec<Statement> {
-    let line = |pc: &u64| lines.get(pc).map_or(0, |s| s.0);
+    let line = |pc: &u64| lines.get(pc).map_or(0, |s| s.line.get());
     let mut by = BTreeMap::<u32, Statement>::new();
     for pc in body {
         let l = line(&pc);
@@ -94,7 +94,7 @@ impl Analysis {
     /// lines and one claims it.
     pub fn statement(&self, pc: u64) -> Option<String> {
         let at = self.pcs.binary_search_by_key(&pc, |r| r.pc).ok()?;
-        let (line, _) = self.pcs[at].stmt?;
+        let line = self.pcs[at].stmt?.line.get();
         let text = self.listing.get(line as usize - 1).map_or("?", |t| t.trim());
         Some(format!("@{line} {text}"))
     }
