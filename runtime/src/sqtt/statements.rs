@@ -4,17 +4,20 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write;
+use std::num::NonZeroU32;
 
 use serde::{Deserialize, Serialize};
 
 use super::verdict::Charge;
-use super::{Analysis, Cycles, Lines};
+use super::{Analysis, Cycles, Lines, Stmt};
 
-/// A statement's cycles in the main loop, a traced wave's a trip.
+/// A `kernel.tk` line's cycles in the main loop, a traced wave's a trip. The rollup is per line: an
+/// unrolled statement's copies sum into one, each instruction's copy staying on its
+/// [`Row::stmt`](super::Row::stmt).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Statement {
-    /// Its line in `kernel.tk`; 0 gathers the loop's instructions no statement claims.
-    pub line: u32,
+    /// Its line in `kernel.tk`; `None` gathers the loop's instructions no statement claims.
+    pub line: Option<NonZeroU32>,
     /// Its `kernel.tk` line, trimmed.
     pub text: String,
     /// The loop's instructions on it.
@@ -26,12 +29,14 @@ pub struct Statement {
     pub idle: Cycles,
 }
 
+/// `listing`'s `line`, trimmed; `?` past its end.
+pub(super) fn listed(listing: &[String], line: NonZeroU32) -> &str {
+    listing.get(line.get() as usize - 1).map_or("?", |t| t.trim())
+}
+
 impl Statement {
-    fn new(line: u32, listing: &[String]) -> Self {
-        let text = match line {
-            0 => "unattributed".into(),
-            l => listing.get(l as usize - 1).map_or("?", |t| t.trim()).into(),
-        };
+    fn new(line: Option<NonZeroU32>, listing: &[String]) -> Self {
+        let text = line.map_or("unattributed", |l| listed(listing, l)).into();
         let none = Cycles::default();
         Self { line, text, pcs: 0, issue: none, stall: none, wait: none, barrier: none, idle: none }
     }
@@ -59,8 +64,8 @@ pub(super) fn rollup(
     listing: &[String],
     trips: u64,
 ) -> Vec<Statement> {
-    let line = |pc: &u64| lines.get(pc).map_or(0, |s| s.line.get());
-    let mut by = BTreeMap::<u32, Statement>::new();
+    let line = |pc: &u64| lines.get(pc).map(|s| s.line);
+    let mut by = BTreeMap::<Option<NonZeroU32>, Statement>::new();
     for pc in body {
         let l = line(&pc);
         by.entry(l).or_insert_with(|| Statement::new(l, listing)).pcs += 1;
@@ -84,24 +89,26 @@ pub(super) fn rollup(
     }
     let mut out: Vec<Statement> = by.into_values().collect();
     out.sort_by(|a, b| {
-        (a.line == 0).cmp(&(b.line == 0)).then(b.exposed().total_cmp(&a.exposed())).then(a.line.cmp(&b.line))
+        (a.line.is_none()).cmp(&b.line.is_none()).then(b.exposed().total_cmp(&a.exposed())).then(a.line.cmp(&b.line))
     });
     out
 }
 
 impl Analysis {
-    /// The statement of the instruction at ELF address `pc`, `@line text`, where the capture has
-    /// lines and one claims it.
-    pub fn statement(&self, pc: u64) -> Option<String> {
-        let at = self.pcs.binary_search_by_key(&pc, |r| r.pc).ok()?;
-        let line = self.pcs[at].stmt?.line.get();
-        let text = self.listing.get(line as usize - 1).map_or("?", |t| t.trim());
-        Some(format!("@{line} {text}"))
+    /// The statement of the instruction at ELF address `pc`, where the capture has lines and one
+    /// claims it.
+    pub fn stmt(&self, pc: u64) -> Option<Stmt> {
+        self.pcs.binary_search_by_key(&pc, |r| r.pc).ok().and_then(|at| self.pcs[at].stmt)
     }
 
-    /// `"  @line text"` where [`Self::statement`] has one, else nothing.
-    pub(super) fn at(&self, pc: u64) -> String {
-        self.statement(pc).map_or(String::new(), |s| format!("  {s}"))
+    /// `stmt`'s `kernel.tk` line, trimmed.
+    pub fn line(&self, stmt: Stmt) -> &str {
+        listed(&self.listing, stmt.line)
+    }
+
+    /// `"  @line text"` of `stmt`, else nothing.
+    pub(super) fn at(&self, stmt: Option<Stmt>) -> String {
+        stmt.map_or(String::new(), |s| format!("  @{} {}", s.line, self.line(s)))
     }
 }
 
@@ -110,7 +117,7 @@ pub(super) fn text(a: &Analysis, o: &mut String, top: usize) {
     let Some(l) = a.main_loop.as_ref().filter(|l| !l.statements.is_empty()) else { return };
     let unit = if a.model.is_some() { "a trip" } else { "an iteration" };
     let (pcs, unattributed) =
-        l.statements.iter().fold((0, 0), |(n, u), s| (n + s.pcs, u + if s.line == 0 { s.pcs } else { 0 }));
+        l.statements.iter().fold((0, 0), |(n, u), s| (n + s.pcs, u + if s.line.is_none() { s.pcs } else { 0 }));
     let _ = writeln!(
         o,
         "== statements: main loop cycles {unit} by kernel.tk line (a wait on its binding load's); {} of {pcs} loop instructions attributed; top {top} by exposed",
@@ -121,9 +128,9 @@ pub(super) fn text(a: &Analysis, o: &mut String, top: usize) {
         "{:>5} {:>4} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}  statement",
         "line", "pcs", "issue", "stall", "wait", "barrier", "idle", "total", "exposed"
     );
-    let shown = l.statements.iter().filter(|s| s.line != 0).take(top);
-    for s in shown.chain(l.statements.iter().filter(|s| s.line == 0)) {
-        let line = if s.line == 0 { "-".into() } else { s.line.to_string() };
+    let shown = l.statements.iter().filter(|s| s.line.is_some()).take(top);
+    for s in shown.chain(l.statements.iter().filter(|s| s.line.is_none())) {
+        let line = s.line.map_or("-".into(), |l| l.to_string());
         let _ = writeln!(
             o,
             "{line:>5} {:>4} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1}  {}",

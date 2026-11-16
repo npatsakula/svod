@@ -1181,7 +1181,10 @@ fn main_loop<'a>(
         partition,
         exposed,
         ses,
-        barriers: BarrierSite::merge(sites, base),
+        barriers: BarrierSite::merge(sites, base)
+            .into_iter()
+            .map(|s| BarrierSite { stmt: stmts.and_then(|(lines, _)| lines.get(&s.pc).copied()), ..s })
+            .collect(),
         bindings: replay.waits(base, |pc| (head..=edge).contains(&pc)).bindings,
         statements,
     })

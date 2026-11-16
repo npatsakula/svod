@@ -700,7 +700,7 @@ fn barrier_names_the_last_arrivers_delay() {
     let hiding = Hiding::new(&waves, &[], &HashSet::new());
     let pass = Buckets::new(&lines).partition(&waves, &[], 0x10..=0x24, &hiding);
     let sites: Vec<_> = pass.barriers.into_values().collect();
-    assert_eq!(sites, [super::BarrierSite { pc: 0x20, hits: 2, last: 1, causes: vec![(0x14, 1)] }]);
+    assert_eq!(sites, [super::BarrierSite { pc: 0x20, hits: 2, last: 1, causes: vec![(0x14, 1)], stmt: None }]);
 }
 
 proptest! {
@@ -1048,7 +1048,7 @@ fn a_text_mismatch_names_the_first_byte() {
 }
 
 /// Synthetic statements over a capture's instructions, by what they do: products, global loads,
-/// LDS ops, the rest; waits and barriers on none.
+/// LDS ops, the rest; waits on none.
 fn with_lines(mut c: Capture) -> Capture {
     let lines = objdump_lines(&c.disassembly)
         .into_iter()
@@ -1057,7 +1057,7 @@ fn with_lines(mut c: Capture) -> Capture {
                 Class::Matrix => 1,
                 Class::VmemLoad => 2,
                 Class::Lds => 3,
-                Class::WaitVmem | Class::WaitLgkm | Class::Barrier => return None,
+                Class::WaitVmem | Class::WaitLgkm => return None,
                 _ => 4,
             };
             Some((pc, stmt(line, 1 + (pc as u32 / 4) % 2)))
@@ -1089,18 +1089,34 @@ fn statements_split_the_loop_exactly() {
     let exposed: f64 = l.statements.iter().map(Statement::exposed).sum();
     assert!((raw - l.partition.cycles as f64 / trips).abs() < 1e-6, "{raw} vs {}", l.partition.cycles as f64 / trips);
     assert!((exposed - l.exposed.cycles as f64 / trips).abs() < 1e-6);
-    let at = |line: u32| l.statements.iter().find(|s| s.line == line).unwrap();
+    let at = |line: u32| l.statements.iter().find(|s| s.line.map_or(0, |l| l.get()) == line).unwrap();
     let matrix = l.partition.issued(&[Class::Matrix]) as f64 / trips;
     assert!((at(1).issue.raw - matrix).abs() < 1e-6, "the products' issue is the mma statement's");
     let waits = l.partition.waited(|_| true) as f64 / trips;
     let bound = at(2).wait.raw + at(3).wait.raw;
     assert!(bound > 0.9 * waits, "waits sit on their loads' statements: {bound:.1} of {waits:.1}");
     assert_eq!(at(0).text, "unattributed");
-    assert_eq!(l.statements.last().unwrap().line, 0, "the unattributed last");
+    assert_eq!(l.statements.last().unwrap().line, None, "the unattributed last");
+    assert_eq!(a.line(stmt(2, 1)), "fill a staged issue [steady]");
+    assert_eq!(a.line(stmt(9, 1)), "?", "past the listing");
+    let Evidence::Waits { loads, .. } = &find(&a, FindingKind::LoadExposed).unwrap().evidence else { panic!() };
+    assert!(loads.iter().all(|l| l.stmt.is_some_and(|s| s.line.get() == 2)), "{loads:?}");
+    let sites = &l.barriers;
+    assert!(!sites.is_empty() && sites.iter().all(|s| s.stmt.is_some_and(|s| s.line.get() == 4)), "{sites:?}");
+    let stalls: Vec<_> = [FindingKind::LoadExposed, FindingKind::LdsExposed]
+        .into_iter()
+        .filter_map(|k| find(&a, k))
+        .flat_map(|f| match &f.evidence {
+            Evidence::Waits { stalls, .. } => stalls.clone(),
+            _ => vec![],
+        })
+        .collect();
+    assert!(stalls.iter().all(|s| s.stmt == a.stmt(s.pc)), "{stalls:?}");
     let text = a.text(4);
     assert!(text.contains("== statements: main loop cycles a trip by kernel.tk line"), "{text}");
     assert!(text.contains("fill a staged issue [steady]") && text.contains("unattributed"), "{text}");
     assert!(text.lines().any(|l| l.contains(" load exposed ") && l.contains("@2 fill a staged issue")), "{text}");
+    assert!(text.lines().any(|l| l.contains(" arrived last ") && l.ends_with("@4 other")), "{text}");
     let json: serde_json::Value = serde_json::from_str(&a.to_json()).unwrap();
     assert!(json["main_loop"]["statements"].is_array() && json["pcs"][0].get("stmt").is_some());
     assert!(
@@ -1150,8 +1166,8 @@ fn rolls_charges_up_by_statement(line: u32, raw: f64, exposed: f64) {
         (0x30, charge(0, 0, 0, 4)),
     ]);
     let rolled = rollup(&charges, [0x10, 0x14, 0x20, 0x24, 0x30], &lines, &listing, 2);
-    assert_eq!(rolled.iter().map(|s| s.line).collect::<Vec<_>>(), [2, 1, 0]);
-    let s = rolled.iter().find(|s| s.line == line).unwrap();
+    assert_eq!(rolled.iter().map(|s| s.line.map_or(0, |l| l.get())).collect::<Vec<_>>(), [2, 1, 0]);
+    let s = rolled.iter().find(|s| s.line == std::num::NonZeroU32::new(line)).unwrap();
     assert!((s.raw() - raw).abs() < 1e-9 && (s.exposed() - exposed).abs() < 1e-9, "{s:?}");
     assert_eq!(s.pcs, [(0, 2), (1, 2), (2, 1)].iter().find(|p| p.0 == line).unwrap().1);
     assert_eq!(

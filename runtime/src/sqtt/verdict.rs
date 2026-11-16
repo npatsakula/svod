@@ -14,7 +14,7 @@ use svod_device::sqtt::hidden::Hiding;
 use svod_device::sqtt::report::Spread;
 use svod_device::sqtt::wave::{Instruction, Wave};
 
-use super::{Analysis, Class, Pstate, Row};
+use super::{Analysis, Class, Pstate, Row, Stmt};
 
 /// Exposed vector-memory waits at a tenth of the loop's cycles: below it, moving loads or deepening
 /// the ring repays less than its register and LDS cost.
@@ -305,6 +305,9 @@ pub struct BarrierSite {
     pub hits: usize,
     pub last: usize,
     pub causes: Vec<(u64, usize)>,
+    /// Its statement, where the capture has lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stmt: Option<Stmt>,
 }
 
 impl BarrierSite {
@@ -485,6 +488,9 @@ pub struct Load {
     /// wait there.
     pub wait: u64,
     pub consumer: String,
+    /// Its statement, where the capture has lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stmt: Option<Stmt>,
 }
 
 impl Load {
@@ -504,6 +510,9 @@ pub struct Stall {
     pub asm: String,
     pub per_trip: f64,
     pub exposed_per_trip: f64,
+    /// Its statement, where the capture has lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stmt: Option<Stmt>,
 }
 
 /// A trip's cycles of a bucket, and those other pipes' work did not hide.
@@ -523,6 +532,7 @@ fn stalls(a: &Analysis, class: Class, trips: f64) -> Vec<Stall> {
         asm: r.asm.clone(),
         per_trip: r.stall as f64 / trips,
         exposed_per_trip: (r.stall - r.hidden_stall.clamp(0, r.stall)) as f64 / trips,
+        stmt: r.stmt,
     };
     rows.into_iter().map(stall).filter(|s| s.exposed_per_trip >= 1.0).take(EVIDENCE).collect()
 }
@@ -649,6 +659,7 @@ fn loads(a: &Analysis, class: Class, trips: f64) -> Vec<Load> {
                 distance: b.distance.clone(),
                 wait,
                 consumer: next(wait),
+                stmt: rows[&b.pc].stmt,
             })
         })
         .collect();
@@ -980,7 +991,7 @@ pub(super) fn text(a: &Analysis, o: &mut String) {
                         o,
                         "   {pc:#x} stalled {per:.0}/{unit} before issue, exposed {exposed:.0}  {}{}",
                         s.asm,
-                        a.at(pc)
+                        a.at(s.stmt)
                     );
                 }
                 for l in loads {
@@ -1002,7 +1013,7 @@ pub(super) fn text(a: &Analysis, o: &mut String) {
                         l.waits,
                         distance.join(","),
                         l.asm,
-                        a.at(l.pc)
+                        a.at(l.stmt)
                     );
                 }
             }
@@ -1013,7 +1024,9 @@ pub(super) fn text(a: &Analysis, o: &mut String) {
                         .causes
                         .iter()
                         .take(EVIDENCE)
-                        .map(|(pc, n)| format!("{pc:#x} {} x{n}{}", asm.get(pc).copied().unwrap_or("?"), a.at(*pc)))
+                        .map(|(pc, n)| {
+                            format!("{pc:#x} {} x{n}{}", asm.get(pc).copied().unwrap_or("?"), a.at(a.stmt(*pc)))
+                        })
                         .collect();
                     let after =
                         if causes.is_empty() { String::new() } else { format!(", after {}", causes.join("; ")) };
@@ -1024,13 +1037,13 @@ pub(super) fn text(a: &Analysis, o: &mut String) {
                         s.pc,
                         s.last,
                         s.hits,
-                        a.at(s.pc)
+                        a.at(s.stmt)
                     );
                 }
             }
             Evidence::Overhead { divergent, .. } => {
                 for (pc, asm) in divergent {
-                    let _ = writeln!(o, "   {pc:#x} {asm}{}", a.at(*pc));
+                    let _ = writeln!(o, "   {pc:#x} {asm}{}", a.at(a.stmt(*pc)));
                 }
             }
             _ => {}
