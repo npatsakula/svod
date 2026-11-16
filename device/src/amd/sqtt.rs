@@ -269,7 +269,7 @@ pub(crate) struct Capture {
     config: SqttConfig,
     arch: AmdArch,
     ses: u32,
-    code: Option<CodeImage>,
+    code: Arc<CodeImage>,
     mclk_mhz: Option<u64>,
 }
 
@@ -280,7 +280,7 @@ impl Capture {
         allocator: &AmdAllocator,
         config: SqttConfig,
         workgroups: u64,
-        code: Option<CodeImage>,
+        code: Arc<CodeImage>,
     ) -> Result<Self> {
         let core = allocator.dev.core();
         let arch = core.arch;
@@ -359,7 +359,7 @@ pub struct SqttHandle {
     config: SqttConfig,
     arch: AmdArch,
     ses: u32,
-    code: Option<CodeImage>,
+    code: Arc<CodeImage>,
     mclk_mhz: Option<u64>,
 }
 
@@ -414,7 +414,7 @@ impl DispatchTimestamps for SqttHandle {
                 SeTrace { se, itrace: (self.config.se_mask >> se) & 1 == 1, bytes, truncated }
             })
             .collect();
-        Some(SqttTrace { arch: self.arch, per_se, code: self.code.clone(), mclk_mhz: self.mclk_mhz })
+        Some(SqttTrace { arch: self.arch, per_se, code: Arc::clone(&self.code), mclk_mhz: self.mclk_mhz })
     }
 }
 

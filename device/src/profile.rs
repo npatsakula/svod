@@ -6,6 +6,7 @@
 //! see one profiling vocabulary.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// An AMD hardware counter: the SQ block (gfx11/RDNA3.5), which answers the
 /// ILP/occupancy question: VALU instructions issued vs SQ-busy cycles, plus
@@ -252,9 +253,9 @@ pub struct SeTrace {
 
 /// The traced kernel's code object and where it ran, for mapping trace PCs
 /// back to instructions: a PC `p` is ELF address `p - load_base`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CodeImage {
-    pub elf: Vec<u8>,
+    pub elf: Arc<[u8]>,
     pub load_base: u64,
     pub entry_pc: u64,
 }
@@ -264,8 +265,7 @@ pub struct CodeImage {
 pub struct SqttTrace {
     pub arch: svod_dtype::AmdArch,
     pub per_se: Vec<SeTrace>,
-    /// `None` when the program was loaded before tracing was first armed.
-    pub code: Option<CodeImage>,
+    pub code: Arc<CodeImage>,
     /// The memory clock level current when the dispatch was armed (`pp_dpm_mclk`), where sysfs has one.
     pub mclk_mhz: Option<u64>,
 }

@@ -378,18 +378,16 @@ fn pstate_parses(s: &str) -> Result<crate::profile::StablePstate, String> {
 }
 
 #[test]
-fn set_sqtt_arms_disarms_and_retains_code() {
+fn set_sqtt_arms_and_disarms() {
     let (_iface, allocator) = mock_device(1);
     let core = Arc::clone(allocator.dev.core());
     let owner = OwnerCtx::new(Arc::clone(&core), allocator);
-    assert!(!core.retains_code());
     assert!(matches!(
         owner.set_sqtt(Some(SqttConfig { simds: SqttSimds::cycle(&[9]), ..SqttConfig::default() })),
         Err(Error::SqttUnsupported { .. })
     ));
     owner.set_sqtt(Some(SqttConfig::default())).unwrap();
     assert_eq!(owner.sqtt_config(), Some(SqttConfig::default()));
-    assert!(core.retains_code());
     owner.set_sqtt(None).unwrap();
     assert_eq!(owner.sqtt_config(), None);
 }
@@ -401,9 +399,9 @@ fn handle_reads_each_se_window_after_retirement() {
     let pool = crate::amd::signal::SignalPool::new(&allocator, 64).unwrap();
     let signal = Arc::new(pool.acquire().unwrap());
     let finalizer = SubmissionFinalizer::timeline(Arc::clone(&signal), 1, None);
-    let code = CodeImage { elf: b"\x7fELF".to_vec(), load_base: 0x1000, entry_pc: 0x1100 };
+    let code = Arc::new(CodeImage { elf: b"\x7fELF"[..].into(), load_base: 0x1000, entry_pc: 0x1100 });
     let cfg = SqttConfig { bytes_per_se: 4096, se_mask: 0b1, ..SqttConfig::default() };
-    let capture = Capture::new(&allocator, cfg, 1, Some(code.clone())).unwrap();
+    let capture = Capture::new(&allocator, cfg, 1, Arc::clone(&code)).unwrap();
     let copies: Vec<u64> = decode(&capture.stop)
         .into_iter()
         .filter_map(|p| match p {
@@ -428,7 +426,7 @@ fn handle_reads_each_se_window_after_retirement() {
     signal.reset(1);
     let trace = handle.sqtt().expect("retired");
     assert_eq!(trace.arch, AmdArch::Gfx1100);
-    assert_eq!(trace.code, Some(code));
+    assert!(Arc::ptr_eq(&trace.code, &code), "the trace shares the program's image");
     assert_eq!(trace.mclk_mhz, None, "the synthetic device has no render node");
     let [se] = &trace.per_se[..] else { panic!("one SE") };
     assert_eq!((se.se, se.itrace, se.truncated), (0, true, false));

@@ -305,9 +305,8 @@ pub struct AmdProgram {
     /// Shared by the program and every captured/in-flight command that can
     /// execute it. The allocation is released only after the last GPU use.
     code: Arc<CodeObject>,
-    /// The ELF and where it loaded, kept for SQTT's PC mapping when the device
-    /// retains code ([`AmdDeviceCore::retain_code`](crate::amd::AmdDeviceCore::retain_code)).
-    image: Option<crate::profile::CodeImage>,
+    /// The ELF and where it loaded, for SQTT's PC mapping.
+    image: Arc<crate::profile::CodeImage>,
 }
 
 impl AmdProgram {
@@ -473,11 +472,8 @@ impl AmdProgram {
             );
         }
 
-        let image = device.core().retains_code().then(|| crate::profile::CodeImage {
-            elf: bytes.to_vec(),
-            load_base: code_gpu,
-            entry_pc: pm4_prog_addr,
-        });
+        let image =
+            Arc::new(crate::profile::CodeImage { elf: bytes.into(), load_base: code_gpu, entry_pc: pm4_prog_addr });
         Ok(Self {
             name: kernel_name.to_string(),
             device_id: allocator.device_id,
@@ -720,7 +716,7 @@ impl AmdProgram {
                 owner.allocator(),
                 config,
                 (g[0] * g[1] * g[2]) as u64,
-                self.image.clone(),
+                Arc::clone(&self.image),
             )?),
             None => None,
         };

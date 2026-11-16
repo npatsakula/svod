@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use proptest::prelude::*;
 use svod_device::profile::{CodeImage, SeTrace, SqttTrace};
@@ -47,7 +48,7 @@ fn capture(fixture: &str) -> Capture {
         });
         (read("kernel.co"), text("kernel.s"), golden["base"].as_u64().unwrap(), ses.collect())
     };
-    let code = Some(CodeImage { elf, load_base, entry_pc: 0 });
+    let code = Arc::new(CodeImage { elf: elf.into(), load_base, entry_pc: 0 });
     let trace = SqttTrace { arch: arch(&disassembly), per_se, code, mclk_mhz: None };
     Capture {
         trace,
@@ -220,7 +221,7 @@ fn profile_report_lists_traces() {
         index: 1,
         kernel: "k".into(),
         dir: "sqtt/001_k".into(),
-        analysis: Err(super::Error::NoCode.into()),
+        analysis: Err(super::Error::NoItrace.into()),
     };
     let mut stage = crate::StageProfile::host("profile", std::time::Duration::ZERO);
     stage.sqtt = vec![ok, failed];
@@ -229,7 +230,7 @@ fn profile_report_lists_traces() {
     assert!(lines[1].starts_with("thread traces (SQTT"), "{report}");
     assert!(lines[2].starts_with("  #0 sqtt/000__Z9vectoropsv: _Z9vectoropsv gfx1200: 8 traced waves; time valu 51%"));
     assert!(lines[2].ends_with("main loop 16 iterations/wave at 7960 cycles (median)."), "{report}");
-    assert!(lines[3].starts_with("  #1 k: SQTT: the trace carries no code image"), "{report}");
+    assert!(lines[3].starts_with("  #1 k: SQTT: no instruction-traced shader engine"), "{report}");
 }
 
 #[test]
@@ -242,12 +243,10 @@ fn flags_truncation() {
 }
 
 #[test]
-fn refuses_a_trace_without_code_or_itrace() {
+fn refuses_a_trace_without_itrace() {
     let mut c = capture("amd/strix_barrier");
     c.trace.per_se[0].itrace = false;
     assert!(matches!(c.analyze(), Err(super::Error::NoItrace)));
-    c.trace.code = None;
-    assert!(matches!(c.analyze(), Err(super::Error::NoCode)));
 }
 
 /// Where this machine has `llvm-objdump`, a loaded directory without `kernel.s` disassembles to the
@@ -333,7 +332,7 @@ fn svod_capture(name: &str, grid: [u32; 3]) -> Capture {
     let mut capture = Capture::load(&fixtures().join("svod").join(name)).unwrap();
     assert_eq!((capture.resources, capture.workgroup, capture.grid), (None, None, None), "older captures load");
     assert_eq!(capture.trace.mclk_mhz, None);
-    let elf = &capture.trace.code.as_ref().unwrap().elf;
+    let elf = &capture.trace.code.elf;
     let major = capture.trace.arch.gfx_major();
     capture.resources = Some(svod_device::amd::program::kernel_resources(elf, "gemm", major).unwrap());
     (capture.workgroup, capture.grid) = (Some([256, 1, 1]), Some(grid));
@@ -935,7 +934,7 @@ fn a_sequence_start_wins_over_an_end() {
 
 #[test]
 fn text_mismatch_names_the_first_byte() {
-    let elf = capture("gfx1200/gemm").trace.code.unwrap().elf;
+    let elf = capture("gfx1200/gemm").trace.code.elf.to_vec();
     assert_eq!(text_mismatch(&elf, &elf), None);
     let (at, text) = text_section(&elf).unwrap();
     let offset = elf.windows(text.len()).position(|w| w == text).unwrap();

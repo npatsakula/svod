@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt, Snafu};
@@ -49,8 +50,6 @@ pub enum Error {
     Io { source: std::io::Error, path: PathBuf },
     #[snafu(display("{}: {source}", path.display()))]
     Json { source: serde_json::Error, path: PathBuf },
-    #[snafu(display("the trace carries no code image: set SVOD_SQTT=1 before the device opens"))]
-    NoCode,
     #[snafu(display("no instruction-traced shader engine has an RDNA3/RDNA4 trace header"))]
     NoItrace,
     #[snafu(display("{arch}: not an AMD arch"))]
@@ -183,7 +182,7 @@ fn io<T>(path: &Path, result: std::io::Result<T>) -> Result<T> {
 impl Capture {
     /// Disassembles the trace's code image.
     pub fn new(trace: SqttTrace, kernel_ns: Option<u64>) -> Result<Self> {
-        let disassembly = disassemble(&trace.code.as_ref().context(NoCodeSnafu)?.elf)?;
+        let disassembly = disassemble(&trace.code.elf)?;
         Ok(Self {
             trace,
             disassembly,
@@ -202,7 +201,7 @@ impl Capture {
     /// `se<N>.att` (raw streams), `kernel.co`, `kernel.s` and `meta.json` under `dir`; with
     /// statements, `lines.json` (ELF address to `[line, column]`) and `kernel.tk`.
     pub fn save(&self, dir: &Path) -> Result<()> {
-        let code = self.trace.code.as_ref().context(NoCodeSnafu)?;
+        let code = &self.trace.code;
         io(dir, std::fs::create_dir_all(dir))?;
         let write = |name: &str, bytes: &[u8]| io(&dir.join(name), std::fs::write(dir.join(name), bytes));
         for se in &self.trace.per_se {
@@ -256,12 +255,12 @@ impl Capture {
                 })
             })
             .collect::<Result<_>>()?;
-        let elf = if dir.join("kernel.co").exists() { read("kernel.co")? } else { vec![] };
+        let elf: Arc<[u8]> = if dir.join("kernel.co").exists() { read("kernel.co")?.into() } else { Arc::default() };
         let disassembly = match dir.join("kernel.s").exists() {
             true => String::from_utf8_lossy(&read("kernel.s")?).into_owned(),
             false => disassemble(&elf)?,
         };
-        let code = Some(CodeImage { elf, load_base: meta.load_base, entry_pc: meta.entry_pc });
+        let code = Arc::new(CodeImage { elf, load_base: meta.load_base, entry_pc: meta.entry_pc });
         let (lines, listing) = match dir.join("lines.json").exists() && dir.join("kernel.tk").exists() {
             true => {
                 let path = dir.join("lines.json");
@@ -567,7 +566,7 @@ impl Analysis {
     }
 
     fn of(capture: &Capture) -> Result<Self> {
-        let code = capture.trace.code.as_ref().context(NoCodeSnafu)?;
+        let code = &capture.trace.code;
         let base = code.load_base;
         let lines: Vec<(u64, &str)> =
             objdump_lines(&capture.disassembly).into_iter().map(|(pc, line)| (pc + base, line)).collect();

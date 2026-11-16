@@ -783,7 +783,7 @@ impl svod_device::DispatchTimestamps for TracedHandle {
         self.retired.load(std::sync::atomic::Ordering::SeqCst).then(|| svod_device::profile::SqttTrace {
             arch: svod_dtype::AmdArch::Gfx1201,
             per_se: vec![],
-            code: None,
+            code: Arc::default(),
             mclk_mhz: None,
         })
     }

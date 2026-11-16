@@ -216,9 +216,6 @@ pub struct AmdDeviceCore {
     /// a per-device flag (not an env var) so tests toggle it without a process-
     /// global env race and `=0` can't accidentally enable it.
     pm4_graph: AtomicBool,
-    /// Programs loaded while set keep their ELF for SQTT's PC mapping. Sticky:
-    /// set by the device factory (`SVOD_SQTT=1`) or the first armed trace.
-    retain_code: AtomicBool,
     /// Whether compute queues take raw PM4 rather than AQL packets, decided once
     /// when the device opens (see [`AmdComputeQueue::will_use_pm4`]).
     ///
@@ -338,7 +335,6 @@ impl AmdDevice {
             iface,
             has_sdma_queue: AtomicBool::new(false),
             pm4_graph: AtomicBool::new(false),
-            retain_code: AtomicBool::new(false),
             pm4_queues,
             poisoned: AtomicBool::new(false),
             error_msg: OnceLock::new(),
@@ -431,7 +427,6 @@ impl AmdDevice {
             iface,
             has_sdma_queue: AtomicBool::new(false),
             pm4_graph: AtomicBool::new(false),
-            retain_code: AtomicBool::new(false),
             pm4_queues,
             poisoned: AtomicBool::new(false),
             error_msg: OnceLock::new(),
@@ -682,16 +677,6 @@ impl AmdDeviceCore {
     #[inline]
     pub fn pm4_graph(&self) -> bool {
         self.pm4_graph.load(Ordering::Acquire)
-    }
-
-    /// Keep the ELF of programs loaded from now on, for SQTT's PC mapping.
-    pub fn retain_code(&self) {
-        self.retain_code.store(true, Ordering::Release);
-    }
-
-    #[inline]
-    pub fn retains_code(&self) -> bool {
-        self.retain_code.load(Ordering::Acquire)
     }
 
     /// Whether this device's compute queues are PM4 (see

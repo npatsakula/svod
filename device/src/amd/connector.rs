@@ -988,7 +988,6 @@ impl crate::device::PlanContext for OwnerCtx {
                 Err(error) => return Err(error).context(crate::error::SqttPowerStateSnafu),
             },
         };
-        self.core.retain_code();
         *armed = Some(ArmedSqtt { config, pstate });
         Ok(())
     }

@@ -8,8 +8,7 @@ use std::collections::BTreeMap;
 use object::{Object, ObjectSection};
 use svod_device::sqtt::stitch::objdump_lines;
 
-use super::{Capture, NoCodeSnafu, Result, run_tool};
-use snafu::OptionExt;
+use super::{Capture, Result, run_tool};
 
 /// A statement's line in `kernel.tk` (from 1) and its unroll copy (from 1; 0 outside an unrolled
 /// loop), as a line table holds them.
@@ -84,7 +83,7 @@ impl Capture {
     /// the captured instructions, kept as [`Self::lines`] and [`Self::listing`] where the two
     /// `.text`s are one; else why not, the capture left as it was.
     pub fn attach_twin(&mut self, twin: &[u8], listing: &str) -> Result<Option<String>> {
-        let captured = &self.trace.code.as_ref().context(NoCodeSnafu)?.elf;
+        let captured = &self.trace.code.elf;
         if let Some(why) = text_mismatch(captured, twin) {
             return Ok(Some(why));
         }

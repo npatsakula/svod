@@ -89,11 +89,6 @@ fn main() -> Result<()> {
         println!("{USAGE}");
         return Ok(());
     };
-    if command == "sqtt" {
-        // SAFETY: no other thread runs yet. The AMD device keeps the code
-        // objects a trace maps its PCs through only when this is set as it opens.
-        unsafe { std::env::set_var("SVOD_SQTT", "1") };
-    }
     // The tuner's picks and round times under `RUST_LOG=svod_tk=debug`.
     let filter = tracing_subscriber::EnvFilter::from_default_env();
     tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).without_time().init();

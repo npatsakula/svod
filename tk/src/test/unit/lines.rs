@@ -5,6 +5,7 @@
 //! each family an RDNA arch runs; the whole sweep is `#[ignore]`d.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use rayon::prelude::*;
 use svod_device::profile::{CodeImage, SqttTrace};
@@ -217,7 +218,7 @@ fn matrix_instructions_sit_on_the_product_statement() {
         arch,
         per_se: vec![],
         mclk_mhz: None,
-        code: Some(CodeImage { elf: elf.to_vec(), load_base: 1 << 40, entry_pc: 1 << 40 }),
+        code: Arc::new(CodeImage { elf: elf.into(), load_base: 1 << 40, entry_pc: 1 << 40 }),
     };
     let mut capture = Capture::new(trace(&built.object), None).unwrap();
     assert_eq!(capture.attach_twin(&built.object, &listing).unwrap(), None);
