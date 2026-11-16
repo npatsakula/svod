@@ -12,6 +12,7 @@ pub(crate) mod heads;
 pub(crate) mod linear;
 pub(crate) mod nearest;
 pub(crate) mod norm;
+pub(crate) mod scatter;
 pub mod shape;
 
 use std::cell::RefCell;
@@ -34,6 +35,7 @@ pub use self::nearest::{
     MARGIN, Metric, Nearest, QuantScheme, Quantized, Rerank, Search, k_nearest, k_nearest_reranked, nearest,
 };
 pub use self::norm::{add_layer_norm, add_rms_norm, layer_norm, rms_norm};
+pub use self::scatter::scatter_add;
 use crate::atoms::{Device, Target};
 pub use crate::kernels::Act;
 use crate::kernels::Batch;
@@ -138,6 +140,10 @@ pub enum Error {
     },
     #[snafu(display("{op}: {source}"))]
     Launch { op: &'static str, source: crate::launch::Error },
+    #[snafu(display("{op}: {device:?} has no atomic add of {dtype:?}, and the graph's scatter is O(rows × target)"))]
+    NoAtomicAdd { op: &'static str, device: DeviceSpec, dtype: DType },
+    #[snafu(display("{op}: {operand} is not a realized buffer"))]
+    Unrealized { op: &'static str, operand: &'static str },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

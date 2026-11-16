@@ -71,7 +71,13 @@ impl MmaIn for I8 {
     }
 }
 
-/// How a kernel touches a parameter: reads it, writes it, or both.
+/// An element an atomic add takes ([`Kernel::atomic_add`]).
+pub trait Accumulable: Elem {}
+impl Accumulable for I32 {}
+impl Accumulable for F32 {}
+
+/// How a kernel touches a parameter: reads it, writes it, both, or adds to
+/// it ([`Accum`]).
 pub trait Access: Copy {
     const KIND: ParamKind;
 }
@@ -84,7 +90,7 @@ macro_rules! access {
         }
     )*};
 }
-access!(In, Out, InOut);
+access!(In, Out, InOut, Accum);
 
 pub trait TierMark: Copy {}
 /// A tier a register tile is loaded from.
@@ -103,6 +109,14 @@ impl Readable for Global<In> {}
 impl Readable for Global<InOut> {}
 impl Writable for Global<Out> {}
 impl Writable for Global<InOut> {}
+
+/// Rows of an accumulator under their gate ([`Kernel::gather_accum`]): only
+/// [`Kernel::atomic_add`] takes one. A view of an accumulator is
+/// `Global<Accum>`, which nothing reads, stores to or adds to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Added;
+impl TierMark for Added {}
+impl Window for Added {}
 
 macro_rules! tier {
     ($($name:ident),*) => {$(
@@ -467,6 +481,48 @@ impl<'k> Kernel<'k> {
         self.param(name, elems)
     }
 
+    /// A parameter of `elems` elements the kernel adds to and never reads or
+    /// stores to ([`Self::atomic_add`]). What it holds is the launch's.
+    ///
+    /// ```compile_fail,E0277
+    /// use svod_tk::build::*;
+    /// use svod_tk::ir::Shape;
+    /// Kernel::record("read", |k| {
+    ///     let p = k.accum::<I32>("p", 4);
+    ///     let v = k.view(p, 0, [4, 1], Shape::new(1, 4), [None, None]);
+    ///     k.load(v); // an accumulator is not `Readable`
+    /// });
+    /// ```
+    ///
+    /// ```compile_fail,E0277
+    /// use svod_tk::build::*;
+    /// use svod_tk::ir::Shape;
+    /// Kernel::record("store", |k| {
+    ///     let p = k.accum::<I32>("p", 4);
+    ///     let v = k.splat::<I32>(Shape::new(1, 4), 1);
+    ///     let out = k.view(p, 0, [4, 1], Shape::new(1, 4), [None, None]);
+    ///     k.store(out, v); // an accumulator is not `Writable`
+    /// });
+    /// ```
+    ///
+    /// ```compile_fail,E0308
+    /// use svod_tk::build::*;
+    /// Kernel::record("read", |k| {
+    ///     let p = k.accum::<I32>("p", 4);
+    ///     k.load_scalar(p, 0); // an accumulator is not `In`
+    /// });
+    /// ```
+    ///
+    /// ```compile_fail,E0277
+    /// use svod_tk::build::*;
+    /// Kernel::record("half", |k| {
+    ///     k.accum::<F16>("p", 4); // no atomic add of f16
+    /// });
+    /// ```
+    pub fn accum<T: Accumulable>(&mut self, name: impl Into<String>, elems: usize) -> ParamRef<'k, T, Accum> {
+        self.param(name, elems)
+    }
+
     /// A symbolic variable in `min..=max` the launch binds by name, counting
     /// in `i32` as every range does; asked for again, the same variable over
     /// the same range. An empty range panics.
@@ -615,6 +671,35 @@ impl<'k> Kernel<'k> {
             shape,
             Place::Global { param: param.0, offset, stride, bounds, rows: Some(rows), period: None },
         ))
+    }
+
+    /// The elements of an accumulator [`Self::atomic_add`] adds to, as
+    /// [`Self::gather`] picks them: row `r`, column `c` is
+    /// `offset + rows[Row := r] + c`, and a row where `valid[Row := r]` is
+    /// zero drops its update. `valid` is required: the author says where a row
+    /// is inside the parameter, and that no two rows of the tile are one
+    /// update (a padded tile's clamped row, say).
+    ///
+    /// ```compile_fail,E0308
+    /// use svod_tk::build::*;
+    /// use svod_tk::ir::Shape;
+    /// Kernel::record("ungated", |k| {
+    ///     let p = k.accum::<I32>("p", 4);
+    ///     let v = k.splat::<I32>(Shape::new(4, 1), 1);
+    ///     let row = k.row();
+    ///     let dst = k.gather(p, 0, row, None, Shape::new(4, 1), None);
+    ///     k.atomic_add(dst, v); // a gather is no gated accumulator
+    /// });
+    /// ```
+    pub fn gather_accum<T: Accumulable>(
+        &mut self,
+        param: ParamRef<'k, T, Accum>,
+        offset: impl Into<Sc<'k>>,
+        rows: Sc<'k>,
+        valid: Sc<'k>,
+        shape: Shape,
+    ) -> Tile<'k, Added, T> {
+        Tile::new(self.gather(param, offset, rows, Some(valid), shape, None).0)
     }
 
     /// `view` with its columns repeating every `period`: column `c` reads
@@ -1099,6 +1184,25 @@ impl<'k> Kernel<'k> {
     /// });
     /// ```
     pub fn store<T: Elem, P: Writable>(&mut self, dst: Tile<'k, P, T>, src: Regs<'k, T>) {
+        self.copy(dst.0, src.0, CopyMode::Sync);
+    }
+
+    /// `dst += src`, element by element: every thread adds what it holds and
+    /// no thread sees another's add before the dispatch ends. The sum is
+    /// exact for `i32`, which wraps; for `f32` its rounding depends on the
+    /// order the threads land in.
+    ///
+    /// ```compile_fail,E0308
+    /// use svod_tk::build::*;
+    /// use svod_tk::ir::Shape;
+    /// Kernel::record("into_out", |k| {
+    ///     let p = k.output::<I32>("p", 4);
+    ///     let v = k.splat::<I32>(Shape::new(1, 4), 1);
+    ///     let out = k.view(p, 0, [4, 1], Shape::new(1, 4), [None, None]);
+    ///     k.atomic_add(out, v); // an output is no accumulator
+    /// });
+    /// ```
+    pub fn atomic_add<T: Accumulable>(&mut self, dst: Tile<'k, Added, T>, src: Regs<'k, T>) {
         self.copy(dst.0, src.0, CopyMode::Sync);
     }
 
