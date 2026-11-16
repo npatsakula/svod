@@ -5,9 +5,9 @@ use proptest::prelude::*;
 use test_case::test_case;
 
 use super::fixture::stitched;
+use crate::sqtt::Category;
 use crate::sqtt::hidden::{self, Hidden};
 use crate::sqtt::wave::{Instruction, OtherSimd, Wave};
-use crate::sqtt::{Category, Unit};
 
 /// AMD's `hidden_latency.py` on the fixture's SE, `{scope: {ELF pc: [idle, stall, issue]}}`: the
 /// decoder library's records through the Python package (`analyze_hidden_latency`).
@@ -100,8 +100,7 @@ proptest! {
                         inst
                     })
                     .collect();
-                Wave { unit: Unit::default(), me: 0, pipe: 0, begin: 0, end: time, complete: true, contexts: 0,
-                    exclude_barrier_wait: false, instructions, pcs: vec![] }
+                Wave { end: time, complete: true, instructions, ..Wave::default() }
             })
             .collect();
         let other = [OtherSimd { time: 3, category: Category::Vmem, cycles: 5 }];

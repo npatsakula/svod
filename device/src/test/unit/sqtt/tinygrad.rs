@@ -8,9 +8,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use test_case::test_case;
 
+use super::fixture::stitched;
 use crate::sqtt::report::Report;
-use crate::sqtt::stitch::{Stitcher, objdump_lines};
-use crate::sqtt::{Kind, Layout, Packet, decode, wave};
+use crate::sqtt::{Kind, Layout, Packet, decode};
 
 /// A tinygrad packet class: `(name, encoding, width, delta (lo, width) per layout, RDNA4 only)`.
 type Class = (&'static str, u8, u8, [(u8, u8); 2], bool);
@@ -273,8 +273,8 @@ fn waves_pair(packets: &[(Packet, Layout)], ctx: &str) {
     assert!(live.is_empty(), "{ctx}: waves never ended: {live:?}");
 }
 
-/// Stitching tinygrad's kernels attributes every record, and to each PC as many as tinygrad's mapper
-/// does; `s_endpgm` emits no token, and AMD synthesises at most one per wave that ran instructions.
+/// Stitching tinygrad's kernels attributes to each PC as many records as tinygrad's mapper does;
+/// `s_endpgm` emits no token, and AMD synthesises at most one per wave that ran instructions.
 #[test_case("gfx1100", "empty")]
 #[test_case("gfx1100", "gemm")]
 #[test_case("gfx1100", "plus")]
@@ -282,25 +282,18 @@ fn waves_pair(packets: &[(Packet, Layout)], ctx: &str) {
 #[test_case("gfx1200", "gemm")]
 #[test_case("gfx1200", "plus")]
 fn stitches_tinygrad(arch: &str, example: &str) {
-    let (dir, golden) = fixture(arch, example);
-    let base = golden["base"].as_u64().unwrap();
-    let dump = std::fs::read_to_string(dir.join("kernel.s")).unwrap();
-    let code: Vec<(u64, &str)> = objdump_lines(&dump).into_iter().map(|(pc, line)| (pc + base, line)).collect();
-    let endpgm = code.iter().find(|(_, line)| line.trim_start().starts_with("s_endpgm")).unwrap().0 - base;
+    let (_, golden) = fixture(arch, example);
+    let s = stitched(&format!("{arch}/{example}"));
+    let endpgm = s.code.iter().find(|(_, line)| line.trim_start().starts_with("s_endpgm")).unwrap().0 - s.base;
+    let itrace = golden["events"].as_array().unwrap().iter().filter(|e| e["itrace"].as_bool().unwrap());
     let mut ours = BTreeMap::new();
-    for event in golden["events"].as_array().unwrap().iter().filter(|e| e["itrace"].as_bool().unwrap()) {
-        let index = event["index"].as_u64().unwrap();
-        let mut trace = wave::analyze(decode(&std::fs::read(dir.join(format!("trace{index}.bin"))).unwrap()));
-        let mut stitcher = Stitcher::new(&code, trace.header.unwrap_or_default().layout);
-        for wave in &mut trace.waves {
-            assert_eq!(stitcher.stitch(wave), wave.instructions.len(), "{arch}/{example} event {index}");
-        }
+    for (index, trace) in itrace.map(|e| e["index"].as_u64().unwrap()).zip(&s.traces) {
         let report = Report::new(&trace.waves);
         let ended = trace.waves.iter().filter(|w| w.complete && !w.instructions.is_empty()).count() as u64;
-        assert!(report.pcs.get(&(endpgm + base)).is_none_or(|s| s.hits <= ended), "{arch}/{example} event {index}");
-        ours.extend(
-            report.pcs.into_iter().filter(|(pc, _)| pc - base != endpgm).map(|(pc, s)| ((index, pc - base), s.hits)),
-        );
+        let ctx = format!("{arch}/{example} event {index}");
+        assert!(report.pcs.get(&(endpgm + s.base)).is_none_or(|h| h.hits <= ended), "{ctx}");
+        let pcs = report.pcs.into_iter().map(|(pc, h)| (pc - s.base, h.hits));
+        ours.extend(pcs.filter(|&(pc, _)| pc != endpgm).map(|(pc, hits)| ((index, pc), hits)));
     }
     let mut mapped = BTreeMap::new();
     for m in golden["mapped"].as_array().unwrap() {

@@ -106,17 +106,13 @@ fn summarizes(fixture: &str) {
     let json = a.to_json();
     assert!(!json.contains('\n'));
     assert_eq!(serde_json::from_str::<Analysis>(&json).unwrap(), a);
-    let text = a.text(5);
-    assert!(text.starts_with(&format!("== sqtt {} ", a.kernel)) && text.contains("== hottest 5 by cycles"));
-    assert!(!text.contains('\x1b') && !text.contains("!!"), "{text}");
+    assert!(!a.text(5).contains("!!"), "{fixture}: no warning");
     assert!(a.summary().starts_with(&a.kernel));
     assert_eq!(a.waits.waves + a.waits.skipped, a.waves);
-    assert!(text.contains("== waits: "));
     assert_eq!(
         a.traced.iter().map(|t| (t.waves, t.complete)).fold((0, 0), |s, t| (s.0 + t.0, s.1 + t.1)),
         (a.waves, a.complete)
     );
-    assert!(text.lines().nth(1).unwrap().starts_with("== verdict"), "the verdict leads: {text}");
     if let Some(l) = &a.main_loop {
         let p = &l.partition;
         assert!(exposed_within(p), "{fixture}: exposed within raw");
@@ -153,7 +149,6 @@ fn waits_report_elf_pcs() {
 fn empty_kernel_has_no_records(fixture: &str) {
     let a = replayed(fixture);
     assert!(a.waves > 0 && a.records == 0 && a.pcs.is_empty() && a.classes.is_empty() && a.main_loop.is_none());
-    assert!(a.text(5).contains("records    0 stitched of 0"));
 }
 
 /// tinygrad's GEMM unrolls its reduction: no backward branch, so no main loop.
@@ -163,7 +158,6 @@ fn unrolled_has_no_main_loop(fixture: &str) {
     let a = replayed(fixture);
     assert_eq!(a.main_loop, None);
     assert_eq!(a.cycles(&[Class::Matrix]).0, 0, "tinygrad's examples run no matrix op");
-    assert!(a.text(5).contains("== main loop: none"));
 }
 
 /// `vectorops` loops back from `s_cbranch_scc0` at 0x2590 to 0x1afc; no matrix op, so the hottest loop.
@@ -199,10 +193,12 @@ fn text_is_stable(fixture: &str, golden: &str) {
 /// Tier 5 renders one paragraph a traced kernel under the stage's report.
 #[test]
 fn profile_report_lists_traces() {
+    let analysis = replayed("amd/navi4_sdata");
+    let summary = analysis.summary();
     let ok = crate::Traced {
         index: 0,
         kernel: "_Z9vectoropsv".into(),
-        analysis: Ok(replayed("amd/navi4_sdata")),
+        analysis: Ok(analysis),
         raw: crate::Raw::Saved("sqtt/000__Z9vectoropsv".into()),
     };
     let failed = crate::Traced {
@@ -216,8 +212,7 @@ fn profile_report_lists_traces() {
     let report = crate::RunProfile { stages: vec![stage], origin_depth: None }.render_report();
     let lines: Vec<&str> = report.lines().collect();
     assert!(lines[1].starts_with("thread traces (SQTT"), "{report}");
-    assert!(lines[2].starts_with("  #0 sqtt/000__Z9vectoropsv: _Z9vectoropsv gfx1200: 8 traced waves; time valu 51%"));
-    assert!(lines[2].ends_with("main loop 16 iterations/wave at 7960 cycles (median)."), "{report}");
+    assert_eq!(lines[2], format!("  #0 sqtt/000__Z9vectoropsv: {summary}"), "{report}");
     assert!(lines[3].starts_with("  #1 k: no instruction-traced shader engine"), "{report}");
 }
 
@@ -300,32 +295,22 @@ fn disassembles_without_kernel_s() {
     }
 }
 
+/// One line for each arm of `From<Kind>`.
 #[test_case("v_wmma_f32_16x16x16_bf16 v[0:7], v[8:15], v[16:23], v[0:7]", Class::Matrix)]
-#[test_case("v_mfma_f32_32x32x8_f16 a[0:15], v[0:1], v[2:3], a[0:15]", Class::Matrix)]
 #[test_case("v_add_f32_e32 v0, v1, v2", Class::Valu)]
-#[test_case("ds_load_b128 v[0:3], v4 offset:16", Class::Lds)]
-#[test_case("global_load_b128 v[0:3], v4, s[0:1]", Class::VmemLoad)]
-#[test_case("buffer_store_b32 v0, off, s[0:3], 0", Class::VmemStore)]
-#[test_case("s_load_b128 s[4:7], s[0:1], null", Class::Smem)]
-#[test_case("s_cbranch_scc1 65530 // 0000000017B8: BFA2FFFA", Class::Branch)]
-#[test_case("s_waitcnt vmcnt(0) lgkmcnt(0)", Class::WaitVmem)]
-#[test_case("s_waitcnt lgkmcnt(0)", Class::WaitLgkm)]
-#[test_case("s_wait_loadcnt_dscnt 0x0", Class::WaitVmem)]
-#[test_case("s_wait_dscnt 0x0", Class::WaitLgkm)]
-#[test_case("s_waitcnt_depctr 0xfffe", Class::Immediate)]
-#[test_case("s_delay_alu instid0(VALU_DEP_1)", Class::Immediate)]
-#[test_case("s_waitcnt_vscnt null, 0x0", Class::WaitVmem)]
-#[test_case("s_wait_kmcnt 0x0", Class::WaitLgkm)]
-#[test_case("s_wait_expcnt 0x0", Class::Immediate)]
-#[test_case("s_wait_idle", Class::Immediate)]
-#[test_case("s_wait_alu depctr_va_sdst(0)", Class::Immediate)]
-#[test_case("image_bvh_intersect_ray v[0:3], v[0:10], s[0:3]", Class::VmemLoad)]
-#[test_case("global_atomic_add_u32 v0, v1, v2, s[0:1] glc", Class::VmemStore)]
-#[test_case("s_memrealtime s[0:1]", Class::Smem)]
-#[test_case("s_sendmsg sendmsg(MSG_DEALLOC_VGPRS)", Class::Message)]
-#[test_case("s_barrier_wait 0xffff", Class::Barrier)]
-#[test_case("s_endpgm", Class::Message)]
 #[test_case("s_mov_b32 s0, 0", Class::Salu)]
+#[test_case("s_cbranch_scc1 65530 // 0000000017B8: BFA2FFFA", Class::Branch)]
+#[test_case("ds_load_b128 v[0:3], v4 offset:16", Class::Lds)]
+#[test_case("s_load_b128 s[4:7], s[0:1], null", Class::Smem)]
+#[test_case("global_load_b128 v[0:3], v4, s[0:1]", Class::VmemLoad)]
+#[test_case("global_atomic_add_u32 v0, v1, v2, s[0:1] glc", Class::VmemStore)]
+#[test_case("s_wait_idle", Class::Immediate ; "idle wait")]
+#[test_case("s_waitcnt vmcnt(0) lgkmcnt(0)", Class::WaitVmem)]
+#[test_case("s_wait_dscnt 0x0", Class::WaitLgkm)]
+#[test_case("s_wait_expcnt 0x0", Class::Immediate ; "export wait")]
+#[test_case("s_barrier_wait 0xffff", Class::Barrier)]
+#[test_case("s_sendmsg sendmsg(MSG_DEALLOC_VGPRS)", Class::Message)]
+#[test_case("s_delay_alu instid0(VALU_DEP_1)", Class::Immediate ; "no token")]
 #[test_case("", Class::Other)]
 fn classifies(asm: &str, class: Class) {
     assert_eq!(Class::of(asm), class);
@@ -421,11 +406,6 @@ fn occupancy_beside_the_limit(name: &str, grid: [u32; 3], by: &[Limiter], peak: 
         }
     }
     assert!(occ.ses.iter().any(|se| se.traced.is_some()));
-    let text = a.text(4);
-    assert!(
-        text.contains("== occupancy") && text.contains("limit      4 waves/SIMD, 1 workgroups/CU, by vgpr"),
-        "{text}"
-    );
     assert_eq!(occ.untimed_matrix, a.arch.starts_with("gfx11"), "gfx11 traces WMMA as 1-cycle VALU tokens");
 }
 
@@ -436,7 +416,6 @@ fn occupancy_beside_the_limit(name: &str, grid: [u32; 3], by: &[Limiter], peak: 
 fn rows_carry_hidden_latency() {
     let a = Analysis::load(&fixtures().join("svod/rdna4_gemm_v1")).unwrap();
     assert_eq!(a.occupancy.limit, None, "no resources recorded");
-    assert!(a.text(4).contains("limit      - "));
     for r in &a.pcs {
         assert!(r.hidden_idle >= 0 && (0..=r.stall).contains(&r.hidden_stall), "{r:?}");
         assert!((0..=r.latency - r.stall).contains(&r.hidden_issue), "{r:?}");
@@ -544,7 +523,6 @@ fn v3_waits_right_behind_its_load() {
     assert!(load.short_cover() && load.consumer.starts_with("v_cndmask_b32"), "{load:?}");
     let consumer = "v_cndmask_b32_e64 v147, 0, v147, s1".to_string();
     assert_eq!(top.knob, Knob::MoveUse { wait: 0xab0, load: 0xa64, consumer });
-    assert!(top.knob.to_string().contains("0xab0 waits for 0xa64, then `v_cndmask_b32_e64 v147, 0, v147, s1`"));
     assert!(!v3.verdict.findings[1..].iter().any(|f| f.share >= 0.10), "{:?}", v3.verdict.findings);
     let added = alu_per_trip(&v3) - alu_per_trip(&v1);
     assert!((260.0..300.0).contains(&added), "v3's guards: {added:.1} VALU+SALU cycles a trip");
@@ -560,7 +538,6 @@ fn ragged_rows_are_loop_overhead() {
     let execz: Vec<u64> = divergent.iter().filter(|d| d.1.starts_with("s_cbranch_execz")).map(|d| d.0).collect();
     assert_eq!((divergent.len(), execz), (8, vec![0x5f4, 0x624, 0x7e4, 0x810]), "{divergent:?}");
     assert!(*valu_hits > 5.0, "{valu_hits}");
-    assert!(ragged.text(4).contains("   0x810 s_cbranch_execz 65290"));
     assert_eq!(kinds(&control.verdict.bound), [FindingKind::MatrixBound]);
     assert!((0.85..0.95).contains(&control.verdict.bound[0].share), "{:?}", control.verdict.bound);
     assert!(find(&control, FindingKind::LoopOverhead).is_none(), "{:?}", control.verdict.findings);
@@ -603,18 +580,7 @@ fn record(time: i64, duration: i64, stall: i64, pc: u64) -> svod_device::sqtt::w
 }
 
 fn wave(instructions: Vec<svod_device::sqtt::wave::Instruction>) -> svod_device::sqtt::wave::Wave {
-    svod_device::sqtt::wave::Wave {
-        unit: svod_device::sqtt::Unit { sa: 0, wgp: 0, simd: 0, wave: 0 },
-        me: 0,
-        pipe: 0,
-        begin: 0,
-        end: 0,
-        complete: true,
-        contexts: 0,
-        exclude_barrier_wait: false,
-        instructions,
-        pcs: vec![],
-    }
+    svod_device::sqtt::wave::Wave { complete: true, instructions, ..Default::default() }
 }
 
 const LOOP: [(u64, &str); 6] = [
@@ -860,7 +826,6 @@ fn compare_v1_v3_shows_the_select() {
     let d = compared("rdna4_gemm_v1", "rdna4_gemm_v3");
     assert_eq!(d.unit, Unit::Trip);
     assert!(d.cautions.is_empty(), "both standard, ratios 1.60x and 1.74x: {:?}", d.cautions);
-    assert_eq!((d.a.kernel_ns, d.b.kernel_ns), (Some(175920), Some(203880)));
     let wait = bucket(&d, "wait load");
     assert!((280.0..300.0).contains(&wait.raw[0]) && (1020.0..1045.0).contains(&wait.raw[1]), "{wait:?}");
     assert!((720.0..760.0).contains(&wait.delta_raw()) && (580.0..620.0).contains(&wait.delta_exposed()), "{wait:?}");

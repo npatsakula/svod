@@ -7,7 +7,7 @@ use super::fixture::stitched;
 use crate::sqtt::asm::{Counter, Kind, classify};
 use crate::sqtt::waits::{Replay, Waits};
 use crate::sqtt::wave::{Instruction, Wave};
-use crate::sqtt::{Category, Layout, Unit};
+use crate::sqtt::{Category, Layout};
 
 /// `s_cbranch_scc1` from line `from` to line `to` of a program at 4 bytes a line.
 fn branch(from: usize, to: usize) -> String {
@@ -38,19 +38,7 @@ fn wave(program: &[String], path: &[usize], stall: i64) -> Wave {
         })
         .collect::<Vec<_>>();
     let end = instructions.last().map_or(0, |i| i.time + i.duration);
-    let pcs = vec![(0, 0)];
-    Wave {
-        unit: Unit::default(),
-        me: 0,
-        pipe: 0,
-        begin: 0,
-        end,
-        complete: true,
-        contexts: 0,
-        exclude_barrier_wait: false,
-        instructions,
-        pcs,
-    }
+    Wave { end, complete: true, instructions, pcs: vec![(0, 0)], ..Wave::default() }
 }
 
 fn analyze(layout: Layout, program: &[String], waves: &[Wave]) -> Waits {

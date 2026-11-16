@@ -9,7 +9,7 @@ use crate::sqtt::simd::Residency;
 use crate::sqtt::stitch::{Stitcher, objdump_lines};
 use crate::sqtt::waits::Replay;
 use crate::sqtt::wave::{Instruction, Wave, analyze};
-use crate::sqtt::{Category, Header, InstOp, Kind, Layout, Packet, Popcount, Unit, decode};
+use crate::sqtt::{Category, Header, InstOp, Kind, Layout, Packet, Popcount, decode};
 
 /// Packs `(value, nibbles)` tokens into a little-endian nibble stream, NOP-padded to whole bytes.
 fn stream(tokens: &[(u128, usize)]) -> Vec<u8> {
@@ -304,18 +304,8 @@ const LOOP: &str = "
 ";
 
 fn wave(categories: &[Category], start: u64) -> Wave {
-    Wave {
-        unit: Unit::default(),
-        me: 0,
-        pipe: 0,
-        begin: 0,
-        end: 0,
-        complete: true,
-        contexts: 0,
-        exclude_barrier_wait: false,
-        instructions: categories.iter().enumerate().map(|(t, &c)| record(t as i64, c, 1, 0)).collect(),
-        pcs: vec![(0, start)],
-    }
+    let instructions = categories.iter().enumerate().map(|(t, &c)| record(t as i64, c, 1, 0)).collect();
+    Wave { complete: true, instructions, pcs: vec![(0, start)], ..Wave::default() }
 }
 
 #[test]

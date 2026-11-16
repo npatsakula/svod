@@ -17,7 +17,7 @@ pub struct Instruction {
     pub pc: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Wave {
     pub unit: Unit,
     pub me: u8,
