@@ -275,8 +275,9 @@ of AMD's rocprof-trace-decoder, checked against its control CSVs) over `llvm-obj
 - **Any plan**: `ProfileOptions { sqtt: Some(SqttOptions::default()), .. }` adds Tier 5 (`SqttOptions::from_env()?` reads
   `SVOD_SQTT=1`); the profile report then ends with one summary line a kernel, the dirs under `Sink::Disk` (`./sqtt`,
   `SVOD_SQTT_DIR`), or each capture held with `Sink::Memory`. The traced pass syncs after each kernel and frees its `64 MiB × SEs` before the next.
-- **Offline replay**: a dir holds `se<N>.att` (raw), `kernel.co`, `kernel.s`, `meta.json` (arch, load base, untraced and
-  traced ns, labels: cfg, shape, `model.*` terms). `tk_bench sqtt --load DIR [--json] [--attribute]` or
+- **Offline replay**: a dir holds `se<N>.att` (raw), `kernel.co`, `kernel.s`, `meta.json` (`format`, which a load
+  checks; arch, load base, untraced and traced ns, labels: cfg, shape; `model`: the trip's reduction, the trips an
+  iteration, the price terms), `lines.json` and `kernel.tk` where the twin build attached. `tk_bench sqtt --load DIR [--json] [--attribute]` or
   `svod_runtime::sqtt::Analysis::load(dir)` re-analyze with no GPU (`llvm-objdump` only if `kernel.s` is gone).
 - **Reading the report** (`Analysis::text`, fixed format, `== ` a section; `--json` is one line):
   `!! TRUNCATED` (buffer filled: totals undercount) or `!! UNSTITCHED` first; `verdict`: `ceiling` (matrix pipe busy

@@ -10,7 +10,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use snafu::{OptionExt, ResultExt, Snafu};
+use snafu::{OptionExt, ResultExt, Snafu, ensure};
 use svod_device::amd::occupancy::{Cu, Limit, limits};
 use svod_device::profile::{CodeImage, KernelResources, SeTrace, SqttTrace, StablePstate};
 use svod_device::sqtt::asm::{self, Access, Counter, Kind, Memory, Space};
@@ -58,7 +58,12 @@ pub enum Error {
     Header { se: u32, version: u8 },
     #[snafu(display("{arch}: not an AMD arch"))]
     Arch { arch: String },
+    #[snafu(display("{}: capture format {found:?}, this build reads {FORMAT}; capture it again", path.display()))]
+    Format { path: PathBuf, found: Option<u32> },
 }
+
+/// The `meta.json` layout [`Capture::load`] reads; bumped whenever it changes.
+pub const FORMAT: u32 = 1;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -226,27 +231,26 @@ impl Pstate {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Meta {
+    format: u32,
     arch: String,
     load_base: u64,
     entry_pc: u64,
     kernel_ns: Option<u64>,
-    #[serde(default)]
     traced_ns: Option<u64>,
     ses: Vec<SeMeta>,
-    #[serde(default)]
     labels: BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     model: Option<Model>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     resources: Option<KernelResources>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     workgroup: Option<[u32; 3]>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     grid: Option<[u32; 3]>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pstate: Option<Pstate>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     mclk_mhz: Option<u64>,
+}
+
+/// A `meta.json`'s format alone, read before the rest.
+#[derive(Deserialize)]
+struct Version {
+    format: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -296,6 +300,7 @@ impl Capture {
             write("kernel.tk", s.listing.as_bytes())?;
         }
         let meta = Meta {
+            format: FORMAT,
             arch: self.trace.arch.to_string(),
             load_base: code.load_base,
             entry_pc: code.entry_pc,
@@ -323,7 +328,10 @@ impl Capture {
     pub fn load(dir: &Path) -> Result<Self> {
         let read = |name: &str| io(&dir.join(name), std::fs::read(dir.join(name)));
         let path = dir.join("meta.json");
-        let meta: Meta = serde_json::from_slice(&read("meta.json")?).context(JsonSnafu { path })?;
+        let bytes = read("meta.json")?;
+        let found = serde_json::from_slice::<Version>(&bytes).context(JsonSnafu { path: &path })?.format;
+        ensure!(found == Some(FORMAT), FormatSnafu { path, found });
+        let meta: Meta = serde_json::from_slice(&bytes).context(JsonSnafu { path })?;
         let arch = AmdArch::parse(&meta.arch).context(ArchSnafu { arch: &meta.arch })?;
         let per_se = meta
             .ses
@@ -604,7 +612,6 @@ pub struct Analysis {
     /// Shader clock: the longest instruction-traced SE's wave span over `traced_ns`, else `kernel_ns`.
     pub sclk_mhz: Option<u64>,
     /// Memory clock level current when the dispatch was armed.
-    #[serde(default)]
     pub mclk_mhz: Option<u64>,
     /// Instruction records of the traced waves, and those a PC was attributed to.
     pub records: usize,

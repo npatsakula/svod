@@ -263,6 +263,22 @@ fn names_a_foreign_header() {
     assert!(matches!(c.analyze(), Err(super::Error::Header { se: 0, version: 5 })));
 }
 
+/// A `meta.json` of another format, or of none, is refused before its fields are read.
+#[test_case(Some(0))]
+#[test_case(Some(crate::sqtt::FORMAT + 1))]
+#[test_case(None)]
+fn refuses_another_format(format: Option<u32>) {
+    let dir = tempfile::tempdir().unwrap();
+    capture("amd/strix_barrier").save(dir.path()).unwrap();
+    let path = dir.path().join("meta.json");
+    let mut meta: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    meta["format"] = format.into();
+    meta.as_object_mut().unwrap().remove("arch");
+    std::fs::write(&path, meta.to_string()).unwrap();
+    let refused = Capture::load(dir.path());
+    assert!(matches!(&refused, Err(super::Error::Format { found, .. }) if *found == format), "{refused:?}");
+}
+
 #[test]
 fn refuses_a_trace_without_itrace() {
     let mut c = capture("amd/strix_barrier");
