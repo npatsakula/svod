@@ -1,719 +1,169 @@
 {
-"target": "gfx1100",
-"base": 35184388898816,
-"events": [
-{
-"index": 0,
-"se": 0,
-"itrace": true,
-"bytes": 4640,
-"packets": 1938,
-"kinds": {
-"EVENT": 16,
-"LAYOUT_HEADER": 1,
-"NOP": 1174,
-"REG": 308,
-"SNAPSHOT": 7,
-"TS_DELTA_OR_MARK": 136,
-"TS_DELTA_SHORT": 114,
-"TS_WAVE_STATE": 182
-},
-"last_time": 17905286,
-"sha256_kind_time": "28aa6c2c1a340c861e3c25297c87f6d1b249446ba7a730ed9dfe15181e5dd718",
-"head": [
-[
-"LAYOUT_HEADER",
-0,
-{
-"flag4": 0,
-"group": 0,
-"layout": 3,
-"sel_a": 6,
-"sel_b": 0,
-"simd": 0
-}
-],
-[
-"TS_WAVE_STATE",
-77,
-{
-"coarse": 0
-}
-],
-[
-"REG",
-77,
-{
-"hi_byte": 2,
-"slot": 4,
-"subop": 49664,
-"val32": 1073807360
-}
-],
-[
-"NOP",
-77,
-{}
-],
-[
-"NOP",
-77,
-{}
-],
-[
-"NOP",
-77,
-{}
-],
-[
-"NOP",
-77,
-{}
-],
-[
-"NOP",
-77,
-{}
-],
-[
-"NOP",
-77,
-{}
-],
-[
-"NOP",
-77,
-{}
-],
-[
-"NOP",
-77,
-{}
-],
-[
-"NOP",
-77,
-{}
-]
-],
-"sha256_fields": "22eb400aa7fa84c0156a0911fc96bc971d163144081ae5f39823be9542b625a6"
-},
-{
-"index": 1,
-"se": 1,
-"itrace": true,
-"bytes": 4672,
-"packets": 1932,
-"kinds": {
-"ALUEXEC": 4,
-"EVENT": 16,
-"IMMEDIATE": 4,
-"INST": 5,
-"LAYOUT_HEADER": 1,
-"NOP": 1142,
-"REG": 307,
-"SNAPSHOT": 7,
-"TS_DELTA_OR_MARK": 138,
-"TS_DELTA_SHORT": 117,
-"TS_WAVE_STATE": 184,
-"VALUINST": 2,
-"VMEMEXEC": 3,
-"WAVEEND": 1,
-"WAVESTART": 1
-},
-"last_time": 17859155,
-"sha256_kind_time": "812e6c71a73ebda5b731769fd61ae0ad796ee4e20854b53848d9701e6dd2b89c",
-"head": [
-[
-"LAYOUT_HEADER",
-0,
-{
-"flag4": 0,
-"group": 0,
-"layout": 3,
-"sel_a": 6,
-"sel_b": 0,
-"simd": 0
-}
-],
-[
-"TS_WAVE_STATE",
-76,
-{
-"coarse": 0
-}
-],
-[
-"REG",
-76,
-{
-"hi_byte": 2,
-"slot": 4,
-"subop": 49664,
-"val32": 1073872896
-}
-],
-[
-"TS_DELTA_OR_MARK",
-1997,
-{
-"delta": 1921,
-"pl": 0,
-"rt": 0
-}
-],
-[
-"REG",
-1997,
-{
-"hi_byte": 130,
-"slot": 4,
-"subop": 30,
-"val32": 1
-}
-],
-[
-"NOP",
-1997,
-{}
-],
-[
-"NOP",
-1997,
-{}
-],
-[
-"NOP",
-1997,
-{}
-],
-[
-"NOP",
-1997,
-{}
-],
-[
-"NOP",
-1997,
-{}
-],
-[
-"NOP",
-1997,
-{}
-],
-[
-"NOP",
-1997,
-{}
-]
-],
-"sha256_fields": "b03960558e6680234f2c8960fc68f32a96f434767ae0c4098cfca648c1557b1f"
-},
-{
-"index": 2,
-"se": 2,
-"itrace": false,
-"bytes": 4672,
-"packets": 1978,
-"kinds": {
-"EVENT": 17,
-"LAYOUT_HEADER": 1,
-"NOP": 1213,
-"REG": 308,
-"SNAPSHOT": 7,
-"TS_DELTA_OR_MARK": 137,
-"TS_DELTA_SHORT": 114,
-"TS_WAVE_STATE": 181
-},
-"last_time": 17884579,
-"sha256_kind_time": "51048bace2d09529b4031c91242207acfd7745c48f5d1f8d140e5d1be9ca70a0",
-"head": [
-[
-"LAYOUT_HEADER",
-0,
-{
-"flag4": 0,
-"group": 0,
-"layout": 3,
-"sel_a": 6,
-"sel_b": 0,
-"simd": 0
-}
-],
-[
-"TS_WAVE_STATE",
-77,
-{
-"coarse": 0
-}
-],
-[
-"REG",
-77,
-{
-"hi_byte": 2,
-"slot": 4,
-"subop": 49664,
-"val32": 1073938432
-}
-],
-[
-"TS_DELTA_OR_MARK",
-1543,
-{
-"delta": 1466,
-"pl": 0,
-"rt": 0
-}
-],
-[
-"REG",
-1543,
-{
-"hi_byte": 130,
-"slot": 4,
-"subop": 30,
-"val32": 1
-}
-],
-[
-"NOP",
-1543,
-{}
-],
-[
-"NOP",
-1543,
-{}
-],
-[
-"NOP",
-1543,
-{}
-],
-[
-"NOP",
-1543,
-{}
-],
-[
-"NOP",
-1543,
-{}
-],
-[
-"NOP",
-1543,
-{}
-],
-[
-"NOP",
-1543,
-{}
-]
-],
-"sha256_fields": "4a43bc4c8ca51b0b0406760a57de9c62f82185234ee0b0e414e75d5f5286bfe5"
-},
-{
-"index": 3,
-"se": 3,
-"itrace": false,
-"bytes": 4704,
-"packets": 2029,
-"kinds": {
-"EVENT": 18,
-"LAYOUT_HEADER": 1,
-"NOP": 1261,
-"REG": 309,
-"SNAPSHOT": 7,
-"TS_DELTA_OR_MARK": 137,
-"TS_DELTA_SHORT": 117,
-"TS_WAVE_STATE": 179
-},
-"last_time": 17885965,
-"sha256_kind_time": "53ed7a41d39a49d22d58222badc3c39d9c43707d3b45bc59033c497c7a1cf870",
-"head": [
-[
-"LAYOUT_HEADER",
-0,
-{
-"flag4": 0,
-"group": 0,
-"layout": 3,
-"sel_a": 6,
-"sel_b": 0,
-"simd": 0
-}
-],
-[
-"TS_WAVE_STATE",
-77,
-{
-"coarse": 0
-}
-],
-[
-"REG",
-77,
-{
-"hi_byte": 2,
-"slot": 4,
-"subop": 49664,
-"val32": 1074003968
-}
-],
-[
-"TS_DELTA_OR_MARK",
-1086,
-{
-"delta": 1009,
-"pl": 0,
-"rt": 0
-}
-],
-[
-"REG",
-1086,
-{
-"hi_byte": 130,
-"slot": 4,
-"subop": 30,
-"val32": 1
-}
-],
-[
-"NOP",
-1086,
-{}
-],
-[
-"NOP",
-1086,
-{}
-],
-[
-"NOP",
-1086,
-{}
-],
-[
-"NOP",
-1086,
-{}
-],
-[
-"NOP",
-1086,
-{}
-],
-[
-"NOP",
-1086,
-{}
-],
-[
-"NOP",
-1086,
-{}
-]
-],
-"sha256_fields": "4721e7cccb1597a85283716ad38d0cabb512c9dc2eae03d224d4aa9fc74fa38b"
-},
-{
-"index": 4,
-"se": 4,
-"itrace": false,
-"bytes": 4736,
-"packets": 2056,
-"kinds": {
-"EVENT": 19,
-"LAYOUT_HEADER": 1,
-"NOP": 1285,
-"REG": 310,
-"SNAPSHOT": 7,
-"TS_DELTA_OR_MARK": 137,
-"TS_DELTA_SHORT": 114,
-"TS_WAVE_STATE": 183
-},
-"last_time": 17889594,
-"sha256_kind_time": "056c21808b1609f294a0e7fb45fb4891d535643fc1d9365b18e260200ef60a51",
-"head": [
-[
-"LAYOUT_HEADER",
-0,
-{
-"flag4": 0,
-"group": 0,
-"layout": 3,
-"sel_a": 6,
-"sel_b": 0,
-"simd": 0
-}
-],
-[
-"TS_WAVE_STATE",
-77,
-{
-"coarse": 0
-}
-],
-[
-"REG",
-77,
-{
-"hi_byte": 2,
-"slot": 4,
-"subop": 49664,
-"val32": 1074069504
-}
-],
-[
-"TS_DELTA_OR_MARK",
-615,
-{
-"delta": 538,
-"pl": 0,
-"rt": 0
-}
-],
-[
-"REG",
-615,
-{
-"hi_byte": 130,
-"slot": 4,
-"subop": 30,
-"val32": 1
-}
-],
-[
-"NOP",
-615,
-{}
-],
-[
-"NOP",
-615,
-{}
-],
-[
-"NOP",
-615,
-{}
-],
-[
-"NOP",
-615,
-{}
-],
-[
-"NOP",
-615,
-{}
-],
-[
-"NOP",
-615,
-{}
-],
-[
-"NOP",
-615,
-{}
-]
-],
-"sha256_fields": "a788315fc667010b5c4ee414fa035b774e71c89e61cc8099356733dc906cba10"
-},
-{
-"index": 5,
-"se": 5,
-"itrace": false,
-"bytes": 4704,
-"packets": 1962,
-"kinds": {
-"EVENT": 20,
-"LAYOUT_HEADER": 1,
-"NOP": 1187,
-"REG": 311,
-"SNAPSHOT": 7,
-"TS_DELTA_OR_MARK": 137,
-"TS_DELTA_SHORT": 114,
-"TS_WAVE_STATE": 185
-},
-"last_time": 17871294,
-"sha256_kind_time": "f85f1273cdcf021d0b2921136b380b8fc7ceadf1be4a33d0eebe0846408c70a2",
-"head": [
-[
-"LAYOUT_HEADER",
-0,
-{
-"flag4": 0,
-"group": 0,
-"layout": 3,
-"sel_a": 6,
-"sel_b": 0,
-"simd": 0
-}
-],
-[
-"TS_WAVE_STATE",
-77,
-{
-"coarse": 0
-}
-],
-[
-"REG",
-77,
-{
-"hi_byte": 2,
-"slot": 4,
-"subop": 49664,
-"val32": 3758096384
-}
-],
-[
-"TS_WAVE_STATE",
-157,
-{
-"coarse": 0
-}
-],
-[
-"REG",
-157,
-{
-"hi_byte": 130,
-"slot": 4,
-"subop": 30,
-"val32": 1
-}
-],
-[
-"NOP",
-157,
-{}
-],
-[
-"NOP",
-157,
-{}
-],
-[
-"NOP",
-157,
-{}
-],
-[
-"NOP",
-157,
-{}
-],
-[
-"TS_DELTA_OR_MARK",
-997,
-{
-"delta": 840,
-"pl": 0,
-"rt": 0
-}
-],
-[
-"TS_WAVE_STATE",
-997,
-{
-"coarse": 2
-}
-],
-[
-"TS_WAVE_STATE",
-1005,
-{
-"coarse": 2
-}
-]
-],
-"sha256_fields": "75ea3e77de51517cf5450bdec7464a31f247b5e38927e719075a90d554b187ac"
-}
-],
-"mapped": [
-[
-1,
-"IMMEDIATE",
-1527245,
-0,
-5632
-],
-[
-1,
-"INST",
-1527246,
-0,
-5636
-],
-[
-1,
-"INST",
-1527247,
-0,
-5644
-],
-[
-1,
-"VALUINST",
-1527248,
-0,
-5652
-],
-[
-1,
-"IMMEDIATE",
-1528652,
-0,
-5656
-],
-[
-1,
-"IMMEDIATE",
-1528653,
-0,
-5660
-],
-[
-1,
-"INST",
-1528654,
-0,
-5664
-],
-[
-1,
-"INST",
-1528655,
-0,
-5672
-],
-[
-1,
-"IMMEDIATE",
-1529440,
-0,
-5680
-],
-[
-1,
-"VALUINST",
-1529441,
-0,
-5684
-],
-[
-1,
-"INST",
-1529458,
-0,
-5688
-]
-]
+  "target": "gfx1100",
+  "base": 35184388898816,
+  "events": [
+    {
+      "index": 0,
+      "se": 0,
+      "itrace": true,
+      "bytes": 4640,
+      "packets": 1938,
+      "kinds": {"EVENT": 16, "LAYOUT_HEADER": 1, "NOP": 1174, "REG": 308, "SNAPSHOT": 7, "TS_DELTA_OR_MARK": 136, "TS_DELTA_SHORT": 114, "TS_WAVE_STATE": 182},
+      "last_time": 17905286,
+      "sha256_kind_time": "28aa6c2c1a340c861e3c25297c87f6d1b249446ba7a730ed9dfe15181e5dd718",
+      "head": [
+        ["LAYOUT_HEADER", 0, {"flag4": 0, "group": 0, "layout": 3, "sel_a": 6, "sel_b": 0, "simd": 0}],
+        ["TS_WAVE_STATE", 77, {"coarse": 0}],
+        ["REG", 77, {"hi_byte": 2, "slot": 4, "subop": 49664, "val32": 1073807360}],
+        ["NOP", 77, {}],
+        ["NOP", 77, {}],
+        ["NOP", 77, {}],
+        ["NOP", 77, {}],
+        ["NOP", 77, {}],
+        ["NOP", 77, {}],
+        ["NOP", 77, {}],
+        ["NOP", 77, {}],
+        ["NOP", 77, {}]
+      ],
+      "sha256_fields": "22eb400aa7fa84c0156a0911fc96bc971d163144081ae5f39823be9542b625a6"
+    },
+    {
+      "index": 1,
+      "se": 1,
+      "itrace": true,
+      "bytes": 4672,
+      "packets": 1932,
+      "kinds": {"ALUEXEC": 4, "EVENT": 16, "IMMEDIATE": 4, "INST": 5, "LAYOUT_HEADER": 1, "NOP": 1142, "REG": 307, "SNAPSHOT": 7, "TS_DELTA_OR_MARK": 138, "TS_DELTA_SHORT": 117, "TS_WAVE_STATE": 184, "VALUINST": 2, "VMEMEXEC": 3, "WAVEEND": 1, "WAVESTART": 1},
+      "last_time": 17859155,
+      "sha256_kind_time": "812e6c71a73ebda5b731769fd61ae0ad796ee4e20854b53848d9701e6dd2b89c",
+      "head": [
+        ["LAYOUT_HEADER", 0, {"flag4": 0, "group": 0, "layout": 3, "sel_a": 6, "sel_b": 0, "simd": 0}],
+        ["TS_WAVE_STATE", 76, {"coarse": 0}],
+        ["REG", 76, {"hi_byte": 2, "slot": 4, "subop": 49664, "val32": 1073872896}],
+        ["TS_DELTA_OR_MARK", 1997, {"delta": 1921, "pl": 0, "rt": 0}],
+        ["REG", 1997, {"hi_byte": 130, "slot": 4, "subop": 30, "val32": 1}],
+        ["NOP", 1997, {}],
+        ["NOP", 1997, {}],
+        ["NOP", 1997, {}],
+        ["NOP", 1997, {}],
+        ["NOP", 1997, {}],
+        ["NOP", 1997, {}],
+        ["NOP", 1997, {}]
+      ],
+      "sha256_fields": "b03960558e6680234f2c8960fc68f32a96f434767ae0c4098cfca648c1557b1f"
+    },
+    {
+      "index": 2,
+      "se": 2,
+      "itrace": false,
+      "bytes": 4672,
+      "packets": 1978,
+      "kinds": {"EVENT": 17, "LAYOUT_HEADER": 1, "NOP": 1213, "REG": 308, "SNAPSHOT": 7, "TS_DELTA_OR_MARK": 137, "TS_DELTA_SHORT": 114, "TS_WAVE_STATE": 181},
+      "last_time": 17884579,
+      "sha256_kind_time": "51048bace2d09529b4031c91242207acfd7745c48f5d1f8d140e5d1be9ca70a0",
+      "head": [
+        ["LAYOUT_HEADER", 0, {"flag4": 0, "group": 0, "layout": 3, "sel_a": 6, "sel_b": 0, "simd": 0}],
+        ["TS_WAVE_STATE", 77, {"coarse": 0}],
+        ["REG", 77, {"hi_byte": 2, "slot": 4, "subop": 49664, "val32": 1073938432}],
+        ["TS_DELTA_OR_MARK", 1543, {"delta": 1466, "pl": 0, "rt": 0}],
+        ["REG", 1543, {"hi_byte": 130, "slot": 4, "subop": 30, "val32": 1}],
+        ["NOP", 1543, {}],
+        ["NOP", 1543, {}],
+        ["NOP", 1543, {}],
+        ["NOP", 1543, {}],
+        ["NOP", 1543, {}],
+        ["NOP", 1543, {}],
+        ["NOP", 1543, {}]
+      ],
+      "sha256_fields": "4a43bc4c8ca51b0b0406760a57de9c62f82185234ee0b0e414e75d5f5286bfe5"
+    },
+    {
+      "index": 3,
+      "se": 3,
+      "itrace": false,
+      "bytes": 4704,
+      "packets": 2029,
+      "kinds": {"EVENT": 18, "LAYOUT_HEADER": 1, "NOP": 1261, "REG": 309, "SNAPSHOT": 7, "TS_DELTA_OR_MARK": 137, "TS_DELTA_SHORT": 117, "TS_WAVE_STATE": 179},
+      "last_time": 17885965,
+      "sha256_kind_time": "53ed7a41d39a49d22d58222badc3c39d9c43707d3b45bc59033c497c7a1cf870",
+      "head": [
+        ["LAYOUT_HEADER", 0, {"flag4": 0, "group": 0, "layout": 3, "sel_a": 6, "sel_b": 0, "simd": 0}],
+        ["TS_WAVE_STATE", 77, {"coarse": 0}],
+        ["REG", 77, {"hi_byte": 2, "slot": 4, "subop": 49664, "val32": 1074003968}],
+        ["TS_DELTA_OR_MARK", 1086, {"delta": 1009, "pl": 0, "rt": 0}],
+        ["REG", 1086, {"hi_byte": 130, "slot": 4, "subop": 30, "val32": 1}],
+        ["NOP", 1086, {}],
+        ["NOP", 1086, {}],
+        ["NOP", 1086, {}],
+        ["NOP", 1086, {}],
+        ["NOP", 1086, {}],
+        ["NOP", 1086, {}],
+        ["NOP", 1086, {}]
+      ],
+      "sha256_fields": "4721e7cccb1597a85283716ad38d0cabb512c9dc2eae03d224d4aa9fc74fa38b"
+    },
+    {
+      "index": 4,
+      "se": 4,
+      "itrace": false,
+      "bytes": 4736,
+      "packets": 2056,
+      "kinds": {"EVENT": 19, "LAYOUT_HEADER": 1, "NOP": 1285, "REG": 310, "SNAPSHOT": 7, "TS_DELTA_OR_MARK": 137, "TS_DELTA_SHORT": 114, "TS_WAVE_STATE": 183},
+      "last_time": 17889594,
+      "sha256_kind_time": "056c21808b1609f294a0e7fb45fb4891d535643fc1d9365b18e260200ef60a51",
+      "head": [
+        ["LAYOUT_HEADER", 0, {"flag4": 0, "group": 0, "layout": 3, "sel_a": 6, "sel_b": 0, "simd": 0}],
+        ["TS_WAVE_STATE", 77, {"coarse": 0}],
+        ["REG", 77, {"hi_byte": 2, "slot": 4, "subop": 49664, "val32": 1074069504}],
+        ["TS_DELTA_OR_MARK", 615, {"delta": 538, "pl": 0, "rt": 0}],
+        ["REG", 615, {"hi_byte": 130, "slot": 4, "subop": 30, "val32": 1}],
+        ["NOP", 615, {}],
+        ["NOP", 615, {}],
+        ["NOP", 615, {}],
+        ["NOP", 615, {}],
+        ["NOP", 615, {}],
+        ["NOP", 615, {}],
+        ["NOP", 615, {}]
+      ],
+      "sha256_fields": "a788315fc667010b5c4ee414fa035b774e71c89e61cc8099356733dc906cba10"
+    },
+    {
+      "index": 5,
+      "se": 5,
+      "itrace": false,
+      "bytes": 4704,
+      "packets": 1962,
+      "kinds": {"EVENT": 20, "LAYOUT_HEADER": 1, "NOP": 1187, "REG": 311, "SNAPSHOT": 7, "TS_DELTA_OR_MARK": 137, "TS_DELTA_SHORT": 114, "TS_WAVE_STATE": 185},
+      "last_time": 17871294,
+      "sha256_kind_time": "f85f1273cdcf021d0b2921136b380b8fc7ceadf1be4a33d0eebe0846408c70a2",
+      "head": [
+        ["LAYOUT_HEADER", 0, {"flag4": 0, "group": 0, "layout": 3, "sel_a": 6, "sel_b": 0, "simd": 0}],
+        ["TS_WAVE_STATE", 77, {"coarse": 0}],
+        ["REG", 77, {"hi_byte": 2, "slot": 4, "subop": 49664, "val32": 3758096384}],
+        ["TS_WAVE_STATE", 157, {"coarse": 0}],
+        ["REG", 157, {"hi_byte": 130, "slot": 4, "subop": 30, "val32": 1}],
+        ["NOP", 157, {}],
+        ["NOP", 157, {}],
+        ["NOP", 157, {}],
+        ["NOP", 157, {}],
+        ["TS_DELTA_OR_MARK", 997, {"delta": 840, "pl": 0, "rt": 0}],
+        ["TS_WAVE_STATE", 997, {"coarse": 2}],
+        ["TS_WAVE_STATE", 1005, {"coarse": 2}]
+      ],
+      "sha256_fields": "75ea3e77de51517cf5450bdec7464a31f247b5e38927e719075a90d554b187ac"
+    }
+  ],
+  "mapped": [
+    [1, "IMMEDIATE", 1527245, 0, 5632],
+    [1, "INST", 1527246, 0, 5636],
+    [1, "INST", 1527247, 0, 5644],
+    [1, "VALUINST", 1527248, 0, 5652],
+    [1, "IMMEDIATE", 1528652, 0, 5656],
+    [1, "IMMEDIATE", 1528653, 0, 5660],
+    [1, "INST", 1528654, 0, 5664],
+    [1, "INST", 1528655, 0, 5672],
+    [1, "IMMEDIATE", 1529440, 0, 5680],
+    [1, "VALUINST", 1529441, 0, 5684],
+    [1, "INST", 1529458, 0, 5688]
+  ]
 }
