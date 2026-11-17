@@ -142,6 +142,9 @@ cargo run -p svod-model --release --example nemotron_diarize -- audio_1.wav --dt
 tk kernels appear under their kernel names (`gemm`, `conv`, `flash_attention`, `heads`,
 `layer_norm`, …) next to graph kernels, timed the same way.
 
+To see why a kernel is slow on an AMD RDNA card, trace it: [Profiling](./profiling) reads its
+thread trace down to the tile statements.
+
 :::tip[Measure on a quiet GPU]
 Another process on the GPU skews every number. `tk_bench`, the probes and the tune store warm the
 clock first. Run one `tk_bench` command at a time, and probe tests with `--test-threads=1`.

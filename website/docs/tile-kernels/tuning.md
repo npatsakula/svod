@@ -165,29 +165,5 @@ kernels together (a split's merge, a tail's partials) and an op's plan alike.
 
 ### Thread trace
 
-On an AMD RDNA3 or RDNA4 card, `tk_bench sqtt` records an SQ thread trace (SQTT) of a GEMM
-config (`sqtt attention`, `sqtt nearest` and `sqtt conv` trace those ops the same way): the config
-is timed untraced first, then run once more with tracing on. Each kernel's
-trace is saved in its own directory under `--out` (`./sqtt` by default), and a report is printed.
-It opens with a verdict: what limits the main loop, largest share of its cycles first, each finding
-with the instructions behind it and the knob to turn. Then come the traced SIMDs' cycles by
-instruction class, the main loop's iterations and cycles per
-iteration, and the instructions that stall most. For a GEMM, `--attribute` adds the cost model's
-terms next to the traced cycles of the instructions each term prices; other ops' traces carry no
-price to set beside them. `--load` reads a saved directory again,
-with no GPU:
-
-```bash
-SVOD_DEVICE=AMD cargo run --release -p svod-tk --example tk_bench -- sqtt gemm 1500 1280 5120 --attribute
-cargo run --release -p svod-tk --example tk_bench -- sqtt --load <DIR>
-```
-
-Instruction tokens come from SE0 and SE1, one SIMD each (by default SIMD 0 on SE0 and SIMD 1 on
-SE1; `SVOD_SQTT_SIMD` sets them), so the per-instruction numbers describe the waves on those SIMDs.
-Tracing leaves the clock to the device. `SVOD_SQTT_PSTATE=standard` (or `peak`) pins a stable
-power state, which lowers the shader clock and distorts what the trace shows: use it only to
-match an older pinned capture. Tracing perturbs the run either way: never compare a traced time
-with an untraced one. From Rust, `ProfileOptions { sqtt: Some(SqttOptions::default()), .. }`
-traces any profiled plan the same way (`ExecutionPlan::profile`, `Tensor::profile`);
-`SqttOptions::from_env()` builds those options from `SVOD_SQTT=1` and `SVOD_SQTT_DIR` for a
-program that wants an environment switch.
+On an AMD RDNA3 or RDNA4 card, `tk_bench sqtt` traces a config of `gemm`, `attention`, `nearest`
+or `conv` and prints what limits its main loop. See [Profiling](./profiling).
