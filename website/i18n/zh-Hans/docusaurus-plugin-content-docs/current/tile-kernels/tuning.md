@@ -89,11 +89,4 @@ SVOD_DEVICE=CUDA cargo run --release -p svod-tk --example tk_bench -- gemm --top
 
 ### 线程追踪 {#thread-trace}
 
-在 AMD RDNA3 或 RDNA4 显卡上，`tk_bench sqtt` 记录一个 GEMM 配置的 SQ 线程追踪（SQTT）（`sqtt attention`、`sqtt nearest` 和 `sqtt conv` 以同样方式追踪这些算子）：先在不追踪的情况下为该配置计时，再开启追踪运行一次。每个内核的追踪保存在 `--out`（默认 `./sqtt`）下各自的目录中，并打印一份报告。报告以结论开头：限制主循环的因素，按占其周期的份额从大到小排列，每项发现附上其背后的指令和应调整的参数。随后是被追踪 SIMD 按指令类别的周期数、主循环的迭代次数与每次迭代的周期数，以及停顿最多的指令。对于 GEMM，`--attribute` 在每个代价模型项旁列出该项所计价指令的追踪周期；其他算子的追踪不带可供对照的价格。`--load` 无需 GPU 即可重新读取已保存的目录：
-
-```bash
-SVOD_DEVICE=AMD cargo run --release -p svod-tk --example tk_bench -- sqtt gemm 1500 1280 5120 --attribute
-cargo run --release -p svod-tk --example tk_bench -- sqtt --load <DIR>
-```
-
-指令令牌来自 SE0 和 SE1，各一个 SIMD（默认 SE0 上为 SIMD 0，SE1 上为 SIMD 1；由 `SVOD_SQTT_SIMD` 设置），因此逐指令的数字描述的是这些 SIMD 上的 wave。追踪不干预设备的时钟。`SVOD_SQTT_PSTATE=standard`（或 `peak`）会固定一个稳定的功耗状态，这会降低着色器时钟并扭曲追踪所呈现的内容：仅在需要与旧的固定时钟追踪对照时使用。无论哪种方式追踪都会扰动运行：切勿将追踪下的时间与未追踪的时间比较。在 Rust 中，`ProfileOptions { sqtt: Some(SqttOptions::default()), .. }` 以同样方式追踪任何被剖析的计划（`ExecutionPlan::profile`、`Tensor::profile`）；`SqttOptions::from_env()` 依据 `SVOD_SQTT=1` 和 `SVOD_SQTT_DIR` 构造这些选项，供需要环境变量开关的程序使用。
+在 AMD RDNA3 或 RDNA4 显卡上，`tk_bench sqtt` 追踪 `gemm`、`attention`、`nearest` 或 `conv` 的一个配置，并打印限制其主循环的因素。见[剖析](./profiling)。

@@ -166,28 +166,5 @@ SVOD_DEVICE=CUDA cargo run --release -p svod-tk --example tk_bench -- gemm --top
 
 ### Thread trace {#thread-trace}
 
-AMD RDNA3 या RDNA4 card पर `tk_bench sqtt` किसी GEMM config की SQ thread trace (SQTT) record करता है
-(`sqtt attention`, `sqtt nearest` और `sqtt conv` इन ops को इसी तरह trace करते हैं):
-पहले config का समय बिना trace के मापा जाता है, फिर trace चालू करके उसे एक बार और चलाया जाता है। हर
-kernel की trace `--out` (default `./sqtt`) के अंदर उसकी अपनी directory में सहेजी जाती है, और एक report
-छपती है। वह एक verdict से शुरू होती है: main loop को क्या सीमित करता है, उसके cycles के सबसे बड़े हिस्से
-से शुरू करके, हर finding के साथ उसके पीछे के instructions और घुमाने लायक knob। इसके बाद traced SIMDs के cycles instruction class के हिसाब से, main loop के iterations और हर iteration
-के cycles, और सबसे ज़्यादा stall करने वाले instructions। GEMM के लिए `--attribute` cost model के हर term
-के साथ उन instructions के traced cycles दिखाता है जिनकी price वह term लगाता है; दूसरे ops की traces में
-साथ रखने लायक कोई price नहीं होती। `--load` सहेजी गई directory को
-बिना GPU के फिर से पढ़ता है:
-
-```bash
-SVOD_DEVICE=AMD cargo run --release -p svod-tk --example tk_bench -- sqtt gemm 1500 1280 5120 --attribute
-cargo run --release -p svod-tk --example tk_bench -- sqtt --load <DIR>
-```
-
-Instruction tokens SE0 और SE1 से आते हैं, हर एक का एक SIMD (default में SE0 पर SIMD 0 और SE1 पर
-SIMD 1; `SVOD_SQTT_SIMD` इन्हें तय करता है), इसलिए per-instruction संख्याएँ उन्हीं SIMDs की waves के
-बारे में हैं। Tracing clock को device पर छोड़ता है। `SVOD_SQTT_PSTATE=standard` (या `peak`) एक stable
-power state तय करता है, जो shader clock घटाता है और trace जो दिखाती है उसे बिगाड़ता है: इसे सिर्फ़ किसी
-पुरानी pinned capture से मिलान के लिए इस्तेमाल करें। Tracing हर हाल में run को बदलता है: traced समय की
-तुलना कभी untraced समय से न करें। Rust से `ProfileOptions { sqtt: Some(SqttOptions::default()), .. }`
-किसी भी profiled plan को इसी तरह trace करता है (`ExecutionPlan::profile`, `Tensor::profile`);
-`SqttOptions::from_env()` ये options `SVOD_SQTT=1` और `SVOD_SQTT_DIR` से बनाता है, उस program के लिए
-जिसे environment से switch चाहिए।
+AMD RDNA3 या RDNA4 card पर `tk_bench sqtt` `gemm`, `attention`, `nearest` या `conv` के किसी config को
+trace करता है और छापता है कि उसके main loop को क्या सीमित करता है। [Profiling](./profiling) देखें।
