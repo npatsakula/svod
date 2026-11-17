@@ -292,8 +292,9 @@ impl std::str::FromStr for SqttSimds {
     }
 }
 
-/// An amdgpu stable power state (`AMDGPU_CTX_STABLE_PSTATE_*`): fixed clocks for
-/// repeatable cycle counts, `Standard` below the boost clock, `Peak` at it.
+/// An amdgpu stable power state (`AMDGPU_CTX_STABLE_PSTATE_*`): fixed clocks,
+/// `Standard` below the boost clock, `Peak` at it. A pinned clock is not the one
+/// the kernel runs at unpinned, so a trace under it shows other stalls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StablePstate {
