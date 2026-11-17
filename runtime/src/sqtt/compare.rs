@@ -8,6 +8,7 @@ use std::fmt::Write;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use strum::IntoStaticStr;
 use svod_device::amd::occupancy::Limit;
 
 use super::verdict::{observed, slowdown};
@@ -43,9 +44,11 @@ pub struct Side {
     pub bound: Vec<FindingKind>,
 }
 
-/// What the loop's figures are over.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// What the loop's figures are over, an iteration where either of two sides is ([`Ord`]). Its
+/// `&str` is the bare noun, [`Self::name`] the one with its article.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, IntoStaticStr)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum Unit {
     /// A trip of the main loop (both captures count their trips, [`Trips::counted`]).
     ///
@@ -325,8 +328,8 @@ fn findings(a: &Analysis, b: &Analysis) -> Vec<FindingDelta> {
 impl Analysis {
     /// `b` against `self` (A): Δ is B − A, every loop figure a unit of each side's own.
     pub fn compare(&self, b: &Self) -> Diff {
-        let counted = |a: &Self| a.main_loop.as_ref().is_some_and(|l| l.trips.counted);
-        let unit = if counted(self) && counted(b) { Unit::Trip } else { Unit::Iteration };
+        let unit = |a: &Self| a.main_loop.as_ref().map_or(Unit::Iteration, |l| l.trips.unit());
+        let unit = unit(self).max(unit(b));
         let (sa, sb) = (side(self, unit), side(b, unit));
         let mut cautions = vec![];
         if sa.pstate != sb.pstate {
@@ -410,7 +413,7 @@ impl Diff {
         };
         let ratio = |s: &Side| s.slowdown.map_or("-".into(), |r| format!("{r:.2}x"));
         let mhz = |s: &Side| s.sclk_mhz.map_or("-".into(), |m| format!("~{m}"));
-        let pstate = |s: &Side| s.pstate.map_or("unrecorded", Pstate::name);
+        let pstate = |s: &Side| s.pstate.map_or("unrecorded", Into::into);
         let _ = writeln!(
             o,
             "time       {} -> {} ns untraced{change}; traced/untraced {} -> {}; sclk {} -> {} MHz; pstate {} -> {}",
@@ -464,7 +467,7 @@ impl Diff {
         );
         let busy = |s: &Side| s.matrix_busy.map_or("-".into(), |m| format!("{:.1}%", 100.0 * m));
         let bound = |s: &Side| {
-            let kinds: Vec<&str> = s.bound.iter().map(|k| k.name()).collect();
+            let kinds: Vec<&str> = s.bound.iter().map(|&k| k.into()).collect();
             if kinds.is_empty() { "-".into() } else { kinds.join("+") }
         };
         let _ =
@@ -477,7 +480,8 @@ impl Diff {
                 [Some(_), None] => "gone",
                 _ => "changed",
             };
-            let _ = writeln!(o, "{what:<10} {:<17} {:>6} -> {:>6}", f.kind.name(), pct(f.share[0]), pct(f.share[1]));
+            let _ =
+                writeln!(o, "{what:<10} {:<17} {:>6} -> {:>6}", <&str>::from(f.kind), pct(f.share[0]), pct(f.share[1]));
         }
         self.buckets_text(&mut o);
         self.statements_text(&mut o, top);

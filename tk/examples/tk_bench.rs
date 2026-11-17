@@ -1032,7 +1032,7 @@ fn attribution(a: &Analysis) -> Result<String> {
     ];
     for (term, counterpart) in measured {
         let m = price.terms.get(&term).copied().unwrap_or(f64::NAN);
-        let term = term.name();
+        let term: &str = term.into();
         let (cycles, share, at, what) = match counterpart {
             Some((c, what)) => {
                 let per_wave = c as f64 / waves;

@@ -3,18 +3,19 @@
 //! latency): the exposed cycles. The findings ([`Finding`]) rank by exposed share; the pipes' busy
 //! shares over the steady window classify the kernel apart ([`Verdict::bound`]).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write;
-use std::ops::RangeInclusive;
+use std::ops::{Index, IndexMut, RangeInclusive};
 
 use serde::{Deserialize, Serialize};
+use strum::IntoStaticStr;
 use svod_device::amd::occupancy::Limit;
 use svod_device::sqtt::asm::{Access, Counter, Kind, Memory, Space, classify};
 use svod_device::sqtt::hidden::Hiding;
 use svod_device::sqtt::report::Spread;
 use svod_device::sqtt::wave::{Instruction, Wave};
 
-use super::{Analysis, Class, Pstate, Row, Stmt};
+use super::{Analysis, Class, Insts, Pstate, Row, Stmt, Unit};
 
 /// Exposed vector-memory waits at a tenth of the loop's cycles; below it, moving loads or deepening
 /// the ring is taken to repay less than its register and LDS cost. Heuristic.
@@ -102,31 +103,25 @@ pub enum Bucket {
 impl std::fmt::Display for Bucket {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Issue(c) => write!(f, "issue {}", c.name()),
-            Self::Stall(c) => write!(f, "stall {}", c.name()),
+            Self::Issue(c) => write!(f, "issue {}", <&str>::from(c)),
+            Self::Stall(c) => write!(f, "stall {}", <&str>::from(c)),
             Self::Wait(on) => write!(f, "wait {}", on.name()),
             Self::Barrier => f.write_str("barrier"),
-            Self::Idle(c) => write!(f, "idle {}", c.name()),
+            Self::Idle(c) => write!(f, "idle {}", <&str>::from(c)),
         }
     }
 }
 
-fn stores(kind: Option<&Kind>) -> bool {
+fn stores(kind: Kind) -> bool {
     matches!(
         kind,
-        Some(Kind::Memory(Memory {
-            access: Access::Store | Access::Atomic { returns: false } | Access::Writeback,
-            ..
-        }))
+        Kind::Memory(Memory { access: Access::Store | Access::Atomic { returns: false } | Access::Writeback, .. })
     )
 }
 
-/// Every instruction's kind by PC, and the PCs of gfx12's `s_barrier_signal`: where a wave arrives at
-/// a barrier it waits for later.
-pub(super) struct Buckets {
-    kinds: HashMap<u64, Kind>,
-    signals: HashSet<u64>,
-}
+/// The partition's reading of every instruction: its kind by PC, and whether it is gfx12's
+/// `s_barrier_signal`, where a wave arrives at a barrier it waits for later.
+pub(super) struct Buckets<'a>(pub &'a Insts<'a>);
 
 /// What one SE's traced waves did in the main loop.
 pub(super) struct Pass {
@@ -137,27 +132,72 @@ pub(super) struct Pass {
     pub charges: BTreeMap<u64, Charge>,
 }
 
-/// An instruction's cycles in the loop by bucket, `[raw, exposed]`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(super) struct Charge {
-    pub issue: [i64; 2],
-    pub stall: [i64; 2],
-    pub wait: [i64; 2],
-    pub barrier: [i64; 2],
-    pub idle: [i64; 2],
+/// What an instruction's cycles in the loop went to: a [`Bucket`] less its class or counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Part {
+    Issue,
+    Stall,
+    Wait,
+    Barrier,
+    Idle,
+}
+
+/// Cycles by [`Part`], raw and exposed: an instruction's in the loop summed over the traced waves,
+/// or a statement's a trip ([`Statement`](super::Statement)).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(from = "Parts", into = "Parts")]
+pub struct Charge(pub [PerTrip; 5]);
+
+impl Index<Part> for Charge {
+    type Output = PerTrip;
+
+    fn index(&self, part: Part) -> &PerTrip {
+        &self.0[part as usize]
+    }
+}
+
+impl IndexMut<Part> for Charge {
+    fn index_mut(&mut self, part: Part) -> &mut PerTrip {
+        &mut self.0[part as usize]
+    }
 }
 
 impl Charge {
-    pub fn add(&mut self, o: &Self) {
-        for (at, from) in [
-            (&mut self.issue, o.issue),
-            (&mut self.stall, o.stall),
-            (&mut self.wait, o.wait),
-            (&mut self.barrier, o.barrier),
-            (&mut self.idle, o.idle),
-        ] {
-            (at[0], at[1]) = (at[0].saturating_add(from[0]), at[1].saturating_add(from[1]));
+    /// `o`'s cycles over `over` added part by part.
+    pub fn add(&mut self, o: &Self, over: f64) {
+        for (at, c) in self.0.iter_mut().zip(o.0) {
+            (at.raw, at.exposed) = (at.raw + c.raw / over, at.exposed + c.exposed / over);
         }
+    }
+
+    pub fn raw(&self) -> f64 {
+        self.0.iter().map(|c| c.raw).sum()
+    }
+
+    pub fn exposed(&self) -> f64 {
+        self.0.iter().map(|c| c.exposed).sum()
+    }
+}
+
+/// A [`Charge`] as JSON: a field a part.
+#[derive(Serialize, Deserialize)]
+struct Parts {
+    issue: PerTrip,
+    stall: PerTrip,
+    wait: PerTrip,
+    barrier: PerTrip,
+    idle: PerTrip,
+}
+
+impl From<Parts> for Charge {
+    fn from(Parts { issue, stall, wait, barrier, idle }: Parts) -> Self {
+        Self([issue, stall, wait, barrier, idle])
+    }
+}
+
+impl From<Charge> for Parts {
+    fn from(Charge([issue, stall, wait, barrier, idle]): Charge) -> Self {
+        Self { issue, stall, wait, barrier, idle }
     }
 }
 
@@ -167,26 +207,22 @@ fn charge(at: &mut [i64; 2], cycles: i64, hidden: i64) {
     (at[0], at[1]) = (at[0].saturating_add(cycles), at[1].saturating_add(cycles - hidden.clamp(0, cycles)));
 }
 
-impl Buckets {
-    pub(super) fn new(lines: &[(u64, &str)]) -> Self {
-        let signal = |line: &str| line.trim_start().starts_with("s_barrier_signal");
-        Self {
-            kinds: lines.iter().map(|&(pc, line)| (pc, classify(line).kind)).collect(),
-            signals: lines.iter().filter(|l| signal(l.1)).map(|l| l.0).collect(),
-        }
+impl Buckets<'_> {
+    fn kind(&self, pc: u64) -> Kind {
+        self.0.get(&pc).map_or(Kind::Other, |i| i.1)
     }
 
-    fn class(&self, pc: u64) -> Class {
-        self.kinds.get(&pc).map_or(Class::Other, |&k| Class::from(k))
+    fn signals(&self, pc: u64) -> bool {
+        self.0.get(&pc).is_some_and(|i| i.0.trim_start().starts_with("s_barrier_signal"))
     }
 
     /// `binder`: the `(counter, pc)` of the instruction a wait record waited for.
     fn counts(&self, pc: u64, binder: Option<&(Counter, u64)>) -> Counts {
-        let kind = self.kinds.get(&pc).copied().unwrap_or(Kind::Other);
+        let kind = self.kind(pc);
         match (Class::from(kind), kind) {
             (Class::Barrier, _) => Counts::Barrier,
             (Class::WaitVmem | Class::WaitLgkm, Kind::Wait(wait)) => Counts::Wait(match binder {
-                Some(&(counter, at)) => WaitOn { counter, store: stores(self.kinds.get(&at)) },
+                Some(&(counter, at)) => WaitOn { counter, store: self.0.get(&at).is_some_and(|i| stores(i.1)) },
                 None => {
                     let counter = wait.counts().map(|(c, _)| c).find(|&c| c != Counter::Exp).expect("a counted wait");
                     WaitOn { counter, store: counter == Counter::Store }
@@ -232,8 +268,8 @@ impl Buckets {
                 let cursor = run.get_or_insert(r.time);
                 let gap = (r.time - *cursor).max(0);
                 if gap > 0 {
-                    sum(Bucket::Idle(self.class(r.pc)), gap, hidden.idle);
-                    charge(&mut charges.entry(r.pc).or_default().idle, gap, hidden.idle);
+                    sum(Bucket::Idle(Class::from(self.kind(r.pc))), gap, hidden.idle);
+                    charges.entry(r.pc).or_default()[Part::Idle].charge(gap, hidden.idle);
                     *cursor = r.time;
                 }
                 let end = r.time + r.duration;
@@ -246,19 +282,19 @@ impl Buckets {
                         sum(Bucket::Stall(class), stalled, hidden.stall);
                         sum(Bucket::Issue(class), cycles - stalled, hidden.issue);
                         let at = charges.entry(r.pc).or_default();
-                        charge(&mut at.stall, stalled, hidden.stall);
-                        charge(&mut at.issue, cycles - stalled, hidden.issue);
+                        at[Part::Stall].charge(stalled, hidden.stall);
+                        at[Part::Issue].charge(cycles - stalled, hidden.issue);
                         stalled
                     }
                     Counts::Wait(on) => {
                         sum(Bucket::Wait(on), cycles, hidden.stall + hidden.issue);
                         let at = charges.entry(binder.map_or(r.pc, |b| b.1)).or_default();
-                        charge(&mut at.wait, cycles, hidden.stall + hidden.issue);
+                        at[Part::Wait].charge(cycles, hidden.stall + hidden.issue);
                         cycles
                     }
                     Counts::Barrier => {
                         sum(Bucket::Barrier, cycles, hidden.stall + hidden.issue);
-                        charge(&mut charges.entry(r.pc).or_default().barrier, cycles, hidden.stall + hidden.issue);
+                        charges.entry(r.pc).or_default()[Part::Barrier].charge(cycles, hidden.stall + hidden.issue);
                         0
                     }
                 };
@@ -267,7 +303,7 @@ impl Buckets {
                 }
                 if let Counts::Barrier = counts {
                     let held = worst.take();
-                    match self.signals.contains(&r.pc) {
+                    match self.signals(r.pc) {
                         true => arrived = held,
                         false => site(&mut barriers, r, arrived.take().or(held)),
                     }
@@ -407,8 +443,9 @@ impl Partition {
 }
 
 /// What limits the loop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, IntoStaticStr)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum FindingKind {
     MatrixBound,
     LoadExposed,
@@ -419,23 +456,10 @@ pub enum FindingKind {
     IssueBound,
 }
 
-impl FindingKind {
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::MatrixBound => "matrix_bound",
-            Self::LoadExposed => "load_exposed",
-            Self::LdsExposed => "lds_exposed",
-            Self::Barrier => "barrier",
-            Self::OccupancyLimited => "occupancy_limited",
-            Self::LoopOverhead => "loop_overhead",
-            Self::IssueBound => "issue_bound",
-        }
-    }
-}
-
 /// Why a finding's numbers are approximate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, IntoStaticStr)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum Approx {
     /// The traced run took over [`PERTURBED`] times the untraced one.
     Perturbed,
@@ -452,19 +476,6 @@ pub enum Approx {
     /// The main loop's instructions carry no statements: a trip is taken as one loop iteration,
     /// whatever the iteration unrolls.
     PerIteration,
-}
-
-impl Approx {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Perturbed => "perturbed",
-            Self::UntimedMatrix => "untimed_matrix",
-            Self::ApproxBindings => "approx_bindings",
-            Self::ImplausibleTime => "implausible_time",
-            Self::Truncated => "truncated",
-            Self::PerIteration => "per_iteration",
-        }
-    }
 }
 
 /// A load or store that bound the loop's waits, over its waits in the loop.
@@ -527,6 +538,11 @@ impl PerTrip {
     pub fn of(cycles: [i64; 2], trips: u64) -> Self {
         let trips = trips.max(1) as f64;
         Self { raw: cycles[0] as f64 / trips, exposed: cycles[1] as f64 / trips }
+    }
+
+    /// `cycles` added, raw and less what `hidden` covers of them.
+    fn charge(&mut self, cycles: i64, hidden: i64) {
+        (self.raw, self.exposed) = (self.raw + cycles as f64, self.exposed + (cycles - hidden.clamp(0, cycles)) as f64);
     }
 }
 
@@ -991,14 +1007,14 @@ fn pct(share: f64) -> f64 {
 /// The verdict section: the kernel's ceiling and class, the loop's findings with their evidence and
 /// knob, then what makes them approximate.
 pub(super) fn text(a: &Analysis, o: &mut String) {
-    let (unit, of) = match &a.main_loop {
-        Some(l) if l.trips.counted => {
-            ("trip", format!("a trip ({} an iteration, its statements' unroll copies)", l.trips.per_iteration))
-        }
-        Some(_) => ("iteration", "an iteration (no statements)".into()),
-        None => ("trip", "- (no main loop)".into()),
+    let trips = a.main_loop.as_ref().map(|l| l.trips);
+    let of = match trips {
+        Some(t) if t.counted => format!("a trip ({} an iteration, its statements' unroll copies)", t.per_iteration),
+        Some(_) => "an iteration (no statements)".into(),
+        None => "- (no main loop)".into(),
     };
-    let a_unit = if unit == "trip" { "a trip" } else { "an iteration" };
+    let unit = trips.map_or(Unit::Trip, |t| t.unit());
+    let (a_unit, unit): (_, &str) = (unit.name(), unit.into());
     let v = &a.verdict;
     let _ = writeln!(o, "== verdict: cycles are a traced wave's, {of}; exposed: not hidden by other pipes' work");
     if let Some(c) = &v.ceiling {
@@ -1020,7 +1036,7 @@ pub(super) fn text(a: &Analysis, o: &mut String) {
         );
     }
     let flags = |f: &Finding| {
-        let approx: Vec<&str> = f.approx.iter().map(|a| a.name()).collect();
+        let approx: Vec<&str> = f.approx.iter().map(|&a| a.into()).collect();
         if approx.is_empty() { String::new() } else { format!(" (approx: {})", approx.join(", ")) }
     };
     for f in &v.bound {
@@ -1038,7 +1054,7 @@ pub(super) fn text(a: &Analysis, o: &mut String) {
             }
             _ => String::new(),
         };
-        let _ = writeln!(o, "bound      {:<17} {:>5.1}%  {what}{}", f.kind.name(), pct(f.share), flags(f));
+        let _ = writeln!(o, "bound      {:<17} {:>5.1}%  {what}{}", <&str>::from(f.kind), pct(f.share), flags(f));
         let _ = writeln!(o, "   knob: {}", f.knob);
     }
     if v.findings.is_empty() {
@@ -1079,7 +1095,13 @@ pub(super) fn text(a: &Analysis, o: &mut String) {
             _ => String::new(),
         };
         let (share, raw) = (pct(f.share), pct(f.raw));
-        let _ = writeln!(o, "{:>2} {:<17} {share:>5.1}% (raw {raw:.1}%)  {what}{}", rank + 1, f.kind.name(), flags(f));
+        let _ = writeln!(
+            o,
+            "{:>2} {:<17} {share:>5.1}% (raw {raw:.1}%)  {what}{}",
+            rank + 1,
+            <&str>::from(f.kind),
+            flags(f)
+        );
         match &f.evidence {
             Evidence::Waits { loads, stalls, .. } => {
                 for s in stalls {
@@ -1092,7 +1114,7 @@ pub(super) fn text(a: &Analysis, o: &mut String) {
                     );
                 }
                 for l in loads {
-                    let what = if stores(Some(&classify(&l.asm).kind)) { "store" } else { "load" };
+                    let what = if stores(classify(&l.asm).kind) { "store" } else { "load" };
                     let latency = match l.latency {
                         Some(s) if l.stalled * 2 >= l.waits => format!("latency med {}", s.median),
                         _ => "latency <= cover".into(),
@@ -1150,7 +1172,7 @@ pub(super) fn text(a: &Analysis, o: &mut String) {
     if let Some(r) = slowdown(a).filter(|&r| r > PERTURBED) {
         let why = match a.pstate {
             Some(Pstate::Unpinned) => "unpinned: not the clock".to_string(),
-            Some(p) => format!("pinned {}: its lower clock moves cycle shares", p.name()),
+            Some(p) => format!("pinned {}: its lower clock moves cycle shares", <&str>::from(p)),
             None => "pstate unrecorded".into(),
         };
         let _ = writeln!(o, "note       the traced run took {r:.2}x the untraced ({why})");

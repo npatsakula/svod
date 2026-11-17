@@ -14,10 +14,11 @@ use svod_device::amd::occupancy::Limiter;
 
 use super::compare::align;
 use super::statements::rollup;
-use super::verdict::{Buckets, Charge, load_bytes};
+use super::verdict::{Buckets, load_bytes};
 use super::{
-    Analysis, Approx, Axis, Bucket, Capture, Caution, Class, Delta, Diff, Evidence, Finding, FindingKind, Knob,
-    LineRow, Lines, LoopRow, Partition, Pstate, Reduction, Spread, Statement, Statements, Stmt, Unit, WaitOn, locate,
+    Analysis, Approx, Axis, Bucket, Capture, Caution, Charge, Class, Delta, Diff, Evidence, Finding, FindingKind, Knob,
+    LineRow, Lines, LoopRow, Part, Partition, PerTrip, Pstate, Reduction, Spread, Statement, Statements, Stmt, Unit,
+    WaitOn, insts, locate,
 };
 
 fn fixtures() -> PathBuf {
@@ -637,7 +638,7 @@ const LOOP: [(u64, &str); 6] = [
 
 fn partition(waves: &[svod_device::sqtt::wave::Wave], bound: &[HashMap<usize, (Counter, u64)>]) -> Partition {
     let hiding = Hiding::new(waves, &[], &HashSet::new());
-    Buckets::new(&LOOP).partition(waves, bound, 0x10..=0x20, &hiding).partition
+    Buckets(&insts(&LOOP)).partition(waves, bound, 0x10..=0x20, &hiding).partition
 }
 
 /// Each bucket's raw cycles.
@@ -691,7 +692,7 @@ fn exposed_takes_off_what_other_waves_hid() {
     let busy = wave((0..60).map(|t| record(t, 1, 0, 0x0)).collect());
     let waves = [waiting, busy];
     let hiding = Hiding::new(&waves, &[], &HashSet::new());
-    let pass = Buckets::new(&LOOP).partition(&waves[..1], &[], 0x10..=0x20, &hiding);
+    let pass = Buckets(&insts(&LOOP)).partition(&waves[..1], &[], 0x10..=0x20, &hiding);
     let p = pass.partition;
     assert_eq!((p.cycles()[0], p.waited(|_| true), p.idled(&[])), (31, [10, 0], [18, 0]));
     assert!(exposed_within(&p));
@@ -722,7 +723,7 @@ fn barrier_names_the_last_arrivers_delay() {
     let records = [trip(0, 50, 2), trip(200, 3, 300)].concat();
     let waves = [wave(records)];
     let hiding = Hiding::new(&waves, &[], &HashSet::new());
-    let pass = Buckets::new(&lines).partition(&waves, &[], 0x10..=0x24, &hiding);
+    let pass = Buckets(&insts(&lines)).partition(&waves, &[], 0x10..=0x24, &hiding);
     let sites: Vec<_> = pass.barriers.into_values().collect();
     assert_eq!(sites, [super::BarrierSite { pc: 0x20, hits: 2, last: 1, causes: vec![(0x14, 1)], stmt: None }]);
 }
@@ -751,7 +752,7 @@ proptest! {
             .map(|w| wave(w.iter().map(|&(t, d, s, pc)| record(t, d, s.min(d), pcs[pc])).collect()))
             .collect();
         let hiding = Hiding::new(&waves, &[], &HashSet::new());
-        let pass = Buckets::new(&lines).partition(&waves, &[], 0x10..=0x20, &hiding);
+        let pass = Buckets(&insts(&lines)).partition(&waves, &[], 0x10..=0x20, &hiding);
         let p = pass.partition;
         prop_assert!(exposed_within(&p));
         let expected: i64 = waves
@@ -1194,9 +1195,9 @@ fn statements_split_the_loop_exactly() {
     assert!((exposed - exposed_cycles).abs() < 1e-6);
     let at = |line: u32| l.statements.iter().find(|s| s.line.map_or(0, |l| l.get()) == line).unwrap();
     let matrix = l.partition.issued(&[Class::Matrix])[0] as f64 / trips;
-    assert!((at(1).issue.raw - matrix).abs() < 1e-6, "the products' issue is the mma statement's");
+    assert!((at(1).parts[Part::Issue].raw - matrix).abs() < 1e-6, "the products' issue is the mma statement's");
     let waits = l.partition.waited(|_| true)[0] as f64 / trips;
-    let bound = at(2).wait.raw + at(3).wait.raw;
+    let bound = at(2).parts[Part::Wait].raw + at(3).parts[Part::Wait].raw;
     assert!(bound > 0.9 * waits, "waits sit on their loads' statements: {bound:.1} of {waits:.1}");
     assert_eq!(at(0).text, "unattributed");
     assert_eq!(l.statements.last().unwrap().line, None, "the unattributed last");
@@ -1251,7 +1252,8 @@ fn compare_aligns_by_statement() {
 }
 
 fn charge(issue: i64, stall: i64, wait: i64, idle: i64) -> Charge {
-    Charge { issue: [issue, issue / 2], stall: [stall, 0], wait: [wait, wait / 4], barrier: [0; 2], idle: [idle, idle] }
+    let c = |raw: i64, exposed: i64| PerTrip { raw: raw as f64, exposed: exposed as f64 };
+    Charge([c(issue, issue / 2), c(stall, 0), c(wait, wait / 4), c(0, 0), c(idle, idle)])
 }
 
 /// Charges roll up by line over the trips: a wait charged to its binding load lands on the load's

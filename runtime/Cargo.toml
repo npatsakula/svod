@@ -31,6 +31,7 @@ smallvec = { workspace = true }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["float_roundtrip"] }
 gimli = { version = "0.34", default-features = false, features = ["read"] }
+strum = { version = "0.28", features = ["derive"] }
 
 [dev-dependencies]
 test-case = "3.3.1"

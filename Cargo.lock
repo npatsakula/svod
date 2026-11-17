@@ -3832,6 +3832,7 @@ dependencies = [
  "sha2 0.11.0",
  "smallvec",
  "snafu",
+ "strum",
  "svod-codegen",
  "svod-device",
  "svod-dtype",

@@ -8,8 +8,7 @@ use std::num::NonZeroU32;
 
 use serde::{Deserialize, Serialize};
 
-use super::verdict::Charge;
-use super::{Analysis, Lines, PerTrip, Stmt};
+use super::{Analysis, Charge, Lines, Stmt};
 
 /// A `kernel.tk` line's cycles in the main loop, a traced wave's a trip. The rollup is per line: an
 /// unrolled statement's copies sum into one, each instruction's copy staying on its
@@ -22,11 +21,8 @@ pub struct Statement {
     pub text: String,
     /// The loop's instructions on it.
     pub pcs: usize,
-    pub issue: PerTrip,
-    pub stall: PerTrip,
-    pub wait: PerTrip,
-    pub barrier: PerTrip,
-    pub idle: PerTrip,
+    #[serde(flatten)]
+    pub parts: Charge,
 }
 
 /// `listing`'s `line`, trimmed; `?` past its end.
@@ -37,20 +33,15 @@ pub(super) fn listed(listing: &[String], line: NonZeroU32) -> &str {
 impl Statement {
     fn new(line: Option<NonZeroU32>, listing: &[String]) -> Self {
         let text = line.map_or("unattributed", |l| listed(listing, l)).into();
-        let none = PerTrip::default();
-        Self { line, text, pcs: 0, issue: none, stall: none, wait: none, barrier: none, idle: none }
-    }
-
-    fn parts(&self) -> [PerTrip; 5] {
-        [self.issue, self.stall, self.wait, self.barrier, self.idle]
+        Self { line, text, pcs: 0, parts: Charge::default() }
     }
 
     pub fn raw(&self) -> f64 {
-        self.parts().iter().map(|c| c.raw).sum()
+        self.parts.raw()
     }
 
     pub fn exposed(&self) -> f64 {
-        self.parts().iter().map(|c| c.exposed).sum()
+        self.parts.exposed()
     }
 }
 
@@ -71,21 +62,9 @@ pub(super) fn rollup(
         by.entry(l).or_insert_with(|| Statement::new(l, listing)).pcs += 1;
     }
     let trips = trips.max(1) as f64;
-    let add = |to: &mut PerTrip, c: [i64; 2]| {
-        (to.raw, to.exposed) = (to.raw + c[0] as f64 / trips, to.exposed + c[1] as f64 / trips)
-    };
     for (pc, c) in charges {
         let l = line(pc);
-        let s = by.entry(l).or_insert_with(|| Statement::new(l, listing));
-        for (to, from) in [
-            (&mut s.issue, c.issue),
-            (&mut s.stall, c.stall),
-            (&mut s.wait, c.wait),
-            (&mut s.barrier, c.barrier),
-            (&mut s.idle, c.idle),
-        ] {
-            add(to, from);
-        }
+        by.entry(l).or_insert_with(|| Statement::new(l, listing)).parts.add(c, trips);
     }
     let mut out: Vec<Statement> = by.into_values().collect();
     out.sort_by(|a, b| {
@@ -115,7 +94,7 @@ impl Analysis {
 /// The main loop's statements, `top` most exposed and the unattributed.
 pub(super) fn text(a: &Analysis, o: &mut String, top: usize) {
     let Some(l) = a.main_loop.as_ref().filter(|l| !l.statements.is_empty()) else { return };
-    let unit = if l.trips.counted { "a trip" } else { "an iteration" };
+    let unit = l.trips.unit().name();
     let (pcs, unattributed) =
         l.statements.iter().fold((0, 0), |(n, u), s| (n + s.pcs, u + if s.line.is_none() { s.pcs } else { 0 }));
     let _ = writeln!(
@@ -131,19 +110,8 @@ pub(super) fn text(a: &Analysis, o: &mut String, top: usize) {
     let shown = l.statements.iter().filter(|s| s.line.is_some()).take(top);
     for s in shown.chain(l.statements.iter().filter(|s| s.line.is_none())) {
         let line = s.line.map_or("-".into(), |l| l.to_string());
-        let _ = writeln!(
-            o,
-            "{line:>5} {:>4} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1}  {}",
-            s.pcs,
-            s.issue.raw,
-            s.stall.raw,
-            s.wait.raw,
-            s.barrier.raw,
-            s.idle.raw,
-            s.raw(),
-            s.exposed(),
-            s.text
-        );
+        let parts: String = s.parts.0.iter().map(|c| format!(" {:>8.1}", c.raw)).collect();
+        let _ = writeln!(o, "{line:>5} {:>4}{parts} {:>8.1} {:>8.1}  {}", s.pcs, s.raw(), s.exposed(), s.text);
     }
 }
 

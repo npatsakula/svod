@@ -3,7 +3,7 @@
 //! fixed-format text ([`Analysis`]'s `Display`) or JSON. A [`Capture`] saves the raw streams with the
 //! code object and the disassembly, so a trace is re-analyzed offline with no GPU.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt, Snafu, ensure};
+use strum::IntoStaticStr;
 use svod_device::amd::occupancy::{Cu, Limit, limits};
 use svod_device::profile::{CodeImage, KernelResources, SeTrace, SqttTrace, StablePstate};
 use svod_device::sqtt::asm::{self, Access, Counter, Kind, Memory, Space};
@@ -31,8 +32,8 @@ pub use compare::{BucketDelta, Caution, Delta, Diff, FindingDelta, LoopRow, Rows
 pub use lines::{DwarfError, LISTING, LineRow, LineTable, Lines, Statements, Stmt, line_table, locate};
 pub use statements::Statement;
 pub use verdict::{
-    Approx, BarrierSite, Bucket, Ceiling, Demand, Evidence, Finding, FindingKind, Findings, Knob, Load, Partition,
-    PerTrip, Stall, Verdict, WaitOn,
+    Approx, BarrierSite, Bucket, Ceiling, Charge, Demand, Evidence, Finding, FindingKind, Findings, Knob, Load, Part,
+    Partition, PerTrip, Stall, Verdict, WaitOn,
 };
 
 #[derive(Debug, Snafu)]
@@ -125,8 +126,9 @@ pub struct Capture {
 
 /// The power state a traced dispatch ran at: the device's own clock, or a stable state pinned
 /// through the DRM context ([`StablePstate`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, IntoStaticStr)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum Pstate {
     Unpinned,
     Standard,
@@ -173,8 +175,9 @@ pub struct Reduction {
 }
 
 /// A term of the tile planner's GEMM price.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, IntoStaticStr)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum Term {
     Steps,
     Reads,
@@ -182,19 +185,6 @@ pub enum Term {
     Wait,
     LoneTrip,
     Trip,
-}
-
-impl Term {
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Steps => "steps",
-            Self::Reads => "reads",
-            Self::Fill => "fill",
-            Self::Wait => "wait",
-            Self::LoneTrip => "lone_trip",
-            Self::Trip => "trip",
-        }
-    }
 }
 
 /// The planner's price of a GEMM: its ns on the busiest SM, the trips a block runs, the blocks that
@@ -213,16 +203,6 @@ pub struct Price {
 pub struct Model {
     pub per_trip: Option<Reduction>,
     pub price: Option<Price>,
-}
-
-impl Pstate {
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Unpinned => "unpinned",
-            Self::Standard => "standard",
-            Self::Peak => "peak",
-        }
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -370,8 +350,9 @@ impl Capture {
 }
 
 /// What an instruction's cycles count as, by its mnemonic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, IntoStaticStr)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum Class {
     /// `v_wmma`, `v_swmmac`, `v_mfma`.
     Matrix,
@@ -400,25 +381,6 @@ pub enum Class {
 impl Class {
     pub fn of(asm: &str) -> Self {
         Self::from(asm::classify(asm).kind)
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Matrix => "matrix",
-            Self::Valu => "valu",
-            Self::Salu => "salu",
-            Self::Lds => "lds",
-            Self::VmemLoad => "vmem_load",
-            Self::VmemStore => "vmem_store",
-            Self::Smem => "smem",
-            Self::Branch => "branch",
-            Self::WaitVmem => "wait_vmem",
-            Self::WaitLgkm => "wait_lgkm",
-            Self::Immediate => "immediate",
-            Self::Barrier => "barrier",
-            Self::Message => "message",
-            Self::Other => "other",
-        }
     }
 }
 
@@ -547,6 +509,13 @@ pub struct Trips {
     pub counted: bool,
 }
 
+impl Trips {
+    /// What the per-trip figures are over: a trip where the statements count them, else an iteration.
+    pub fn unit(&self) -> Unit {
+        if self.counted { Unit::Trip } else { Unit::Iteration }
+    }
+}
+
 /// One traced SE's waves in the main loop.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SeLoop {
@@ -659,11 +628,12 @@ impl Analysis {
         let base = code.load_base;
         let lines: Vec<(u64, &str)> =
             objdump_lines(&capture.disassembly).into_iter().map(|(pc, line)| (pc + base, line)).collect();
+        let insts = insts(&lines);
         let (mut ses, mut traced, mut layout) = (vec![], vec![], None);
         // The traced SEs' waves, SE by SE: `(se, range)` into `waves`.
         let (mut waves, mut by_se, mut hidings) = (vec![], vec![], vec![]);
         let mut pcs = BTreeMap::<u64, Stats>::new();
-        let matrix = hidden::matrix_pcs(&lines);
+        let matrix: HashSet<u64> = insts.iter().filter(|(_, i)| i.1 == Kind::Matrix).map(|(&pc, _)| pc).collect();
         let (mut hidden, mut occupancy) = (BTreeMap::<u64, Hidden>::new(), vec![]);
 
         for se in &capture.trace.per_se {
@@ -734,17 +704,16 @@ impl Analysis {
             (None, Some(s)) => return HeaderSnafu { se: s.se, version: s.refused.expect("refused") }.fail(),
             (None, None) => return NoItraceSnafu.fail(),
         };
-        let text: BTreeMap<u64, &str> = lines.iter().copied().collect();
         let rows: Vec<Row> = pcs
             .iter()
             .map(|(&pc, s)| {
-                let line = text.get(&pc).copied().unwrap_or_default();
-                let (asm, class, pc) = (asm(line), Class::of(line), pc - base);
+                let (line, kind) = insts.get(&pc).copied().unwrap_or(("", Kind::Other));
+                let pc = pc - base;
                 let h = hidden.get(&pc).copied().unwrap_or_default();
                 Row {
                     pc,
-                    asm,
-                    class,
+                    asm: asm(line),
+                    class: Class::from(kind),
                     hits: s.hits,
                     latency: s.latency,
                     stall: s.stall,
@@ -794,7 +763,7 @@ impl Analysis {
         let listing: Vec<String> =
             capture.statements.iter().flat_map(|s| s.listing.lines()).map(str::to_string).collect();
         let statements = capture.statements.as_ref().map(|s| (&s.lines, listing.as_slice()));
-        let main_loop = main_loop(&lines, &pcs, traced_waves, &replay, base, statements);
+        let main_loop = main_loop(&insts, &pcs, traced_waves, &replay, base, statements);
         let mut analysis = Self {
             kernel: kernel.to_string(),
             arch: capture.trace.arch.to_string(),
@@ -869,7 +838,7 @@ impl Analysis {
         let mclk = self.mclk_mhz.map_or(String::new(), |mhz| format!(", mclk {mhz} MHz"));
         let (untraced, traced) = (ns(self.kernel_ns), ns(self.traced_ns));
         let ratio = verdict::slowdown(self).map_or(String::new(), |r| format!(" ({r:.2}x)"));
-        let pstate = self.pstate.map_or("unrecorded", Pstate::name);
+        let pstate = self.pstate.map_or("unrecorded", Into::into);
         let _ = writeln!(
             o,
             "kernel     {untraced} ns untraced, {traced} ns traced{ratio}, wave span {span} cycles, sclk {sclk} MHz{mclk}, pstate {pstate}"
@@ -896,8 +865,14 @@ impl Analysis {
         let share = |c: i64| if total > 0 { 100.0 * c as f64 / total as f64 } else { 0.0 };
         for c in &self.classes {
             let (l, s) = (c.latency, c.stall);
-            let _ =
-                writeln!(o, "{:<11} {:>8} {l:>11} {:>5.1}% {s:>11} {:>11}", c.class.name(), c.hits, share(l), l - s);
+            let _ = writeln!(
+                o,
+                "{:<11} {:>8} {l:>11} {:>5.1}% {s:>11} {:>11}",
+                <&str>::from(c.class),
+                c.hits,
+                share(l),
+                l - s
+            );
         }
         let (hits, stall): (u64, i64) = self.classes.iter().fold((0, 0), |(h, s), c| (h + c.hits, s + c.stall));
         let _ = writeln!(o, "{:<11} {hits:>8} {total:>11} {:>5.1}% {stall:>11} {:>11}", "total", 100.0, total - stall);
@@ -1044,7 +1019,7 @@ impl Analysis {
         let top: Vec<String> = classes
             .iter()
             .take(4)
-            .map(|c| format!("{} {:.0}%", c.class.name(), 100.0 * c.latency as f64 / total as f64))
+            .map(|c| format!("{} {:.0}%", <&str>::from(c.class), 100.0 * c.latency as f64 / total as f64))
             .collect();
         let sclk = self.sclk_mhz.map_or(String::new(), |mhz| format!(", sclk ~{mhz} MHz"));
         let pace = self
@@ -1069,7 +1044,7 @@ impl Analysis {
 fn partition_text(o: &mut String, l: &MainLoop) {
     use std::fmt::Write;
     let t = l.trips;
-    let unit = if t.counted { "a trip" } else { "an iteration" };
+    let unit = t.unit().name();
     let _ = writeln!(
         o,
         "trips      {} an iteration ({}), {} in the loop over {} waves",
@@ -1111,6 +1086,14 @@ impl std::fmt::Display for Analysis {
     }
 }
 
+/// Every instruction of the disassembly by PC: its line and kind, classified once.
+pub(crate) type Insts<'a> = BTreeMap<u64, (&'a str, Kind)>;
+
+/// The [`Insts`] of `lines`, `(pc, line)` pairs.
+pub(crate) fn insts<'a>(lines: &[(u64, &'a str)]) -> Insts<'a> {
+    lines.iter().map(|&(pc, line)| (pc, (line, asm::classify(line).kind))).collect()
+}
+
 /// One traced SE's waves, their wait records' bindings by record index, and the SE's pipes.
 struct SeWaves<'a> {
     se: u32,
@@ -1124,20 +1107,18 @@ struct SeWaves<'a> {
 /// cycles in it split, SE by SE, and by the statement `stmts` gives each instruction; an iteration
 /// runs as many trips as the largest unroll copy among its statements ([`Trips`]).
 fn main_loop<'a>(
-    lines: &[(u64, &str)],
+    insts: &Insts,
     pcs: &BTreeMap<u64, Stats>,
     ses: impl Iterator<Item = SeWaves<'a>> + Clone,
     replay: &Replay,
     base: u64,
     stmts: Option<(&Lines, &[String])>,
 ) -> Option<MainLoop> {
-    let edges = lines
+    let edges = insts
         .iter()
-        .filter_map(|&(pc, line)| Some((branch(pc, line).filter(|&target| target <= pc)?, pc)))
+        .filter_map(|(&pc, &(line, _))| Some((branch(pc, line).filter(|&target| target <= pc)?, pc)))
         .filter(|(_, pc)| pcs.contains_key(pc));
-    let matrix = |&(head, edge): &(u64, u64)| {
-        lines.iter().any(|&(pc, line)| (head..=edge).contains(&pc) && Class::of(line) == Class::Matrix)
-    };
+    let matrix = |&(head, edge): &(u64, u64)| insts.range(head..=edge).any(|(_, i)| i.1 == Kind::Matrix);
     let edges: Vec<(u64, u64)> = edges.collect();
     let (head, edge) = match edges.iter().filter(|e| matrix(e)).min_by_key(|(h, e)| e - h) {
         Some(&e) => e,
@@ -1152,12 +1133,11 @@ fn main_loop<'a>(
         }
     }
     let iterations = Spread::of(trips);
-    let body: Vec<u64> =
-        lines.iter().map(|l| l.0).filter(|pc| (head..=edge).contains(pc)).map(|pc| pc - base).collect();
+    let body: Vec<u64> = insts.range(head..=edge).map(|(pc, _)| pc - base).collect();
     let copies =
         stmts.map_or(vec![], |(stmts, _)| body.iter().filter_map(|pc| stmts.get(pc)).map(|s| s.copy).collect());
     let per_iteration = copies.iter().copied().max().unwrap_or(1).max(1);
-    let buckets = verdict::Buckets::new(lines);
+    let buckets = verdict::Buckets(insts);
     let (mut sites, mut charges) = (vec![], BTreeMap::<u64, verdict::Charge>::new());
     let ses: Vec<SeLoop> = ses
         .map(|s| {
@@ -1165,7 +1145,7 @@ fn main_loop<'a>(
             let pass = buckets.partition(s.waves, s.bound, head..=edge, s.hiding);
             sites.extend(pass.barriers.into_values());
             for (pc, c) in pass.charges {
-                charges.entry(pc - base).or_default().add(&c);
+                charges.entry(pc - base).or_default().add(&c, 1.0);
             }
             SeLoop { se: s.se, trips: edges * u64::from(per_iteration), partition: pass.partition }
         })
