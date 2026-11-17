@@ -1,0 +1,42 @@
+{
+  "fixture": "rdna4_nearest_split",
+  "shape": "n4096 d128 k16 NegDot",
+  "trips": 508,
+  "groups": [
+    {
+      "key": "matrix",
+      "raw": 145.7,
+      "exposed": 145.7
+    },
+    {
+      "key": "issue",
+      "raw": 76.7,
+      "exposed": 64.9
+    },
+    {
+      "key": "stall",
+      "raw": 38.9,
+      "exposed": 8.4
+    },
+    {
+      "key": "load",
+      "raw": 182.7,
+      "exposed": 141
+    },
+    {
+      "key": "lds",
+      "raw": 78.6,
+      "exposed": 58.8
+    },
+    {
+      "key": "barrier",
+      "raw": 255.1,
+      "exposed": 202.6
+    },
+    {
+      "key": "idle",
+      "raw": 311.1,
+      "exposed": 129.1
+    }
+  ]
+}
