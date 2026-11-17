@@ -19,7 +19,7 @@ use svod_device::sqtt::stitch::{branch, objdump_lines};
 use svod_dtype::AmdArch;
 use svod_ir::{Op, UOp, ops};
 use svod_runtime::amd::{LocatedAmd, compile_ir_to_amd_object, compile_ir_to_amd_object_as};
-use svod_runtime::sqtt::{Capture, Class, Lines, Statements, TwinError, disassemble, line_table, locate, same_text};
+use svod_runtime::sqtt::{Capture, Class, Lines, Statements, disassemble, line_table, locate, same_text};
 use test_case::test_case;
 
 use crate::build::{BF16, I8};
@@ -379,8 +379,9 @@ fn the_listing_names_statements_and_roles() {
 
 /// End to end on the host: a GEMM's SOURCE compiled puts its main loop's
 /// matrix instructions on the steady loop's product statement, one unroll
-/// copy a column; a capture of that code object takes the twin's lines,
-/// and a capture of other code refuses them.
+/// copy a column; a capture of that code object reads them from it, and
+/// keeps them saved and loaded back; a capture of a kernel built bare has
+/// none.
 #[test]
 fn matrix_instructions_sit_on_the_product_statement() {
     let arch = AmdArch::Gfx1201;
@@ -408,17 +409,16 @@ fn matrix_instructions_sit_on_the_product_statement() {
         mclk_mhz: None,
         code: Arc::new(CodeImage { elf: elf.into(), load_base: 1 << 40, entry_pc: 1 << 40 }),
     };
-    let mut capture = Capture::new(trace(&built.object), None).unwrap();
-    capture.attach_twin(&built.object, &listing).unwrap();
+    let capture = Capture::new(trace(&built.object), None).unwrap();
     assert_eq!(capture.statements, Some(Statements { lines: built.lines.clone(), listing: listing.clone() }));
+    let dir = tempfile::tempdir().unwrap();
+    capture.save(dir.path()).unwrap();
+    assert_eq!(Capture::load(dir.path()).unwrap().statements, capture.statements, "saved and loaded back");
 
     let (prog, lowering) = tile_gemm(config::gemm_cfg([64, 64, 64], 2, [2, 2], false));
-    let elsewhere =
+    let bare =
         compile_ir_to_amd_object(&standalone(prog, &lowering).unwrap().text(&lowering.device.target).unwrap(), arch);
-    let mut capture = Capture::new(trace(&elsewhere.unwrap()), None).unwrap();
-    let why = capture.attach_twin(&built.object, &listing);
-    assert!(matches!(why, Err(TwinError::TextDiffers { .. })), "{why:?}");
-    assert_eq!(capture.statements, None);
+    assert_eq!(Capture::new(trace(&bare.unwrap()), None).unwrap().statements, None, "a kernel without a line table");
 }
 
 /// `located` with its line table taken out: the `!dbg` attachments and the

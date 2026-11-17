@@ -180,6 +180,17 @@ pub fn line_table(elf: &[u8]) -> Result<Option<LineTable>, DwarfError> {
     Ok(tabled.then_some(LineTable { rows, listing }))
 }
 
+impl Statements {
+    /// The statements of a code object built with a line table over its [`LISTING`]: each of
+    /// `disassembly`'s instructions on its row ([`locate`]), and the listing its DWARF carries;
+    /// `None` where it carries no line table or no listing.
+    pub fn of(elf: &[u8], disassembly: &str) -> Result<Option<Self>, DwarfError> {
+        let Some(LineTable { rows, listing: Some(listing) }) = line_table(elf)? else { return Ok(None) };
+        let lines = locate(&rows, objdump_lines(disassembly).into_iter().map(|(pc, _)| pc));
+        Ok(Some(Self { lines, listing }))
+    }
+}
+
 /// `llvm-dwarfdump --debug-line` of a code object, the tool found beside clang.
 pub fn debug_line(elf: &[u8]) -> Result<String> {
     run_tool("llvm-dwarfdump", &["--debug-line", "-"], elf)

@@ -59,6 +59,8 @@ pub enum Error {
     Arch { arch: String },
     #[snafu(display("{}: capture format {found:?}, this build reads {FORMAT}; capture it again", path.display()))]
     Format { path: PathBuf, found: Option<u32> },
+    #[snafu(display("the kernel's line table: {source}"))]
+    LineTable { source: DwarfError },
 }
 
 /// The `meta.json` layout [`Capture::load`] reads; bumped whenever it changes.
@@ -119,8 +121,8 @@ pub struct Capture {
     pub grid: Option<[u32; 3]>,
     /// The power state the traced dispatch ran at; `None` where the capture predates the record.
     pub pstate: Option<Pstate>,
-    /// Each instruction's tile-program statement, and `kernel.tk`: from an offline twin build
-    /// ([`Self::attach_twin`]); `None` where none matched.
+    /// Each instruction's tile-program statement, and `kernel.tk`: from the code object's own line
+    /// table ([`Statements::of`]); `None` where it has none.
     pub statements: Option<Statements>,
 }
 
@@ -264,9 +266,11 @@ fn io<T>(path: &Path, result: std::io::Result<T>) -> Result<T> {
 }
 
 impl Capture {
-    /// Disassembles the trace's code image.
+    /// Disassembles the trace's code image, and reads its statements where it carries a line
+    /// table over its listing (a tk kernel's, [`Statements::of`]).
     pub fn new(trace: SqttTrace, kernel_ns: Option<u64>) -> Result<Self> {
         let disassembly = disassemble(&trace.code.elf)?;
+        let statements = Statements::of(&trace.code.elf, &disassembly).context(LineTableSnafu)?;
         Ok(Self {
             trace,
             disassembly,
@@ -278,7 +282,7 @@ impl Capture {
             workgroup: None,
             grid: None,
             pstate: None,
-            statements: None,
+            statements,
         })
     }
 
