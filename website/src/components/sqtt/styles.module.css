@@ -1,0 +1,69 @@
+.figure {
+  margin: 1.5rem 0;
+}
+
+.svg {
+  display: block;
+  width: 100%;
+  max-width: 640px;
+  height: auto;
+  font-family: var(--ifm-font-family-base);
+  overflow: visible;
+}
+
+.svg text {
+  fill: var(--sqtt-ink);
+}
+
+.svg .muted {
+  fill: var(--sqtt-muted);
+}
+
+.caption {
+  margin-top: 0.5rem;
+  font-size: 0.875rem;
+  color: var(--sqtt-muted);
+}
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 1rem;
+  margin: 0.5rem 0 0;
+  padding: 0;
+  list-style: none;
+  font-size: 0.8rem;
+}
+
+.legend li {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.swatch {
+  display: inline-block;
+  flex: none;
+  width: 0.85rem;
+  height: 0.85rem;
+  border-radius: 3px;
+}
+
+.table {
+  margin: 0.75rem 0 0;
+  font-size: 0.875rem;
+}
+
+.table th,
+.table td {
+  padding: 0.3rem 0.6rem;
+}
+
+.table td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.table code {
+  white-space: nowrap;
+}

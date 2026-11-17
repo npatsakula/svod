@@ -2,11 +2,37 @@
 sidebar_label: 剖析
 ---
 
-# 用线程追踪剖析 {#profiling-with-a-thread-trace}
+import RawVsExposed from "@site/src/components/sqtt/RawVsExposed";
+import TripAnatomy from "@site/src/components/sqtt/TripAnatomy";
+import SplitBarrier from "@site/src/components/sqtt/SplitBarrier";
+import BarrierCompare from "@site/src/components/sqtt/BarrierCompare";
+
+# 用线程追踪剖析
 
 内核的时间告诉你它慢。线程追踪告诉你为什么慢：每个 wave 在等待哪条指令、等了多久，以及这条指令来自 tile 程序的哪一行。本页带你从“这个内核很慢”走到对 tk 程序的一处改动。
 
-## 为什么需要追踪 {#why-a-trace}
+<div className="sqtt-diagram">
+
+```mermaid
+%%{init: {"flowchart": {"rankSpacing": 22, "nodeSpacing": 24}}}%%
+flowchart TD
+  L["内核启动，追踪运行"] --> S0["SE0：追踪一个 SIMD"]
+  L --> S1["SE1：追踪一个 SIMD"]
+  S0 --> A0["se0.att"]
+  S1 --> A1["se1.att"]
+  A0 --> D["解码"]
+  A1 --> D
+  D --> W["wave 及其指令"]
+  W --> M["主循环，切分为行程"]
+  M --> B["桶：issue、stall、wait、barrier、idle"]
+  B --> V["发现：结论"]
+  V --> T["kernel.tk 中的语句"]
+  C["kernel.co 的行表"] -.-> T
+```
+
+</div>
+
+## 为什么需要追踪 {/* #why-a-trace */}
 
 其他工具都从外部观察内核。设备时间说明它耗时多久，roofline 说明它距离内存与计算上限有多远，计数器说明各单元有多忙。它们都说不出某个周期上一个 wave 在做什么。在 AMD 的 RDNA 显卡上，SQ 线程追踪（SQTT）恰好记录了这一点，因此你可以看出主循环是在等待全局加载、等待 LDS、等待屏障，还是什么都没在等。
 
@@ -20,7 +46,7 @@ Svod 的剖析器分为五层。每一层都在下一层之上增加细节：
 | 4，硬件计数器 | 繁忙周期、wave、指令（`SVOD_PMC`） | AMD（PM4）、CUDA（CUPTI） |
 | 5，线程追踪 | 每个被追踪 wave 的指令及其周期，只需额外一遍运行 | AMD gfx11 和 gfx12 |
 
-## 追踪记录了什么 {#what-the-trace-records}
+## 追踪记录了什么 {/* #what-the-trace-records */}
 
 追踪是每个着色器引擎（SE）的一条令牌流：一个 wave 何时开始、何时结束，以及对被追踪的 SIMD 而言，它发出的每条指令及发出时间。Svod 解码这条流，把每条指令映射回内核的反汇编，并把主循环的周期划分到各个桶中：
 
@@ -32,9 +58,20 @@ Svod 的剖析器分为五层。每一层都在下一层之上增加细节：
 
 每个桶还有一个**暴露**（exposed）份额：其周期减去其他流水线的工作在同一时间掩盖掉的部分。一次 180 个周期的加载等待，若其中 140 个周期矩阵流水线都在忙，则代价约为 40。各项发现按暴露份额排序，因为只有暴露的周期在被消除时才会缩短内核时间。
 
+<RawVsExposed
+  labels={{matrix: "matrix", valu: "VALU", load: "加载等待", barrier: "屏障", hidden: "原始，被其他流水线的工作掩盖", exposed: "暴露：没有其他工作在运行", raw: "原始", exposedSpan: "暴露", time: "一个 SIMD 上的时间 →"}}
+  caption="示意图，并非追踪数据：一次加载等待全部计入原始周期，但只有没有其他流水线繁忙的那些周期才计为暴露；没有其他工作运行时的屏障同样是暴露的。"
+/>
+
 一次**行程**（trip）是 tile 程序循环体的一次执行；循环展开时，它可能短于一次硬件迭代。周期数指一个被追踪 wave 的周期，按每次行程计。
 
-## 范围与开销 {#scope-and-cost}
+
+<TripAnatomy
+  labels={{matrix: "矩阵发出", issue: "其他发出（VALU、SALU、LDS……）", stall: "停顿", load: "等待全局加载", lds: "等待 LDS", barrier: "屏障", idle: "空闲", raw: "原始", exposed: "暴露", bucket: "桶", total: "合计"}}
+  caption={(d) => `rdna4_nearest_split 夹具（${d.shape}）主循环的一次行程：一个被追踪 wave 的周期按桶划分，取其 ${d.trips} 次行程的平均。`}
+/>
+
+## 范围与开销 {/* #scope-and-cost */}
 
 - **硬件。** AMD gfx11（RDNA3、RDNA3.5）和 gfx12（RDNA4）。其他任何目标都会以 `only gfx11 and gfx12 are traced` 被拒绝。采集已在 gfx1201（RX 9070 XT）和 gfx1151（Strix Halo）上验证。gfx1100 的追踪可以解码，但尚未验证任何硬件采集。
 - **gfx11 没有上限数据。** gfx11 把矩阵操作记录为一个单周期令牌，因此在那里各流水线的繁忙份额未知。报告不打印 `ceiling` 行，其发现使用原始份额，并标记为 `approx: untimed_matrix`。
@@ -43,14 +80,14 @@ Svod 的剖析器分为五层。每一层都在下一层之上增加细节：
 - **每个被追踪的内核额外一遍运行。** 剖析先在不追踪的情况下为各次运行计时，然后在启用追踪的情况下再运行一次计划。这一遍在每个内核之后同步，并在下一个内核之前释放其缓冲区。任何计时列都不来自这一遍。
 - **两个 SIMD。** 指令令牌来自 SE0 和 SE1，各一个 SIMD（`SqttConfig::se_mask`）。`SVOD_SQTT_SIMD` 选择它们：为每个 SE 指定同一个 SIMD，或给出一个在各 SE 上循环使用的逗号列表（默认 `0,1`，即 SE0 上为 SIMD 0，SE1 上为 SIMD 1）。逐指令的数字描述的是这两个 SIMD 上的 wave。
 
-## 时钟与前提条件 {#clocks-and-prerequisites}
+## 时钟与前提条件 {/* #clocks-and-prerequisites */}
 
 - 一块属于上述目标的 AMD 显卡，以 `SVOD_DEVICE=AMD`（或 `AMD:N`）选中，运行 PM4 队列。
 - 与 Svod 编译所用的 clang 放在一起的 `llvm-objdump`。采集会保存其反汇编，因此重放只在缺少 `kernel.s` 时才需要该工具。
 - **不固定时钟，这是默认行为。** 追踪的那一遍以设备自行选择的时钟运行，与未追踪的运行一样。`SVOD_SQTT_PSTATE=standard`（或 `peak`）通过 DRM 上下文固定一个稳定的功耗状态。这会降低着色器时钟并扭曲追踪所呈现的内容。仅在需要与旧的固定时钟采集对照时使用。
 - 一块安静的 GPU。追踪无论如何都会扰动运行：报告会打印追踪运行时间与未追踪运行时间之比，超过 1.2× 时将发现标记为 `approx: perturbed`。切勿将追踪下的时间与未追踪的时间比较。
 
-## 在 Rust 中追踪 {#tracing-from-rust}
+## 在 Rust 中追踪 {/* #tracing-from-rust */}
 
 `ProfileOptions::sqtt` 为任何被剖析的计划（`ExecutionPlan::profile`）或张量（`Tensor::profile`）开启第 5 层：
 
@@ -74,13 +111,13 @@ for traced in profile.stages.iter().flat_map(|stage| &stage.sqtt) {
 
 每个 `Traced` 携带自己的 `analysis`。一个内核的追踪无法分析时，其他内核不受影响。`RunProfile::render_report` 以每个被追踪内核一行摘要结尾。
 
-## 追踪模型 {#tracing-a-model}
+## 追踪模型 {/* #tracing-a-model */}
 
 模型示例的 `--profile` 标志不会追踪。要追踪模型，请用上述选项剖析其输出张量。计划中的每个已编译内核都会被追踪：tk 内核和图内核都一样。`SqttOptions::from_env()` 从环境构建这些选项，供需要开关的程序使用：`SVOD_SQTT=1` 开启追踪，`SVOD_SQTT_DIR` 指定目录，`SVOD_SQTT_PSTATE` 和 `SVOD_SQTT_SIMD` 设置配置。`SVOD_SQTT` 不为 `1` 时它返回 `Ok(None)`，值无法解析时返回错误。
 
 从未追踪运行的逐内核表开始，挑出占主导的内核，用 `tk_bench sqtt --load`（见下文）读取它的目录。对于 tk 内核，接下来单独追踪它，以便改变其配置。
 
-## 追踪单个内核 {#tracing-one-kernel}
+## 追踪单个内核 {/* #tracing-one-kernel */}
 
 `tk_bench sqtt` 在某个形状上构建一个 tk 算子，像调优器那样在不追踪的情况下为每个配置计时，追踪一次，保存采集并打印其报告：
 
@@ -97,7 +134,7 @@ SVOD_DEVICE=AMD cargo run --release -p svod-tk --example tk_bench -- sqtt neares
 
 四个命令都接受 `--cfg`、`--top N`（表格行数，默认 12）、`--out DIR`（默认 `./sqtt`）和 `--json`（报告输出为一行 JSON）。`--cfg` 是逗号列表。默认值 `tuned` 是该算子会启动的配置。数字 `I` 是规划器排名第 `I` 的配置。GEMM 还接受固定编码 `BMxBNxBK:S:WRxWC[:rolled]`，`nearest` 和 `conv` 接受 `ranked`，它列出排名而不进行追踪。每个配置落在 `DIR/<op>_<shape>_<cfg>/p<program>/<index>_<entry>/` 中，路径以 `saved …` 打印。
 
-## 保存的目录与重放 {#the-saved-directory-and-replay}
+## 保存的目录与重放 {/* #the-saved-directory-and-replay */}
 
 | 文件 | 内容 |
 |---|---|
@@ -116,7 +153,7 @@ cargo run --release -p svod-tk --example tk_bench -- sqtt --load DIR [--json] [-
 
 在 Rust 中，`svod_runtime::sqtt::Analysis::load(dir)` 返回同样的分析结果。
 
-## 阅读报告 {#reading-the-report}
+## 阅读报告 {/* #reading-the-report */}
 
 `rdna4_nearest_split` 夹具（`device/src/test/fixtures/sqtt/svod/`）是一个 gfx1201 上的 nearest 内核，n4096 d128 k16。节选后，其报告如下：
 
@@ -150,7 +187,7 @@ traced     se0 sa0 wgp0 simd0 (2 waves), se1 sa0 wgp0 simd1 (2 waves) of 2 SEs
 
 之后还有其他各节：按类别划分的时间、每个 SE 的占用率、主循环按桶划分的每次行程周期数、停顿最多的指令、等待及约束它们的加载，以及最热的指令。
 
-## 结论类别及其调节手段 {#verdict-classes-and-their-levers}
+## 结论类别及其调节手段 {/* #verdict-classes-and-their-levers */}
 
 阈值是启发式的，作为常量保存在 `runtime/src/sqtt/verdict.rs` 中。
 
@@ -164,11 +201,46 @@ traced     se0 sa0 wgp0 simd0 (2 waves), se1 sa0 wgp0 simd1 (2 waves) of 2 SEs
 | `barrier` | 屏障周期 ≥ 循环的 10% | `barrier` | 先解决其他发现；只有当屏障的暴露份额超过 10% 时才删除、合并或拆分它 |
 | `loop_overhead` | VALU+SALU 发出 ≥ 矩阵发出的 10%，或存在任何发散分支 | `hoist` | 将地址和边界检查的运算提出循环；使边界检查一致（uniform） |
 
+<div className="sqtt-diagram">
+
+```mermaid
+%%{init: {"flowchart": {"rankSpacing": 40, "nodeSpacing": 22, "subGraphTitleMargin": {"top": 4, "bottom": 10}}}}%%
+flowchart LR
+  subgraph bound["bound 类别"]
+    MB["matrix_bound"]
+    IB["issue_bound"]
+    OL["occupancy_limited"]
+  end
+  subgraph findings["发现"]
+    LE["load_exposed"]
+    LX["lds_exposed"]
+    BA["barrier"]
+    LO["loop_overhead"]
+  end
+  MB -->|"less_matrix_work"| MW["更便宜的类型或更少的矩阵操作"]
+  IB -->|"cut_issue"| CI["从循环中去掉非矩阵指令"]
+  OL -->|"free_resources"| FR["每个工作组更少的 VGPR 或更少的 LDS"]
+  OL -->|"more_workgroups"| WG["更小的 tile 或更多拆分"]
+  OL -->|"more_waves"| FR
+  OL -->|"more_waves"| WG
+  LE -->|"latency"| RG["更深的环形缓冲"]
+  LE -->|"move_use"| AH["提前一步发出的加载"]
+  LX -->|"lds_flush"| DS["更少、更宽的 ds 操作"]
+  LX -->|"lds_use"| DS
+  LX -->|"lds_use"| FE["更早读取下一个分片"]
+  LX -->|"lds_queue"| DS
+  LX -->|"lds_queue"| CF["无冲突的布局"]
+  BA -->|"barrier"| BR["先解决其他发现；只有当屏障的暴露份额超过 10% 时才删除、合并或拆分它"]
+  LO -->|"hoist"| HO["将地址和边界检查的运算提出循环；使边界检查一致"]
+```
+
+</div>
+
 屏障是一个汇点：各 wave 停在那里等待最慢的 wave，因此它的时间属于让那个 wave 变慢的任何原因。该发现会列出最后到达的是谁、在哪条指令之后到达。
 
 标记为 `approx` 的发现，其数字需要谨慎解读：`perturbed`、`untimed_matrix`、`approx_bindings`（猜测的绑定）、`implausible_time`（损坏的流）、`truncated` 或 `per_iteration`。
 
-## `--attribute` 与 `--compare` {#--attribute-and---compare}
+## `--attribute` 与 `--compare` {/* #--attribute-and---compare */}
 
 `--attribute` 仅适用于 GEMM，因为只有 `tk_bench sqtt gemm` 的采集带有代价模型的价格。它把每个计价项（`steps`、`reads`、`fill`、`wait`、`lone_trip`、`trip`）与其所计价指令的追踪周期并列。各项相互重叠，因此应比较份额和每次行程的节奏，而不是总数。
 
@@ -180,7 +252,7 @@ cargo run --release -p svod-tk --example tk_bench -- sqtt --compare A B [--json]
 
 它打印两者的时间、出现、消失或变化的发现、按 |Δ exposed| 排序的每次行程循环桶、按文本对齐的语句，以及按助记符对齐的循环指令。当两份采集运行在不同的功耗状态、其追踪/未追踪比值相差超过 10%，或其行程覆盖的归约量不同时，它会以 `!!` 发出警告。没有主循环的采集没有可对齐的内容。
 
-## 工作流程 {#the-workflow}
+## 工作流程 {/* #the-workflow */}
 
 1. 在未追踪剖析的逐内核表中找到慢的内核。
 2. 追踪它：`tk_bench sqtt <op> <shape>`；对于只存在于模型内部的内核，用带 `SqttOptions` 的 `Tensor::profile`。
@@ -189,15 +261,22 @@ cargo run --release -p svod-tk --example tk_bench -- sqtt --compare A B [--json]
 5. 做一处改动，以指向新目录的 `--out` 再次追踪，并运行 `--compare old new`。检查目标桶是否发生了变化，并只依据未追踪时间判断收益。
 6. 保留改动之前，在空闲的 GPU 上用 `tk_bench` 或调优器确认。
 
-## 实例 {#worked-examples}
+## 实例 {/* #worked-examples */}
 
-### 注意力：提前一步加载偏置 {#attention-loading-the-bias-a-step-ahead}
+### 注意力：提前一步加载偏置 {/* #attention-loading-the-bias-a-step-ahead */}
 
 一个直接读取的注意力偏置 tile 是在使用它的分数的那一步中加载的，因此它的等待紧跟在加载之后。这正是 `load_exposed` 以 `move_use` 指出的模式。现在内核提前一步加载每个 tile（`tk/src/kernels/attention.rs` 中由 `pipeline_with` 将其带入下一步），因此加载有整整一步的时间完成。PR #230 测得 d128 下 −19%、d64 下 −7%。
 
-### Nearest：在 RDNA4 上拆分屏障 {#nearest-splitting-the-barrier-on-rdna4}
+### Nearest：在 RDNA4 上拆分屏障 {/* #nearest-splitting-the-barrier-on-rdna4 */}
 
-`rdna4_nearest_joined` 和 `rdna4_nearest_split` 夹具是同一个 `NearestCfg`（n4096 d128 k16），分别为采用 RDNA4 拆分屏障之前和之后。在 gfx12 上，寄存器暂存环形缓冲的稳态循环现在在 LDS 提交之后发出屏障信号（`arrive`，`s_barrier_signal`），并在行程末尾等待它（`await`，`s_barrier_wait`）。两者之间的尾部在较慢的 wave 追赶时运行。对这两个夹具运行 `--compare` 即可看到：
+`rdna4_nearest_joined` 和 `rdna4_nearest_split` 夹具是同一个 `NearestCfg`（n4096 d128 k16），分别为采用 RDNA4 拆分屏障之前和之后。在 gfx12 上，寄存器暂存环形缓冲的稳态循环现在在 LDS 提交之后发出屏障信号（`arrive`，`s_barrier_signal`），并在行程末尾等待它（`await`，`s_barrier_wait`）。两者之间的尾部在较慢的 wave 追赶时运行。
+
+<SplitBarrier
+  labels={{joined: "合并：一个 s_barrier", split: "拆分：s_barrier_signal，随后 s_barrier_wait", wave: "wave", work: "工作", parked: "停在屏障处", next: "下一次行程", barrier: "s_barrier", signal: "s_barrier_signal，在 LDS 提交之后", wait: "s_barrier_wait", release: "最后一个 wave 发出信号", joinedNext: "合并：下一次行程开始"}}
+  caption="示意图，并非追踪数据：一次行程中的四个 wave。拆分后，提前到达的 wave 运行其尾部而不是停下；只有当它等待时最慢的 wave 仍未发出信号，它才会停下。虚线标出合并版本开始下一次行程的位置；最慢的 wave 并不会更早开始自己的下一次行程。"
+/>
+
+对这两个夹具运行 `--compare` 即可看到：
 
 ```text
 time       180320 -> 144840 ns untraced (-19.7%); traced/untraced 1.01x -> 1.02x; …
@@ -210,9 +289,14 @@ barrier              1081.7    255.1   -826.6    962.9    202.6   -760.2
      0.0    255.1   +255.1      0.0    202.6   +202.6  await [steady]
 ```
 
+<BarrierCompare
+  labels={{joined: "合并", split: "拆分", raw: "原始", exposed: "暴露", statement: "语句"}}
+  caption={(d) => `主循环的屏障桶，每次行程的周期数，来自对两个夹具运行的 tk_bench sqtt --compare；未追踪时间 ${d.us[0]} → ${d.us[1]} µs。`}
+/>
+
 屏障暴露从每次行程 963 个周期降到 203 个周期，`barrier [steady]` 语句变为 `arrive` + `await [steady]`，未追踪时间从 180 µs 降到 145 µs。每一侧都是单次追踪运行。PR #230 的基准测试测得 nearest d128 k16 为 −5.6%。新出现的 `load_exposed` 发现是下一个调节手段：屏障消失后，全局加载的延迟显露出来。
 
-### GEMM：不规整的 M {#gemm-a-ragged-m}
+### GEMM：不规整的 M {/* #gemm-a-ragged-m */}
 
 `rdna4_gemm_1536` 和 `rdna4_gemm_1500` 夹具是同一个 GEMM 配置，M 分别为 1536 和 1500（N 1280、K 5120，Whisper 的 fc2）。两次重放都给出 `bound matrix_bound`。只有 1500 那次额外出现 `loop_overhead`，其证据是主循环中的八个发散分支：
 
@@ -225,7 +309,7 @@ barrier              1081.7    255.1   -826.6    962.9    202.6   -760.2
 
 M 不是 tile 的倍数时，边界检查会以 exec 分支的形式出现在循环内部；而 1536 的采集是其 128 行 tile 的倍数，没有这样的分支。这个结论是定性的：不规整的边缘会耗费循环指令，而填充到 tile 倍数的形状不需要付出这一代价，因此在为不规整形状调整调度之前，先检查填充后的形状。
 
-## 注意事项 {#caveats}
+## 注意事项 {/* #caveats */}
 
 - 追踪只能看到两个 SIMD。从不落到它们上的网格在那里什么也追踪不到。
 - 追踪下的时间绝不是基准测试结果。用 `tk_bench` 或调优器在不追踪的情况下评判一处改动。

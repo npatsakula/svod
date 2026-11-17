@@ -1,0 +1,55 @@
+{
+  "fixtures": [
+    "rdna4_nearest_joined",
+    "rdna4_nearest_split"
+  ],
+  "kernel_ns": [
+    180320,
+    144840
+  ],
+  "barrier": {
+    "raw": [
+      1081.7,
+      255.1
+    ],
+    "exposed": [
+      962.9,
+      202.6
+    ]
+  },
+  "statements": [
+    {
+      "statement": "barrier [steady]",
+      "raw": [
+        1081.7,
+        0
+      ],
+      "exposed": [
+        962.9,
+        0
+      ]
+    },
+    {
+      "statement": "await [steady]",
+      "raw": [
+        0,
+        255.1
+      ],
+      "exposed": [
+        0,
+        202.6
+      ]
+    },
+    {
+      "statement": "arrive [steady]",
+      "raw": [
+        0,
+        0
+      ],
+      "exposed": [
+        0,
+        0
+      ]
+    }
+  ]
+}

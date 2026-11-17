@@ -2,11 +2,37 @@
 sidebar_label: Profiling
 ---
 
+import RawVsExposed from "@site/src/components/sqtt/RawVsExposed";
+import TripAnatomy from "@site/src/components/sqtt/TripAnatomy";
+import SplitBarrier from "@site/src/components/sqtt/SplitBarrier";
+import BarrierCompare from "@site/src/components/sqtt/BarrierCompare";
+
 # Profiling with a Thread Trace
 
 A kernel's time tells you that it is slow. A thread trace tells you why: which instruction each
 wave waited on, for how long, and which line of the tile program that instruction came from. This
 page takes you from "this kernel is slow" to a change in the tk program.
+
+<div className="sqtt-diagram">
+
+```mermaid
+%%{init: {"flowchart": {"rankSpacing": 22, "nodeSpacing": 24}}}%%
+flowchart TD
+  L["kernel launch, traced pass"] --> S0["SE0: one SIMD traced"]
+  L --> S1["SE1: one SIMD traced"]
+  S0 --> A0["se0.att"]
+  S1 --> A1["se1.att"]
+  A0 --> D["decode"]
+  A1 --> D
+  D --> W["waves and their instructions"]
+  W --> M["main loop, cut into trips"]
+  M --> B["buckets: issue, stall, wait, barrier, idle"]
+  B --> V["findings: the verdict"]
+  V --> T["statements in kernel.tk"]
+  C["kernel.co line table"] -.-> T
+```
+
+</div>
 
 ## Why a trace
 
@@ -42,8 +68,12 @@ Each bucket also has an **exposed** share: its cycles less what other pipes' wor
 time. A load wait of 180 cycles while the matrix pipe is busy for 140 of them costs about 40. The
 findings rank by exposed share, because only exposed cycles shorten the kernel when you remove them.
 
+<RawVsExposed />
+
 A **trip** is one pass of the tile program's loop body, which may be shorter than a hardware
 iteration when the loop is unrolled. Cycles are a traced wave's, per trip.
+
+<TripAnatomy />
 
 ## Scope and cost
 
@@ -219,6 +249,41 @@ The thresholds are heuristics, kept as constants in `runtime/src/sqtt/verdict.rs
 | `barrier` | Barrier cycles ≥ 10% of the loop | `barrier` | Fix the other findings first; drop, merge or split a barrier only if its exposed share passes 10% |
 | `loop_overhead` | VALU+SALU issue ≥ 10% of the matrix issue, or any divergent branch | `hoist` | Hoist address and guard arithmetic; make guards uniform |
 
+<div className="sqtt-diagram">
+
+```mermaid
+%%{init: {"flowchart": {"rankSpacing": 40, "nodeSpacing": 22, "subGraphTitleMargin": {"top": 4, "bottom": 10}}}}%%
+flowchart LR
+  subgraph bound["bound class"]
+    MB["matrix_bound"]
+    IB["issue_bound"]
+    OL["occupancy_limited"]
+  end
+  subgraph findings["findings"]
+    LE["load_exposed"]
+    LX["lds_exposed"]
+    BA["barrier"]
+    LO["loop_overhead"]
+  end
+  MB -->|"less_matrix_work"| MW["a cheaper type or fewer matrix ops"]
+  IB -->|"cut_issue"| CI["drop non-matrix instructions from the loop"]
+  OL -->|"free_resources"| FR["fewer VGPRs or less LDS a workgroup"]
+  OL -->|"more_workgroups"| WG["a smaller tile or more splits"]
+  OL -->|"more_waves"| FR
+  OL -->|"more_waves"| WG
+  LE -->|"latency"| RG["a deeper ring"]
+  LE -->|"move_use"| AH["a load issued a step ahead"]
+  LX -->|"lds_flush"| DS["fewer and wider ds ops"]
+  LX -->|"lds_use"| DS
+  LX -->|"lds_use"| FE["the next fragment read earlier"]
+  LX -->|"lds_queue"| DS
+  LX -->|"lds_queue"| CF["a conflict-free layout"]
+  BA -->|"barrier"| BR["fix the other findings first; drop, merge or split a barrier only past 10% exposed"]
+  LO -->|"hoist"| HO["hoist address and guard arithmetic; make guards uniform"]
+```
+
+</div>
+
 A barrier is a sink: the waves park there for the slowest wave, so its time belongs to whatever
 made that wave slow. The finding lists who arrived last and after which instruction.
 
@@ -275,7 +340,11 @@ The `rdna4_nearest_joined` and `rdna4_nearest_split` fixtures are the same `Near
 d128 k16) before and after RDNA4's split barrier. On gfx12 the register-staged ring's steady loop
 now signals the barrier (`arrive`, `s_barrier_signal`) after the LDS commit and waits for it
 (`await`, `s_barrier_wait`) at the end of the trip. The tail between the two runs while slower waves
-catch up. `--compare` on the fixtures shows it:
+catch up.
+
+<SplitBarrier />
+
+`--compare` on the fixtures shows it:
 
 ```text
 time       180320 -> 144840 ns untraced (-19.7%); traced/untraced 1.01x -> 1.02x; …
@@ -287,6 +356,8 @@ barrier              1081.7    255.1   -826.6    962.9    202.6   -760.2
   1081.7      0.0  -1081.7    962.9      0.0   -962.9  barrier [steady]
      0.0    255.1   +255.1      0.0    202.6   +202.6  await [steady]
 ```
+
+<BarrierCompare />
 
 Barrier exposure falls from 963 to 203 cycles a trip, the `barrier [steady]` statement becomes
 `arrive` + `await [steady]`, and the untraced time goes from 180 to 145 µs. Each side is a single

@@ -2,13 +2,39 @@
 sidebar_label: Profiling
 ---
 
-# Thread trace के साथ profiling {#profiling-with-a-thread-trace}
+import RawVsExposed from "@site/src/components/sqtt/RawVsExposed";
+import TripAnatomy from "@site/src/components/sqtt/TripAnatomy";
+import SplitBarrier from "@site/src/components/sqtt/SplitBarrier";
+import BarrierCompare from "@site/src/components/sqtt/BarrierCompare";
+
+# Thread trace के साथ profiling
 
 किसी कर्नेल का समय आपको बताता है कि वह धीमा है। Thread trace बताती है कि क्यों: हर wave किस
 instruction पर रुकी, कितनी देर, और वह instruction tile program की किस line से आया। यह पेज आपको
 "यह कर्नेल धीमा है" से tk program में एक बदलाव तक ले जाता है।
 
-## Trace क्यों {#why-a-trace}
+<div className="sqtt-diagram">
+
+```mermaid
+%%{init: {"flowchart": {"rankSpacing": 22, "nodeSpacing": 24}}}%%
+flowchart TD
+  L["kernel launch, traced pass"] --> S0["SE0: एक SIMD traced"]
+  L --> S1["SE1: एक SIMD traced"]
+  S0 --> A0["se0.att"]
+  S1 --> A1["se1.att"]
+  A0 --> D["decode"]
+  A1 --> D
+  D --> W["waves और उनके instructions"]
+  W --> M["main loop, trips में बँटा"]
+  M --> B["buckets: issue, stall, wait, barrier, idle"]
+  B --> V["findings: verdict"]
+  V --> T["kernel.tk के statements"]
+  C["kernel.co की line table"] -.-> T
+```
+
+</div>
+
+## Trace क्यों {/* #why-a-trace */}
 
 बाक़ी tools कर्नेल को बाहर से देखते हैं। Device time बताता है कि उसमें कितना समय लगा, roofline बताता है
 कि वह memory और compute की सीमाओं से कितना दूर है, और counters बताते हैं कि units कितनी व्यस्त थीं।
@@ -26,7 +52,7 @@ Svod के profiler के पाँच tiers हैं। हर एक अप
 | 4, hardware counters | Busy cycles, waves, instructions (`SVOD_PMC`) | AMD (PM4), CUDA (CUPTI) |
 | 5, thread trace | हर traced wave के instructions उनके cycles के साथ, एक अतिरिक्त pass में | AMD gfx11 और gfx12 |
 
-## Trace क्या record करती है {#what-the-trace-records}
+## Trace क्या record करती है {/* #what-the-trace-records */}
 
 Trace हर shader engine (SE) के लिए tokens की एक stream है: कोई wave कब शुरू हुई और कब ख़त्म हुई, और
 traced SIMD के लिए, उसने कौन-सा instruction कब issue किया। Svod stream को decode करता है, हर
@@ -43,10 +69,21 @@ instruction को कर्नेल के disassembly से वापस map
 उसे घटाकर। 180 cycles का load wait, जिनमें से 140 के दौरान matrix pipe व्यस्त है, लगभग 40 का पड़ता है।
 Findings exposed हिस्से से rank होती हैं, क्योंकि सिर्फ़ exposed cycles हटाने पर ही कर्नेल छोटा होता है।
 
+<RawVsExposed
+  labels={{matrix: "matrix", valu: "VALU", load: "load wait", barrier: "barrier", hidden: "raw, दूसरी pipes के काम से छिपा", exposed: "exposed: और कुछ नहीं चल रहा", raw: "raw", exposedSpan: "exposed", time: "एक SIMD पर समय →"}}
+  caption="एक schematic, trace data नहीं: load wait पूरा का पूरा raw में गिना जाता है, लेकिन exposed में सिर्फ़ उसके वे cycles जब कोई दूसरी pipe व्यस्त नहीं है; और कुछ न चलते समय barrier भी इसी तरह exposed होता है।"
+/>
+
 एक **trip** tile program के loop body का एक pass है, जो loop के unrolled होने पर hardware iteration से
 छोटा हो सकता है। Cycles किसी traced wave के होते हैं, प्रति trip।
 
-## Scope और cost {#scope-and-cost}
+
+<TripAnatomy
+  labels={{matrix: "matrix issue", issue: "दूसरा issue (VALU, SALU, LDS, …)", stall: "stall", load: "global loads पर wait", lds: "LDS पर wait", barrier: "barrier", idle: "idle", raw: "raw", exposed: "exposed", bucket: "bucket", total: "कुल"}}
+  caption={(d) => `rdna4_nearest_split fixture (${d.shape}) के main loop की एक trip: bucket के हिसाब से एक traced wave के cycles, उसकी ${d.trips} trips का औसत।`}
+/>
+
+## Scope और cost {/* #scope-and-cost */}
 
 - **Hardware.** AMD gfx11 (RDNA3, RDNA3.5) और gfx12 (RDNA4)। कोई भी दूसरा target
   `only gfx11 and gfx12 are traced` के साथ मना कर दिया जाता है। Captures gfx1201 (RX 9070 XT) और gfx1151
@@ -67,7 +104,7 @@ Findings exposed हिस्से से rank होती हैं, क्�
   (default `0,1`, SE0 पर SIMD 0 और SE1 पर SIMD 1)। Per-instruction संख्याएँ उन्हीं दो SIMDs की waves के
   बारे में हैं।
 
-## Clocks और prerequisites {#clocks-and-prerequisites}
+## Clocks और prerequisites {/* #clocks-and-prerequisites */}
 
 - ऊपर के targets में से एक AMD card, `SVOD_DEVICE=AMD` (या `AMD:N`) से चुना हुआ, PM4 queues पर चलता हुआ।
 - उस clang के बगल में `llvm-objdump` जिससे Svod compile करता है। Capture अपना disassembly सहेजती है,
@@ -80,7 +117,7 @@ Findings exposed हिस्से से rank होती हैं, क्�
   है, और 1.2× से ऊपर वह findings पर `approx: perturbed` का निशान लगाती है। Traced समय की तुलना कभी
   untraced समय से न करें।
 
-## Rust से tracing {#tracing-from-rust}
+## Rust से tracing {/* #tracing-from-rust */}
 
 `ProfileOptions::sqtt` किसी भी profiled plan (`ExecutionPlan::profile`) या tensor (`Tensor::profile`)
 के लिए tier 5 चालू करता है:
@@ -108,7 +145,7 @@ for traced in profile.stages.iter().flat_map(|stage| &stage.sqtt) {
 हर `Traced` अपना `analysis` ख़ुद रखता है। जिस कर्नेल की trace analyze नहीं होती, वह बाक़ियों को अछूता
 छोड़ता है। `RunProfile::render_report` हर traced कर्नेल के लिए एक summary line के साथ ख़त्म होता है।
 
-## किसी मॉडल की tracing {#tracing-a-model}
+## किसी मॉडल की tracing {/* #tracing-a-model */}
 
 Model examples का `--profile` flag trace नहीं करता। किसी मॉडल को trace करने के लिए, उसके output tensor
 को ऊपर के options के साथ profile करें। Plan का हर compiled कर्नेल trace होता है: tk kernels और graph
@@ -121,7 +158,7 @@ Untraced run की per-kernel table से शुरू करें, जो �
 `tk_bench sqtt --load` (नीचे) से पढ़ें। tk कर्नेल के लिए, अगला क़दम उसे अकेले trace करना है, ताकि आप
 उसका config बदल सकें।
 
-## एक कर्नेल की tracing {#tracing-one-kernel}
+## एक कर्नेल की tracing {/* #tracing-one-kernel */}
 
 `tk_bench sqtt` एक shape पर एक tk op बनाता है, हर config का समय tuner की तरह बिना trace के मापता है,
 उसे एक बार trace करता है, capture सहेजता है और उसकी report छापता है:
@@ -144,7 +181,7 @@ op launch करेगा। एक संख्या `I` planner का `I`व
 बजाय ranking की सूची देता है। हर config `DIR/<op>_<shape>_<cfg>/p<program>/<index>_<entry>/` में
 पहुँचता है, और path `saved …` के रूप में छपता है।
 
-## सहेजी गई directory और replay {#the-saved-directory-and-replay}
+## सहेजी गई directory और replay {/* #the-saved-directory-and-replay */}
 
 | File | क्या रखती है |
 |---|---|
@@ -166,7 +203,7 @@ cargo run --release -p svod-tk --example tk_bench -- sqtt --load DIR [--json] [-
 
 Rust से, `svod_runtime::sqtt::Analysis::load(dir)` वही analysis लौटाता है।
 
-## Report पढ़ना {#reading-the-report}
+## Report पढ़ना {/* #reading-the-report */}
 
 `rdna4_nearest_split` fixture (`device/src/test/fixtures/sqtt/svod/`) एक gfx1201 nearest कर्नेल है,
 n4096 d128 k16। संक्षेप में, उसकी report ऐसी है:
@@ -207,7 +244,7 @@ traced     se0 sa0 wgp0 simd0 (2 waves), se1 sa0 wgp0 simd1 (2 waves) of 2 SEs
 इसके बाद और sections आते हैं: class के हिसाब से समय, प्रति SE occupancy, bucket के हिसाब से main loop के
 प्रति trip cycles, शीर्ष stalls, waits उन loads के साथ जिन्होंने उन्हें बाँधा, और सबसे गर्म instructions।
 
-## Verdict classes और उनके levers {#verdict-classes-and-their-levers}
+## Verdict classes और उनके levers {/* #verdict-classes-and-their-levers */}
 
 Thresholds heuristics हैं, जो `runtime/src/sqtt/verdict.rs` में constants के रूप में रखे गए हैं।
 
@@ -221,6 +258,41 @@ Thresholds heuristics हैं, जो `runtime/src/sqtt/verdict.rs` में 
 | `barrier` | Barrier cycles loop के ≥ 10% | `barrier` | पहले दूसरी findings ठीक करें; barrier को हटाएँ, merge या split करें सिर्फ़ तब जब उसका exposed हिस्सा 10% पार करे |
 | `loop_overhead` | VALU+SALU issue matrix issue के ≥ 10%, या कोई भी divergent branch | `hoist` | Address और guard arithmetic को hoist करें; guards को uniform बनाएँ |
 
+<div className="sqtt-diagram">
+
+```mermaid
+%%{init: {"flowchart": {"rankSpacing": 40, "nodeSpacing": 22, "subGraphTitleMargin": {"top": 4, "bottom": 10}}}}%%
+flowchart LR
+  subgraph bound["bound class"]
+    MB["matrix_bound"]
+    IB["issue_bound"]
+    OL["occupancy_limited"]
+  end
+  subgraph findings["findings"]
+    LE["load_exposed"]
+    LX["lds_exposed"]
+    BA["barrier"]
+    LO["loop_overhead"]
+  end
+  MB -->|"less_matrix_work"| MW["सस्ता type या कम matrix ops"]
+  IB -->|"cut_issue"| CI["loop से non-matrix instructions हटाएँ"]
+  OL -->|"free_resources"| FR["प्रति workgroup कम VGPRs या कम LDS"]
+  OL -->|"more_workgroups"| WG["छोटा tile या ज़्यादा splits"]
+  OL -->|"more_waves"| FR
+  OL -->|"more_waves"| WG
+  LE -->|"latency"| RG["गहरी ring"]
+  LE -->|"move_use"| AH["एक step पहले issue किया गया load"]
+  LX -->|"lds_flush"| DS["कम और चौड़े ds ops"]
+  LX -->|"lds_use"| DS
+  LX -->|"lds_use"| FE["अगला fragment पहले पढ़ा गया"]
+  LX -->|"lds_queue"| DS
+  LX -->|"lds_queue"| CF["conflict-free layout"]
+  BA -->|"barrier"| BR["पहले दूसरी findings ठीक करें; barrier को हटाएँ, merge या split करें सिर्फ़ तब जब उसका exposed हिस्सा 10% पार करे"]
+  LO -->|"hoist"| HO["address और guard arithmetic को hoist करें; guards को uniform बनाएँ"]
+```
+
+</div>
+
 Barrier एक sink है: waves सबसे धीमी wave के लिए वहाँ रुकती हैं, इसलिए उसका समय उसी चीज़ का है जिसने
 उस wave को धीमा किया। Finding बताती है कि आख़िर में कौन पहुँचा और किस instruction के बाद।
 
@@ -228,7 +300,7 @@ Barrier एक sink है: waves सबसे धीमी wave के लि�
 `approx_bindings` (अनुमानित binding), `implausible_time` (corrupt stream), `truncated` या
 `per_iteration`।
 
-## `--attribute` और `--compare` {#--attribute-and---compare}
+## `--attribute` और `--compare` {/* #--attribute-and---compare */}
 
 `--attribute` सिर्फ़ GEMM के लिए है, क्योंकि सिर्फ़ `tk_bench sqtt gemm` capture में cost model की price
 होती है। यह हर priced term (`steps`, `reads`, `fill`, `wait`, `lone_trip`, `trip`) को उन instructions
@@ -247,7 +319,7 @@ cargo run --release -p svod-tk --example tk_bench -- sqtt --compare A B [--json]
 अनुपात 10% से ज़्यादा अलग हैं, या जब उनके trips reduction की अलग-अलग मात्राएँ cover करते हैं। जिस
 capture में कोई main loop नहीं, उसके पास align करने को कुछ नहीं।
 
-## Workflow {#the-workflow}
+## Workflow {/* #the-workflow */}
 
 1. Untraced profile की per-kernel table में धीमा कर्नेल ढूँढें।
 2. उसे trace करें: `tk_bench sqtt <op> <shape>`, या ऐसे कर्नेल के लिए जो सिर्फ़ किसी मॉडल के भीतर मौजूद
@@ -259,9 +331,9 @@ capture में कोई main loop नहीं, उसके पास align
    चलाएँ। जाँचें कि लक्षित bucket हिला, और लाभ को सिर्फ़ untraced समय से आँकें।
 6. बदलाव रखने से पहले idle GPU पर `tk_bench` या tuner से पुष्टि करें।
 
-## हल किए गए उदाहरण {#worked-examples}
+## हल किए गए उदाहरण {/* #worked-examples */}
 
-### Attention: bias को एक step पहले load करना {#attention-loading-the-bias-a-step-ahead}
+### Attention: bias को एक step पहले load करना {/* #attention-loading-the-bias-a-step-ahead */}
 
 सीधे पढ़ी जाने वाली attention bias tile उसी step में load होती थी जिसके scores उसे इस्तेमाल करते थे,
 इसलिए उसका wait load के ठीक पीछे बैठता था। यही वह pattern है जिसे `load_exposed` `move_use` के साथ नाम
@@ -269,13 +341,20 @@ capture में कोई main loop नहीं, उसके पास align
 `pipeline_with` उसे अगले step में ले जाता है), इसलिए load के पास पहुँचने के लिए पूरा एक step होता है।
 PR #230 ने d128 पर −19% और d64 पर −7% मापा।
 
-### Nearest: RDNA4 पर barrier को split करना {#nearest-splitting-the-barrier-on-rdna4}
+### Nearest: RDNA4 पर barrier को split करना {/* #nearest-splitting-the-barrier-on-rdna4 */}
 
 `rdna4_nearest_joined` और `rdna4_nearest_split` fixtures एक ही `NearestCfg` (n4096 d128 k16) हैं,
 RDNA4 के split barrier से पहले और बाद। gfx12 पर register-staged ring का steady loop अब LDS commit के
 बाद barrier को signal करता है (`arrive`, `s_barrier_signal`) और trip के अंत में उसका इंतज़ार करता है
 (`await`, `s_barrier_wait`)। दोनों के बीच का tail तब चलता है जब धीमी waves पीछे से पहुँच रही होती
-हैं। Fixtures पर `--compare` यह दिखाता है:
+हैं।
+
+<SplitBarrier
+  labels={{joined: "joined: एक s_barrier", split: "split: s_barrier_signal, फिर s_barrier_wait", wave: "wave", work: "काम", parked: "barrier पर रुकी", next: "अगली trip", barrier: "s_barrier", signal: "s_barrier_signal, LDS commit के बाद", wait: "s_barrier_wait", release: "आख़िरी wave का signal", joinedNext: "joined: अगली trip की शुरुआत"}}
+  caption="एक schematic, trace data नहीं: एक trip में चार waves। Split में जल्दी पहुँचने वाली wave रुकने के बजाय अपनी tail चलाती है, और तभी रुकती है जब उसके wait तक सबसे धीमी wave ने signal नहीं किया हो। एक dashed line दिखाती है कि joined version अपनी अगली trip कहाँ शुरू करता है; सबसे धीमी wave अपनी trip उससे पहले शुरू नहीं करती।"
+/>
+
+Fixtures पर `--compare` यह दिखाता है:
 
 ```text
 time       180320 -> 144840 ns untraced (-19.7%); traced/untraced 1.01x -> 1.02x; …
@@ -288,12 +367,17 @@ barrier              1081.7    255.1   -826.6    962.9    202.6   -760.2
      0.0    255.1   +255.1      0.0    202.6   +202.6  await [steady]
 ```
 
+<BarrierCompare
+  labels={{joined: "joined", split: "split", raw: "raw", exposed: "exposed", statement: "statement"}}
+  caption={(d) => `main loop का barrier bucket, प्रति trip cycles, दोनों fixtures पर tk_bench sqtt --compare से; untraced समय ${d.us[0]} → ${d.us[1]} µs।`}
+/>
+
 Barrier exposure प्रति trip 963 से 203 cycles पर गिरता है, `barrier [steady]` statement `arrive` +
 `await [steady]` बन जाता है, और untraced समय 180 से 145 µs पर जाता है। हर पक्ष एक अकेला traced run है।
 PR #230 के benchmark ने nearest d128 k16 के लिए −5.6% मापा। जो `load_exposed` finding प्रकट होती है वह
 अगला lever है: barrier के जाने के बाद global loads की latency दिखती है।
 
-### GEMM: एक ragged M {#gemm-a-ragged-m}
+### GEMM: एक ragged M {/* #gemm-a-ragged-m */}
 
 `rdna4_gemm_1536` और `rdna4_gemm_1500` fixtures M 1536 और M 1500 पर एक ही GEMM config हैं (N 1280,
 K 5120, Whisper का fc2)। दोनों replays `bound matrix_bound` कहते हैं। सिर्फ़ 1500 वाला `loop_overhead`
@@ -311,7 +395,7 @@ K 5120, Whisper का fc2)। दोनों replays `bound matrix_bound` क�
 loop instructions की कीमत लेता है जो tile तक padded shape नहीं चुकाता, इसलिए ragged shape के schedule
 को tune करने से पहले padded shape जाँचें।
 
-## Caveats {#caveats}
+## Caveats {/* #caveats */}
 
 - Trace दो SIMDs देखती है। जो grid उन पर कभी नहीं पहुँचता वह वहाँ कुछ trace नहीं करता।
 - Traced समय कभी benchmark नहीं है। किसी बदलाव को `tk_bench` या tuner से आँकें, बिना trace के।

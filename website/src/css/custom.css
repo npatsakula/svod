@@ -28,3 +28,41 @@
   --ifm-color-primary-lightest: #4fddbf;
   --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.3);
 }
+
+/* Thread-trace figures (src/components/sqtt): one hue per bucket, stepped for each theme. */
+:root {
+  --sqtt-matrix: #2a78d6;
+  --sqtt-issue: #eda100;
+  --sqtt-stall: #1baf7a;
+  --sqtt-load: #eb6834;
+  --sqtt-lds: #6250d6;
+  --sqtt-barrier: #e34948;
+  --sqtt-idle: #b9b7b0;
+  --sqtt-before: #8d8b84;
+  --sqtt-ink: var(--ifm-font-color-base);
+  --sqtt-muted: var(--ifm-color-emphasis-700);
+  --sqtt-rule: var(--ifm-color-emphasis-300);
+  --sqtt-surface: var(--ifm-background-color);
+}
+
+[data-theme='dark'] {
+  --sqtt-matrix: #3987e5;
+  --sqtt-issue: #c98500;
+  --sqtt-stall: #199e70;
+  --sqtt-load: #d95926;
+  --sqtt-lds: #9085e9;
+  --sqtt-barrier: #e66767;
+  --sqtt-idle: #5f5e59;
+  --sqtt-before: #85847d;
+}
+
+/* A flowchart scaled to a phone's width is illegible: keep it wide enough to read and let it scroll. */
+@media (max-width: 600px) {
+  .sqtt-diagram {
+    overflow-x: auto;
+  }
+
+  .sqtt-diagram svg {
+    min-width: 520px;
+  }
+}
