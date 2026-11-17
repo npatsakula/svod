@@ -1,0 +1,335 @@
+<!doctype html><html lang=en dir=ltr class="docs-wrapper plugin-docs plugin-id-default docs-version-current docs-doc-page docs-doc-id-tile-kernels/profiling" data-has-hydrated=false><head><meta charset=UTF-8><meta name=generator content="Docusaurus v3.10.2"><title data-rh=true>Profiling with a Thread Trace | Svod</title><meta data-rh=true name=viewport content="width=device-width, initial-scale=1.0"/><meta data-rh=true name=twitter:card content=summary_large_image /><meta data-rh=true property=og:image content=https://svod.vpermilp.online/img/docusaurus-social-card.jpg /><meta data-rh=true name=twitter:image content=https://svod.vpermilp.online/img/docusaurus-social-card.jpg /><meta data-rh=true property=og:url content=https://svod.vpermilp.online/docs/tile-kernels/profiling /><meta data-rh=true property=og:locale content=en /><meta data-rh=true property=og:locale:alternate content=zh_CN /><meta data-rh=true property=og:locale:alternate content=ru /><meta data-rh=true property=og:locale:alternate content=hi /><meta data-rh=true name=docusaurus_locale content=en /><meta data-rh=true name=docsearch:language content=en /><meta data-rh=true name=docusaurus_version content=current /><meta data-rh=true name=docusaurus_tag content=docs-default-current /><meta data-rh=true name=docsearch:version content=current /><meta data-rh=true name=docsearch:docusaurus_tag content=docs-default-current /><meta data-rh=true property=og:title content="Profiling with a Thread Trace | Svod"/><meta data-rh=true name=description content="A kernel's time tells you that it is slow. A thread trace tells you why: which instruction each"/><meta data-rh=true property=og:description content="A kernel's time tells you that it is slow. A thread trace tells you why: which instruction each"/><link data-rh=true rel=icon href=/img/favicon.ico /><link data-rh=true rel=canonical href=https://svod.vpermilp.online/docs/tile-kernels/profiling /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/tile-kernels/profiling hreflang=en /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/zh-Hans/docs/tile-kernels/profiling hreflang=zh-CN /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/ru/docs/tile-kernels/profiling hreflang=ru /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/hi/docs/tile-kernels/profiling hreflang=hi /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/tile-kernels/profiling hreflang=x-default /><script data-rh=true type=application/ld+json>{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","item":"https://svod.vpermilp.online/docs/tile-kernels/profiling","name":"Profiling","position":1}]}</script><link rel=stylesheet href=/assets/css/styles.e76ef093.css /><script src=/assets/js/runtime~main.75c57ce8.js defer></script><script src=/assets/js/main.1859fc55.js defer></script></head><body><svg style="display: none;"><defs>
+<symbol id=theme-svg-external-link viewBox="0 0 24 24"><path fill=currentColor d="M21 13v10h-21v-19h12v2h-10v15h17v-8h2zm3-12h-10.988l4.035 4-6.977 7.07 2.828 2.828 6.977-7.07 4.125 4.172v-11z"/></symbol>
+</defs></svg>
+<script>!function(){var t=function(){try{return new URLSearchParams(window.location.search).get("docusaurus-theme")}catch(t){}}()||function(){try{return window.localStorage.getItem("theme-f0d")}catch(t){}}();document.documentElement.setAttribute("data-theme",t||(window.matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light")),document.documentElement.setAttribute("data-theme-choice",t||"system")}(),function(){try{for(var[t,e]of new URLSearchParams(window.location.search).entries())if(t.startsWith("docusaurus-data-")){var a=t.replace("docusaurus-data-","data-");document.documentElement.setAttribute(a,e)}}catch(t){}}()</script><div id=__docusaurus><link rel=preload as=image href=/img/logo.svg /><div role=region aria-label="Skip to main content"><a class=skipToContent_fXgn href=#__docusaurus_skipToContent_fallback>Skip to main content</a></div><nav aria-label=Main class="theme-layout-navbar navbar navbar--fixed-top"><div class=navbar__inner><div class="theme-layout-navbar-left navbar__items"><button aria-label="Toggle navigation bar" aria-expanded=false class="navbar__toggle clean-btn" type=button><svg width=30 height=30 viewBox="0 0 30 30" aria-hidden=true><path stroke=currentColor stroke-linecap=round stroke-miterlimit=10 stroke-width=2 d="M4 7h22M4 15h22M4 23h22"/></svg></button><a class=navbar__brand href=/><div class=navbar__logo><img src=/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--light_NVdE"/><img src=/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--dark_xIcU"/></div><b class="navbar__title text--truncate">Svod</b></a><a aria-current=page class="navbar__item navbar__link navbar__link--active" href=/docs/introduction>Docs</a></div><div class="theme-layout-navbar-right navbar__items navbar__items--right"><div class="navbar__item dropdown dropdown--hoverable dropdown--right"><a href=# aria-haspopup=true aria-expanded=false role=button class=navbar__link><svg viewBox="0 0 24 24" width=20 height=20 aria-hidden=true class=iconLanguage_nlXk><path fill=currentColor d="M12.87 15.07l-2.54-2.51.03-.03c1.74-1.94 2.98-4.17 3.71-6.53H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z"/></svg>English</a><ul class=dropdown__menu><li><a href=/docs/tile-kernels/profiling target=_self rel="noopener noreferrer" class="dropdown__link dropdown__link--active" lang=en>English</a><li><a href=/zh-Hans/docs/tile-kernels/profiling target=_self rel="noopener noreferrer" class=dropdown__link lang=zh-CN>简体中文</a><li><a href=/ru/docs/tile-kernels/profiling target=_self rel="noopener noreferrer" class=dropdown__link lang=ru>Русский</a><li><a href=/hi/docs/tile-kernels/profiling target=_self rel="noopener noreferrer" class=dropdown__link lang=hi>हिन्दी</a></ul></div><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class="navbar__item navbar__link">GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a><div class="toggle_vylO colorModeToggle_DEke"><button class="clean-btn toggleButton_gllP toggleButtonDisabled_aARS" type=button disabled title="system mode" aria-label="Switch between dark and light mode (currently system mode)"><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP lightToggleIcon_pyhR"><path fill=currentColor d="M12,9c1.65,0,3,1.35,3,3s-1.35,3-3,3s-3-1.35-3-3S10.35,9,12,9 M12,7c-2.76,0-5,2.24-5,5s2.24,5,5,5s5-2.24,5-5 S14.76,7,12,7L12,7z M2,13l2,0c0.55,0,1-0.45,1-1s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S1.45,13,2,13z M20,13l2,0c0.55,0,1-0.45,1-1 s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S19.45,13,20,13z M11,2v2c0,0.55,0.45,1,1,1s1-0.45,1-1V2c0-0.55-0.45-1-1-1S11,1.45,11,2z M11,20v2c0,0.55,0.45,1,1,1s1-0.45,1-1v-2c0-0.55-0.45-1-1-1C11.45,19,11,19.45,11,20z M5.99,4.58c-0.39-0.39-1.03-0.39-1.41,0 c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0s0.39-1.03,0-1.41L5.99,4.58z M18.36,16.95 c-0.39-0.39-1.03-0.39-1.41,0c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0c0.39-0.39,0.39-1.03,0-1.41 L18.36,16.95z M19.42,5.99c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06c-0.39,0.39-0.39,1.03,0,1.41 s1.03,0.39,1.41,0L19.42,5.99z M7.05,18.36c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06 c-0.39,0.39-0.39,1.03,0,1.41s1.03,0.39,1.41,0L7.05,18.36z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP darkToggleIcon_wfgR"><path fill=currentColor d="M9.37,5.51C9.19,6.15,9.1,6.82,9.1,7.5c0,4.08,3.32,7.4,7.4,7.4c0.68,0,1.35-0.09,1.99-0.27C17.45,17.19,14.93,19,12,19 c-3.86,0-7-3.14-7-7C5,9.07,6.81,6.55,9.37,5.51z M12,3c-4.97,0-9,4.03-9,9s4.03,9,9,9s9-4.03,9-9c0-0.46-0.04-0.92-0.1-1.36 c-0.98,1.37-2.58,2.26-4.4,2.26c-2.98,0-5.4-2.42-5.4-5.4c0-1.81,0.89-3.42,2.26-4.4C12.92,3.04,12.46,3,12,3L12,3z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP systemToggleIcon_QzmC"><path fill=currentColor d="m12 21c4.971 0 9-4.029 9-9s-4.029-9-9-9-9 4.029-9 9 4.029 9 9 9zm4.95-13.95c1.313 1.313 2.05 3.093 2.05 4.95s-0.738 3.637-2.05 4.95c-1.313 1.313-3.093 2.05-4.95 2.05v-14c1.857 0 3.637 0.737 4.95 2.05z"/></svg></button></div><div class=navbarSearchContainer_Bca1><div class="navbar__search searchBarContainer_NW3z" dir=ltr><svg aria-hidden=true class=searchIcon_T3tP focusable=false viewBox="0 0 16 16"><path fill=currentColor d="M6.02945 10.20327a4.17382 4.17382 0 1 1 4.17382-4.17382 4.15609 4.15609 0 0 1-4.17382 4.17382Zm9.69195 4.2199-4.8225-4.82338A5.88021 5.88021 0 0 0 12.058 6.02856 6.00467 6.00467 0 1 0 9.59979 10.8989l4.82338 4.82338a.89729.89729 0 0 0 1.29912 0 .89749.89749 0 0 0-.00087-1.29909Z"/></svg><input placeholder=Search aria-label=Search class="navbar__search-input searchInput_YFbd" value="" /><div class="loadingRing_RJI3 searchBarLoadingRing_YnHq"><div></div><div></div><div></div><div></div></div></div></div></div></div><div role=presentation class=navbar-sidebar__backdrop></div></nav><div id=__docusaurus_skipToContent_fallback class="theme-layout-main main-wrapper mainWrapper_z2l0"><div class=docsWrapper_hBAB><button aria-label="Scroll back to top" class="clean-btn theme-back-to-top-button backToTopButton_sjWU" type=button></button><div class=docRoot_UBD9><aside class="theme-doc-sidebar-container docSidebarContainer_YfHR"><div class=sidebarViewport_aRkj><div class=sidebar_njMd><nav aria-label="Docs sidebar" class="menu thin-scrollbar menu_SIkG"><ul class="theme-doc-sidebar-menu menu__list"><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-1 menu__list-item"><a class=menu__link href=/docs/introduction><span class=linkLabel_WmDU>Introduction</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/docs/examples><span class=categoryLinkLabel_W154>Getting Started</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/docs/architecture/ir-design><span class=categoryLinkLabel_W154>Architecture</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret menu__link--active" role=button aria-expanded=true href=/docs/tile-kernels/overview><span class=categoryLinkLabel_W154>Tile Kernels (tk)</span></a></div><ul class=menu__list><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/docs/tile-kernels/overview><span class=linkLabel_WmDU>Overview</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/docs/tile-kernels/first-kernel><span class=linkLabel_WmDU>Your First Kernel</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/docs/tile-kernels/layouts-and-lowering><span class=linkLabel_WmDU>Layouts and Lowering</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/docs/tile-kernels/kernel-library><span class=linkLabel_WmDU>Kernel Library</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/docs/tile-kernels/op-layer><span class=linkLabel_WmDU>Op Layer</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/docs/tile-kernels/tuning><span class=linkLabel_WmDU>Tuning</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class="menu__link menu__link--active" aria-current=page tabindex=0 href=/docs/tile-kernels/profiling><span class=linkLabel_WmDU>Profiling</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/docs/tile-kernels/testing-and-debugging><span class=linkLabel_WmDU>Testing and Debugging</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/docs/tile-kernels/portability><span class=linkLabel_WmDU>Portability</span></a></ul><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/docs/backends/overview><span class=categoryLinkLabel_W154>Backends</span></a></div></ul></nav></div></div></aside><main class=docMainContainer_TBSr><div class="container padding-top--md padding-bottom--lg"><div class=row><div class="col docItemCol_VOVn"><div class=docItemContainer_Djhp><article><nav class="theme-doc-breadcrumbs breadcrumbsContainer_Z_bl" aria-label=Breadcrumbs><ul class=breadcrumbs><li class=breadcrumbs__item><a aria-label="Home page" class=breadcrumbs__link href=/><svg viewBox="0 0 24 24" class=breadcrumbHomeIcon_YNFT><path d="M10 19v-5h4v5c0 .55.45 1 1 1h3c.55 0 1-.45 1-1v-7h1.7c.46 0 .68-.57.33-.87L12.67 3.6c-.38-.34-.96-.34-1.34 0l-8.36 7.53c-.34.3-.13.87.33.87H5v7c0 .55.45 1 1 1h3c.55 0 1-.45 1-1z" fill=currentColor /></svg></a><li class=breadcrumbs__item><span class=breadcrumbs__link>Tile Kernels (tk)</span><li class="breadcrumbs__item breadcrumbs__item--active"><span class=breadcrumbs__link>Profiling</span></ul></nav><div class="tocCollapsible_ETCw theme-doc-toc-mobile tocMobile_ITEo"><button type=button class="clean-btn tocCollapsibleButton_TO0P">On this page</button></div><div class="theme-doc-markdown markdown"><header><h1>Profiling with a Thread Trace</h1></header>
+<p>A kernel's time tells you that it is slow. A thread trace tells you why: which instruction each
+wave waited on, for how long, and which line of the tile program that instruction came from. This
+page takes you from "this kernel is slow" to a change in the tk program.</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=why-a-trace>Why a trace<a href=#why-a-trace class=hash-link aria-label="Direct link to Why a trace" title="Direct link to Why a trace" translate=no>​</a></h2>
+<p>The other tools see a kernel from outside. The device time says how long it took, the roofline
+says how far it is from the memory and compute limits, and the counters say how busy the units
+were. None of them says what a wave was doing on a given cycle. On AMD's RDNA cards the SQ thread
+trace (SQTT) records exactly that, so you can see whether the main loop waits on global loads, on
+the LDS, on a barrier, or on nothing at all.</p>
+<p>Svod's profiler has five tiers. Each adds detail to the one below:</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Tier<th>What it gives<th>Where<tbody><tr><td>1, device time<td>Each kernel's time on the GPU clock<td>GPU backends; wall clock on the CPU<tr><td>2, roofline<td>GFLOP/s and GB/s from tier 1 and the kernel's static work estimate<td>Every backend<tr><td>3, static occupancy<td>Registers, LDS, scratch and an occupancy estimate, without a dispatch<td>AMD, CUDA; Metal in part<tr><td>4, hardware counters<td>Busy cycles, waves, instructions (<code>SVOD_PMC</code>)<td>AMD (PM4), CUDA (CUPTI)<tr><td>5, thread trace<td>Every traced wave's instructions with their cycles, in one extra pass<td>AMD gfx11 and gfx12</table>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=what-the-trace-records>What the trace records<a href=#what-the-trace-records class=hash-link aria-label="Direct link to What the trace records" title="Direct link to What the trace records" translate=no>​</a></h2>
+<p>A trace is a stream of tokens per shader engine (SE): when a wave started and ended, and for the
+traced SIMD, each instruction it issued and when. Svod decodes the stream, maps every instruction
+back to the kernel's disassembly, and splits the main loop's cycles into buckets:</p>
+<ul>
+<li class=""><strong>issue</strong>: the instruction was issuing, by its class (<code>matrix</code>, <code>valu</code>, <code>salu</code>, <code>lds</code>, <code>vmem_load</code>, …);</li>
+<li class=""><strong>stall</strong>: it was ready but its pipe or queue was busy;</li>
+<li class=""><strong>wait</strong>: an <code>s_wait_*</code> waited for a load, an LDS access or a store, charged to the load that bound it;</li>
+<li class=""><strong>barrier</strong>: the wave was parked at a workgroup barrier;</li>
+<li class=""><strong>idle</strong>: no record, because the SIMD was issuing for another wave or on a dependency the trace does not show.</li>
+</ul>
+<p>Each bucket also has an <strong>exposed</strong> share: its cycles less what other pipes' work hid at the same
+time. A load wait of 180 cycles while the matrix pipe is busy for 140 of them costs about 40. The
+findings rank by exposed share, because only exposed cycles shorten the kernel when you remove them.</p>
+<p>A <strong>trip</strong> is one pass of the tile program's loop body, which may be shorter than a hardware
+iteration when the loop is unrolled. Cycles are a traced wave's, per trip.</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=scope-and-cost>Scope and cost<a href=#scope-and-cost class=hash-link aria-label="Direct link to Scope and cost" title="Direct link to Scope and cost" translate=no>​</a></h2>
+<ul>
+<li class=""><strong>Hardware.</strong> AMD gfx11 (RDNA3, RDNA3.5) and gfx12 (RDNA4). Any other target is refused with
+<code>only gfx11 and gfx12 are traced</code>. Captures were verified on gfx1201 (RX 9070 XT) and gfx1151
+(Strix Halo). gfx1100 traces decode, but no hardware capture was verified.</li>
+<li class=""><strong>gfx11 has no ceiling figure.</strong> gfx11 records a matrix op as a one-cycle token, so the pipes'
+busy shares are unknown there. The report prints no <code>ceiling</code> line, and its findings use raw
+shares, marked <code>approx: untimed_matrix</code>.</li>
+<li class=""><strong>PM4 queues only.</strong> A device opened with <code>SVOD_AMD_AQL=1</code> refuses to arm the trace.</li>
+<li class=""><strong>Window.</strong> Each SE gets a 64 MiB buffer by default (<code>SqttConfig::window</code>, in 4 KiB pages,
+configurable). A buffer that fills loses its tail. The report then opens with <code>!! TRUNCATED</code>, and
+its totals undercount.</li>
+<li class=""><strong>One extra pass per traced kernel.</strong> The profile times its runs untraced, then runs the plan once
+more with the trace armed. That pass synchronizes after each kernel and frees its buffers before
+the next. No timing column comes from it.</li>
+<li class=""><strong>Two SIMDs.</strong> Instruction tokens come from SE0 and SE1, one SIMD each (<code>SqttConfig::se_mask</code>).
+<code>SVOD_SQTT_SIMD</code> chooses them: one SIMD for every SE, or a comma list repeated over the SEs
+(default <code>0,1</code>, SIMD 0 on SE0 and SIMD 1 on SE1). Per-instruction numbers describe the waves on
+those two SIMDs.</li>
+</ul>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=clocks-and-prerequisites>Clocks and prerequisites<a href=#clocks-and-prerequisites class=hash-link aria-label="Direct link to Clocks and prerequisites" title="Direct link to Clocks and prerequisites" translate=no>​</a></h2>
+<ul>
+<li class="">An AMD card of the targets above, selected with <code>SVOD_DEVICE=AMD</code> (or <code>AMD:N</code>), running PM4 queues.</li>
+<li class=""><code>llvm-objdump</code> next to the clang Svod compiles with. A capture saves its disassembly, so a replay
+needs the tool only when <code>kernel.s</code> is missing.</li>
+<li class=""><strong>Unpinned clock, the default.</strong> The traced pass runs at whatever clock the device picks, just as
+an untraced run does. <code>SVOD_SQTT_PSTATE=standard</code> (or <code>peak</code>) pins a stable power state through
+the DRM context. That lowers the shader clock and distorts what the trace shows. Use it only to
+match an older pinned capture.</li>
+<li class="">A quiet GPU. Tracing perturbs the run anyway: the report prints the traced run's time over the
+untraced one, and above 1.2× it marks the findings <code>approx: perturbed</code>. Never compare a traced
+time with an untraced one.</li>
+</ul>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=tracing-from-rust>Tracing from Rust<a href=#tracing-from-rust class=hash-link aria-label="Direct link to Tracing from Rust" title="Direct link to Tracing from Rust" translate=no>​</a></h2>
+<p><code>ProfileOptions::sqtt</code> turns tier 5 on for any profiled plan (<code>ExecutionPlan::profile</code>) or tensor
+(<code>Tensor::profile</code>):</p>
+<div class="language-rust codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-rust codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token keyword" style=color:#00009f>use</span><span class="token plain"> </span><span class="token namespace" style=opacity:0.7>svod_runtime</span><span class="token namespace punctuation" style=opacity:0.7;color:#393A34>::</span><span class="token punctuation" style=color:#393A34>{</span><span class="token class-name">ProfileOptions</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"> </span><span class="token class-name">SqttOptions</span><span class="token punctuation" style=color:#393A34>}</span><span class="token punctuation" style=color:#393A34>;</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain" style=display:inline-block></span><br/></div><div class=token-line style=color:#393A34><span class="token plain"></span><span class="token keyword" style=color:#00009f>let</span><span class="token plain"> opts </span><span class="token operator" style=color:#393A34>=</span><span class="token plain"> </span><span class="token class-name">ProfileOptions</span><span class="token plain"> </span><span class="token punctuation" style=color:#393A34>{</span><span class="token plain"> sqtt</span><span class="token punctuation" style=color:#393A34>:</span><span class="token plain"> </span><span class="token class-name">Some</span><span class="token punctuation" style=color:#393A34>(</span><span class="token class-name">SqttOptions</span><span class="token punctuation" style=color:#393A34>::</span><span class="token function" style=color:#d73a49>default</span><span class="token punctuation" style=color:#393A34>(</span><span class="token punctuation" style=color:#393A34>)</span><span class="token punctuation" style=color:#393A34>)</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"> </span><span class="token punctuation" style=color:#393A34>..</span><span class="token class-name">Default</span><span class="token punctuation" style=color:#393A34>::</span><span class="token function" style=color:#d73a49>default</span><span class="token punctuation" style=color:#393A34>(</span><span class="token punctuation" style=color:#393A34>)</span><span class="token plain"> </span><span class="token punctuation" style=color:#393A34>}</span><span class="token punctuation" style=color:#393A34>;</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain"></span><span class="token keyword" style=color:#00009f>let</span><span class="token plain"> profile </span><span class="token operator" style=color:#393A34>=</span><span class="token plain"> plan</span><span class="token punctuation" style=color:#393A34>.</span><span class="token function" style=color:#d73a49>profile</span><span class="token punctuation" style=color:#393A34>(</span><span class="token operator" style=color:#393A34>&</span><span class="token plain">opts</span><span class="token punctuation" style=color:#393A34>)</span><span class="token operator" style=color:#393A34>?</span><span class="token punctuation" style=color:#393A34>;</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain"></span><span class="token keyword" style=color:#00009f>for</span><span class="token plain"> traced </span><span class="token keyword" style=color:#00009f>in</span><span class="token plain"> profile</span><span class="token punctuation" style=color:#393A34>.</span><span class="token plain">stages</span><span class="token punctuation" style=color:#393A34>.</span><span class="token function" style=color:#d73a49>iter</span><span class="token punctuation" style=color:#393A34>(</span><span class="token punctuation" style=color:#393A34>)</span><span class="token punctuation" style=color:#393A34>.</span><span class="token function" style=color:#d73a49>flat_map</span><span class="token punctuation" style=color:#393A34>(</span><span class="token closure-params closure-punctuation punctuation" style=color:#393A34>|</span><span class="token closure-params">stage</span><span class="token closure-params closure-punctuation punctuation" style=color:#393A34>|</span><span class="token plain"> </span><span class="token operator" style=color:#393A34>&</span><span class="token plain">stage</span><span class="token punctuation" style=color:#393A34>.</span><span class="token plain">sqtt</span><span class="token punctuation" style=color:#393A34>)</span><span class="token plain"> </span><span class="token punctuation" style=color:#393A34>{</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">    </span><span class="token keyword" style=color:#00009f>match</span><span class="token plain"> </span><span class="token operator" style=color:#393A34>&</span><span class="token plain">traced</span><span class="token punctuation" style=color:#393A34>.</span><span class="token plain">analysis </span><span class="token punctuation" style=color:#393A34>{</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">        </span><span class="token class-name">Ok</span><span class="token punctuation" style=color:#393A34>(</span><span class="token plain">analysis</span><span class="token punctuation" style=color:#393A34>)</span><span class="token plain"> </span><span class="token operator" style=color:#393A34>=></span><span class="token plain"> </span><span class="token macro property" style=color:#36acaa>println!</span><span class="token punctuation" style=color:#393A34>(</span><span class="token string" style=color:#e3116c>"{}: {}"</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"> traced</span><span class="token punctuation" style=color:#393A34>.</span><span class="token plain">kernel</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"> analysis</span><span class="token punctuation" style=color:#393A34>.</span><span class="token function" style=color:#d73a49>summary</span><span class="token punctuation" style=color:#393A34>(</span><span class="token punctuation" style=color:#393A34>)</span><span class="token punctuation" style=color:#393A34>)</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">        </span><span class="token class-name">Err</span><span class="token punctuation" style=color:#393A34>(</span><span class="token plain">error</span><span class="token punctuation" style=color:#393A34>)</span><span class="token plain"> </span><span class="token operator" style=color:#393A34>=></span><span class="token plain"> </span><span class="token macro property" style=color:#36acaa>println!</span><span class="token punctuation" style=color:#393A34>(</span><span class="token string" style=color:#e3116c>"{}: {error}"</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"> traced</span><span class="token punctuation" style=color:#393A34>.</span><span class="token plain">kernel</span><span class="token punctuation" style=color:#393A34>)</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">    </span><span class="token punctuation" style=color:#393A34>}</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain"></span><span class="token punctuation" style=color:#393A34>}</span><br/></div></code></pre></div></div>
+<p><code>SqttOptions</code> holds a <code>SqttConfig</code> (SEs, SIMDs, window, power state) and a <code>Sink</code>:</p>
+<ul>
+<li class=""><code>Sink::Disk(dir)</code>, the default, saves each kernel's capture under <code>dir/&lt;index>_&lt;entry point></code>
+(<code>./sqtt</code> by default), so the pass holds one capture at a time. <code>Traced::raw</code> is <code>Raw::Saved(path)</code>.</li>
+<li class=""><code>Sink::Memory</code> keeps each capture in <code>Raw::Held</code>. A capture can take up to 64 MiB an SE, so a
+whole model's may not fit.</li>
+</ul>
+<p>Each <code>Traced</code> carries its own <code>analysis</code>. A kernel whose trace does not analyze leaves the others
+intact. <code>RunProfile::render_report</code> ends with one summary line per traced kernel.</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=tracing-a-model>Tracing a model<a href=#tracing-a-model class=hash-link aria-label="Direct link to Tracing a model" title="Direct link to Tracing a model" translate=no>​</a></h2>
+<p>The model examples' <code>--profile</code> flag does not trace. To trace a model, profile its output tensor
+with the options above. Every compiled kernel in the plan is traced: tk kernels and graph kernels
+alike. <code>SqttOptions::from_env()</code> builds the options from the environment for a program that wants
+a switch: <code>SVOD_SQTT=1</code> traces, <code>SVOD_SQTT_DIR</code> names the directory, and <code>SVOD_SQTT_PSTATE</code> and
+<code>SVOD_SQTT_SIMD</code> set the config. It returns <code>Ok(None)</code> when <code>SVOD_SQTT</code> is not <code>1</code>, and an error
+for a value that does not parse.</p>
+<p>Start with the per-kernel table of the untraced run, pick the kernel that dominates, and read its
+directory with <code>tk_bench sqtt --load</code> (below). For a tk kernel, trace it on its own next, so
+that you can vary its config.</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=tracing-one-kernel>Tracing one kernel<a href=#tracing-one-kernel class=hash-link aria-label="Direct link to Tracing one kernel" title="Direct link to Tracing one kernel" translate=no>​</a></h2>
+<p><code>tk_bench sqtt</code> builds one tk op at a shape, times each config untraced as the tuner does, traces
+it once, saves the capture and prints its report:</p>
+<div class="language-bash codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-bash codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">SVOD_DEVICE=AMD cargo run --release -p svod-tk --example tk_bench -- sqtt nearest 4096 128 16</span><br/></div></code></pre></div></div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Command<th>Traces<tbody><tr><td><code>sqtt gemm M N K [--residual] [--gated]</code><td>A bf16 GEMM, with a residual or SwiGLU epilogue<tr><td><code>sqtt attention B H T D [--causal] [--bias] [--flip FORM,…] [--ring S]</code><td>bf16 attention over <code>[B, T, H, D]</code>; <code>--flip</code> flips softmax forms of each config, <code>--ring</code> sets its ring slots<tr><td><code>sqtt nearest N D K [--metric M] [--splits S]</code><td>A self-join of <code>N</code> f16 rows at depth <code>D</code>, keeping <code>K</code> a row; <code>--splits</code> overrides the config's splits<tr><td><code>sqtt conv H W CIN COUT KERNEL STRIDE [--batch B] [--residual]</code><td>A YOLO block's f16 convolution with bias and SiLU</table>
+<p>All four take <code>--cfg</code>, <code>--top N</code> (table rows, 12 by default), <code>--out DIR</code> (<code>./sqtt</code> by default)
+and <code>--json</code> (the report as one JSON line). <code>--cfg</code> is a comma list. <code>tuned</code>, the default, is the
+config the op would launch. A number <code>I</code> is the planner's <code>I</code>th ranked config. GEMM also takes a
+pinned code <code>BMxBNxBK:S:WRxWC[:rolled]</code>, and <code>nearest</code> and <code>conv</code> take <code>ranked</code>, which lists the
+ranking instead of tracing. Each config lands in
+<code>DIR/&lt;op>_&lt;shape>_&lt;cfg>/p&lt;program>/&lt;index>_&lt;entry>/</code>, and the path is printed as <code>saved …</code>.</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=the-saved-directory-and-replay>The saved directory and replay<a href=#the-saved-directory-and-replay class=hash-link aria-label="Direct link to The saved directory and replay" title="Direct link to The saved directory and replay" translate=no>​</a></h2>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>File<th>Holds<tbody><tr><td><code>se0.att</code>, <code>se1.att</code>, …<td>Each SE's raw trace stream<tr><td><code>kernel.co</code><td>The traced code object; a tk kernel launched on AMD also carries a line table over its <code>kernel.tk</code> listing, and the listing itself, in its DWARF<tr><td><code>kernel.s</code><td><code>llvm-objdump -d</code> of <code>kernel.co</code>; PCs in the report are its addresses<tr><td><code>meta.json</code><td><code>format</code> 2, arch, load base, untraced and traced ns, the SEs, labels (op, shape, cfg), the loop model, resources, workgroup and grid, power state, memory clock</table>
+<p>A load checks <code>format</code> and asks you to capture again when it differs. Statements are read back from
+<code>kernel.co</code> on every load. Only AMD tk kernels have them; graph kernels have none (CUDA and Metal
+have no thread trace). Without statements, a trip is taken to be one loop iteration, marked
+<code>approx: per_iteration</code>.</p>
+<p>Replay needs no GPU:</p>
+<div class="language-bash codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-bash codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">cargo run --release -p svod-tk --example tk_bench -- sqtt --load DIR [--json] [--attribute]</span><br/></div></code></pre></div></div>
+<p>From Rust, <code>svod_runtime::sqtt::Analysis::load(dir)</code> returns the same analysis.</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=reading-the-report>Reading the report<a href=#reading-the-report class=hash-link aria-label="Direct link to Reading the report" title="Direct link to Reading the report" translate=no>​</a></h2>
+<p>The <code>rdna4_nearest_split</code> fixture (<code>device/src/test/fixtures/sqtt/svod/</code>) is a gfx1201 nearest
+kernel, n4096 d128 k16. Abridged, its report reads:</p>
+<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">== verdict: cycles are a traced wave's, a trip (1 an iteration, its statements' unroll copies); exposed: not hidden by other pipes' work</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">ceiling    matrix pipe 14.7% busy over the steady window: removing every stall gains at most 6.82x; …</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">bound      occupancy_limited  56.6%  SIMD idle 56.6%: 2.0 waves a SIMD, ~4.6 would fill it; limit 8 by vgpr+lds</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">   knob: fewer waves resident than the kernel allows: more workgroups in flight</span><br/></div><div class=token-line style=color:#393A34><span class="token plain"> 1 barrier            18.6% (raw 23.4%)  barrier (sink): 255/trip parked for the workgroup's slowest wave, 203 exposed; …</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">   knob: drop or merge a barrier only if its exposed share passes 10%</span><br/></div><div class=token-line style=color:#393A34><span class="token plain"> 2 load_exposed       13.0% (raw 16.8%)  cycles a trip: waiting on loads 183 (141 exposed); stalled issuing 0 (0 exposed)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">   0x364 load exposed 129/trip at wait 0x44c (then ds_store_b128 v177, v[105:108]): cover med 91, latency med 238, … @21 fill c staged issue [steady]</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">   knob: latency: more work between a load and its wait (prefetch distance, ring slots)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain"> 3 loop_overhead       2.7% (raw 3.2%)  valu 26 + salu 9 issue cycles a trip beside matrix 146 (24%), …</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">kernel     144840 ns untraced, 148360 ns traced (1.02x), wave span 461319 cycles, sclk ~3109 MHz, mclk 875 MHz, pstate unpinned</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">traced     se0 sa0 wgp0 simd0 (2 waves), se1 sa0 wgp0 simd1 (2 waves) of 2 SEs</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">== statements: main loop cycles a trip by kernel.tk line (a wait on its binding load's); 104 of 105 loop instructions attributed; top 12 by exposed</span><br/></div><div class=token-line style=color:#393A34><span class="token plain"> line  pcs    issue    stall     wait  barrier     idle    total  exposed  statement</span><br/></div><div class=token-line style=color:#393A34><span class="token plain"> 1581    1      0.0      0.0      0.0    255.1      0.0    255.1    202.6  await [steady]</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">   21    8      7.0      2.1    182.7      0.0     32.7    224.5    162.5  fill c staged issue [steady]</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">   28   24    145.7     11.4      0.0      0.0     75.5    232.6    148.0  mma x·c_s [steady]</span><br/></div></code></pre></div></div>
+<p>Read it top down:</p>
+<ol>
+<li class=""><strong><code>ceiling</code></strong>: how busy the matrix pipe was. At 14.7%, this loop is far from the matrix limit,
+and removing every stall would gain at most 6.82×.</li>
+<li class=""><strong><code>bound</code></strong>: the kernel's class, from the pipes' busy shares (<code>matrix_bound</code>, <code>issue_bound</code> or
+<code>occupancy_limited</code>).</li>
+<li class=""><strong>Numbered findings</strong>: what the loop's exposed cycles went to, the largest first. Each lists its
+evidence (PCs, the load behind a wait, who arrived last at a barrier), the tk statement after
+<code>@</code>, and a <code>knob</code> line saying what to change.</li>
+<li class=""><strong><code>kernel</code> and <code>traced</code></strong>: the untraced and traced times, the clock, and which SIMDs were traced.</li>
+<li class=""><strong><code>statements</code></strong>: the loop's cycles per trip by <code>kernel.tk</code> line. <code>[steady]</code> is the loop's steady
+state; <code>[prologue]</code>, <code>[head]</code>, <code>[drain]</code> and <code>[epilogue]</code> are the parts around it.</li>
+</ol>
+<p>Further sections follow: time by class, occupancy per SE, the main loop's cycles per trip by
+bucket, the top stalls, the waits with the loads that bound them, and the hottest instructions.</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=verdict-classes-and-their-levers>Verdict classes and their levers<a href=#verdict-classes-and-their-levers class=hash-link aria-label="Direct link to Verdict classes and their levers" title="Direct link to Verdict classes and their levers" translate=no>​</a></h2>
+<p>The thresholds are heuristics, kept as constants in <code>runtime/src/sqtt/verdict.rs</code>.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Class<th>Fires when<th>Knob<th>The tk lever<tbody><tr><td><code>matrix_bound</code><td>Matrix pipe busy ≥ 70% of the steady window<td><code>less_matrix_work</code><td>A cheaper type or fewer matrix ops; the schedule is not the problem<tr><td><code>issue_bound</code><td>Some pipe busy ≥ 90%, under 60% of that matrix<td><code>cut_issue</code><td>Drop non-matrix instructions from the loop<tr><td><code>occupancy_limited</code><td>SIMDs idle ≥ 10%<td><code>free_resources</code>, <code>more_workgroups</code>, <code>more_waves</code><td>Fewer VGPRs or less LDS a workgroup; a smaller tile or more splits for more workgroups<tr><td><code>load_exposed</code><td>Global load waits and stalls ≥ 10% of the loop, exposed<td><code>latency</code>, <code>move_use</code><td>A deeper ring or a load issued a step ahead; <code>move_use</code> names the use right behind the load<tr><td><code>lds_exposed</code><td>LDS waits and stalls ≥ 10%, exposed<td><code>lds_flush</code>, <code>lds_use</code>, <code>lds_queue</code><td>Fewer and wider <code>ds</code> ops, the next fragment read earlier, a conflict-free layout<tr><td><code>barrier</code><td>Barrier cycles ≥ 10% of the loop<td><code>barrier</code><td>Fix the other findings first; drop, merge or split a barrier only if its exposed share passes 10%<tr><td><code>loop_overhead</code><td>VALU+SALU issue ≥ 10% of the matrix issue, or any divergent branch<td><code>hoist</code><td>Hoist address and guard arithmetic; make guards uniform</table>
+<p>A barrier is a sink: the waves park there for the slowest wave, so its time belongs to whatever
+made that wave slow. The finding lists who arrived last and after which instruction.</p>
+<p>A finding marked <code>approx</code> has figures to read with care: <code>perturbed</code>, <code>untimed_matrix</code>,
+<code>approx_bindings</code> (a guessed binding), <code>implausible_time</code> (a corrupt stream), <code>truncated</code> or
+<code>per_iteration</code>.</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=--attribute-and---compare><code>--attribute</code> and <code>--compare</code><a href=#--attribute-and---compare class=hash-link aria-label="Direct link to --attribute-and---compare" title="Direct link to --attribute-and---compare" translate=no>​</a></h2>
+<p><code>--attribute</code> is GEMM-only, because only a <code>tk_bench sqtt gemm</code> capture carries the cost model's
+price. It sets each priced term (<code>steps</code>, <code>reads</code>, <code>fill</code>, <code>wait</code>, <code>lone_trip</code>, <code>trip</code>) beside the
+traced cycles of the instructions it prices. The terms overlap, so compare shares and the pace per
+trip, not totals.</p>
+<p><code>--compare A B</code> sets B's capture against A's (Δ = B − A):</p>
+<div class="language-bash codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-bash codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">cargo run --release -p svod-tk --example tk_bench -- sqtt --compare A B [--json] [--top N]</span><br/></div></code></pre></div></div>
+<p>It prints both times, the findings that appeared, disappeared or changed, the loop buckets per trip
+by |Δ exposed|, the statements by text, and the loop's instructions aligned by mnemonic. It warns
+with <code>!!</code> when the two captures ran at different power states, when their traced/untraced ratios
+are more than 10% apart, or when their trips cover different amounts of the reduction. A capture
+with no main loop has nothing to align.</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=the-workflow>The workflow<a href=#the-workflow class=hash-link aria-label="Direct link to The workflow" title="Direct link to The workflow" translate=no>​</a></h2>
+<ol>
+<li class="">Find the slow kernel in the per-kernel table of an untraced profile.</li>
+<li class="">Trace it: <code>tk_bench sqtt &lt;op> &lt;shape></code>, or <code>Tensor::profile</code> with <code>SqttOptions</code> for a kernel
+that only exists inside a model.</li>
+<li class="">Read <code>ceiling</code> and <code>bound</code>. A <code>matrix_bound</code> kernel is near its limit: change the work, not the
+schedule.</li>
+<li class="">Take the first finding, its evidence and its <code>@</code> statement. That statement is the line of the
+tile program to change.</li>
+<li class="">Make one change, trace again with <code>--out</code> set to a new directory, and run
+<code>--compare old new</code>. Check that the targeted bucket moved, and judge the gain by the untraced
+time only.</li>
+<li class="">Confirm with <code>tk_bench</code> or the tuner on an idle GPU before keeping the change.</li>
+</ol>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=worked-examples>Worked examples<a href=#worked-examples class=hash-link aria-label="Direct link to Worked examples" title="Direct link to Worked examples" translate=no>​</a></h2>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=attention-loading-the-bias-a-step-ahead>Attention: loading the bias a step ahead<a href=#attention-loading-the-bias-a-step-ahead class=hash-link aria-label="Direct link to Attention: loading the bias a step ahead" title="Direct link to Attention: loading the bias a step ahead" translate=no>​</a></h3>
+<p>A directly read attention bias tile was loaded in the step whose scores used it, so its wait sat
+right behind the load. That is the pattern <code>load_exposed</code> names with <code>move_use</code>. The kernel now
+loads each tile one step ahead (<code>pipeline_with</code> carries it into the next step in
+<code>tk/src/kernels/attention.rs</code>), so the load has a whole step to land. PR #230 measured −19% at
+d128 and −7% at d64.</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=nearest-splitting-the-barrier-on-rdna4>Nearest: splitting the barrier on RDNA4<a href=#nearest-splitting-the-barrier-on-rdna4 class=hash-link aria-label="Direct link to Nearest: splitting the barrier on RDNA4" title="Direct link to Nearest: splitting the barrier on RDNA4" translate=no>​</a></h3>
+<p>The <code>rdna4_nearest_joined</code> and <code>rdna4_nearest_split</code> fixtures are the same <code>NearestCfg</code> (n4096
+d128 k16) before and after RDNA4's split barrier. On gfx12 the register-staged ring's steady loop
+now signals the barrier (<code>arrive</code>, <code>s_barrier_signal</code>) after the LDS commit and waits for it
+(<code>await</code>, <code>s_barrier_wait</code>) at the end of the trip. The tail between the two runs while slower waves
+catch up. <code>--compare</code> on the fixtures shows it:</p>
+<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">time       180320 -> 144840 ns untraced (-19.7%); traced/untraced 1.01x -> 1.02x; …</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">changed    barrier            46.8% ->  18.6%</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">appears    load_exposed           - ->  13.0%</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">bucket                A raw    B raw    Δ raw    A exp    B exp    Δ exp</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">barrier              1081.7    255.1   -826.6    962.9    202.6   -760.2</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">   A raw    B raw    Δ raw    A exp    B exp    Δ exp  statement</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  1081.7      0.0  -1081.7    962.9      0.0   -962.9  barrier [steady]</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">     0.0    255.1   +255.1      0.0    202.6   +202.6  await [steady]</span><br/></div></code></pre></div></div>
+<p>Barrier exposure falls from 963 to 203 cycles a trip, the <code>barrier [steady]</code> statement becomes
+<code>arrive</code> + <code>await [steady]</code>, and the untraced time goes from 180 to 145 µs. Each side is a single
+traced run. PR #230's benchmark measured −5.6% for nearest d128 k16. The <code>load_exposed</code> finding
+that appears is the next lever: with the barrier gone, the global loads' latency shows.</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=gemm-a-ragged-m>GEMM: a ragged M<a href=#gemm-a-ragged-m class=hash-link aria-label="Direct link to GEMM: a ragged M" title="Direct link to GEMM: a ragged M" translate=no>​</a></h3>
+<p>The <code>rdna4_gemm_1536</code> and <code>rdna4_gemm_1500</code> fixtures are the same GEMM config at M 1536 and
+M 1500 (N 1280, K 5120, Whisper's fc2). Both replays say <code>bound matrix_bound</code>. Only the 1500 one
+adds <code>loop_overhead</code>, whose evidence is eight divergent branches in the main loop:</p>
+<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain"> 2 loop_overhead       0.5% (raw 0.7%)  valu 24 + salu 7 issue cycles an iteration beside matrix 443 (7%), 22 valu ops an iteration, 8 divergent branches (approx: per_iteration)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">   0x5f0 s_and_saveexec_b32 s1, vcc_lo</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">   0x5f4 s_cbranch_execz 3</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">   knob: hoist address and guard arithmetic out of the loop; make guards uniform (no exec branches)</span><br/></div></code></pre></div></div>
+<p>An M that is not a multiple of the tile puts the edge guards inside the loop as exec branches,
+and the 1536 capture, a multiple of its 128-row tile, has none. The lesson is qualitative: a ragged
+edge costs loop instructions that a shape padded to the tile does not pay, so check the padded
+shape before tuning the schedule of a ragged one.</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=caveats>Caveats<a href=#caveats class=hash-link aria-label="Direct link to Caveats" title="Direct link to Caveats" translate=no>​</a></h2>
+<ul>
+<li class="">The trace sees two SIMDs. A grid that never lands on them traces nothing there.</li>
+<li class="">A traced time is never a benchmark. Judge a change by <code>tk_bench</code> or the tuner, untraced.</li>
+<li class=""><code>exposed</code> is an estimate of what other pipes hid, so it is not a promise of the time a fix saves.</li>
+<li class="">The thresholds are heuristics. A finding below 10% is evidence, not a verdict.</li>
+<li class="">Without statements (a graph kernel, or a capture whose code object has no line table), figures are
+per loop iteration rather than per trip.</li>
+<li class="">A capture from an older <code>meta.json</code> format does not load; capture it again.</li>
+</ul></div><footer class="theme-doc-footer docusaurus-mt-lg"><div class="row margin-top--sm theme-doc-footer-edit-meta-row"><div class="col noPrint_WFHX"><a href=https://github.com/npatsakula/svod/edit/main/website/docs/tile-kernels/profiling.md target=_blank rel="noopener noreferrer" class=theme-edit-this-page><svg fill=currentColor height=20 width=20 viewBox="0 0 40 40" class=iconEdit_Z9Sw aria-hidden=true><g><path d="m34.5 11.7l-3 3.1-6.3-6.3 3.1-3q0.5-0.5 1.2-0.5t1.1 0.5l3.9 3.9q0.5 0.4 0.5 1.1t-0.5 1.2z m-29.5 17.1l18.4-18.5 6.3 6.3-18.4 18.4h-6.3v-6.2z"/></g></svg>Edit this page</a></div><div class="col lastUpdated_JAkA"></div></div></footer></article><nav class="docusaurus-mt-lg pagination-nav" aria-label="Docs pages"><a class="pagination-nav__link pagination-nav__link--prev" href=/docs/tile-kernels/tuning><div class=pagination-nav__sublabel>Previous</div><div class=pagination-nav__label>Tuning</div></a><a class="pagination-nav__link pagination-nav__link--next" href=/docs/tile-kernels/testing-and-debugging><div class=pagination-nav__sublabel>Next</div><div class=pagination-nav__label>Testing and Debugging</div></a></nav></div></div><div class="col col--3"><div class="tableOfContents_bqdL thin-scrollbar theme-doc-toc-desktop"><ul class="table-of-contents table-of-contents__left-border"><li><a href=#why-a-trace class="table-of-contents__link toc-highlight">Why a trace</a><li><a href=#what-the-trace-records class="table-of-contents__link toc-highlight">What the trace records</a><li><a href=#scope-and-cost class="table-of-contents__link toc-highlight">Scope and cost</a><li><a href=#clocks-and-prerequisites class="table-of-contents__link toc-highlight">Clocks and prerequisites</a><li><a href=#tracing-from-rust class="table-of-contents__link toc-highlight">Tracing from Rust</a><li><a href=#tracing-a-model class="table-of-contents__link toc-highlight">Tracing a model</a><li><a href=#tracing-one-kernel class="table-of-contents__link toc-highlight">Tracing one kernel</a><li><a href=#the-saved-directory-and-replay class="table-of-contents__link toc-highlight">The saved directory and replay</a><li><a href=#reading-the-report class="table-of-contents__link toc-highlight">Reading the report</a><li><a href=#verdict-classes-and-their-levers class="table-of-contents__link toc-highlight">Verdict classes and their levers</a><li><a href=#--attribute-and---compare class="table-of-contents__link toc-highlight"><code>--attribute</code> and <code>--compare</code></a><li><a href=#the-workflow class="table-of-contents__link toc-highlight">The workflow</a><li><a href=#worked-examples class="table-of-contents__link toc-highlight">Worked examples</a><ul><li><a href=#attention-loading-the-bias-a-step-ahead class="table-of-contents__link toc-highlight">Attention: loading the bias a step ahead</a><li><a href=#nearest-splitting-the-barrier-on-rdna4 class="table-of-contents__link toc-highlight">Nearest: splitting the barrier on RDNA4</a><li><a href=#gemm-a-ragged-m class="table-of-contents__link toc-highlight">GEMM: a ragged M</a></ul><li><a href=#caveats class="table-of-contents__link toc-highlight">Caveats</a></ul></div></div></div></div></main></div></div></div><footer class="theme-layout-footer footer footer--dark"><div class="container container-fluid"><div class="row footer__links"><div class="theme-layout-footer-column col footer__col"><div class=footer__title>Docs</div><ul class="footer__items clean-list"><li class=footer__item><a class=footer__link-item href=/docs/introduction>Introduction</a></ul></div><div class="theme-layout-footer-column col footer__col"><div class=footer__title>Community</div><ul class="footer__items clean-list"><li class=footer__item><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class=footer__link-item>GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a></ul></div></div><div class="footer__bottom text--center"><div class=footer__copyright>Copyright © 2026 Svod. Built with Docusaurus.</div></div></div></footer></div></body>

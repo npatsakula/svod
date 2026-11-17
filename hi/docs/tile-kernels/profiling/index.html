@@ -1,0 +1,336 @@
+<!doctype html><html lang=hi dir=ltr class="docs-wrapper plugin-docs plugin-id-default docs-version-current docs-doc-page docs-doc-id-tile-kernels/profiling" data-has-hydrated=false><head><meta charset=UTF-8><meta name=generator content="Docusaurus v3.10.2"><title data-rh=true>Thread trace के साथ profiling | Svod</title><meta data-rh=true name=viewport content="width=device-width, initial-scale=1.0"/><meta data-rh=true name=twitter:card content=summary_large_image /><meta data-rh=true property=og:image content=https://svod.vpermilp.online/hi/img/docusaurus-social-card.jpg /><meta data-rh=true name=twitter:image content=https://svod.vpermilp.online/hi/img/docusaurus-social-card.jpg /><meta data-rh=true property=og:url content=https://svod.vpermilp.online/hi/docs/tile-kernels/profiling /><meta data-rh=true property=og:locale content=hi /><meta data-rh=true property=og:locale:alternate content=en /><meta data-rh=true property=og:locale:alternate content=zh_CN /><meta data-rh=true property=og:locale:alternate content=ru /><meta data-rh=true name=docusaurus_locale content=hi /><meta data-rh=true name=docsearch:language content=hi /><meta data-rh=true name=docusaurus_version content=current /><meta data-rh=true name=docusaurus_tag content=docs-default-current /><meta data-rh=true name=docsearch:version content=current /><meta data-rh=true name=docsearch:docusaurus_tag content=docs-default-current /><meta data-rh=true property=og:title content="Thread trace के साथ profiling | Svod"/><meta data-rh=true name=description content=profiling-with-a-thread-trace} /><meta data-rh=true property=og:description content=profiling-with-a-thread-trace} /><link data-rh=true rel=icon href=/hi/img/favicon.ico /><link data-rh=true rel=canonical href=https://svod.vpermilp.online/hi/docs/tile-kernels/profiling /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/tile-kernels/profiling hreflang=en /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/zh-Hans/docs/tile-kernels/profiling hreflang=zh-CN /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/ru/docs/tile-kernels/profiling hreflang=ru /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/hi/docs/tile-kernels/profiling hreflang=hi /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/tile-kernels/profiling hreflang=x-default /><script data-rh=true type=application/ld+json>{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","item":"https://svod.vpermilp.online/hi/docs/tile-kernels/profiling","name":"Profiling","position":1}]}</script><link rel=stylesheet href=/hi/assets/css/styles.e76ef093.css /><script src=/hi/assets/js/runtime~main.8c957850.js defer></script><script src=/hi/assets/js/main.739c4eaa.js defer></script></head><body><svg style="display: none;"><defs>
+<symbol id=theme-svg-external-link viewBox="0 0 24 24"><path fill=currentColor d="M21 13v10h-21v-19h12v2h-10v15h17v-8h2zm3-12h-10.988l4.035 4-6.977 7.07 2.828 2.828 6.977-7.07 4.125 4.172v-11z"/></symbol>
+</defs></svg>
+<script>!function(){var t=function(){try{return new URLSearchParams(window.location.search).get("docusaurus-theme")}catch(t){}}()||function(){try{return window.localStorage.getItem("theme-007")}catch(t){}}();document.documentElement.setAttribute("data-theme",t||(window.matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light")),document.documentElement.setAttribute("data-theme-choice",t||"system")}(),function(){try{for(var[t,e]of new URLSearchParams(window.location.search).entries())if(t.startsWith("docusaurus-data-")){var a=t.replace("docusaurus-data-","data-");document.documentElement.setAttribute(a,e)}}catch(t){}}()</script><div id=__docusaurus><link rel=preload as=image href=/hi/img/logo.svg /><div role=region aria-label="मुख्य कंटेंट तक स्किप करें"><a class=skipToContent_fXgn href=#__docusaurus_skipToContent_fallback>मुख्य कंटेंट तक स्किप करें</a></div><nav aria-label=Main class="theme-layout-navbar navbar navbar--fixed-top"><div class=navbar__inner><div class="theme-layout-navbar-left navbar__items"><button aria-label="Toggle navigation bar" aria-expanded=false class="navbar__toggle clean-btn" type=button><svg width=30 height=30 viewBox="0 0 30 30" aria-hidden=true><path stroke=currentColor stroke-linecap=round stroke-miterlimit=10 stroke-width=2 d="M4 7h22M4 15h22M4 23h22"/></svg></button><a class=navbar__brand href=/hi/><div class=navbar__logo><img src=/hi/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--light_NVdE"/><img src=/hi/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--dark_xIcU"/></div><b class="navbar__title text--truncate">Svod</b></a><a aria-current=page class="navbar__item navbar__link navbar__link--active" href=/hi/docs/introduction>डॉक्स</a></div><div class="theme-layout-navbar-right navbar__items navbar__items--right"><div class="navbar__item dropdown dropdown--hoverable dropdown--right"><a href=# aria-haspopup=true aria-expanded=false role=button class=navbar__link><svg viewBox="0 0 24 24" width=20 height=20 aria-hidden=true class=iconLanguage_nlXk><path fill=currentColor d="M12.87 15.07l-2.54-2.51.03-.03c1.74-1.94 2.98-4.17 3.71-6.53H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z"/></svg>हिन्दी</a><ul class=dropdown__menu><li><a href=/docs/tile-kernels/profiling target=_self rel="noopener noreferrer" class=dropdown__link lang=en>English</a><li><a href=/zh-Hans/docs/tile-kernels/profiling target=_self rel="noopener noreferrer" class=dropdown__link lang=zh-CN>简体中文</a><li><a href=/ru/docs/tile-kernels/profiling target=_self rel="noopener noreferrer" class=dropdown__link lang=ru>Русский</a><li><a href=/hi/docs/tile-kernels/profiling target=_self rel="noopener noreferrer" class="dropdown__link dropdown__link--active" lang=hi>हिन्दी</a></ul></div><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class="navbar__item navbar__link">GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a><div class="toggle_vylO colorModeToggle_DEke"><button class="clean-btn toggleButton_gllP toggleButtonDisabled_aARS" type=button disabled title="system mode" aria-label="Switch between dark and light mode (currently system mode)"><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP lightToggleIcon_pyhR"><path fill=currentColor d="M12,9c1.65,0,3,1.35,3,3s-1.35,3-3,3s-3-1.35-3-3S10.35,9,12,9 M12,7c-2.76,0-5,2.24-5,5s2.24,5,5,5s5-2.24,5-5 S14.76,7,12,7L12,7z M2,13l2,0c0.55,0,1-0.45,1-1s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S1.45,13,2,13z M20,13l2,0c0.55,0,1-0.45,1-1 s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S19.45,13,20,13z M11,2v2c0,0.55,0.45,1,1,1s1-0.45,1-1V2c0-0.55-0.45-1-1-1S11,1.45,11,2z M11,20v2c0,0.55,0.45,1,1,1s1-0.45,1-1v-2c0-0.55-0.45-1-1-1C11.45,19,11,19.45,11,20z M5.99,4.58c-0.39-0.39-1.03-0.39-1.41,0 c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0s0.39-1.03,0-1.41L5.99,4.58z M18.36,16.95 c-0.39-0.39-1.03-0.39-1.41,0c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0c0.39-0.39,0.39-1.03,0-1.41 L18.36,16.95z M19.42,5.99c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06c-0.39,0.39-0.39,1.03,0,1.41 s1.03,0.39,1.41,0L19.42,5.99z M7.05,18.36c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06 c-0.39,0.39-0.39,1.03,0,1.41s1.03,0.39,1.41,0L7.05,18.36z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP darkToggleIcon_wfgR"><path fill=currentColor d="M9.37,5.51C9.19,6.15,9.1,6.82,9.1,7.5c0,4.08,3.32,7.4,7.4,7.4c0.68,0,1.35-0.09,1.99-0.27C17.45,17.19,14.93,19,12,19 c-3.86,0-7-3.14-7-7C5,9.07,6.81,6.55,9.37,5.51z M12,3c-4.97,0-9,4.03-9,9s4.03,9,9,9s9-4.03,9-9c0-0.46-0.04-0.92-0.1-1.36 c-0.98,1.37-2.58,2.26-4.4,2.26c-2.98,0-5.4-2.42-5.4-5.4c0-1.81,0.89-3.42,2.26-4.4C12.92,3.04,12.46,3,12,3L12,3z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP systemToggleIcon_QzmC"><path fill=currentColor d="m12 21c4.971 0 9-4.029 9-9s-4.029-9-9-9-9 4.029-9 9 4.029 9 9 9zm4.95-13.95c1.313 1.313 2.05 3.093 2.05 4.95s-0.738 3.637-2.05 4.95c-1.313 1.313-3.093 2.05-4.95 2.05v-14c1.857 0 3.637 0.737 4.95 2.05z"/></svg></button></div><div class=navbarSearchContainer_Bca1><div class="navbar__search searchBarContainer_NW3z" dir=ltr><svg aria-hidden=true class=searchIcon_T3tP focusable=false viewBox="0 0 16 16"><path fill=currentColor d="M6.02945 10.20327a4.17382 4.17382 0 1 1 4.17382-4.17382 4.15609 4.15609 0 0 1-4.17382 4.17382Zm9.69195 4.2199-4.8225-4.82338A5.88021 5.88021 0 0 0 12.058 6.02856 6.00467 6.00467 0 1 0 9.59979 10.8989l4.82338 4.82338a.89729.89729 0 0 0 1.29912 0 .89749.89749 0 0 0-.00087-1.29909Z"/></svg><input placeholder=Search aria-label=Search class="navbar__search-input searchInput_YFbd" value="" /><div class="loadingRing_RJI3 searchBarLoadingRing_YnHq"><div></div><div></div><div></div><div></div></div></div></div></div></div><div role=presentation class=navbar-sidebar__backdrop></div></nav><div id=__docusaurus_skipToContent_fallback class="theme-layout-main main-wrapper mainWrapper_z2l0"><div class=docsWrapper_hBAB><button aria-label="Scroll back to top" class="clean-btn theme-back-to-top-button backToTopButton_sjWU" type=button></button><div class=docRoot_UBD9><aside class="theme-doc-sidebar-container docSidebarContainer_YfHR"><div class=sidebarViewport_aRkj><div class=sidebar_njMd><nav aria-label="Docs sidebar" class="menu thin-scrollbar menu_SIkG"><ul class="theme-doc-sidebar-menu menu__list"><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-1 menu__list-item"><a class=menu__link href=/hi/docs/introduction><span class=linkLabel_WmDU>परिचय</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/hi/docs/examples><span class=categoryLinkLabel_W154>शुरुआत</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/hi/docs/architecture/ir-design><span class=categoryLinkLabel_W154>आर्किटेक्चर</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret menu__link--active" role=button aria-expanded=true href=/hi/docs/tile-kernels/overview><span class=categoryLinkLabel_W154>Tile कर्नेल (tk)</span></a></div><ul class=menu__list><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/hi/docs/tile-kernels/overview><span class=linkLabel_WmDU>अवलोकन</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/hi/docs/tile-kernels/first-kernel><span class=linkLabel_WmDU>आपका पहला कर्नेल</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/hi/docs/tile-kernels/layouts-and-lowering><span class=linkLabel_WmDU>Layouts और Lowering</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/hi/docs/tile-kernels/kernel-library><span class=linkLabel_WmDU>कर्नेल लाइब्रेरी</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/hi/docs/tile-kernels/op-layer><span class=linkLabel_WmDU>Op Layer</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/hi/docs/tile-kernels/tuning><span class=linkLabel_WmDU>Tuning</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class="menu__link menu__link--active" aria-current=page tabindex=0 href=/hi/docs/tile-kernels/profiling><span class=linkLabel_WmDU>Profiling</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/hi/docs/tile-kernels/testing-and-debugging><span class=linkLabel_WmDU>टेस्टिंग और डिबगिंग</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/hi/docs/tile-kernels/portability><span class=linkLabel_WmDU>पोर्टेबिलिटी</span></a></ul><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/hi/docs/backends/overview><span class=categoryLinkLabel_W154>बैकएंड</span></a></div></ul></nav></div></div></aside><main class=docMainContainer_TBSr><div class="container padding-top--md padding-bottom--lg"><div class=row><div class="col docItemCol_VOVn"><div class=docItemContainer_Djhp><article><nav class="theme-doc-breadcrumbs breadcrumbsContainer_Z_bl" aria-label=Breadcrumbs><ul class=breadcrumbs><li class=breadcrumbs__item><a aria-label="Home page" class=breadcrumbs__link href=/hi/><svg viewBox="0 0 24 24" class=breadcrumbHomeIcon_YNFT><path d="M10 19v-5h4v5c0 .55.45 1 1 1h3c.55 0 1-.45 1-1v-7h1.7c.46 0 .68-.57.33-.87L12.67 3.6c-.38-.34-.96-.34-1.34 0l-8.36 7.53c-.34.3-.13.87.33.87H5v7c0 .55.45 1 1 1h3c.55 0 1-.45 1-1z" fill=currentColor /></svg></a><li class=breadcrumbs__item><span class=breadcrumbs__link>Tile कर्नेल (tk)</span><li class="breadcrumbs__item breadcrumbs__item--active"><span class=breadcrumbs__link>Profiling</span></ul></nav><div class="tocCollapsible_ETCw theme-doc-toc-mobile tocMobile_ITEo"><button type=button class="clean-btn tocCollapsibleButton_TO0P">इस पेज पर</button></div><div class="theme-doc-markdown markdown"><header><h1>Thread trace के साथ profiling</h1></header>
+<p>किसी कर्नेल का समय आपको बताता है कि वह धीमा है। Thread trace बताती है कि क्यों: हर wave किस
+instruction पर रुकी, कितनी देर, और वह instruction tile program की किस line से आया। यह पेज आपको
+"यह कर्नेल धीमा है" से tk program में एक बदलाव तक ले जाता है।</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=why-a-trace>Trace क्यों<a href=#why-a-trace class=hash-link aria-label="Trace क्यों का सीधा लिंक" title="Trace क्यों का सीधा लिंक" translate=no>​</a></h2>
+<p>बाक़ी tools कर्नेल को बाहर से देखते हैं। Device time बताता है कि उसमें कितना समय लगा, roofline बताता है
+कि वह memory और compute की सीमाओं से कितना दूर है, और counters बताते हैं कि units कितनी व्यस्त थीं।
+इनमें से कोई नहीं बताता कि किसी दिए गए cycle पर कोई wave क्या कर रही थी। AMD के RDNA cards पर SQ
+thread trace (SQTT) ठीक यही record करती है, इसलिए आप देख सकते हैं कि main loop global loads का, LDS
+का, किसी barrier का इंतज़ार करता है, या किसी का भी नहीं।</p>
+<p>Svod के profiler के पाँच tiers हैं। हर एक अपने नीचे वाले में detail जोड़ता है:</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Tier<th>क्या देता है<th>कहाँ<tbody><tr><td>1, device time<td>GPU clock पर हर कर्नेल का समय<td>GPU backends; CPU पर wall clock<tr><td>2, roofline<td>Tier 1 और कर्नेल के static work estimate से GFLOP/s और GB/s<td>हर backend<tr><td>3, static occupancy<td>Registers, LDS, scratch और एक occupancy estimate, बिना dispatch के<td>AMD, CUDA; Metal में आंशिक रूप से<tr><td>4, hardware counters<td>Busy cycles, waves, instructions (<code>SVOD_PMC</code>)<td>AMD (PM4), CUDA (CUPTI)<tr><td>5, thread trace<td>हर traced wave के instructions उनके cycles के साथ, एक अतिरिक्त pass में<td>AMD gfx11 और gfx12</table>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=what-the-trace-records>Trace क्या record करती है<a href=#what-the-trace-records class=hash-link aria-label="Trace क्या record करती है का सीधा लिंक" title="Trace क्या record करती है का सीधा लिंक" translate=no>​</a></h2>
+<p>Trace हर shader engine (SE) के लिए tokens की एक stream है: कोई wave कब शुरू हुई और कब ख़त्म हुई, और
+traced SIMD के लिए, उसने कौन-सा instruction कब issue किया। Svod stream को decode करता है, हर
+instruction को कर्नेल के disassembly से वापस map करता है, और main loop के cycles को buckets में बाँटता
+है:</p>
+<ul>
+<li class=""><strong>issue</strong>: instruction issue हो रहा था, अपनी class के हिसाब से (<code>matrix</code>, <code>valu</code>, <code>salu</code>, <code>lds</code>, <code>vmem_load</code>, …);</li>
+<li class=""><strong>stall</strong>: वह तैयार था लेकिन उसकी pipe या queue व्यस्त थी;</li>
+<li class=""><strong>wait</strong>: एक <code>s_wait_*</code> ने किसी load, LDS access या store का इंतज़ार किया, जो उस load के नाम लिखा जाता है जिसने उसे बाँधा;</li>
+<li class=""><strong>barrier</strong>: wave किसी workgroup barrier पर रुकी हुई थी;</li>
+<li class=""><strong>idle</strong>: कोई record नहीं, क्योंकि SIMD किसी दूसरी wave के लिए issue कर रहा था या किसी ऐसी dependency पर था जिसे trace नहीं दिखाती।</li>
+</ul>
+<p>हर bucket का एक <strong>exposed</strong> हिस्सा भी होता है: उसके cycles, उसी समय दूसरी pipes के काम ने जितना छिपाया
+उसे घटाकर। 180 cycles का load wait, जिनमें से 140 के दौरान matrix pipe व्यस्त है, लगभग 40 का पड़ता है।
+Findings exposed हिस्से से rank होती हैं, क्योंकि सिर्फ़ exposed cycles हटाने पर ही कर्नेल छोटा होता है।</p>
+<p>एक <strong>trip</strong> tile program के loop body का एक pass है, जो loop के unrolled होने पर hardware iteration से
+छोटा हो सकता है। Cycles किसी traced wave के होते हैं, प्रति trip।</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=scope-and-cost>Scope और cost<a href=#scope-and-cost class=hash-link aria-label="Scope और cost का सीधा लिंक" title="Scope और cost का सीधा लिंक" translate=no>​</a></h2>
+<ul>
+<li class=""><strong>Hardware.</strong> AMD gfx11 (RDNA3, RDNA3.5) और gfx12 (RDNA4)। कोई भी दूसरा target
+<code>only gfx11 and gfx12 are traced</code> के साथ मना कर दिया जाता है। Captures gfx1201 (RX 9070 XT) और gfx1151
+(Strix Halo) पर verify की गईं। gfx1100 की traces decode होती हैं, लेकिन कोई hardware capture verify
+नहीं की गई।</li>
+<li class=""><strong>gfx11 पर कोई ceiling figure नहीं।</strong> gfx11 matrix op को एक-cycle token के रूप में record करता है,
+इसलिए वहाँ pipes के busy हिस्से अज्ञात हैं। Report कोई <code>ceiling</code> line नहीं छापती, और उसकी findings
+कच्चे (raw) हिस्से इस्तेमाल करती हैं, जिन पर <code>approx: untimed_matrix</code> का निशान होता है।</li>
+<li class=""><strong>सिर्फ़ PM4 queues.</strong> <code>SVOD_AMD_AQL=1</code> के साथ खोला गया device trace को arm करने से मना कर देता है।</li>
+<li class=""><strong>Window.</strong> हर SE को default में 64 MiB का buffer मिलता है (<code>SqttConfig::window</code>, 4 KiB pages में,
+configurable)। जो buffer भर जाता है वह अपना tail खो देता है। तब report <code>!! TRUNCATED</code> से शुरू होती है,
+और उसके totals कम गिनते हैं।</li>
+<li class=""><strong>हर traced कर्नेल के लिए एक अतिरिक्त pass.</strong> Profile अपने runs का समय बिना trace के मापता है, फिर
+trace arm करके plan को एक बार और चलाता है। वह pass हर कर्नेल के बाद synchronize करता है और अगले से
+पहले उसके buffers free करता है। कोई timing column उससे नहीं आता।</li>
+<li class=""><strong>दो SIMDs.</strong> Instruction tokens SE0 और SE1 से आते हैं, हर एक का एक SIMD (<code>SqttConfig::se_mask</code>)।
+<code>SVOD_SQTT_SIMD</code> उन्हें चुनता है: हर SE के लिए एक SIMD, या एक comma list जो SEs पर दोहराई जाती है
+(default <code>0,1</code>, SE0 पर SIMD 0 और SE1 पर SIMD 1)। Per-instruction संख्याएँ उन्हीं दो SIMDs की waves के
+बारे में हैं।</li>
+</ul>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=clocks-and-prerequisites>Clocks और prerequisites<a href=#clocks-and-prerequisites class=hash-link aria-label="Clocks और prerequisites का सीधा लिंक" title="Clocks और prerequisites का सीधा लिंक" translate=no>​</a></h2>
+<ul>
+<li class="">ऊपर के targets में से एक AMD card, <code>SVOD_DEVICE=AMD</code> (या <code>AMD:N</code>) से चुना हुआ, PM4 queues पर चलता हुआ।</li>
+<li class="">उस clang के बगल में <code>llvm-objdump</code> जिससे Svod compile करता है। Capture अपना disassembly सहेजती है,
+इसलिए replay को tool की ज़रूरत तभी होती है जब <code>kernel.s</code> मौजूद न हो।</li>
+<li class=""><strong>Unpinned clock, default.</strong> Traced pass उसी clock पर चलता है जो device चुनता है, ठीक वैसे ही जैसे
+untraced run। <code>SVOD_SQTT_PSTATE=standard</code> (या <code>peak</code>) DRM context के ज़रिए एक stable power state pin
+करता है। यह shader clock घटाता है और trace जो दिखाती है उसे बिगाड़ता है। इसे सिर्फ़ किसी पुरानी pinned
+capture से मिलान के लिए इस्तेमाल करें।</li>
+<li class="">एक शांत GPU. Tracing हर हाल में run को बदलता है: report traced run का समय untraced के अनुपात में छापती
+है, और 1.2× से ऊपर वह findings पर <code>approx: perturbed</code> का निशान लगाती है। Traced समय की तुलना कभी
+untraced समय से न करें।</li>
+</ul>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=tracing-from-rust>Rust से tracing<a href=#tracing-from-rust class=hash-link aria-label="Rust से tracing का सीधा लिंक" title="Rust से tracing का सीधा लिंक" translate=no>​</a></h2>
+<p><code>ProfileOptions::sqtt</code> किसी भी profiled plan (<code>ExecutionPlan::profile</code>) या tensor (<code>Tensor::profile</code>)
+के लिए tier 5 चालू करता है:</p>
+<div class="language-rust codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-rust codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token keyword" style=color:#00009f>use</span><span class="token plain"> </span><span class="token namespace" style=opacity:0.7>svod_runtime</span><span class="token namespace punctuation" style=opacity:0.7;color:#393A34>::</span><span class="token punctuation" style=color:#393A34>{</span><span class="token class-name">ProfileOptions</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"> </span><span class="token class-name">SqttOptions</span><span class="token punctuation" style=color:#393A34>}</span><span class="token punctuation" style=color:#393A34>;</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain" style=display:inline-block></span><br/></div><div class=token-line style=color:#393A34><span class="token plain"></span><span class="token keyword" style=color:#00009f>let</span><span class="token plain"> opts </span><span class="token operator" style=color:#393A34>=</span><span class="token plain"> </span><span class="token class-name">ProfileOptions</span><span class="token plain"> </span><span class="token punctuation" style=color:#393A34>{</span><span class="token plain"> sqtt</span><span class="token punctuation" style=color:#393A34>:</span><span class="token plain"> </span><span class="token class-name">Some</span><span class="token punctuation" style=color:#393A34>(</span><span class="token class-name">SqttOptions</span><span class="token punctuation" style=color:#393A34>::</span><span class="token function" style=color:#d73a49>default</span><span class="token punctuation" style=color:#393A34>(</span><span class="token punctuation" style=color:#393A34>)</span><span class="token punctuation" style=color:#393A34>)</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"> </span><span class="token punctuation" style=color:#393A34>..</span><span class="token class-name">Default</span><span class="token punctuation" style=color:#393A34>::</span><span class="token function" style=color:#d73a49>default</span><span class="token punctuation" style=color:#393A34>(</span><span class="token punctuation" style=color:#393A34>)</span><span class="token plain"> </span><span class="token punctuation" style=color:#393A34>}</span><span class="token punctuation" style=color:#393A34>;</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain"></span><span class="token keyword" style=color:#00009f>let</span><span class="token plain"> profile </span><span class="token operator" style=color:#393A34>=</span><span class="token plain"> plan</span><span class="token punctuation" style=color:#393A34>.</span><span class="token function" style=color:#d73a49>profile</span><span class="token punctuation" style=color:#393A34>(</span><span class="token operator" style=color:#393A34>&</span><span class="token plain">opts</span><span class="token punctuation" style=color:#393A34>)</span><span class="token operator" style=color:#393A34>?</span><span class="token punctuation" style=color:#393A34>;</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain"></span><span class="token keyword" style=color:#00009f>for</span><span class="token plain"> traced </span><span class="token keyword" style=color:#00009f>in</span><span class="token plain"> profile</span><span class="token punctuation" style=color:#393A34>.</span><span class="token plain">stages</span><span class="token punctuation" style=color:#393A34>.</span><span class="token function" style=color:#d73a49>iter</span><span class="token punctuation" style=color:#393A34>(</span><span class="token punctuation" style=color:#393A34>)</span><span class="token punctuation" style=color:#393A34>.</span><span class="token function" style=color:#d73a49>flat_map</span><span class="token punctuation" style=color:#393A34>(</span><span class="token closure-params closure-punctuation punctuation" style=color:#393A34>|</span><span class="token closure-params">stage</span><span class="token closure-params closure-punctuation punctuation" style=color:#393A34>|</span><span class="token plain"> </span><span class="token operator" style=color:#393A34>&</span><span class="token plain">stage</span><span class="token punctuation" style=color:#393A34>.</span><span class="token plain">sqtt</span><span class="token punctuation" style=color:#393A34>)</span><span class="token plain"> </span><span class="token punctuation" style=color:#393A34>{</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">    </span><span class="token keyword" style=color:#00009f>match</span><span class="token plain"> </span><span class="token operator" style=color:#393A34>&</span><span class="token plain">traced</span><span class="token punctuation" style=color:#393A34>.</span><span class="token plain">analysis </span><span class="token punctuation" style=color:#393A34>{</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">        </span><span class="token class-name">Ok</span><span class="token punctuation" style=color:#393A34>(</span><span class="token plain">analysis</span><span class="token punctuation" style=color:#393A34>)</span><span class="token plain"> </span><span class="token operator" style=color:#393A34>=></span><span class="token plain"> </span><span class="token macro property" style=color:#36acaa>println!</span><span class="token punctuation" style=color:#393A34>(</span><span class="token string" style=color:#e3116c>"{}: {}"</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"> traced</span><span class="token punctuation" style=color:#393A34>.</span><span class="token plain">kernel</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"> analysis</span><span class="token punctuation" style=color:#393A34>.</span><span class="token function" style=color:#d73a49>summary</span><span class="token punctuation" style=color:#393A34>(</span><span class="token punctuation" style=color:#393A34>)</span><span class="token punctuation" style=color:#393A34>)</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">        </span><span class="token class-name">Err</span><span class="token punctuation" style=color:#393A34>(</span><span class="token plain">error</span><span class="token punctuation" style=color:#393A34>)</span><span class="token plain"> </span><span class="token operator" style=color:#393A34>=></span><span class="token plain"> </span><span class="token macro property" style=color:#36acaa>println!</span><span class="token punctuation" style=color:#393A34>(</span><span class="token string" style=color:#e3116c>"{}: {error}"</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"> traced</span><span class="token punctuation" style=color:#393A34>.</span><span class="token plain">kernel</span><span class="token punctuation" style=color:#393A34>)</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">    </span><span class="token punctuation" style=color:#393A34>}</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain"></span><span class="token punctuation" style=color:#393A34>}</span><br/></div></code></pre></div></div>
+<p><code>SqttOptions</code> में एक <code>SqttConfig</code> (SEs, SIMDs, window, power state) और एक <code>Sink</code> होता है:</p>
+<ul>
+<li class=""><code>Sink::Disk(dir)</code>, default, हर कर्नेल की capture <code>dir/&lt;index>_&lt;entry point></code> के तहत सहेजता है
+(default में <code>./sqtt</code>), इसलिए pass एक समय में एक capture रखता है। <code>Traced::raw</code> <code>Raw::Saved(path)</code> है।</li>
+<li class=""><code>Sink::Memory</code> हर capture <code>Raw::Held</code> में रखता है। एक capture प्रति SE 64 MiB तक ले सकती है, इसलिए
+पूरे मॉडल की captures शायद न समाएँ।</li>
+</ul>
+<p>हर <code>Traced</code> अपना <code>analysis</code> ख़ुद रखता है। जिस कर्नेल की trace analyze नहीं होती, वह बाक़ियों को अछूता
+छोड़ता है। <code>RunProfile::render_report</code> हर traced कर्नेल के लिए एक summary line के साथ ख़त्म होता है।</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=tracing-a-model>किसी मॉडल की tracing<a href=#tracing-a-model class=hash-link aria-label="किसी मॉडल की tracing का सीधा लिंक" title="किसी मॉडल की tracing का सीधा लिंक" translate=no>​</a></h2>
+<p>Model examples का <code>--profile</code> flag trace नहीं करता। किसी मॉडल को trace करने के लिए, उसके output tensor
+को ऊपर के options के साथ profile करें। Plan का हर compiled कर्नेल trace होता है: tk kernels और graph
+kernels दोनों। <code>SqttOptions::from_env()</code> उस program के लिए जिसे switch चाहिए, options environment से
+बनाता है: <code>SVOD_SQTT=1</code> trace करता है, <code>SVOD_SQTT_DIR</code> directory का नाम देता है, और <code>SVOD_SQTT_PSTATE</code>
+और <code>SVOD_SQTT_SIMD</code> config तय करते हैं। जब <code>SVOD_SQTT</code> <code>1</code> नहीं होता तो यह <code>Ok(None)</code> लौटाता है, और जो
+मान parse नहीं होता उसके लिए error।</p>
+<p>Untraced run की per-kernel table से शुरू करें, जो कर्नेल हावी है उसे चुनें, और उसकी directory
+<code>tk_bench sqtt --load</code> (नीचे) से पढ़ें। tk कर्नेल के लिए, अगला क़दम उसे अकेले trace करना है, ताकि आप
+उसका config बदल सकें।</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=tracing-one-kernel>एक कर्नेल की tracing<a href=#tracing-one-kernel class=hash-link aria-label="एक कर्नेल की tracing का सीधा लिंक" title="एक कर्नेल की tracing का सीधा लिंक" translate=no>​</a></h2>
+<p><code>tk_bench sqtt</code> एक shape पर एक tk op बनाता है, हर config का समय tuner की तरह बिना trace के मापता है,
+उसे एक बार trace करता है, capture सहेजता है और उसकी report छापता है:</p>
+<div class="language-bash codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-bash codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">SVOD_DEVICE=AMD cargo run --release -p svod-tk --example tk_bench -- sqtt nearest 4096 128 16</span><br/></div></code></pre></div></div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Command<th>क्या trace करता है<tbody><tr><td><code>sqtt gemm M N K [--residual] [--gated]</code><td>एक bf16 GEMM, residual या SwiGLU epilogue के साथ<tr><td><code>sqtt attention B H T D [--causal] [--bias] [--flip FORM,…] [--ring S]</code><td><code>[B, T, H, D]</code> पर bf16 attention; <code>--flip</code> हर config के softmax forms को पलटता है, <code>--ring</code> उसके ring slots तय करता है<tr><td><code>sqtt nearest N D K [--metric M] [--splits S]</code><td>depth <code>D</code> पर <code>N</code> f16 rows का self-join, हर row के लिए <code>K</code> रखते हुए; <code>--splits</code> config के splits को override करता है<tr><td><code>sqtt conv H W CIN COUT KERNEL STRIDE [--batch B] [--residual]</code><td>bias और SiLU के साथ किसी YOLO block का f16 convolution</table>
+<p>चारों <code>--cfg</code>, <code>--top N</code> (table rows, default में 12), <code>--out DIR</code> (default में <code>./sqtt</code>) और <code>--json</code>
+(report एक JSON line के रूप में) लेते हैं। <code>--cfg</code> एक comma list है। <code>tuned</code>, default, वह config है जो
+op launch करेगा। एक संख्या <code>I</code> planner का <code>I</code>वाँ ranked config है। GEMM एक pinned code
+<code>BMxBNxBK:S:WRxWC[:rolled]</code> भी लेता है, और <code>nearest</code> और <code>conv</code> <code>ranked</code> लेते हैं, जो trace करने के
+बजाय ranking की सूची देता है। हर config <code>DIR/&lt;op>_&lt;shape>_&lt;cfg>/p&lt;program>/&lt;index>_&lt;entry>/</code> में
+पहुँचता है, और path <code>saved …</code> के रूप में छपता है।</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=the-saved-directory-and-replay>सहेजी गई directory और replay<a href=#the-saved-directory-and-replay class=hash-link aria-label="सहेजी गई directory और replay का सीधा लिंक" title="सहेजी गई directory और replay का सीधा लिंक" translate=no>​</a></h2>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>File<th>क्या रखती है<tbody><tr><td><code>se0.att</code>, <code>se1.att</code>, …<td>हर SE की raw trace stream<tr><td><code>kernel.co</code><td>Traced code object; AMD पर launch हुआ tk कर्नेल अपने DWARF में अपनी <code>kernel.tk</code> listing पर एक line table, और ख़ुद listing भी, रखता है<tr><td><code>kernel.s</code><td><code>kernel.co</code> का <code>llvm-objdump -d</code>; report के PCs इसके addresses हैं<tr><td><code>meta.json</code><td><code>format</code> 2, arch, load base, untraced और traced ns, SEs, labels (op, shape, cfg), loop model, resources, workgroup और grid, power state, memory clock</table>
+<p>Load <code>format</code> जाँचता है और अलग होने पर आपसे फिर से capture करने को कहता है। Statements हर load पर
+<code>kernel.co</code> से वापस पढ़े जाते हैं। सिर्फ़ AMD tk kernels के पास ये होते हैं; graph kernels के पास कोई
+नहीं (CUDA और Metal के पास कोई thread trace नहीं)। Statements के बिना, एक trip को एक loop iteration
+माना जाता है, जिस पर <code>approx: per_iteration</code> का निशान होता है।</p>
+<p>Replay को किसी GPU की ज़रूरत नहीं:</p>
+<div class="language-bash codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-bash codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">cargo run --release -p svod-tk --example tk_bench -- sqtt --load DIR [--json] [--attribute]</span><br/></div></code></pre></div></div>
+<p>Rust से, <code>svod_runtime::sqtt::Analysis::load(dir)</code> वही analysis लौटाता है।</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=reading-the-report>Report पढ़ना<a href=#reading-the-report class=hash-link aria-label="Report पढ़ना का सीधा लिंक" title="Report पढ़ना का सीधा लिंक" translate=no>​</a></h2>
+<p><code>rdna4_nearest_split</code> fixture (<code>device/src/test/fixtures/sqtt/svod/</code>) एक gfx1201 nearest कर्नेल है,
+n4096 d128 k16। संक्षेप में, उसकी report ऐसी है:</p>
+<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">== verdict: cycles are a traced wave's, a trip (1 an iteration, its statements' unroll copies); exposed: not hidden by other pipes' work</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">ceiling    matrix pipe 14.7% busy over the steady window: removing every stall gains at most 6.82x; …</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">bound      occupancy_limited  56.6%  SIMD idle 56.6%: 2.0 waves a SIMD, ~4.6 would fill it; limit 8 by vgpr+lds</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">   knob: fewer waves resident than the kernel allows: more workgroups in flight</span><br/></div><div class=token-line style=color:#393A34><span class="token plain"> 1 barrier            18.6% (raw 23.4%)  barrier (sink): 255/trip parked for the workgroup's slowest wave, 203 exposed; …</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">   knob: drop or merge a barrier only if its exposed share passes 10%</span><br/></div><div class=token-line style=color:#393A34><span class="token plain"> 2 load_exposed       13.0% (raw 16.8%)  cycles a trip: waiting on loads 183 (141 exposed); stalled issuing 0 (0 exposed)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">   0x364 load exposed 129/trip at wait 0x44c (then ds_store_b128 v177, v[105:108]): cover med 91, latency med 238, … @21 fill c staged issue [steady]</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">   knob: latency: more work between a load and its wait (prefetch distance, ring slots)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain"> 3 loop_overhead       2.7% (raw 3.2%)  valu 26 + salu 9 issue cycles a trip beside matrix 146 (24%), …</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">kernel     144840 ns untraced, 148360 ns traced (1.02x), wave span 461319 cycles, sclk ~3109 MHz, mclk 875 MHz, pstate unpinned</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">traced     se0 sa0 wgp0 simd0 (2 waves), se1 sa0 wgp0 simd1 (2 waves) of 2 SEs</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">== statements: main loop cycles a trip by kernel.tk line (a wait on its binding load's); 104 of 105 loop instructions attributed; top 12 by exposed</span><br/></div><div class=token-line style=color:#393A34><span class="token plain"> line  pcs    issue    stall     wait  barrier     idle    total  exposed  statement</span><br/></div><div class=token-line style=color:#393A34><span class="token plain"> 1581    1      0.0      0.0      0.0    255.1      0.0    255.1    202.6  await [steady]</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">   21    8      7.0      2.1    182.7      0.0     32.7    224.5    162.5  fill c staged issue [steady]</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">   28   24    145.7     11.4      0.0      0.0     75.5    232.6    148.0  mma x·c_s [steady]</span><br/></div></code></pre></div></div>
+<p>इसे ऊपर से नीचे पढ़ें:</p>
+<ol>
+<li class=""><strong><code>ceiling</code></strong>: matrix pipe कितनी व्यस्त थी। 14.7% पर यह loop matrix की सीमा से बहुत दूर है, और हर
+stall हटाने से अधिकतम 6.82× का लाभ होगा।</li>
+<li class=""><strong><code>bound</code></strong>: कर्नेल की class, pipes के busy हिस्सों से (<code>matrix_bound</code>, <code>issue_bound</code> या
+<code>occupancy_limited</code>)।</li>
+<li class=""><strong>क्रमांकित findings</strong>: loop के exposed cycles किसमें गए, सबसे बड़ा पहले। हर एक अपना evidence
+(PCs, किसी wait के पीछे का load, barrier पर आख़िर में कौन पहुँचा), <code>@</code> के बाद tk statement, और क्या
+बदलना है यह बताने वाली एक <code>knob</code> line देती है।</li>
+<li class=""><strong><code>kernel</code> और <code>traced</code></strong>: untraced और traced समय, clock, और कौन-से SIMDs trace हुए।</li>
+<li class=""><strong><code>statements</code></strong>: <code>kernel.tk</code> line के हिसाब से loop के प्रति trip cycles। <code>[steady]</code> loop की steady
+state है; <code>[prologue]</code>, <code>[head]</code>, <code>[drain]</code> और <code>[epilogue]</code> उसके आसपास के हिस्से हैं।</li>
+</ol>
+<p>इसके बाद और sections आते हैं: class के हिसाब से समय, प्रति SE occupancy, bucket के हिसाब से main loop के
+प्रति trip cycles, शीर्ष stalls, waits उन loads के साथ जिन्होंने उन्हें बाँधा, और सबसे गर्म instructions।</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=verdict-classes-and-their-levers>Verdict classes और उनके levers<a href=#verdict-classes-and-their-levers class=hash-link aria-label="Verdict classes और उनके levers का सीधा लिंक" title="Verdict classes और उनके levers का सीधा लिंक" translate=no>​</a></h2>
+<p>Thresholds heuristics हैं, जो <code>runtime/src/sqtt/verdict.rs</code> में constants के रूप में रखे गए हैं।</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Class<th>कब fire होती है<th>Knob<th>tk lever<tbody><tr><td><code>matrix_bound</code><td>Matrix pipe steady window के ≥ 70% व्यस्त<td><code>less_matrix_work</code><td>सस्ता type या कम matrix ops; schedule समस्या नहीं है<tr><td><code>issue_bound</code><td>कोई pipe ≥ 90% व्यस्त, उसका matrix 60% से कम<td><code>cut_issue</code><td>Loop से non-matrix instructions हटाएँ<tr><td><code>occupancy_limited</code><td>SIMDs ≥ 10% idle<td><code>free_resources</code>, <code>more_workgroups</code>, <code>more_waves</code><td>प्रति workgroup कम VGPRs या कम LDS; ज़्यादा workgroups के लिए छोटा tile या ज़्यादा splits<tr><td><code>load_exposed</code><td>Global load waits और stalls loop के ≥ 10%, exposed<td><code>latency</code>, <code>move_use</code><td>गहरी ring या एक step पहले issue किया गया load; <code>move_use</code> load के ठीक पीछे के use का नाम देता है<tr><td><code>lds_exposed</code><td>LDS waits और stalls ≥ 10%, exposed<td><code>lds_flush</code>, <code>lds_use</code>, <code>lds_queue</code><td>कम और चौड़े <code>ds</code> ops, अगला fragment पहले पढ़ा गया, conflict-free layout<tr><td><code>barrier</code><td>Barrier cycles loop के ≥ 10%<td><code>barrier</code><td>पहले दूसरी findings ठीक करें; barrier को हटाएँ, merge या split करें सिर्फ़ तब जब उसका exposed हिस्सा 10% पार करे<tr><td><code>loop_overhead</code><td>VALU+SALU issue matrix issue के ≥ 10%, या कोई भी divergent branch<td><code>hoist</code><td>Address और guard arithmetic को hoist करें; guards को uniform बनाएँ</table>
+<p>Barrier एक sink है: waves सबसे धीमी wave के लिए वहाँ रुकती हैं, इसलिए उसका समय उसी चीज़ का है जिसने
+उस wave को धीमा किया। Finding बताती है कि आख़िर में कौन पहुँचा और किस instruction के बाद।</p>
+<p><code>approx</code> के निशान वाली finding के आँकड़े सावधानी से पढ़ने हैं: <code>perturbed</code>, <code>untimed_matrix</code>,
+<code>approx_bindings</code> (अनुमानित binding), <code>implausible_time</code> (corrupt stream), <code>truncated</code> या
+<code>per_iteration</code>।</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=--attribute-and---compare><code>--attribute</code> और <code>--compare</code><a href=#--attribute-and---compare class=hash-link aria-label="--attribute-and---compare का सीधा लिंक" title="--attribute-and---compare का सीधा लिंक" translate=no>​</a></h2>
+<p><code>--attribute</code> सिर्फ़ GEMM के लिए है, क्योंकि सिर्फ़ <code>tk_bench sqtt gemm</code> capture में cost model की price
+होती है। यह हर priced term (<code>steps</code>, <code>reads</code>, <code>fill</code>, <code>wait</code>, <code>lone_trip</code>, <code>trip</code>) को उन instructions
+के traced cycles के बगल में रखता है जिनकी price वह लगाता है। Terms overlap करते हैं, इसलिए totals की
+नहीं, हिस्सों और प्रति trip गति की तुलना करें।</p>
+<p><code>--compare A B</code> B की capture को A की capture के सामने रखता है (Δ = B − A):</p>
+<div class="language-bash codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-bash codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">cargo run --release -p svod-tk --example tk_bench -- sqtt --compare A B [--json] [--top N]</span><br/></div></code></pre></div></div>
+<p>यह दोनों समय छापता है, वे findings जो प्रकट हुईं, ग़ायब हुईं या बदलीं, |Δ exposed| के हिसाब से loop के
+प्रति trip buckets, text के हिसाब से statements, और mnemonic के हिसाब से aligned loop के instructions।
+यह <code>!!</code> के साथ चेतावनी देता है जब दोनों captures अलग power states पर चलीं, जब उनके traced/untraced
+अनुपात 10% से ज़्यादा अलग हैं, या जब उनके trips reduction की अलग-अलग मात्राएँ cover करते हैं। जिस
+capture में कोई main loop नहीं, उसके पास align करने को कुछ नहीं।</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=the-workflow>Workflow<a href=#the-workflow class=hash-link aria-label="Workflow का सीधा लिंक" title="Workflow का सीधा लिंक" translate=no>​</a></h2>
+<ol>
+<li class="">Untraced profile की per-kernel table में धीमा कर्नेल ढूँढें।</li>
+<li class="">उसे trace करें: <code>tk_bench sqtt &lt;op> &lt;shape></code>, या ऐसे कर्नेल के लिए जो सिर्फ़ किसी मॉडल के भीतर मौजूद
+है, <code>SqttOptions</code> के साथ <code>Tensor::profile</code>।</li>
+<li class=""><code>ceiling</code> और <code>bound</code> पढ़ें। <code>matrix_bound</code> कर्नेल अपनी सीमा के पास है: schedule नहीं, काम बदलें।</li>
+<li class="">पहली finding, उसका evidence और उसका <code>@</code> statement लें। वह statement tile program की वह line है जिसे
+बदलना है।</li>
+<li class="">एक बदलाव करें, <code>--out</code> को एक नई directory पर set करके फिर से trace करें, और <code>--compare old new</code>
+चलाएँ। जाँचें कि लक्षित bucket हिला, और लाभ को सिर्फ़ untraced समय से आँकें।</li>
+<li class="">बदलाव रखने से पहले idle GPU पर <code>tk_bench</code> या tuner से पुष्टि करें।</li>
+</ol>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=worked-examples>हल किए गए उदाहरण<a href=#worked-examples class=hash-link aria-label="हल किए गए उदाहरण का सीधा लिंक" title="हल किए गए उदाहरण का सीधा लिंक" translate=no>​</a></h2>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=attention-loading-the-bias-a-step-ahead>Attention: bias को एक step पहले load करना<a href=#attention-loading-the-bias-a-step-ahead class=hash-link aria-label="Attention: bias को एक step पहले load करना का सीधा लिंक" title="Attention: bias को एक step पहले load करना का सीधा लिंक" translate=no>​</a></h3>
+<p>सीधे पढ़ी जाने वाली attention bias tile उसी step में load होती थी जिसके scores उसे इस्तेमाल करते थे,
+इसलिए उसका wait load के ठीक पीछे बैठता था। यही वह pattern है जिसे <code>load_exposed</code> <code>move_use</code> के साथ नाम
+देता है। अब कर्नेल हर tile को एक step पहले load करता है (<code>tk/src/kernels/attention.rs</code> में
+<code>pipeline_with</code> उसे अगले step में ले जाता है), इसलिए load के पास पहुँचने के लिए पूरा एक step होता है।
+PR #230 ने d128 पर −19% और d64 पर −7% मापा।</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=nearest-splitting-the-barrier-on-rdna4>Nearest: RDNA4 पर barrier को split करना<a href=#nearest-splitting-the-barrier-on-rdna4 class=hash-link aria-label="Nearest: RDNA4 पर barrier को split करना का सीधा लिंक" title="Nearest: RDNA4 पर barrier को split करना का सीधा लिंक" translate=no>​</a></h3>
+<p><code>rdna4_nearest_joined</code> और <code>rdna4_nearest_split</code> fixtures एक ही <code>NearestCfg</code> (n4096 d128 k16) हैं,
+RDNA4 के split barrier से पहले और बाद। gfx12 पर register-staged ring का steady loop अब LDS commit के
+बाद barrier को signal करता है (<code>arrive</code>, <code>s_barrier_signal</code>) और trip के अंत में उसका इंतज़ार करता है
+(<code>await</code>, <code>s_barrier_wait</code>)। दोनों के बीच का tail तब चलता है जब धीमी waves पीछे से पहुँच रही होती
+हैं। Fixtures पर <code>--compare</code> यह दिखाता है:</p>
+<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">time       180320 -> 144840 ns untraced (-19.7%); traced/untraced 1.01x -> 1.02x; …</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">changed    barrier            46.8% ->  18.6%</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">appears    load_exposed           - ->  13.0%</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">bucket                A raw    B raw    Δ raw    A exp    B exp    Δ exp</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">barrier              1081.7    255.1   -826.6    962.9    202.6   -760.2</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">   A raw    B raw    Δ raw    A exp    B exp    Δ exp  statement</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  1081.7      0.0  -1081.7    962.9      0.0   -962.9  barrier [steady]</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">     0.0    255.1   +255.1      0.0    202.6   +202.6  await [steady]</span><br/></div></code></pre></div></div>
+<p>Barrier exposure प्रति trip 963 से 203 cycles पर गिरता है, <code>barrier [steady]</code> statement <code>arrive</code> +
+<code>await [steady]</code> बन जाता है, और untraced समय 180 से 145 µs पर जाता है। हर पक्ष एक अकेला traced run है।
+PR #230 के benchmark ने nearest d128 k16 के लिए −5.6% मापा। जो <code>load_exposed</code> finding प्रकट होती है वह
+अगला lever है: barrier के जाने के बाद global loads की latency दिखती है।</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=gemm-a-ragged-m>GEMM: एक ragged M<a href=#gemm-a-ragged-m class=hash-link aria-label="GEMM: एक ragged M का सीधा लिंक" title="GEMM: एक ragged M का सीधा लिंक" translate=no>​</a></h3>
+<p><code>rdna4_gemm_1536</code> और <code>rdna4_gemm_1500</code> fixtures M 1536 और M 1500 पर एक ही GEMM config हैं (N 1280,
+K 5120, Whisper का fc2)। दोनों replays <code>bound matrix_bound</code> कहते हैं। सिर्फ़ 1500 वाला <code>loop_overhead</code>
+जोड़ता है, जिसका evidence main loop में आठ divergent branches हैं:</p>
+<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain"> 2 loop_overhead       0.5% (raw 0.7%)  valu 24 + salu 7 issue cycles an iteration beside matrix 443 (7%), 22 valu ops an iteration, 8 divergent branches (approx: per_iteration)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">   0x5f0 s_and_saveexec_b32 s1, vcc_lo</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">   0x5f4 s_cbranch_execz 3</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">   knob: hoist address and guard arithmetic out of the loop; make guards uniform (no exec branches)</span><br/></div></code></pre></div></div>
+<p>जो M tile का multiple नहीं है वह edge guards को loop के भीतर exec branches के रूप में डाल देता है, और
+1536 वाली capture, जो अपनी 128-row tile का multiple है, में कोई नहीं है। सबक़ गुणात्मक है: ragged edge
+loop instructions की कीमत लेता है जो tile तक padded shape नहीं चुकाता, इसलिए ragged shape के schedule
+को tune करने से पहले padded shape जाँचें।</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=caveats>Caveats<a href=#caveats class=hash-link aria-label="Caveats का सीधा लिंक" title="Caveats का सीधा लिंक" translate=no>​</a></h2>
+<ul>
+<li class="">Trace दो SIMDs देखती है। जो grid उन पर कभी नहीं पहुँचता वह वहाँ कुछ trace नहीं करता।</li>
+<li class="">Traced समय कभी benchmark नहीं है। किसी बदलाव को <code>tk_bench</code> या tuner से आँकें, बिना trace के।</li>
+<li class=""><code>exposed</code> इसका अनुमान है कि दूसरी pipes ने क्या छिपाया, इसलिए यह उस समय का वादा नहीं है जो कोई fix
+बचाता है।</li>
+<li class="">Thresholds heuristics हैं। 10% से कम की finding evidence है, फ़ैसला नहीं।</li>
+<li class="">Statements के बिना (graph कर्नेल, या ऐसी capture जिसके code object में कोई line table नहीं), आँकड़े
+प्रति trip के बजाय प्रति loop iteration होते हैं।</li>
+<li class="">पुराने <code>meta.json</code> format की capture load नहीं होती; उसे फिर से capture करें।</li>
+</ul></div><footer class="theme-doc-footer docusaurus-mt-lg"><div class="row margin-top--sm theme-doc-footer-edit-meta-row"><div class="col noPrint_WFHX"><a href=https://github.com/npatsakula/svod/edit/main/website/docs/tile-kernels/profiling.md target=_blank rel="noopener noreferrer" class=theme-edit-this-page><svg fill=currentColor height=20 width=20 viewBox="0 0 40 40" class=iconEdit_Z9Sw aria-hidden=true><g><path d="m34.5 11.7l-3 3.1-6.3-6.3 3.1-3q0.5-0.5 1.2-0.5t1.1 0.5l3.9 3.9q0.5 0.4 0.5 1.1t-0.5 1.2z m-29.5 17.1l18.4-18.5 6.3 6.3-18.4 18.4h-6.3v-6.2z"/></g></svg>इस पेज को बदलें</a></div><div class="col lastUpdated_JAkA"></div></div></footer></article><nav class="docusaurus-mt-lg pagination-nav" aria-label="डॉक्स पेज"><a class="pagination-nav__link pagination-nav__link--prev" href=/hi/docs/tile-kernels/tuning><div class=pagination-nav__sublabel>पिछ्ला</div><div class=pagination-nav__label>Tuning</div></a><a class="pagination-nav__link pagination-nav__link--next" href=/hi/docs/tile-kernels/testing-and-debugging><div class=pagination-nav__sublabel>अगला</div><div class=pagination-nav__label>टेस्टिंग और डिबगिंग</div></a></nav></div></div><div class="col col--3"><div class="tableOfContents_bqdL thin-scrollbar theme-doc-toc-desktop"><ul class="table-of-contents table-of-contents__left-border"><li><a href=#why-a-trace class="table-of-contents__link toc-highlight">Trace क्यों</a><li><a href=#what-the-trace-records class="table-of-contents__link toc-highlight">Trace क्या record करती है</a><li><a href=#scope-and-cost class="table-of-contents__link toc-highlight">Scope और cost</a><li><a href=#clocks-and-prerequisites class="table-of-contents__link toc-highlight">Clocks और prerequisites</a><li><a href=#tracing-from-rust class="table-of-contents__link toc-highlight">Rust से tracing</a><li><a href=#tracing-a-model class="table-of-contents__link toc-highlight">किसी मॉडल की tracing</a><li><a href=#tracing-one-kernel class="table-of-contents__link toc-highlight">एक कर्नेल की tracing</a><li><a href=#the-saved-directory-and-replay class="table-of-contents__link toc-highlight">सहेजी गई directory और replay</a><li><a href=#reading-the-report class="table-of-contents__link toc-highlight">Report पढ़ना</a><li><a href=#verdict-classes-and-their-levers class="table-of-contents__link toc-highlight">Verdict classes और उनके levers</a><li><a href=#--attribute-and---compare class="table-of-contents__link toc-highlight"><code>--attribute</code> और <code>--compare</code></a><li><a href=#the-workflow class="table-of-contents__link toc-highlight">Workflow</a><li><a href=#worked-examples class="table-of-contents__link toc-highlight">हल किए गए उदाहरण</a><ul><li><a href=#attention-loading-the-bias-a-step-ahead class="table-of-contents__link toc-highlight">Attention: bias को एक step पहले load करना</a><li><a href=#nearest-splitting-the-barrier-on-rdna4 class="table-of-contents__link toc-highlight">Nearest: RDNA4 पर barrier को split करना</a><li><a href=#gemm-a-ragged-m class="table-of-contents__link toc-highlight">GEMM: एक ragged M</a></ul><li><a href=#caveats class="table-of-contents__link toc-highlight">Caveats</a></ul></div></div></div></div></main></div></div></div><footer class="theme-layout-footer footer footer--dark"><div class="container container-fluid"><div class="row footer__links"><div class="theme-layout-footer-column col footer__col"><div class=footer__title>डॉक्स</div><ul class="footer__items clean-list"><li class=footer__item><a class=footer__link-item href=/hi/docs/introduction>परिचय</a></ul></div><div class="theme-layout-footer-column col footer__col"><div class=footer__title>समुदाय</div><ul class="footer__items clean-list"><li class=footer__item><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class=footer__link-item>GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a></ul></div></div><div class="footer__bottom text--center"><div class=footer__copyright>Copyright © 2026 Svod. Built with Docusaurus.</div></div></div></footer></div></body>
