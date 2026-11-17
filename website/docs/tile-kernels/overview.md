@@ -59,8 +59,9 @@ model code ──► svod_tk::ops          always a Tensor; picks a kernel and c
 
 A target counts as measured only once
 `targets::families_match_the_interpreter_on_the_device` passes on it. To see what a card reaches,
-run `gemm_throughput_probe` and `attention_throughput_probe` on it
-([Tuning](./tuning#probe-tests)): they print the tuner's pick in TFLOP/s.
+run the `gemm` and `attention` commands of
+`cargo run --release -p svod-tk --example tk_bench` on it
+([Tuning](./tuning#benchmarks)): they print the tuner's pick in TFLOP/s.
 
 :::note[Not in this release]
 Hopper TMA and mbarrier producers (sm_90 runs `wgmma` fed by `cp.async`), Blackwell `tcgen05`,

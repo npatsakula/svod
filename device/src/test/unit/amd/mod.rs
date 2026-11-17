@@ -33,3 +33,5 @@ mod program_abi;
 mod queue;
 #[cfg(unix)]
 mod signal;
+#[cfg(unix)]
+mod sqtt;

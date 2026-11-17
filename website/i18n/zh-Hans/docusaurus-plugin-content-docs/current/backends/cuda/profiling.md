@@ -114,10 +114,10 @@ SVOD_PMC: 2 of 5 requested counters are not collected on this backend
 SVOD_DEVICE=CUDA:0 SVOD_PMC=1 cargo run --release -p svod-model --example gigaam_infer -- --profile ./audio.wav
 ```
 
-tk 的吞吐量探针只为手写内核计时。它们读取事件时间戳，而不是计数器：
+`tk_bench` 示例只为手写内核计时。它读取事件时间戳，而不是计数器（[调优](../../tile-kernels/tuning.md#benchmarks)）：
 
 ```bash
-SVOD_DEVICE=CUDA:0 cargo test -p svod-tk --release --lib gemm_throughput_probe -- --ignored --nocapture
+SVOD_DEVICE=CUDA:0 cargo run --release -p svod-tk --example tk_bench -- gemm
 ```
 
 ### 权限

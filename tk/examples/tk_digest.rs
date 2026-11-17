@@ -1,6 +1,8 @@
 //! Digests of the LLVM text every kernel of the refactor sweep renders to,
 //! per target, for proving a refactor byte-identical in what it emits:
-//! run at the base and at the change, then `--diff` the two.
+//! run at the base and at the change, then `--diff` the two. On AMD the
+//! text is the SOURCE stage a device compiles, its line table and
+//! `kernel.tk` listing included (`sweep::try_source`).
 //!
 //! ```text
 //! cargo run -p svod-tk --release --example tk_digest -- --out DIR [--targets sm_86,gfx942] [--full]
@@ -55,7 +57,7 @@ fn main() -> Result<()> {
         let texts: Vec<(String, String)> = launches
             .into_par_iter()
             .map(|(kernel, prog, lowering)| {
-                let text = match catch_unwind(AssertUnwindSafe(|| sweep::try_render(prog, &lowering))) {
+                let text = match catch_unwind(AssertUnwindSafe(|| sweep::try_source(prog, &lowering))) {
                     Ok(Ok(text)) => text,
                     Ok(Err(e)) => format!("FAILED: {e}"),
                     Err(panic) => {

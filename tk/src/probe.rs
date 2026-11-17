@@ -499,20 +499,42 @@ pub(crate) fn probes(target: &Target) -> Result<Vec<Probe>> {
     ])
 }
 
-/// A trip probe of `blocks_per_sm` blocks an SM (one round where the SM
-/// holds them all), to tell a trip's per-block issue from what the resident
-/// blocks hide of it.
-#[cfg(test)]
-pub(crate) fn trips_at(
+/// A trip pair at `blocks_per_sm` blocks an SM, resolved on the device: ns
+/// per block-trip.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Trip {
+    /// The probe less its baseline.
+    pub trip: f64,
+    /// The pairs' run-to-run spread.
+    pub spread: f64,
+    pub base: f64,
+    /// [`Resolved::measurable`].
+    pub measurable: bool,
+}
+
+/// The trip probe `op` (`probe:trip`, `probe:trip_rolled`, `probe:trip_one`)
+/// over a ring `stages` deep at `blocks_per_sm` blocks an SM (one round
+/// where the SM holds them all), timed on the default device: a trip's
+/// per-block issue told from what the resident blocks hide of it. `None`
+/// where its pairs do not resolve.
+pub fn trip_at(
     target: &Target,
     op: &'static str,
     unroll: bool,
     stages: usize,
     blocks_per_sm: usize,
-) -> Result<Probe> {
+) -> Result<Option<Trip>> {
     let mut p = Probes::new(target)?;
     p.blocks = p.sms as usize * blocks_per_sm;
-    Ok(p.trips(op, unroll, stages))
+    let probe = p.trips(op, unroll, stages);
+    let mut built = tune::compile(probe.candidates, &ScratchPool::default());
+    let unit = probe.scale / probe.units;
+    Ok(resolved(&resolve_pairs(&mut built)).map(|r| Trip {
+        trip: r.difference * unit,
+        spread: r.spread * unit,
+        base: r.baseline * unit,
+        measurable: r.measurable(),
+    }))
 }
 
 /// The blocks a full SM of `target` runs at once in the trip probes: every

@@ -17,3 +17,4 @@ mod segment;
 mod semseg;
 mod stage_dtype;
 mod weight_layout;
+mod windows;

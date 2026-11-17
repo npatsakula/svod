@@ -2,38 +2,27 @@
 //! interpreter: a global-resident A operand, the transposed `ldmatrix` B
 //! operand, row reductions and vector broadcasts.
 
-use svod_dtype::{DType, ScalarDType};
-use svod_tensor::Tensor;
+use svod_dtype::ScalarDType;
 use test_case::test_case;
 
 use super::declared;
 use crate::build::*;
 use crate::interp::run;
 use crate::ir::*;
-use crate::launch::graph_launch;
-use crate::layouts::WarpGrid;
 use crate::lower::Lowering;
 
 fn data(n: usize, seed: &mut u64) -> Vec<f64> {
     super::rounded(ScalarDType::BFloat16, n, seed, |x| x)
 }
 
-fn check(prog: Program, inputs: Vec<Vec<f64>>, out_elems: usize, tol: f64) {
+fn check(prog: Program, mut params: Vec<Vec<f64>>, out_elems: usize, tol: f64) {
     let Some(target) = super::cp_async_target() else { return };
-    let mut params = inputs.clone();
     params.push(vec![0.0; out_elems]);
-    let want = run(&prog, params, &[]).unwrap();
-    let lowering = Lowering::new(&declared(target));
-    let tensors: Vec<Tensor> = inputs
-        .iter()
-        .map(|v| Tensor::from_slice(v.iter().map(|&x| x as f32).collect::<Vec<_>>()).cast(DType::BFloat16))
-        .collect();
-    let out = Tensor::empty(&[out_elems], DType::Float32);
-    let mut refs: Vec<&Tensor> = tensors.iter().collect();
-    refs.push(&out);
-    let got: Vec<f32> = graph_launch(prog, &lowering, &refs).unwrap().to_vec::<f32>().unwrap();
-    let worst = got.iter().zip(want.last().unwrap()).map(|(g, w)| (*g as f64 - w).abs()).fold(0.0, f64::max);
-    assert!(worst < tol, "max abs diff {worst}");
+    let want = run(&prog, params.clone(), &[]).unwrap();
+    let params = super::device::poisoned(&prog, &params);
+    let got = super::targets::on_device(prog, &Lowering::new(&declared(target)), &params).pop().flatten().expect("out");
+    let worst = got.iter().zip(want.last().unwrap()).map(|(g, w)| (g - w).abs()).fold(0.0, f64::max);
+    assert!(worst < tol && !got.iter().any(|g| g.is_nan()), "max abs diff {worst}, or an element left unwritten");
 }
 
 /// `s = q · kᵀ` with Q loaded straight from global memory into the A layout
@@ -119,48 +108,4 @@ fn row_reductions_and_broadcast() {
     let mut seed = 3;
     let (qd, kd) = (data(bq * d, &mut seed), data(bkv * d, &mut seed));
     check(prog, vec![qd, kd], bq * (bkv + 2), 1e-3);
-}
-
-/// The card's empirical tensor-core ceiling: register-resident `mma.sync`
-/// with f32 accumulation and no memory traffic.
-#[test]
-#[ignore = "perf probe: needs a CUDA device"]
-fn mma_peak_probe() {
-    let Some(target) = super::cp_async_target() else { return };
-    let (bm, bn, bk, iters, blocks) = (64usize, 64usize, 16usize, 4096i64, 28 * 16usize);
-    let prog = Kernel::record("mma_peak", |k| {
-        let a = k.input::<BF16>("a", bm * bk);
-        let b = k.input::<BF16>("b", bn * bk);
-        let c = k.output::<F32>("c", blocks * bm * bn);
-        k.grid([Sc::from(blocks), Sc::from(1), Sc::from(1)]);
-        k.warps(WarpGrid { rows: 2, cols: 2 });
-        let a_g = k.view(a, 0, [bk, 1], Shape::new(bm, bk), [None, None]);
-        let b_g = k.view(b, 0, [bk, 1], Shape::new(bn, bk), [None, None]);
-        let a_r = k.load(a_g);
-        let b_r = k.load(b_g);
-        let acc0 = k.zeros::<F32>(Shape::new(bm, bn));
-        let [acc] = k.loop_(iters, [acc0], |k, _, [acc]| [k.mma(acc, a_r, false, b_r, true)]);
-        let block = k.block(0);
-        let c_view = k.view(c, block * (bm * bn), [bn, 1], Shape::new(bm, bn), [None, None]);
-        k.store(c_view, *acc);
-    });
-    let prog = prog;
-    let lowering = Lowering::new(&declared(target));
-    let a_t = Tensor::from_slice(vec![0.5f32; bm * bk]).cast(DType::BFloat16);
-    let b_t = Tensor::from_slice(vec![0.5f32; bn * bk]).cast(DType::BFloat16);
-    let out = Tensor::empty(&[blocks * bm * bn], DType::Float32);
-    let plan = graph_launch(prog, &lowering, &[&a_t, &b_t, &out]).unwrap().prepare().unwrap();
-    let warm = std::time::Instant::now();
-    while warm.elapsed().as_millis() < 500 {
-        plan.execute().unwrap();
-    }
-    let mut best = f64::INFINITY;
-    for _ in 0..20 {
-        // Every kernel of the run, the inputs' casts included.
-        if let Some(run) = crate::tune::run(&plan) {
-            best = best.min(run.as_secs_f64());
-        }
-    }
-    let flops = 2.0 * (bm * bn * bk) as f64 * iters as f64 * blocks as f64;
-    eprintln!("mma.sync bf16→f32 ceiling: {:.3} ms, {:.1} TFLOP/s", best * 1e3, flops / best / 1e12);
 }

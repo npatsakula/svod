@@ -174,6 +174,39 @@ pub(super) fn sched_barrier(last: &Arc<UOp>) -> Arc<UOp> {
     )
 }
 
+/// The LDS-only memory-model tag of a tk barrier's fences
+/// ([`svod_ir::BarrierFence::Local`]): a global prefetch stays in flight.
+const LOCAL: &str = r#"!mmra !{{!"amdgpu-synchronize-as", !"local"}}"#;
+
+/// A block barrier's first half (`s_barrier_signal -1`) after `last`: this
+/// wave's LDS accesses before it complete first (a release fence: the
+/// intrinsic touches no memory as LLVM sees it).
+pub(super) fn barrier_signal(last: &Arc<UOp>) -> Arc<UOp> {
+    UOp::custom(
+        smallvec![last.clone()],
+        format!(
+            "declare void @llvm.amdgcn.s.barrier.signal(i32)\n\
+             fence syncscope(\"workgroup\") release, {LOCAL}\n\
+             call void @llvm.amdgcn.s.barrier.signal(i32 -1)"
+        ),
+        DType::Void,
+    )
+}
+
+/// A block barrier's second half (`s_barrier_wait -1`) after `last`, LDS
+/// accesses after it ordered after every wave's signal (an acquire fence).
+pub(super) fn barrier_wait(last: &Arc<UOp>) -> Arc<UOp> {
+    UOp::custom(
+        smallvec![last.clone()],
+        format!(
+            "declare void @llvm.amdgcn.s.barrier.wait(i16)\n\
+             call void @llvm.amdgcn.s.barrier.wait(i16 -1)\n\
+             fence syncscope(\"workgroup\") acquire, {LOCAL}"
+        ),
+        DType::Void,
+    )
+}
+
 /// The wave's issue priority from here on (`s_setprio`): a side effect in
 /// list order, with no value to depend on, so it may follow a barrier.
 pub(super) fn setprio(level: u8) -> Arc<UOp> {

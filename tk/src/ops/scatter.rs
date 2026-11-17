@@ -59,7 +59,7 @@ pub fn scatter_add(target: Tensor, index: &Tensor, values: &Tensor) -> Result<Te
         _ => return DtypeSnafu { op: OP, operand: "target", got: dtype, want: DType::Int32 }.fail(),
     };
     let tensors = [&target, index, values];
-    launch::aliasing(&prog, &tensors).context(LaunchSnafu { op: OP })?;
+    launch::aliasing(&prog, &tensors, &[]).context(LaunchSnafu { op: OP })?;
     let device = target.device();
     if device == DeviceSpec::Cpu {
         let body = move |ph: Vec<Arc<UOp>>| serial(&ph, rows as i64, d as i64, pairs as i64);

@@ -122,12 +122,12 @@ fn signal_pool_construction_failure_and_drop_balance_backing() {
     let (iface, allocator) = mock_device(1);
     iface.script_alloc(Err(Error::Runtime { message: "scripted signal allocation".into() }));
     assert!(SignalPool::new(&allocator, 64).is_err());
-    assert_eq!((iface.allocation_count(), iface.free_count(), iface.live_handle_count()), (0, 0, 0));
+    assert_eq!(iface.counts(), (0, 0, 0));
 
     let pool = SignalPool::new(&allocator, 64).unwrap();
-    assert_eq!(iface.live_handle_count(), 1);
+    assert_eq!(iface.counts(), (1, 0, 1));
     drop(pool);
-    assert_eq!((iface.allocation_count(), iface.free_count(), iface.live_handle_count()), (1, 1, 0));
+    assert_eq!(iface.counts(), (1, 1, 0));
     assert!(iface.free_issues().is_empty());
 }
 
@@ -251,8 +251,7 @@ fn a_stopped_queue_fails_a_blocked_wait_at_once(
     expected_cause: &str,
 ) {
     let (iface, allocator) = super::test_support::mock_device_with_signals(xccs);
-    let lane = crate::amd::connector::PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator)
-        .expect("pool queue");
+    let lane = super::test_support::pool_queue(&allocator);
     let signal = Arc::clone(lane.pm4_signal());
     let waiting = Arc::clone(&signal);
     let (tx, rx) = std::sync::mpsc::channel();
@@ -282,8 +281,7 @@ fn a_stopped_queue_fails_a_blocked_wait_at_once(
 #[test]
 fn a_timed_out_wait_names_the_stopped_queue() {
     let (_iface, allocator) = super::test_support::mock_device_with_signals(2);
-    let lane = crate::amd::connector::PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator)
-        .expect("pool queue");
+    let lane = super::test_support::pool_queue(&allocator);
     report_queue_error(&lane, QueueReport::Inactive, 0x80);
     let error = lane.pm4_signal().wait(1, 1).expect_err("a stopped queue must fail the wait");
     assert!(matches!(error, Error::AmdQueueError { cause: "out of VGPRs", .. }), "{error:?}");
@@ -295,8 +293,7 @@ fn a_timed_out_wait_names_the_stopped_queue() {
 #[test_case::test_case(2; "aql")]
 fn quiet_error_words_leave_a_wait_to_its_deadline(xccs: u32) {
     let (iface, allocator) = super::test_support::mock_device_with_signals(xccs);
-    let lane = crate::amd::connector::PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator)
-        .expect("pool queue");
+    let lane = super::test_support::pool_queue(&allocator);
     let error = lane.pm4_signal().wait(1, 20).expect_err("nothing completes the wait");
     assert!(matches!(error, Error::TimelineTimeout { .. }), "{error:?}");
     assert!(wait_count(&iface) > 0, "the wait never slept, so never read the words on a wake");

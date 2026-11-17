@@ -314,6 +314,24 @@ fn test_profile_carries_the_requested_origin_depth() {
     assert_eq!(plan.profile(&ProfileOptions::default()).expect("profile").origin_depth, None, "the leaf by default");
 }
 
+/// Tier 5 on a plan whose context cannot trace profiles as before, saving nothing.
+#[test]
+fn test_profile_without_a_thread_trace_saves_nothing() {
+    let mut builder = ExecutionPlanBuilder::new(DeviceSpec::Cpu);
+    let dst_idx = builder.add_buffer(1, cpu_buffer(DType::Float32, 4));
+    let src_idx = builder.add_buffer(2, f32_buffer(&[1.0, 2.0, 3.0, 4.0]));
+    builder.add_op(copy_op(99, vec![dst_idx, src_idx], Vec::new()));
+    builder.set_output_buffer(dst_idx);
+    let plan = builder.build().expect("build plan");
+
+    let dir = tempfile::tempdir().unwrap();
+    let sqtt = SqttOptions { sink: Sink::Disk(dir.path().join("sqtt")), ..Default::default() };
+    let opts = ProfileOptions { sqtt: Some(sqtt), ..Default::default() };
+    let profile = plan.profile(&opts).expect("profile");
+    assert!(profile.stages[0].sqtt.is_empty() && !profile.render_report().contains("SQTT"));
+    assert!(!dir.path().join("sqtt").exists());
+}
+
 /// A `CustomFunction` whose runtime is unimplemented surfaces its typed
 /// `Unsupported`, and — because the epoch was already reserved — the plan is
 /// poisoned rather than left retryable.
@@ -1491,14 +1509,21 @@ fn a_covering_write_supersedes_the_accesses_beneath_it() {
     assert_eq!(hazards.record(3, std::slice::from_ref(&small), &[]), vec![2], "and then stands in for them");
 }
 
-/// Zero-length views touch no bytes, so they never conflict.
-#[test]
-fn empty_ranges_never_conflict() {
+/// Zero-length views touch no bytes, so they never conflict, wherever they
+/// sit against a live write, read or written.
+#[test_case::test_case(0, false; "a read at the start")]
+#[test_case::test_case(16, false; "a read inside")]
+#[test_case::test_case(32, false; "a read at the end")]
+#[test_case::test_case(16, true; "a write inside")]
+fn empty_ranges_never_conflict(offset: usize, write: bool) {
     let base = 0x3000usize;
-    let (live, empty) = (base..base + 32, base..base);
+    let (live, empty) = (base..base + 32, base + offset..base + offset);
     let mut hazards = GraphHazards::default();
     hazards.record(0, &[], std::slice::from_ref(&live));
-    assert!(hazards.record(1, std::slice::from_ref(&empty), &[]).is_empty());
+    let (reads, writes) =
+        if write { (&[][..], std::slice::from_ref(&empty)) } else { (std::slice::from_ref(&empty), &[][..]) };
+    assert!(hazards.record(1, reads, writes).is_empty());
+    assert_eq!(hazards.record(2, std::slice::from_ref(&live), &[]), vec![0], "the live write still orders a reader");
 }
 
 /// The storages a plan reports to scoped sync follow the buffers bound at

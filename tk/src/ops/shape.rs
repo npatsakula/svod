@@ -49,16 +49,13 @@ pub struct Extent {
 /// JIT `batch_var`) binds it, as the operand spells it; `None` when a dim
 /// other than a bound leading one is symbolic.
 pub fn extent(shape: &[SInt]) -> Option<(Extent, Option<SInt>)> {
-    let var = match shape.first() {
-        Some(dim @ SInt::Symbolic(_)) => {
-            bound_var(dim)?;
-            Some(dim.clone())
-        }
-        _ => None,
+    let (var, pinned) = match shape.first() {
+        Some(dim @ SInt::Symbolic(_)) => (Some(dim.clone()), bound_var(dim)?.pinned()),
+        _ => (None, false),
     };
     let dims: Option<Vec<usize>> =
         shape.iter().enumerate().map(|(i, d)| if i == 0 { d.vmax() } else { d.as_const() }).collect();
-    Some((Extent { dims: dims?, var: var.is_some() }, var))
+    Some((Extent { dims: dims?, var: var.is_some() && !pinned }, var))
 }
 
 /// The variable bound to `dim`, as a kernel binds it at launch: `None` for
@@ -141,6 +138,10 @@ pub fn linear(
     })
 }
 
+/// The input channels a convolution's kernel reduces over come in runs of
+/// this many; [`super::conv2d`] pads others with zeros.
+pub const CONV_CIN: usize = 16;
+
 /// `x [b, h, w, cin]` ⊛ `geom`'s weight; `dtypes` are those of `x`, `w` and
 /// the bias, `out` the output type and `residual` the residual's. A static
 /// batch folds into the GEMM rows, a bound one walks grid z; the ranking
@@ -168,7 +169,7 @@ pub fn conv2d(
         if groups != 1 || !geom.cout.is_multiple_of(8) || pixels == 0 || x.dims[0] == 0 {
             return Err(Fallback::Shape);
         }
-        if !geom.cin.is_multiple_of(16) {
+        if !geom.cin.is_multiple_of(CONV_CIN) {
             return Err(Fallback::Shape);
         }
         let (batches, m) = conv_grid(x, geom);

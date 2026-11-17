@@ -5,7 +5,7 @@
 use std::fmt;
 use std::num::NonZeroUsize;
 
-use super::{Act, Admits, Admitted, Batch, Spec, batch_offset, bound, konst, load_f32};
+use super::{Act, Admits, Admitted, Batch, Spec, Window, Windows, batch_offset, bound, konst, load_f32};
 use crate::atoms::{Core, Device};
 use crate::build::*;
 use crate::ir::*;
@@ -364,6 +364,7 @@ pub struct GemmSpec {
     pub k: usize,
     pub batch: Batch,
     pub epilogue: Epilogue,
+    pub windows: Windows,
 }
 
 impl Spec for GemmSpec {
@@ -399,10 +400,12 @@ pub fn gemm<T: MmaIn>(spec: &Admitted<GemmSpec>) -> Program {
 /// [`gemm`] over `tiles`, split `split` ways along K as [`mainloop_gemm`]
 /// splits it.
 fn gemm_over<T: MmaIn>(spec: &Admitted<GemmSpec>, tiles: Tiles, split: usize) -> Program {
-    let GemmSpec { m, k: kk, .. } = **spec;
+    let GemmSpec { m, k: kk, windows, .. } = **spec;
     let [bm, _, bk] = spec.cfg().tile;
-    mainloop_gemm::<T>("gemm", spec, m * kk, tiles, split, |k, a, bb, row0| {
-        let a_view = k.view(a, batch_offset(bb, m * kk), [kk, 1], Shape::new(bm, bk), [bound(m, bm), None]);
+    let w = windows.a(kk);
+    mainloop_gemm::<T>("gemm", spec, w.elems(m), tiles, split, |k, a, bb, row0| {
+        let at = w.from(batch_offset(bb, w.elems(m)));
+        let a_view = k.view(a, at, [w.ld, 1], Shape::new(bm, bk), [bound(m, bm), None]);
         let a_view = k.at(a_view, row0, 0);
         Box::new(move |k, _step, koff| k.at(a_view, 0, koff))
     })
@@ -436,10 +439,11 @@ impl TailSpec<'_> {
 
     /// The merge of the tail's partials.
     pub fn merge(&self) -> SplitMergeSpec {
-        let GemmSpec { m, n, epilogue, .. } = *self.gemm;
+        let GemmSpec { m, n, epilogue, windows, .. } = *self.gemm;
         let cfg = self.gemm.cfg();
         let parts = Parts { order: cfg.order, tile: [cfg.tile[0], cfg.tile[1]], run: self.plan.tail };
-        SplitMergeSpec { m, n, split: self.plan.split, epilogue, tile: TAIL_MERGE, parts: Some(parts) }
+        let split = self.plan.split;
+        SplitMergeSpec { m, n, split, epilogue, tile: TAIL_MERGE, parts: Some(parts), windows: windows.outputs() }
     }
 }
 
@@ -503,7 +507,7 @@ fn build<'k, T: MmaIn, U: Elem>(
     split: usize,
     a_source: impl FnOnce(&mut Kernel<'k>, ParamRef<'k, T, In>, &Option<Sc<'k>>, Sc<'k>) -> ASource<'k, T>,
 ) {
-    let GemmSpec { m, n, k: kk, ref batch, epilogue } = **spec;
+    let GemmSpec { m, n, k: kk, ref batch, epilogue, windows } = **spec;
     let cfg = spec.cfg();
     let [bm, bn, bk] = cfg.tile;
     let trips = kk / bk;
@@ -516,7 +520,8 @@ fn build<'k, T: MmaIn, U: Elem>(
     let a = k.input::<T>("a", cap * a_elems);
     let b = k.input::<T>("b", halves * n * kk);
     let bias = epi.bias.then(|| k.input::<T>("bias", halves * n));
-    let residual = epi.residual.then(|| k.input::<U>("residual", cap * m * n));
+    let (rw, cw) = (windows.residual(n), if partial { Window::whole(n) } else { windows.c(n) });
+    let residual = epi.residual.then(|| k.input::<U>("residual", rw.elems(cap * m)));
     let rope = epi.rope.map(|rope| {
         let plain = Epilogue { bias: epi.bias, rope: epi.rope, ..Epilogue::DEFAULT };
         assert!(epi == plain && rope.heads * rope.head_dim <= n, "{epi:?} turns no more than a bias");
@@ -528,7 +533,7 @@ fn build<'k, T: MmaIn, U: Elem>(
         Tiles::Run(run) if partial => Some(run.count()),
         _ => None,
     };
-    let c = k.output::<U>("c", slots.map_or(cap.max(split) * m * n, |count| split * count * bm * bn));
+    let c = k.output::<U>("c", slots.map_or(cw.elems(cap.max(split) * m), |count| split * count * bm * bn));
     let (gm, gn) = (m.div_ceil(bm), n.div_ceil(bn));
     let (gz, bb) = if partial { (Sc::from(split), Some(k.block(2))) } else { batch.axis(k) };
     let [gx, gy] = tiles.grid(gm, gn);
@@ -560,9 +565,9 @@ fn build<'k, T: MmaIn, U: Elem>(
             let slot = bb.clone().expect("the split index") * count + k.block(0);
             Dest::Slot(c, slot * (bm * bn))
         }
-        None => Dest::Tile(c),
+        None => Dest::Tile(c, cw),
     };
-    finish::<T, U>(k, accs, epi, bias, residual, rope, dest, &bb, &tile);
+    finish::<T, U>(k, accs, epi, bias, residual.map(|r| (r, rw)), rope, dest, &bb, &tile);
 }
 
 /// Where a block's `[bm, bn]` output tile sits in an `[m, n]` output, and
@@ -589,8 +594,8 @@ impl<'k> Tile2<'k> {
 
 /// Where the epilogue stores a block's tile.
 enum Dest<'k, U> {
-    /// Its window of the `[m, n]` output.
-    Tile(ParamRef<'k, U, Out>),
+    /// Its tile of the `[m, n]` output, in the output's window.
+    Tile(ParamRef<'k, U, Out>, Window),
     /// A `[bm, bn]` slot of its own, row-major from this element.
     Slot(ParamRef<'k, U, Out>, Sc<'k>),
 }
@@ -602,7 +607,7 @@ fn finish<'k, T: Elem, U: Elem>(
     accs: Vec<Regs<'k, F32>>,
     epi: Epilogue,
     bias: Option<ParamRef<'k, T, In>>,
-    residual: Option<ParamRef<'k, U, In>>,
+    residual: Option<(ParamRef<'k, U, In>, Window)>,
     rope: Option<Turn<'k, T>>,
     c: Dest<'k, U>,
     bb: &Option<Sc<'k>>,
@@ -632,28 +637,29 @@ fn finish<'k, T: Elem, U: Elem>(
     if let Some((rope, cos, sin)) = rope {
         out = turn(k, out, rope, cos, sin, t);
     }
-    if let Some(residual) = residual {
-        let r = tile(k, residual, bb, t);
+    if let Some((residual, w)) = residual {
+        let r = tile(k, residual, w, bb, t);
         let r = load_f32(k, r);
         out = k.binary(out, r, BinaryOp::Add);
     }
     let out = k.cast::<F32, U>(out);
     let c_view = match c {
-        Dest::Tile(c) => tile(k, c, bb, t),
+        Dest::Tile(c, w) => tile(k, c, w, bb, t),
         Dest::Slot(c, at) => k.view(c, at, [bn, 1], Shape::new(t.bm, bn), t.within()),
     };
     k.store(c_view, out);
 }
 
-/// The block's `[bm, bn]` window of an `[m, n]` parameter.
+/// The block's `[bm, bn]` tile of an `[m, n]` parameter laid out in `w`.
 fn tile<'k, U: Elem, A: Access>(
     k: &mut Kernel<'k>,
     p: ParamRef<'k, U, A>,
+    w: Window,
     bb: &Option<Sc<'k>>,
     t: &Tile2<'k>,
 ) -> Gmem<'k, U, A> {
-    let Tile2 { m, n, bm, bn, ref row0, ref col0, ref bounds } = *t;
-    let v = k.view(p, batch_offset(bb, m * n), [n, 1], Shape::new(bm, bn), bounds.clone());
+    let Tile2 { m, bm, bn, ref row0, ref col0, ref bounds, .. } = *t;
+    let v = k.view(p, w.from(batch_offset(bb, w.elems(m))), [w.ld, 1], Shape::new(bm, bn), bounds.clone());
     k.at(v, row0.clone(), col0.clone())
 }
 
@@ -723,6 +729,8 @@ pub struct SplitMergeSpec {
     /// `[bm, bn]`, powers of two (dividing the [`Parts`]' tile).
     pub tile: [usize; 2],
     pub parts: Option<Parts>,
+    /// The residual's and the output's windows; never an A.
+    pub windows: Windows,
 }
 
 /// The output tiles a run of a GEMM's raster partials holds, a
@@ -748,13 +756,15 @@ fn merge<T: Elem, U: Elem>(spec: &SplitMergeSpec) -> Program {
 }
 
 fn merge_body<'k, T: Elem, U: Elem>(k: &mut Kernel<'k>, spec: &SplitMergeSpec) {
-    let SplitMergeSpec { m, n, split, epilogue: epi, tile: [bm, bn], parts } = *spec;
+    let SplitMergeSpec { m, n, split, epilogue: epi, tile: [bm, bn], parts, windows } = *spec;
     assert!(!epi.gated && epi.rope.is_none(), "a gated or turned output is not split");
+    assert!(windows.a.is_none(), "a merge reads no A");
     let elems = parts.map_or(m * n, |p| p.run.count() * p.tile[0] * p.tile[1]);
     let partial = k.input::<F32>("partial", split * elems);
     let bias = epi.bias.then(|| k.input::<T>("bias", n));
-    let residual = epi.residual.then(|| k.input::<U>("residual", m * n));
-    let c = k.output::<U>("c", m * n);
+    let (rw, cw) = (windows.residual(n), windows.c(n));
+    let residual = epi.residual.then(|| k.input::<U>("residual", rw.elems(m)));
+    let c = k.output::<U>("c", cw.elems(m));
     let shape = Shape::new(bm, bn);
     let (sum, tile) = match parts {
         None => {
@@ -794,7 +804,7 @@ fn merge_body<'k, T: Elem, U: Elem>(k: &mut Kernel<'k>, spec: &SplitMergeSpec) {
             (sum, tile)
         }
     };
-    finish::<T, U>(k, vec![sum], epi, bias, residual, None, Dest::Tile(c), &None, &tile);
+    finish::<T, U>(k, vec![sum], epi, bias, residual.map(|r| (r, rw)), None, Dest::Tile(c, cw), &None, &tile);
 }
 
 /// The sum of the `split` f32 partials `part` views at each split.

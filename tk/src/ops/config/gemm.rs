@@ -637,7 +637,7 @@ impl GemmProblem {
     /// where the shape leaves the config out. Every config walks the
     /// default raster ([`TileOrder::DEFAULT`]): the fill's model prices other
     /// group heights too flat to tell them apart, and the default runs within
-    /// the tuner's drift of the best.
+    /// the tuner's drift of the best (`tk_bench raster` measures it).
     ///
     /// A tail split weighs the last wave's idle SMs against its partials'
     /// bytes, their merge and its launches ([`Self::plan_price`]), and only

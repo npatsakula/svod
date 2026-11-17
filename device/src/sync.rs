@@ -45,6 +45,12 @@ pub trait DispatchTimestamps: Send + Sync {
     fn counters(&self) -> Option<crate::profile::CounterSet> {
         None
     }
+
+    /// The thread trace recorded for this dispatch, when SQTT was armed for
+    /// it. `None` by default, before retirement, and on backends without SQTT.
+    fn sqtt(&self) -> Option<crate::profile::SqttTrace> {
+        None
+    }
 }
 
 /// Waitable completion token for a batch of submitted device work.

@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use smallvec::smallvec;
+use svod_codegen::llvm::Location;
 use svod_codegen::llvm::nvptx::smem::{cp_async_commit, cp_async_wait};
 use svod_codegen::llvm::nvptx::wgmma;
 use svod_dtype::{AddrSpace, DType, DeviceSpec, ScalarDType};
@@ -25,21 +26,26 @@ mod compute;
 mod copy;
 mod nvptx;
 
-thread_local! {
-    /// The rolled ranges of the program [`emit`] is emitting, handed to
-    /// [`lower`](super::lower) — a thread-local, as `emit` returns the
-    /// program alone.
-    pub(super) static ROLLED: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(vec![]) };
+/// What a renderer is told of an emitted program beside its instructions.
+#[derive(Debug, Default)]
+pub struct Marks {
+    /// The ranges the program's own schedule kept rolled (a loop whose body
+    /// holds a product), which every target is hinted against unrolling
+    /// further.
+    pub rolled: Vec<u64>,
+    /// Each listed UOp's statement and unroll copy, first first; a node
+    /// hash-consed into several statements keeps its first.
+    pub located: Vec<(u64, Location)>,
 }
 
-/// The laid program as a pre-linearized Svod program, and the instruction
-/// list it holds.
+/// The laid program as a pre-linearized Svod program, the instruction list
+/// it holds, and its marks.
 pub fn emit(
     prog: &Program<Laid>,
     low: &Lowering,
     params: Vec<Arc<UOp>>,
     device: DeviceSpec,
-) -> Result<(Arc<UOp>, Arc<UOp>)> {
+) -> Result<(Arc<UOp>, Arc<UOp>, Marks)> {
     // Parameters and buffers committed up front: the assembly rebuilds none
     // of the ops reading them to commit their shapes.
     let params = params.iter().map(UOp::committed_shape).collect();
@@ -56,8 +62,8 @@ pub fn emit(
         }
     }
     let info = KernelInfo { name: Some(prog.name.clone()), ..Default::default() };
-    ROLLED.with(|cell| cell.borrow_mut().extend(e.rolled));
-    UOp::listed_program(info, list, device).context(ProgramSnafu)
+    let (program, linear) = UOp::listed_program(info, list, device).context(ProgramSnafu)?;
+    Ok((program, linear, e.marks))
 }
 
 /// The instruction list cut at the insertion point of every nesting level
@@ -190,14 +196,18 @@ struct Emit<'a> {
     async_products: bool,
     /// Whether the loop being emitted holds a product, innermost last: the
     /// ranges opened over one that does are the schedule's own decision to
-    /// stay rolled, carried to the renderer ([`crate::lower::Lowered::rolled`]).
+    /// stay rolled, carried to the renderer ([`Marks::rolled`]).
     rolling: Vec<bool>,
-    rolled: Vec<u64>,
     range_id: usize,
     reg_slot: usize,
     local_slot: usize,
     tag: u64,
     last: Arc<UOp>,
+    /// Every statement's line in the listing ([`super::listing`]), by address.
+    lines: HashMap<*const Stmt<Laid>, u32>,
+    /// The location of the statement being emitted, if any.
+    at: Option<Location>,
+    marks: Marks,
 }
 
 /// A register-side view of a tiled value for addressing shared/global memory.
@@ -305,15 +315,24 @@ impl<'a> Emit<'a> {
             scope: Scope::Block,
             async_products: false,
             rolling: vec![],
-            rolled: vec![],
             range_id: 0,
             reg_slot: 0,
             local_slot: 0,
             tag: 0,
+            lines: prog.walk().enumerate().map(|(i, (_, s))| (s as *const _, i as u32 + 1)).collect(),
+            at: None,
+            marks: Marks::default(),
+        }
+    }
+
+    fn locate(&mut self, id: u64) {
+        if let Some(at) = self.at {
+            self.marks.located.push((id, at));
         }
     }
 
     fn push(&mut self, u: Arc<UOp>) -> Arc<UOp> {
+        self.locate(u.id);
         self.list.push(u.clone());
         self.levels.insert(u.id, self.level());
         self.last = u.clone();
@@ -361,6 +380,7 @@ impl<'a> Emit<'a> {
             }
             level = level.max(self.level_of(&src));
         }
+        self.locate(u.id);
         self.list.hoist(level, u.clone());
         self.levels.insert(u.id, level);
         u
@@ -695,6 +715,15 @@ impl<'a> Emit<'a> {
     }
 
     fn stmt(&mut self, stmt: &Stmt<Laid>) -> Result<()> {
+        let line = self.lines[&(stmt as *const _)];
+        let column = self.at.map_or(0, |at| at.column);
+        let outer = self.at.replace(Location { line, column });
+        let out = self.stmt_inner(stmt);
+        self.at = outer;
+        out
+    }
+
+    fn stmt_inner(&mut self, stmt: &Stmt<Laid>) -> Result<()> {
         match stmt {
             Stmt::Let { dst, op } => {
                 self.let_(*dst, op)?;
@@ -825,7 +854,7 @@ impl<'a> Emit<'a> {
         let range = UOp::range_axis_dtype(end, AxisId::Renumbered(self.range_id), AxisType::Loop, DType::Int32);
         self.range_id += 1;
         if self.rolling.last() == Some(&true) {
-            self.rolled.push(range.id);
+            self.marks.rolled.push(range.id);
         }
         let range = self.push(range);
         self.list.open();
@@ -898,10 +927,14 @@ impl<'a> Emit<'a> {
         let level = self.level();
         let wide_range = self.widened(range.clone());
         let base = add(&start, &mul(&wide_range, &wide_range.const_like(u)));
+        let outer = self.at;
         for copy in 0..u {
+            // Column: the copy among the innermost unrolled loop's, from 1.
+            self.at = outer.map(|at| Location { column: copy as u32 + 1, ..at });
             self.bind(l.iv, level, add(&base, &base.const_like(copy)));
             self.body(l)?;
         }
+        self.at = outer;
         self.close_range(range);
         Ok(())
     }
@@ -916,6 +949,17 @@ impl<'a> Emit<'a> {
             }
             Sync::Barrier { scope: Scope::Warp } if target.sync.warp_barrier => nvptx::warp_barrier(&self.last),
             Sync::Barrier { scope: Scope::Warp } => return Ok(()),
+            Sync::Arrive if target.sync.split_barrier => {
+                let tag = self.next_tag();
+                amdgpu::barrier_signal(&self.last).rtag(Some(smallvec![tag as usize]))
+            }
+            Sync::Await if target.sync.split_barrier => {
+                let tag = self.next_tag();
+                amdgpu::barrier_wait(&self.last).rtag(Some(smallvec![tag as usize]))
+            }
+            // Unsplit, the whole barrier waits where the second half does.
+            Sync::Arrive => return Ok(()),
+            Sync::Await => return self.sync(Sync::Barrier { scope: Scope::Block }),
             Sync::CommitAsync if target.fill == Fill::CpAsync => cp_async_commit(smallvec![]),
             Sync::WaitAsync { pending } if target.fill == Fill::CpAsync => cp_async_wait(pending, smallvec![]),
             // Without `cp.async` the copies were synchronous: nothing to wait for.

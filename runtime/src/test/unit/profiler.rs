@@ -9,6 +9,7 @@ use svod_device::hcq::{
     DeviceQueue, QueueKind, QueueMergeLimits, SemanticLinkedPlan, TopologyOperation, TopologyOperationKind,
     TopologyResource, schedule_device_lanes,
 };
+use svod_device::profile::{SqttSimds, StablePstate};
 use svod_device::{AmdCounter, CounterSet, CudaCounter, PmcCounter};
 use svod_dtype::DeviceSpec;
 use svod_ir::UOp;
@@ -17,8 +18,8 @@ use test_case::test_case;
 
 use crate::kernel_cache::CachedKernel;
 use crate::profiler::{
-    KernelProfile, OperationTiming, OriginView, PmcSelection, ProfileOptions, RunProfile, StageProfile, UNATTRIBUTED,
-    aggregate_origins, analyze_execution_lanes, has_origins, parse_pmc,
+    KernelProfile, OperationTiming, OriginView, PmcSelection, ProfileOptions, RunProfile, Sink, SqttOptions,
+    StageProfile, UNATTRIBUTED, aggregate_origins, analyze_execution_lanes, has_origins, parse_pmc,
 };
 
 /// Every counter of every backend round-trips through its token, and tokens are
@@ -110,6 +111,47 @@ fn from_env_parses_the_origin_depth(value: Option<&str>, expected: Option<usize>
     let parsed = ProfileOptions::from_env().origin_depth;
     unsafe { std::env::remove_var("SVOD_ORIGIN_DEPTH") };
     assert_eq!(parsed, expected, "SVOD_ORIGIN_DEPTH={value:?}");
+}
+
+/// `SVOD_SQTT*` mutate the whole process; these cases are their only readers.
+static SQTT_ENV: Mutex<()> = Mutex::new(());
+
+fn with_env<T>(vars: &[(&str, &str)], read: impl FnOnce() -> T) -> T {
+    const SQTT: [&str; 4] = ["SVOD_SQTT", "SVOD_SQTT_DIR", "SVOD_SQTT_PSTATE", "SVOD_SQTT_SIMD"];
+    let _guard = SQTT_ENV.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let clear = || SQTT.iter().for_each(|var| unsafe { std::env::remove_var(var) });
+    clear();
+    vars.iter().for_each(|(var, value)| unsafe { std::env::set_var(var, value) });
+    let read = read();
+    clear();
+    read
+}
+
+/// `SVOD_SQTT_PSTATE` picks the traced pass's pin; unset leaves the clock to the device.
+#[test_case(None => Some(None); "unset")]
+#[test_case(Some("peak") => Some(Some(StablePstate::Peak)); "set")]
+fn config_from_env_parses_the_pstate(value: Option<&str>) -> Option<Option<StablePstate>> {
+    with_env(value.map(|v| ("SVOD_SQTT_PSTATE", v)).as_slice(), SqttOptions::config_from_env).ok().map(|c| c.pstate)
+}
+
+/// `SVOD_SQTT_SIMD` picks each SE's traced SIMD; unset keeps CU 0's two SIMDs alternating.
+#[test_case(None => Some(SqttSimds::default()); "unset")]
+#[test_case(Some("1,0") => Some("1,0".parse().unwrap()); "set")]
+fn config_from_env_parses_the_simds(value: Option<&str>) -> Option<SqttSimds> {
+    with_env(value.map(|v| ("SVOD_SQTT_SIMD", v)).as_slice(), SqttOptions::config_from_env).ok().map(|c| c.simds)
+}
+
+/// `SVOD_SQTT=1` alone traces, saved under `SVOD_SQTT_DIR`; a bad config value is an error, not a default.
+#[test]
+fn sqtt_from_env_traces_when_asked() {
+    let read = |vars: &[(&str, &str)]| with_env(vars, SqttOptions::from_env);
+    assert_eq!(read(&[("SVOD_SQTT_PSTATE", "peak")]).unwrap(), None);
+    assert_eq!(read(&[("SVOD_SQTT", "0")]).unwrap(), None);
+    assert_eq!(read(&[("SVOD_SQTT", "1")]).unwrap(), Some(SqttOptions::default()));
+    let dir = read(&[("SVOD_SQTT", "1"), ("SVOD_SQTT_DIR", "traces")]).unwrap().map(|o| o.sink);
+    assert_eq!(dir, Some(Sink::Disk("traces".into())));
+    let error = read(&[("SVOD_SQTT", "1"), ("SVOD_SQTT_SIMD", "x")]).unwrap_err();
+    assert_eq!(error.var, "SVOD_SQTT_SIMD");
 }
 
 #[test]
@@ -310,6 +352,7 @@ fn dispatch(name: &'static str, micros: u64, origin: Option<OriginId>, origins: 
         gpu_end_ns: None,
         static_info: None,
         counters: None,
+        sqtt: None,
     }
 }
 
@@ -712,4 +755,77 @@ fn json_export_round_trips_and_embeds_the_referenced_origins() {
     assert_eq!(head["parent"], serde_json::Value::Null, "a root scope");
     let call = by_id[&(s.ffn1_call.get() as u64)];
     assert_eq!(call["parent"], s.ffn1.get(), "call frames keep their module parent");
+}
+
+/// A traced dispatch's handle as the AMD one behaves: its trace reads only once retired, and it counts
+/// the trace buffers live.
+struct TracedHandle {
+    live: Arc<std::sync::atomic::AtomicUsize>,
+    retired: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl TracedHandle {
+    fn new(live: &Arc<std::sync::atomic::AtomicUsize>, retired: &Arc<std::sync::atomic::AtomicBool>) -> Arc<Self> {
+        live.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Arc::new(Self { live: Arc::clone(live), retired: Arc::clone(retired) })
+    }
+}
+
+impl Drop for TracedHandle {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl svod_device::DispatchTimestamps for TracedHandle {
+    fn timestamps_ns(&self) -> Option<(u64, u64)> {
+        Some((10, 25))
+    }
+
+    fn sqtt(&self) -> Option<svod_device::profile::SqttTrace> {
+        self.retired.load(std::sync::atomic::Ordering::SeqCst).then(|| svod_device::profile::SqttTrace {
+            arch: svod_dtype::AmdArch::Gfx1201,
+            per_se: vec![],
+            code: Arc::default(),
+            mclk_mhz: None,
+        })
+    }
+}
+
+/// Tier 5's drained pass synchronizes each traced dispatch, reads its trace and drops its handle
+/// before the next: one kernel's trace buffers live at a time, every trace kept. The plain pass holds
+/// every handle until its one synchronize.
+#[test]
+fn drained_dispatches_hold_one_trace_at_a_time() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let (live, retired) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicBool::new(false)));
+    let mut finalizer = crate::profiler::SubmissionProfileFinalizer::with_capacity(3);
+    for name in ["a", "b", "c"] {
+        retired.store(false, Ordering::SeqCst);
+        let handle = TracedHandle::new(&live, &retired);
+        assert_eq!(live.load(Ordering::SeqCst), 1, "{name}: an earlier trace is still live");
+        let sync = || {
+            retired.store(true, Ordering::SeqCst);
+            Ok(())
+        };
+        finalizer.push_drained(dispatch(name, 1, None, &[]), Some(handle), sync).unwrap();
+        assert_eq!(live.load(Ordering::SeqCst), 0, "{name}: its handle outlived the drain");
+    }
+    let profiles = finalizer.finish(|| panic!("nothing is left to synchronize")).unwrap();
+    assert!(profiles.iter().all(|p| p.sqtt.is_some() && (p.gpu_start_ns, p.gpu_end_ns) == (Some(10), Some(25))));
+
+    let mut held = crate::profiler::SubmissionProfileFinalizer::with_capacity(3);
+    retired.store(false, Ordering::SeqCst);
+    for name in ["a", "b", "c"] {
+        held.push(dispatch(name, 1, None, &[]), Some(TracedHandle::new(&live, &retired)));
+    }
+    assert_eq!(live.load(Ordering::SeqCst), 3);
+    let profiles = held
+        .finish(|| {
+            retired.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .unwrap();
+    assert!(profiles.iter().all(|p| p.sqtt.is_some()));
+    assert_eq!(live.load(Ordering::SeqCst), 0);
 }

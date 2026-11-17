@@ -1479,19 +1479,17 @@ impl AmdComputeQueue {
     /// use the PM4 path (`KFD_IOC_QUEUE_TYPE_COMPUTE`), submitting raw PM4
     /// dwords directly into the ring; multi-XCC CDNA uses AQL, where each
     /// dispatch is a 64-byte AQL packet and PM4 helpers are wrapped via the
-    /// vendor IB packet. `SVOD_AMD_AQL` set to anything but `"0"` forces AQL.
-    /// Used by `AmdGraph::capture` to skip the (multi-MiB) per-graph build on
-    /// PM4 queues unless PM4 graph capture is opted into (`SVOD_PM4_GRAPH=1`);
-    /// AQL queues are always captured.
+    /// vendor IB packet. `SVOD_AMD_AQL` set to anything but `"0"` when the
+    /// device opens forces AQL. Used by `AmdGraph::capture` to skip the
+    /// (multi-MiB) per-graph build on PM4 queues unless PM4 graph capture is
+    /// opted into ([`AmdDeviceCore::set_pm4_graph`]); AQL queues are always
+    /// captured.
     pub fn will_use_pm4(core: &AmdDeviceCore) -> bool {
-        let force_aql = std::env::var("SVOD_AMD_AQL").ok().map(|s| s != "0").unwrap_or(false);
-        !force_aql && core.node.num_xcc.max(1) == 1
+        core.pm4_queues()
     }
 
     pub fn create(allocator: &AmdAllocator) -> Result<Box<Self>> {
         let core = allocator.dev.core();
-        // `SVOD_AMD_AQL=1` forces AQL even on single-XCC, useful for
-        // bisecting PM4 vs AQL bring-up issues.
         let is_pm4 = Self::will_use_pm4(core);
         let queue_type = if is_pm4 { kfd::KFD_IOC_QUEUE_TYPE_COMPUTE } else { kfd::KFD_IOC_QUEUE_TYPE_COMPUTE_AQL };
         let inner = create_queue(allocator, queue_type, COMPUTE_RING_BYTES, !is_pm4, /*needs_cwsr=*/ true)?;
@@ -1560,8 +1558,8 @@ impl AmdComputeQueue {
         pool: &PoolQueue,
         submission: &crate::hcq::Submission,
         kernargs: &[u8],
-        pmc_start: &[u32],
-        pmc_read: &[u32],
+        profile_start: &[u32],
+        profile_stop: &[u32],
     ) -> Result<HcqDispatchResult> {
         debug_assert!(
             Arc::ptr_eq(&self.core, pool.core()),
@@ -1574,8 +1572,8 @@ impl AmdComputeQueue {
             return Err(err);
         }
         if !self.is_pm4 {
-            if !pmc_start.is_empty() || !pmc_read.is_empty() {
-                return Err(Error::Runtime { message: "AMD AQL PMC register profiling is unsupported".into() });
+            if !profile_start.is_empty() || !profile_stop.is_empty() {
+                return Err(Error::Runtime { message: "AMD AQL register profiling (PMC, SQTT) is unsupported".into() });
             }
             pool.ensure_pm4_headroom()?;
             self.wait_dispatch_headroom(pool)?;
@@ -1727,28 +1725,34 @@ impl AmdComputeQueue {
             completion_xcc_mask: None,
             queue_event_mailbox: self.core.queue_event_mailbox().map(|mailbox| mailbox.address),
         };
-        let q = if pmc_start.is_empty() && pmc_read.is_empty() {
+        let q = if profile_start.is_empty() && profile_stop.is_empty() {
             lower_hcq_pm4(&finalized, state)?
         } else {
-            // PMC register programs are backend diagnostics rather than neutral
-            // HCQ commands. Keep their established bracketing while all semantic
-            // queue commands use the common lowerer.
+            // Profiler register programs (PMC, SQTT) are backend diagnostics
+            // rather than neutral HCQ commands: the start goes right before the
+            // compute, the stop before the timeline store that retires the
+            // dispatch (and its event mailbox write), so the host reads nothing
+            // the stop has yet to copy out.
             let compute = finalized
                 .commands
                 .iter()
                 .position(|command| matches!(command, crate::hcq::Command::Compute(_)))
                 .ok_or_else(|| Error::Runtime { message: "AMD PM4 HCQ submission has no compute command".into() })?;
-            let mut prefix = crate::hcq::Submission::new(finalized.queue);
-            prefix.commands.extend_from_slice(&finalized.commands[..compute]);
-            let mut middle = crate::hcq::Submission::new(finalized.queue);
-            middle.commands.extend_from_slice(&finalized.commands[compute..finalized.commands.len() - 1]);
-            let mut suffix = crate::hcq::Submission::new(finalized.queue);
-            suffix.commands.push(finalized.commands.last().unwrap().clone());
-            let mut q = lower_hcq_pm4(&prefix, state)?;
-            q.extend_from_slice(pmc_start);
-            q.extend(lower_hcq_pm4(&middle, state)?);
-            q.extend_from_slice(pmc_read);
-            q.extend(lower_hcq_pm4(&suffix, state)?);
+            let retire = finalized
+                .commands
+                .iter()
+                .rposition(|command| matches!(command, crate::hcq::Command::Store { dst, .. } if *dst == counter_addr))
+                .expect("a PM4 dispatch ends in its timeline store");
+            let lower = |commands: &[crate::hcq::Command]| {
+                let mut part = crate::hcq::Submission::new(finalized.queue);
+                part.commands.extend_from_slice(commands);
+                lower_hcq_pm4(&part, state)
+            };
+            let mut q = lower(&finalized.commands[..compute])?;
+            q.extend_from_slice(profile_start);
+            q.extend(lower(&finalized.commands[compute..retire])?);
+            q.extend_from_slice(profile_stop);
+            q.extend(lower(&finalized.commands[retire..])?);
             q
         };
 
@@ -2389,7 +2393,7 @@ fn dwords_as_bytes(p: &[u32; 16]) -> &[u8] {
 /// appending into `q` (minus SQTT/PMC/dispatch_ptr).
 /// The shader entry point is pre-shifted right by 8 (COMPUTE_PGM_LO/HI hold the
 /// upper bits of a 256-byte-aligned address). `wave32` comes from
-/// `kd.kernel_code_properties & 0x400`; `cs_w32_en` is gfx11/12-only.
+/// the descriptor's `ENABLE_WAVEFRONT_SIZE32`; `cs_w32_en` is gfx11/12-only.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_exec_pm4(
     q: &mut Vec<u32>,

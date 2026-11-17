@@ -102,7 +102,9 @@ impl RenderContext {
     }
 
     /// The module-level nodes the back edges refer to: the hints first, then
-    /// one distinct, self-referential loop ID per loop, as LLVM requires.
+    /// one distinct, self-referential loop ID per loop, as LLVM requires;
+    /// one node a line, numbered `!0` up, so the module's other nodes number
+    /// on from the count.
     pub fn loop_metadata(&self) -> Vec<String> {
         let Some(hints) = self.loop_hints.filter(|_| !self.loops.is_empty()) else { return Vec::new() };
         let hints: Vec<&str> = hints.iter().filter(|h| !h.is_empty()).copied().collect();

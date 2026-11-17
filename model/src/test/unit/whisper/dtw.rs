@@ -195,14 +195,7 @@ fn shifted_diagonal_alignment_is_golden() {
         }
     }
     let (text, time) = dtw::find_alignment_path_selected(
-        &qk,
-        n_heads,
-        text_stride,
-        audio_stride,
-        valid_text,
-        valid_audio,
-        medfilt,
-        sot_len,
+        &qk, n_heads, text_stride, audio_stride, valid_text, valid_audio, medfilt, sot_len,
     );
     assert_eq!(text, [0, 1, 1, 1, 2, 2, 3, 3, 3]);
     assert_eq!(time, [0, 0, 1, 2, 2, 3, 3, 4, 5]);

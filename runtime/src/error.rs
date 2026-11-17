@@ -83,6 +83,11 @@ pub enum Error {
     #[snafu(display("Unsupported runtime feature {kind}: {reason}"))]
     Unsupported { kind: String, reason: String },
 
+    /// A thread trace could not be read back or analyzed.
+    #[snafu(display("SQTT: {source}"))]
+    #[snafu(context(false))]
+    Sqtt { source: crate::sqtt::Error },
+
     /// Device error (from svod_device crate).
     #[snafu(display("Device error: {source}"))]
     #[snafu(context(false))]

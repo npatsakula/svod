@@ -34,4 +34,11 @@ impl YoloBottleneck {
         let h = scoped("cv1", || self.cv1.forward(x))?;
         scoped("cv2", || if self.add { self.cv2.forward_residual(&h, x) } else { self.cv2.forward(&h) })
     }
+
+    /// [`Self::forward`] stored into channels `at..` of `into`, as
+    /// [`YoloConv::forward_into`]: `into` after the store.
+    pub fn forward_into(&self, x: &Tensor, into: (&Tensor, usize)) -> Result<Tensor> {
+        let h = scoped("cv1", || self.cv1.forward(x))?;
+        scoped("cv2", || self.cv2.forward_into(&h, self.add.then_some(x), into))
+    }
 }

@@ -94,7 +94,7 @@ fn tk_gemm_tuned_vs_pinned() {
 
         // tk at a pinned config.
         let mut pinned = |label: &str, c: GemmCfg| {
-            let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: epi };
+            let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: epi, windows: Default::default() };
             let spec = spec.admitted(&planner, c).unwrap_or_else(|why| panic!("{label} {c:?}: {why:?}"));
             let out = Tensor::empty(&[m * n], DType::BFloat16);
             let mut params: Vec<&Tensor> = vec![&a, &b];

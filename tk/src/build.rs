@@ -1208,10 +1208,10 @@ impl<'k> Kernel<'k> {
 
     // ---- control ---------------------------------------------------------
 
-    fn carried<T>(&mut self, init: &[Regs<'k, T>]) -> Vec<ValId> {
+    fn carried(&mut self, init: &[ValId]) -> Vec<ValId> {
         init.iter()
-            .map(|i| {
-                let Value { dtype, shape, .. } = self.prog.value(i.0).clone();
+            .map(|&i| {
+                let Value { dtype, shape, .. } = self.prog.value(i).clone();
                 self.value(dtype, shape, Place::Reg)
             })
             .collect()
@@ -1223,20 +1223,20 @@ impl<'k> Kernel<'k> {
     /// into the carried values then read what the iteration began with,
     /// as the interpreter's simultaneous assignment does, and a next the
     /// body never defines still moves.
-    fn snapshot_carried<T: Elem>(&mut self, body: &mut Block, phi: &[ValId], next: &mut [Regs<'k, T>]) {
+    fn snapshot_carried(&mut self, body: &mut Block, phi: &[ValId], next: &mut [ValId]) {
         let mut defined = std::collections::HashSet::new();
         for (_, s) in body.walk() {
             defined.extend(defines(s));
         }
         let mut copies = vec![];
         for (n, &p) in next.iter_mut().zip(phi) {
-            if n.0 == p || defined.contains(&n.0) {
+            if *n == p || defined.contains(n) {
                 continue;
             }
-            let Value { dtype, shape, .. } = self.prog.value(n.0).clone();
+            let Value { dtype, shape, .. } = self.prog.value(*n).clone();
             let dst = self.value(dtype, shape, Place::Reg);
-            copies.push(Stmt::Let { dst, op: TileOp::Move { src: n.0 } });
-            *n = Tile::new(dst);
+            copies.push(Stmt::Let { dst, op: TileOp::Move { src: *n } });
+            *n = dst;
         }
         body.0.splice(0..0, copies);
     }
@@ -1245,16 +1245,16 @@ impl<'k> Kernel<'k> {
     /// loop's `next`s are one value: every one past the first reads a copy
     /// made at the body's end, where the moves into the `phi`s read, so
     /// their order decides nothing ([`check_carried`]).
-    fn deshare_carried<T: Elem>(&mut self, body: &mut Block, next: &mut [Regs<'k, T>]) {
+    fn deshare_carried(&mut self, body: &mut Block, next: &mut [ValId]) {
         let mut seen = std::collections::HashSet::new();
         for n in next.iter_mut() {
-            if seen.insert(n.0) {
+            if seen.insert(*n) {
                 continue;
             }
-            let Value { dtype, shape, .. } = self.prog.value(n.0).clone();
+            let Value { dtype, shape, .. } = self.prog.value(*n).clone();
             let dst = self.value(dtype, shape, Place::Reg);
-            body.0.push(Stmt::Let { dst, op: TileOp::Move { src: n.0 } });
-            *n = Tile::new(dst);
+            body.0.push(Stmt::Let { dst, op: TileOp::Move { src: *n } });
+            *n = dst;
         }
     }
 
@@ -1303,13 +1303,15 @@ impl<'k> Kernel<'k> {
     ) -> Vec<Regs<'k, T>> {
         let (start, extent) = (self.intern(0), self.intern(extent));
         let iv = self.push_scalar(Scalar::Induction);
+        let init = ids(&init);
         let phi = self.carried(&init);
         let mut next = vec![];
-        let mut block = self.with_block(|k| next = body(k, Sc::id(iv), phi.iter().map(|&v| Tile::new(v)).collect()));
+        let mut block =
+            self.with_block(|k| next = ids(&body(k, Sc::id(iv), phi.iter().map(|&v| Tile::new(v)).collect())));
         self.snapshot_carried(&mut block, &phi, &mut next);
         self.deshare_carried(&mut block, &mut next);
         let carried = carry(&init, &phi, &next);
-        self.push(Stmt::Loop(Loop { iv, start, extent, carried, body: block, unroll: 1 }));
+        self.push(Stmt::Loop(Loop { iv, start, extent, carried, body: block, unroll: 1, trip: None }));
         phi.into_iter().map(Tile::new).collect()
     }
 
@@ -1354,6 +1356,54 @@ impl<'k> Kernel<'k> {
         produce: impl for<'r> FnOnce(&mut Self, Sc<'k>, Filling<'k, 'r>),
         consume: impl for<'r> FnOnce(&mut Self, Sc<'k>, Reading<'k, 'r>, Vec<Regs<'k, T>>) -> Vec<Regs<'k, T>>,
     ) -> Vec<Regs<'k, T>> {
+        let consume = |k: &mut Self, step, slot: Reading<'k, '_>, phi: Vec<ValId>| {
+            ids(&consume(k, step, slot, phi.into_iter().map(Tile::new).collect()))
+        };
+        self.pipeline_ids(extent, ring, ids(&init), produce, consume).into_iter().map(Tile::new).collect()
+    }
+
+    /// [`Self::pipeline`] carrying `side` beside the accumulators: register
+    /// tiles of another type, as a block's operand read a step ahead of the
+    /// step it serves.
+    #[allow(clippy::type_complexity)]
+    pub fn pipeline_with<T: Elem, U: Elem, I: Into<Acc<'k, T>>, const N: usize, const M: usize>(
+        &mut self,
+        extent: impl Into<Sc<'k>>,
+        ring: Ring<'k, impl Elem>,
+        init: [I; N],
+        side: [Regs<'k, U>; M],
+        produce: impl for<'r> FnOnce(&mut Self, Sc<'k>, Filling<'k, 'r>),
+        consume: impl for<'r> FnOnce(
+            &mut Self,
+            Sc<'k>,
+            Reading<'k, 'r>,
+            [Acc<'k, T>; N],
+            [Regs<'k, U>; M],
+        ) -> ([Acc<'k, T>; N], [Regs<'k, U>; M]),
+    ) -> ([Acc<'k, T>; N], [Regs<'k, U>; M]) {
+        let init: Vec<ValId> = init.into_iter().map(|i| i.into().0.0).chain(side.iter().map(|r| r.0)).collect();
+        let consume = |k: &mut Self, step, slot: Reading<'k, '_>, phi: Vec<ValId>| {
+            let (acc, side) = phi.split_at(N);
+            let acc = tiles(acc.iter().map(|&v| Tile::new(v)).collect()).map(Acc);
+            let (acc, side) = consume(k, step, slot, acc, tiles(side.iter().map(|&v| Tile::new(v)).collect()));
+            acc.iter().map(|a| a.0.0).chain(side.iter().map(|r| r.0)).collect()
+        };
+        let out = self.pipeline_ids(extent, ring, init, produce, consume);
+        let (acc, side) = out.split_at(N);
+        (
+            tiles(acc.iter().map(|&v| Tile::new(v)).collect()).map(Acc),
+            tiles(side.iter().map(|&v| Tile::new(v)).collect()),
+        )
+    }
+
+    fn pipeline_ids(
+        &mut self,
+        extent: impl Into<Sc<'k>>,
+        ring: Ring<'k, impl Elem>,
+        init: Vec<ValId>,
+        produce: impl for<'r> FnOnce(&mut Self, Sc<'k>, Filling<'k, 'r>),
+        consume: impl for<'r> FnOnce(&mut Self, Sc<'k>, Reading<'k, 'r>, Vec<ValId>) -> Vec<ValId>,
+    ) -> Vec<ValId> {
         let schedule = ring.schedule;
         let extent = self.intern(extent);
         let [pstep, pslot, cstep, cslot] = [(); 4].map(|()| self.push_scalar(Scalar::Induction));
@@ -1361,15 +1411,13 @@ impl<'k> Kernel<'k> {
         let body = self.with_block(|k| produce(k, Sc::id(pstep), Filling::new(pslot)));
         let produce = Stage { step: pstep, slot: pslot, body };
         let mut next = vec![];
-        let mut body = self.with_block(|k| {
-            next = consume(k, Sc::id(cstep), Reading::new(cslot), phi.iter().map(|&v| Tile::new(v)).collect())
-        });
+        let mut body = self.with_block(|k| next = consume(k, Sc::id(cstep), Reading::new(cslot), phi.clone()));
         self.snapshot_carried(&mut body, &phi, &mut next);
         self.deshare_carried(&mut body, &mut next);
         let consume = Stage { step: cstep, slot: cslot, body };
         let carried = carry(&init, &phi, &next);
         self.push(Stmt::Pipeline(Pipeline { extent, schedule, carried, produce, consume }));
-        phi.into_iter().map(Tile::new).collect()
+        phi
     }
 
     /// Every warp runs `body` on its own ([`Stmt::Warps`]): [`warp`](Self::warp)
@@ -1501,7 +1549,7 @@ impl<'k> Kernel<'k> {
     /// warp, which some warps skip, it fails the lowering
     /// ([`crate::lower::Error::DivergentBarrier`]).
     pub fn barrier(&mut self) {
-        self.push(Stmt::Sync(Sync::Barrier { scope: Scope::Block }));
+        self.push(Stmt::Sync(AuthoredSync::Barrier { scope: Scope::Block }));
     }
 
     fn finish(mut self) -> Program {
@@ -1564,7 +1612,11 @@ fn tiles<'k, T, const N: usize>(list: Vec<Regs<'k, T>>) -> [Regs<'k, T>; N] {
 }
 
 /// Each `init`'s carried register: its `phi` and its `next`.
-fn carry<T>(init: &[Regs<'_, T>], phi: &[ValId], next: &[Regs<'_, T>]) -> Vec<Carried> {
+fn carry(init: &[ValId], phi: &[ValId], next: &[ValId]) -> Vec<Carried> {
     assert_eq!(next.len(), init.len(), "a body returns a tile per carried one");
-    (0..init.len()).map(|i| Carried { init: init[i].0, phi: phi[i], next: next[i].0 }).collect()
+    (0..init.len()).map(|i| Carried { init: init[i], phi: phi[i], next: next[i] }).collect()
+}
+
+fn ids<T>(tiles: &[Regs<'_, T>]) -> Vec<ValId> {
+    tiles.iter().map(|t| t.0).collect()
 }

@@ -6,6 +6,7 @@
 //! their exact submission order. Backends lower the commands to native packets.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::Range;
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
@@ -37,8 +38,16 @@ pub struct TopologyResource {
 
 impl TopologyResource {
     fn overlaps(&self, other: &Self) -> bool {
-        self.id == other.id && self.owner == other.owner && self.start < other.end && other.start < self.end
+        self.id == other.id
+            && self.owner == other.owner
+            && bytes_overlap(&(self.start..self.end), &(other.start..other.end))
     }
+}
+
+/// Whether two byte ranges share a byte: an empty range shares none, so a
+/// zero-byte access orders after nothing and nothing orders after it.
+pub fn bytes_overlap(a: &Range<usize>, b: &Range<usize>) -> bool {
+    !a.is_empty() && !b.is_empty() && a.start < b.end && b.start < a.end
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

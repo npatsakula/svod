@@ -19,7 +19,7 @@ pub mod text;
 
 pub use common::LlvmTarget;
 pub use cpu::render_uop as cpu_render_uop;
-pub use text::LlvmTextRenderer;
+pub use text::{LlvmTextRenderer, Location};
 
 pub fn cpu_extra_matcher() -> svod_ir::pattern::TypedPatternMatcher<()> {
     svod_schedule::devectorize::bool_storage_patterns().clone()

@@ -237,6 +237,53 @@ fn graph_kernel_runs_a_linear_program() {
     assert_eq!(actual, expected.iter().map(|v| v * 2.0).collect::<Vec<_>>());
 }
 
+/// A device's renderer whose text carries a mark: what renders a SOURCE
+/// stage ahead of the device, so the stage the device compiles is told
+/// from its own render.
+struct Marked<'d>(&'d dyn svod_device::device::Renderer);
+
+const MARK: &str = "; rendered ahead\n";
+
+impl svod_device::device::Renderer for Marked<'_> {
+    fn render(&self, ast: &Arc<UOp>, name: Option<&str>) -> svod_device::Result<ProgramSpec> {
+        let mut spec = self.0.render(ast, name)?;
+        spec.src.push_str(MARK);
+        Ok(spec)
+    }
+
+    fn device(&self) -> &DeviceSpec {
+        self.0.device()
+    }
+
+    fn supported_ops(&self) -> svod_ir::RendererOps {
+        self.0.supported_ops()
+    }
+}
+
+/// A graph kernel whose PROGRAM carries its SOURCE stage, rendered ahead
+/// through the pipeline ([`program_pipeline::do_render`]) and stripped of
+/// origins, reaches the device as handed: scheduled, compiled and run with
+/// that SOURCE, which the device does not render again.
+#[test]
+fn graph_kernel_compiles_a_source_rendered_ahead() {
+    let (x, expected) = input();
+    let spec = x.buffer().unwrap().allocator().device_spec();
+    let device = config_for(&spec).resolve_device(&spec, svod_device::registry::registry()).unwrap();
+    let out = Tensor::empty(&[N], DType::Float32);
+    let y = Tensor::graph_kernel("linear_add_one", out, &[&x], |ph| {
+        let program = add_one_program(&ph[0], &ph[1], spec.clone());
+        let (rendered, _) = program_pipeline::do_render(&program, &Marked(device.renderer.as_ref())).unwrap();
+        rendered.without_origins()
+    })
+    .unwrap();
+
+    let plan = y.prepare_with(&config_for(&spec)).unwrap();
+    let kernel = plan.kernels().find(|k| k.entry_point == "linear_add_one").expect("the PROGRAM compiles as is");
+    assert!(kernel.code.ends_with(MARK), "the SOURCE rendered ahead:\n{}", kernel.code);
+    plan.execute().unwrap();
+    assert_eq!(y.as_vec::<f32>().unwrap(), expected);
+}
+
 const ROW: i64 = 8;
 const MAX_ROWS: i64 = 4;
 

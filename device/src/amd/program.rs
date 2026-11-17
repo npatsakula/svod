@@ -33,6 +33,10 @@ const R_AMDGPU_REL64: u32 = 5;
 const R_AMDGPU_REL32_LO: u32 = 10;
 const R_AMDGPU_REL32_HI: u32 = 11;
 
+/// The `kernel_code_properties` bit of a wave32 kernel.
+const ENABLE_WAVEFRONT_SIZE32: u16 =
+    crate::amd::sys::hsa::amd_kernel_code_properties_t_AMD_KERNEL_CODE_PROPERTIES_ENABLE_WAVEFRONT_SIZE32 as u16;
+
 /// Pre-execution metadata extracted from a single kernel's ELF.
 #[derive(Debug, Clone)]
 pub struct ParsedKernel {
@@ -43,6 +47,25 @@ pub struct ParsedKernel {
     pub kd_offset: u64,
     /// Decoded kernel descriptor.
     pub kd: AmdHsaKernelDescriptor,
+}
+
+/// The registers, LDS and wave size of a code object's kernel, read off its descriptor on the host as
+/// a loaded program's `resource_usage` reports them.
+pub fn kernel_resources(
+    bytes: &[u8],
+    kernel_name: &str,
+    arch: svod_dtype::AmdArch,
+) -> Result<crate::profile::KernelResources> {
+    let kd = parse_kernel(bytes, kernel_name)?.kd;
+    let wave_size = if kd.kernel_code_properties & ENABLE_WAVEFRONT_SIZE32 != 0 { 32 } else { 64 };
+    Ok(crate::amd::occupancy::decode_resources(
+        kd.compute_pgm_rsrc1,
+        kd.compute_pgm_rsrc3,
+        kd.group_segment_fixed_size,
+        kd.private_segment_fixed_size,
+        wave_size,
+        arch,
+    ))
 }
 
 /// Parse an AMDGPU code-object ELF and resolve the named kernel descriptor.
@@ -119,7 +142,7 @@ pub fn parse_kernel(bytes: &[u8], kernel_name: &str) -> Result<ParsedKernel> {
     if image.is_empty() {
         return Err(Error::Runtime { message: "AMD ELF has no SHF_ALLOC sections to load".into() });
     }
-    let _ = placements;
+    let placed: std::collections::HashSet<object::SectionIndex> = placements.iter().map(|p| p.0).collect();
 
     // ── 3. Find the kernel descriptor symbol. ────────────────────────────
     let mut kd_offset = None;
@@ -158,6 +181,10 @@ pub fn parse_kernel(bytes: &[u8], kernel_name: &str) -> Result<ParsedKernel> {
     // image offsets, the GPU jumps to garbage on dispatch, and the CP
     // stalls in SPI without launching any shader (radeontop: 100% spi,
     // 0% on TA/SH/SX/SMX/CB/DB).
+    //
+    // Only a placed section's relocations apply: a section the image does
+    // not hold (a line table's `.debug_*`, with its `R_AMDGPU_ABS32`s) has
+    // nowhere in it to be written.
     let image_offset = |idx: object::SectionIndex| -> Option<u64> {
         if let Some(&remapped) = zero_addr_remap.get(&idx) {
             return Some(remapped);
@@ -166,7 +193,7 @@ pub fn parse_kernel(bytes: &[u8], kernel_name: &str) -> Result<ParsedKernel> {
         // placed it during step 2a).
         file.section_by_index(idx).ok().map(|s| s.address())
     };
-    for section in file.sections() {
+    for section in file.sections().filter(|s| placed.contains(&s.index())) {
         let section_base = image_offset(section.index()).unwrap_or(0);
         for (sec_off, reloc) in section.relocations() {
             let r_type = match reloc.flags() {
@@ -270,7 +297,7 @@ pub struct AmdProgram {
     rsrc1: u32,
     rsrc2: u32,
     rsrc3: u32,
-    /// `(kd.kernel_code_properties & 0x400) != 0` — true for wave32 kernels
+    /// `kd.kernel_code_properties & ENABLE_WAVEFRONT_SIZE32 != 0` — true for wave32 kernels
     /// (RDNA3/4 default). Controls the `cs_w32_en` bit in DISPATCH_INITIATOR.
     wave32: bool,
     /// gfx major version (9, 11, or 12). gfx9 (CDNA) ignores `cs_w32_en`.
@@ -290,6 +317,8 @@ pub struct AmdProgram {
     /// Shared by the program and every captured/in-flight command that can
     /// execute it. The allocation is released only after the last GPU use.
     code: Arc<CodeObject>,
+    /// The ELF and where it loaded, for SQTT's PC mapping.
+    image: Arc<crate::profile::CodeImage>,
 }
 
 impl AmdProgram {
@@ -354,7 +383,7 @@ impl AmdProgram {
         let rsrc1 = rsrc1_kd | (if target_major == 11 { 1u32 << 20 } else { 0 });
         let rsrc2 = rsrc2_kd | (lds_size << 15);
         let rsrc3 = rsrc3_kd;
-        let wave32 = (props & 0x400) != 0;
+        let wave32 = props & ENABLE_WAVEFRONT_SIZE32 != 0;
         let pm4_prog_addr = aql_prog_addr.wrapping_add(entry as u64);
 
         // Decode KCP bits that affect the user-SGPR pre-load layout. We only
@@ -455,6 +484,8 @@ impl AmdProgram {
             );
         }
 
+        let image =
+            Arc::new(crate::profile::CodeImage { elf: bytes.into(), load_base: code_gpu, entry_pc: pm4_prog_addr });
         Ok(Self {
             name: kernel_name.to_string(),
             device_id: allocator.device_id,
@@ -472,6 +503,7 @@ impl AmdProgram {
             var_count,
             abi,
             code: Arc::new(CodeObject { buffer: code_buf.into_inner() }),
+            image,
         })
     }
 
@@ -675,7 +707,8 @@ impl AmdProgram {
 
         let queue = pool.queue();
         let is_pm4 = queue.is_pm4();
-        let pmc_counters = if profile && is_pm4 && self.target_major == 11 { owner.pmc_counters() } else { Vec::new() };
+        // Arming refused targets without counters (`pmc::check_target`).
+        let pmc_counters = if profile && is_pm4 { owner.pmc_counters() } else { Vec::new() };
         let pmc = if pmc_counters.is_empty() {
             None
         } else {
@@ -687,10 +720,25 @@ impl AmdProgram {
                 crate::allocator::RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
                 _ => return Err(Error::Runtime { message: "PMC readback buffer not host-visible".into() }),
             };
-            let (start, read) = crate::amd::pmc::build_streams(&pmc_counters, &grid, gpu);
+            let (start, read) = crate::amd::pmc::build_streams(self.dev.arch, &pmc_counters, &grid, gpu);
             Some((buf, host, grid, start, read))
         };
+        let sqtt = match owner.armed_sqtt().filter(|_| profile && is_pm4) {
+            Some((config, arch)) => Some(crate::amd::sqtt::Capture::new(
+                owner.allocator(),
+                config,
+                arch,
+                (g[0] * g[1] * g[2]) as u64,
+                Arc::clone(&self.image),
+            )?),
+            None => None,
+        };
+        // PMC programs and reads first, as Tinygrad does; the trace brackets
+        // the dispatch inside them.
         let (pmc_start, pmc_read): (&[u32], &[u32]) = pmc.as_ref().map_or((&[], &[]), |(_, _, _, s, r)| (s, r));
+        let (sqtt_start, sqtt_stop): (&[u32], &[u32]) = sqtt.as_ref().map_or((&[], &[]), |c| (&c.start, &c.stop));
+        let profile_start = [pmc_start, sqtt_start].concat();
+        let profile_stop = [pmc_read, sqtt_stop].concat();
 
         let dispatch = crate::hcq::ComputeDispatch {
             workgroup_size: [l[0] as u32, l[1] as u32, l[2] as u32],
@@ -724,7 +772,7 @@ impl AmdProgram {
         if profile {
             submission.request_profile();
         }
-        let result = queue.submit_hcq_dispatch(pool, &submission, &kernargs, pmc_start, pmc_read)?;
+        let result = queue.submit_hcq_dispatch(pool, &submission, &kernargs, &profile_start, &profile_stop)?;
         if let Some(writes) = invalidate {
             pool.caches_invalidated(writes);
         }
@@ -764,7 +812,12 @@ impl AmdProgram {
                 (Some(sig), None) => Some(sig),
                 (None, _) => None,
             };
-            Ok(handle)
+            Ok(match (handle, sqtt) {
+                (Some(inner), Some(capture)) => {
+                    Some(Arc::new(capture.into_handle(inner, Arc::clone(&result.finalizer))) as Arc<_>)
+                }
+                (handle, _) => handle,
+            })
         } else {
             Ok(result.timestamps.map(|signal| signal as Arc<dyn crate::sync::DispatchTimestamps>))
         }
@@ -793,13 +846,7 @@ impl Program for AmdProgram {
         // filter).
         let _ = unsafe {
             crate::device::PlanContext::dispatch(
-                &owner,
-                self,
-                buffers,
-                vals,
-                global_size,
-                local_size,
-                /*profile=*/ false,
+                &owner, self, buffers, vals, global_size, local_size, /*profile=*/ false,
             )?
         };
         if wait {
@@ -847,13 +894,7 @@ impl Program for AmdProgram {
         // the probes write into scratch it owns. SAFETY: forwarded contract.
         let stamps = unsafe {
             crate::device::PlanContext::dispatch(
-                &owner,
-                self,
-                buffers,
-                vals,
-                global_size,
-                local_size,
-                /*profile=*/ true,
+                &owner, self, buffers, vals, global_size, local_size, /*profile=*/ true,
             )?
         };
         // Poisons the device and propagates on a faulting candidate, exactly as
@@ -894,7 +935,7 @@ impl Program for AmdProgram {
             self.kd.group_segment_fixed_size,
             self.kd.private_segment_fixed_size,
             if self.wave32 { 32 } else { 64 },
-            self.target_major,
+            self.dev.arch,
         ))
     }
 }

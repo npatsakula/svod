@@ -1,4 +1,4 @@
-use super::test_support::{MockAmdIface, mock_device, mock_device_with_signals, scripted_error};
+use super::test_support::{MockAmdIface, mock_device, mock_device_with_signals, pool_queue, scripted_error};
 use crate::amd::AmdAllocator;
 use crate::amd::connector::PoolQueue;
 use crate::amd::iface::AllocKind;
@@ -17,9 +17,7 @@ const PARK: Duration = Duration::from_millis(100);
 /// `count` lanes of one mock device, sharing its kernarg arena.
 fn lanes(count: usize) -> (Arc<MockAmdIface>, AmdAllocator, Vec<Arc<PoolQueue>>) {
     let (iface, allocator) = mock_device_with_signals(1);
-    let pools = (0..count)
-        .map(|_| PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator).unwrap())
-        .collect();
+    let pools = (0..count).map(|_| pool_queue(&allocator)).collect();
     (iface, allocator, pools)
 }
 
@@ -49,12 +47,12 @@ fn kernarg_arena_construction_balances_and_scripts_allocation_failure() {
     let (iface, allocator) = mock_device(1);
     iface.script_alloc(Err(scripted_error("kernarg allocation")));
     assert!(KernargArena::new(&allocator, allocator.dev.core()).is_err());
-    assert_eq!((iface.allocation_count(), iface.free_count(), iface.live_handle_count()), (0, 0, 0));
+    assert_eq!(iface.counts(), (0, 0, 0));
 
     let arena = KernargArena::new(&allocator, allocator.dev.core()).expect("arena");
-    assert_eq!(iface.allocation_count(), 1);
+    assert_eq!(iface.counts(), (1, 0, 1));
     drop(arena);
-    assert_eq!((iface.free_count(), iface.live_handle_count()), (1, 0));
+    assert_eq!(iface.counts(), (1, 1, 0));
     assert!(iface.free_issues().is_empty());
 }
 
@@ -72,7 +70,7 @@ fn kernarg_failed_retire_wait_poisons_and_hands_out_nothing() {
     assert!(allocator.dev.is_poisoned());
     assert_eq!(arena.live_slots(), [(0, "submitted")]);
     assert!(arena.reserve(16, 16).is_err(), "a poisoned device reuses no slot");
-    assert_eq!((iface.allocation_count(), iface.free_count()), (allocations, 0));
+    assert_eq!(iface.counts(), (allocations, 0, allocations));
     drop(pools);
     assert_eq!(iface.free_count(), 0, "all hardware-referenced queue storage must remain quarantined");
 }
@@ -109,11 +107,7 @@ fn kernarg_arena_is_shared_by_every_lane_of_one_device() {
 }
 
 /// Lanes that find the shared arena full at once take disjoint slots once the
-/// slot in their way retires. Each lane wrapping on its own handed every one of
-/// them offset 0, so two lanes wrote their kernargs and AQL control programs
-/// over each other: a lane that ran another's control program stored that
-/// lane's timeline value instead of its own, and its next dispatch waited on
-/// the CP for a value nobody writes.
+/// slot in their way retires.
 #[test]
 fn concurrent_wraps_hand_out_disjoint_slots() {
     const LANES: usize = 4;

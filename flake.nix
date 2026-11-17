@@ -53,7 +53,8 @@
           || (pkgs.lib.hasSuffix "config.json" path)
           || (pkgs.lib.hasSuffix ".onnx" path)
           || (pkgs.lib.hasSuffix ".h" path)
-          || (pkgs.lib.hasSuffix ".tiktoken" path);
+          || (pkgs.lib.hasSuffix ".tiktoken" path)
+          || (pkgs.lib.hasInfix "/src/test/fixtures/" path);
 
         src = pkgs.lib.cleanSourceWith {
           src = ./.;
@@ -80,6 +81,8 @@
           z3
           zlib
           llvm.clang
+          # llvm-objdump and llvm-dwarfdump, which the SQTT tests read code objects with.
+          (pkgs.lib.getBin llvm.llvm)
         ];
 
         commonArgs = {
