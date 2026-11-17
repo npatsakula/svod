@@ -9,13 +9,13 @@ use std::ops::Range;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use snafu::{ResultExt, Snafu};
-use svod_dtype::DeviceSpec;
 use svod_dtype::default_device::default_device;
+use svod_dtype::{AmdArch, DeviceSpec, GpuArch};
 use svod_ir::{CallInfo, UOp};
 use svod_tensor::Tensor;
 
 use crate::ir::{ParamKind, Program};
-use crate::lower::{self, Lowering};
+use crate::lower::{self, Lowered, Lowering};
 
 /// Lowered bodies by tile program, lowering, device and placeholders: a model
 /// calls an op once per layer, and lowering is milliseconds of instruction
@@ -45,6 +45,8 @@ pub enum Error {
     Arity { name: String, want: usize, got: usize },
     #[snafu(display("{name} writes {a}, which shares storage with {b}"))]
     Aliased { name: String, a: String, b: String },
+    #[snafu(display("{name} is lowered for {lowered:?}, which an {device} device does not run"))]
+    Arch { name: String, lowered: GpuArch, device: AmdArch },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -77,7 +79,7 @@ pub(crate) fn graph_launch_once(prog: Program, lowering: &Lowering, tensors: &[&
 }
 
 /// [`graph_launch_all`] of `body`, `prog` lowered already for its target
-/// alone ([`lower::standalone`]), kept in no memo: its parameters are
+/// alone ([`lower::standalone`], as [`body`] hands it), kept in no memo: its parameters are
 /// positional in `prog.params()` order, so the call binds `tensors` in that
 /// order. Where this device or the tensors' placeholders are not the ones it
 /// was lowered over, `prog` is lowered again for them.
@@ -92,9 +94,11 @@ pub(crate) fn graph_launch_lowered(
         tensors.len() == prog.params.len(),
         AritySnafu { name: name.clone(), want: prog.params.len(), got: tensors.len() }
     );
-    if default_device() != lower::standalone_device(lowering) || tensors.is_empty() {
+    let device = default_device();
+    if device != lower::standalone_device(lowering) || tensors.is_empty() {
         return launch_all(prog.clone(), lowering, tensors, &[], false);
     }
+    runs_on(&name, lowering, &device)?;
     let origin = svod_ir::origin::current();
     let info =
         CallInfo { name: Some(name.clone()), origin, origins: origin.into_iter().collect(), ..CallInfo::default() };
@@ -157,10 +161,11 @@ fn launch_all(
         AritySnafu { name: name.clone(), want: prog.params.len(), got: tensors.len() }
     );
     aliasing(&prog, tensors, ranges)?;
+    let device = default_device();
+    runs_on(&name, lowering, &device)?;
     let out_at = first_output(&prog);
     // `custom_kernel` hands placeholders in `[out, ins...]` order.
     let ins: Vec<&Tensor> = tensors.iter().enumerate().filter(|(i, _)| *i != out_at).map(|(_, t)| *t).collect();
-    let device = default_device();
     let mut failure = None;
     // The kernel is charged to the call site, never to whichever site first
     // lowered the memoized body.
@@ -172,9 +177,8 @@ fn launch_all(
         if let Some(program) = LOWERED.lock().expect("lowered memo").get(&key).filter(|_| memo) {
             return program.clone();
         }
-        match lower::lower(prog, lowering, in_param_order(&ph, out_at), device) {
-            Ok(lowered) => {
-                let program = lowered.program.without_origins();
+        match lower::lower(prog, lowering, in_param_order(&ph, out_at), device).and_then(|l| body(&l, lowering)) {
+            Ok(program) => {
                 if memo {
                     LOWERED.lock().expect("lowered memo").insert(key, program.clone());
                 }
@@ -194,6 +198,37 @@ fn launch_all(
     let out = outs.remove(0);
     outs.insert(out_at, out);
     Ok(outs)
+}
+
+/// The PROGRAM a launch of `lowered` hands the graph, without origins: on
+/// an AMD target with its SOURCE stage ([`Lowered::source`]), so the code
+/// object carries its line table and `kernel.tk`; elsewhere bare, for the
+/// device to render.
+pub(crate) fn body(lowered: &Lowered, lowering: &Lowering) -> lower::Result<Arc<UOp>> {
+    let program = match lowering.device.target.arch {
+        GpuArch::Amd(arch) => lowered.source(arch)?,
+        GpuArch::Cuda(_) | GpuArch::Metal(_) => lowered.program.clone(),
+    };
+    Ok(program.without_origins())
+}
+
+/// An AMD device runs what is lowered for its own arch: a [`body`]'s
+/// SOURCE names no arch, so a kernel lowered for another would compile for
+/// the device's unnoticed. A device whose arch is unknown here (none
+/// attached) is not checked.
+fn runs_on(name: &str, lowering: &Lowering, device: &DeviceSpec) -> Result<()> {
+    static ARCHS: LazyLock<Mutex<std::collections::HashMap<usize, Option<AmdArch>>>> = LazyLock::new(Default::default);
+    let &DeviceSpec::Amd { device_id } = device else { return Ok(()) };
+    // Topology is read once per device: a launch would otherwise walk sysfs.
+    let arch = *ARCHS
+        .lock()
+        .expect("device archs")
+        .entry(device_id)
+        .or_insert_with(|| svod_device::registry::resolve_amd_arch_from_topology(device_id).ok());
+    let Some(arch) = arch else { return Ok(()) };
+    let lowered = lowering.device.target.arch;
+    snafu::ensure!(lowered == GpuArch::Amd(arch), ArchSnafu { name, lowered, device: arch });
+    Ok(())
 }
 
 /// No parameter the kernel writes shares memory with another: the body

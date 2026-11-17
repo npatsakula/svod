@@ -436,10 +436,19 @@ fn unlocated(located: &str) -> String {
     lines.collect()
 }
 
-/// The LLVM text an AMD device renders of `prog` launched over lazy tensors
-/// of its parameters: the PROGRAM [`launch::graph_launch_once`] hands the
-/// graph, rendered as the device's renderer renders it, under its function name.
-fn launched_text(arch: AmdArch, prog: Program, lowering: &Lowering) -> String {
+/// The AMD arch a launch runs on here: this host's device's, else gfx1201
+/// (with no device attached a launch is not checked against one), with its
+/// CUs.
+fn launch_arch() -> (AmdArch, u32) {
+    let arch = svod_device::registry::resolve_amd_arch_from_topology(0).unwrap_or(AmdArch::Gfx1201);
+    (arch, ARCHES.iter().find(|a| a.0 == arch).map_or(64, |a| a.1))
+}
+
+/// The PROGRAM [`launch::graph_launch_once`] hands the graph of `prog`
+/// launched on an AMD device over lazy tensors of its parameters.
+///
+/// [`launch::graph_launch_once`]: crate::launch::graph_launch_once
+fn launched(prog: Program, lowering: &Lowering) -> Arc<UOp> {
     let device = svod_dtype::DeviceSpec::Amd { device_id: 0 };
     let out = svod_dtype::default_device::with_default_device(device, || {
         let tensors: Vec<svod_tensor::Tensor> =
@@ -448,13 +457,39 @@ fn launched_text(arch: AmdArch, prog: Program, lowering: &Lowering) -> String {
     });
     let (mut stack, mut seen) = (vec![out.uop()], std::collections::HashSet::new());
     while let Some(node) = stack.pop() {
-        if let Op::Program(ops::Program { linear: Some(linear), info, .. }) = node.op() {
-            let renderer = svod_runtime::amd::renderer(arch);
-            return renderer.render(linear, Some(&info.function_name())).expect("renders").code;
+        if matches!(node.op(), Op::Program(..)) {
+            return node;
         }
         stack.extend(node.op().sources().into_iter().filter(|s| seen.insert(s.id)));
     }
     panic!("the launch holds no PROGRAM")
+}
+
+/// The LLVM text an AMD device renders of `prog` launched bare: its
+/// renderer over the launch's LINEAR stage, under its function name.
+fn launched_text(arch: AmdArch, prog: Program, lowering: &Lowering) -> String {
+    let program = launched(prog, lowering);
+    let Op::Program(ops::Program { linear: Some(linear), info, .. }) = program.op() else { panic!("no LINEAR") };
+    svod_runtime::amd::renderer(arch).render(linear, Some(&info.function_name())).expect("renders").code
+}
+
+/// A launch on an AMD device hands the graph its kernel's SOURCE, origins
+/// stripped: its code object carries the line table and the listing, and
+/// holds the `.text` the device's own render of the bare kernel would.
+#[test]
+fn a_launch_hands_the_device_its_line_table() {
+    let (arch, cus) = launch_arch();
+    let cfg = config::gemm_cfg([128, 128, 32], 2, [4, 2], true);
+    let prog = gemm::<BF16>(&assumed(gemm_spec(1500, 1280, 5120), cfg));
+    let lowering = cfg.lowering(&planner(amd(arch, cus)).device);
+    let program = launched(prog.clone(), &lowering);
+    assert!(program.toposort().iter().all(|n| n.origin().is_none()), "no origins");
+    let object = compile_ir_to_amd_object(&code(&program), arch).expect("compiles");
+    let table = line_table(&object).expect("its DWARF reads").expect("a line table");
+    assert_eq!(table.listing, Some(standalone(prog.clone(), &lowering).unwrap().listing()));
+    assert!(table.rows.iter().any(|r| r.line > 0));
+    let bare = compile_ir_to_amd_object(&launched_text(arch, prog, &lowering), arch).expect("compiles");
+    assert_eq!(text(&object), text(&bare));
 }
 
 /// The twin a capture's statements come from is the kernel a launch on the
@@ -462,9 +497,9 @@ fn launched_text(arch: AmdArch, prog: Program, lowering: &Lowering) -> String {
 /// launch's text, and the two compile to one `.text`. A launch numbers the
 /// parameters `[out, ins...]`; a twin lowered over them in declared order
 /// (the GEMM's output last) loads its kernel arguments in another order.
-#[test_case(AmdArch::Gfx1201, 64; "gfx1201")]
-#[test_case(AmdArch::Gfx1151, 40; "gfx1151")]
-fn a_twin_is_the_launched_kernel(arch: AmdArch, cus: u32) {
+#[test]
+fn a_twin_is_the_launched_kernel() {
+    let (arch, cus) = launch_arch();
     let planner = planner(amd(arch, cus));
     let tiles = [
         ((1500, 1280, 5120), config::gemm_cfg([128, 128, 32], 2, [4, 2], false)),
@@ -489,8 +524,9 @@ fn a_twin_is_the_launched_kernel(arch: AmdArch, cus: u32) {
 /// names why it cannot where the target is no AMD one.
 #[test]
 fn twin_attaches_to_the_launched_kernel() {
-    let arch = AmdArch::Gfx1201;
-    let (prog, lowering) = tile_gemm(config::gemm_cfg([128, 128, 32], 2, [4, 2], true));
+    let (arch, cus) = launch_arch();
+    let cfg = config::gemm_cfg([128, 128, 32], 2, [4, 2], true);
+    let (prog, lowering) = (tile_gemm(cfg).0, cfg.lowering(&planner(amd(arch, cus)).device));
     let object = compile_ir_to_amd_object(&launched_text(arch, prog.clone(), &lowering), arch).unwrap();
     let trace = SqttTrace {
         arch,

@@ -219,14 +219,25 @@ pub(crate) fn fingerprint(candidates: &[Candidate]) -> u64 {
 /// outside any origin scope, which would key the call site; `None` where it
 /// does not lower or render, and the caller keys it by its inputs: a
 /// program that fails to lower fails the same way until they change.
-fn emitted(prog: &Program, lowering: &Lowering) -> Option<(u64, Arc<UOp>)> {
+fn emitted(prog: &Program, lowering: &Lowering) -> Option<(u64, crate::lower::Lowered)> {
     let _capture = svod_ir::origin::capture_for_thread(false);
     let _scope = svod_ir::origin::install(None);
     let lowered = crate::lower::standalone(prog.clone(), lowering)
         .inspect_err(|e| tracing::debug!(target: crate::ops::PLAN, name = prog.name, error = %e, "does not lower"))
         .ok()?;
     let emitted = digest(&(digest(&lowered.program), lowered.text(&lowering.device.target).ok()?));
-    Some((emitted, lowered.program))
+    Some((emitted, lowered))
+}
+
+/// What `prog` emits ([`emitted`]) with the body a launch of its lowering
+/// hands the graph ([`launch::body`]), `None` where it has none: what it
+/// emits is the bare lowering's either way.
+fn emitted_body(prog: &Program, lowering: &Lowering) -> Option<(u64, Option<Arc<UOp>>)> {
+    let (emitted, lowered) = emitted(prog, lowering)?;
+    let body = launch::body(&lowered, lowering)
+        .inspect_err(|e| tracing::debug!(target: crate::ops::PLAN, name = prog.name, error = %e, "does not render"))
+        .ok();
+    Some((emitted, body))
 }
 
 /// A program lowered (or found not to lower), with what it emits.
@@ -503,15 +514,15 @@ impl TuneStore {
         };
         let found: Vec<(u64, u64)> = missing
             .into_par_iter()
-            .map(|(m, (prog, lowering))| {
-                let lowered = emitted(prog, lowering);
-                if let Some(keep) = keep {
-                    keep.0
-                        .lock()
-                        .expect("lowerings")
-                        .insert(m, lowered.as_ref().map(|(emitted, program)| (*emitted, program.clone())));
+            .map(|(m, (prog, lowering))| match keep {
+                Some(keep) => {
+                    let lowered = emitted_body(prog, lowering);
+                    let found = lowered.as_ref().map_or((m, m), |(emitted, _)| (m, *emitted));
+                    let body = lowered.and_then(|(emitted, body)| Some((emitted, body?)));
+                    keep.0.lock().expect("lowerings").insert(m, body);
+                    found
                 }
-                lowered.map_or((m, m), |(emitted, _)| (m, emitted))
+                None => emitted(prog, lowering).map_or((m, m), |(emitted, _)| (m, emitted)),
             })
             .collect();
         self.record_emitted(&found);
@@ -520,21 +531,21 @@ impl TuneStore {
         (digest(&emitted), emitted.iter().map(digest).collect())
     }
 
-    /// `prog` lowered under `lowering` ([`crate::lower::standalone`]),
-    /// without origins, from `keep` where a fingerprint left it (or found
-    /// it does not lower), else lowered here and what it emits remembered
-    /// as a fingerprint would; `None` where it does not lower. What the
-    /// program emits comes with it.
+    /// `prog` lowered under `lowering` ([`crate::lower::standalone`]) as
+    /// its launch's body ([`launch::body`]), from `keep` where a fingerprint
+    /// left it (or found it does not lower), else lowered here and what it
+    /// emits remembered as a fingerprint would; `None` where it does not
+    /// lower. What the program emits comes with it.
     pub(crate) fn lowered(&self, prog: &Program, lowering: &Lowering, keep: &Lowerings) -> Option<(u64, Arc<UOp>)> {
         let m = made_of(prog, lowering);
         if let Some(kept) = keep.take(m) {
             return kept;
         }
-        let (emitted, program) = emitted(prog, lowering)?;
+        let (emitted, program) = emitted_body(prog, lowering)?;
         if !self.emitted_memo().lock().expect("emitted memo").contains_key(&m) {
             self.record_emitted(&[(m, emitted)]);
         }
-        Some((emitted, program))
+        Some((emitted, program?))
     }
 
     /// The digest of what `programs` emit, where a fingerprint or a compile

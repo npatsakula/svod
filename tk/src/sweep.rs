@@ -4,7 +4,8 @@
 //! gate, the wider set of the planner's shortlists and the attention,
 //! convolution, norm, heads and probe variants ([`digested`]), all under
 //! the declared costs ([`costs`]) so a ranking is the same on any machine;
-//! the targets of the sweep ([`targets`]); their LLVM text ([`try_render`]);
+//! the targets of the sweep ([`targets`]); their LLVM text ([`try_render`],
+//! as a device compiles it [`try_source`]);
 //! and digests of it compared across builds ([`digest`], [`diff`]).
 //! Fixtures, not an API: hidden from the docs.
 
@@ -717,6 +718,21 @@ pub fn try_render(prog: Program, lowering: &Lowering) -> Result<String, svod_cod
     let name = prog.name.clone();
     crate::lower::render(prog, lowering)
         .map_err(|e| svod_codegen::Error::InvalidGraph { reason: format!("{name}: {e}") })
+}
+
+/// The text a device compiles of `prog` [`standalone`](crate::lower::standalone):
+/// on AMD its SOURCE stage, line table and listing included
+/// ([`Lowered::source`](crate::lower::Lowered::source)), elsewhere [`try_render`]'s.
+pub fn try_source(prog: Program, lowering: &Lowering) -> Result<String, svod_codegen::Error> {
+    let GpuArch::Amd(arch) = lowering.device.target.arch else { return try_render(prog, lowering) };
+    let name = prog.name.clone();
+    let failed = |e: crate::lower::Error| svod_codegen::Error::InvalidGraph { reason: format!("{name}: {e}") };
+    let program = crate::lower::standalone(prog, lowering).and_then(|l| l.source(arch)).map_err(failed)?;
+    let svod_ir::Op::Program(svod_ir::ops::Program { source: Some(source), .. }) = program.op() else {
+        unreachable!("a rendered PROGRAM")
+    };
+    let svod_ir::Op::Source(svod_ir::ops::Source { code, .. }) = source.op() else { unreachable!("a SOURCE stage") };
+    Ok(code.clone())
 }
 
 /// The targets of the refactor sweep, by the names the gate files them
