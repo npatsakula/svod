@@ -328,6 +328,24 @@ fn the_source_is_the_same_every_time() {
     }
 }
 
+/// A located code object loads as its bare build does: the device's
+/// loader lays out and relocates the sections it loads alone, so the line
+/// table's `.debug_*` sections and their `R_AMDGPU_ABS32`s leave the image
+/// and the kernel descriptor as they were.
+#[test_case(AmdArch::Gfx1201, 64; "gfx1201")]
+#[test_case(AmdArch::Gfx942, 304; "gfx942")]
+fn a_located_object_loads_as_the_bare_one(arch: AmdArch, cus: u32) {
+    representatives(arch, cus).into_par_iter().for_each(|(name, prog, lowering)| {
+        let low = standalone(prog, &lowering).expect("lowers");
+        let Op::Program(ops::Program { info, .. }) = low.program.op() else { unreachable!("a PROGRAM") };
+        let [located, plain] = [code(&low.source(arch).unwrap()), bare(&low, arch)].map(|ir| {
+            let object = compile_ir_to_amd_object(&ir, arch).expect("compiles");
+            svod_device::amd::program::parse_kernel(&object, &info.function_name()).expect("loads")
+        });
+        assert!(located.image == plain.image && located.kd_offset == plain.kd_offset, "{name}");
+    });
+}
+
 fn tile_gemm(cfg: crate::kernels::gemm::GemmCfg) -> (Program, Lowering) {
     let planner = planner(amd(AmdArch::Gfx1201, 64));
     (gemm::<BF16>(&assumed(gemm_spec(4096, 4096, 4096), cfg)), cfg.lowering(&planner.device))

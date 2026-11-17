@@ -142,7 +142,7 @@ pub fn parse_kernel(bytes: &[u8], kernel_name: &str) -> Result<ParsedKernel> {
     if image.is_empty() {
         return Err(Error::Runtime { message: "AMD ELF has no SHF_ALLOC sections to load".into() });
     }
-    let _ = placements;
+    let placed: std::collections::HashSet<object::SectionIndex> = placements.iter().map(|p| p.0).collect();
 
     // ── 3. Find the kernel descriptor symbol. ────────────────────────────
     let mut kd_offset = None;
@@ -181,6 +181,10 @@ pub fn parse_kernel(bytes: &[u8], kernel_name: &str) -> Result<ParsedKernel> {
     // image offsets, the GPU jumps to garbage on dispatch, and the CP
     // stalls in SPI without launching any shader (radeontop: 100% spi,
     // 0% on TA/SH/SX/SMX/CB/DB).
+    //
+    // Only a placed section's relocations apply: a section the image does
+    // not hold (a line table's `.debug_*`, with its `R_AMDGPU_ABS32`s) has
+    // nowhere in it to be written.
     let image_offset = |idx: object::SectionIndex| -> Option<u64> {
         if let Some(&remapped) = zero_addr_remap.get(&idx) {
             return Some(remapped);
@@ -189,7 +193,7 @@ pub fn parse_kernel(bytes: &[u8], kernel_name: &str) -> Result<ParsedKernel> {
         // placed it during step 2a).
         file.section_by_index(idx).ok().map(|s| s.address())
     };
-    for section in file.sections() {
+    for section in file.sections().filter(|s| placed.contains(&s.index())) {
         let section_base = image_offset(section.index()).unwrap_or(0);
         for (sec_off, reloc) in section.relocations() {
             let r_type = match reloc.flags() {
