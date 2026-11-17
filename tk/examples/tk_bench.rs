@@ -41,9 +41,9 @@
 //!   [--out DIR] [--json] [--attribute] [--residual] [--gated]`: each config
 //!   (the tuner's pick by default, `I` the planner's `I`th) timed untraced,
 //!   then traced once on an AMD RDNA3/RDNA4 card (SQTT), its trace saved
-//!   under `DIR` (`./sqtt`) with its tile statements where a host build with
-//!   a line table compiles to the traced code (`kernel.tk`, `lines.json`;
-//!   else the `lines=mismatch` label says why), and its report printed (`--top` rows a table,
+//!   under `DIR` (`./sqtt`) with its tile statements (the traced code
+//!   object's own line table over `kernel.tk`, `lines.json`), and its
+//!   report printed (`--top` rows a table,
 //!   `--json` one line); `--attribute` (GEMM only) sets the model's terms
 //!   (`price` less each) beside the traced SIMD's cycles of their counterparts.
 //!   `sqtt attention B H T D [--causal] [--bias] [--cfg I|tuned,…]` traces
@@ -651,10 +651,9 @@ fn zeroed_terms(costs: Costs) -> [(Term, Costs); 6] {
     ]
 }
 
-/// The model of a ring over `schedule` whose trip reduces `elems` of `axis`.
-fn ring_model(axis: Axis, elems: usize, schedule: Schedule) -> Model {
-    let per_iteration = schedule.per_iteration() as u32;
-    Model { per_trip: Some(Reduction { axis, elems: elems as u64 }), per_iteration, price: None }
+/// The model of a ring whose trip reduces `elems` of `axis`.
+fn ring_model(axis: Axis, elems: usize) -> Model {
+    Model { per_trip: Some(Reduction { axis, elems: elems as u64 }), price: None }
 }
 
 /// What a GEMM trace carries for `--attribute`: the model's price of `cfg`,
@@ -676,7 +675,7 @@ fn gemm_model(planner: &Planner, [m, n, k]: [usize; 3], epilogue: Epilogue, cfg:
         blocks_per_sm: target.sms.map(|sms| blocks.div_ceil(sms as usize) as u64),
         terms: terms.into_iter().collect(),
     };
-    Model { price: Some(price), ..ring_model(Axis::K, cfg.tile[2], cfg.schedule) }
+    Model { price: Some(price), ..ring_model(Axis::K, cfg.tile[2]) }
 }
 
 fn sqtt_bench(args: &Args) -> Result<()> {
@@ -725,15 +724,11 @@ fn sqtt_bench(args: &Args) -> Result<()> {
         if opts.counters != svod_runtime::profiler::PmcSelection::None {
             profiles.iter().for_each(|p| print!("{}", p.render_table()));
         }
-        // A program's traces, and the program they ran.
-        let traces: Vec<_> = (profiles.iter().enumerate())
-            .flat_map(|(p, profile)| profile.stages.iter().flat_map(move |s| s.sqtt.iter().map(move |t| (p, t))))
-            .collect();
+        let traces: Vec<_> = profiles.iter().flat_map(|p| p.stages.iter().flat_map(|s| s.sqtt.iter())).collect();
         if traces.is_empty() {
             return Err("no thread trace: SQTT needs an AMD RDNA3/RDNA4 device (SVOD_DEVICE=AMD)".into());
         }
-        let candidate = candidate()?;
-        for (program, trace) in traces {
+        for trace in traces {
             let Raw::Saved(dir) = &trace.raw else { unreachable!("a disk sink saves") };
             if let Err(error) = &trace.analysis {
                 return Err(format!("{}: {error}", dir.display()).into());
@@ -742,15 +737,6 @@ fn sqtt_bench(args: &Args) -> Result<()> {
             capture.labels.extend(labels.clone());
             capture.model = Some(model.clone());
             capture.labels.insert("candidate_ns".into(), untraced.map_or("-".into(), |t| t.as_nanos().to_string()));
-            // The statements, from a host build with a line table whose code is the traced one.
-            match tune::twin(&candidate[program], &mut capture) {
-                Ok(()) => capture.labels.insert("lines".into(), "twin".into()),
-                Err(why) => {
-                    eprintln!("{}: no statements: {why}", dir.display());
-                    capture.labels.insert("lines.why".into(), why.to_string());
-                    capture.labels.insert("lines".into(), "mismatch".into())
-                }
-            };
             capture.save(dir)?;
             println!("saved {}", dir.display());
             sqtt_print(&capture, args, top)?;
@@ -863,7 +849,7 @@ fn attention_traced<'a>(planner: &'a Planner, [b, h, t, d]: [usize; 4], args: &A
                 ),
                 candidate: Box::new(move || Ok(candidates::attention(&admitted, &[t], &DType::BFloat16, planner))),
                 labels,
-                model: ring_model(Axis::Keys, cfg.bkv, cfg.schedule),
+                model: ring_model(Axis::Keys, cfg.bkv),
             })
         })
         .collect()
@@ -928,7 +914,7 @@ fn nearest_traced<'a>(planner: &'a Planner, [n, depth, k]: [usize; 3], args: &Ar
                 candidate: Box::new(move || Ok(candidates::nearest(planner, DType::Float16, &admitted))),
                 labels,
                 // A trip streams `bk` of the depth, or the rows' whole depth.
-                model: ring_model(Axis::Depth, cfg.bk.unwrap_or(d), cfg.schedule),
+                model: ring_model(Axis::Depth, cfg.bk.unwrap_or(d)),
             })
         })
         .collect()
@@ -994,7 +980,7 @@ fn conv_traced<'a>(
                 name: format!("conv_{h}x{w}x{cin}x{cout}k{kernel}s{stride}b{images}_{i}"),
                 candidate: Box::new(move || Ok(candidates::conv(&admitted, &DType::Float16, planner))),
                 labels,
-                model: ring_model(Axis::K, cfg.gemm.tile[2], cfg.gemm.schedule),
+                model: ring_model(Axis::K, cfg.gemm.tile[2]),
             })
         })
         .collect()
@@ -1069,7 +1055,7 @@ fn attribution(a: &Analysis) -> Result<String> {
     let per_sm = price.blocks_per_sm.map_or(f64::NAN, |b| b as f64);
     let main_loop = a.main_loop.as_ref();
     let iteration = main_loop.and_then(|l| l.cycles).map(|c| c.median as f64);
-    let unroll = main_loop.map(|l| f64::from(l.trips.per_iteration));
+    let unroll = main_loop.filter(|l| l.trips.counted).map(|l| f64::from(l.trips.per_iteration));
     let per_trip = iteration.zip(unroll).map(|(c, u)| c / u);
     writeln!(
         o,

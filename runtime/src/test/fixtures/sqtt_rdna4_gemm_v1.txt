@@ -1,12 +1,12 @@
 == sqtt gemm gfx1201 candidate_ns=147280 cfg=[256, 128, 32] s2 [4, 2] unroll=true Warp crews=1 kernel=gemm op=gemm shape=1500x1280x5120
-== verdict: cycles are a traced wave's, a trip (2 an iteration, the kernel's schedule); exposed: not hidden by other pipes' work
-ceiling    matrix pipe 74.1% busy over the steady window: removing every stall gains at most 1.35x; 464 cycles a trip queued for the matrix pipe, 14 exposed
-demand     3072 global bytes a trip a wave x 480 resident waves / 2626 cycles a trip at 1600 MHz: 898 GB/s requested from L2 and DRAM
+== verdict: cycles are a traced wave's, an iteration (no statements); exposed: not hidden by other pipes' work
+ceiling    matrix pipe 74.1% busy over the steady window: removing every stall gains at most 1.35x; 929 cycles an iteration queued for the matrix pipe, 28 exposed
+demand     6144 global bytes an iteration a wave x 480 resident waves / 5252 cycles an iteration at 1600 MHz: 898 GB/s requested from L2 and DRAM
 bound      matrix_bound       74.1%  pipes busy: matrix 74.1% valu 57.0% any 83.8% (approx: perturbed)
    knob: near the matrix pipe's throughput: only less matrix work (a cheaper type, fewer ops) helps much
 bound      occupancy_limited  16.2%  SIMD idle 16.2%: 4.0 waves a SIMD, ~4.8 would fill it; limit unknown (approx: perturbed)
    knob: more resident waves would fill the idle cycles; the capture records no resources to tell what limits them
- 1 barrier             5.4% (raw 27.4%)  barrier (sink): 719/trip parked for the workgroup's slowest wave, 142 exposed; this is other findings' time, fix those first (approx: perturbed)
+ 1 barrier             5.4% (raw 27.4%)  barrier (sink): 1438/iteration parked for the workgroup's slowest wave, 283 exposed; this is other findings' time, fix those first (approx: perturbed, per_iteration)
    0x964 arrived last 158/632 (25%), after 0x7e8 v_wmma_f32_16x16x16_bf16 v[121:128], v[180:183], v[184:187], v[121:128] x157; 0x944 s_wait_loadcnt 0x1 x1
    0xbcc arrived last 152/632 (24%), after 0xa3c v_wmma_f32_16x16x16_bf16 v[121:128], v[180:183], v[184:187], v[121:128] x140; 0xb68 s_wait_loadcnt 0x5 x6; 0xb98 s_wait_loadcnt 0x1 x6
    knob: drop or merge a barrier only if its exposed share passes 10%
@@ -42,32 +42,32 @@ se3        120.0/120 (p95 120) over 99% of the span; 30 SIMDs 4.0/4
 == main loop 0x6ac..=0xbd0 (matrix)
 iterations/wave  min 79 med 79 max 79 (waves 8)
 cycles/iteration min 4809 med 4825 p90 5839 max 11078 (n 624)
-trips      2 an iteration (the kernel's schedule), 1264 in the loop over 8 waves
-== main loop cycles a trip: a traced wave's, each cycle once (issue, stall and idle by class); exposed: less what other pipes hid
+trips      1 an iteration (no statements: per-trip figures are per iteration), 632 in the loop over 8 waves
+== main loop cycles an iteration: a traced wave's, each cycle once (issue, stall and idle by class); exposed: less what other pipes hid
 bucket                     all   share   exposed   share       se0       se1
-issue matrix             483.0   18.4%     483.0   18.4%     483.0     483.0
-issue valu                 5.0    0.2%       5.0    0.2%       5.0       5.0
-issue salu                 1.0    0.0%       0.4    0.0%       1.0       1.0
-issue lds                 42.1    1.6%      13.7    0.5%      42.3      42.0
-issue vmem_load           10.0    0.4%      10.0    0.4%      10.0      10.0
-issue branch               0.5    0.0%       0.5    0.0%       0.5       0.5
-issue immediate            1.5    0.1%       0.4    0.0%       1.5       1.5
-stall matrix               1.5    0.1%       0.0    0.0%       1.5       1.5
+issue matrix             966.0   18.4%     966.0   18.4%     965.9     966.1
+issue valu                10.0    0.2%      10.0    0.2%      10.0      10.0
+issue salu                 2.0    0.0%       0.7    0.0%       2.0       2.0
+issue lds                 84.3    1.6%      27.4    0.5%      84.6      83.9
+issue vmem_load           20.0    0.4%      20.0    0.4%      20.0      20.0
+issue branch               1.0    0.0%       1.0    0.0%       1.0       1.0
+issue immediate            3.0    0.1%       0.8    0.0%       3.0       3.0
+stall matrix               3.0    0.1%       0.0    0.0%       3.0       3.1
 stall valu                 0.0    0.0%       0.0    0.0%       0.0       0.0
-stall lds                266.2   10.1%      43.9    1.7%     266.2     266.2
-stall vmem_load           25.4    1.0%       0.0    0.0%      25.4      25.4
-stall immediate            2.0    0.1%       1.0    0.0%       2.0       2.0
-wait load                291.5   11.1%     118.1    4.5%     307.5     275.5
-wait ds                   35.4    1.3%       0.0    0.0%      35.4      35.4
-wait ds store             61.1    2.3%      10.8    0.4%      58.7      63.5
-barrier                  719.2   27.4%     141.7    5.4%     712.9     725.6
-idle matrix              464.5   17.7%      14.2    0.5%     464.5     464.5
-idle valu                 45.8    1.7%      31.6    1.2%      45.8      45.8
-idle salu                  4.0    0.2%       1.4    0.1%       4.0       4.0
-idle lds                 156.4    6.0%      22.4    0.9%     152.7     160.1
-idle vmem_load             9.7    0.4%       3.4    0.1%       9.7       9.7
+stall lds                532.4   10.1%      87.8    1.7%     532.4     532.4
+stall vmem_load           50.8    1.0%       0.0    0.0%      50.8      50.8
+stall immediate            4.0    0.1%       2.0    0.0%       4.0       4.0
+wait load                582.9   11.1%     236.1    4.5%     614.9     550.9
+wait ds                   70.8    1.3%       0.0    0.0%      70.8      70.8
+wait ds store            122.2    2.3%      21.6    0.4%     117.4     127.1
+barrier                 1438.5   27.4%     283.5    5.4%    1425.7    1451.2
+idle matrix              928.9   17.7%      28.4    0.5%     929.0     928.9
+idle valu                 91.6    1.7%      63.2    1.2%      91.6      91.7
+idle salu                  8.0    0.2%       2.8    0.1%       8.0       7.9
+idle lds                 312.8    6.0%      44.7    0.9%     305.4     320.1
+idle vmem_load            19.5    0.4%       6.8    0.1%      19.5      19.5
 idle barrier               0.0    0.0%       0.0    0.0%       0.0       0.0
-total                   2625.8  100.0%     901.4   34.3%    2629.4    2622.2
+total                   5251.6  100.0%    1802.8   34.3%    5258.9    5244.4
 == main loop: top 8 by stall
       pc    hits    cycles   lat/hit stall/hit  expo/hit  asm
    0x964     632    450131     712.2     711.2      65.8  s_barrier_wait 0xffff

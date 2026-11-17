@@ -232,16 +232,6 @@ impl Lowered {
         at
     }
 
-    /// The LLVM text `renderer` (a device's own) makes of the program under
-    /// the name a device renders it by, its PROGRAM's function name, with a
-    /// line table over [`Self::listing`]: a device kernel's twin.
-    pub fn located_text_by(&self, renderer: LlvmTextRenderer) -> Result<String> {
-        let Op::Program(ops::Program { info, .. }) = self.program.op() else { unreachable!("emit returns a PROGRAM") };
-        let name = info.function_name();
-        let renderer = renderer.locations(self.locations(), self.listing());
-        Ok(renderer.render(&self.linear, Some(&name)).context(RenderSnafu { name })?.code)
-    }
-
     /// The PROGRAM an AMD device of `arch` compiles: its SOURCE stage
     /// rendered here, by the device's renderer with a line table over
     /// [`Self::listing`] and the listing itself as `kernel.tk`'s DWARF 5

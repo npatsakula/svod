@@ -128,20 +128,6 @@ fn in_param_order(placeholders: &[Arc<UOp>], out_at: usize) -> Vec<Arc<UOp>> {
         .collect()
 }
 
-/// `prog` lowered for its target alone over the parameters a launch on that
-/// device binds (unlike [`lower::standalone`]'s, numbered `[out, ins...]`):
-/// the kernel [`graph_launch_once`] compiles there, whatever tensors it runs on.
-pub(crate) fn lowered_as_launched(prog: Program, lowering: &Lowering) -> lower::Result<lower::Lowered> {
-    let out_at = first_output(&prog);
-    let order = std::iter::once(out_at).chain((0..prog.params.len()).filter(|&i| i != out_at));
-    let placeholders = order
-        .enumerate()
-        .map(|(slot, i)| UOp::param(slot, prog.params[i].elems, svod_dtype::DType::Scalar(prog.params[i].dtype), None))
-        .collect::<Vec<_>>();
-    let device = lower::standalone_device(lowering);
-    lower::lower(prog, lowering, in_param_order(&placeholders, out_at), device)
-}
-
 /// [`graph_launch`] returning every parameter's tensor as it is after the
 /// kernel, in `prog.params()` order, so programs with several outputs can be read.
 pub fn graph_launch_all(prog: Program, lowering: &Lowering, tensors: &[&Tensor]) -> Result<Vec<Tensor>> {

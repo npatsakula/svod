@@ -13,13 +13,11 @@ use test_case::test_case;
 use svod_device::amd::occupancy::Limiter;
 
 use super::compare::align;
-use super::lines::text_section;
 use super::statements::rollup;
 use super::verdict::{Buckets, Charge, load_bytes};
 use super::{
     Analysis, Approx, Axis, Bucket, Capture, Caution, Class, Delta, Diff, Evidence, Finding, FindingKind, Knob,
-    LineRow, Lines, LoopRow, Partition, Pstate, Reduction, Spread, Statement, Statements, Stmt, TwinError, Unit,
-    WaitOn, locate, parse_debug_line, same_text,
+    LineRow, Lines, LoopRow, Partition, Pstate, Reduction, Spread, Statement, Statements, Stmt, Unit, WaitOn, locate,
 };
 
 fn fixtures() -> PathBuf {
@@ -124,7 +122,7 @@ fn summarizes(fixture: &str) {
         l.ses.iter().for_each(|s| sum.add(&s.partition));
         assert_eq!(&sum, p, "the SEs' partitions add up");
         let edges = a.pcs.iter().find(|r| r.pc == l.back_edge).unwrap().hits;
-        assert_eq!((l.trips.total, l.trips.per_iteration), (edges, 1), "no model: per iteration");
+        assert_eq!((l.trips.total, l.trips.per_iteration), (edges, 1), "no statements: per iteration");
         assert!(a.verdict.findings.iter().all(|f| f.approx.contains(&Approx::PerIteration)), "{:?}", a.verdict);
     }
 }
@@ -466,8 +464,9 @@ fn verdict_of(name: &str) -> Analysis {
     Analysis::load(&fixtures().join("svod").join(name)).unwrap()
 }
 
-/// The VALU and SALU cycles a trip in the main loop, their stall included.
-fn alu_per_trip(a: &Analysis) -> f64 {
+/// The VALU and SALU cycles a unit of the main loop (a trip, or an iteration where its trips are not
+/// counted), their stall included.
+fn alu_per_unit(a: &Analysis) -> f64 {
     let l = a.main_loop.as_ref().unwrap();
     let alu = [Class::Valu, Class::Salu];
     (l.partition.issued(&alu)[0] + l.partition.stalled(&alu)[0]) as f64 / l.trips.total as f64
@@ -490,26 +489,29 @@ fn load_share(a: &Analysis) -> f64 {
 }
 
 /// svod's ring GEMM, its 1500- and 1536-row twins and the Strix GEMM all run 160 K-trips of 32,
-/// their 2-slot ring unrolled: 2 trips an iteration. v1, v3 and Strix pinned the clock at the standard pstate and ran over 1.2x the
-/// untraced time; the 1500 and 1536 captures ran unpinned at 1.04x.
-#[test_case("rdna4_gemm_v1", Some(Pstate::Standard))]
-#[test_case("rdna4_gemm_v3", Some(Pstate::Standard))]
-#[test_case("rdna4_gemm_1500", Some(Pstate::Unpinned))]
-#[test_case("rdna4_gemm_1536", Some(Pstate::Unpinned))]
-#[test_case("strix_smoke", Some(Pstate::Standard))]
-fn verdict_reads_the_capture(name: &str, pstate: Option<Pstate>) {
+/// their 2-slot ring unrolled: 2 trips an iteration, where the code object's statements count them
+/// (`trips`), else a trip is taken as an iteration and every loop finding says so. v1, v3 and Strix
+/// pinned the clock at the standard pstate and ran over 1.2x the untraced time; the 1500 and 1536
+/// captures ran unpinned at 1.04x.
+#[test_case("rdna4_gemm_v1", Some(Pstate::Standard), 1)]
+#[test_case("rdna4_gemm_v3", Some(Pstate::Standard), 1)]
+#[test_case("rdna4_gemm_1500", Some(Pstate::Unpinned), 1)]
+#[test_case("rdna4_gemm_1536", Some(Pstate::Unpinned), 1)]
+#[test_case("strix_smoke", Some(Pstate::Standard), 1)]
+fn verdict_reads_the_capture(name: &str, pstate: Option<Pstate>, trips: u32) {
     let a = verdict_of(name);
     let t = a.main_loop.as_ref().unwrap().trips;
     let model = a.model.as_ref().unwrap();
     assert_eq!(model.per_trip, Some(Reduction { axis: Axis::K, elems: 32 }));
-    assert_eq!((t.per_iteration, model.price.as_ref().unwrap().trips), (2, 160));
+    assert_eq!((t.per_iteration, t.counted, model.price.as_ref().unwrap().trips), (trips, trips > 1, 160));
     let edges = a.pcs.iter().find(|r| r.pc == a.main_loop.as_ref().unwrap().back_edge).unwrap().hits;
-    assert_eq!(t.total, 2 * edges);
+    assert_eq!(t.total, u64::from(trips) * edges);
     assert_eq!(a.pstate, pstate);
     let perturbed = pstate == Some(Pstate::Standard);
     let all = a.verdict.bound.iter().chain(&a.verdict.findings);
     assert!(all.clone().all(|f| f.approx.contains(&Approx::Perturbed) == perturbed), "{:?}", a.verdict);
-    assert!(!all.clone().any(|f| f.approx.contains(&Approx::PerIteration)), "{:?}", a.verdict);
+    let per_iteration = |f: &Finding| f.approx.contains(&Approx::PerIteration);
+    assert!(a.verdict.findings.iter().all(|f| per_iteration(f) != t.counted), "{:?}", a.verdict);
     assert!(a.verdict.findings.iter().all(|f| f.share <= f.raw + 1e-12), "exposed within raw: {:?}", a.verdict);
     let l = a.main_loop.as_ref().unwrap();
     let signals: Vec<u64> = a.pcs.iter().filter(|r| r.asm.starts_with("s_barrier_signal")).map(|r| r.pc).collect();
@@ -563,8 +565,8 @@ fn v3_waits_right_behind_its_load() {
     let consumer = "v_cndmask_b32_e64 v147, 0, v147, s1".to_string();
     assert_eq!(top.knob, Knob::MoveUse { wait: 0xab0, load: 0xa64, consumer });
     assert!(!v3.verdict.findings[1..].iter().any(|f| f.share >= 0.10), "{:?}", v3.verdict.findings);
-    let added = alu_per_trip(&v3) - alu_per_trip(&v1);
-    assert!((260.0..300.0).contains(&added), "v3's guards: {added:.1} VALU+SALU cycles a trip");
+    let added = alu_per_unit(&v3) - alu_per_unit(&v1);
+    assert!((520.0..600.0).contains(&added), "v3's guards: {added:.1} VALU+SALU cycles an iteration, two trips");
 }
 
 /// The 1500-row GEMM guards its staged fill's rows: 8 exec branches in the loop, ~11 VALU ops a
@@ -932,30 +934,34 @@ fn finding_delta(d: &Diff, kind: FindingKind) -> [Option<f64>; 2] {
     d.findings.iter().find(|f| f.kind == kind).map_or([None; 2], |f| f.share)
 }
 
-/// The same GEMM at the same pinned clock: v3's zero-select on loaded data pulls the ring fill's
-/// wait up behind its load (+~740 load-wait cycles a trip, ~600 of them exposed) and inserts 34
-/// `v_cndmask` rows (17 ops a trip, ~250 cycles a trip with their stall); load_exposed appears.
+/// The same GEMM at the same pinned clock, its figures an iteration of two trips (neither capture
+/// counts them): v3's zero-select on loaded data pulls the ring fill's wait up behind its load
+/// (+~740 load-wait cycles a trip, ~600 of them exposed) and inserts 34 `v_cndmask` rows (17 ops a
+/// trip, ~250 cycles a trip with their stall); load_exposed appears.
 #[test]
 fn compare_v1_v3_shows_the_select() {
     let d = compared("rdna4_gemm_v1", "rdna4_gemm_v3");
-    assert_eq!(d.unit, Unit::Trip);
+    assert_eq!(d.unit, Unit::Iteration);
     assert!(d.cautions.is_empty(), "both standard, ratios 1.60x and 1.74x: {:?}", d.cautions);
     let wait = bucket(&d, "wait load");
-    assert!((280.0..300.0).contains(&wait.raw[0]) && (1020.0..1045.0).contains(&wait.raw[1]), "{wait:?}");
-    assert!((720.0..760.0).contains(&wait.delta_raw()) && (580.0..620.0).contains(&wait.delta_exposed()), "{wait:?}");
+    assert!((560.0..600.0).contains(&wait.raw[0]) && (2040.0..2090.0).contains(&wait.raw[1]), "{wait:?}");
+    assert!(
+        (1440.0..1520.0).contains(&wait.delta_raw()) && (1160.0..1240.0).contains(&wait.delta_exposed()),
+        "{wait:?}"
+    );
     let load = WaitOn { counter: Counter::Load, store: false };
     assert_eq!(d.buckets[0].bucket, Bucket::Wait(load), "the largest exposed delta leads");
     let total = d.total.unwrap();
     let sum = |side: usize| d.buckets.iter().map(|b| b.delta.raw[side]).sum::<f64>();
     assert!((total.raw[0] - sum(0)).abs() < 1e-6 && (total.raw[1] - sum(1)).abs() < 1e-6, "{total:?}");
     let alu = ["issue valu", "stall valu", "issue salu"].map(|n| bucket(&d, n).delta_raw()).iter().sum::<f64>();
-    assert!((260.0..300.0).contains(&alu), "v3's guards: {alu:.1} VALU+SALU cycles a trip");
+    assert!((520.0..600.0).contains(&alu), "v3's guards: {alu:.1} VALU+SALU cycles an iteration");
     let cnd: Vec<&LoopRow> = d.rows.inserted.iter().filter(|r| r.asm.starts_with("v_cndmask_b32")).collect();
     let (ops, cycles) = cnd.iter().fold((0.0, 0.0), |(h, c), r| (h + r.hits, c + r.cycles));
     assert_eq!(cnd.len(), 34);
-    assert!((ops - 17.0f64).abs() < 1e-9 && (250.0..300.0).contains(&cycles), "{ops} ops, {cycles:.1} cycles");
+    assert!((ops - 34.0f64).abs() < 1e-9 && (500.0..600.0).contains(&cycles), "{ops} ops, {cycles:.1} cycles");
     let valu: f64 = d.rows.inserted.iter().filter(|r| r.class == Class::Valu).map(|r| r.hits).sum();
-    assert!((30.0..40.0).contains(&valu), "v1's 5 VALU ops a trip grow to 40: {valu} inserted");
+    assert!((60.0..80.0).contains(&valu), "v1's 10 VALU ops an iteration grow to 80: {valu} inserted");
     assert!(!d.rows.matched.iter().any(|[a, _]| a.asm.starts_with("v_cndmask")), "v1's loop has no select");
     assert!(d.rows.matched.iter().all(|[a, b]| a.asm.split(' ').next() == b.asm.split(' ').next()));
     assert!(matches!(finding_delta(&d, FindingKind::LoadExposed), [None, Some(s)] if s > 0.10));
@@ -990,13 +996,15 @@ fn compare_with_itself_is_empty() {
     assert!(d.findings.iter().all(|f| f.share[0] == f.share[1]));
 }
 
-/// Different clocks and perturbation, and trips over different K: each named in the header.
+/// Different clocks and perturbation, and trips over different K: each named in the header; a side
+/// that does not count its trips puts both an iteration.
 #[test]
 fn compare_cautions() {
-    let (v1, control) = (verdict_of("rdna4_gemm_v1"), verdict_of("rdna4_gemm_1536"));
-    let d = v1.compare(&control);
+    let (v1, plain) = (verdict_of("rdna4_gemm_v1"), verdict_of("rdna4_gemm_1536"));
+    let d = v1.compare(&plain);
     assert!(d.cautions.contains(&Caution::Pstate { a: Some(Pstate::Standard), b: Some(Pstate::Unpinned) }));
     assert!(d.cautions.iter().any(|c| matches!(c, Caution::Slowdown { .. })), "{:?}", d.cautions);
+    let control = with_lines(Capture::load(&fixtures().join("svod/rdna4_gemm_1536")).unwrap()).analyze().unwrap();
     let mut wide = control.clone();
     let k = |elems| Some(Reduction { axis: Axis::K, elems });
     wide.model.as_mut().unwrap().per_trip = k(64);
@@ -1004,9 +1012,7 @@ fn compare_cautions() {
     assert_eq!(d.cautions, [Caution::TripsDiffer { a: k(32).unwrap(), b: k(64).unwrap() }]);
     let text = d.text(4);
     assert!(text.contains("Δ/k exp") && text.contains("!! TRIPS differ: 32 K vs 64 K elements a trip"), "{text}");
-    let mut unlabelled = control.clone();
-    unlabelled.model = None;
-    let d = control.compare(&unlabelled);
+    let d = control.compare(&plain);
     assert_eq!(d.unit, Unit::Iteration);
     assert_eq!(d.a.units * 2, control.main_loop.as_ref().unwrap().trips.total);
     let text = d.text(4);
@@ -1063,41 +1069,16 @@ proptest! {
     }
 }
 
-const DWARFDUMP: &str = "\
-.debug_line contents:
-debug_line[0x00000000]
-Line table prologue:
-    total_length: 0x000006f5
-include_directories[  0] = \"\"
-file_names[  0]:
-           name: \"kernel.tk\"
-
-Address            Line   Column File   ISA Discriminator OpIndex Flags
------------------- ------ ------ ------ --- ------------- ------- -------------
-0x0000000000000000      3      0      0   0             0       0  is_stmt prologue_end
-0x000000000000004c      4      2      0   0             0       0  is_stmt
-0x0000000000000050      0      0      0   0             0       0
-0x0000000000000058      7      1      0   0             0       0  is_stmt
-0x0000000000000060      7      1      0   0             0       0  is_stmt end_sequence
-";
-
-#[test]
-fn parses_debug_line_rows() {
+/// A line table's rows: one sequence over 0x0..0x60, line 0 at 0x50.
+fn rows() -> Vec<LineRow> {
     let row = |address, line, column, end| LineRow { address, line, column, end };
-    assert_eq!(
-        parse_debug_line(DWARFDUMP),
-        [
-            row(0, 3, 0, false),
-            row(0x4c, 4, 2, false),
-            row(0x50, 0, 0, false),
-            row(0x58, 7, 1, false),
-            row(0x60, 7, 1, true)
-        ]
-    );
-    // LLVM before 17 prints no OpIndex column; the rows read the same.
-    let old = "0x0000000000000010      9      3      0   0             0  is_stmt\n";
-    assert_eq!(parse_debug_line(old), [row(0x10, 9, 3, false)]);
-    assert!(parse_debug_line("Address Line Column\n---- ----\n").is_empty());
+    vec![
+        row(0, 3, 0, false),
+        row(0x4c, 4, 2, false),
+        row(0x50, 0, 0, false),
+        row(0x58, 7, 1, false),
+        row(0x60, 7, 1, true),
+    ]
 }
 
 /// The statement on `line`, unroll copy `copy`.
@@ -1113,7 +1094,7 @@ fn stmt(line: u32, copy: u32) -> Stmt {
 #[test_case(0x60, None; "the sequence's end")]
 #[test_case(0x64, None; "past it")]
 fn locates_an_instruction(pc: u64, at: Option<(u32, u32)>) {
-    assert_eq!(locate(&parse_debug_line(DWARFDUMP), [pc]).get(&pc).copied(), at.map(|(l, c)| stmt(l, c)));
+    assert_eq!(locate(&rows(), [pc]).get(&pc).copied(), at.map(|(l, c)| stmt(l, c)));
 }
 
 /// Two sequences meeting at one address: the second's start wins over the first's end.
@@ -1123,24 +1104,6 @@ fn a_sequence_start_wins_over_an_end() {
     let rows = [row(0x20, 5, false), row(0x0, 2, false), row(0x20, 0, true), row(0x40, 0, true)];
     let want = Lines::from([(0x10, stmt(2, 0)), (0x20, stmt(5, 0)), (0x30, stmt(5, 0))]);
     assert_eq!(locate(&rows, [0x10, 0x20, 0x30, 0x40]), want);
-}
-
-#[test]
-fn a_text_mismatch_names_the_first_byte() {
-    let elf = capture("gfx1200/gemm").trace.code.elf.to_vec();
-    let (at, text) = text_section(&elf).unwrap();
-    assert_eq!(same_text(&elf, &elf).unwrap(), (at, at));
-    let offset = elf.windows(text.len()).position(|w| w == text).unwrap();
-    let mut other = elf.clone();
-    other[offset + 8] ^= 1;
-    assert_eq!(at, 0x1700, "a linked object's .text sits past its headers");
-    let n = text.len();
-    let differs = same_text(&elf, &other);
-    assert!(matches!(differs, Err(TwinError::TextDiffers { captured, twin, at: 8 }) if captured == n && twin == n));
-    assert!(matches!(same_text(&elf, b"not an elf"), Err(TwinError::NoText)));
-    let mut c = capture("gfx1200/gemm");
-    assert!(matches!(c.attach_twin(&other, "listing"), Err(TwinError::TextDiffers { .. })));
-    assert_eq!(c.statements, None, "the capture left as it was");
 }
 
 /// Synthetic statements over a capture's instructions, by what they do: products, global loads,

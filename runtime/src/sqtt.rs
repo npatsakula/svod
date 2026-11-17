@@ -28,10 +28,7 @@ mod lines;
 mod statements;
 mod verdict;
 pub use compare::{BucketDelta, Caution, Delta, Diff, FindingDelta, LoopRow, Rows, Side, StatementDelta, Unit};
-pub use lines::{
-    DwarfError, LISTING, LineRow, LineTable, Lines, Statements, Stmt, TwinError, debug_line, line_table, locate,
-    parse_debug_line, same_text,
-};
+pub use lines::{DwarfError, LISTING, LineRow, LineTable, Lines, Statements, Stmt, line_table, locate};
 pub use statements::Statement;
 pub use verdict::{
     Approx, BarrierSite, Bucket, Ceiling, Demand, Evidence, Finding, FindingKind, Findings, Knob, Load, Partition,
@@ -210,13 +207,11 @@ pub struct Price {
     pub terms: BTreeMap<Term, f64>,
 }
 
-/// What a tk kernel's program says of its main loop: the reduction a trip covers, the trips one
-/// iteration runs (its ring's depth where the loop is unrolled over the slots), and, for a GEMM, the
-/// planner's price.
+/// What a tk kernel's program says of its main loop: the reduction a trip covers and, for a GEMM,
+/// the planner's price.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Model {
     pub per_trip: Option<Reduction>,
-    pub per_iteration: u32,
     pub price: Option<Price>,
 }
 
@@ -547,14 +542,17 @@ pub struct MainLoop {
     pub statements: Vec<Statement>,
 }
 
-/// The unit per-trip figures are in: a trip of the kernel's reduction where the capture has a
-/// [`Model`], else one loop iteration.
+/// The unit per-trip figures are in: a trip of the kernel's main loop where its instructions carry
+/// statements, else one loop iteration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Trips {
-    /// Trips an iteration runs: [`Model::per_iteration`], else 1.
+    /// Trips an iteration runs: the largest unroll copy ([`Stmt::copy`]) among the loop's
+    /// statements, at least 1; 1 where they have none.
     pub per_iteration: u32,
     /// Trips the traced waves ran in the loop: their back-edge executions times `per_iteration`.
     pub total: u64,
+    /// Whether `per_iteration` is the loop's statements' (else a trip is taken as an iteration).
+    pub counted: bool,
 }
 
 /// One traced SE's waves in the main loop.
@@ -790,7 +788,6 @@ impl Analysis {
             .zip(capture.resources)
             .zip(capture.workgroup)
             .and_then(|((cu, resources), workgroup)| limits(&resources, workgroup.iter().product(), &cu));
-        let per_iteration = capture.model.as_ref().map_or(1, |m| m.per_iteration.max(1));
         let replay = Replay::new(&waves, &lines, layout, base);
         let mut bound: Vec<HashMap<usize, (Counter, u64)>> = vec![HashMap::new(); waves.len()];
         for (wave, seq, counter, pc) in replay.bound() {
@@ -805,7 +802,7 @@ impl Analysis {
         let listing: Vec<String> =
             capture.statements.iter().flat_map(|s| s.listing.lines()).map(str::to_string).collect();
         let statements = capture.statements.as_ref().map(|s| (&s.lines, listing.as_slice()));
-        let main_loop = main_loop(&lines, &pcs, traced_waves, &replay, per_iteration, base, statements);
+        let main_loop = main_loop(&lines, &pcs, traced_waves, &replay, base, statements);
         let mut analysis = Self {
             kernel: kernel.to_string(),
             arch: capture.trace.arch.to_string(),
@@ -940,7 +937,7 @@ impl Analysis {
                 };
                 let _ = writeln!(o, "iterations/wave  {}", spread(l.iterations, false));
                 let _ = writeln!(o, "cycles/iteration {}", spread(l.cycles, true));
-                partition_text(&mut o, l, self.model.is_some());
+                partition_text(&mut o, l);
                 statements::text(self, &mut o, top);
                 let mut rows: Vec<&Row> = self.loop_rows().collect();
                 rows.sort_by_key(|r| (std::cmp::Reverse(r.stall), r.pc));
@@ -1077,15 +1074,15 @@ impl Analysis {
 }
 
 /// The main loop's partition a trip: every bucket, raw and exposed, its shares, and each traced SE's.
-fn partition_text(o: &mut String, l: &MainLoop, modelled: bool) {
+fn partition_text(o: &mut String, l: &MainLoop) {
     use std::fmt::Write;
     let t = l.trips;
-    let unit = if modelled { "a trip" } else { "an iteration" };
+    let unit = if t.counted { "a trip" } else { "an iteration" };
     let _ = writeln!(
         o,
         "trips      {} an iteration ({}), {} in the loop over {} waves",
         t.per_iteration,
-        if modelled { "the kernel's schedule" } else { "no model: per-trip figures are per iteration" },
+        if t.counted { "its statements' unroll copies" } else { "no statements: per-trip figures are per iteration" },
         t.total,
         l.partition.waves
     );
@@ -1133,13 +1130,12 @@ struct SeWaves<'a> {
 /// The innermost executed backward branch whose span issues a matrix instruction, else the most
 /// executed one; its waves' trips and the cycles between their back edges, and how the traced waves'
 /// cycles in it split, SE by SE, and by the statement `stmts` gives each instruction; an iteration
-/// runs `per_iteration` trips.
+/// runs as many trips as the largest unroll copy among its statements ([`Trips`]).
 fn main_loop<'a>(
     lines: &[(u64, &str)],
     pcs: &BTreeMap<u64, Stats>,
     ses: impl Iterator<Item = SeWaves<'a>> + Clone,
     replay: &Replay,
-    per_iteration: u32,
     base: u64,
     stmts: Option<(&Lines, &[String])>,
 ) -> Option<MainLoop> {
@@ -1164,6 +1160,11 @@ fn main_loop<'a>(
         }
     }
     let iterations = Spread::of(trips);
+    let body: Vec<u64> =
+        lines.iter().map(|l| l.0).filter(|pc| (head..=edge).contains(pc)).map(|pc| pc - base).collect();
+    let copies =
+        stmts.map_or(vec![], |(stmts, _)| body.iter().filter_map(|pc| stmts.get(pc)).map(|s| s.copy).collect());
+    let per_iteration = copies.iter().copied().max().unwrap_or(1).max(1);
     let buckets = verdict::Buckets::new(lines);
     let (mut sites, mut charges) = (vec![], BTreeMap::<u64, verdict::Charge>::new());
     let ses: Vec<SeLoop> = ses
@@ -1180,10 +1181,10 @@ fn main_loop<'a>(
         .collect();
     let mut partition = Partition::default();
     ses.iter().for_each(|s| partition.add(&s.partition));
-    let trips = Trips { per_iteration, total: ses.iter().map(|s| s.trips).sum() };
-    let body = lines.iter().map(|l| l.0).filter(|pc| (head..=edge).contains(pc)).map(|pc| pc - base);
-    let statements =
-        stmts.map_or(vec![], |(stmts, listing)| statements::rollup(&charges, body, stmts, listing, trips.total));
+    let trips = Trips { per_iteration, total: ses.iter().map(|s| s.trips).sum(), counted: !copies.is_empty() };
+    let statements = stmts.map_or(vec![], |(stmts, listing)| {
+        statements::rollup(&charges, body.iter().copied(), stmts, listing, trips.total)
+    });
     Some(MainLoop {
         head: head - base,
         back_edge: edge - base,

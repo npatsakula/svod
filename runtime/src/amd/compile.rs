@@ -148,7 +148,7 @@ pub(crate) fn amd_object_key(
 }
 
 /// [`compile_ir_to_amd_object`] with the flags a clang of LLVM `llvm_major`
-/// compiles with ([`amd_object_flags`]: the machine-sink gate), by this
+/// compiles with (the machine-sink gate among them), by this
 /// host's clang: what proves a change of the IR leaves the code alone on
 /// either side of the gate.
 ///

@@ -19,9 +19,9 @@ pub use compile::{
 use svod_codegen::llvm::LlvmTextRenderer;
 use svod_dtype::AmdArch;
 
-/// The renderer an AMD device renders every kernel with: a host build of a
-/// device kernel (an SQTT capture's line-table twin) renders through it, so
-/// the two cannot drift apart.
+/// The renderer an AMD device renders every kernel with: a kernel rendered
+/// ahead for the device ([`LocatedAmd`], a tk kernel with its line table)
+/// renders through it, so the two cannot drift apart.
 pub fn renderer(arch: AmdArch) -> LlvmTextRenderer {
     LlvmTextRenderer::amd(arch)
 }

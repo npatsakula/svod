@@ -115,7 +115,7 @@ impl Analysis {
 /// The main loop's statements, `top` most exposed and the unattributed.
 pub(super) fn text(a: &Analysis, o: &mut String, top: usize) {
     let Some(l) = a.main_loop.as_ref().filter(|l| !l.statements.is_empty()) else { return };
-    let unit = if a.model.is_some() { "a trip" } else { "an iteration" };
+    let unit = if l.trips.counted { "a trip" } else { "an iteration" };
     let (pcs, unattributed) =
         l.statements.iter().fold((0, 0), |(n, u), s| (n + s.pcs, u + if s.line.is_none() { s.pcs } else { 0 }));
     let _ = writeln!(

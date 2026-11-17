@@ -47,9 +47,11 @@ pub struct Side {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Unit {
-    /// A trip of the reduction (both captures have a model).
+    /// A trip of the main loop (both captures count their trips, [`Trips::counted`]).
+    ///
+    /// [`Trips::counted`]: super::Trips::counted
     Trip,
-    /// A loop iteration: a capture has no model.
+    /// A loop iteration: a capture does not count its trips.
     Iteration,
 }
 
@@ -323,7 +325,8 @@ fn findings(a: &Analysis, b: &Analysis) -> Vec<FindingDelta> {
 impl Analysis {
     /// `b` against `self` (A): Δ is B − A, every loop figure a unit of each side's own.
     pub fn compare(&self, b: &Self) -> Diff {
-        let unit = if self.model.is_some() && b.model.is_some() { Unit::Trip } else { Unit::Iteration };
+        let counted = |a: &Self| a.main_loop.as_ref().is_some_and(|l| l.trips.counted);
+        let unit = if counted(self) && counted(b) { Unit::Trip } else { Unit::Iteration };
         let (sa, sb) = (side(self, unit), side(b, unit));
         let mut cautions = vec![];
         if sa.pstate != sb.pstate {
@@ -442,7 +445,7 @@ impl Diff {
             };
         }
         if self.unit == Unit::Iteration {
-            let _ = writeln!(o, "note       no model on a side: figures are per loop iteration");
+            let _ = writeln!(o, "note       no statements on a side: figures are per loop iteration");
         }
         let occupancy = |s: &Side| s.occupancy.map_or("-".into(), |w| format!("{w:.1}"));
         let limit = |s: &Side| {

@@ -449,8 +449,8 @@ pub enum Approx {
     ImplausibleTime,
     /// An SE's buffer filled and its tail is lost: the sums undercount.
     Truncated,
-    /// The capture has no [`Model`](super::Model): a trip is taken as one loop iteration, whatever
-    /// the iteration unrolls.
+    /// The main loop's instructions carry no statements: a trip is taken as one loop iteration,
+    /// whatever the iteration unrolls.
     PerIteration,
 }
 
@@ -843,10 +843,11 @@ pub(super) fn rank(a: &Analysis) -> Verdict {
         base.into_iter().flatten().chain(more.iter().copied()).collect::<Vec<_>>()
     };
     let raw_flag: &[Approx] = if untimed { &[Approx::UntimedMatrix] } else { &[] };
-    // A loop finding's figures are a trip's: an iteration's where no model says what a trip is.
+    // A loop finding's figures are a trip's: an iteration's where no statements count its trips.
+    let uncounted = !a.main_loop.as_ref().is_some_and(|l| l.trips.counted);
     let per_trip = |more: &[Approx]| {
-        let unmodelled = a.model.is_none().then_some(Approx::PerIteration);
-        approx(&more.iter().copied().chain(unmodelled).collect::<Vec<_>>())
+        let uncounted = uncounted.then_some(Approx::PerIteration);
+        approx(&more.iter().copied().chain(uncounted).collect::<Vec<_>>())
     };
     let finding = |kind, (share, raw), evidence, knob, approx| Finding { kind, share, raw, evidence, knob, approx };
     let mut v = Verdict { demand: demand(a), ..Verdict::default() };
@@ -991,10 +992,10 @@ fn pct(share: f64) -> f64 {
 /// knob, then what makes them approximate.
 pub(super) fn text(a: &Analysis, o: &mut String) {
     let (unit, of) = match &a.main_loop {
-        Some(l) if a.model.is_some() => {
-            ("trip", format!("a trip ({} an iteration, the kernel's schedule)", l.trips.per_iteration))
+        Some(l) if l.trips.counted => {
+            ("trip", format!("a trip ({} an iteration, its statements' unroll copies)", l.trips.per_iteration))
         }
-        Some(_) => ("iteration", "an iteration (no model)".into()),
+        Some(_) => ("iteration", "an iteration (no statements)".into()),
         None => ("trip", "- (no main loop)".into()),
     };
     let a_unit = if unit == "trip" { "a trip" } else { "an iteration" };

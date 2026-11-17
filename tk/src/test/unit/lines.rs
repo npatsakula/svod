@@ -19,7 +19,7 @@ use svod_device::sqtt::stitch::{branch, objdump_lines};
 use svod_dtype::AmdArch;
 use svod_ir::{Op, UOp, ops};
 use svod_runtime::amd::{LocatedAmd, compile_ir_to_amd_object, compile_ir_to_amd_object_as};
-use svod_runtime::sqtt::{Capture, Class, Lines, Statements, disassemble, line_table, locate, same_text};
+use svod_runtime::sqtt::{Capture, Class, Lines, Statements, disassemble, line_table, locate};
 use test_case::test_case;
 
 use crate::build::{BF16, I8};
@@ -422,7 +422,7 @@ fn matrix_instructions_sit_on_the_product_statement() {
 }
 
 /// `located` with its line table taken out: the `!dbg` attachments and the
-/// debug metadata [`Lowered::located_text_by`] adds.
+/// debug metadata [`Lowered::source`] adds.
 fn unlocated(located: &str) -> String {
     // The debug nodes are numbered from 2^20, clear of the loop hints.
     let node = |l: &str| l.strip_prefix('!')?.split_once(" = ")?.0.parse::<u32>().ok();
@@ -492,13 +492,12 @@ fn a_launch_hands_the_device_its_line_table() {
     assert_eq!(text(&object), text(&bare));
 }
 
-/// The twin a capture's statements come from is the kernel a launch on the
-/// device compiles: its located text, the line table taken out, is the
-/// launch's text, and the two compile to one `.text`. A launch numbers the
-/// parameters `[out, ins...]`; a twin lowered over them in declared order
-/// (the GEMM's output last) loads its kernel arguments in another order.
+/// A launch's SOURCE is the device's bare render of the launched kernel,
+/// located: its line table taken out, the text is the bare one, and the two
+/// compile to one `.text`; a launch numbers the parameters `[out, ins...]`,
+/// whatever order the program declares them in (the GEMM's output last).
 #[test]
-fn a_twin_is_the_launched_kernel() {
+fn a_launched_source_is_the_bare_kernel_located() {
     let (arch, cus) = launch_arch();
     let planner = planner(amd(arch, cus));
     let tiles = [
@@ -510,36 +509,11 @@ fn a_twin_is_the_launched_kernel() {
     tiles.into_par_iter().for_each(|((m, n, k), cfg)| {
         let prog = gemm::<BF16>(&assumed(gemm_spec(m, n, k), cfg));
         let lowering = cfg.lowering(&planner.device);
-        let launched = launched_text(arch, prog.clone(), &lowering);
-        let twin = crate::launch::lowered_as_launched(prog, &lowering).expect("lowers");
-        let located = twin.located_text_by(svod_runtime::amd::renderer(arch)).unwrap();
+        let bare = launched_text(arch, prog.clone(), &lowering);
+        let located = code(&launched(prog, &lowering));
         assert!(located.contains("!dbg !DILocation"), "{m}x{n}x{k}: no locations");
-        assert_eq!(unlocated(&located), launched, "{m}x{n}x{k} {cfg:?}");
-        let [twin, launched] = [located, launched].map(|ir| compile_ir_to_amd_object(&ir, arch).unwrap());
-        same_text(&launched, &twin).unwrap_or_else(|e| panic!("{m}x{n}x{k} {cfg:?}: {e}"));
+        assert_eq!(unlocated(&located), bare, "{m}x{n}x{k} {cfg:?}");
+        let [a, b] = [located, bare].map(|ir| text(&compile_ir_to_amd_object(&ir, arch).unwrap()));
+        assert!(a == b, "{m}x{n}x{k} {cfg:?}: .text differs");
     });
-}
-
-/// `tune::twin` gives a capture of the launched kernel its statements, and
-/// names why it cannot where the target is no AMD one.
-#[test]
-fn twin_attaches_to_the_launched_kernel() {
-    let (arch, cus) = launch_arch();
-    let cfg = config::gemm_cfg([128, 128, 32], 2, [4, 2], true);
-    let (prog, lowering) = (tile_gemm(cfg).0, cfg.lowering(&planner(amd(arch, cus)).device));
-    let object = compile_ir_to_amd_object(&launched_text(arch, prog.clone(), &lowering), arch).unwrap();
-    let trace = SqttTrace {
-        arch,
-        per_se: vec![],
-        mclk_mhz: None,
-        code: Arc::new(CodeImage { elf: object.into(), load_base: 1 << 40, entry_pc: 1 << 40 }),
-    };
-    let mut capture = Capture::new(trace, None).unwrap();
-    crate::tune::twin(&(prog.clone(), lowering.clone()), &mut capture).unwrap();
-    let statements = capture.statements.as_ref().expect("attached");
-    assert!(!statements.lines.is_empty() && statements.listing.contains("mma a_s·b_s [steady]"));
-    let cfg = config::gemm_cfg([128, 128, 32], 2, [4, 2], true);
-    let cuda = cfg.lowering(&planner(crate::sweep::hopper()).device);
-    let why = crate::tune::twin(&(prog, cuda), &mut capture);
-    assert!(matches!(why, Err(crate::tune::TwinError::NotAmd { .. })), "{why:?}");
 }
