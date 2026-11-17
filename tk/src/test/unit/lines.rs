@@ -455,14 +455,19 @@ fn matrix_instructions_sit_on_the_product_statement() {
 /// `located` with its line table taken out: the `!dbg` attachments and the
 /// debug metadata [`Lowered::source`] adds.
 fn unlocated(located: &str) -> String {
-    // The debug nodes are numbered from 2^20, clear of the loop hints.
-    let node = |l: &str| l.strip_prefix('!')?.split_once(" = ")?.0.parse::<u32>().ok();
     let debug = |l: &str| {
-        l.starts_with("!llvm.dbg.cu") || l.starts_with("!llvm.module.flags") || node(l).is_some_and(|n| n >= 1 << 20)
+        let node = l.strip_prefix('!').and_then(|l| l.split_once(" = ")).map(|(_, node)| node);
+        l.starts_with("!llvm.dbg.cu")
+            || l.starts_with("!llvm.module.flags")
+            || node.is_some_and(|n| n.trim_start_matches("distinct ").starts_with("!DI") || n.contains(" Version\""))
     };
-    let lines = located.split_inclusive('\n').filter(|l| !debug(l)).map(|l| match l.find(", !dbg !DILocation(") {
-        Some(at) => format!("{}{}", &l[..at], &l[at + l[at..].find(')').expect("a closed location") + 1..]),
-        None => l.replace(" !dbg !1048578", ""),
+    let lines = located.split_inclusive('\n').filter(|l| !debug(l)).map(|l| match l.find(" !dbg !") {
+        Some(at) => {
+            let id = &l[at + " !dbg !".len()..];
+            let end = l.len() - id.len() + id.find(|c: char| !c.is_ascii_digit()).unwrap_or(id.len());
+            format!("{}{}", l[..at].strip_suffix(',').unwrap_or(&l[..at]), &l[end..])
+        }
+        None => l.to_string(),
     });
     lines.collect()
 }
@@ -542,7 +547,7 @@ fn a_launched_source_is_the_bare_kernel_located() {
         let lowering = cfg.lowering(&planner.device);
         let bare = launched_text(arch, prog.clone(), &lowering);
         let located = code(&launched(prog, &lowering));
-        assert!(located.contains("!dbg !DILocation"), "{m}x{n}x{k}: no locations");
+        assert!(located.contains(", !dbg !"), "{m}x{n}x{k}: no locations");
         assert_eq!(unlocated(&located), bare, "{m}x{n}x{k} {cfg:?}");
         let [a, b] = [located, bare].map(|ir| text(&compile_ir_to_amd_object(&ir, arch).unwrap()));
         assert!(a == b, "{m}x{n}x{k} {cfg:?}: .text differs");

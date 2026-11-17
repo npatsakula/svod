@@ -849,3 +849,154 @@ fn a_located_render_embeds_its_listing() {
     assert!(ir.contains(want), "{ir}");
     assert!(!LlvmTextRenderer::amd(AmdArch::Gfx1201).render(&linear, Some("listed")).unwrap().code.contains("!DIFile"));
 }
+
+/// `count` loops one after another, each storing through its own counter:
+/// one loop ID node apiece on AMD.
+fn sequential_loops_linear(count: usize) -> std::sync::Arc<UOp> {
+    let stores = (0..count)
+        .map(|i| {
+            let bound = UOp::const_(DType::Int32, ConstValue::Int(24));
+            let range = UOp::range_axis_dtype(bound, AxisId::Renumbered(i), AxisType::Loop, DType::Int32);
+            let out = UOp::index().buffer(UOp::param(0, 24, DType::Float32, None)).indices(vec![range.clone()]);
+            let value = UOp::const_(DType::Float32, ConstValue::Float(i as f64));
+            out.call().unwrap().store(value).end(smallvec::smallvec![range])
+        })
+        .collect();
+    UOp::linear(svod_schedule::linearize_with_cfg(UOp::sink(stores)).into())
+}
+
+/// Every node `i` of `linear` located on line `i / 3 + 1`, in column 1
+/// where `i` is odd and none where even (some share a location), the pairs
+/// inserted in `order`.
+fn every_node_located(
+    linear: &std::sync::Arc<UOp>,
+    order: impl Fn(Vec<(u64, crate::llvm::Location)>) -> Vec<(u64, crate::llvm::Location)>,
+) -> std::collections::HashMap<u64, crate::llvm::Location> {
+    let nodes = linear.op().sources();
+    let at = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, u)| (u.id, crate::llvm::Location { line: i as u32 / 3 + 1, column: i as u32 % 2 }));
+    order(at.collect()).into_iter().collect()
+}
+
+fn located_render(
+    linear: &std::sync::Arc<UOp>,
+    locations: std::collections::HashMap<u64, crate::llvm::Location>,
+) -> crate::RenderedKernel {
+    let renderer = LlvmTextRenderer::amd(AmdArch::Gfx1201).locations(locations, "listing\n".into());
+    renderer.render(linear, Some("located")).expect("renders")
+}
+
+/// The numbered nodes a module defines, by id.
+fn metadata_nodes(ir: &str) -> std::collections::HashMap<usize, &str> {
+    let mut nodes = std::collections::HashMap::new();
+    for line in ir.lines().filter(|l| l.starts_with('!')) {
+        let Some((id, node)) = line[1..].split_once(" = ") else { continue };
+        let Ok(id) = id.parse::<usize>() else { continue };
+        assert!(nodes.insert(id, node).is_none(), "!{id} defined twice:\n{ir}");
+    }
+    nodes
+}
+
+/// Every instruction a located operation renders carries `!dbg` naming a
+/// `!DILocation` of its line and column under the kernel's subprogram, and
+/// nothing else does: no label, and no operation left unlocated.
+#[test]
+fn every_located_instruction_carries_its_location() {
+    let linear = nested_loops_linear();
+    let mut locations = every_node_located(&linear, |at| at);
+    let unlocated = linear.op().sources().iter().find(|u| matches!(u.op(), Op::Store(_))).expect("a store").id;
+    locations.remove(&unlocated);
+    let rendered = located_render(&linear, locations.clone());
+    let ir = &rendered.code;
+    let nodes = metadata_nodes(ir);
+    let define = ir.lines().find(|l| l.starts_with("define ")).expect("a define");
+    let subprogram = define.rsplit_once(" !dbg !").and_then(|(_, sp)| sp.strip_suffix(" {")).expect("a subprogram");
+    assert!(nodes[&subprogram.parse::<usize>().unwrap()].starts_with("distinct !DISubprogram("), "{ir}");
+    let body: Vec<&str> = ir.lines().skip_while(|l| !l.starts_with("define ")).skip(1).collect();
+    let mut seen = 0;
+    for op in rendered.operations.iter().filter(|op| !op.lines.is_empty()) {
+        for line in op.lines.iter().flat_map(|l| l.split('\n')) {
+            let label = line.trim().is_empty() || line.ends_with(':');
+            let found: Vec<&str> = body.iter().copied().filter(|l| l.starts_with(line)).collect();
+            assert!(!found.is_empty(), "`{line}` not in\n{ir}");
+            match locations.get(&op.uop_id) {
+                Some(at) if !label => {
+                    let want = format!("!DILocation(line: {}, column: {}, scope: !{subprogram})", at.line, at.column);
+                    let located = found.iter().any(|l| {
+                        l.strip_prefix(line)
+                            .and_then(|rest| rest.strip_prefix(", !dbg !"))
+                            .and_then(|id| nodes.get(&id.parse::<usize>().ok()?))
+                            .is_some_and(|node| *node == want)
+                    });
+                    assert!(located, "`{line}` of {} not at {at:?}:\n{ir}", op.op);
+                    seen += 1;
+                }
+                _ => assert!(found.iter().any(|l| !l.contains("!dbg")), "`{line}` of {} located:\n{ir}", op.op),
+            }
+        }
+    }
+    assert!(seen > 10, "{ir}");
+    assert_amd_ir_compiles(ir, "gfx1201");
+}
+
+/// The debug nodes follow the renderer's own, however many loops number
+/// those: every id is defined once, every reference resolves, and the
+/// locations are one node per line and column.
+#[test_case::test_case(1; "one loop")]
+#[test_case::test_case(300; "three hundred loops")]
+fn debug_metadata_never_meets_the_loop_metadata(loops: usize) {
+    let linear = sequential_loops_linear(loops);
+    let ir = located_render(&linear, every_node_located(&linear, |at| at)).code;
+    let nodes = metadata_nodes(&ir);
+    assert_eq!(nodes.values().filter(|n| n.starts_with("distinct !{")).count(), loops, "a loop ID a loop");
+    let mut ids: Vec<usize> = nodes.keys().copied().collect();
+    ids.sort_unstable();
+    assert_eq!(ids, (0..ids.len()).collect::<Vec<_>>(), "numbered densely from !0");
+    let first_debug = nodes.iter().filter(|(_, n)| n.contains("!DI")).map(|(id, _)| *id).min().unwrap();
+    assert!(
+        nodes.iter().filter(|(_, n)| !n.contains("!DI") && !n.contains("Version")).all(|(id, _)| *id < first_debug)
+    );
+    let references = ir.split('!').skip(1).filter_map(|s| {
+        let digits: String = s.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse::<usize>().ok()
+    });
+    for id in references {
+        assert!(nodes.contains_key(&id), "!{id} referenced, never defined");
+    }
+    let locations: Vec<&&str> = nodes.values().filter(|n| n.starts_with("!DILocation(")).collect();
+    assert_eq!(
+        locations.len(),
+        locations.iter().collect::<std::collections::HashSet<_>>().len(),
+        "one node a location"
+    );
+    assert_amd_ir_compiles(&ir, "gfx1201");
+}
+
+/// A located render is the same text whatever order its locations were
+/// gathered in.
+#[test]
+fn a_located_render_is_deterministic() {
+    let linear = sequential_loops_linear(8);
+    let forward = located_render(&linear, every_node_located(&linear, |at| at)).code;
+    for _ in 0..4 {
+        let reversed = every_node_located(&linear, |mut at| {
+            at.reverse();
+            at
+        });
+        assert_eq!(located_render(&linear, reversed).code, forward);
+    }
+}
+
+#[test_case::test_case("  %v1 = add i32 %v0, 1", true; "assignment")]
+#[test_case::test_case("  br label %loop_latch_0, !llvm.loop !3", true; "back edge")]
+#[test_case::test_case("  call void asm sideeffect \"s_nop 0 ; done:\", \"\"()", true; "asm with a colon")]
+#[test_case::test_case("  store float 1.0, ptr %v2", true; "store")]
+#[test_case::test_case("loop_body_0:", false; "loop label")]
+#[test_case::test_case("v12_entry:", false; "block label")]
+#[test_case::test_case("  ; a comment", false; "comment")]
+#[test_case::test_case("", false; "blank")]
+fn an_instruction_is_what_is_no_label_comment_or_blank(line: &str, instruction: bool) {
+    assert_eq!(crate::llvm::text::is_instruction(line), instruction);
+}
