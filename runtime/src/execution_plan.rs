@@ -664,7 +664,11 @@ impl ExecutionPlan {
                             })
                         })
                         .collect::<Result<Vec<_>>>()?;
-                    let (global_size, local_size) = Self::kernel_launch_sizes(kernel)?;
+                    let Some((global_size, local_size)) = Self::kernel_launch_sizes(kernel)? else {
+                        return Ok(NativeReplayOutcome::Declined(NativeReplayDecline::EmptyLaunch {
+                            operation: kernel.id,
+                        }));
+                    };
                     CallValues::Program {
                         program: kernel.kernel.program.as_ref(),
                         buffers,
@@ -809,7 +813,9 @@ impl ExecutionPlan {
         }
     }
 
-    fn kernel_launch_sizes(kernel: &PreparedKernel) -> Result<RuntimeLaunchSizes> {
+    /// `None` when the grid is empty: no thread would run, so the kernel is
+    /// skipped rather than submitted (CUDA rejects an empty grid).
+    fn kernel_launch_sizes(kernel: &PreparedKernel) -> Result<Option<RuntimeLaunchSizes>> {
         let mut vars: HashMap<&str, i64> =
             HashMap::with_capacity(kernel.kernel.var_names.len() + kernel.fixedvars.len());
         for (idx, name) in kernel.kernel.var_names.iter().enumerate() {
@@ -830,7 +836,7 @@ impl ExecutionPlan {
         let dims =
             ProgramSpec::resolve_launch_dims(&kernel.kernel.global_size, kernel.kernel.local_size.as_ref(), &vars)
                 .context(ExecSnafu { context: format!("kernel {} launch dimensions", kernel.id) })?;
-        Ok((Some(dims.global_size), dims.local_size))
+        Ok((!dims.is_empty()).then_some((Some(dims.global_size), dims.local_size)))
     }
 
     /// Lazily capture all kernels into a backend replay graph. Only backends
@@ -907,7 +913,8 @@ impl ExecutionPlan {
         for level in &self.op_levels {
             for &idx in level {
                 let PreparedOp::CompiledProgram(k) = &self.ops[idx] else { return Ok(None) };
-                let (global_size, local_size) = Self::kernel_launch_sizes(k)?;
+                // Static dims never change, so an empty kernel keeps the plan per-call.
+                let Some((global_size, local_size)) = Self::kernel_launch_sizes(k)? else { return Ok(None) };
                 let e = kernels.len();
 
                 let current_addresses = k
@@ -982,7 +989,7 @@ impl ExecutionPlan {
                     .context(ExecSnafu { context: format!("resolve replay buffer for kernel {}", kernel.id) })
             })
             .collect::<Result<_>>()?;
-        let (global_size, local_size) = Self::kernel_launch_sizes(kernel)?;
+        let Some((global_size, local_size)) = Self::kernel_launch_sizes(kernel)? else { return Ok(None) };
         let program = kernel.kernel.program.as_ref();
         // Backends that expose a reusable context dispatch through it so all the
         // plan's kernels share one queue. Others (CPU) return `None` and fall
@@ -1727,7 +1734,7 @@ impl ExecutionPlan {
         for (index, mut profile) in traced?.into_iter().enumerate() {
             let Some(trace) = profile.sqtt.take() else { continue };
             let prepared = compiled.get(index).filter(|k| Arc::ptr_eq(&k.kernel, &profile.kernel));
-            let dims = prepared.and_then(|k| Self::kernel_launch_sizes(k).ok());
+            let dims = prepared.and_then(|k| Self::kernel_launch_sizes(k).ok().flatten());
             let axes = |size: [usize; 3]| size.map(|n| u32::try_from(n).unwrap_or(u32::MAX));
             let kernel = profile.kernel.entry_point.clone();
             let ns = |k: &KernelProfile| k.gpu_end_ns?.checked_sub(k.gpu_start_ns?);

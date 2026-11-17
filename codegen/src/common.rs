@@ -82,9 +82,15 @@ pub fn shaped_dtype(value: &Arc<UOp>) -> DType {
     }
 }
 
-/// Check whether a buffer (PARAM/DefineGlobal) is used as a STORE target in the graph.
+/// Check whether a buffer (PARAM/DefineGlobal) is written in the graph: a STORE
+/// target, or modified in place by a custom statement
+/// ([`UOp::read_modify_writes`]).
 pub fn is_output_buffer(def_global: &Arc<UOp>, nodes: &[Arc<UOp>]) -> bool {
     let buffer_id = def_global.id;
+    let indexes = |dep: &Arc<UOp>| matches!(dep.op(), Op::Index(ops::Index { buffer, .. }) if buffer.id == buffer_id);
+    if nodes.iter().any(|node| node.read_modify_writes().any(indexes)) {
+        return true;
+    }
 
     for node in nodes {
         if let Some(buffer) = node.store_buffer() {

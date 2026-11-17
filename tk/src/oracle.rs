@@ -46,6 +46,7 @@ fn op(name: &str) -> &'static str {
         "wide_mma" => "oracle:wide_mma",
         "tr_load" => "oracle:tr_load",
         "dot2_bf16" => "oracle:dot2_bf16",
+        "atomic_add" => "oracle:atomic_add",
         other => unreachable!("no oracle op for {other}"),
     }
 }
@@ -87,7 +88,13 @@ fn cuda(target: &Target, c: CudaArch) -> Vec<Capability> {
         "{shared}\n.visible .entry oracle() {{\n  .reg .b64 %rd<3>;\n  mov.u64 %rd1, smem;\n  mov.u64 %rd2, 0;\n  \
          cp.async.cg.shared.global [%rd1], [%rd2], 16;\n  cp.async.commit_group;\n  ret;\n}}"
     ));
+    let atomic_add = module(
+        "\n.visible .entry oracle() {\n  .reg .b32 %r<3>;\n  .reg .f32 %f<3>;\n  .reg .b64 %rd1;\n  \
+         mov.u64 %rd1, 0;\n  atom.global.add.u32 %r1, [%rd1], %r2;\n  atom.global.add.f32 %f1, [%rd1], %f2;\n  \
+         ret;\n}",
+    );
     vec![
+        Capability { name: "atomic_add", module: atomic_add, table: target.atomic_add },
         Capability { name: "wgmma", module: wgmma, table: !target.group_mma.is_empty() },
         Capability { name: "ldmatrix", module: ldmatrix, table: target.ldmatrix },
         Capability { name: "mma_i8", module: mma_i8, table: target.geometry_of(ScalarDType::Int8).is_some() },
@@ -113,7 +120,13 @@ fn amd(target: &Target, a: AmdArch) -> Vec<Capability> {
         (false, true) => module("v_wmma_i32_16x16x16_iu8 v[0:7], v[8:9], v[10:11], v[12:19]"),
         (false, false) => module("v_wmma_i32_16x16x16_iu8 v[0:7], v[8:11], v[12:15], v[16:23]"),
     };
+    let add_i32 = if cdna { "global_atomic_add" } else { "global_atomic_add_u32" };
     vec![
+        Capability {
+            name: "atomic_add",
+            module: module(&format!("{add_i32} v0, v1, s[0:1]\n  global_atomic_add_f32 v0, v1, s[0:1]")),
+            table: target.atomic_add,
+        },
         Capability { name: "wmma16", module: wmma16, table: target.geometry().is_some() },
         Capability {
             name: "wide_mma",
@@ -235,6 +248,7 @@ pub(crate) fn flipped(target: &Target, verdicts: &[(&'static str, Option<bool>)]
             "wide_mma" if !v => gated.wide_mma = vec![],
             "tr_load" => gated.tr_load = v,
             "dot2_bf16" => gated.dot2_bf16 = v,
+            "atomic_add" => gated.atomic_add = v,
             _ => {}
         }
     }

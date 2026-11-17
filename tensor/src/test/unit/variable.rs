@@ -642,4 +642,23 @@ crate::codegen_tests! {
         let argmin = realized_prefix(&dot.argmin(1isize).unwrap().cast(DType::Float32), &config, n_rows);
         assert_eq!(argmin, vec![2.0; n_rows]);
     }
+
+    /// A plan whose grid spans a row variable replays at 0 rows as a skipped
+    /// launch and keeps running at the rows bound after it.
+    fn test_symbolic_row_shrink_replays_through_zero_rows(config) {
+        test_setup();
+        let (rows, cols) = (8usize, 3usize);
+        let xs: Vec<f32> = (0..rows * cols).map(|e| e as f32).collect();
+        let x = Tensor::from_slice(xs.clone()).try_reshape([rows, cols]).unwrap();
+        let n = Variable::new("n", 0, rows as i64);
+        let xb = x.try_shrink([Some((SInt::Const(0), n.bind(3).unwrap().as_sint())), None]).unwrap();
+        let doubled = (&xb * &Tensor::from_slice([2.0f32])).unwrap().contiguous();
+        let mut plan = Tensor::prepare_batch_with([&doubled], &config).unwrap();
+
+        for n_rows in [3usize, 0, 5, 0, 8] {
+            plan.execute_with_vars(&[n.bind(n_rows as i64).unwrap().as_var_val()]).unwrap();
+            let got = crate::jit::to_vec::<f32>(&doubled.buffer().unwrap(), n_rows * cols).unwrap();
+            assert_eq!(got, xs[..n_rows * cols].iter().map(|v| v * 2.0).collect::<Vec<_>>(), "n = {n_rows}");
+        }
+    }
 }

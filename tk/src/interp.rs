@@ -313,13 +313,19 @@ impl<P: Phase> Frame<'_, P> {
                         }
                     }
                 }
-                let store = match v.place {
-                    Place::Smem { alloc, .. } => &mut self.smem[alloc.index()],
-                    Place::Global { param, .. } => &mut self.globals[param.index()],
+                let (store, added) = match v.place {
+                    Place::Smem { alloc, .. } => (&mut self.smem[alloc.index()], false),
+                    Place::Global { param, .. } => {
+                        (&mut self.globals[param.index()], self.prog.params[param.index()].kind == ParamKind::Accum)
+                    }
                     Place::Reg => unreachable!(),
                 };
                 for (i, x) in writes {
-                    store[i] = x;
+                    store[i] = match (added, v.dtype) {
+                        (false, _) => x,
+                        (true, ScalarDType::Int32) => f64::from((store[i] as i32).wrapping_add(x as i32)),
+                        (true, dtype) => round_to(dtype, store[i] + x),
+                    };
                 }
             }
         }

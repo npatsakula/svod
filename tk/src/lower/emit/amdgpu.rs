@@ -64,7 +64,8 @@ impl Emit<'_> {
 /// rows: the largest within the row, whose loads gain most, of the widest input
 /// row or else output row that gains. A byte offset must fit 31 bits.
 pub(super) fn swizzled(params: Vec<Arc<UOp>>, prog: &Program<Laid>, target: &Target) -> Vec<Arc<UOp>> {
-    let fits = |p: &Param| p.elems.saturating_mul(p.dtype.bytes()) <= i32::MAX as usize;
+    // An atomic add takes a plain global pointer, never a descriptor.
+    let fits = |p: &Param| p.elems.saturating_mul(p.dtype.bytes()) <= i32::MAX as usize && p.kind != ParamKind::Accum;
     let Some(swizzle) = target.cache_swizzle.filter(|_| prog.params.iter().all(fits)) else { return params };
     let widest = |input: bool| {
         let rows = prog.values.iter().filter_map(|v| match &v.place {

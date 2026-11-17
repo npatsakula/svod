@@ -205,6 +205,9 @@ pub struct Target {
     /// A bf16 pair's dot product accumulated in f32 (`v_dot2_f32_bf16`):
     /// RDNA3 on, and gfx950.
     pub dot2_bf16: bool,
+    /// An `i32` and an `f32` add to global memory, each one instruction with
+    /// no compare-and-swap loop.
+    pub atomic_add: bool,
     /// Shared memory a block may use without special launch attributes.
     pub smem_bytes: usize,
     /// Streaming multiprocessors (compute units), when the device reports them.
@@ -704,6 +707,7 @@ fn cuda(c: CudaArch) -> Target {
         ldmatrix: (c.major, c.minor) >= (7, 5),
         tr_load: false,
         dot2_bf16: false,
+        atomic_add: true,
         smem_bytes: c.max_shared_per_block_optin(),
         sms: None,
         memory_bytes: None,
@@ -780,6 +784,7 @@ fn amd(a: AmdArch) -> Target {
         ldmatrix: false,
         tr_load: a.is_rdna4(),
         dot2_bf16: !cdna || a == AmdArch::Gfx950,
+        atomic_add: true,
         smem_bytes: if a == AmdArch::Gfx950 { 160 << 10 } else { 64 << 10 },
         sms: None,
         memory_bytes: None,
@@ -811,6 +816,7 @@ fn metal(f: MetalFamily) -> Target {
         ldmatrix: false,
         tr_load: false,
         dot2_bf16: false,
+        atomic_add: false,
         smem_bytes: 32 << 10,
         sms: None,
         memory_bytes: None,

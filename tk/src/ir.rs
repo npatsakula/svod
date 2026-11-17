@@ -791,6 +791,11 @@ pub enum ParamKind {
     Out,
     /// Written, then read back by the lanes that wrote it ([`crate::build::Kernel::inout`]).
     InOut,
+    /// Added to and nothing else ([`crate::build::Kernel::atomic_add`]): a
+    /// copy into it is an atomic add, element by element and in no order
+    /// among threads, landing by the end of the dispatch. Its contents are
+    /// the launch's own, and the kernel never reads them.
+    Accum,
 }
 
 #[derive(Clone, Debug, PartialEq)]

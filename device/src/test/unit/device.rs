@@ -103,9 +103,18 @@ fn device_spec_parses_aliases_and_round_trips_through_canonicalize() {
 #[test_case("METAL:"; "empty id")]
 #[test_case("NV:0"; "alias reserved for a userspace driver")]
 #[test_case(""; "empty")]
+#[test_case("DISKé"; "multi-byte char straddling the disk scheme")]
+#[test_case("hıp"; "non-ascii letter that uppercases to an alias")]
 fn device_spec_parse_rejects_malformed_specs(text: &str) {
     let err = DeviceSpec::parse(text).expect_err(text);
     assert!(matches!(err, crate::Error::InvalidDevice { .. }), "{text}: {err:?}");
+}
+
+/// The disk scheme is case-insensitive; the path after it is kept as written.
+#[test]
+fn device_spec_parse_keeps_the_disk_path_as_written() {
+    let spec = DeviceSpec::parse("disk:Data/日本").unwrap();
+    assert_eq!(spec, DeviceSpec::Disk { path: "Data/日本".into() });
 }
 
 /// Opening CUDA must never panic: without the driver library, without a GPU,
@@ -220,6 +229,30 @@ fn program_spec_launch_dims_resolves_mulacc_extent() {
     .expect("build MulAcc extent");
     let sink = UOp::sink(vec![UOp::special(extent, "gidx0".to_string())]);
     assert_eq!(launch_dims(sink, &[("ts", 8)]).global_size, [127, 1, 1], "ts*16 - 1 = 8*16 - 1 = 127");
+}
+
+/// A grid extent bound to 0 resolves to an empty launch rather than an error;
+/// a negative extent is still rejected.
+#[test_case(0, 0, Some(true); "bound to 0 is empty")]
+#[test_case(1, 0, Some(false); "bound to 1 runs")]
+#[test_case(0, -1, None; "negative is rejected")]
+fn program_spec_launch_dims_with_variable_extent(n: i64, offset: i64, empty: Option<bool>) {
+    let extent = UOp::try_mulacc(
+        slotted_var("n", 0, 8, 0),
+        UOp::const_(DType::Int32, 1.into()),
+        UOp::const_(DType::Int32, offset.into()),
+    )
+    .expect("build n + offset extent");
+    let sink = UOp::sink(vec![
+        UOp::special(extent, "gidx0".to_string()),
+        UOp::special(UOp::index_const(3), "lidx0".to_string()),
+    ]);
+    let linear = UOp::linear(sink.toposort().into());
+    let source = UOp::source("void launch_kernel() {}".to_string());
+    let staged = program(sink, DeviceSpec::Cpu, Some(linear), Some(source), None);
+    let spec = crate::device::ProgramSpec::from_uop(&staged).expect("program spec");
+    let dims = spec.launch_dims(&[("n", n)].into_iter().collect());
+    assert_eq!(dims.as_ref().ok().map(crate::device::ConcreteLaunchDims::is_empty), empty, "{dims:?}");
 }
 
 /// A `core_id` variable sets the CPU global size from its bounds, and attached

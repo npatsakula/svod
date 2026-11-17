@@ -26,11 +26,13 @@ pub trait DeviceSpecExt {
 impl DeviceSpecExt for DeviceSpec {
     fn parse(s: &str) -> Result<Self> {
         // DISK: preserve path case (don't uppercase)
-        if s.len() >= 5 && s[..5].eq_ignore_ascii_case("DISK:") {
-            return Ok(DeviceSpec::Disk { path: std::path::PathBuf::from(&s[5..]) });
+        if let Some((scheme, path)) = s.split_at_checked(5)
+            && scheme.eq_ignore_ascii_case("DISK:")
+        {
+            return Ok(DeviceSpec::Disk { path: std::path::PathBuf::from(path) });
         }
 
-        let s = s.to_uppercase();
+        let s = s.to_ascii_uppercase();
         let (kind, id) = match s.split_once(':') {
             Some((kind, id)) => (kind, Some(id)),
             None => (s.as_str(), None),

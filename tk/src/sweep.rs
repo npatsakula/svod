@@ -12,7 +12,7 @@
 use svod_dtype::{AmdArch, CudaArch, GpuArch, ScalarDType};
 
 use crate::atoms::{Core, Costs, Device, Target};
-use crate::build::{BF16, F16, I8};
+use crate::build::{BF16, F16, F32, I8, I32};
 use crate::kernels::{Admitted, Spec};
 use std::num::NonZeroUsize;
 
@@ -28,6 +28,7 @@ use crate::kernels::nearest::{
     nearest, nearest_merge, nearest_rescore, nearest_select,
 };
 use crate::kernels::rows::{Norm, NormCfg, NormSpec, norm};
+use crate::kernels::scatter::{ScatterSpec, scatter_add};
 use crate::kernels::{Act, Batch};
 use crate::lower::Lowering;
 use crate::ops::config::{self, NearestProblem, Planner};
@@ -180,6 +181,11 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
         let cfg = planner.gemm_ranked(1, 4096, 4096, k, &epilogue)[0];
         assumed(GemmSpec { m, n, k, batch: Batch::Static(1), epilogue, windows: Default::default() }, cfg)
     };
+    if target.atomic_add {
+        let scatter = ScatterSpec { rows: 40, pairs: 300, d: 3 };
+        push("scatter_add i32", scatter_add::<I32>(&scatter), Lowering::new(&planner.device));
+        push("scatter_add f32", scatter_add::<F32>(&scatter), Lowering::new(&planner.device));
+    }
     let plain = gemm_spec(130, 192, 128, Epilogue::DEFAULT);
     for (i, cfg) in first_eight(&planner.gemm_ranked(1, 4096, 4096, 4096, &plain.epilogue)).into_iter().enumerate() {
         let spec = assumed((*plain).clone(), cfg);
