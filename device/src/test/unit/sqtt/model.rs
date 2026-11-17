@@ -8,8 +8,8 @@ use crate::sqtt::report::{Report, Stats};
 use crate::sqtt::simd::Residency;
 use crate::sqtt::stitch::{Stitcher, objdump_lines};
 use crate::sqtt::waits::Replay;
-use crate::sqtt::wave::{Instruction, Wave, analyze};
-use crate::sqtt::{Category, Header, InstOp, Kind, Layout, Packet, Popcount, decode};
+use crate::sqtt::wave::{Cause, Instruction, Wave, analyze};
+use crate::sqtt::{Category, Header, InstOp, Kind, Layout, Packet, Popcount, Unit, decode};
 
 /// Packs `(value, nibbles)` tokens into a little-endian nibble stream, NOP-padded to whole bytes.
 fn stream(tokens: &[(u128, usize)]) -> Vec<u8> {
@@ -84,6 +84,22 @@ fn wave_end(wave: u128) -> (u128, usize) {
 
 fn packets(tokens: &[(u128, usize)]) -> Vec<Packet> {
     decode(&stream(tokens)).filter(|p| p.kind != Kind::Nop).collect()
+}
+
+/// A wave the trace saw only end gets AMD's start at time 0: the orphans lead the occupancy, the
+/// latest first, ahead of the ends in stream order.
+#[test]
+fn orphans_lead_the_occupancy() {
+    let end = |wave: u8| Packet {
+        time: 10 * u64::from(wave + 1),
+        raw: 0,
+        kind: Kind::WaveEnd(Unit { sa: 0, wgp: 0, simd: 1, wave }),
+    };
+    let trace = analyze((0..3).map(end));
+    let got: Vec<_> = trace.occupancy.iter().map(|o| (o.time, o.unit.wave, o.start, o.cause)).collect();
+    let orphan = |wave| (0, wave, true, Cause::Orphan);
+    let ended = |wave: u8| (10 * i64::from(wave + 1), wave, false, Cause::Wave);
+    assert_eq!(got, [orphan(2), orphan(1), orphan(0), ended(0), ended(1), ended(2)]);
 }
 
 #[test]

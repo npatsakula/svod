@@ -126,6 +126,9 @@ struct Model {
     pgm: Pipes<u64>,
     /// The resident waves' locations.
     running: HashSet<u32>,
+    /// The starts AMD inserts at time 0 for waves the trace saw only end, in the order they ended:
+    /// they lead the occupancy, the latest first.
+    orphans: Vec<Occupancy>,
 }
 
 fn location(unit: Unit) -> u32 {
@@ -247,7 +250,7 @@ impl Model {
             self.with(unit.wave, |state| state.complete(time));
         }
         if !self.running.remove(&location(unit)) {
-            self.trace.occupancy.insert(0, Occupancy { time: 0, unit, start: true, cause: Cause::Orphan });
+            self.orphans.push(Occupancy { time: 0, unit, start: true, cause: Cause::Orphan });
         }
         self.occupy(time, unit, false, Cause::Wave);
     }
@@ -256,6 +259,7 @@ impl Model {
         for slot in &mut self.slots {
             self.trace.waves.extend(slot.drain(..).map(|state| state.wave));
         }
+        self.trace.occupancy.splice(0..0, self.orphans.into_iter().rev());
         self.trace
     }
 }

@@ -56,51 +56,58 @@ pub struct Residency {
 type Key = (u8, u8, u8);
 
 impl Residency {
-    /// `None` without a wave on the SE.
+    /// `None` without a wave on the SE. The window follows from the SE's totals; one replay of the
+    /// events then sums each SIMD's waves over it.
     pub fn new(events: &[Occupancy]) -> Option<Self> {
         let mut events: Vec<&Occupancy> = events.iter().filter(|o| o.cause == Cause::Wave).collect();
         events.sort_by_key(|o| o.time);
         // AMD's `plot_occupancy_resources.py`: a start counts once, an end only for a counted start.
         let mut active = HashSet::<Unit>::new();
-        let mut per_simd = BTreeMap::<Key, u32>::new();
-        // `(from, total, per SIMD)`: the state after every event of `from`, held to the next segment.
-        let mut segments: Vec<(i64, u32, BTreeMap<Key, u32>)> = vec![];
-        for (i, o) in events.iter().enumerate() {
-            let key = (o.unit.sa, o.unit.wgp, o.unit.simd);
-            match o.start {
-                true if active.insert(o.unit) => *per_simd.entry(key).or_default() += 1,
-                false if active.remove(&o.unit) => *per_simd.get_mut(&key).expect("an active wave's SIMD") -= 1,
-                _ => {}
+        let counted: Vec<bool> =
+            events.iter().map(|o| if o.start { active.insert(o.unit) } else { active.remove(&o.unit) }).collect();
+        // `(from, total)`: the SE's resident waves after every event of `from`, held to the next segment.
+        let (mut segments, mut total) = (Vec::<(i64, u32)>::new(), 0u32);
+        for (i, (o, &counted)) in events.iter().zip(&counted).enumerate() {
+            if counted {
+                total = if o.start { total + 1 } else { total - 1 };
             }
             if events.get(i + 1).is_none_or(|next| next.time > o.time) {
-                segments.push((o.time, active.len() as u32, per_simd.clone()));
+                segments.push((o.time, total));
             }
         }
-        let ends: Vec<i64> = segments.iter().skip(1).map(|s| s.0).collect();
-        let held: Vec<_> = segments.iter().zip(ends).map(|(s, to)| (s.0, to, s.1, &s.2)).collect();
+        let held: Vec<(i64, i64, u32)> = segments.windows(2).map(|w| (w[0].0, w[1].0, w[0].1)).collect();
         let peak = held.iter().map(|s| s.2).max().filter(|&p| p > 0)?;
         let robust_peak = percentile(held.iter().map(|s| (s.2, s.1 - s.0)), ROBUST).max(1);
         let steady = |total: u32| total * STEADY.1 >= robust_peak * STEADY.0;
         let from = held.iter().find(|s| steady(s.2))?.0;
         let to = held.iter().rev().find(|s| steady(s.2))?.1;
-        let mut simds = BTreeMap::<Key, (i64, u32)>::new();
-        let mut total = 0;
-        for &(start, end, count, per_simd) in &held {
-            let cycles = end.min(to) - start.max(from);
-            if cycles <= 0 {
-                continue;
+        // `waves` held over `[since, at)`, the part within the window, summed into `sum`.
+        let within = |sum: i64, since: i64, at: i64, waves: u32| {
+            let cycles = at.min(to) - since.max(from);
+            (cycles > 0 && waves > 0).then(|| cycles.saturating_mul(waves.into()).saturating_add(sum))
+        };
+        let wave_cycles = held.iter().fold(0, |sum, &(since, at, waves)| within(sum, since, at, waves).unwrap_or(sum));
+        // Per SIMD: `(waves, since, wave_cycles, peak)`, its waves held since `since`.
+        let mut simds = BTreeMap::<Key, (u32, i64, i64, u32)>::new();
+        let close = |s: &mut (u32, i64, i64, u32), at: i64| {
+            if let Some(sum) = within(s.2, s.1, at, s.0) {
+                (s.2, s.3) = (sum, s.3.max(s.0));
             }
-            total = cycles.saturating_mul(count.into()).saturating_add(total);
-            for (&key, &waves) in per_simd.iter().filter(|&(_, &waves)| waves > 0) {
-                let simd = simds.entry(key).or_default();
-                (simd.0, simd.1) = (cycles.saturating_mul(waves.into()).saturating_add(simd.0), simd.1.max(waves));
-            }
+            s.1 = at;
+        };
+        for o in events.iter().zip(&counted).filter(|c| *c.1).map(|c| c.0) {
+            let simd = simds.entry((o.unit.sa, o.unit.wgp, o.unit.simd)).or_insert((0, o.time, 0, 0));
+            close(simd, o.time);
+            simd.0 = if o.start { simd.0 + 1 } else { simd.0 - 1 };
         }
         let simds = simds
             .into_iter()
-            .map(|((sa, wgp, simd), (wave_cycles, peak))| Simd { sa, wgp, simd, wave_cycles, cycles: to - from, peak })
+            .filter_map(|((sa, wgp, simd), mut s)| {
+                close(&mut s, to);
+                (s.3 > 0).then_some(Simd { sa, wgp, simd, wave_cycles: s.2, cycles: to - from, peak: s.3 })
+            })
             .collect();
-        Some(Self { peak, robust_peak, window: (from, to), wave_cycles: total, simds })
+        Some(Self { peak, robust_peak, window: (from, to), wave_cycles, simds })
     }
 
     /// The SE's time-weighted mean resident waves over the window.
