@@ -1207,7 +1207,7 @@ impl<'k> Kernel<'k> {
         self.snapshot_carried(&mut block, &phi, &mut next);
         self.deshare_carried(&mut block, &mut next);
         let carried = carry(&init, &phi, &next);
-        self.push(Stmt::Loop(Loop { iv, start, extent, carried, body: block, unroll: 1 }));
+        self.push(Stmt::Loop(Loop { iv, start, extent, carried, body: block, unroll: 1, trip: None }));
         phi.into_iter().map(Tile::new).collect()
     }
 
@@ -1445,7 +1445,7 @@ impl<'k> Kernel<'k> {
     /// warp, which some warps skip, it fails the lowering
     /// ([`crate::lower::Error::DivergentBarrier`]).
     pub fn barrier(&mut self) {
-        self.push(Stmt::Sync(Sync::Barrier { scope: Scope::Block }));
+        self.push(Stmt::Sync(AuthoredSync::Barrier { scope: Scope::Block }));
     }
 
     fn finish(mut self) -> Program {

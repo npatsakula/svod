@@ -25,9 +25,9 @@ fn kinds(prog: &Program, block: &Block) -> Vec<&'static str> {
             Stmt::Copy { dst, .. } if prog.value(*dst).tier() == Tier::Smem => "store",
             Stmt::Copy { dst, .. } if prog.value(*dst).tier() == Tier::Global => "out",
             Stmt::Copy { .. } => "load",
-            Stmt::Sync(Sync::Barrier { .. }) => "barrier",
-            Stmt::Sync(Sync::CommitAsync) => "commit",
-            Stmt::Sync(Sync::WaitAsync { .. }) => "wait",
+            Stmt::Sync(AuthoredSync::Barrier { .. }) => "barrier",
+            Stmt::Sync(AuthoredSync::CommitAsync) => "commit",
+            Stmt::Sync(AuthoredSync::WaitAsync { .. }) => "wait",
             Stmt::Loop(_) => "loop",
             Stmt::Pipeline(_) => "pipeline",
             _ => "other",
@@ -77,7 +77,7 @@ fn warps_fence_their_own_effects_and_the_block_fences_theirs() {
     assert_eq!(kinds(&prog, body), ["other", "store", "barrier", "load", "out"]);
     let scopes: Vec<Scope> = prog
         .walk()
-        .filter_map(|(_, s)| if let Stmt::Sync(Sync::Barrier { scope }) = s { Some(*scope) } else { None })
+        .filter_map(|(_, s)| if let Stmt::Sync(AuthoredSync::Barrier { scope }) = s { Some(*scope) } else { None })
         .collect();
     assert_eq!(scopes, [Scope::Warp, Scope::Block]);
 }
@@ -108,12 +108,16 @@ fn a_key_warps_state_over_its_ring_is_fenced_by_the_warp_then_the_block() {
         .iter()
         .position(|s| matches!(s, Stmt::Copy { dst, .. } if f32_smem(&prog, *dst)))
         .expect("the output store");
-    assert!(matches!(body.0[store - 1], Stmt::Sync(Sync::Barrier { scope: Scope::Warp })), "{:?}", kinds(&prog, body));
+    assert!(
+        matches!(body.0[store - 1], Stmt::Sync(AuthoredSync::Barrier { scope: Scope::Warp })),
+        "{:?}",
+        kinds(&prog, body)
+    );
     let after = &prog.body.0[at + 1..];
     let load =
         after.iter().position(|s| matches!(s, Stmt::Copy { src, .. } if f32_smem(&prog, *src))).expect("a merge load");
     assert!(
-        after[..load].iter().any(|s| matches!(s, Stmt::Sync(Sync::Barrier { scope: Scope::Block }))),
+        after[..load].iter().any(|s| matches!(s, Stmt::Sync(AuthoredSync::Barrier { scope: Scope::Block }))),
         "{:?}",
         top(&prog)
     );
@@ -136,7 +140,7 @@ fn a_store_before_a_loop_is_fenced_past_it() {
         k.store(o, y);
     });
     let Some(Stmt::Loop(l)) = prog.body.0.iter_mut().find(|s| matches!(s, Stmt::Loop(_))) else { panic!("a loop") };
-    l.body.0.push(Stmt::Sync(Sync::Barrier { scope: Scope::Block }));
+    l.body.0.push(Stmt::Sync(AuthoredSync::Barrier { scope: Scope::Block }));
     insert_barriers(&mut prog).unwrap();
     let k = top(&prog);
     let at = k.iter().position(|k| *k == "loop").unwrap();
@@ -234,12 +238,12 @@ fn a_pending_async_copy_survives_a_barrier(between: Between) {
     });
     let after_copy = top(&prog).iter().position(|s| *s == "async").unwrap() + 1;
     match between {
-        Between::Barrier => prog.body.0.insert(after_copy, Stmt::Sync(Sync::Barrier { scope: Scope::Block })),
+        Between::Barrier => prog.body.0.insert(after_copy, Stmt::Sync(AuthoredSync::Barrier { scope: Scope::Block })),
         Between::Loop => {
             let Some(Stmt::Loop(l)) = prog.body.0.iter_mut().find(|s| matches!(s, Stmt::Loop(_))) else {
                 panic!("a loop")
             };
-            l.body.0.push(Stmt::Sync(Sync::Barrier { scope: Scope::Block }));
+            l.body.0.push(Stmt::Sync(AuthoredSync::Barrier { scope: Scope::Block }));
         }
         Between::Fence => {}
     }

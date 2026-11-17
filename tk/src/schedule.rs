@@ -22,8 +22,9 @@ const RAISED: u8 = 3;
 /// after the loop ([`Sync::WaitProducts`]). Where a block barrier's halves
 /// part (`split`), a register-staged ring over two slots arrives as its
 /// trip stops touching shared memory and waits at the trip's end
-/// ([`Expander::register_staged`]). The result's phase has no pipeline
-/// statement.
+/// ([`Expander::register_staged`]). Each loop a template places is tagged
+/// with the trip it runs ([`Loop::trip`]). The result's phase has no
+/// pipeline statement.
 pub fn expand(prog: Program, fill: Fill, core: Core, split: bool) -> Program<Expanded> {
     let (mut out, body) = prog.rephase(|_, ()| (), ());
     out.body = Expander { prog: &mut out, fill, core, split, scope: Scope::Block }.block(body);
@@ -144,7 +145,15 @@ impl Expander<'_> {
             Self::if_(producing, produce.body.0),
             Stmt::Sync(Sync::CommitAsync),
         ];
-        vec![Stmt::Loop(Loop { iv, start, extent: total, carried, body: Block(body), unroll: stages as u32 })]
+        vec![Stmt::Loop(Loop {
+            iv,
+            start,
+            extent: total,
+            carried,
+            body: Block(body),
+            unroll: stages as u32,
+            trip: Some(Trip::Steady),
+        })]
     }
 
     /// [`Self::cp_async`] with the consume's products left in flight: step
@@ -193,7 +202,15 @@ impl Expander<'_> {
             Stmt::Sync(Sync::CommitAsync),
         ];
         vec![
-            Stmt::Loop(Loop { iv, start, extent: total, carried, body: Block(body), unroll: stages as u32 }),
+            Stmt::Loop(Loop {
+                iv,
+                start,
+                extent: total,
+                carried,
+                body: Block(body),
+                unroll: stages as u32,
+                trip: Some(Trip::Steady),
+            }),
             Stmt::Sync(Sync::WaitProducts { pending: 0 }),
         ]
     }
@@ -217,7 +234,7 @@ impl Expander<'_> {
         body.extend([Stmt::Sync(Sync::CommitAsync), Stmt::Sync(Sync::WaitAsync { pending: 0 }), self.barrier()]);
         body.extend(consume.body.0);
         body.push(self.barrier());
-        vec![Stmt::Loop(Loop { iv, start, extent, carried, body: Block(body), unroll: 1 })]
+        vec![Stmt::Loop(Loop { iv, start, extent, carried, body: Block(body), unroll: 1, trip: Some(Trip::Steady) })]
     }
 
     /// Every global→shared copy of a produce body split into its load half
@@ -331,13 +348,13 @@ impl Expander<'_> {
         let crew = self.c(i64::from(crew));
         let first = self.bin(BinOp::Lt, warp, crew);
         let second = self.bin(BinOp::Eq, first, zero);
-        let trips = |start, extent, carried, body: Vec<Stmt<Expanded>>| {
-            Stmt::Loop(Loop { iv, start, extent, carried, body: Block(body), unroll: 1 })
+        let trips = |trip, start, extent, carried, body: Vec<Stmt<Expanded>>| {
+            Stmt::Loop(Loop { iv, start, extent, carried, body: Block(body), unroll: 1, trip: Some(trip) })
         };
         vec![
-            trips(before, nonempty, vec![], head),
+            trips(Trip::Head, before, nonempty, vec![], head),
             Self::if_(second, vec![barrier.clone()]),
-            trips(zero, extent, carried, body),
+            trips(Trip::Steady, zero, extent, carried, body),
             Self::if_(first, vec![barrier]),
         ]
     }
@@ -394,13 +411,13 @@ impl Expander<'_> {
             issued.chain(reads.iter().cloned()).chain(fenced).chain(tail.iter().cloned()).chain(wait).collect();
         // The drain's carried registers hold what the steady loop left.
         let drained: Vec<Carried> = carried.iter().map(|c| Carried { init: c.phi, ..*c }).collect();
-        let trips = |start, extent, carried, body: Vec<Stmt<Expanded>>, unroll| {
-            Stmt::Loop(Loop { iv, start, extent, carried, body: Block(body), unroll })
+        let trips = |trip, start, extent, carried, body: Vec<Stmt<Expanded>>, unroll| {
+            Stmt::Loop(Loop { iv, start, extent, carried, body: Block(body), unroll, trip: Some(trip) })
         };
         vec![
-            trips(zero, nonempty, vec![], head, 1),
-            trips(one, steady, carried, body, stages as u32),
-            trips(extent, nonempty, drained, consume.body.0, 1),
+            trips(Trip::Head, zero, nonempty, vec![], head, 1),
+            trips(Trip::Steady, one, steady, carried, body, stages as u32),
+            trips(Trip::Drain, extent, nonempty, drained, consume.body.0, 1),
         ]
     }
 }

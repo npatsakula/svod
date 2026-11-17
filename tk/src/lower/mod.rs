@@ -85,13 +85,9 @@ pub struct Lowered {
     pub linear: Arc<UOp>,
     /// The tile program as emitted: laid, with every register value's layout.
     pub tile: Program<Laid>,
-    /// The ranges the program's own schedule kept rolled (a loop whose body
-    /// holds a product), which [`Lowered::text`] hints every target against
-    /// unrolling further.
-    pub rolled: Vec<u64>,
-    /// Each instruction's statement and unroll copy as emitted, first first
-    /// ([`Self::locations`]).
-    located: Vec<(u64, Location)>,
+    /// Its rolled ranges, which [`Lowered::text`] hints, and each
+    /// instruction's location ([`Self::locations`]).
+    pub marks: emit::Marks,
 }
 
 /// `params` are the flat buffer UOps in `prog.params()` order (placeholders on
@@ -113,11 +109,8 @@ pub fn lower(mut prog: Program, lowering: &Lowering, params: Vec<Arc<UOp>>, devi
     let target = &lowering.device.target;
     let prog = schedule::expand(prog, target.fill, lowering.core, target.sync.split_barrier);
     let laid = layouts::infer(prog, &lowering.device, lowering.core).context(LayoutSnafu)?;
-    emit::ROLLED.with(|cell| cell.borrow_mut().clear());
-    let (program, linear) = emit::emit(&laid, lowering, params, device)?;
-    let rolled = emit::ROLLED.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
-    let located = emit::LOCATIONS.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
-    Ok(Lowered { program, linear, tile: laid, rolled, located })
+    let (program, linear, marks) = emit::emit(&laid, lowering, params, device)?;
+    Ok(Lowered { program, linear, tile: laid, marks })
 }
 
 /// Every shared view within its allocation wherever its offset is bounded,
@@ -197,7 +190,7 @@ impl Lowered {
             GpuArch::Amd(arch) => LlvmTextRenderer::amd(arch),
             GpuArch::Metal(_) => return UnsupportedSnafu { what: "Metal's LLVM text" }.fail(),
         }
-        .rolled(self.rolled.iter().copied());
+        .rolled(self.marks.rolled.iter().copied());
         if svod_schedule::spec::spec_enabled() {
             let nodes = self.linear.op().sources();
             svod_schedule::spec::type_verify_list(&nodes, &svod_schedule::spec::spec_program()).expect("a valid list");
@@ -217,8 +210,8 @@ impl Lowered {
     /// before its user: a stack, a cast, a shuffle built in an expression)
     /// takes its first user's.
     pub fn locations(&self) -> HashMap<u64, Location> {
-        let mut at: HashMap<u64, Location> = HashMap::with_capacity(self.located.len());
-        for &(id, location) in &self.located {
+        let mut at: HashMap<u64, Location> = HashMap::with_capacity(self.marks.located.len());
+        for &(id, location) in &self.marks.located {
             at.entry(id).or_insert(location);
         }
         let given: HashSet<u64> = at.keys().copied().collect();

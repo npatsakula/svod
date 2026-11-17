@@ -33,6 +33,16 @@ impl Role {
     }
 }
 
+impl From<Trip> for Role {
+    fn from(trip: Trip) -> Self {
+        match trip {
+            Trip::Head => Self::Head,
+            Trip::Steady => Self::Steady,
+            Trip::Drain => Self::Drain,
+        }
+    }
+}
+
 /// Every statement's role, in [`Program::walk`] order.
 pub fn roles<P: Phase>(prog: &Program<P>) -> Vec<Option<Role>> {
     let mut out = Vec::new();
@@ -40,37 +50,31 @@ pub fn roles<P: Phase>(prog: &Program<P>) -> Vec<Option<Role>> {
     out
 }
 
-/// A template expands a pipeline into the trips of one induction (head,
-/// steady and drain loops): a block holding loops that share their `iv`
-/// holds a pipeline's trips, and its statements take their roles from
-/// where they stand among them. Elsewhere a statement takes its parent's.
+/// A loop a template placed runs its trip ([`Loop::trip`]); a statement
+/// beside one is in the prologue before its pipeline's first trip, with the
+/// trip before it between two trips of one pipeline (a crew's stagger), in
+/// the epilogue past the last. Elsewhere a statement takes its parent's.
 fn block_roles<P: Phase>(block: &Block<P>, inherited: Option<Role>, out: &mut Vec<Option<Role>>) {
-    let mut by_iv: HashMap<ScalarId, Vec<usize>> = HashMap::new();
-    for (i, stmt) in block.0.iter().enumerate() {
-        if let Stmt::Loop(l) = stmt {
-            by_iv.entry(l.iv).or_default().push(i);
-        }
-    }
-    let trips: HashMap<usize, Role> = by_iv
-        .into_values()
-        .filter(|loops| loops.len() > 1)
-        .flat_map(|loops| {
-            loops.into_iter().enumerate().map(|(k, i)| (i, [Role::Head, Role::Steady, Role::Drain][k.min(2)]))
-        })
-        .collect();
-    let (first, last) = (trips.keys().min().copied(), trips.keys().max().copied());
-    // Between two trip loops (a crew's stagger), the trip before's.
-    let mut between = inherited;
-    for (i, stmt) in block.0.iter().enumerate() {
-        let role = match (trips.get(&i), first, last) {
-            (Some(&trip), ..) => {
-                between = Some(trip);
-                between
+    let trip = |s: &Stmt<P>| match s {
+        Stmt::Loop(l) => l.trip,
+        _ => None,
+    };
+    // The first trip after each statement.
+    let mut next: Vec<Option<Trip>> =
+        block.0.iter().rev().scan(None, |after, s| Some(std::mem::replace(after, trip(s).or(*after)))).collect();
+    next.reverse();
+    let mut before = None;
+    for (stmt, next) in block.0.iter().zip(next) {
+        let role = match (trip(stmt), before, next) {
+            (Some(trip), ..) => {
+                before = Some(trip);
+                Some(trip.into())
             }
-            (None, Some(first), _) if i < first => Some(Role::Prologue),
-            (None, _, Some(last)) if i > last => Some(Role::Epilogue),
-            (None, Some(_), _) => between,
-            (None, None, _) => inherited,
+            // A pipeline's trips run head, steady, drain: a later one is the same pipeline's.
+            (None, Some(before), Some(next)) if next > before => Some(before.into()),
+            (None, _, Some(_)) => Some(Role::Prologue),
+            (None, Some(_), None) => Some(Role::Epilogue),
+            (None, None, None) => inherited,
         };
         out.push(role);
         stmt.blocks().for_each(|b| block_roles(b, role, out));
@@ -165,7 +169,7 @@ fn describe<'p, P: Phase>(prog: &'p Program<P>, stmt: &Stmt<P>, origin: &mut Has
         Stmt::Warps { .. } => "warps".into(),
         Stmt::If { otherwise, .. } if otherwise.0.is_empty() => "if".into(),
         Stmt::If { .. } => "if/else".into(),
-        Stmt::Sync(sync) => match sync {
+        Stmt::Sync(sync) => match (*sync).into() {
             Sync::Barrier { scope: Scope::Block } => "barrier".into(),
             Sync::Barrier { scope: Scope::Warp } => "warp barrier".into(),
             Sync::Arrive => "arrive".into(),

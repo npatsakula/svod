@@ -22,11 +22,14 @@ use svod_runtime::amd::{LocatedAmd, compile_ir_to_amd_object, compile_ir_to_amd_
 use svod_runtime::sqtt::{Capture, Class, Lines, Statements, disassemble, line_table, locate};
 use test_case::test_case;
 
+use crate::atoms::{Core, Fill};
 use crate::build::{BF16, I8};
-use crate::ir::Program;
+use crate::ir::{Expanded, Program, Stmt, Trip};
 use crate::kernels::gemm::{Epilogue, GemmSpec, gemm};
+use crate::lower::listing::{Role, listing, roles};
 use crate::lower::{Lowered, Lowering, standalone};
 use crate::ops::config;
+use crate::schedule::expand;
 use crate::sweep::{Launch, amd, assumed, digested, planner};
 
 use super::gemm_spec;
@@ -375,6 +378,34 @@ fn the_listing_names_statements_and_roles() {
     let has = |prefix: &str, role: &str| lines.iter().any(|l| l.starts_with(prefix) && l.ends_with(role));
     assert!(has("fill a staged commit -> ", "[steady]"), "{listing}");
     assert!(has("store c", "[epilogue]") && has("", "[prologue]"), "{listing}");
+}
+
+/// A template tags the trips it expands a ring into and the listing reads
+/// roles from the tags: a `cp.async` ring's one loop runs steady, with a
+/// prologue and an epilogue around it, and what stands between two
+/// pipelines of one block is the second's prologue, not the first's drain.
+#[test_case(Fill::CpAsync, &[Trip::Steady]; "one loop")]
+#[test_case(Fill::Staged, &[Trip::Head, Trip::Steady, Trip::Drain]; "peeled")]
+fn the_roles_are_the_templates_trips(fill: Fill, trips: &[Trip]) {
+    let mut prog = expand(super::gemm_nt(64, 32, 160, 32, 32, 32, 2), fill, Core::Warp, false);
+    let trip = |s: &Stmt<Expanded>| if let Stmt::Loop(l) = s { l.trip } else { None };
+    assert_eq!(prog.body.0.iter().filter_map(trip).collect::<Vec<_>>(), trips);
+    // The one pipeline twice in a row: roles read only the statements' shapes.
+    prog.body.0.extend(prog.body.0.clone());
+    let roles = roles(&prog);
+    let top: Vec<Option<Role>> = prog.walk().zip(roles).filter(|((depth, _), _)| *depth == 0).map(|(_, r)| r).collect();
+    let body = &prog.body.0;
+    let second = body.iter().rposition(|s| trip(s) == trips.first().copied()).unwrap();
+    let end = body.iter().rposition(|s| trip(s) == trips.last().copied()).unwrap();
+    let want: Vec<Option<Role>> = (body.iter().enumerate())
+        .map(|(i, s)| match trip(s) {
+            Some(t) => Some(t.into()),
+            None if i < second => Some(Role::Prologue),
+            None if i > end => Some(Role::Epilogue),
+            None => unreachable!("no statement of the template's stands between its trips"),
+        })
+        .collect();
+    assert_eq!(top, want, "\n{}", listing(&prog));
 }
 
 /// End to end on the host: a GEMM's SOURCE compiled puts its main loop's
