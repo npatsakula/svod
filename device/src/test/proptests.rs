@@ -1,5 +1,6 @@
-use crate::Buffer;
 use crate::allocator::{Allocator, BufferSpec, CpuAllocator, LruAllocator};
+use crate::registry::DeviceSpecExt;
+use crate::{Buffer, DeviceSpec};
 use proptest::prelude::*;
 use smallvec::SmallVec;
 use std::sync::Arc;
@@ -83,6 +84,12 @@ fn same_size_specs() -> impl Strategy<Value = (AllocCase, AllocCase)> {
 }
 
 proptest! {
+    /// Property: parsing a device spec returns a result for any text, never a panic.
+    #[test]
+    fn device_spec_parse_never_panics(text in any::<String>()) {
+        let _ = DeviceSpec::parse(&text);
+    }
+
     /// Property: dtype/shape metadata is isolated between buffer reuses.
     ///
     /// This is the critical property for cache correctness: even though the underlying
