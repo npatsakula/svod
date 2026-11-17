@@ -988,6 +988,32 @@ fn compare_1536_1500_shows_the_guards() {
     assert_eq!((a.waves_per_simd, &a.by), (8, &d.b.limit.as_ref().unwrap().by));
 }
 
+/// The same nearest config on gfx1201 without and with the split barrier (an unsplit build of the
+/// same commit against the shipped one), each statement read from its own code object. The trip's
+/// `barrier` becomes `arrive` + `await`: gfx12 spells a whole barrier as an adjacent
+/// `s_barrier_signal`/`s_barrier_wait` pair, which the split moves apart, and the barrier's exposed
+/// cycles a trip fall from ~960 to ~200.
+#[test]
+fn compare_split_barrier_names_its_statements() {
+    let d = compared("rdna4_nearest_joined", "rdna4_nearest_split");
+    assert!(d.cautions.is_empty(), "same cfg, both unpinned: {:?}", d.cautions);
+    let statement = |text: &str| d.statements.iter().find(|s| s.statement == text);
+    let barrier = statement("barrier [steady]").unwrap_or_else(|| panic!("{:?}", d.statements));
+    assert!(barrier.exposed[0] > 900.0 && barrier.raw[1] == 0.0, "{barrier:?}");
+    let wait = statement("await [steady]").unwrap();
+    assert!(wait.raw[0] == 0.0 && (150.0..260.0).contains(&wait.exposed[1]), "{wait:?}");
+    let arrive = statement("arrive [steady]").unwrap();
+    assert!(arrive.raw[0] == 0.0, "{arrive:?}");
+    for m in ["s_barrier_signal", "s_barrier_wait"] {
+        assert!(
+            d.rows.inserted.iter().any(|r| r.asm.starts_with(m)) && d.rows.removed.iter().any(|r| r.asm.starts_with(m))
+        );
+    }
+    let delta = bucket(&d, "barrier");
+    assert!(delta.delta_exposed() < -700.0, "{delta:?}");
+    assert!(matches!(finding_delta(&d, FindingKind::Barrier), [Some(a), Some(b)] if a > 2.0 * b));
+}
+
 /// A capture against itself: nothing inserted or removed, every delta zero.
 #[test]
 fn compare_with_itself_is_empty() {
