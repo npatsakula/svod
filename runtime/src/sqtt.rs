@@ -18,7 +18,7 @@ use svod_device::sqtt::asm::{self, Access, Counter, Kind, Memory, Space};
 use svod_device::sqtt::hidden::{self, Hidden, Hiding};
 pub use svod_device::sqtt::report::Spread;
 use svod_device::sqtt::report::{Report, Stats};
-use svod_device::sqtt::simd::{PipeBusy, ROBUST, Residency, STEADY, Simd};
+use svod_device::sqtt::simd::{PipeBusy, Residency, Simd};
 use svod_device::sqtt::stitch::{Stitcher, branch, objdump_lines};
 use svod_device::sqtt::waits::{Binding, Replay, Waits};
 use svod_device::sqtt::{decode, wave};
@@ -26,15 +26,15 @@ use svod_dtype::AmdArch;
 
 mod compare;
 mod lines;
+mod partition;
 mod statements;
+mod text;
 mod verdict;
 pub use compare::{BucketDelta, Caution, Delta, Diff, FindingDelta, LoopRow, Rows, Side, StatementDelta, Unit};
 pub use lines::{DwarfError, LISTING, LineRow, LineTable, Lines, Statements, Stmt, line_table, locate};
+pub use partition::{BarrierSite, Bucket, Charge, Part, Partition, PerTrip, WaitOn};
 pub use statements::Statement;
-pub use verdict::{
-    Approx, BarrierSite, Bucket, Ceiling, Charge, Demand, Evidence, Finding, FindingKind, Findings, Knob, Load, Part,
-    Partition, PerTrip, Stall, Verdict, WaitOn,
-};
+pub use verdict::{Approx, Ceiling, Demand, Evidence, Finding, FindingKind, Findings, Knob, Load, Stall, Verdict};
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
@@ -814,276 +814,6 @@ impl Analysis {
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).expect("an analysis serializes")
     }
-
-    /// The fixed-format report with `top` rows a table.
-    pub fn text(&self, top: usize) -> String {
-        use std::fmt::Write;
-        let mut o = String::new();
-        let labels: String = self.labels.iter().map(|(k, v)| format!(" {k}={v}")).collect();
-        let _ = writeln!(o, "== sqtt {} {}{labels}", self.kernel, self.arch);
-        for se in self.ses.iter().filter(|s| s.truncated) {
-            let _ = writeln!(o, "!! TRUNCATED se{}: its buffer filled and the tail is lost; totals undercount", se.se);
-        }
-        for (se, version) in self.ses.iter().filter_map(|s| Some((s.se, s.refused?))) {
-            let _ = writeln!(o, "!! UNSUPPORTED se{se}: a header of version {version}; the stream from it is left out");
-        }
-        if self.stitched < self.records {
-            let _ =
-                writeln!(o, "!! UNSTITCHED {} of {} records have no PC", self.records - self.stitched, self.records);
-        }
-        verdict::text(self, &mut o);
-        let ns = |ns: Option<u64>| ns.map_or("-".into(), |ns| ns.to_string());
-        let span = self.ses.iter().filter(|s| s.itrace).map(|s| s.span).max().unwrap_or(0);
-        let sclk = self.sclk_mhz.map_or("-".into(), |mhz| format!("~{mhz}"));
-        let mclk = self.mclk_mhz.map_or(String::new(), |mhz| format!(", mclk {mhz} MHz"));
-        let (untraced, traced) = (ns(self.kernel_ns), ns(self.traced_ns));
-        let ratio = verdict::slowdown(self).map_or(String::new(), |r| format!(" ({r:.2}x)"));
-        let pstate = self.pstate.map_or("unrecorded", Into::into);
-        let _ = writeln!(
-            o,
-            "kernel     {untraced} ns untraced, {traced} ns traced{ratio}, wave span {span} cycles, sclk {sclk} MHz{mclk}, pstate {pstate}"
-        );
-        let traced: Vec<String> = self
-            .traced
-            .iter()
-            .map(|t| format!("se{} sa{} wgp{} simd{} ({} waves)", t.se, t.sa, t.wgp, t.simd, t.waves))
-            .collect();
-        let _ = writeln!(o, "traced     {} of {} SEs", traced.join(", "), self.ses.len());
-        let lifetime = self.lifetime.map_or("-".into(), |l| format!("min {} med {} max {}", l.min, l.median, l.max));
-        let starts: usize = self.ses.iter().filter(|s| s.itrace).map(|s| s.waves).sum();
-        let peak = self.ses.iter().map(|s| s.occupancy_peak).max().unwrap_or(0);
-        let _ = writeln!(
-            o,
-            "waves      {} traced ({} complete) of {starts} on the traced SEs, occupancy peak {peak}; lifetime {lifetime} cycles",
-            self.waves, self.complete
-        );
-        let _ = writeln!(o, "records    {} stitched of {}", self.stitched, self.records);
-        let total: i64 = self.classes.iter().map(|c| c.latency).sum();
-        let _ = writeln!(o, "== time by class (traced SIMD, cycles summed over waves)");
-        let _ =
-            writeln!(o, "{:<11} {:>8} {:>11} {:>6} {:>11} {:>11}", "class", "hits", "cycles", "share", "stall", "exec");
-        let share = |c: i64| if total > 0 { 100.0 * c as f64 / total as f64 } else { 0.0 };
-        for c in &self.classes {
-            let (l, s) = (c.latency, c.stall);
-            let _ = writeln!(
-                o,
-                "{:<11} {:>8} {l:>11} {:>5.1}% {s:>11} {:>11}",
-                <&str>::from(c.class),
-                c.hits,
-                share(l),
-                l - s
-            );
-        }
-        let (hits, stall): (u64, i64) = self.classes.iter().fold((0, 0), |(h, s), c| (h + c.hits, s + c.stall));
-        let _ = writeln!(o, "{:<11} {hits:>8} {total:>11} {:>5.1}% {stall:>11} {:>11}", "total", 100.0, total - stall);
-        self.occupancy_text(&mut o);
-        let table = |o: &mut String, rows: Vec<&Row>| {
-            let _ = writeln!(
-                o,
-                "{:>8} {:>7} {:>9} {:>9} {:>9} {:>9}  asm",
-                "pc", "hits", "cycles", "lat/hit", "stall/hit", "expo/hit"
-            );
-            for r in rows {
-                let per = |c: i64| c as f64 / r.hits.max(1) as f64;
-                let (l, s, e) = (per(r.latency), per(r.stall), per(r.stall - r.hidden_stall));
-                let _ =
-                    writeln!(o, "{:>#8x} {:>7} {:>9} {l:>9.1} {s:>9.1} {e:>9.1}  {}", r.pc, r.hits, r.latency, r.asm);
-            }
-        };
-        match &self.main_loop {
-            None => {
-                let _ = writeln!(o, "== main loop: none (no executed backward branch)");
-            }
-            Some(l) => {
-                let kind = if l.matrix { "matrix" } else { "hottest, no matrix op" };
-                let _ = writeln!(o, "== main loop {:#x}..={:#x} ({kind})", l.head, l.back_edge);
-                let spread = |s: Option<Spread>, p: bool| match s {
-                    None => "-".into(),
-                    Some(s) if p => format!("min {} med {} p90 {} max {} (n {})", s.min, s.median, s.p90, s.max, s.n),
-                    Some(s) => format!("min {} med {} max {} (waves {})", s.min, s.median, s.max, s.n),
-                };
-                let _ = writeln!(o, "iterations/wave  {}", spread(l.iterations, false));
-                let _ = writeln!(o, "cycles/iteration {}", spread(l.cycles, true));
-                partition_text(&mut o, l);
-                statements::text(self, &mut o, top);
-                let mut rows: Vec<&Row> = self.loop_rows().collect();
-                rows.sort_by_key(|r| (std::cmp::Reverse(r.stall), r.pc));
-                let _ = writeln!(o, "== main loop: top {top} by stall");
-                table(&mut o, rows.into_iter().take(top).collect());
-            }
-        }
-        self.waits_text(&mut o, top);
-        let mut rows: Vec<&Row> = self.pcs.iter().collect();
-        rows.sort_by_key(|r| (std::cmp::Reverse(r.latency), r.pc));
-        let _ = writeln!(o, "== hottest {top} by cycles");
-        table(&mut o, rows.into_iter().take(top).collect());
-        o
-    }
-
-    /// The kernel's limit on resident waves, and per SE the waves resident over its steady window
-    /// (`mean/peak`, the SE's and its SIMDs'), with the traced SIMD's and its pipes' busy shares.
-    fn occupancy_text(&self, o: &mut String) {
-        use std::fmt::Write;
-        let occ = &self.occupancy;
-        let (num, den) = STEADY;
-        let _ = writeln!(
-            o,
-            "== occupancy: resident waves mean/peak over the steady window (the SE at {}% of its p{} or more)",
-            100 * num / den,
-            100 * ROBUST.0 / ROBUST.1
-        );
-        match &occ.limit {
-            Some(l) => {
-                let by: Vec<&str> = l.by.iter().map(|b| b.name()).collect();
-                let (waves, groups, by) = (l.waves_per_simd, l.workgroups_per_cu, by.join("+"));
-                let _ = writeln!(o, "limit      {waves} waves/SIMD, {groups} workgroups/CU, by {by}");
-            }
-            None => {
-                let _ = writeln!(o, "limit      - (no kernel resources and workgroup in the capture)");
-            }
-        }
-        for se in &occ.ses {
-            let r = &se.residency;
-            let span = self.ses.iter().find(|s| s.se == se.se).map_or(0, |s| s.span).max(1);
-            let window = 100.0 * (r.window.1 - r.window.0) as f64 / span as f64;
-            let peak = r.simds.iter().map(|s| s.peak).max().unwrap_or(0);
-            let mean = r.simds.iter().map(Simd::mean).sum::<f64>() / r.simds.len().max(1) as f64;
-            let traced = se.traced.map_or(String::new(), |t| format!("; traced {:.1}/{}", t.mean(), t.peak));
-            let _ = writeln!(
-                o,
-                "se{:<8} {:.1}/{} (p{} {}) over {window:.0}% of the span; {} SIMDs {mean:.1}/{peak}{traced}",
-                se.se,
-                r.mean(),
-                r.peak,
-                100 * ROBUST.0 / ROBUST.1,
-                r.robust_peak,
-                r.simds.len()
-            );
-            if let Some(b) = se.busy {
-                let pct = |c: i64| 100.0 * b.share(c);
-                let _ = writeln!(
-                    o,
-                    "  busy     matrix {:.1}% valu {:.1}% vmem {:.1}% scalar {:.1}% any {:.1}%",
-                    pct(b.matrix),
-                    pct(b.valu),
-                    pct(b.vmem),
-                    pct(b.scalar),
-                    pct(b.any)
-                );
-            }
-        }
-        if occ.untimed_matrix {
-            let _ =
-                writeln!(o, "note       matrix ops trace as 1-cycle VALU tokens here: matrix and valu busy undercount");
-        }
-    }
-
-    /// The bindings whose waits stalled longest: `stalled` of `waits` stalled (latency over those),
-    /// `wait` is the wait PC it bound most often and `distance` lists `back edges:instances`.
-    fn waits_text(&self, o: &mut String, top: usize) {
-        use std::fmt::Write;
-        let w = &self.waits;
-        let _ = writeln!(
-            o,
-            "== waits: {} on {} waves ({} skipped), {} unbound, {} approximate; top {top} bindings by stall",
-            w.instances, w.waves, w.skipped, w.unbound, w.approx
-        );
-        let _ = writeln!(
-            o,
-            "{:>8} {:>7} {:>7} {:>9} {:>7} {:>7} {:>8} {:<12}  asm",
-            "pc", "waits", "stalled", "stall", "lat med", "lat p90", "wait", "distance"
-        );
-        let asm: BTreeMap<u64, &str> = self.pcs.iter().map(|r| (r.pc, r.asm.as_str())).collect();
-        for b in w.bindings.iter().take(top) {
-            let wait = b.waits.iter().max_by_key(|&&(pc, n, _)| (n, std::cmp::Reverse(pc))).map_or(0, |w| w.0);
-            let distance: Vec<String> = b.distance.iter().map(|(d, n)| format!("{d}:{n}")).collect();
-            let (med, p90) = b.latency.map_or(("-".into(), "-".into()), |l| (l.median.to_string(), l.p90.to_string()));
-            let asm = asm.get(&b.pc).copied().unwrap_or_default();
-            let _ = writeln!(
-                o,
-                "{:>#8x} {:>7} {:>7} {:>9} {med:>7} {p90:>7} {wait:>#8x} {:<12}  {asm}",
-                b.pc,
-                b.count,
-                b.stalled,
-                b.stall,
-                distance.join(",")
-            );
-        }
-    }
-
-    /// One paragraph: where the traced SIMD's time went and the main loop's pace.
-    pub fn summary(&self) -> String {
-        let total: i64 = self.classes.iter().map(|c| c.latency).sum::<i64>().max(1);
-        let mut classes = self.classes.clone();
-        classes.sort_by_key(|c| std::cmp::Reverse(c.latency));
-        let top: Vec<String> = classes
-            .iter()
-            .take(4)
-            .map(|c| format!("{} {:.0}%", <&str>::from(c.class), 100.0 * c.latency as f64 / total as f64))
-            .collect();
-        let sclk = self.sclk_mhz.map_or(String::new(), |mhz| format!(", sclk ~{mhz} MHz"));
-        let pace = self
-            .main_loop
-            .as_ref()
-            .and_then(|l| Some((l.iterations?, l.cycles?)))
-            .map_or("no main loop".into(), |(i, c)| {
-                format!("main loop {} iterations/wave at {} cycles (median)", i.median, c.median)
-            });
-        let warn = if self.ses.iter().any(|s| s.truncated) { " TRUNCATED." } else { "" };
-        format!(
-            "{} {}: {} traced waves{sclk}; time {}; {pace}.{warn}",
-            self.kernel,
-            self.arch,
-            self.waves,
-            top.join(", ")
-        )
-    }
-}
-
-/// The main loop's partition a trip: every bucket, raw and exposed, its shares, and each traced SE's.
-fn partition_text(o: &mut String, l: &MainLoop) {
-    use std::fmt::Write;
-    let t = l.trips;
-    let unit = t.unit().name();
-    let _ = writeln!(
-        o,
-        "trips      {} an iteration ({}), {} in the loop over {} waves",
-        t.per_iteration,
-        if t.counted { "its statements' unroll copies" } else { "no statements: per-trip figures are per iteration" },
-        t.total,
-        l.partition.waves
-    );
-    let ses: String = l.ses.iter().map(|s| format!(" {:>9}", format!("se{}", s.se))).collect();
-    let _ = writeln!(
-        o,
-        "== main loop cycles {unit}: a traced wave's, each cycle once (issue, stall and idle by class); exposed: less what other pipes hid"
-    );
-    let _ = writeln!(o, "{:<20} {:>9} {:>7} {:>9} {:>7}{ses}", "bucket", "all", "share", "exposed", "share");
-    let per = |cycles: i64, trips: u64| cycles as f64 / trips.max(1) as f64;
-    let p = &l.partition;
-    let total = p.cycles()[0].max(1) as f64;
-    let rows = p.buckets.keys().map(|&b| (b.to_string(), Some(b))).chain([("total".into(), None)]);
-    for (name, bucket) in rows {
-        // A bucket's cycles, else every bucket's.
-        let of = |p: &Partition| bucket.map_or(p.cycles(), |b| p.buckets.get(&b).copied().unwrap_or_default());
-        let ses: String = l.ses.iter().map(|s| format!(" {:>9.1}", per(of(&s.partition)[0], s.trips))).collect();
-        let [all, exposed] = of(p);
-        let share = |c: i64| 100.0 * c as f64 / total;
-        let _ = writeln!(
-            o,
-            "{name:<20} {:>9.1} {:>6.1}% {:>9.1} {:>6.1}%{ses}",
-            per(all, t.total),
-            share(all),
-            per(exposed, t.total),
-            share(exposed)
-        );
-    }
-}
-
-impl std::fmt::Display for Analysis {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.text(10))
-    }
 }
 
 /// Every instruction of the disassembly by PC: its line and kind, classified once.
@@ -1137,8 +867,8 @@ fn main_loop<'a>(
     let copies =
         stmts.map_or(vec![], |(stmts, _)| body.iter().filter_map(|pc| stmts.get(pc)).map(|s| s.copy).collect());
     let per_iteration = copies.iter().copied().max().unwrap_or(1).max(1);
-    let buckets = verdict::Buckets(insts);
-    let (mut sites, mut charges) = (vec![], BTreeMap::<u64, verdict::Charge>::new());
+    let buckets = partition::Buckets(insts);
+    let (mut sites, mut charges) = (vec![], BTreeMap::<u64, Charge>::new());
     let ses: Vec<SeLoop> = ses
         .map(|s| {
             let edges = s.waves.iter().flat_map(|w| &w.instructions).filter(|i| i.pc == edge).count() as u64;

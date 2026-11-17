@@ -3,7 +3,6 @@
 //! load that bound it, so a fill carries the waits its latency causes.
 
 use std::collections::{BTreeMap, HashMap};
-use std::fmt::Write;
 use std::num::NonZeroU32;
 
 use serde::{Deserialize, Serialize};
@@ -83,35 +82,6 @@ impl Analysis {
     /// `stmt`'s `kernel.tk` line, trimmed.
     pub fn line(&self, stmt: Stmt) -> &str {
         listed(&self.listing, stmt.line)
-    }
-
-    /// `"  @line text"` of `stmt`, else nothing.
-    pub(super) fn at(&self, stmt: Option<Stmt>) -> String {
-        stmt.map_or(String::new(), |s| format!("  @{} {}", s.line, self.line(s)))
-    }
-}
-
-/// The main loop's statements, `top` most exposed and the unattributed.
-pub(super) fn text(a: &Analysis, o: &mut String, top: usize) {
-    let Some(l) = a.main_loop.as_ref().filter(|l| !l.statements.is_empty()) else { return };
-    let unit = l.trips.unit().name();
-    let (pcs, unattributed) =
-        l.statements.iter().fold((0, 0), |(n, u), s| (n + s.pcs, u + if s.line.is_none() { s.pcs } else { 0 }));
-    let _ = writeln!(
-        o,
-        "== statements: main loop cycles {unit} by kernel.tk line (a wait on its binding load's); {} of {pcs} loop instructions attributed; top {top} by exposed",
-        pcs - unattributed
-    );
-    let _ = writeln!(
-        o,
-        "{:>5} {:>4} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}  statement",
-        "line", "pcs", "issue", "stall", "wait", "barrier", "idle", "total", "exposed"
-    );
-    let shown = l.statements.iter().filter(|s| s.line.is_some()).take(top);
-    for s in shown.chain(l.statements.iter().filter(|s| s.line.is_none())) {
-        let line = s.line.map_or("-".into(), |l| l.to_string());
-        let parts: String = s.parts.0.iter().map(|c| format!(" {:>8.1}", c.raw)).collect();
-        let _ = writeln!(o, "{line:>5} {:>4}{parts} {:>8.1} {:>8.1}  {}", s.pcs, s.raw(), s.exposed(), s.text);
     }
 }
 

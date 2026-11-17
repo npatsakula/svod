@@ -13,8 +13,9 @@ use test_case::test_case;
 use svod_device::amd::occupancy::Limiter;
 
 use super::compare::align;
+use super::partition::Buckets;
 use super::statements::rollup;
-use super::verdict::{Buckets, load_bytes};
+use super::verdict::load_bytes;
 use super::{
     Analysis, Approx, Axis, Bucket, Capture, Caution, Charge, Class, Delta, Diff, Evidence, Finding, FindingKind, Knob,
     LineRow, Lines, LoopRow, Part, Partition, PerTrip, Pstate, Reduction, Spread, Statement, Statements, Stmt, Unit,
