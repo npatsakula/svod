@@ -103,9 +103,18 @@ fn device_spec_parses_aliases_and_round_trips_through_canonicalize() {
 #[test_case("METAL:"; "empty id")]
 #[test_case("NV:0"; "alias reserved for a userspace driver")]
 #[test_case(""; "empty")]
+#[test_case("DISKé"; "multi-byte char straddling the disk scheme")]
+#[test_case("hıp"; "non-ascii letter that uppercases to an alias")]
 fn device_spec_parse_rejects_malformed_specs(text: &str) {
     let err = DeviceSpec::parse(text).expect_err(text);
     assert!(matches!(err, crate::Error::InvalidDevice { .. }), "{text}: {err:?}");
+}
+
+/// The disk scheme is case-insensitive; the path after it is kept as written.
+#[test]
+fn device_spec_parse_keeps_the_disk_path_as_written() {
+    let spec = DeviceSpec::parse("disk:Data/日本").unwrap();
+    assert_eq!(spec, DeviceSpec::Disk { path: "Data/日本".into() });
 }
 
 /// Opening CUDA must never panic: without the driver library, without a GPU,
