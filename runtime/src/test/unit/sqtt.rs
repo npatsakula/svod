@@ -282,6 +282,7 @@ fn names_a_foreign_header() {
 
 /// A `meta.json` of another format, or of none, is refused before its fields are read.
 #[test_case(Some(0))]
+#[test_case(Some(1))]
 #[test_case(Some(crate::sqtt::FORMAT + 1))]
 #[test_case(None)]
 fn refuses_another_format(format: Option<u32>) {
@@ -490,14 +491,15 @@ fn load_share(a: &Analysis) -> f64 {
 
 /// svod's ring GEMM, its 1500- and 1536-row twins and the Strix GEMM all run 160 K-trips of 32,
 /// their 2-slot ring unrolled: 2 trips an iteration, where the code object's statements count them
-/// (`trips`), else a trip is taken as an iteration and every loop finding says so. v1, v3 and Strix
+/// (`trips`: Strix's code object carries its line table), else a trip is taken as an iteration and
+/// every loop finding says so. v1, v3 and Strix
 /// pinned the clock at the standard pstate and ran over 1.2x the untraced time; the 1500 and 1536
 /// captures ran unpinned at 1.04x.
 #[test_case("rdna4_gemm_v1", Some(Pstate::Standard), 1)]
 #[test_case("rdna4_gemm_v3", Some(Pstate::Standard), 1)]
 #[test_case("rdna4_gemm_1500", Some(Pstate::Unpinned), 1)]
 #[test_case("rdna4_gemm_1536", Some(Pstate::Unpinned), 1)]
-#[test_case("strix_smoke", Some(Pstate::Standard), 1)]
+#[test_case("strix_smoke", Some(Pstate::Standard), 2)]
 fn verdict_reads_the_capture(name: &str, pstate: Option<Pstate>, trips: u32) {
     let a = verdict_of(name);
     let t = a.main_loop.as_ref().unwrap().trips;
@@ -1127,19 +1129,34 @@ fn with_lines(mut c: Capture) -> Capture {
     c
 }
 
-/// A capture with lines saves `lines.json` and `kernel.tk` and loads them back; its rows carry their
-/// statements, and its loop's cycles split over them exactly as over the partition's buckets, the
-/// waits on the statements of the loads that bound them.
+/// A capture's statements are its code object's: saved, nothing but `kernel.co` holds them, so
+/// Strix's (whose code object carries its line table) load back and synthetic ones do not.
+#[test]
+fn statements_come_from_the_code_object() {
+    let strix = Capture::load(&fixtures().join("svod/strix_smoke")).unwrap();
+    let s = strix.statements.as_ref().expect("Strix's line table");
+    assert!(s.listing.lines().any(|l| l.trim() == "mma a_s·b_s [steady]") && s.lines.len() > 100, "{s:?}");
+    let synthetic = with_lines(Capture::load(&fixtures().join("svod/rdna4_gemm_v3")).unwrap());
+    for (c, kept) in [(&strix, true), (&synthetic, false)] {
+        let dir = tempfile::tempdir().unwrap();
+        c.save(dir.path()).unwrap();
+        let mut saved: Vec<String> =
+            std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        saved.sort();
+        assert!(
+            saved.iter().all(|f| f.ends_with(".att") || ["kernel.co", "kernel.s", "meta.json"].contains(&f.as_str()))
+        );
+        let back = Capture::load(dir.path()).unwrap().statements;
+        assert_eq!(back.as_ref(), c.statements.as_ref().filter(|_| kept));
+    }
+}
+
+/// A capture's rows carry their statements, and its loop's cycles split over them exactly as over
+/// the partition's buckets, the waits on the statements of the loads that bound them.
 #[test]
 fn statements_split_the_loop_exactly() {
     let c = with_lines(Capture::load(&fixtures().join("svod/rdna4_gemm_v3")).unwrap());
-    let dir = tempfile::tempdir().unwrap();
-    c.save(dir.path()).unwrap();
-    assert!(dir.path().join("lines.json").exists() && dir.path().join("kernel.tk").exists());
-    let back = Capture::load(dir.path()).unwrap();
-    assert_eq!(back.statements, c.statements);
-    let a = back.analyze().unwrap();
-    assert_eq!(a, c.analyze().unwrap());
+    let a = c.analyze().unwrap();
     assert!(a.pcs.iter().filter(|r| r.class == Class::Matrix).all(|r| r.stmt.is_some_and(|s| s.line.get() == 1)));
     assert_eq!(a.listing.len(), 4);
     let l = a.main_loop.as_ref().unwrap();

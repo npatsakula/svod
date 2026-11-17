@@ -61,7 +61,7 @@ pub enum Error {
 }
 
 /// The `meta.json` layout [`Capture::load`] reads; bumped whenever it changes.
-pub const FORMAT: u32 = 1;
+pub const FORMAT: u32 = 2;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -281,8 +281,8 @@ impl Capture {
         })
     }
 
-    /// `se<N>.att` (raw streams), `kernel.co`, `kernel.s` and `meta.json` under `dir`; with
-    /// statements, `lines.json` (ELF address to its [`Stmt`]) and `kernel.tk`.
+    /// `se<N>.att` (raw streams), `kernel.co`, `kernel.s` and `meta.json` under `dir`: the
+    /// statements are `kernel.co`'s own line table, read again on load.
     pub fn save(&self, dir: &Path) -> Result<()> {
         let code = &self.trace.code;
         io(dir, std::fs::create_dir_all(dir))?;
@@ -292,11 +292,6 @@ impl Capture {
         }
         write("kernel.co", &code.elf)?;
         write("kernel.s", self.disassembly.as_bytes())?;
-        if let Some(s) = &self.statements {
-            let path = dir.join("lines.json");
-            write("lines.json", serde_json::to_string(&s.lines).context(JsonSnafu { path })?.as_bytes())?;
-            write("kernel.tk", s.listing.as_bytes())?;
-        }
         let meta = Meta {
             format: FORMAT,
             arch: self.trace.arch.to_string(),
@@ -322,7 +317,8 @@ impl Capture {
         write("meta.json", serde_json::to_string_pretty(&meta).context(JsonSnafu { path })?.as_bytes())
     }
 
-    /// What [`Self::save`] wrote; disassembles `kernel.co` only where `kernel.s` is missing.
+    /// What [`Self::save`] wrote; disassembles `kernel.co` only where `kernel.s` is missing, and
+    /// reads its statements from `kernel.co` as [`Self::new`] does.
     pub fn load(dir: &Path) -> Result<Self> {
         let read = |name: &str| io(&dir.join(name), std::fs::read(dir.join(name)));
         let path = dir.join("meta.json");
@@ -348,15 +344,11 @@ impl Capture {
             true => String::from_utf8_lossy(&read("kernel.s")?).into_owned(),
             false => disassemble(&elf)?,
         };
-        let code = Arc::new(CodeImage { elf, load_base: meta.load_base, entry_pc: meta.entry_pc });
-        let statements = match dir.join("lines.json").exists() && dir.join("kernel.tk").exists() {
-            true => {
-                let path = dir.join("lines.json");
-                let lines: Lines = serde_json::from_slice(&read("lines.json")?).context(JsonSnafu { path })?;
-                Some(Statements { lines, listing: String::from_utf8_lossy(&read("kernel.tk")?).into_owned() })
-            }
-            false => None,
+        let statements = match elf.is_empty() {
+            true => None,
+            false => Statements::of(&elf, &disassembly).context(LineTableSnafu)?,
         };
+        let code = Arc::new(CodeImage { elf, load_base: meta.load_base, entry_pc: meta.entry_pc });
         Ok(Self {
             trace: SqttTrace { arch, per_se, code, mclk_mhz: meta.mclk_mhz },
             disassembly,

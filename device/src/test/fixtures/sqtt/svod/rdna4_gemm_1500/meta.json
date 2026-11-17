@@ -1,5 +1,5 @@
 {
-  "format": 1,
+  "format": 2,
   "arch": "gfx1201",
   "load_base": 139640707473408,
   "entry_pc": 139640707473408,
@@ -29,7 +29,6 @@
       "axis": "k",
       "elems": 32
     },
-    "per_iteration": 2,
     "price": {
       "ns": 182508.0,
       "trips": 160,
