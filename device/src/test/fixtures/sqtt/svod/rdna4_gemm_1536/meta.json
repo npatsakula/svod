@@ -1,0 +1,66 @@
+{
+  "format": 2,
+  "arch": "gfx1201",
+  "load_base": 132063342379008,
+  "entry_pc": 132063342379008,
+  "kernel_ns": 147520,
+  "traced_ns": 153600,
+  "ses": [
+    {
+      "se": 0,
+      "itrace": true,
+      "truncated": false
+    },
+    {
+      "se": 1,
+      "itrace": true,
+      "truncated": false
+    }
+  ],
+  "labels": {
+    "candidate_ns": "146560",
+    "cfg": "[128, 128, 32] s2 [4, 2] unroll=true Warp crews=1",
+    "kernel": "gemm",
+    "op": "gemm",
+    "shape": "1536x1280x5120"
+  },
+  "model": {
+    "per_trip": {
+      "axis": "k",
+      "elems": 32
+    },
+    "price": {
+      "ns": 182527.0,
+      "trips": 160,
+      "blocks_per_sm": 2,
+      "terms": {
+        "steps": 78778.0,
+        "reads": 11262.0,
+        "fill": 16343.0,
+        "wait": 37890.0,
+        "lone_trip": 2017.0,
+        "trip": 0.0
+      }
+    }
+  },
+  "resources": {
+    "vgprs": 176,
+    "agprs": null,
+    "sgprs": 16,
+    "lds_bytes": 32768,
+    "scratch_bytes": 0,
+    "wave_size": 32,
+    "occupancy": 0.5
+  },
+  "workgroup": [
+    256,
+    1,
+    1
+  ],
+  "grid": [
+    12,
+    10,
+    1
+  ],
+  "pstate": "unpinned"
+}

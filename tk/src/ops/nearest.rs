@@ -850,7 +850,7 @@ pub(crate) fn timed<'t>(
 
 /// The programs `spec` launches in order: the kernel, and split, the merge
 /// of its shares.
-pub(crate) fn programs(planner: &Planner, dtype: DType, spec: &Admitted<NearestSpec>) -> crate::tune::Candidate {
+pub fn programs(planner: &Planner, dtype: DType, spec: &Admitted<NearestSpec>) -> crate::tune::Candidate {
     let lowering = Lowering::new(&planner.device);
     if spec.cfg().select().is_some() {
         // Every block's scores, bound and listing, as [`matrix`] launches them.

@@ -22,6 +22,7 @@ fn parse_properties_handles_real_kfd_format() {
 
 #[test]
 fn enumerate_returns_empty_when_topology_missing() {
+    let _lock = topology_override();
     let temp = tempfile_dir();
     // Point at a non-existent directory.
     unsafe {
@@ -36,6 +37,7 @@ fn enumerate_returns_empty_when_topology_missing() {
 
 #[test]
 fn enumerate_skips_cpu_nodes_and_parses_gpu() {
+    let _lock = topology_override();
     let root = tempfile_dir();
     let n0 = root.join("0");
     let n1 = root.join("1");

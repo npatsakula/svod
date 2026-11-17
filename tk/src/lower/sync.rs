@@ -56,12 +56,12 @@ impl State {
     /// (`divergent`), a block barrier would wait for them forever.
     fn meet(&mut self, need: Need, scope: Scope, divergent: bool, out: &mut Vec<Stmt>) -> Result<()> {
         if need == Need::Land {
-            out.extend([Stmt::Sync(Sync::CommitAsync), Stmt::Sync(Sync::WaitAsync { pending: 0 })]);
+            out.extend([Stmt::Sync(AuthoredSync::CommitAsync), Stmt::Sync(AuthoredSync::WaitAsync { pending: 0 })]);
             self.pending.clear();
         }
         if need >= Need::Fence {
             ensure!(!divergent || scope == Scope::Warp, DivergentBarrierSnafu { what: "a shared tile's fence" });
-            out.push(Stmt::Sync(Sync::Barrier { scope }));
+            out.push(Stmt::Sync(AuthoredSync::Barrier { scope }));
             self.fenced();
         }
         Ok(())
@@ -132,12 +132,11 @@ fn walk(prog: &Program, block: Block, mut state: State, scope: Scope, divergent:
             }
             Stmt::Sync(sync) => {
                 match sync {
-                    Sync::Barrier { scope: on } => {
+                    AuthoredSync::Barrier { scope: on } => {
                         ensure!(!divergent || on == Scope::Warp, DivergentBarrierSnafu { what: "a barrier" });
                         state.fenced();
                     }
-                    Sync::Fence | Sync::WaitProducts { .. } | Sync::Prio { .. } => {}
-                    Sync::CommitAsync | Sync::WaitAsync { .. } => {
+                    AuthoredSync::CommitAsync | AuthoredSync::WaitAsync { .. } => {
                         unreachable!("async groups are the templates' and this pass's own")
                     }
                 }

@@ -27,6 +27,9 @@ pub struct RegDef {
 /// A vendored register module: `(prefix, (maj, min, rev), table)`.
 pub type RegModule = (&'static str, (u8, u8, u8), &'static [RegDef]);
 
+/// A GC register the profilers name: `(name, fields, GC majors carrying it)`.
+pub type ProfilerReg = (&'static str, &'static [&'static str], &'static [u32]);
+
 include!("regs_gen.rs");
 
 impl RegDef {
@@ -36,11 +39,13 @@ impl RegDef {
     }
 
     /// OR together `value << field.lo` for each named field. Panics on an
-    /// unknown field name (a programming error).
+    /// unknown field name or a value wider than its field (programming errors).
     pub fn encode(&self, values: &[(&str, u32)]) -> u64 {
         let mut acc = 0u64;
         for (name, v) in values {
             let f = self.field(name).unwrap_or_else(|| panic!("register {} has no field {name}", self.name));
+            let width = u32::from(f.hi - f.lo) + 1;
+            assert!(width >= 32 || *v >> width == 0, "{}.{name} = {v:#x} overflows its {width} bits", self.name);
             acc |= (*v as u64) << f.lo;
         }
         acc

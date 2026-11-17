@@ -147,10 +147,31 @@ pub(crate) fn amd_object_key(
     crate::object_cache::ObjectCacheKey::new(ir.as_bytes(), identity)
 }
 
+/// [`compile_ir_to_amd_object`] with the flags a clang of LLVM `llvm_major`
+/// compiles with (the machine-sink gate among them), by this
+/// host's clang: what proves a change of the IR leaves the code alone on
+/// either side of the gate.
+///
+/// # Errors
+///
+/// As [`compile_ir_to_amd_object`].
+pub fn compile_ir_to_amd_object_as(ir: &str, arch: AmdArch, llvm_major: u32) -> crate::Result<Vec<u8>> {
+    compile_ir_to_amd_object_flagged(&amd_toolchain(None)?, ir, arch, Some(llvm_major))
+}
+
 pub(crate) fn compile_ir_to_amd_object_with(
     toolchain: &ClangToolchain,
     ir: &str,
     arch: AmdArch,
+) -> crate::Result<Vec<u8>> {
+    compile_ir_to_amd_object_flagged(toolchain, ir, arch, toolchain.llvm_major())
+}
+
+fn compile_ir_to_amd_object_flagged(
+    toolchain: &ClangToolchain,
+    ir: &str,
+    arch: AmdArch,
+    llvm_major: Option<u32>,
 ) -> crate::Result<Vec<u8>> {
     if !toolchain.has_target("amdgcn") {
         return Err(crate::Error::JitCompilation {
@@ -161,11 +182,7 @@ pub(crate) fn compile_ir_to_amd_object_with(
         });
     }
     debug!(arch = arch.mcpu(), ir.length = ir.len(), "compiling amdgcn IR via clang");
-    toolchain.compile_ir(
-        &amd_object_flags(ir, arch, toolchain.llvm_major()),
-        ir,
-        &format!("amdgcn (mcpu={})", arch.mcpu()),
-    )
+    toolchain.compile_ir(&amd_object_flags(ir, arch, llvm_major), ir, &format!("amdgcn (mcpu={})", arch.mcpu()))
 }
 
 /// Validate both the generic ELF contract and the architecture encoded in

@@ -5,7 +5,7 @@ pub mod cpu;
 pub mod cuda;
 pub mod metal;
 
-pub use amd::{create_amd_codegen, create_amd_device};
+pub use amd::{LocatedAmd, create_amd_codegen, create_amd_device};
 
 /// The [`ProgramSpec`] of a rendered kernel: source, ABI and var names carried
 /// over, `buf_count` from its buffer arguments.

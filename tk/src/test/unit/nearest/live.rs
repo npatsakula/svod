@@ -5,33 +5,18 @@
 //! symbolic rows and lists, one plan rebound, against the op at each shape.
 
 use svod_dtype::DType;
-use svod_ir::SInt;
 use svod_tensor::{BoundVariable, Tensor, Variable};
 use test_case::test_case;
 
+use super::super::ops::{Rebound, bound};
 use super::*;
-use crate::atoms::Device;
-use crate::ir::{Program, Var};
+use crate::ir::Var;
 use crate::kernels::nearest::{Live, Pow2, Way};
 use crate::kernels::{Admits, Admitted};
-use crate::lower::Lowering;
 
 /// The variables the tests bind the rows and a list's length to.
 const ROWS: &str = "n";
 const LIST: &str = "k";
-
-/// Runs a program on its lowering under the variables given, every
-/// parameter's values after it in order.
-type Exec<'a> = &'a dyn Fn(Program, &Lowering, Vec<Vec<f64>>, &[(&str, i64)]) -> Vec<Vec<f64>>;
-
-fn interpret(prog: Program, _: &Lowering, params: Vec<Vec<f64>>, vars: &[(&str, i64)]) -> Vec<Vec<f64>> {
-    run(&prog, params, vars).unwrap()
-}
-
-fn on_device(prog: Program, lowering: &Lowering, params: Vec<Vec<f64>>, vars: &[(&str, i64)]) -> Vec<Vec<f64>> {
-    let outs = super::super::targets::on_device_with(prog, lowering, &params, vars);
-    outs.into_iter().zip(params).map(|(o, p)| o.unwrap_or(p)).collect()
-}
 
 /// The live rows of `case` (all of them its bound) where `rows`, and lists
 /// bound to `kmax` where it holds more than one score.
@@ -76,115 +61,23 @@ fn ways(kmax: usize, m: usize) -> Vec<NearestCfg> {
 }
 
 impl Case {
-    fn compiled(&self, spec: &Admitted<NearestSpec>) -> Program {
-        if self.f16 { nearest::<F16>(spec) } else { nearest::<BF16>(spec) }
-    }
-
     /// The lists of the first `n` rows, `k` slots each, as the kernels built
     /// for all the case's rows and for lists of `kmax` under `cfg` leave
     /// them with `live` bound to `n` and `k` (rows not live are all `n`, a
-    /// list not live is `kmax` long); a score matrix's in panels of `panel`
-    /// rows and blocks of `cols` candidates. Run by `exec`.
-    #[allow(clippy::too_many_arguments)]
+    /// list not live is `kmax` long), run as `how` runs them; a score
+    /// matrix's filtered, whole rows listed in two shares.
     fn live_listed(
         &self,
         cfg: NearestCfg,
-        live: &Live,
+        live: Live,
         kmax: usize,
         (n, k): (usize, usize),
-        (panel, cols): (usize, usize),
-        device: &Device,
-        exec: Exec,
+        how: Run,
     ) -> (Vec<f64>, Vec<f64>) {
         assert!((live.rows.is_some() || n == self.n) && (live.k.is_some() || k == kmax), "unbound values");
-        let depth = self.d.next_multiple_of(16);
         let rows_var = live.rows.iter().map(|_| (ROWS, n as i64));
-        let vars: Vec<(&str, i64)> = rows_var.chain(live.k.iter().map(|_| (LIST, k as i64))).collect();
-        let (score, index) = match cfg.select() {
-            Some(select) => {
-                // Filtered, its bound read at the live length.
-                let select = SelectCfg { filter: true, ..select };
-                let cfg = NearestCfg { list: Way::Matrix(select), ..cfg };
-                let (scored, listing) = (Lowering::new(device), Lowering::new(device));
-                let (mut score, mut index) = (vec![], vec![]);
-                for r0 in (0..self.n).step_by(panel) {
-                    let rows = panel.min(self.n - r0);
-                    let live = Live { rows: live.rows.clone().map(|(v, _)| (v, r0)), k: live.k.clone() };
-                    let mut lists = vec![vec![0.0; rows * kmax]; 2];
-                    for c0 in (0..self.m).step_by(cols) {
-                        let width = cols.min(self.m - c0);
-                        // Live, every panel reads the rows whole.
-                        let held = if live.rows.is_some() { 0..self.n } else { r0..r0 + rows };
-                        let part = self.part(held, c0..c0 + width);
-                        let mut params = part.params(depth, 1, kmax);
-                        params.truncate(params.len() - 2);
-                        let groups = width.div_ceil(cfg.bkv);
-                        params.extend([vec![0.0; rows * width], vec![0.0; rows * groups]]);
-                        let spec = part.spec(depth, cfg, kmax).map(|s| NearestSpec {
-                            n: rows,
-                            m: width,
-                            live: live.clone(),
-                            ..s
-                        });
-                        let mut out = exec(part.compiled(&spec), &scored, params, &vars);
-                        let (mins, matrix) = (out.pop().unwrap(), out.pop().unwrap());
-                        let (metric, first) = (self.metric, c0 == 0);
-                        let spec = |cols, first, filter, shares| SelectSpec {
-                            n: rows,
-                            cols,
-                            k: kmax,
-                            metric,
-                            first,
-                            cfg: select,
-                            live: live.clone(),
-                            wide: select.wide(device.target.wave),
-                            filter,
-                            shares,
-                        };
-                        // Filtered by the live `k`-th of the trips' leasts.
-                        let lists_out = vec![vec![0.0; rows * kmax]; 2];
-                        let params = [vec![mins.clone(), vec![0.0; 2]], lists_out].concat();
-                        let mut out = exec(nearest_select(&spec(groups, true, None, 1)), &listing, params, &vars);
-                        out.truncate(out.len() - 1);
-                        let filter = vec![mins, out.pop().unwrap()];
-                        // Whole rows list in two shares, merged at the live length.
-                        let shares = if width == self.m { spec(width, true, None, 1).steps().min(2) } else { 1 };
-                        let spec = spec(width, first, Some(cfg.bkv), shares);
-                        let chunk = vec![c0 as f64, f64::from(c0 + width == self.m)];
-                        let carried = if first { vec![] } else { lists };
-                        let parts = kmax * if shares > 1 { shares * share_stride(rows) } else { rows };
-                        let params = [vec![matrix, chunk], carried, filter, vec![vec![0.0; parts]; 2]].concat();
-                        let mut out = exec(nearest_select(&spec), &listing, params, &vars);
-                        lists = out.split_off(out.len() - 2);
-                        if shares > 1 {
-                            let merge =
-                                NearestMergeSpec { n: rows, splits: shares, metric, k: kmax, live: live.clone() };
-                            let params = [lists, vec![vec![0.0; rows * kmax]; 2]].concat();
-                            let mut out = exec(nearest_merge(&merge), &Lowering::new(device), params, &vars);
-                            lists = out.split_off(out.len() - 2);
-                        }
-                    }
-                    score.extend(&lists[0]);
-                    index.extend(&lists[1]);
-                }
-                (score, index)
-            }
-            None => {
-                let spec = self.spec(depth, cfg, kmax).map(|s| NearestSpec { live: live.clone(), ..s });
-                let params = self.params(depth, cfg.splits, kmax);
-                let mut out = exec(self.compiled(&spec), &Lowering::new(device), params, &vars);
-                let (index, score) = (out.pop().unwrap(), out.pop().unwrap());
-                if cfg.splits == 1 {
-                    (score, index)
-                } else {
-                    let merge = NearestMergeSpec { live: live.clone(), ..self.merge(cfg.splits, kmax) };
-                    let params = vec![score, index, vec![0.0; self.n * kmax], vec![0.0; self.n * kmax]];
-                    let mut out = exec(nearest_merge(&merge), &Lowering::new(device), params, &vars);
-                    let index = out.pop().unwrap();
-                    (out.pop().unwrap(), index)
-                }
-            }
-        };
+        let vars = rows_var.chain(live.k.iter().map(|_| (LIST, k as i64))).collect();
+        let (score, index) = self.run(cfg, kmax, &Run { vars, live, shares: Some(2), ..how });
         let cut = |v: Vec<f64>| (0..n).flat_map(|i| v[i * kmax..][..k].to_vec()).collect::<Vec<_>>();
         (cut(score), cut(index))
     }
@@ -207,10 +100,9 @@ fn assert_live_interpreted(
     nk: (usize, usize),
     panels: (usize, usize),
 ) {
-    let device = crate::sweep::declared(crate::atoms::sm86());
     let (n, k) = nk;
     let what = format!("{cfg:?} {live:?} bound to n {n} k {k} of {} rows, {kmax} slots", case.n);
-    let got = case.live_listed(cfg, live, kmax, nk, panels, &device, &interpret);
+    let got = case.live_listed(cfg, live.clone(), kmax, nk, Run { blocks: panels, ..Run::host() });
     let small = case.first(n);
     let want = small.listed(concrete_way(cfg, k), k);
     assert_eq!(got, want, "{what}");
@@ -323,7 +215,7 @@ fn live_lists_keep_the_lists_of_their_values_on_device(kmax: usize, d: usize) {
                 let live = live(&case, true, kmax);
                 let what = format!("{cfg:?} n {n} k {k}");
                 let blocks = (cap.div_ceil(2), m.div_ceil(3));
-                let got = case.live_listed(cfg, &live, kmax, (n, k), blocks, &planner.device, &on_device);
+                let got = case.live_listed(cfg, live, kmax, (n, k), Run { blocks, ..Run::on(&planner.device) });
                 let small = case.first(n);
                 let want = small.on_device(&planner, depth, concrete_way(cfg, k), k);
                 assert_eq!(got, want, "{what}");
@@ -335,40 +227,6 @@ fn live_lists_keep_the_lists_of_their_values_on_device(kmax: usize, d: usize) {
 }
 
 // ---- the op -----------------------------------------------------------------
-
-/// `t`'s leading dim bound to `var`, its capacity the rest.
-fn bound(t: &Tensor, var: &BoundVariable) -> Tensor {
-    let mut ranges: Vec<Option<(SInt, SInt)>> = vec![None; t.shape().unwrap().len()];
-    ranges[0] = Some((SInt::Const(0), var.as_sint()));
-    t.try_shrink(ranges).unwrap()
-}
-
-/// The prepared plans of `outs` (f32 and contiguous), whose variables each
-/// run binds anew. A realized symbolic dim is laid out at its bound, as
-/// Tinygrad's: a `[N, k]` output's rows are `k`'s bound apart.
-struct Rebound(Vec<svod_runtime::ExecutionPlan>);
-
-impl Rebound {
-    fn new(outs: &[&Tensor]) -> Self {
-        Self(outs.iter().map(|t| t.cast(DType::Float32).contiguous().prepare().unwrap()).collect())
-    }
-
-    /// Every output's first `rows` rows of `cols` values, `stride` apart,
-    /// under `vars`.
-    fn run(&mut self, vars: &[(&str, i64)], (rows, cols, stride): (usize, usize, usize)) -> Vec<Vec<f64>> {
-        self.0
-            .iter_mut()
-            .map(|plan| {
-                plan.execute_with_vars(vars).unwrap();
-                let mut bytes = vec![0u8; rows * stride * 4];
-                plan.output_buffer().unwrap().copyout_prefix(&mut bytes).unwrap();
-                let values: Vec<f64> =
-                    bytes.chunks(4).map(|b| f64::from(f32::from_le_bytes(b.try_into().unwrap()))).collect();
-                (0..rows).flat_map(|i| values[i * stride..][..cols].to_vec()).collect()
-            })
-            .collect()
-    }
-}
 
 /// `case`'s operands with the rows (`x`, the row floor and groups) bound to
 /// `var` where given: `(x, c, options)`.
@@ -608,16 +466,9 @@ fn rows_that_may_be_none(dtype: DType) {
 #[test]
 fn live_tunings_key_apart_from_their_bounds() {
     use crate::ops::nearest::Salt;
-    let spec = |live| NearestSpec {
-        n: 300,
-        m: 500,
-        d: 64,
-        dtype: svod_dtype::ScalarDType::Float16,
-        metric: Metric::L2,
-        floors: BOTH,
-        groups: true,
-        k: 16,
-        live,
+    let spec = |live| {
+        let plain = plain(300, 500, 64, Metric::L2, 16, ScalarDType::Float16, NearestCfg::new(32, 16, 2));
+        NearestSpec { floors: BOTH, groups: true, live, ..plain.into_spec() }
     };
     let concrete = spec(Live::default());
     assert_eq!(format!("{:?}", Salt(&concrete)), format!("{:?}", (Metric::L2, BOTH, true)));
@@ -637,118 +488,4 @@ type Picks<'a> =
 /// `f` as a pick every planner's borrow fits.
 fn picks<F: for<'t> Fn(&'t Planner, &[NearestCfg], Admitted<'t, NearestSpec>) -> Admitted<'t, NearestSpec>>(f: F) -> F {
     f
-}
-
-/// The tuner's pick of the op's spec, kept in `cfg`.
-fn tuned_into(
-    cfg: &std::cell::Cell<Option<NearestCfg>>,
-    dtype: DType,
-) -> impl for<'t> FnOnce(&'t Planner, &[NearestCfg], Admitted<'t, NearestSpec>) -> Admitted<'t, NearestSpec> + '_ {
-    move |planner, ranked, spec| {
-        let spec = tk::nearest::tuned(crate::tune::TuneStore::global(), planner, dtype, ranked, spec.into_spec());
-        cfg.set(Some(spec.cfg()));
-        spec
-    }
-}
-
-/// The op's run time over live rows against the op at the bound rows'
-/// count, f16, `LIVE_ROWS` (16384) rows against as many candidates (their
-/// values, another buffer) at `LIVE_DEPTHS`
-/// (128, 768), lists of `LIVE_KS` (1, 16, 64, 256), every kernel of a run
-/// summed, best of `LIVE_RUNS` (5) runs, the two alternated `LIVE_ROUNDS`
-/// (3) times: the concrete op (its tuned pick), the live op bound at the
-/// same count under the concrete pick's config (what the live rows cost)
-/// and under its own tuned pick, and rows bound at twice as many run at
-/// the count (one plan for both). The live rows are a realized buffer, as
-/// a JIT's symbolic batch is (a view of a static one is copied first).
-/// Prints, never asserts
-/// (`--ignored --nocapture --test-threads=1`).
-#[test]
-#[ignore = "perf probe: needs a GPU"]
-fn live_probe() {
-    let list = |name: &str, default: &str| -> Vec<usize> {
-        let text = std::env::var(name).unwrap_or(default.into());
-        text.split(',').map(|v| v.trim().parse().expect("a comma-separated list of counts")).collect()
-    };
-    let (n, depths, ks) =
-        (list("LIVE_ROWS", "16384")[0], list("LIVE_DEPTHS", "128,768"), list("LIVE_KS", "1,16,64,256"));
-    let (runs, rounds) = (list("LIVE_RUNS", "5")[0], list("LIVE_ROUNDS", "3")[0]);
-    let Some(_) = super::super::device_planner() else { return };
-    let dtype = DType::Float16;
-    let timed = |plan: &mut svod_runtime::ExecutionPlan, vars: &[(&str, i64)]| {
-        plan.execute_with_vars(vars).unwrap();
-        (0..runs).filter_map(|_| crate::tune::run(plan)).min().map_or(f64::NAN, |t| t.as_secs_f64() * 1e3)
-    };
-    crate::tune::scoped(true, || {
-        for &d in &depths {
-            for &k in &ks {
-                let mut seed = 5;
-                let data: Vec<f32> = (0..2 * n * d).map(|_| super::super::lcg(&mut seed) as f32).collect();
-                let all = Tensor::from_slice(&data).cast(dtype.clone()).try_reshape([(2 * n) as isize, d as isize]);
-                let all = all.unwrap().contiguous();
-                all.realize().unwrap();
-                let x = all.narrow(0, 0, n).unwrap().contiguous();
-                // The candidates a buffer of their own, the same values as
-                // the rows: a self-join of one tensor would read one buffer
-                // for both, which the live rows (a buffer of their own)
-                // cannot.
-                let c = all.narrow(0, 0, n).unwrap().contiguous();
-                x.realize().unwrap();
-                c.realize().unwrap();
-                let opts = Nearest { metric: Metric::SquaredL2, ..Nearest::default() };
-                let tuned = |cfg| tuned_into(cfg, dtype.clone());
-                // The concrete op and its pick.
-                let pick = std::cell::Cell::new(None);
-                let (_, index) = tk::nearest::picked(&x, &c, k, opts, None, tuned(&pick)).unwrap();
-                let mut concrete = index.prepare().unwrap();
-                // Rows bound at the count, under the concrete pick.
-                let at = Variable::new(ROWS, 1, n as i64).bind(n as i64).unwrap();
-                let same = picks(|_, _, spec| match pick.get() {
-                    Some(cfg) => assumed(spec.into_spec(), cfg),
-                    None => spec,
-                });
-                // Realized as the JIT hands a symbolic batch on: a view of a
-                // static buffer would be copied first.
-                let xb = bound(&x, &at).contiguous();
-                xb.realize().unwrap();
-                let (_, index) = tk::nearest::picked(&xb, &c, k, opts, None, same).unwrap();
-                let mut live_same = index.prepare().unwrap();
-                // Rows bound at the count under their own pick, and at twice it.
-                let own = std::cell::Cell::new(None);
-                let (_, index) = tk::nearest::picked(&xb, &c, k, opts, None, tuned(&own)).unwrap();
-                let mut live_own = index.prepare().unwrap();
-                let twice = Variable::new(ROWS, 1, 2 * n as i64).bind(n as i64).unwrap();
-                let wide = std::cell::Cell::new(None);
-                let xw = bound(&all, &twice).contiguous();
-                xw.realize().unwrap();
-                let (_, index) = tk::nearest::picked(&xw, &c, k, opts, None, tuned(&wide)).unwrap();
-                let mut live_wide = index.prepare().unwrap();
-                let vars = [(ROWS, n as i64)];
-                let mut best = [f64::INFINITY; 4];
-                for _ in 0..rounds {
-                    let times = [
-                        timed(&mut concrete, &[]),
-                        timed(&mut live_same, &vars),
-                        timed(&mut live_own, &vars),
-                        timed(&mut live_wide, &vars),
-                    ];
-                    for (b, t) in best.iter_mut().zip(times) {
-                        *b = b.min(t);
-                    }
-                }
-                let [c, s, o, w] = best;
-                let share = |t: f64| format!("{t:8.3} ms {:+6.1} %", 100.0 * (t / c - 1.0));
-                eprintln!(
-                    "live {n}x{n} d{d} k{k}: concrete {c:8.3} ms {:?} | live same cfg {} | live own {} {:?} | bound {} run at {n} {} {:?}",
-                    pick.get(),
-                    share(s),
-                    share(o),
-                    own.get(),
-                    2 * n,
-                    share(w),
-                    wide.get(),
-                );
-            }
-        }
-    });
 }

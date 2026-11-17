@@ -27,12 +27,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
+use snafu::{OptionExt, ResultExt, Snafu};
 use svod_dtype::default_device::{default_device, with_default_device};
 use svod_dtype::{DType, DeviceSpec, ScalarDType};
 use svod_ir::SInt;
 use svod_ir::UOp;
 use svod_runtime::benchmark::{CLOCK_WARMUP, round_robin_min, warm_clock};
-use svod_runtime::{ExecutionPlan, KernelResources};
+use svod_runtime::{ExecutionPlan, KernelResources, ProfileOptions, RunProfile, Sink, SqttOptions};
 use svod_tensor::{PrepareConfig, Tensor};
 
 use crate::atoms::Target;
@@ -217,14 +218,25 @@ pub(crate) fn fingerprint(candidates: &[Candidate]) -> u64 {
 /// outside any origin scope, which would key the call site; `None` where it
 /// does not lower or render, and the caller keys it by its inputs: a
 /// program that fails to lower fails the same way until they change.
-fn emitted(prog: &Program, lowering: &Lowering) -> Option<(u64, Arc<UOp>)> {
+fn emitted(prog: &Program, lowering: &Lowering) -> Option<(u64, crate::lower::Lowered)> {
     let _capture = svod_ir::origin::capture_for_thread(false);
     let _scope = svod_ir::origin::install(None);
     let lowered = crate::lower::standalone(prog.clone(), lowering)
         .inspect_err(|e| tracing::debug!(target: crate::ops::PLAN, name = prog.name, error = %e, "does not lower"))
         .ok()?;
     let emitted = digest(&(digest(&lowered.program), lowered.text(&lowering.device.target).ok()?));
-    Some((emitted, lowered.program))
+    Some((emitted, lowered))
+}
+
+/// What `prog` emits ([`emitted`]) with the body a launch of its lowering
+/// hands the graph ([`launch::body`]), `None` where it has none: what it
+/// emits is the bare lowering's either way.
+fn emitted_body(prog: &Program, lowering: &Lowering) -> Option<(u64, Option<Arc<UOp>>)> {
+    let (emitted, lowered) = emitted(prog, lowering)?;
+    let body = launch::body(&lowered, lowering)
+        .inspect_err(|e| tracing::debug!(target: crate::ops::PLAN, name = prog.name, error = %e, "does not render"))
+        .ok();
+    Some((emitted, body))
 }
 
 /// A program lowered (or found not to lower), with what it emits.
@@ -501,15 +513,15 @@ impl TuneStore {
         };
         let found: Vec<(u64, u64)> = missing
             .into_par_iter()
-            .map(|(m, (prog, lowering))| {
-                let lowered = emitted(prog, lowering);
-                if let Some(keep) = keep {
-                    keep.0
-                        .lock()
-                        .expect("lowerings")
-                        .insert(m, lowered.as_ref().map(|(emitted, program)| (*emitted, program.clone())));
+            .map(|(m, (prog, lowering))| match keep {
+                Some(keep) => {
+                    let lowered = emitted_body(prog, lowering);
+                    let found = lowered.as_ref().map_or((m, m), |(emitted, _)| (m, *emitted));
+                    let body = lowered.and_then(|(emitted, body)| Some((emitted, body?)));
+                    keep.0.lock().expect("lowerings").insert(m, body);
+                    found
                 }
-                lowered.map_or((m, m), |(emitted, _)| (m, emitted))
+                None => emitted(prog, lowering).map_or((m, m), |(emitted, _)| (m, emitted)),
             })
             .collect();
         self.record_emitted(&found);
@@ -518,21 +530,21 @@ impl TuneStore {
         (digest(&emitted), emitted.iter().map(digest).collect())
     }
 
-    /// `prog` lowered under `lowering` ([`crate::lower::standalone`]),
-    /// without origins, from `keep` where a fingerprint left it (or found
-    /// it does not lower), else lowered here and what it emits remembered
-    /// as a fingerprint would; `None` where it does not lower. What the
-    /// program emits comes with it.
+    /// `prog` lowered under `lowering` ([`crate::lower::standalone`]) as
+    /// its launch's body ([`launch::body`]), from `keep` where a fingerprint
+    /// left it (or found it does not lower), else lowered here and what it
+    /// emits remembered as a fingerprint would; `None` where it does not
+    /// lower. What the program emits comes with it.
     pub(crate) fn lowered(&self, prog: &Program, lowering: &Lowering, keep: &Lowerings) -> Option<(u64, Arc<UOp>)> {
         let m = made_of(prog, lowering);
         if let Some(kept) = keep.take(m) {
             return kept;
         }
-        let (emitted, program) = emitted(prog, lowering)?;
+        let (emitted, program) = emitted_body(prog, lowering)?;
         if !self.emitted_memo().lock().expect("emitted memo").contains_key(&m) {
             self.record_emitted(&[(m, emitted)]);
         }
-        Some((emitted, program))
+        Some((emitted, program?))
     }
 
     /// The digest of what `programs` emit, where a fingerprint or a compile
@@ -817,7 +829,7 @@ pub(crate) struct Built {
 
 /// What compiling a candidate showed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Compiled {
+pub enum Compiled {
     Failed,
     /// A kernel [`spilled`]: admitted only where every candidate does, timed
     /// among a tile's pipelines.
@@ -1189,14 +1201,78 @@ fn compile_one(
             Some((store, keep)) => {
                 let (digest, body) = store.lowered(&p, &l, keep)?;
                 emitted.push(digest);
-                scratch_plan_of(p, &l, pool, Some(body))
+                scratch_plan_of(p, &l, pool, Some(body)).ok()
             }
-            None => scratch_plan(p, &l, pool),
+            None => scratch_plan(p, &l, pool).ok(),
         })
         .collect();
     let key = plans.as_ref().filter(|_| !emitted.is_empty()).map(|_| digest(&emitted));
     let resources = plans.iter().flatten().flat_map(|(plan, _)| resources(plan)).collect();
     (Built { plans, resources }, key)
+}
+
+/// Each candidate's verdict and best device time in ns as the tuner times
+/// it: compiled on scratch buffers, its programs' times summed with their
+/// launches ([`time`]); `None` where it failed to build or run.
+pub fn measure(candidates: Vec<Candidate>) -> Vec<(Compiled, Option<u64>)> {
+    let pool = ScratchPool::default();
+    let mut built = compile(candidates, &pool);
+    let verdicts: Vec<Compiled> = built.iter().map(Built::verdict).collect();
+    verdicts.into_iter().zip(time(&mut built)).collect()
+}
+
+/// A candidate's programs each [profiled](ExecutionPlan::profile) under
+/// `opts` on scratch buffers, after one untimed run, under the timing lock;
+/// a [`Sink::Disk`] goes to `<dir>/p<program>`, a thread trace a program.
+pub fn profile(candidate: Candidate, opts: &ProfileOptions) -> Result<Vec<RunProfile>, Error> {
+    let pool = ScratchPool::default();
+    let plans: Vec<Scratch> =
+        candidate.into_iter().map(|(p, l)| scratch_plan(p, &l, &pool)).collect::<Result<_, _>>()?;
+    let _device = DEVICE.lock().unwrap_or_else(PoisonError::into_inner);
+    let profiled = plans.into_iter().enumerate().map(|(program, (mut plan, vars))| {
+        let vars: Vec<(&str, i64)> = vars.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+        plan.execute_with_vars(&vars).context(RunSnafu { program })?;
+        let sqtt = opts.sqtt.clone().map(|sqtt| match sqtt.sink {
+            Sink::Disk(dir) => SqttOptions { sink: Sink::Disk(dir.join(format!("p{program}"))), ..sqtt },
+            Sink::Memory => sqtt,
+        });
+        plan.profile(&ProfileOptions { sqtt, ..opts.clone() }).context(RunSnafu { program })
+    });
+    profiled.collect()
+}
+
+/// Why a candidate's program did not build or run on scratch buffers.
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("{source}"))]
+    Launch {
+        #[snafu(source(from(launch::Error, Box::new)))]
+        source: Box<launch::Error>,
+    },
+    #[snafu(display("{name}: its graph failed to schedule"))]
+    Schedule { name: String },
+    #[snafu(display("{name}: {source}"))]
+    Prepare {
+        name: String,
+        #[snafu(source(from(svod_tensor::error::Error, Box::new)))]
+        source: Box<svod_tensor::error::Error>,
+    },
+    #[snafu(display("program {program}: {source}"))]
+    Run {
+        program: usize,
+        #[snafu(source(from(svod_runtime::Error, Box::new)))]
+        source: Box<svod_runtime::Error>,
+    },
+}
+
+/// Each prepared plan's best device time in ns, timed as [`measure`] times a
+/// candidate: an op's plan, end to end.
+pub fn measure_plans(plans: Vec<ExecutionPlan>) -> Vec<Option<u64>> {
+    let mut built: Vec<Built> = plans
+        .into_iter()
+        .map(|plan| Built { resources: resources(&plan), plans: Some(vec![(plan, vec![])]) })
+        .collect();
+    time(&mut built)
 }
 
 /// Held across every [`time`] in the process, the probes' and the tuner's
@@ -1439,13 +1515,18 @@ fn scratch(p: &Param) -> Tensor {
 /// measurement alone, kept in no memo or cache (it runs under scratch
 /// placeholders no op's call keys, and a shortlist of them per shape would
 /// otherwise stay for the process).
-pub(crate) fn scratch_plan(prog: Program, lowering: &Lowering, pool: &ScratchPool) -> Option<Scratch> {
+pub(crate) fn scratch_plan(prog: Program, lowering: &Lowering, pool: &ScratchPool) -> Result<Scratch, Error> {
     scratch_plan_of(prog, lowering, pool, None)
 }
 
 /// [`scratch_plan`] of `body`, the program lowered already
 /// ([`crate::lower::standalone`]) where given.
-fn scratch_plan_of(prog: Program, lowering: &Lowering, pool: &ScratchPool, body: Option<Arc<UOp>>) -> Option<Scratch> {
+fn scratch_plan_of(
+    prog: Program,
+    lowering: &Lowering,
+    pool: &ScratchPool,
+    body: Option<Arc<UOp>>,
+) -> Result<Scratch, Error> {
     let vars: Vec<(String, i64)> = prog.vars.iter().map(|v| (v.name.clone(), v.max)).collect();
     let name = prog.name.clone();
     let buffers = pool.buffers(&prog.params);
@@ -1455,15 +1536,18 @@ fn scratch_plan_of(prog: Program, lowering: &Lowering, pool: &ScratchPool, body:
             .map(|mut outs| outs.swap_remove(launch::first_output(&prog))),
         None => launch::graph_launch_once(prog, lowering, &tensors),
     }
-    .ok()?;
+    .context(LaunchSnafu)?;
     let mut config = PrepareConfig::from_env();
     config.ephemeral = true;
     // A program past what the scheduler's rewrites hold (past the rewrite
     // engine's stack) panics there: the candidate fails to build, as one
     // the compiler refuses, rather than taking the tuning down.
     let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| out.prepare_with(&config)));
-    let plan = prepared.map_err(|_| tracing::warn!(kernel = name, "a candidate's graph failed to schedule")).ok()?;
-    Some((plan.ok()?, vars))
+    let plan = prepared
+        .map_err(|_| tracing::warn!(kernel = name, "a candidate's graph failed to schedule"))
+        .ok()
+        .context(ScheduleSnafu { name: &name })?;
+    Ok((plan.context(PrepareSnafu { name })?, vars))
 }
 
 /// Runs a candidate's `plans` back to back, in order, unsynchronized, for

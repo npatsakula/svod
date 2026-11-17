@@ -191,6 +191,46 @@ pub enum Error {
     /// Reachable only via cross-backend misuse, never on the CPU path.
     #[snafu(display("allocator does not support operation: {op}"))]
     Unsupported { op: &'static str },
+
+    /// Hardware counters cannot be collected on this target or queue.
+    #[snafu(display("hardware counters unsupported: {reason}"))]
+    PmcUnsupported { reason: String },
+
+    /// SQTT thread tracing cannot run on this target, queue or configuration.
+    #[snafu(display("SQTT thread trace unsupported: {source}"))]
+    #[snafu(context(false))]
+    SqttUnsupported { source: SqttUnsupported },
+
+    /// The trace asked for a stable power state the DRM context could not pin,
+    /// and the device is not already in `profile_standard`.
+    #[snafu(display(
+        "SQTT could not pin the requested stable power state through the DRM context: {source}; \
+         trace unpinned (no `SqttConfig::pstate`) or run `amd-smi set -l stable_std`"
+    ))]
+    SqttPowerState {
+        #[snafu(source(from(Error, Box::new)))]
+        source: Box<Error>,
+    },
+}
+
+/// Why a thread trace cannot run.
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub), module)]
+pub enum SqttUnsupported {
+    #[snafu(display("{arch}: only gfx11 and gfx12 are traced"))]
+    Arch { arch: svod_dtype::AmdArch },
+    #[snafu(display(
+        "the device runs AQL queues and a trace needs PM4 ones: open it without SVOD_AMD_AQL (or with SVOD_AMD_AQL=0)"
+    ))]
+    AqlQueues,
+    #[snafu(display("{field} {value}: {why}"))]
+    Config { field: &'static str, value: String, why: &'static str },
+    #[snafu(display("limit_cu on an unknown CU topology ({cu_per_se} CUs an SE, {cu_per_sa} an SA)"))]
+    Topology { cu_per_se: u32, cu_per_sa: u32 },
+    #[snafu(display("this backend has no thread trace"))]
+    Backend,
+    #[snafu(display("this backend has no amdgpu DRM context to pin a stable power state"))]
+    NoDrmContext,
 }
 
 /// Flatten `error` and its source chain into one line; `libloading` keeps the

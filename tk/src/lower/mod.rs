@@ -2,13 +2,14 @@
 //! shared-memory effects, expand the schedule template, give every register
 //! tile a layout, then emit the instruction list in program order.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use snafu::{ResultExt, Snafu, ensure};
 use svod_codegen::Renderer;
-use svod_codegen::llvm::LlvmTextRenderer;
-use svod_dtype::{DType, DeviceSpec, GpuArch};
-use svod_ir::UOp;
+use svod_codegen::llvm::{LlvmTextRenderer, Location};
+use svod_dtype::{AmdArch, DType, DeviceSpec, GpuArch};
+use svod_ir::{Op, UOp, ops};
 
 use crate::atoms::{Core, Device, Target};
 use crate::ir::*;
@@ -16,6 +17,7 @@ use crate::layouts;
 use crate::schedule;
 
 pub mod emit;
+pub mod listing;
 mod scopes;
 pub mod sync;
 
@@ -34,6 +36,12 @@ pub enum Error {
         name: String,
         #[snafu(source(from(svod_codegen::Error, Box::new)))]
         source: Box<svod_codegen::Error>,
+    },
+    #[snafu(display("the SOURCE of {name}: {source}"))]
+    Source {
+        name: String,
+        #[snafu(source(from(svod_device::Error, Box::new)))]
+        source: Box<svod_device::Error>,
     },
     #[snafu(display("{what} is a block barrier under a branch on the warp, which some warps skip"))]
     DivergentBarrier { what: &'static str },
@@ -77,10 +85,9 @@ pub struct Lowered {
     pub linear: Arc<UOp>,
     /// The tile program as emitted: laid, with every register value's layout.
     pub tile: Program<Laid>,
-    /// The ranges the program's own schedule kept rolled (a loop whose body
-    /// holds a product), which [`Lowered::text`] hints every target against
-    /// unrolling further.
-    pub rolled: Vec<u64>,
+    /// Its rolled ranges, which [`Lowered::text`] hints, and each
+    /// instruction's location ([`Self::locations`]).
+    pub marks: emit::Marks,
 }
 
 /// `params` are the flat buffer UOps in `prog.params()` order (placeholders on
@@ -99,12 +106,11 @@ pub fn lower(mut prog: Program, lowering: &Lowering, params: Vec<Arc<UOp>>, devi
     within_shared(&prog)?;
     materialize_operands(&mut prog, lowering.core);
     sync::insert_barriers(&mut prog)?;
-    let prog = schedule::expand(prog, lowering.device.target.fill, lowering.core);
+    let target = &lowering.device.target;
+    let prog = schedule::expand(prog, target.fill, lowering.core, target.sync.split_barrier);
     let laid = layouts::infer(prog, &lowering.device, lowering.core).context(LayoutSnafu)?;
-    emit::ROLLED.with(|cell| cell.borrow_mut().clear());
-    let (program, linear) = emit::emit(&laid, lowering, params, device)?;
-    let rolled = emit::ROLLED.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
-    Ok(Lowered { program, linear, tile: laid, rolled })
+    let (program, linear, marks) = emit::emit(&laid, lowering, params, device)?;
+    Ok(Lowered { program, linear, tile: laid, marks })
 }
 
 /// Every shared view within its allocation wherever its offset is bounded,
@@ -145,17 +151,23 @@ fn within_shared(prog: &Program) -> Result<()> {
 }
 
 /// `prog` lowered for its lowering's target alone, its parameters declared
-/// flat: what a graph launch on the target's device would emit, with no
-/// graph and no device.
+/// flat in their order: what a launch of a lowered body on the target's
+/// device emits, with no graph and no device. A plain launch numbers them
+/// `[out, ins...]` instead ([`crate::launch::graph_launch`]).
 pub fn standalone(prog: Program, lowering: &Lowering) -> Result<Lowered> {
     let params =
         prog.params.iter().enumerate().map(|(i, p)| UOp::param(i, p.elems, DType::Scalar(p.dtype), None)).collect();
-    let device = match lowering.device.target.arch {
+    lower(prog, lowering, params, standalone_device(lowering))
+}
+
+/// The first device of `lowering`'s target, which a [`standalone`] program
+/// is lowered for.
+pub(crate) fn standalone_device(lowering: &Lowering) -> DeviceSpec {
+    match lowering.device.target.arch {
         GpuArch::Cuda(_) => DeviceSpec::Cuda { device_id: 0 },
         GpuArch::Amd(_) => DeviceSpec::Amd { device_id: 0 },
         GpuArch::Metal(_) => DeviceSpec::Metal { device_id: 0 },
-    };
-    lower(prog, lowering, params, device)
+    }
 }
 
 /// The LLVM text of `prog` [`standalone`] ([`Lowered::text`]).
@@ -178,13 +190,54 @@ impl Lowered {
             GpuArch::Amd(arch) => LlvmTextRenderer::amd(arch),
             GpuArch::Metal(_) => return UnsupportedSnafu { what: "Metal's LLVM text" }.fail(),
         }
-        .rolled(self.rolled.iter().copied());
+        .rolled(self.marks.rolled.iter().copied());
         if svod_schedule::spec::spec_enabled() {
             let nodes = self.linear.op().sources();
             svod_schedule::spec::type_verify_list(&nodes, &svod_schedule::spec::spec_program()).expect("a valid list");
         }
         let name = &self.tile.name;
         Ok(renderer.render(&self.linear, Some(name)).context(RenderSnafu { name })?.code)
+    }
+
+    /// `kernel.tk`: one line per statement of [`Self::tile`] ([`listing::listing`]).
+    pub fn listing(&self) -> String {
+        listing::listing(&self.tile)
+    }
+
+    /// Each instruction's statement (its line in [`Self::listing`]) and
+    /// unroll copy (the column, from 1; 0 outside an unrolled loop). One the
+    /// statements did not list themselves (an operand the assembly listed
+    /// before its user: a stack, a cast, a shuffle built in an expression)
+    /// takes its first user's.
+    pub fn locations(&self) -> HashMap<u64, Location> {
+        let mut at: HashMap<u64, Location> = HashMap::with_capacity(self.marks.located.len());
+        for &(id, location) in &self.marks.located {
+            at.entry(id).or_insert(location);
+        }
+        let given: HashSet<u64> = at.keys().copied().collect();
+        // Users follow their operands: walked backward, an earlier user overwrites a later one's.
+        for u in self.linear.op().sources().iter().rev() {
+            let Some(&location) = at.get(&u.id) else { continue };
+            for src in u.op().sources().iter().filter(|s| !given.contains(&s.id)) {
+                at.insert(src.id, location);
+            }
+        }
+        at
+    }
+
+    /// The PROGRAM an AMD device of `arch` compiles: its SOURCE stage
+    /// rendered here, by the device's renderer with a line table over
+    /// [`Self::listing`] and the listing itself as `kernel.tk`'s DWARF 5
+    /// source ([`svod_runtime::amd::LocatedAmd`]). The pipeline mints the
+    /// stage ([`do_render`](svod_codegen::program_pipeline::do_render)), with
+    /// the checks a device's render runs, and a device handed the PROGRAM
+    /// renders nothing. The line table is not meant to change the code; a
+    /// sweep over every tk kernel checks that (`a_line_table_leaves_every_kernel_alone`).
+    pub fn source(&self, arch: AmdArch) -> Result<Arc<UOp>> {
+        let Op::Program(ops::Program { info, .. }) = self.program.op() else { unreachable!("emit returns a PROGRAM") };
+        let renderer = svod_runtime::amd::LocatedAmd::new(info.target.clone(), arch, self.locations(), self.listing());
+        let rendered = svod_codegen::program_pipeline::do_render(&self.program, &renderer);
+        Ok(rendered.context(SourceSnafu { name: &self.tile.name })?.0)
     }
 }
 

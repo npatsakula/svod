@@ -4,45 +4,24 @@
 //! partial last wave's split where the model prices it cheaper, never where
 //! the tiles fill whole waves or dwarf one, at counts that divide the
 //! trips, and only as a twin the tuner times beside its unsplit pipeline;
-//! the config's code holds the split.
+//! the config's code holds its raster and its split.
 
 use proptest::prelude::*;
 use svod_dtype::ScalarDType;
 use test_case::test_case;
 
+use super::raster::walked;
 use super::{costs, gfx942_costs, gfx1201_costs, sm86_costs};
 use crate::atoms::{Costs, Device};
 use crate::atoms::{Target, sm86};
 use crate::build::*;
 use crate::interp::{round_to, run};
-use crate::ir::Shape;
+use crate::kernels::Act;
 use crate::kernels::gemm::{
     Epilogue, GemmCfg, GemmSpec, Run, Scale, TailPlan, TailSpec, TailSplit, TileOrder, Tiles, gemm, gemm_tail,
 };
-use crate::kernels::{Act, Batch};
 use crate::ops::config::{GemmProblem, LAUNCH, Planner, TAIL_SPLITS, Tiled, gemm_cfg};
 use crate::sweep::{assumed, planner};
-
-/// The walk index each tile of a `gm × gn` grid takes under `run` of a
-/// raster in groups of `rows`, row-major; `-1` where the run takes none.
-fn covered(gm: usize, gn: usize, rows: usize, run_: Run) -> Vec<i64> {
-    let (order, tiles) = (TileOrder::grouped(rows).expect("a group of rows"), Tiles::Run(run_));
-    let prog = Kernel::record("run", |k| {
-        let out = k.output::<I32>("tiles", gm * gn);
-        let [gx, gy] = tiles.grid(gm, gn);
-        k.grid([gx, gy, Sc::from(1)]);
-        k.warps(1);
-        let (row, col) = tiles.tile(k, order, gm, gn);
-        let id = k.block(0) + run_.first();
-        let one = Shape::new(1, 1);
-        let at = k.view(out, 0, [gn, 1], one, [None, None]);
-        let at = k.at(at, row, col);
-        let id = k.splat::<I32>(one, id);
-        k.store(at, id);
-    });
-    let out = run(&prog, vec![vec![-1.0; gm * gn]], &[]).expect("the run walks").remove(0);
-    out.into_iter().map(|id| id as i64).collect()
-}
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
@@ -71,7 +50,7 @@ proptest! {
         let mut taken = vec![0usize; tiles];
         let mut ids = vec![];
         for r in plan.waves.into_iter().chain([plan.tail]) {
-            for (tile, id) in covered(gm, gn, rows, r).into_iter().enumerate() {
+            for (tile, id) in walked(gm, gn, rows, Tiles::Run(r)).into_iter().enumerate() {
                 if id >= 0 {
                     prop_assert!(r.range().contains(&(id as usize)), "{:?} took walk index {}", r, id);
                     taken[tile] += 1;
@@ -84,13 +63,26 @@ proptest! {
         prop_assert_eq!(ids, (0..tiles as i64).collect::<Vec<_>>());
     }
 
-    /// A config's code holds its tail split whole, the tile drops it, and
-    /// no split under two reads back.
+    /// A config's code holds its raster and its tail split whole: any group
+    /// height up to the tallest round-trips and a taller one (a hand-made
+    /// code's) reads back as the tallest; the tile drops the split, and no
+    /// split under two reads back.
     #[test]
-    fn a_tail_split_round_trips_its_code(split in 0usize..=64, rows in 1usize..=16) {
+    fn a_gemm_cfg_round_trips_its_code(
+        rows in 1usize..,
+        split in 0usize..=64,
+        tile in prop::sample::select(vec![[128, 64, 32], [128, 128, 64]]),
+        stages in 1usize..=3,
+        unroll in any::<bool>(),
+    ) {
         let order = TileOrder::grouped(rows).expect("a group of rows");
-        let base = GemmCfg { order, ..gemm_cfg([128, 128, 64], 2, [2, 2], true) };
+        prop_assert_eq!(order.rows(), rows.min(TileOrder::MOST_ROWS));
+        let base = GemmCfg { order, ..gemm_cfg(tile, stages, [2, 2], unroll) };
         let unsplit = base.code();
+        prop_assert!(unsplit.ends_with(&format!(",g{},~", order.rows())), "{}", unsplit);
+        prop_assert_eq!(GemmCfg::of_code(&unsplit), Some(base));
+        let hand = unsplit.replace(&format!(",g{},", order.rows()), &format!(",g{rows},"));
+        prop_assert_eq!(GemmCfg::of_code(&hand), Some(base));
         let code = format!("{},t{split}", unsplit.strip_suffix(",~").expect("an unsplit code"));
         match TailSplit::new(split) {
             Some(tail) => {
@@ -101,7 +93,6 @@ proptest! {
             }
             None => prop_assert_eq!(GemmCfg::of_code(&code), None),
         }
-        prop_assert_eq!(GemmCfg::of_code(&unsplit), Some(base));
     }
 }
 
@@ -154,7 +145,7 @@ fn a_tail_split_computes_the_gemm(
     let order = TileOrder::grouped(rows).expect("a group of rows");
     let cfg = GemmCfg { order, tail: Some(split), ..gemm_cfg(tile, 2, warps, false) };
     assert!(TailSpec::merges(&cfg), "{cfg:?}: the merge tile divides the GEMM's");
-    let spec = assumed(GemmSpec { m, n, k, batch: Batch::Static(1), epilogue }, cfg);
+    let spec = assumed(GemmSpec { epilogue, ..super::gemm_spec(m, n, k) }, cfg);
     let plan = TailPlan::new(m.div_ceil(tile[0]) * n.div_ceil(tile[1]), wave, split).expect("a tail");
     let tail = TailSpec { gemm: spec.clone(), plan };
     let out = if epilogue.out_f32 { ScalarDType::Float32 } else { ScalarDType::BFloat16 };
@@ -184,7 +175,7 @@ fn a_tail_split_computes_the_gemm(
     // A slot holds its tile's elements inside the output and nothing past
     // it, where a device's accumulator holds no defined value.
     let ([bm, bn, _], gn) = (tile, n.div_ceil(tile[1]));
-    let walk = covered(m.div_ceil(bm), gn, rows, plan.tail);
+    let walk = walked(m.div_ceil(bm), gn, rows, Tiles::Run(plan.tail));
     for (e, v) in parts.iter().enumerate() {
         let (slot, r, col) = (e / (bm * bn) % plan.tail.count(), e / bn % bm, e % bn);
         let at = walk.iter().position(|&w| w == (plan.tail.first() + slot) as i64).expect("a tail tile");
@@ -194,9 +185,10 @@ fn a_tail_split_computes_the_gemm(
     }
     let got = last(run(&programs.next().expect("the merge"), with(vec![parts], c), &[]).unwrap());
 
+    let dots = super::interp::naive_gemm(&a, &b, n, k);
     for i in 0..m {
         for j in 0..n {
-            let dot: f64 = (0..k).map(|p| a[i * k + p] * b[j * k + p]).sum();
+            let dot = dots[i * n + j];
             let mut want = activated(epilogue.act, dot + bias.as_ref().map_or(0.0, |b| b[j]));
             want *= epilogue.scale.map_or(1.0, |s| f64::from(s.get()));
             want = round_to(out, want + residual.as_ref().map_or(0.0, |r| r[i * n + j]));

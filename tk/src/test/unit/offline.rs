@@ -12,7 +12,7 @@ use crate::kernels::gemm::Epilogue;
 use crate::ops::config::{self, Planner};
 use crate::ops::shape::{self, Extent, Plan};
 use crate::probe::{self, Measured};
-use crate::tune::{self, TuneStore};
+use crate::tune;
 
 /// A card's target is the architecture's with the card's SMs and dies, and
 /// its shared memory per block is what the device reports.
@@ -67,15 +67,15 @@ const H100: [(&str, u64); 21] = [
 
 /// A probe's store line for `device` under another compiler and probe
 /// programs (`programs`) than this build's.
-fn line(device: &str, op: &str, programs: &str, fs: u64) -> String {
+pub(super) fn line(device: &str, op: &str, programs: &str, fs: u64) -> String {
     format!("value|probe:{op}|{device}|Int32||00000000000000c0|00000000000000aa|{programs} {fs}")
 }
 
-/// A scratch directory holding `lines` as the store file of `target`'s device.
+/// A scratch directory holding `lines` as the store file of `target`'s
+/// device, under an older store format.
 fn store(name: &str, target: &Target, lines: &[String]) -> Scratch {
     let dir = Scratch::new(&format!("offline-{name}"));
-    let file = TuneStore::at(Some(dir.to_path_buf())).file(&tune::device(target)).expect("a rooted store");
-    std::fs::write(file, format!("format 4\n{}\n", lines.join("\n"))).expect("a store file");
+    super::tune::write_store(&dir, &tune::device(target), 4, lines);
     dir
 }
 

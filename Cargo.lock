@@ -1383,6 +1383,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "gimli"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1033caf0b349c518623b5396bfb2cf0bddf44f0306d543a250e5743297aafd10"
+
+[[package]]
 name = "git-version"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3691,6 +3697,7 @@ dependencies = [
  "proptest",
  "proptest-derive",
  "serde",
+ "serde_json",
  "sha2 0.11.0",
  "smallvec",
  "snafu",
@@ -3810,6 +3817,7 @@ dependencies = [
 name = "svod-runtime"
 version = "0.3.0"
 dependencies = [
+ "gimli",
  "libc",
  "libffi",
  "libloading 0.9.0",
@@ -3817,12 +3825,14 @@ dependencies = [
  "object",
  "papaya",
  "parking_lot 0.12.5",
+ "proptest",
  "rayon",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "smallvec",
  "snafu",
+ "strum",
  "svod-codegen",
  "svod-device",
  "svod-dtype",
@@ -3893,6 +3903,7 @@ version = "0.3.0"
 dependencies = [
  "half",
  "libm",
+ "object",
  "papaya",
  "proptest",
  "rayon",
@@ -3905,6 +3916,7 @@ dependencies = [
  "svod-runtime",
  "svod-schedule",
  "svod-tensor",
+ "tempfile",
  "test-case",
  "tracing",
  "tracing-subscriber",

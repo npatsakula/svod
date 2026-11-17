@@ -165,7 +165,7 @@ impl AqlScratchDesc {
     /// 11): SWIZZLE_ENABLE moves to WORD1 bits [31:30] (value 1), NUM_RECORDS
     /// carries the full backing size (one XCC on RDNA), and
     /// `scratch_wave64_lane_byte_size` records the rounded per-thread stride.
-    /// Consumed by any gfx11+ AQL queue (`SVOD_AMD_AQL=1`), never by the PM4
+    /// Consumed by any gfx11+ AQL queue (forced by `SVOD_AMD_AQL`), never by the PM4
     /// path, which programs scratch via per-dispatch `SET_SH_REG`.
     pub(crate) fn gfx11(scratch_va: u64, size: usize, tmpring_size: u32, size_per_thread: u32) -> Self {
         Self {
@@ -216,6 +216,11 @@ pub struct AmdDeviceCore {
     /// a per-device flag (not an env var) so tests toggle it without a process-
     /// global env race and `=0` can't accidentally enable it.
     pm4_graph: AtomicBool,
+    /// Whether compute queues take raw PM4 rather than AQL packets, decided once
+    /// when the device opens (see [`AmdComputeQueue::will_use_pm4`]).
+    ///
+    /// [`AmdComputeQueue::will_use_pm4`]: crate::amd::queue::AmdComputeQueue::will_use_pm4
+    pm4_queues: bool,
     /// Poison latch. Once a GPU fault/timeout is observed, the device is dead:
     /// every `synchronize`/`execute` against any connector on this device
     /// fails fast. Per-physical
@@ -294,8 +299,10 @@ impl AmdDevice {
     /// Build a host-only device around a synthetic topology node and backend.
     /// This deliberately bypasses the device cache, KFD, and process-global
     /// event-page setup so lifecycle tests can exercise the core on any host.
+    /// Its compute queues are PM4 when `pm4_queues`, else AQL, whatever the
+    /// environment says.
     #[cfg(test)]
-    pub(crate) fn synthetic_with_xcc(iface: Arc<dyn crate::amd::iface::AmdIface>, num_xcc: u32) -> Arc<Self> {
+    pub(crate) fn synthetic(iface: Arc<dyn crate::amd::iface::AmdIface>, num_xcc: u32, pm4_queues: bool) -> Arc<Self> {
         let node = AmdNode {
             node_id: 0,
             gpu_id: 1,
@@ -328,6 +335,7 @@ impl AmdDevice {
             iface,
             has_sdma_queue: AtomicBool::new(false),
             pm4_graph: AtomicBool::new(false),
+            pm4_queues,
             poisoned: AtomicBool::new(false),
             error_msg: OnceLock::new(),
             connectors: parking_lot::Mutex::new(Vec::new()),
@@ -407,6 +415,10 @@ impl AmdDevice {
             .unwrap_or(4)
             .clamp(1, u64::BITS as usize);
 
+        // Single-XCC parts take PM4 unless `SVOD_AMD_AQL` (anything but "0")
+        // forces AQL, for bisecting PM4 against AQL bring-up issues.
+        let force_aql = std::env::var("SVOD_AMD_AQL").is_ok_and(|value| value != "0");
+        let pm4_queues = !force_aql && node.num_xcc.max(1) == 1;
         let hdp = Arc::new(crate::amd::iface::Hdp::new(Arc::clone(&iface), node.num_xcc > 1));
         let core = Arc::new(AmdDeviceCore {
             node,
@@ -415,6 +427,7 @@ impl AmdDevice {
             iface,
             has_sdma_queue: AtomicBool::new(false),
             pm4_graph: AtomicBool::new(false),
+            pm4_queues,
             poisoned: AtomicBool::new(false),
             error_msg: OnceLock::new(),
             copy_queue: OnceLock::new(),
@@ -664,6 +677,13 @@ impl AmdDeviceCore {
     #[inline]
     pub fn pm4_graph(&self) -> bool {
         self.pm4_graph.load(Ordering::Acquire)
+    }
+
+    /// Whether this device's compute queues are PM4 (see
+    /// [`AmdComputeQueue::will_use_pm4`](crate::amd::queue::AmdComputeQueue::will_use_pm4)).
+    #[inline]
+    pub(crate) fn pm4_queues(&self) -> bool {
+        self.pm4_queues
     }
 
     /// Block in the kernel for up to `timeout_ms` waiting on **any** of the
@@ -970,7 +990,7 @@ pub(crate) fn alloc_scratch(
     let tmpring_size = pack_tmpring(waves, wave_scratch, arch);
 
     // Every AQL queue reads the descriptor out of `amd_queue_t` — multi-XCC
-    // CDNA always, gfx11+ under `SVOD_AMD_AQL=1`. PM4 queues program scratch
+    // CDNA always, gfx11+ when `SVOD_AMD_AQL` forces AQL. PM4 queues program scratch
     // via per-dispatch `SET_SH_REG` instead and ignore it, but synthesizing
     // it unconditionally is harmless and closes the forced-AQL gap where
     // gfx11 kernels needing scratch read an all-zero SRD. Explicit per

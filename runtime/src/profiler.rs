@@ -21,6 +21,12 @@
 //!   range profiler. This needs a stable GPU power state on AMD, and a loadable
 //!   CUPTI with unrestricted profiling on CUDA; when that is unavailable the run
 //!   degrades to timing-only (Tiers 1–3).
+//! - **Tier 5 — thread trace.** An AMD SQTT capture of one extra pass
+//!   ([`ProfileOptions::sqtt`], [`SqttOptions::from_env`] for `SVOD_SQTT=1`):
+//!   each kernel's trace saved under its own directory or held in memory
+//!   ([`Sink`]) and summarized ([`crate::sqtt::Analysis`]). The trace runs at
+//!   the device's own clock unless its config pins one; it perturbs the
+//!   dispatch, so the timing columns never come from that pass.
 //!
 //! **Accumulate-and-min policy.** Repeated runs of the same plan are merged per
 //! kernel by keeping the minimum device time ([`RunProfile::merge_min`]), which
@@ -32,17 +38,20 @@
 //! [`ExecutionPlan::profile`](crate::ExecutionPlan::profile) or a tensor directly
 //! with `Tensor::profile` (which wraps it). Behavior is configured
 //! through [`ProfileOptions`] (and [`ProfileOptions::from_env`], reading
-//! `SVOD_PMC`, `SVOD_PROFILE_ITERS` and `SVOD_ORIGIN_DEPTH`). The underlying
+//! `SVOD_PMC`, `SVOD_PROFILE_ITERS` and `SVOD_ORIGIN_DEPTH`; and
+//! [`SqttOptions::from_env`], reading the `SVOD_SQTT*` vars). The underlying
 //! per-kernel timing path is
 //! [`ExecutionPlan::execute_profiled`](crate::ExecutionPlan::execute_profiled).
 //! The library never prints; callers render a finished [`RunProfile`] with
 //! [`RunProfile::render_table`].
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Serialize;
+use snafu::Snafu;
 use svod_device::hcq::{CopyLeg, DeviceQueue, SemanticLinkedPlan};
 use svod_device::{CounterSet, KernelResources, PmcCounter};
 use svod_dtype::DeviceSpec;
@@ -221,6 +230,23 @@ impl SubmissionProfileFinalizer {
         self.handles.push(handle);
     }
 
+    /// [`Self::push`] read at once: `synchronize` retires the dispatch, its stamps, counters and trace
+    /// are copied to the host and `handle` is dropped, so a traced dispatch's buffers never outlive it
+    /// (Tier 5 holds one kernel's trace at a time, not a whole plan's).
+    pub(crate) fn push_drained(
+        &mut self,
+        mut profile: KernelProfile,
+        handle: Option<Arc<dyn svod_device::DispatchTimestamps>>,
+        synchronize: impl FnOnce() -> crate::error::Result<()>,
+    ) -> crate::error::Result<()> {
+        if let Some(handle) = handle {
+            synchronize()?;
+            read(&mut profile, &*handle);
+        }
+        self.push(profile, None);
+        Ok(())
+    }
+
     pub(crate) fn finish(
         mut self,
         synchronize: impl FnOnce() -> crate::error::Result<()>,
@@ -229,14 +255,22 @@ impl SubmissionProfileFinalizer {
             synchronize()?;
         }
         for (profile, handle) in self.profiles.iter_mut().zip(&self.handles) {
-            if let Some((start, end)) = handle.as_ref().and_then(|handle| handle.timestamps_ns()) {
-                profile.gpu_start_ns = Some(start);
-                profile.gpu_end_ns = Some(end);
+            if let Some(handle) = handle {
+                read(profile, &**handle);
             }
-            profile.counters = handle.as_ref().and_then(|handle| handle.counters());
         }
         Ok(self.profiles)
     }
+}
+
+/// A retired dispatch's stamps, counters and trace onto its profile.
+fn read(profile: &mut KernelProfile, handle: &dyn svod_device::DispatchTimestamps) {
+    if let Some((start, end)) = handle.timestamps_ns() {
+        profile.gpu_start_ns = Some(start);
+        profile.gpu_end_ns = Some(end);
+    }
+    profile.counters = handle.counters();
+    profile.sqtt = handle.sqtt().map(Box::new);
 }
 
 /// Per-kernel timing from a profiled execution.
@@ -283,6 +317,8 @@ pub struct KernelProfile {
     pub static_info: Option<KernelStaticInfo>,
     /// Tier-4 hardware performance counters, populated when PMC was enabled.
     pub counters: Option<CounterSet>,
+    /// Tier-5 raw thread trace of this dispatch, when its context traced it.
+    pub sqtt: Option<Box<svod_device::profile::SqttTrace>>,
 }
 
 /// Static per-kernel analysis: estimated work plus decoded GPU resources.
@@ -366,19 +402,23 @@ pub struct ProfileOptions {
     /// are always dropped from the rollup key — they are the flat `file:line`
     /// layer under a module path, shown as per-row detail instead.
     pub origin_depth: Option<usize>,
+    /// Tier 5: trace one more pass (AMD SQTT) as [`SqttOptions`] asks ([`StageProfile::sqtt`]).
+    /// The pass synchronizes after each kernel and drops its trace buffers before the next.
+    pub sqtt: Option<SqttOptions>,
 }
 
 impl Default for ProfileOptions {
     fn default() -> Self {
-        Self { iters: 1, static_analysis: true, counters: PmcSelection::None, origin_depth: None }
+        Self { iters: 1, static_analysis: true, counters: PmcSelection::None, origin_depth: None, sqtt: None }
     }
 }
 
 impl ProfileOptions {
     /// Build from the `SVOD_PROFILE_ITERS` / `SVOD_PMC` / `SVOD_ORIGIN_DEPTH`
-    /// env vars (defaults otherwise). This is the single place profiling env vars
-    /// are read; callers that want explicit control construct [`ProfileOptions`]
-    /// directly.
+    /// env vars (defaults otherwise). A thread trace is never read from the
+    /// environment here: [`SqttOptions::from_env`] reads it and reports a bad
+    /// value, which this infallible constructor could not. Callers that want
+    /// explicit control construct [`ProfileOptions`] directly.
     pub fn from_env() -> Self {
         let mut o = Self::default();
         if let Ok(n) = std::env::var("SVOD_PROFILE_ITERS").unwrap_or_default().trim().parse::<u32>() {
@@ -389,6 +429,81 @@ impl ProfileOptions {
         }
         o.origin_depth = parse_origin_depth(&std::env::var("SVOD_ORIGIN_DEPTH").unwrap_or_default());
         o
+    }
+}
+
+/// Tier 5: how [`ExecutionPlan::profile`](crate::ExecutionPlan::profile) traces its extra pass.
+/// The default traces unpinned and saves each kernel's capture under `./sqtt`.
+///
+/// ```no_run
+/// use svod_runtime::{ExecutionPlan, ProfileOptions, SqttOptions};
+///
+/// fn trace(plan: &ExecutionPlan) -> svod_runtime::Result<()> {
+///     // `Tensor::profile` takes the same options.
+///     let opts = ProfileOptions { sqtt: Some(SqttOptions::default()), ..Default::default() };
+///     let profile = plan.profile(&opts)?;
+///     for traced in profile.stages.iter().flat_map(|stage| &stage.sqtt) {
+///         match &traced.analysis {
+///             Ok(analysis) => println!("{}: {}", traced.kernel, analysis.summary()),
+///             Err(error) => println!("{}: {error}", traced.kernel),
+///         }
+///     }
+///     Ok(())
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SqttOptions {
+    pub config: svod_device::profile::SqttConfig,
+    pub sink: Sink,
+}
+
+/// Where a traced pass puts each kernel's [`crate::sqtt::Capture`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Sink {
+    /// Saved under `<dir>/<index>_<entry point>` and dropped, so the pass holds one capture at a time.
+    Disk(PathBuf),
+    /// Held in [`Traced::raw`]: a capture is up to 64 MiB an SE, so a whole model's may not fit.
+    Memory,
+}
+
+impl Default for Sink {
+    fn default() -> Self {
+        Self::Disk("sqtt".into())
+    }
+}
+
+/// A profiling env var whose value does not parse.
+#[derive(Debug, Snafu)]
+#[snafu(display("{var}={value:?}: {why}"))]
+pub struct EnvError {
+    pub var: &'static str,
+    pub value: String,
+    pub why: String,
+}
+
+impl SqttOptions {
+    /// `SVOD_SQTT=1` traces, saved under `SVOD_SQTT_DIR` (default `./sqtt`), as
+    /// [`Self::config_from_env`] configures; `None` where `SVOD_SQTT` is not `1`.
+    pub fn from_env() -> Result<Option<Self>, EnvError> {
+        if std::env::var("SVOD_SQTT").as_deref() != Ok("1") {
+            return Ok(None);
+        }
+        let sink = Sink::Disk(std::env::var_os("SVOD_SQTT_DIR").map_or_else(|| "sqtt".into(), PathBuf::from));
+        Ok(Some(Self { config: Self::config_from_env()?, sink }))
+    }
+
+    /// The default config with `SVOD_SQTT_PSTATE` (`standard` or `peak`) pinning the clock and
+    /// `SVOD_SQTT_SIMD` (a SIMD, or a comma list repeated over the SEs) picking each SE's SIMD.
+    pub fn config_from_env() -> Result<svod_device::profile::SqttConfig, EnvError> {
+        fn var<T: std::str::FromStr<Err: std::fmt::Display>>(var: &'static str) -> Result<Option<T>, EnvError> {
+            let Ok(value) = std::env::var(var) else { return Ok(None) };
+            value.parse().map(Some).map_err(|why: T::Err| EnvError { var, value, why: why.to_string() })
+        }
+        let mut config = svod_device::profile::SqttConfig { pstate: var("SVOD_SQTT_PSTATE")?, ..Default::default() };
+        if let Some(simds) = var("SVOD_SQTT_SIMD")? {
+            config.simds = simds;
+        }
+        Ok(config)
     }
 }
 
@@ -721,17 +836,38 @@ pub struct StageProfile {
     /// Extensible per-stage metadata (rtf, chunk index, …). Keeps the format
     /// stable across models without schema churn; consumed as-is by the UI.
     pub meta: BTreeMap<String, String>,
+    /// Tier-5 thread traces of the stage's kernels.
+    pub sqtt: Vec<Traced>,
+}
+
+/// One kernel's thread trace ([`ProfileOptions::sqtt`]).
+#[derive(Debug)]
+pub struct Traced {
+    /// The kernel's index among the stage's dispatches.
+    pub index: usize,
+    pub kernel: String,
+    /// Per kernel, so one that fails to analyze leaves the rest.
+    pub analysis: Result<crate::sqtt::Analysis, crate::sqtt::Error>,
+    pub raw: Raw,
+}
+
+/// A [`Traced`] kernel's capture, as its [`Sink`] kept it.
+#[derive(Debug)]
+pub enum Raw {
+    /// The directory [`crate::sqtt::Capture::load`] reads back.
+    Saved(PathBuf),
+    Held(Box<crate::sqtt::Capture>),
 }
 
 impl StageProfile {
     /// A host-only stage (no GPU kernels).
     pub fn host(name: impl Into<String>, wall: Duration) -> Self {
-        Self { name: name.into(), wall, kernels: Vec::new(), meta: BTreeMap::new() }
+        Self { name: name.into(), wall, kernels: Vec::new(), meta: BTreeMap::new(), sqtt: Vec::new() }
     }
 
     /// A GPU stage carrying one profiled execution's per-dispatch kernels.
     pub fn gpu(name: impl Into<String>, wall: Duration, kernels: Vec<KernelProfile>) -> Self {
-        Self { name: name.into(), wall, kernels, meta: BTreeMap::new() }
+        Self { name: name.into(), wall, kernels, meta: BTreeMap::new(), sqtt: Vec::new() }
     }
 
     /// Sum of GPU (or wall-fallback) time across the profiled execution.
@@ -853,6 +989,19 @@ impl RunProfile {
                     render_origins(&s.kernels, origin_depth, 20),
                 ));
             }
+            if !s.sqtt.is_empty() {
+                out.push_str("thread traces (SQTT; a traced dispatch's time is perturbed):\n");
+            }
+            for t in &s.sqtt {
+                let at = match &t.raw {
+                    Raw::Saved(dir) => dir.display().to_string(),
+                    Raw::Held(_) => t.kernel.clone(),
+                };
+                match &t.analysis {
+                    Ok(analysis) => out.push_str(&format!("  #{} {at}: {}\n", t.index, analysis.summary())),
+                    Err(error) => out.push_str(&format!("  #{} {}: {error}\n", t.index, t.kernel)),
+                }
+            }
         }
         out
     }
@@ -876,6 +1025,7 @@ impl RunProfile {
                 Some(existing) => {
                     existing.wall += stage.wall;
                     existing.kernels.extend(stage.kernels);
+                    existing.sqtt.extend(stage.sqtt);
                     for (key, value) in stage.meta {
                         let summed = existing.meta.get(&key).and_then(|held| sum_numeric(held, &value));
                         existing.meta.insert(key, summed.unwrap_or(value));

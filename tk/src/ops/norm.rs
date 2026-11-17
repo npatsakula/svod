@@ -73,7 +73,7 @@ fn norm(
     };
     let (ext, var, planner) = (ext.expect("planned"), var.flatten(), planner.expect("planned"));
     let (lead, d) = (&ext.dims[..ext.dims.len() - 1], ext.dims[ext.dims.len() - 1]);
-    let rows = lead[usize::from(var.is_some())..].iter().product();
+    let rows = lead[usize::from(ext.var)..].iter().product();
     let (batch, residual_, bias) = (batch_of(&var, 1), residual.is_some(), b.is_some());
     let spec = NormSpec { norm: kind, rows, d, batch, eps, residual: residual_, bias, cfg: cfgs[0] };
     let spec = tuned(TuneStore::global(), &planner, x.dtype(), &cfgs, spec);

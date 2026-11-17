@@ -55,7 +55,7 @@ use crate::ops::config::{Family, Planner, Rejected};
 /// ```compile_fail,E0308
 /// # use svod_tk::build::BF16;
 /// # use svod_tk::kernels::{Batch, gemm::{Epilogue, GemmSpec, gemm}};
-/// let spec = GemmSpec { m: 40, n: 40, k: 72, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT };
+/// let spec = GemmSpec { m: 40, n: 40, k: 72, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, windows: Default::default() };
 /// gemm::<BF16>(&spec);
 /// ```
 ///
@@ -152,6 +152,67 @@ impl<S: Spec> Deref for Admitted<'_, S> {
 impl<S: Spec + fmt::Debug> fmt::Debug for Admitted<'_, S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Admitted").field("spec", &self.spec).field("cfg", &self.cfg).finish()
+    }
+}
+
+/// A `[rows, width]` operand inside a wider row-major buffer: row `r`,
+/// column `c` at `offset + r·ld + c`; a channel slice of a channels-last
+/// tensor. The buffer holds `rows · ld` elements, so `offset + width ≤ ld`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Window {
+    pub offset: usize,
+    pub ld: usize,
+}
+
+impl Window {
+    /// The whole rows of a `width`-wide operand: no offset, no gap.
+    pub fn whole(width: usize) -> Self {
+        Self { offset: 0, ld: width }
+    }
+
+    /// `at` moved to the window's first element; a window at zero adds
+    /// nothing, so a contiguous operand addresses as it always has.
+    pub fn from<'k>(&self, at: Sc<'k>) -> Sc<'k> {
+        if self.offset == 0 { at } else { at + self.offset }
+    }
+
+    /// The elements a buffer of `rows` rows holds.
+    pub fn elems(&self, rows: usize) -> usize {
+        rows * self.ld
+    }
+}
+
+/// Where a GEMM's row-major operands sit in the buffers bound to them:
+/// `None`, the operand's own contiguous rows. A window changes the program
+/// (its addressing), never the work.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Windows {
+    /// The A operand, `[rows, k]` (a convolution's input pixels, `[pixels, cin]`).
+    pub a: Option<Window>,
+    pub residual: Option<Window>,
+    /// The output, `[rows, n]`.
+    pub c: Option<Window>,
+}
+
+impl Windows {
+    /// Every operand contiguous.
+    pub const NATURAL: Self = Self { a: None, residual: None, c: None };
+
+    pub fn a(&self, k: usize) -> Window {
+        self.a.unwrap_or(Window::whole(k))
+    }
+
+    pub fn residual(&self, n: usize) -> Window {
+        self.residual.unwrap_or(Window::whole(n))
+    }
+
+    pub fn c(&self, n: usize) -> Window {
+        self.c.unwrap_or(Window::whole(n))
+    }
+
+    /// The windows a split's merge reads and writes: the residual's and the output's.
+    pub fn outputs(&self) -> Self {
+        Self { a: None, ..*self }
     }
 }
 

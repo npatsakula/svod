@@ -1,0 +1,55 @@
+{
+  "format": 2,
+  "arch": "gfx1201",
+  "load_base": 133725381783552,
+  "entry_pc": 133725381783552,
+  "kernel_ns": 180320,
+  "traced_ns": 181960,
+  "ses": [
+    {
+      "se": 0,
+      "itrace": true,
+      "truncated": false
+    },
+    {
+      "se": 1,
+      "itrace": true,
+      "truncated": false
+    }
+  ],
+  "labels": {
+    "candidate_ns": "181160",
+    "cfg": "NearestCfg { bq: 64, bkv: 32, schedule: Ring { depth: 2, unroll: false }, warp_rows: 16, bk: None, splits: 1, list: Registers, lanes: Some(LaneQueue { width: 4, depth: 2, passes: true }) }",
+    "kernel": "nearest",
+    "op": "nearest",
+    "shape": "n4096 d128 k16 NegDot"
+  },
+  "model": {
+    "per_trip": {
+      "axis": "depth",
+      "elems": 128
+    },
+    "price": null
+  },
+  "resources": {
+    "vgprs": 176,
+    "agprs": null,
+    "sgprs": 16,
+    "lds_bytes": 16384,
+    "scratch_bytes": 0,
+    "wave_size": 32,
+    "occupancy": 0.5
+  },
+  "workgroup": [
+    128,
+    1,
+    1
+  ],
+  "grid": [
+    64,
+    1,
+    1
+  ],
+  "pstate": "unpinned",
+  "mclk_mhz": 96
+}

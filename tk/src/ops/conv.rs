@@ -1,20 +1,22 @@
 //! `y = scale·act(x ⊛ w + bias) + residual` over channels-last operands.
 
+use std::ops::Range;
+
 use snafu::{ResultExt, ensure};
 use svod_dtype::{DType, ScalarDType};
 use svod_ir::SInt;
 use svod_tensor::Tensor;
 
 use super::config::Planner;
-use super::shape::{self, extent, shape_of};
+use super::shape::{self, Plan, extent, shape_of};
 use super::{
-    Act, DtypeSnafu, GraphSnafu, LaunchSnafu, Linear, Result, ShapeSnafu, Tuner, batch_of, fmt_shape, kernel_buffer,
-    output,
+    Act, DtypeSnafu, GraphSnafu, LaunchSnafu, Linear, Result, ShapeSnafu, Tuner, assigned, batch_of, bound, channels,
+    fmt_shape, kernel_buffer, output, window_into,
 };
 use crate::build::{BF16, F16};
 use crate::kernels::conv::{ConvCfg, ConvGeom, ConvSpec};
 use crate::kernels::gemm::{Epilogue, Scale};
-use crate::kernels::{Admits, Admitted, Batch};
+use crate::kernels::{Admits, Admitted, Batch, Windows};
 use crate::launch;
 use crate::tune::TuneStore;
 
@@ -36,6 +38,9 @@ pub struct Conv<'a> {
     pub scale: Option<f32>,
     /// The output type: the input's (`None`) or `Float32`, the accumulator unrounded.
     pub out_dtype: Option<DType>,
+    /// `out=`: the output stored into channels `at..at + Cout` of this
+    /// `[B, Ho, Wo, C]` tensor, which the op returns after the store.
+    pub into: Option<(&'a Tensor, usize)>,
 }
 
 impl Default for Conv<'_> {
@@ -50,6 +55,7 @@ impl Default for Conv<'_> {
             residual: None,
             scale: None,
             out_dtype: None,
+            into: None,
         }
     }
 }
@@ -57,7 +63,9 @@ impl Default for Conv<'_> {
 const OP: &str = "conv2d";
 
 /// `x [B, H, W, Cin]` ⊛ `w [Cout, kh, kw, Cin / groups]` → `[B, Ho, Wo, Cout]`
-/// with the epilogue `opts`; `B` may be a bound batch variable.
+/// with the epilogue `opts`; `B` may be a bound batch variable. An `x` or a
+/// residual that is a channel slice of a kernel's output is read in place,
+/// and an `into` buffer is stored in place.
 pub fn conv2d(x: &Tensor, w: &Tensor, opts: Conv) -> Result<Tensor> {
     let shape = |t: &Tensor| shape_of(t).context(GraphSnafu { op: OP });
     let (xs, ws) = (shape(x)?, shape(w)?);
@@ -97,13 +105,23 @@ pub fn conv2d(x: &Tensor, w: &Tensor, opts: Conv) -> Result<Tensor> {
         ensure!(got == out, shape_err("residual", &got, fmt_shape(&out)));
     }
     let out_dtype = opts.out_dtype.clone().unwrap_or(x.dtype());
+    let cw = match opts.into {
+        Some((into, at)) => match window_into(OP, into, at, &out, &out_dtype)? {
+            Some(w) => Some(w),
+            None => {
+                let y = conv2d(x, w, Conv { into: None, ..opts })?;
+                return assigned(into, at, &y).context(GraphSnafu { op: OP });
+            }
+        },
+        None => None,
+    };
 
     // A pointwise convolution is a linear layer over the pixels.
     let pointwise = geom.kernel == [1, 1] && geom.stride == [1, 1] && geom.pad == [0, 0] && groups == 1;
     if pointwise && out_dtype == x.dtype() {
         let w2 = w.try_reshape([geom.cout as isize, cin as isize]).context(GraphSnafu { op: OP })?;
-        let lin =
-            Linear { bias: opts.bias, act: opts.act, residual: opts.residual, scale: opts.scale, ..Linear::default() };
+        let (bias, residual, into) = (opts.bias, opts.residual, opts.into);
+        let lin = Linear { bias, act: opts.act, residual, scale: opts.scale, into, ..Linear::default() };
         return super::linear(x, &w2, lin);
     }
 
@@ -120,42 +138,57 @@ pub fn conv2d(x: &Tensor, w: &Tensor, opts: Conv) -> Result<Tensor> {
         out_f32: out_dtype != x.dtype(),
         rope: None,
     };
-    let plan = shape::conv2d(
-        planner.as_deref(),
-        &dtypes,
-        out_dtype.clone(),
-        residual_dtype,
-        ext.as_ref(),
-        &geom,
-        groups,
-        &epilogue,
-    );
+    let plan_of = |g: &ConvGeom| {
+        let residual = residual_dtype.clone();
+        shape::conv2d(planner.as_deref(), &dtypes, out_dtype.clone(), residual, ext.as_ref(), g, groups, &epilogue)
+    };
+    let plan = plan_of(&geom);
+    // Zero channels add nothing: a stem's few channels pad to the least run
+    // the target's reduction tiles plan a kernel for.
+    if groups == 1 && !cin.is_multiple_of(shape::CONV_CIN) {
+        let runs = [1, 2, 4].map(|r| cin.next_multiple_of(r * shape::CONV_CIN));
+        let padded = runs.into_iter().find(|&c| matches!(plan_of(&ConvGeom { cin: c, ..geom }), Plan::Kernel(_)));
+        if let Some(padded) = padded {
+            let pad = [(0, 0), (0, 0), (0, 0), (0, (padded - cin) as isize)];
+            let (x, w) = (x.try_pad(&pad), w.try_pad(&pad));
+            return conv2d(&x.context(GraphSnafu { op: OP })?, &w.context(GraphSnafu { op: OP })?, opts);
+        }
+    }
     let Some(cfgs) = super::kernel(OP, plan) else { return graph(x, w, opts).context(GraphSnafu { op: OP }) };
     let (ext, var, planner) = (ext.expect("planned"), var.flatten(), planner.expect("planned"));
     let images = ext.dims[0];
-    let batch = match var {
-        Some(_) => batch_of(&var, images),
-        None => Batch::Static(images),
-    };
-    let spec = ConvSpec { batch, geom, epilogue, split: 1 };
+    let ((x, xw), residual) = (bound(x), opts.residual.map(bound));
+    let (residual, rw) = (residual.as_ref().map(|(r, _)| r), residual.as_ref().and_then(|(_, w)| *w));
+    let windows = Windows { a: xw, residual: rw, c: cw };
+    let spec = ConvSpec { batch: batch_of(&var, images), geom, epilogue, split: 1, windows };
     let spec = tuned(TuneStore::global(), &planner, x.dtype(), &cfgs, spec);
     super::ran(OP, "conv", ConvCfg { gemm: spec.cfg(), split: spec.split });
     let mut programs = programs(&spec, &x.dtype(), &planner).into_iter();
-    let y = output(&[images, ho, wo, geom.cout], &var, out_dtype).context(GraphSnafu { op: OP })?;
+    let y = match opts.into {
+        Some((into, _)) => into.clone(),
+        None => output(&[images, ho, wo, geom.cout], &var, out_dtype).context(GraphSnafu { op: OP })?,
+    };
     let (prog, lowering) = programs.next().expect("the convolution");
-    let ins = [Some(x), Some(w), opts.bias, opts.residual, Some(&y)];
+    let (xc, outs) = (channels(xw, cin), [channels(rw, geom.cout), channels(cw, geom.cout)]);
+    let launch = |prog, lowering: &_, ins: [Option<&Tensor>; 5], ranges: [Option<Range<usize>>; 5]| {
+        let (ins, ranges): (Vec<&Tensor>, Vec<_>) =
+            ins.into_iter().zip(ranges).filter_map(|(t, r)| Some((t?, r))).unzip();
+        launch::graph_launch_ranged(prog, lowering, &ins, &ranges).context(LaunchSnafu { op: OP })
+    };
+    let [rc, yc] = outs;
     let Some((merge, merge_lowering)) = programs.next() else {
-        let ins: Vec<&Tensor> = ins.into_iter().flatten().collect();
-        return launch::graph_launch(prog, &lowering, &ins).context(LaunchSnafu { op: OP });
+        let ins = [Some(&x), Some(w), opts.bias, residual, Some(&y)];
+        return launch(prog, &lowering, ins, [xc, None, None, rc, yc]);
     };
     let partial = kernel_buffer(&[SInt::Const(spec.split * images * ho * wo * geom.cout)], DType::Float32)
         .context(GraphSnafu { op: OP })?;
-    let partial = launch::graph_launch(prog, &lowering, &[x, w, &partial]).context(LaunchSnafu { op: OP })?;
-    let ins: Vec<&Tensor> = [Some(&partial), opts.bias, opts.residual, Some(&y)].into_iter().flatten().collect();
-    launch::graph_launch(merge, &merge_lowering, &ins).context(LaunchSnafu { op: OP })
+    let partial =
+        launch(prog, &lowering, [Some(&x), Some(w), Some(&partial), None, None], [xc, None, None, None, None])?;
+    let ins = [Some(&partial), opts.bias, residual, Some(&y), None];
+    launch(merge, &merge_lowering, ins, [None, None, rc, yc, None])
 }
 
-fn programs(spec: &Admitted<ConvSpec>, dtype: &DType, planner: &Planner) -> crate::tune::Candidate {
+pub fn programs(spec: &Admitted<ConvSpec>, dtype: &DType, planner: &Planner) -> crate::tune::Candidate {
     match dtype.scalar() {
         Some(ScalarDType::BFloat16) => spec.programs::<BF16>(&planner.device),
         Some(ScalarDType::Float16) => spec.programs::<F16>(&planner.device),
@@ -239,5 +272,9 @@ pub(crate) fn graph(x: &Tensor, w: &Tensor, opts: Conv) -> svod_tensor::error::R
         Some(r) => y.try_add(r.cast(DType::Float32))?,
         None => y,
     };
-    Ok(y.cast(opts.out_dtype.unwrap_or(x.dtype())))
+    let y = y.cast(opts.out_dtype.unwrap_or(x.dtype()));
+    match opts.into {
+        Some((into, at)) => assigned(into, at, &y),
+        None => Ok(y),
+    }
 }

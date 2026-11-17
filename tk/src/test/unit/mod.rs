@@ -14,7 +14,9 @@ mod interp;
 mod isa;
 mod layout;
 mod layouts;
+mod lines;
 mod nearest;
+mod occupancy;
 mod offline;
 mod ops;
 mod ops_plan;
@@ -31,6 +33,7 @@ mod sync;
 mod tail;
 mod targets;
 mod tune;
+mod windows;
 
 use std::sync::{Arc, LazyLock};
 
@@ -131,8 +134,8 @@ fn group_target() -> Option<Target> {
     group.then_some(target)
 }
 
-/// The crate's tracing under `RUST_LOG` on stderr, for the probes: the
-/// tuner's picks and round times at `svod_tk=debug`.
+/// The crate's tracing under `RUST_LOG` on stderr, for the device tests:
+/// the tuner's picks and round times at `svod_tk=debug`.
 fn traced() {
     use tracing_subscriber::EnvFilter;
     let _ = tracing_subscriber::fmt()
@@ -164,11 +167,9 @@ pub(crate) fn tuned_on_device<C: crate::ops::config::Tiled + PartialEq + std::fm
     (candidates, pick)
 }
 
-/// Each candidate's best device time in ns, its programs' summed, on
-/// scratch buffers at capacity: compiled, then timed.
+/// Each candidate's best device time in ns ([`crate::tune::measure`]).
 fn measure(candidates: impl IntoIterator<Item = crate::tune::Candidate>) -> Vec<Option<u64>> {
-    let pool = crate::tune::ScratchPool::default();
-    crate::tune::time(&mut crate::tune::compile(candidates.into_iter().collect(), &pool))
+    crate::tune::measure(candidates.into_iter().collect()).into_iter().map(|(_, ns)| ns).collect()
 }
 
 /// The 8-bit step `probe::costs` measured on each fixture's device on
@@ -394,7 +395,11 @@ pub(crate) fn lane_moves_dear() -> Costs {
 /// `prog` laid for `device` on the warp core: its pipelines expanded as the
 /// target fills, then inferred, as the lowering does before it emits.
 pub(crate) fn laid(prog: Program, device: &crate::atoms::Device) -> crate::layouts::Result<Program<crate::ir::Laid>> {
-    crate::layouts::infer(crate::schedule::expand(prog, device.target.fill, Core::Warp), device, Core::Warp)
+    crate::layouts::infer(
+        crate::schedule::expand(prog, device.target.fill, Core::Warp, device.target.sync.split_barrier),
+        device,
+        Core::Warp,
+    )
 }
 
 /// A plain bf16 `c = a·bᵀ` program on a 2×4 warp grid.
@@ -412,7 +417,7 @@ fn gemm_nt_crews(m: usize, n: usize, k: usize, tile: [usize; 3]) -> Program {
         order: Default::default(),
         tail: None,
     };
-    gemm::<BF16>(&assumed(GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default() }, cfg))
+    gemm::<BF16>(&assumed(gemm_spec(m, n, k), cfg))
 }
 
 fn gemm_nt_batched(m: usize, n: usize, k: usize, tile: [usize; 3], stages: usize, batch: Batch) -> Program {
@@ -424,7 +429,12 @@ fn gemm_nt_batched(m: usize, n: usize, k: usize, tile: [usize; 3], stages: usize
         order: Default::default(),
         tail: None,
     };
-    gemm::<BF16>(&assumed(GemmSpec { m, n, k, batch, epilogue: Epilogue::default() }, cfg))
+    gemm::<BF16>(&assumed(GemmSpec { batch, ..gemm_spec(m, n, k) }, cfg))
+}
+
+/// A single `m×n×k` GEMM with no epilogue.
+pub(super) fn gemm_spec(m: usize, n: usize, k: usize) -> GemmSpec {
+    GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, windows: Default::default() }
 }
 
 /// The next value of a 64-bit LCG stepping `seed`, uniform in `[-1, 1)`.

@@ -11,6 +11,7 @@
 //! define void @kernel(ptr noalias readonly align 32 %data0, ptr noalias align 32 %data1, ..., i32 %N) #0 { ... }
 //! ```
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use svod_dtype::{AmdArch, CudaArch};
@@ -39,22 +40,32 @@ pub struct LlvmTextRenderer {
     /// carry the rolled hint whatever a pattern match over the nodes would
     /// find ([`Self::rolled`]).
     rolled: std::collections::HashSet<u64>,
+    /// Source locations by UOp id and the listing they name ([`Self::locations`]).
+    locations: Option<(std::collections::HashMap<u64, Location>, String)>,
+}
+
+/// Where an operation comes from in a synthetic source the renderer does not
+/// see: a line (nonzero) and a column (zero for none).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Location {
+    pub line: u32,
+    pub column: u32,
 }
 
 impl LlvmTextRenderer {
     /// Renderer for the host CPU target (default for backwards compatibility).
     pub fn new() -> Self {
-        Self { target: LlvmTarget::Cpu, rolled: Default::default() }
+        Self { target: LlvmTarget::Cpu, rolled: Default::default(), locations: None }
     }
 
     /// Renderer for an AMD GPU at the named `gfx{family}` target.
     pub fn amd(arch: AmdArch) -> Self {
-        Self { target: LlvmTarget::Amd(arch), rolled: Default::default() }
+        Self { target: LlvmTarget::Amd(arch), rolled: Default::default(), locations: None }
     }
 
     /// Renderer for an NVIDIA GPU at the named `sm_XY` compute capability.
     pub fn nvptx(arch: CudaArch) -> Self {
-        Self { target: LlvmTarget::Nvptx(arch), rolled: Default::default() }
+        Self { target: LlvmTarget::Nvptx(arch), rolled: Default::default(), locations: None }
     }
 
     /// The loops whose ranges `ids` name, kept rolled by the schedule that
@@ -65,9 +76,17 @@ impl LlvmTextRenderer {
         self
     }
 
+    /// Line-tables-only debug info over `listing`, embedded as the DWARF 5
+    /// source of `kernel.tk`: every instruction of an operation `locations`
+    /// names carries its line and column, the rest none.
+    pub fn locations(mut self, locations: std::collections::HashMap<u64, Location>, listing: String) -> Self {
+        self.locations = Some((locations, listing));
+        self
+    }
+
     /// Construct with an explicit target.
     pub fn with_target(target: LlvmTarget) -> Self {
-        Self { target, rolled: Default::default() }
+        Self { target, rolled: Default::default(), locations: None }
     }
 
     pub fn target(&self) -> LlvmTarget {
@@ -120,6 +139,8 @@ impl Renderer for LlvmTextRenderer {
         }
         let mut kernel: Vec<String> = Vec::new();
         let mut operations = Vec::new();
+        // Attached once the declarations are read off the call sites.
+        let mut located = Vec::new();
         let mut buffer_args: Vec<BufferArg> = Vec::new();
         let mut var_names: Vec<String> = Vec::new();
 
@@ -201,6 +222,9 @@ impl Renderer for LlvmTextRenderer {
             if let Some(err) = ctx.take_error() {
                 return Err(err);
             }
+            if let Some(&at) = self.locations.as_ref().and_then(|(l, _)| l.get(&node.id)) {
+                located.push((first_line..kernel.len(), at));
+            }
             operations.push(RenderedOperation {
                 uop_id: node.id,
                 op: node.op().as_ref().to_string(),
@@ -259,6 +283,15 @@ impl Renderer for LlvmTextRenderer {
         // CUSTOM body line; LLVM forbids redefining a function, so keep only
         // the first occurrence of each identical declaration.
         let module_prefix = dedup_declares(module_blocks.join("\n\n"));
+        let loop_metadata = ctx.loop_metadata();
+        let debug = self.locations.as_ref().map(|(_, listing)| {
+            let mut debug = DebugInfo::new(loop_metadata.len());
+            for (lines, at) in located {
+                let id = debug.location(at);
+                kernel[lines].iter_mut().for_each(|line| *line = attach_location(line, id));
+            }
+            (debug, listing)
+        });
 
         let target_triple_line = match self.target {
             LlvmTarget::Cpu => String::new(),
@@ -276,23 +309,27 @@ impl Renderer for LlvmTextRenderer {
             }
         };
 
+        let (subprogram, debug_metadata) = match debug {
+            Some((debug, listing)) => (format!(" !dbg !{}", debug.subprogram()), debug.metadata(kernel_name, listing)),
+            None => (String::new(), String::new()),
+        };
         let ir = format!(
             r#"; ModuleID = '{kernel_name}'
 source_filename = "{kernel_name}"
 {target_triple_line}
 {module_prefix}
 
-define {abi} @{kernel_name}({inner_params}) #0 {{
+define {abi} @{kernel_name}({inner_params}) #0{subprogram} {{
 entry:
 {inner_body}
 }}
 
 attributes #0 = {{ {attrs} }}
-{loop_metadata}"#,
+{loop_metadata}{debug_metadata}"#,
             module_prefix = module_prefix,
             inner_params = inner_params.join(", "),
             inner_body = kernel.join("\n"),
-            loop_metadata = ctx.loop_metadata().iter().map(|line| format!("{line}\n")).collect::<String>(),
+            loop_metadata = loop_metadata.iter().map(|line| format!("{line}\n")).collect::<String>(),
         );
 
         tracing::trace!(generated_code = ir, "llvm codegen: final generated code");
@@ -322,6 +359,94 @@ attributes #0 = {{ {attrs} }}
     fn decompositor(&self) -> Option<TypedPatternMatcher<()>> {
         None
     }
+}
+
+/// Whether `line` of a function body is an instruction by LLVM's grammar:
+/// neither blank, nor a comment, nor a block label (a name and a colon, no
+/// space, as every label the renderer writes). Only an instruction takes a
+/// `!dbg` attachment.
+pub(crate) fn is_instruction(line: &str) -> bool {
+    let t = line.trim();
+    let label = t.strip_suffix(':').is_some_and(|name| {
+        !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"-$._".contains(&b))
+    });
+    !(t.is_empty() || t.starts_with(';') || label)
+}
+
+/// `line` (several, from a custom body) with location `!{id}` attached to
+/// each instruction.
+fn attach_location(line: &str, id: usize) -> String {
+    let located: Vec<String> =
+        line.split('\n').map(|l| if is_instruction(l) { format!("{l}, !dbg !{id}") } else { l.to_string() }).collect();
+    located.join("\n")
+}
+
+/// The debug metadata of a located render, numbered on from the renderer's
+/// own nodes (its loop metadata, `!0` up), whose count is known once the
+/// body is rendered, so neither can reach the other's ids: the compile
+/// unit, `kernel.tk`, the subprogram, its type and the two module flags,
+/// then one `!DILocation` per line and column, in order of first use.
+struct DebugInfo {
+    first: usize,
+    locations: HashMap<Location, usize>,
+}
+
+impl DebugInfo {
+    /// The nodes before the locations.
+    const UNIT: usize = 6;
+
+    fn new(first: usize) -> Self {
+        Self { first, locations: HashMap::new() }
+    }
+
+    fn subprogram(&self) -> usize {
+        self.first + 2
+    }
+
+    /// The id of the node locating `at`.
+    fn location(&mut self, at: Location) -> usize {
+        let next = self.first + Self::UNIT + self.locations.len();
+        *self.locations.entry(at).or_insert(next)
+    }
+
+    /// The nodes: `listing` as `kernel.tk`'s source, the file named alone,
+    /// with no directory, so the text is the same wherever it is rendered.
+    fn metadata(&self, kernel_name: &str, listing: &str) -> String {
+        use std::fmt::Write;
+        let [cu, file, sp, ty, dwarf, version] = std::array::from_fn(|i| self.first + i);
+        let mut out = format!(
+            "!llvm.dbg.cu = !{{!{cu}}}\n\
+             !llvm.module.flags = !{{!{dwarf}, !{version}}}\n\
+             !{cu} = distinct !DICompileUnit(language: DW_LANG_C99, file: !{file}, producer: \"svod\", \
+             isOptimized: true, runtimeVersion: 0, emissionKind: LineTablesOnly)\n\
+             !{file} = !DIFile(filename: \"kernel.tk\", directory: \"\", source: \"{source}\")\n\
+             !{sp} = distinct !DISubprogram(name: \"{kernel_name}\", scope: !{file}, file: !{file}, line: 1, \
+             type: !{ty}, scopeLine: 1, spFlags: DISPFlagDefinition | DISPFlagOptimized, unit: !{cu})\n\
+             !{ty} = !DISubroutineType(types: !{{}})\n\
+             !{dwarf} = !{{i32 7, !\"Dwarf Version\", i32 5}}\n\
+             !{version} = !{{i32 2, !\"Debug Info Version\", i32 3}}\n",
+            source = metadata_string(listing),
+        );
+        let mut nodes: Vec<(&Location, &usize)> = self.locations.iter().collect();
+        nodes.sort_unstable_by_key(|&(_, id)| *id);
+        for (at, id) in nodes {
+            let _ = writeln!(out, "!{id} = !DILocation(line: {}, column: {}, scope: !{sp})", at.line, at.column);
+        }
+        out
+    }
+}
+
+/// `text` as an LLVM string literal's contents: printable ASCII as is, every
+/// other byte, `"` and `\` as `\XX`.
+fn metadata_string(text: &str) -> String {
+    use std::fmt::Write;
+    text.bytes().fold(String::with_capacity(text.len()), |mut out, b| {
+        match b {
+            b' '..=b'~' if b != b'"' && b != b'\\' => out.push(b as char),
+            _ => write!(out, "\\{b:02X}").expect("a string takes writes"),
+        }
+        out
+    })
 }
 
 /// The first `@llvm.nvvm.*` / `@llvm.amdgcn.*` reference in a CUSTOM body

@@ -6,7 +6,7 @@
 
 use nix::ioctl_readwrite;
 
-use super::kfd;
+use super::{drm, kfd};
 
 // Type code for KFD ioctls (`#define KFD_IOCTL_BASE 'K'`).
 const KFD_IOCTL_BASE: u8 = b'K';
@@ -32,3 +32,6 @@ ioctl_readwrite!(kfd_free_memory_of_gpu, KFD_IOCTL_BASE, 0x17, kfd::kfd_ioctl_fr
 ioctl_readwrite!(kfd_map_memory_to_gpu, KFD_IOCTL_BASE, 0x18, kfd::kfd_ioctl_map_memory_to_gpu_args);
 ioctl_readwrite!(kfd_unmap_memory_from_gpu, KFD_IOCTL_BASE, 0x19, kfd::kfd_ioctl_unmap_memory_from_gpu_args);
 ioctl_readwrite!(kfd_runtime_enable, KFD_IOCTL_BASE, 0x25, kfd::kfd_ioctl_runtime_enable_args);
+
+// `DRM_IOCTL_AMDGPU_CTX`: `DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_CTX, union drm_amdgpu_ctx)`.
+ioctl_readwrite!(amdgpu_ctx, drm::DRM_IOCTL_BASE, drm::DRM_COMMAND_BASE + drm::DRM_AMDGPU_CTX, drm::drm_amdgpu_ctx);

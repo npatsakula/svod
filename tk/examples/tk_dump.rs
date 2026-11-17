@@ -130,7 +130,7 @@ fn main() -> Result<()> {
                 .map_err(gate("linear"))?;
             let p = GemmProblem::new(1, m, n, k, &epilogue);
             report(&mut plan, top, &ranked, &gemm_lattice(&target), |c| p.admit(&planner, c));
-            let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue };
+            let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue, windows: Default::default() };
             let admit = |c: GemmCfg| spec.clone().admitted(&planner, c).map_err(|why| format!("{c:?}: {why:?}"));
             let spec = match pick {
                 Pick::Ranked(i) => admit(*ranked.get(i).ok_or("no such ranked config")?)?,
@@ -237,7 +237,7 @@ fn main() -> Result<()> {
             let p = cp.gemm;
             let gemms: Vec<_> = ranked.iter().map(|c| c.gemm).collect();
             report(&mut plan, top, &gemms, &[], |c| p.admit(&planner, c));
-            let spec = ConvSpec { batch: Batch::Static(b), geom, epilogue, split: 1 };
+            let spec = ConvSpec { batch: Batch::Static(b), geom, epilogue, split: 1, windows: Default::default() };
             let spec = match pick {
                 Pick::Ranked(i) => {
                     let c = *ranked.get(i).ok_or("no such ranked config")?;

@@ -37,6 +37,9 @@ pub trait Phase: Copy + Debug + PartialEq + 'static {
     type Storage: Clone + Debug + PartialEq;
     /// Every register value's layout.
     type Layouts: Clone + Debug + PartialEq;
+    /// A synchronization statement: [`AuthoredSync`] before the templates
+    /// expand, [`Sync`] after.
+    type Sync: Copy + Debug + PartialEq + Into<Sync>;
 
     /// The pipeline `p` is, where the phase has them.
     fn pipeline(p: &Self::Pipeline) -> &Pipeline<Self>;
@@ -58,6 +61,7 @@ impl Phase for Authored {
     type Deal = ();
     type Storage = ();
     type Layouts = ();
+    type Sync = AuthoredSync;
 
     fn pipeline(p: &Pipeline<Self>) -> &Pipeline<Self> {
         p
@@ -83,6 +87,7 @@ impl Phase for Expanded {
     type Deal = ();
     type Storage = ();
     type Layouts = ();
+    type Sync = Sync;
 
     fn pipeline(p: &Infallible) -> &Pipeline<Self> {
         match *p {}
@@ -109,6 +114,7 @@ impl Phase for Laid {
     type Deal = Vec<Vec<u32>>;
     type Storage = Storage;
     type Layouts = Vec<Option<TileLayout>>;
+    type Sync = Sync;
 
     fn pipeline(p: &Infallible) -> &Pipeline<Self> {
         match *p {}
@@ -538,6 +544,20 @@ pub struct Loop<P: Phase = Authored> {
     /// Copies of the body per emitted iteration (1 = rolled); the schedule
     /// template sets it so ring-slot arithmetic folds to constants.
     pub unroll: u32,
+    /// Which of a pipeline's trips the loop runs, where a schedule template
+    /// placed it ([`crate::schedule::expand`]); `None` for an author's loop.
+    pub trip: Option<Trip>,
+}
+
+/// The trips a schedule template expands a pipeline into: the first steps
+/// before the ring runs full, the steps it runs full, and the last ones
+/// after it stops filling. A template folding its head and drain into
+/// branches of one loop runs that loop as steady.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Trip {
+    Head,
+    Steady,
+    Drain,
 }
 
 /// One side of a [`Pipeline`]: a body parameterized by the step it handles
@@ -587,6 +607,15 @@ impl Schedule {
 
     pub fn crews(self) -> u32 {
         if matches!(self, Self::PingPong { .. }) { 2 } else { 1 }
+    }
+
+    /// The trips one iteration of the steady loop runs: the ring's depth
+    /// where the loop is copied once per slot, else one.
+    pub fn per_iteration(self) -> usize {
+        match self {
+            Self::Ring { depth, unroll: true } => depth.get(),
+            _ => 1,
+        }
     }
 
     pub fn kslice(self) -> Option<usize> {
@@ -642,14 +671,47 @@ pub enum Scope {
     Warp,
 }
 
-/// Synchronization the schedule templates and the sync pass emit; an author
-/// writes only a block barrier ([`crate::build::Kernel::barrier`]).
+/// The synchronization of a program not yet expanded: an author writes only
+/// a block barrier ([`crate::build::Kernel::barrier`]), and the sync pass
+/// lands asynchronous copies ([`crate::lower::sync`]). Every other [`Sync`]
+/// is a schedule template's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AuthoredSync {
+    /// [`Sync::Barrier`].
+    Barrier { scope: Scope },
+    /// [`Sync::CommitAsync`].
+    CommitAsync,
+    /// [`Sync::WaitAsync`].
+    WaitAsync { pending: u32 },
+}
+
+impl From<AuthoredSync> for Sync {
+    fn from(sync: AuthoredSync) -> Self {
+        match sync {
+            AuthoredSync::Barrier { scope } => Self::Barrier { scope },
+            AuthoredSync::CommitAsync => Self::CommitAsync,
+            AuthoredSync::WaitAsync { pending } => Self::WaitAsync { pending },
+        }
+    }
+}
+
+/// Synchronization the schedule templates and the sync pass emit
+/// ([`AuthoredSync`] before the templates expand).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Sync {
     /// Every thread of the `scope` arrives before any continues;
     /// shared-memory writes before it are visible after it. A warp's own
     /// barrier orders its lanes' shared accesses and nothing else.
     Barrier { scope: Scope },
+    /// A block barrier's first half: this thread's shared-memory accesses
+    /// before it are done and its writes visible past every thread's
+    /// [`Sync::Await`] that follows it; the thread runs on. Every thread
+    /// alternates the halves; the pair back to back is a block
+    /// [`Sync::Barrier`].
+    Arrive,
+    /// A block barrier's second half: wait until every thread of the block
+    /// has passed its [`Sync::Arrive`].
+    Await,
     /// Close the group of this thread's async copies issued since the last
     /// commit.
     CommitAsync,
@@ -711,7 +773,7 @@ pub enum Stmt<P: Phase = Authored> {
         /// [`crate::build::Kernel::if_any`]).
         results: Vec<(ValId, ValId, Option<ValId>)>,
     },
-    Sync(Sync),
+    Sync(P::Sync),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -765,6 +827,14 @@ pub struct Var {
     pub name: String,
     pub min: i64,
     pub max: i64,
+}
+
+impl Var {
+    /// Whether the range is one value: the variable is a constant of the
+    /// launch (a JIT's pinned dim), which a kernel need not bind.
+    pub fn pinned(&self) -> bool {
+        self.min == self.max
+    }
 }
 
 /// How a cast to a narrower float rounds.
@@ -1025,7 +1095,7 @@ impl<P: Phase> Stmt<P> {
     /// tile op (with the value it defines) through `op`. A pipeline is handed
     /// back for `Q`'s pass to place, as a phase without them has nothing to
     /// map it to.
-    pub fn map<Q: Phase>(
+    pub fn map<Q: Phase<Sync: From<P::Sync>>>(
         self,
         block: &mut impl FnMut(Block<P>) -> Block<Q>,
         op: &mut impl FnMut(ValId, TileOp<P>) -> TileOp<Q>,
@@ -1033,15 +1103,15 @@ impl<P: Phase> Stmt<P> {
         Ok(match self {
             Stmt::Let { dst, op: o } => Stmt::Let { dst, op: op(dst, o) },
             Stmt::Copy { dst, src, mode, scope } => Stmt::Copy { dst, src, mode, scope },
-            Stmt::Loop(Loop { iv, start, extent, carried, body, unroll }) => {
-                Stmt::Loop(Loop { iv, start, extent, carried, body: block(body), unroll })
+            Stmt::Loop(Loop { iv, start, extent, carried, body, unroll, trip }) => {
+                Stmt::Loop(Loop { iv, start, extent, carried, body: block(body), unroll, trip })
             }
             Stmt::Pipeline(p) => return Err(p),
             Stmt::Warps { body } => Stmt::Warps { body: block(body) },
             Stmt::If { pred, then, otherwise, results } => {
                 Stmt::If { pred, then: block(then), otherwise: block(otherwise), results }
             }
-            Stmt::Sync(sync) => Stmt::Sync(sync),
+            Stmt::Sync(sync) => Stmt::Sync(Q::Sync::from(sync)),
         })
     }
 }

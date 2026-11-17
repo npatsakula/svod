@@ -145,3 +145,32 @@ fn event_write_partial_flush_shape() {
     assert_eq!(pkt[0], packet3(PACKET3_EVENT_WRITE, 0));
     assert_eq!(pkt[1], CS_PARTIAL_FLUSH | (EVENT_INDEX_PARTIAL_FLUSH << 8));
 }
+
+#[test]
+fn wait_reg_mem_reg_polls_a_register_for_equality() {
+    let pkt = wait_reg_mem_reg(0xD9F4, 0, 1 << 25);
+    assert_eq!(pkt[0], packet3(PACKET3_WAIT_REG_MEM, 5));
+    // mem_space=0 (register), operation=0 (wait only), function=3 (==), engine=ME.
+    assert_eq!(pkt[1], 3);
+    assert_eq!(&pkt[2..], &[0xD9F4, 0, 0, 1 << 25, 4]);
+    // The memory form differs only in mem_space and function.
+    assert_eq!(wait_reg_mem(0x1000, 0, 1)[1], (1 << 4) | 5);
+}
+
+#[test_case::test_case(THREAD_TRACE_MARKER, 0, 53; "marker")]
+#[test_case::test_case(THREAD_TRACE_FINISH, 0, 55; "finish")]
+#[test_case::test_case(CS_PARTIAL_FLUSH, EVENT_INDEX_PARTIAL_FLUSH, 7 | (4 << 8); "cs partial flush")]
+fn event_write_encodes_type_and_index(event: u32, index: u32, dw1: u32) {
+    assert_eq!(event_write(event, index), [packet3(PACKET3_EVENT_WRITE, 0), dw1]);
+}
+
+#[test]
+fn copy_data_confirmed_adds_only_the_write_confirm_bit() {
+    let dst = 0x0000_1234_5678_9ABC;
+    let plain = copy_data_reg_to_mem(0xD9EF, dst);
+    let confirmed = copy_data_reg_to_mem_confirmed(0xD9EF, dst);
+    assert_eq!(plain[1], (2 << 8) | 4, "src_sel=perf, dst_sel=tc_l2");
+    assert_eq!(confirmed[1], (1 << 20) | (2 << 8) | 4);
+    assert_eq!((plain[0], &plain[2..]), (confirmed[0], &confirmed[2..]));
+    assert_eq!(&plain[2..], &[0xD9EF, 0, 0x5678_9ABC, 0x1234]);
+}

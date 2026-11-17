@@ -46,6 +46,23 @@ fn main() {
         .expect("bindgen kfd_ioctl.h");
     kfd.write_to_file(out_dir.join("kfd_sys.rs")).expect("write kfd_sys.rs");
 
+    // amdgpu DRM UAPI: only the context ioctl, which pins a stable power state
+    // for the SQTT profiler. Layout tests guard the in/out union.
+    println!("cargo:rerun-if-changed=include/drm/amdgpu_drm.h");
+    let drm = bindgen::Builder::default()
+        .header(include.join("drm/amdgpu_drm.h").to_string_lossy().into_owned())
+        .clang_arg(&inc_arg)
+        .allowlist_type("drm_amdgpu_ctx.*")
+        .allowlist_var("AMDGPU_CTX_.*")
+        .allowlist_var("DRM_AMDGPU_CTX")
+        .allowlist_var("DRM_COMMAND_BASE")
+        .allowlist_var("DRM_IOCTL_BASE")
+        .derive_default(true)
+        .generate_comments(false)
+        .generate()
+        .expect("bindgen amdgpu_drm.h");
+    drm.write_to_file(out_dir.join("amdgpu_drm_sys.rs")).expect("write amdgpu_drm_sys.rs");
+
     // HSA / AQL ABI. Tight allowlist over the vendored ROCm headers: the
     // four structs the AQL path lays into GART / the ring, plus the bit
     // enums that drive packet headers and queue/kernel-code properties.

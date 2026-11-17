@@ -15,43 +15,57 @@ fn i32s(buffer: &Buffer) -> Vec<i32> {
     buffer.as_slice::<i32>().unwrap().to_vec()
 }
 
-#[test]
-fn copy_from_fill_and_copy_at_store_in_place() {
-    let mut buf = buffer(DType::Int32, 4);
-    buf.host_write::<i32>().unwrap().copy_from(&[1, 2, 3, 4]).unwrap();
-    assert_eq!(i32s(&buf), [1, 2, 3, 4]);
-    buf.host_write::<i32>().unwrap().copy_at(1, &[20, 30]).unwrap();
-    assert_eq!(i32s(&buf), [1, 20, 30, 4]);
+/// `copy_at(offset, src)` splices `src` in when it ends within the buffer and
+/// `copy_from(src)` replaces everything when it is exactly as long; either
+/// fails with a size mismatch and stores nothing otherwise. `fill` sets every
+/// element.
+fn copies_match_a_host_splice(init: &[i32], offset: usize, src: &[i32]) {
+    let len = init.len();
+    let mut buf = buffer(DType::Int32, len);
+    buf.host_write::<i32>().unwrap().copy_from(init).unwrap();
+    let mut expected = init.to_vec();
+    assert_eq!(i32s(&buf), expected);
+
+    let result = buf.host_write::<i32>().unwrap().copy_at(offset, src);
+    match offset.checked_add(src.len()).filter(|&end| end <= len) {
+        Some(end) => {
+            result.unwrap();
+            expected[offset..end].copy_from_slice(src);
+        }
+        None => assert!(
+            matches!(result, Err(Error::SizeMismatch { expected, actual })
+                if expected == len && actual == offset.saturating_add(src.len())),
+            "{result:?}"
+        ),
+    }
+    assert_eq!(i32s(&buf), expected, "copy_at({offset}, {src:?})");
+
+    let result = buf.host_write::<i32>().unwrap().copy_from(src);
+    if src.len() == len {
+        result.unwrap();
+        expected = src.to_vec();
+    } else {
+        assert!(
+            matches!(result, Err(Error::SizeMismatch { expected, actual }) if expected == len && actual == src.len()),
+            "{result:?}"
+        );
+    }
+    assert_eq!(i32s(&buf), expected, "copy_from({src:?})");
+
     buf.host_write::<i32>().unwrap().fill(9);
-    assert_eq!(i32s(&buf), [9; 4]);
+    assert_eq!(i32s(&buf), vec![9; len]);
 }
 
-#[test_case(3; "short")]
-#[test_case(5; "long")]
-#[test_case(0; "empty")]
-fn copy_from_needs_the_exact_length(len: usize) {
-    let mut buf = buffer(DType::Int32, 4);
-    let err = buf.host_write::<i32>().unwrap().copy_from(&vec![1; len]).unwrap_err();
-    assert!(matches!(err, Error::SizeMismatch { expected: 4, actual } if actual == len), "{err}");
-    assert_eq!(i32s(&buf), [0; 4], "nothing is stored");
-}
-
+#[test_case(1, 2; "inside")]
+#[test_case(2, 2; "ending at the end")]
+#[test_case(4, 0; "empty at the end")]
+#[test_case(0, 3; "short")]
 #[test_case(0, 5; "too long")]
+#[test_case(0, 0; "empty")]
 #[test_case(3, 2; "past the end")]
 #[test_case(usize::MAX, 1; "overflowing offset")]
-fn copy_at_stays_in_bounds(offset: usize, len: usize) {
-    let mut buf = buffer(DType::Int32, 4);
-    let err = buf.host_write::<i32>().unwrap().copy_at(offset, &vec![1; len]).unwrap_err();
-    assert!(matches!(err, Error::SizeMismatch { expected: 4, .. }), "{err}");
-    assert_eq!(i32s(&buf), [0; 4]);
-}
-
-#[test]
-fn copy_at_may_end_at_the_end() {
-    let mut buf = buffer(DType::Int32, 4);
-    buf.host_write::<i32>().unwrap().copy_at(4, &[]).unwrap();
-    buf.host_write::<i32>().unwrap().copy_at(2, &[7, 8]).unwrap();
-    assert_eq!(i32s(&buf), [0, 0, 7, 8]);
+fn copies_at_the_boundaries(offset: usize, len: usize) {
+    copies_match_a_host_splice(&[1, 2, 3, 4], offset, &(10..).take(len).collect::<Vec<_>>());
 }
 
 #[test]
@@ -135,6 +149,15 @@ fn a_failed_acquire_leaves_the_storage_free() {
 }
 
 proptest! {
+    #[test]
+    fn copies_match_a_host_splice_anywhere(
+        init in prop::collection::vec(any::<i32>(), 1..8),
+        offset in prop_oneof![9 => 0usize..10, 1 => Just(usize::MAX)],
+        src in prop::collection::vec(any::<i32>(), 0..10),
+    ) {
+        copies_match_a_host_splice(&init, offset, &src);
+    }
+
     /// `rows` stores exactly what a scatter into a host vector would, or
     /// nothing at all when any row is out of bounds.
     #[test]

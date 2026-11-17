@@ -28,6 +28,7 @@ use crate::amd::queue::AmdComputeQueue;
 use crate::amd::signal::{AmdSignal, TIMELINE_WRAP_WATERMARK, Timeline};
 use crate::error::{Error, Result};
 use crate::sync::TimelineSignal;
+use snafu::ResultExt;
 
 /// One hardware compute lane, retained by [`QueuePool`] and published through
 /// only by its current [`QueueLease`].
@@ -720,6 +721,14 @@ impl Drop for PoolQueue {
     }
 }
 
+/// An armed thread trace and, when its config asked the DRM context to pin
+/// one, the stable power state it holds until disarmed.
+struct ArmedSqtt {
+    config: crate::profile::SqttConfig,
+    arch: crate::amd::sqtt::SqttArch,
+    pstate: Option<crate::amd::sqtt::PstateHold>,
+}
+
 /// Logical per-plan context. Queue ownership is acquired separately through a
 /// non-clone [`QueueLease`]. Direct fallback retains one lease as its replay
 /// session so per-kernel trait calls preserve FIFO ordering.
@@ -731,6 +740,7 @@ pub(crate) struct OwnerCtx {
     newest: Mutex<Option<Arc<SubmissionFinalizer>>>,
     /// PMC: hardware counters to collect on profiling dispatches (empty = off).
     pmc: Mutex<Vec<crate::profile::AmdCounter>>,
+    sqtt: Mutex<Option<ArmedSqtt>>,
     linked_plan: Mutex<Option<crate::amd::linked_plan::AmdLinkedPlan>>,
 }
 
@@ -742,6 +752,7 @@ impl OwnerCtx {
             session: Mutex::new(None),
             newest: Mutex::new(None),
             pmc: Mutex::new(Vec::new()),
+            sqtt: Mutex::new(None),
             linked_plan: Mutex::new(None),
         }
     }
@@ -749,6 +760,11 @@ impl OwnerCtx {
     /// Hardware counters to collect on this owner's profiling dispatches.
     pub fn pmc_counters(&self) -> Vec<crate::profile::AmdCounter> {
         self.pmc.lock().clone()
+    }
+
+    /// The thread trace armed for this owner's profiling dispatches, and the target it was armed for.
+    pub fn armed_sqtt(&self) -> Option<(crate::profile::SqttConfig, crate::amd::sqtt::SqttArch)> {
+        self.sqtt.lock().as_ref().map(|armed| (armed.config, armed.arch))
     }
 
     #[inline]
@@ -922,24 +938,59 @@ impl crate::device::PlanContext for OwnerCtx {
         Ok(crate::device::NativeReplayOutcome::Executed)
     }
 
-    fn set_pmc(&self, counters: &[crate::profile::PmcCounter]) -> usize {
+    /// AMD counters on a target or queue without counter streams are refused
+    /// and leave nothing armed.
+    fn set_pmc(&self, counters: &[crate::profile::PmcCounter]) -> Result<usize> {
         let mut armed = self.pmc.lock();
-        *armed = counters
+        armed.clear();
+        let amd: Vec<_> = counters
             .iter()
             .filter_map(|c| match c {
                 crate::profile::PmcCounter::Amd(c) => Some(*c),
                 _ => None,
             })
             .collect();
-        armed.len()
+        if !amd.is_empty() {
+            crate::amd::pmc::check_target(self.core.arch, self.core.pm4_queues())?;
+        }
+        *armed = amd;
+        Ok(armed.len())
     }
 
     fn pmc_available(&self) -> bool {
-        crate::amd::pmc::stable_pstate()
+        crate::amd::pmc::stable_pstate(self.core.node.drm_render_minor)
     }
 
     fn pmc_default(&self) -> Vec<crate::profile::PmcCounter> {
         crate::profile::AmdCounter::all().into_iter().map(crate::profile::PmcCounter::Amd).collect()
+    }
+
+    /// Arming checks the target and queue kind, then, where the config asks
+    /// for one, pins a stable power state through a DRM context held while
+    /// armed; a device already pinned in sysfs (`profile_standard`) needs none
+    /// for `Standard`. A held pin carries over a re-arm at the same state.
+    fn set_sqtt(&self, config: Option<crate::profile::SqttConfig>) -> Result<()> {
+        let mut armed = self.sqtt.lock();
+        let Some(config) = config else {
+            *armed = None;
+            return Ok(());
+        };
+        let arch = crate::amd::sqtt::check_target(self.core.arch, self.core.pm4_queues())?;
+        // A pin at another state is released before the new one is taken: the
+        // kernel refuses a second level while one context holds the device.
+        let held = armed.take().filter(|armed| armed.config.pstate == config.pstate).and_then(|armed| armed.pstate);
+        let pinned = || crate::amd::pmc::stable_pstate(self.core.node.drm_render_minor);
+        let pstate = match (config.pstate, held) {
+            (None, _) => None,
+            (Some(_), Some(held)) => Some(held),
+            (Some(mode), None) => match self.core.iface().hold_stable_pstate(mode) {
+                Ok(held) => Some(held),
+                Err(_) if mode == crate::profile::StablePstate::Standard && pinned() => None,
+                Err(error) => return Err(error).context(crate::error::SqttPowerStateSnafu),
+            },
+        };
+        *armed = Some(ArmedSqtt { config, arch, pstate });
+        Ok(())
     }
 
     fn synchronize(&self) -> Result<()> {

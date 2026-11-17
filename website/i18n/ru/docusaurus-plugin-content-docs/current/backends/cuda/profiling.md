@@ -121,11 +121,11 @@ SVOD_PMC: 2 of 5 requested counters are not collected on this backend
 SVOD_DEVICE=CUDA:0 SVOD_PMC=1 cargo run --release -p svod-model --example gigaam_infer -- --profile ./audio.wav
 ```
 
-Замеры пропускной способности tk измеряют только ручные ядра. Они читают временные метки
-событий, а не счётчики:
+Пример `tk_bench` замеряет только ручные ядра. Он читает временные метки
+событий, а не счётчики ([Тюнинг](../../tile-kernels/tuning.md#benchmarks)):
 
 ```bash
-SVOD_DEVICE=CUDA:0 cargo test -p svod-tk --release --lib gemm_throughput_probe -- --ignored --nocapture
+SVOD_DEVICE=CUDA:0 cargo run --release -p svod-tk --example tk_bench -- gemm
 ```
 
 ### Привилегии

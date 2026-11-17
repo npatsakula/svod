@@ -481,6 +481,13 @@ fn extract_ranges_from_uops(begins_uop: &Arc<UOp>, ends_uop: &Arc<UOp>) -> Optio
     Some(begins.into_iter().zip(ends).collect())
 }
 
+/// A SHRINK's `(offset, size)` per axis; `None` for any other op or a
+/// range not held as a shape argument.
+pub fn shrink_ranges(uop: &UOp) -> Option<Vec<(SInt, SInt)>> {
+    let Op::Shrink(ops::Shrink { offsets, sizes, .. }) = uop.op() else { return None };
+    extract_ranges_from_uops(offsets, sizes)
+}
+
 /// Convert a Shape to Tinygrad's scalar/STACK shape argument encoding.
 ///
 /// This creates a UOp that encodes the shape dimensions, suitable for

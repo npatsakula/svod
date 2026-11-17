@@ -57,6 +57,7 @@ const sidebars: SidebarsConfig = {
         'tile-kernels/kernel-library',
         'tile-kernels/op-layer',
         'tile-kernels/tuning',
+        'tile-kernels/profiling',
         'tile-kernels/testing-and-debugging',
         'tile-kernels/portability',
       ],

@@ -1,0 +1,1287 @@
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use proptest::prelude::*;
+use svod_device::profile::{CodeImage, SeTrace, SqttTrace};
+use svod_device::sqtt::asm::Counter;
+use svod_device::sqtt::hidden::Hiding;
+use svod_device::sqtt::stitch::objdump_lines;
+use svod_dtype::AmdArch;
+use test_case::test_case;
+
+use svod_device::amd::occupancy::Limiter;
+
+use super::compare::align;
+use super::partition::Buckets;
+use super::statements::rollup;
+use super::verdict::load_bytes;
+use super::{
+    Analysis, Approx, Axis, Bucket, Capture, Caution, Charge, Class, Delta, Diff, Evidence, Finding, FindingKind, Knob,
+    LineRow, Lines, LoopRow, Part, Partition, PerTrip, Pstate, Reduction, Spread, Statement, Statements, Stmt, Unit,
+    WaitOn, insts, locate,
+};
+
+fn fixtures() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../device/src/test/fixtures/sqtt")
+}
+
+fn arch(disassembly: &str) -> AmdArch {
+    let target = disassembly.lines().find_map(|l| l.trim().strip_prefix(".amdgcn_target \"")).unwrap();
+    AmdArch::parse(target.trim_end_matches('"').rsplit('-').next().unwrap()).unwrap()
+}
+
+/// A device fixture as a [`Capture`]: AMD's `amd/<name>` (one SE) or tinygrad's `<arch>/<name>`.
+fn capture(fixture: &str) -> Capture {
+    let dir = fixtures().join(fixture);
+    let read = |name: &str| std::fs::read(dir.join(name)).unwrap();
+    let text = |name: &str| String::from_utf8(read(name)).unwrap();
+    let (elf, disassembly, load_base, per_se) = if fixture.starts_with("amd/") {
+        let base = u64::from_str_radix(text("base.txt").trim().trim_start_matches("0x"), 16).unwrap();
+        let se = SeTrace { se: 0, itrace: true, bytes: read("se0.att"), truncated: false };
+        (read("code_object.out"), text("code_object.s"), base, vec![se])
+    } else {
+        let golden: serde_json::Value = serde_json::from_slice(&read("golden.json")).unwrap();
+        let ses = golden["events"].as_array().unwrap().iter().map(|e| SeTrace {
+            se: e["se"].as_u64().unwrap() as u32,
+            itrace: e["itrace"].as_bool().unwrap(),
+            bytes: read(&format!("trace{}.bin", e["index"])),
+            truncated: false,
+        });
+        (read("kernel.co"), text("kernel.s"), golden["base"].as_u64().unwrap(), ses.collect())
+    };
+    let code = Arc::new(CodeImage { elf: elf.into(), load_base, entry_pc: 0 });
+    let trace = SqttTrace { arch: arch(&disassembly), per_se, code, mclk_mhz: None };
+    Capture {
+        trace,
+        disassembly,
+        kernel_ns: None,
+        traced_ns: None,
+        labels: BTreeMap::from([("fixture".into(), fixture.into())]),
+        model: None,
+        resources: None,
+        workgroup: None,
+        grid: None,
+        pstate: None,
+        statements: None,
+    }
+}
+
+/// The fixture saved and loaded back, as an agent replays it.
+fn replayed(fixture: &str) -> Analysis {
+    let dir = tempfile::tempdir().unwrap();
+    capture(fixture).save(dir.path()).unwrap();
+    Analysis::load(dir.path()).unwrap()
+}
+
+/// Every bucket's exposed cycles within its raw ones.
+fn exposed_within(p: &Partition) -> bool {
+    p.buckets.values().all(|c| (0..=c[0]).contains(&c[1]))
+}
+
+#[test_case("amd/navi4_setpc")]
+#[test_case("amd/navi4_sdata")]
+#[test_case("amd/navi4_fifo")]
+#[test_case("amd/navi4_barriernop")]
+#[test_case("amd/strix_barrier")]
+#[test_case("gfx1100/gemm")]
+#[test_case("gfx1100/plus")]
+#[test_case("gfx1200/gemm")]
+#[test_case("gfx1200/plus")]
+fn summarizes(fixture: &str) {
+    let a = replayed(fixture);
+    assert_eq!(a, capture(fixture).analyze().unwrap(), "save and load keep the analysis");
+    assert!(a.waves > 0 && a.stitched == a.records && a.records > 0, "{fixture}: {} of {}", a.stitched, a.records);
+    let sum = |f: fn(&super::Row) -> i64| a.pcs.iter().map(f).sum::<i64>();
+    assert_eq!(a.classes.iter().map(|c| c.latency).sum::<i64>(), sum(|r| r.latency));
+    assert_eq!(a.classes.iter().map(|c| c.stall).sum::<i64>(), sum(|r| r.stall));
+    assert_eq!(a.classes.iter().map(|c| c.hits).sum::<u64>(), a.pcs.iter().map(|r| r.hits).sum::<u64>());
+    assert!(a.pcs.iter().all(|r| r.hits > 0 && !r.asm.is_empty() && r.stall <= r.latency), "{fixture}");
+    assert!(a.ses.iter().any(|s| s.itrace && s.span > 0 && s.occupancy_peak > 0));
+    let span = a.ses.iter().filter(|s| s.itrace).map(|s| s.span).max().unwrap() as u64;
+    let timed = Capture { kernel_ns: Some(span), ..capture(fixture) }.analyze().unwrap();
+    assert_eq!((a.sclk_mhz, timed.sclk_mhz), (None, Some(1000)), "a cycle a ns is 1 GHz");
+    assert!(a.lifetime.is_some_and(|l| l.min > 0 && l.min <= l.median && l.median <= l.max));
+    assert_ne!(a.kernel, "?");
+    let json = a.to_json();
+    assert!(!json.contains('\n'));
+    assert_eq!(serde_json::from_str::<Analysis>(&json).unwrap(), a);
+    assert!(!a.text(5).contains("!!"), "{fixture}: no warning");
+    assert!(a.summary().starts_with(&a.kernel));
+    assert_eq!(a.waits.waves + a.waits.skipped, a.waves);
+    assert_eq!(
+        a.traced.iter().map(|t| (t.waves, t.complete)).fold((0, 0), |s, t| (s.0 + t.0, s.1 + t.1)),
+        (a.waves, a.complete)
+    );
+    if let Some(l) = &a.main_loop {
+        let p = &l.partition;
+        assert!(exposed_within(p), "{fixture}: exposed within raw");
+        assert!(
+            p.buckets.contains_key(&Bucket::Barrier)
+                && p.buckets.iter().all(|(&b, c)| b == Bucket::Barrier || c[0] > 0)
+        );
+        let mut sum = Partition::default();
+        l.ses.iter().for_each(|s| sum.add(&s.partition));
+        assert_eq!(&sum, p, "the SEs' partitions add up");
+        let edges = a.pcs.iter().find(|r| r.pc == l.back_edge).unwrap().hits;
+        assert_eq!((l.trips.total, l.trips.per_iteration), (edges, 1), "no statements: per iteration");
+        assert!(a.verdict.findings.iter().all(|f| f.approx.contains(&Approx::PerIteration)), "{:?}", a.verdict);
+    }
+}
+
+/// The waits report ELF PCs, as the rest of the analysis: v3's select pulls the ring fill's first wait
+/// up to 0x74c, on the oldest of its six loads, waited within the trip that issued it.
+#[test]
+fn waits_report_elf_pcs() {
+    let a = Analysis::load(&fixtures().join("svod/rdna4_gemm_v3")).unwrap();
+    let site = a.waits.sites.iter().find(|s| s.pc == 0x74c).unwrap();
+    assert_eq!(site.bindings, [(0x6fc, site.instances)]);
+    let load = a.waits.bindings.iter().find(|b| b.pc == 0x6fc).unwrap();
+    assert_eq!(load.distance, [(0, load.count)]);
+    let row = |pc: u64| a.pcs.iter().find(|r| r.pc == pc).unwrap();
+    assert_eq!((row(0x74c).class, row(0x6fc).class), (Class::WaitVmem, Class::VmemLoad));
+    assert!(a.text(4).lines().any(|l| l.trim_start().starts_with("0xa64") && l.ends_with("global_load_b128 v[144:147], v[232:233], off")));
+}
+
+/// An empty kernel's waves issue only `s_endpgm`, which sends no token.
+#[test_case("gfx1100/empty")]
+#[test_case("gfx1200/empty")]
+fn empty_kernel_has_no_records(fixture: &str) {
+    let a = replayed(fixture);
+    assert!(a.waves > 0 && a.records == 0 && a.pcs.is_empty() && a.classes.is_empty() && a.main_loop.is_none());
+}
+
+/// tinygrad's GEMM unrolls its reduction: no backward branch, so no main loop.
+#[test_case("gfx1100/gemm")]
+#[test_case("gfx1200/gemm")]
+fn unrolled_has_no_main_loop(fixture: &str) {
+    let a = replayed(fixture);
+    assert_eq!(a.main_loop, None);
+    assert_eq!(a.cycles(&[Class::Matrix]).0, 0, "tinygrad's examples run no matrix op");
+}
+
+/// `vectorops` loops back from `s_cbranch_scc0` at 0x2590 to 0x1afc; no matrix op, so the hottest loop.
+#[test]
+fn finds_the_main_loop() {
+    let a = replayed("amd/navi4_sdata");
+    let l = a.main_loop.clone().unwrap();
+    assert_eq!((l.head, l.back_edge, l.matrix), (0x1afc, 0x2590, false));
+    let (trips, cycles) = (l.iterations.unwrap(), l.cycles.unwrap());
+    assert!(trips.min > 1, "{trips:?}");
+    let edge_hits = a.pcs.iter().find(|r| r.pc == l.back_edge).unwrap().hits as usize;
+    assert_eq!(cycles.n, edge_hits - trips.n, "one gap fewer than back edges a wave");
+    assert!(cycles.min > 0 && cycles.p90 <= cycles.max);
+    assert!(a.loop_rows().all(|r| (l.head..=l.back_edge).contains(&r.pc)) && a.loop_rows().count() > 1);
+}
+
+/// The text an agent reads, fixed: `SVOD_SQTT_BLESS=1` rewrites the expected file after a deliberate change.
+#[test_case("amd/navi4_sdata", "sqtt_navi4_sdata.txt")]
+#[test_case("svod/rdna4_gemm_v1", "sqtt_rdna4_gemm_v1.txt")]
+fn text_is_stable(fixture: &str, golden: &str) {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/test/fixtures").join(golden);
+    let text = match fixture.strip_prefix("svod/") {
+        Some(name) => Analysis::load(&fixtures().join("svod").join(name)).unwrap().text(8),
+        None => replayed(fixture).text(8),
+    };
+    if std::env::var_os("SVOD_SQTT_BLESS").is_some() {
+        std::fs::write(&path, &text).unwrap();
+    }
+    assert_eq!(text, std::fs::read_to_string(&path).unwrap());
+}
+
+/// Tier 5 renders one paragraph a traced kernel under the stage's report.
+#[test]
+fn profile_report_lists_traces() {
+    let analysis = replayed("amd/navi4_sdata");
+    let summary = analysis.summary();
+    let ok = crate::Traced {
+        index: 0,
+        kernel: "_Z9vectoropsv".into(),
+        analysis: Ok(analysis),
+        raw: crate::Raw::Saved("sqtt/000__Z9vectoropsv".into()),
+    };
+    let failed = crate::Traced {
+        index: 1,
+        kernel: "k".into(),
+        analysis: Err(super::Error::NoItrace),
+        raw: crate::Raw::Saved("sqtt/001_k".into()),
+    };
+    let mut stage = crate::StageProfile::host("profile", std::time::Duration::ZERO);
+    stage.sqtt = vec![ok, failed];
+    let report = crate::RunProfile { stages: vec![stage], origin_depth: None }.render_report();
+    let lines: Vec<&str> = report.lines().collect();
+    assert!(lines[1].starts_with("thread traces (SQTT"), "{report}");
+    assert_eq!(lines[2], format!("  #0 sqtt/000__Z9vectoropsv: {summary}"), "{report}");
+    assert!(lines[3].starts_with("  #1 k: no instruction-traced shader engine"), "{report}");
+}
+
+#[test]
+fn flags_truncation() {
+    let mut c = capture("amd/strix_barrier");
+    c.trace.per_se[0].truncated = true;
+    let a = c.analyze().unwrap();
+    assert!(a.text(3).lines().nth(1).unwrap().starts_with("!! TRUNCATED se0"));
+    assert!(a.summary().ends_with("TRUNCATED."));
+    let mut c = Capture::load(&fixtures().join("svod/rdna4_gemm_v1")).unwrap();
+    let flagged = |c: &Capture| {
+        let v = c.analyze().unwrap().verdict;
+        let all: Vec<bool> = v.bound.iter().chain(&v.findings).map(|f| f.approx.contains(&Approx::Truncated)).collect();
+        assert!(!all.is_empty());
+        all
+    };
+    assert!(flagged(&c).iter().all(|&f| !f));
+    c.trace.per_se[1].truncated = true;
+    assert!(flagged(&c).iter().all(|&f| f), "every finding undercounts");
+}
+
+/// A stream the trace window cut partway, as a full buffer leaves it: every finding is flagged, and
+/// the totals undercount the whole capture's by what the cut SE lost.
+#[test]
+fn a_cut_stream_undercounts() {
+    let full = Capture::load(&fixtures().join("svod/rdna4_gemm_v1")).unwrap();
+    let mut cut = full.clone();
+    let se = &mut cut.trace.per_se[0];
+    se.bytes.truncate(se.bytes.len() / 2);
+    se.truncated = true;
+    let (full, cut) = (full.analyze().unwrap(), cut.analyze().unwrap());
+    let all = cut.verdict.bound.iter().chain(&cut.verdict.findings);
+    assert!(all.clone().count() > 0 && all.clone().all(|f| f.approx.contains(&Approx::Truncated)), "{:?}", cut.verdict);
+    assert!(cut.ses[0].truncated && !cut.ses[1].truncated);
+    assert_eq!(cut.ses[1], full.ses[1], "the other SE as it was");
+    // SE1 holds about half of each total: SE0's cut half keeps some.
+    assert!(
+        full.records / 2 < cut.records && cut.records < full.records,
+        "{} of {} records",
+        cut.records,
+        full.records
+    );
+    assert!(cut.complete < full.complete, "SE0's waves lose their ends: {} of {}", cut.complete, full.complete);
+    let trips = |a: &Analysis| a.main_loop.as_ref().unwrap().trips.total;
+    assert!(trips(&full) / 2 < trips(&cut) && trips(&cut) < trips(&full), "{} of {} trips", trips(&cut), trips(&full));
+}
+
+/// `version` in place of the HEADER a stream opens with, its version in bits 7..=12.
+fn foreign(bytes: &mut [u8], version: u16) {
+    let word = u16::from_le_bytes([bytes[0], bytes[1]]);
+    assert_eq!(word & 0x7f, 0b0010001, "the stream opens with its header");
+    bytes[..2].copy_from_slice(&(word & !(0x3f << 7) | version << 7).to_le_bytes());
+}
+
+/// A foreign header on an instruction-traced SE: named on the SE and in the text while another SE
+/// decodes, the error where none does.
+#[test]
+fn names_a_foreign_header() {
+    let mut c = Capture::load(&fixtures().join("svod/rdna4_gemm_v1")).unwrap();
+    foreign(&mut c.trace.per_se[1].bytes, 2);
+    let a = c.analyze().unwrap();
+    assert_eq!(a.ses.iter().map(|s| s.refused).collect::<Vec<_>>(), [None, Some(2), None, None]);
+    assert_eq!(a.traced.iter().map(|t| t.se).collect::<Vec<_>>(), [0]);
+    assert!(a.text(3).contains("!! UNSUPPORTED se1: a header of version 2;"), "{}", a.text(3));
+    let mut c = capture("amd/strix_barrier");
+    foreign(&mut c.trace.per_se[0].bytes, 5);
+    assert!(matches!(c.analyze(), Err(super::Error::Header { se: 0, version: 5 })));
+}
+
+/// A `meta.json` of another format, or of none, is refused before its fields are read.
+#[test_case(Some(0))]
+#[test_case(Some(1))]
+#[test_case(Some(crate::sqtt::FORMAT + 1))]
+#[test_case(None)]
+fn refuses_another_format(format: Option<u32>) {
+    let dir = tempfile::tempdir().unwrap();
+    capture("amd/strix_barrier").save(dir.path()).unwrap();
+    let path = dir.path().join("meta.json");
+    let mut meta: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    meta["format"] = format.into();
+    meta.as_object_mut().unwrap().remove("arch");
+    std::fs::write(&path, meta.to_string()).unwrap();
+    let refused = Capture::load(dir.path());
+    assert!(matches!(&refused, Err(super::Error::Format { found, .. }) if *found == format), "{refused:?}");
+}
+
+/// A directory without `meta.json`, or with one that is no JSON, is refused naming the file.
+#[test_case(None ; "missing")]
+#[test_case(Some("{\"format\": 1,") ; "malformed")]
+fn refuses_a_missing_or_malformed_meta(meta: Option<&str>) {
+    let dir = tempfile::tempdir().unwrap();
+    capture("amd/strix_barrier").save(dir.path()).unwrap();
+    let path = dir.path().join("meta.json");
+    match meta {
+        Some(text) => std::fs::write(&path, text).unwrap(),
+        None => std::fs::remove_file(&path).unwrap(),
+    }
+    match Capture::load(dir.path()) {
+        Err(super::Error::Io { path: at, .. }) if meta.is_none() => assert_eq!(at, path),
+        Err(super::Error::Json { path: at, .. }) if meta.is_some() => assert_eq!(at, path),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn refuses_a_trace_without_itrace() {
+    let mut c = capture("amd/strix_barrier");
+    c.trace.per_se[0].itrace = false;
+    assert!(matches!(c.analyze(), Err(super::Error::NoItrace)));
+}
+
+/// A loaded directory without `kernel.s` disassembles to the fixture's text with `llvm-objdump`.
+#[test]
+fn disassembles_without_kernel_s() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = capture("gfx1200/gemm");
+    c.save(dir.path()).unwrap();
+    std::fs::remove_file(dir.path().join("kernel.s")).unwrap();
+    let loaded = Capture::load(dir.path()).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(objdump_lines(&loaded.disassembly), objdump_lines(&c.disassembly));
+}
+
+/// One line for each arm of `From<Kind>`.
+#[test_case("v_wmma_f32_16x16x16_bf16 v[0:7], v[8:15], v[16:23], v[0:7]", Class::Matrix)]
+#[test_case("v_add_f32_e32 v0, v1, v2", Class::Valu)]
+#[test_case("s_mov_b32 s0, 0", Class::Salu)]
+#[test_case("s_cbranch_scc1 65530 // 0000000017B8: BFA2FFFA", Class::Branch)]
+#[test_case("ds_load_b128 v[0:3], v4 offset:16", Class::Lds)]
+#[test_case("s_load_b128 s[4:7], s[0:1], null", Class::Smem)]
+#[test_case("global_load_b128 v[0:3], v4, s[0:1]", Class::VmemLoad)]
+#[test_case("global_atomic_add_u32 v0, v1, v2, s[0:1] glc", Class::VmemStore)]
+#[test_case("s_wait_idle", Class::Immediate ; "idle wait")]
+#[test_case("s_waitcnt vmcnt(0) lgkmcnt(0)", Class::WaitVmem)]
+#[test_case("s_wait_dscnt 0x0", Class::WaitLgkm)]
+#[test_case("s_wait_expcnt 0x0", Class::Immediate ; "export wait")]
+#[test_case("s_barrier_wait 0xffff", Class::Barrier)]
+#[test_case("s_sendmsg sendmsg(MSG_DEALLOC_VGPRS)", Class::Message)]
+#[test_case("s_delay_alu instid0(VALU_DEP_1)", Class::Immediate ; "no token")]
+#[test_case("", Class::Other)]
+fn classifies(asm: &str, class: Class) {
+    assert_eq!(Class::of(asm), class);
+}
+
+proptest! {
+    #[test]
+    fn spread_is_ordered(samples in prop::collection::vec(any::<i32>(), 0..64)) {
+        let samples: Vec<i64> = samples.into_iter().map(i64::from).collect();
+        match Spread::of(samples.clone()) {
+            None => prop_assert!(samples.is_empty()),
+            Some(s) => {
+                prop_assert_eq!(s.n, samples.len());
+                prop_assert!(s.min <= s.median && s.median <= s.p90 && s.p90 <= s.max);
+                prop_assert_eq!((s.min, s.max), (*samples.iter().min().unwrap(), *samples.iter().max().unwrap()));
+            }
+        }
+    }
+
+    /// Any bytes after a real header analyze without panicking, and the class totals still add up.
+    #[test]
+    fn garbage_streams_keep_the_invariants(tail in prop::collection::vec(any::<u8>(), 0..2048)) {
+        let mut c = capture("gfx1200/gemm");
+        for se in &mut c.trace.per_se {
+            se.bytes.truncate(64);
+            se.bytes.extend_from_slice(&tail);
+        }
+        if let Ok(a) = c.analyze() {
+            let total: i64 = a.pcs.iter().map(|r| r.latency).sum();
+            prop_assert_eq!(a.classes.iter().map(|c| c.latency).sum::<i64>(), total);
+            prop_assert!(a.stitched <= a.records);
+            let _ = a.text(5);
+        }
+    }
+}
+
+/// One of svod's own captures with what a capture now records beside the trace: its kernel's
+/// resources (read off `kernel.co`), the 8-wave workgroup of its `[4, 2]` warps and its grid.
+fn svod_capture(name: &str, grid: [u32; 3]) -> Capture {
+    let mut capture = Capture::load(&fixtures().join("svod").join(name)).unwrap();
+    assert_eq!((capture.resources, capture.workgroup, capture.grid), (None, None, None), "older captures load");
+    assert_eq!(capture.trace.mclk_mhz, None);
+    let elf = &capture.trace.code.elf;
+    capture.resources = Some(svod_device::amd::program::kernel_resources(elf, "gemm", capture.trace.arch).unwrap());
+    (capture.workgroup, capture.grid) = (Some([256, 1, 1]), Some(grid));
+    capture
+}
+
+#[test]
+fn capture_keeps_resources_launch_and_mclk() {
+    let mut capture = svod_capture("rdna4_gemm_v1", [10, 6, 1]);
+    capture.trace.mclk_mhz = Some(1800);
+    let dir = tempfile::tempdir().unwrap();
+    capture.save(dir.path()).unwrap();
+    let back = Capture::load(dir.path()).unwrap();
+    assert_eq!((back.resources, back.workgroup, back.grid), (capture.resources, capture.workgroup, capture.grid));
+    assert!(back.model.is_some() && back.model == capture.model);
+    assert_eq!(back.trace.mclk_mhz, Some(1800));
+    let a = back.analyze().unwrap();
+    assert_eq!(a, capture.analyze().unwrap());
+    assert!(a.text(1).lines().any(|l| l.starts_with("kernel ") && l.contains("MHz, mclk 1800 MHz, pstate")));
+}
+
+/// The kernel's limit beside the waves the trace saw. v1 and v3 (256 VGPRs, 48 KiB LDS) and the
+/// Strix GEMM (208 VGPRs) fit one 8-wave workgroup a CU, 4 waves a SIMD, and the traced SIMDs hold
+/// that through the window. Strix's peak passes it: its waves free their VGPRs
+/// (`MSG_DEALLOC_VGPRS`) before they end, so the next workgroup starts beside their tails.
+#[test_case("rdna4_gemm_v1", [10, 6, 1], &[Limiter::Vgpr, Limiter::Lds], 4)]
+#[test_case("rdna4_gemm_v3", [10, 6, 1], &[Limiter::Vgpr, Limiter::Lds], 4)]
+#[test_case("strix_smoke", [10, 12, 1], &[Limiter::Vgpr], 8)]
+fn occupancy_beside_the_limit(name: &str, grid: [u32; 3], by: &[Limiter], peak: u32) {
+    let a = svod_capture(name, grid).analyze().unwrap();
+    let occ = &a.occupancy;
+    let limit = occ.limit.clone().expect("resources and workgroup known");
+    assert_eq!((limit.waves_per_simd, limit.workgroups_per_cu, limit.by.as_slice()), (4, 1, by));
+    assert_eq!(occ.ses.len(), a.ses.len(), "every SE's residency");
+    for se in &occ.ses {
+        let r = &se.residency;
+        let s = a.ses.iter().find(|s| s.se == se.se).unwrap();
+        assert!(r.window.0 < r.window.1 && r.mean() <= r.peak as f64 && r.peak as usize <= s.occupancy_peak);
+        let window = (r.window.1 - r.window.0) as f64 / s.span as f64;
+        assert!(window > 0.9, "{name} se{}: the robust peak's window spans the dispatch, {window:.2}", se.se);
+        let simds: i64 = r.simds.iter().map(|s| s.wave_cycles).sum();
+        assert_eq!(simds, r.wave_cycles, "the SIMDs' waves add up to the SE's");
+        assert_eq!(se.busy.is_some(), se.traced.is_some());
+        assert!(se.itrace || se.traced.is_none());
+        if let Some(b) = se.busy {
+            let parts = [b.matrix, b.valu, b.vmem, b.scalar];
+            assert!(b.any <= b.cycles && parts.iter().all(|&c| (0..=b.any).contains(&c)), "{b:?}");
+        }
+        if let Some(t) = se.traced {
+            assert!((t.mean() - 4.0).abs() < 0.05 && t.peak == peak, "{name} se{}: {t:?}", se.se);
+        }
+    }
+    assert!(occ.ses.iter().any(|se| se.traced.is_some()));
+    assert_eq!(occ.untimed_matrix, a.arch.starts_with("gfx11"), "gfx11 traces WMMA as 1-cycle VALU tokens");
+}
+
+/// AMD's hidden latency folded into the rows: hidden stall and issue stay within the row's own.
+/// Hidden idle is measured from the previous record's own end, not the latest end so far as `idle`
+/// is, so it may pass `idle` where records overlap.
+#[test]
+fn rows_carry_hidden_latency() {
+    let a = Analysis::load(&fixtures().join("svod/rdna4_gemm_v1")).unwrap();
+    assert_eq!(a.occupancy.limit, None, "no resources recorded");
+    for r in &a.pcs {
+        assert!(r.hidden_idle >= 0 && (0..=r.stall).contains(&r.hidden_stall), "{r:?}");
+        assert!((0..=r.latency - r.stall).contains(&r.hidden_issue), "{r:?}");
+    }
+    assert!(a.pcs.iter().any(|r| r.hidden_stall > 0 && r.hidden_issue > 0));
+}
+
+fn verdict_of(name: &str) -> Analysis {
+    Analysis::load(&fixtures().join("svod").join(name)).unwrap()
+}
+
+/// The VALU and SALU cycles a unit of the main loop (a trip, or an iteration where its trips are not
+/// counted), their stall included.
+fn alu_per_unit(a: &Analysis) -> f64 {
+    let l = a.main_loop.as_ref().unwrap();
+    let alu = [Class::Valu, Class::Salu];
+    (l.partition.issued(&alu)[0] + l.partition.stalled(&alu)[0]) as f64 / l.trips.total as f64
+}
+
+fn find(a: &Analysis, kind: FindingKind) -> Option<&Finding> {
+    a.verdict.bound.iter().chain(&a.verdict.findings).find(|f| f.kind == kind)
+}
+
+fn kinds(findings: &[Finding]) -> Vec<FindingKind> {
+    findings.iter().map(|f| f.kind).collect()
+}
+
+/// The exposed share of the loop's vector-memory waits and the stall before its loads issued.
+fn load_share(a: &Analysis) -> f64 {
+    let l = a.main_loop.as_ref().unwrap();
+    let vmem = |on: WaitOn| on.counter == Counter::Load;
+    let p = &l.partition;
+    (p.waited(vmem)[1] + p.stalled(&[Class::VmemLoad])[1]) as f64 / p.cycles()[0] as f64
+}
+
+/// svod's ring GEMM, its 1500- and 1536-row twins and the Strix GEMM all run 160 K-trips of 32,
+/// their 2-slot ring unrolled: 2 trips an iteration, where the code object's statements count them
+/// (`trips`: Strix's code object carries its line table), else a trip is taken as an iteration and
+/// every loop finding says so. v1, v3 and Strix
+/// pinned the clock at the standard pstate and ran over 1.2x the untraced time; the 1500 and 1536
+/// captures ran unpinned at 1.04x.
+#[test_case("rdna4_gemm_v1", Some(Pstate::Standard), 1)]
+#[test_case("rdna4_gemm_v3", Some(Pstate::Standard), 1)]
+#[test_case("rdna4_gemm_1500", Some(Pstate::Unpinned), 1)]
+#[test_case("rdna4_gemm_1536", Some(Pstate::Unpinned), 1)]
+#[test_case("strix_smoke", Some(Pstate::Standard), 2)]
+fn verdict_reads_the_capture(name: &str, pstate: Option<Pstate>, trips: u32) {
+    let a = verdict_of(name);
+    let t = a.main_loop.as_ref().unwrap().trips;
+    let model = a.model.as_ref().unwrap();
+    assert_eq!(model.per_trip, Some(Reduction { axis: Axis::K, elems: 32 }));
+    assert_eq!((t.per_iteration, t.counted, model.price.as_ref().unwrap().trips), (trips, trips > 1, 160));
+    let edges = a.pcs.iter().find(|r| r.pc == a.main_loop.as_ref().unwrap().back_edge).unwrap().hits;
+    assert_eq!(t.total, u64::from(trips) * edges);
+    assert_eq!(a.pstate, pstate);
+    let perturbed = pstate == Some(Pstate::Standard);
+    let all = a.verdict.bound.iter().chain(&a.verdict.findings);
+    assert!(all.clone().all(|f| f.approx.contains(&Approx::Perturbed) == perturbed), "{:?}", a.verdict);
+    let per_iteration = |f: &Finding| f.approx.contains(&Approx::PerIteration);
+    assert!(a.verdict.findings.iter().all(|f| per_iteration(f) != t.counted), "{:?}", a.verdict);
+    assert!(a.verdict.findings.iter().all(|f| f.share <= f.raw + 1e-12), "exposed within raw: {:?}", a.verdict);
+    let l = a.main_loop.as_ref().unwrap();
+    let signals: Vec<u64> = a.pcs.iter().filter(|r| r.asm.starts_with("s_barrier_signal")).map(|r| r.pc).collect();
+    assert!(!l.barriers.is_empty());
+    for s in &l.barriers {
+        assert!(!signals.contains(&s.pc), "{name}: a signal is no wait: {s:?}");
+        assert!(s.last <= s.hits && s.causes.iter().map(|c| c.1).sum::<usize>() <= s.last, "{s:?}");
+        assert!(s.last > 0 && s.last * 2 < s.hits, "{name}: some traced wave arrives last, most don't: {s:?}");
+    }
+    let d = a.verdict.demand.clone().unwrap();
+    assert!(d.bytes_per_trip > 0 && d.gbs > 0.0, "{d:?}");
+    let mut idle = a;
+    idle.main_loop.as_mut().unwrap().partition.buckets.clear();
+    assert_eq!(super::verdict::rank(&idle).demand, None, "no rate over a trip of no cycles");
+}
+
+/// v1 waits on its A/B fill after the trip's matrix work: its loads' latency is covered, and with
+/// what other waves' pipes hid off, no loop finding passes a tenth of the loop. The barriers stay as
+/// a sink, the matrix pipe is ~74% busy and the SIMDs idle ~16% of the window.
+#[test]
+fn v1_runs_near_matrix_throughput() {
+    let a = verdict_of("rdna4_gemm_v1");
+    let c = a.verdict.ceiling.clone().unwrap();
+    assert!((0.70..0.80).contains(&c.matrix), "{c:?}");
+    assert_eq!(kinds(&a.verdict.bound), [FindingKind::MatrixBound, FindingKind::OccupancyLimited]);
+    let occupancy = find(&a, FindingKind::OccupancyLimited).unwrap();
+    assert!((0.10..0.20).contains(&occupancy.share), "{occupancy:?}");
+    assert!(a.verdict.findings.iter().all(|f| f.share < 0.10), "{:?}", a.verdict.findings);
+    let barrier = find(&a, FindingKind::Barrier).unwrap();
+    assert!(barrier.raw > 0.20 && barrier.share < 0.10, "a sink: {barrier:?}");
+    assert!(load_share(&a) < 0.10 && find(&a, FindingKind::LoadExposed).is_none());
+    let l = a.main_loop.as_ref().unwrap();
+    for b in l.bindings.iter().filter(|b| b.pc == 0x9a0 || b.pc == 0x96c) {
+        let latency = b.latency.unwrap().median;
+        assert!(b.distance == [(0, b.count)] && b.cover.median * 10 > latency * 8, "mostly covered: {b:?}");
+    }
+}
+
+/// v3's select pulls the ring fill's waits up to just after issue (cover ~nothing of a ~1000-cycle
+/// latency): its exposed loads lead, and the knob names the wait and the select right after it.
+#[test]
+fn v3_waits_right_behind_its_load() {
+    let (v1, v3) = (verdict_of("rdna4_gemm_v1"), verdict_of("rdna4_gemm_v3"));
+    let top = &v3.verdict.findings[0];
+    assert_eq!(top.kind, FindingKind::LoadExposed, "{:?}", v3.verdict.findings);
+    assert!(top.share > 2.0 * load_share(&v1) && top.share < top.raw, "{} vs {}", top.share, load_share(&v1));
+    let Evidence::Waits { loads, .. } = &top.evidence else { panic!("{top:?}") };
+    let load = &loads[0];
+    assert_eq!((load.pc, load.wait, load.stalled, load.waits), (0xa64, 0xab0, 316, 316));
+    assert!(load.short_cover() && load.consumer.starts_with("v_cndmask_b32"), "{load:?}");
+    let consumer = "v_cndmask_b32_e64 v147, 0, v147, s1".to_string();
+    assert_eq!(top.knob, Knob::MoveUse { wait: 0xab0, load: 0xa64, consumer });
+    assert!(!v3.verdict.findings[1..].iter().any(|f| f.share >= 0.10), "{:?}", v3.verdict.findings);
+    let added = alu_per_unit(&v3) - alu_per_unit(&v1);
+    assert!((520.0..600.0).contains(&added), "v3's guards: {added:.1} VALU+SALU cycles an iteration, two trips");
+}
+
+/// The 1500-row GEMM guards its staged fill's rows: 8 exec branches in the loop, ~11 VALU ops a
+/// trip of them. Its 1536-row control has no guard and keeps the matrix pipe ~90% busy.
+#[test]
+fn ragged_rows_are_loop_overhead() {
+    let (ragged, control) = (verdict_of("rdna4_gemm_1500"), verdict_of("rdna4_gemm_1536"));
+    let f = find(&ragged, FindingKind::LoopOverhead).unwrap();
+    let Evidence::Overhead { divergent, valu_hits, .. } = &f.evidence else { panic!("{f:?}") };
+    let execz: Vec<u64> = divergent.iter().filter(|d| d.1.starts_with("s_cbranch_execz")).map(|d| d.0).collect();
+    assert_eq!((divergent.len(), execz), (8, vec![0x5f4, 0x624, 0x7e4, 0x810]), "{divergent:?}");
+    assert!(*valu_hits > 5.0, "{valu_hits}");
+    assert_eq!(kinds(&control.verdict.bound), [FindingKind::MatrixBound]);
+    assert!((0.85..0.95).contains(&control.verdict.bound[0].share), "{:?}", control.verdict.bound);
+    assert!(find(&control, FindingKind::LoopOverhead).is_none(), "{:?}", control.verdict.findings);
+    assert!(control.verdict.findings.iter().all(|f| f.share < 0.10), "{:?}", control.verdict.findings);
+}
+
+/// gfx11 traces matrix ops as 1-cycle tokens: no ceiling or pipe-share class, raw shares flagged, and
+/// the LDS ops' pre-issue stall (an untimed matrix op's cycles) is no LDS finding.
+#[test]
+fn strix_claims_nothing_of_its_matrix_pipe() {
+    let a = verdict_of("strix_smoke");
+    assert!(a.occupancy.untimed_matrix && a.verdict.ceiling.is_none());
+    let bound = [FindingKind::MatrixBound, FindingKind::IssueBound];
+    assert!(!a.verdict.bound.iter().any(|f| bound.contains(&f.kind)), "{:?}", a.verdict.bound);
+    assert!(a.verdict.findings.iter().all(|f| f.approx.contains(&Approx::UntimedMatrix) && f.share == f.raw));
+    let l = a.main_loop.as_ref().unwrap();
+    assert!(l.partition.stalled(&[Class::Lds])[0] as f64 > 0.10 * l.partition.cycles()[0] as f64, "the stall is there");
+    assert!(find(&a, FindingKind::LdsExposed).is_none(), "{:?}", a.verdict.findings);
+    let overhead = find(&a, FindingKind::LoopOverhead).unwrap();
+    let Evidence::Overhead { divergent, .. } = &overhead.evidence else { panic!("{overhead:?}") };
+    assert!(divergent.iter().any(|(pc, asm)| *pc == 0x920 && asm.starts_with("s_cbranch_execz")), "{divergent:?}");
+    assert!(a.text(4).contains("note       gfx11 traces matrix ops as 1-cycle tokens"));
+}
+
+#[test_case("global_load_b128 v[0:3], v4, s[0:1]", Some(16))]
+#[test_case("global_load_b32 v0, v1, s[0:1]", Some(4))]
+#[test_case("buffer_load_dwordx4 v[0:3], v4, s[0:3], 0 offen", Some(16))]
+#[test_case("buffer_load_dword v0, v4, s[0:3], 0 offen", Some(4))]
+#[test_case("global_load_u16 v0, v1, s[0:1]", Some(2))]
+#[test_case("global_load_d16_hi_b16 v0, v1, s[0:1]", Some(2))]
+#[test_case("global_load_i8 v0, v1, s[0:1]", Some(1))]
+#[test_case("global_load_tr_b64 v[0:1], v2, s[0:1]", Some(8))]
+#[test_case("s_nop 0", None)]
+fn load_widths(asm: &str, bytes: Option<u64>) {
+    assert_eq!(load_bytes(asm), bytes);
+}
+
+fn record(time: i64, duration: i64, stall: i64, pc: u64) -> svod_device::sqtt::wave::Instruction {
+    svod_device::sqtt::wave::Instruction { time, category: svod_device::sqtt::Category::Valu, duration, stall, pc }
+}
+
+fn wave(instructions: Vec<svod_device::sqtt::wave::Instruction>) -> svod_device::sqtt::wave::Wave {
+    svod_device::sqtt::wave::Wave { complete: true, instructions, ..Default::default() }
+}
+
+const LOOP: [(u64, &str); 6] = [
+    (0x0, "v_mov_b32 v0, 0"),
+    (0x8, "ds_store_b128 v0, v[4:7]"),
+    (0x10, "v_add_f32 v0, v1, v2"),
+    (0x14, "s_wait_loadcnt_dscnt 0x0"),
+    (0x18, "s_barrier_wait 0xffff"),
+    (0x20, "s_cbranch_scc0 65530"),
+];
+
+fn partition(waves: &[svod_device::sqtt::wave::Wave], bound: &[HashMap<usize, (Counter, u64)>]) -> Partition {
+    let hiding = Hiding::new(waves, &[], &HashSet::new());
+    Buckets(&insts(&LOOP)).partition(waves, bound, 0x10..=0x20, &hiding).partition
+}
+
+/// Each bucket's raw cycles.
+fn raw(p: &Partition) -> BTreeMap<Bucket, i64> {
+    p.buckets.iter().map(|(&b, c)| (b, c[0])).collect()
+}
+
+/// A loop at 0x10..=0x20 of a VALU op, a wait, a barrier: overlapping records count once, a stall
+/// apart from its issue, gaps as idle on the record after them; records outside the loop don't
+/// count, and a wave that leaves and re-enters the loop counts its runs inside alone. The wait
+/// counts on the counter its binding was queued on, a store's apart.
+#[test]
+fn partition_counts_each_cycle_once() {
+    let records = vec![
+        record(0, 5, 0, 0x0),
+        record(10, 6, 2, 0x10),
+        record(14, 4, 4, 0x14),
+        record(20, 10, 0, 0x18),
+        record(25, 1, 0, 0x20),
+        record(40, 3, 0, 0x8),
+        record(100, 4, 0, 0x10),
+        record(106, 4, 0, 0x14),
+    ];
+    let expect = |wait: WaitOn| {
+        BTreeMap::from([
+            (Bucket::Issue(Class::Valu), 8),
+            (Bucket::Stall(Class::Valu), 2),
+            (Bucket::Wait(wait), 6),
+            (Bucket::Barrier, 10),
+            (Bucket::Idle(Class::WaitVmem), 2),
+            (Bucket::Idle(Class::Barrier), 2),
+        ])
+    };
+    let unbound = WaitOn { counter: Counter::Load, store: false };
+    let p = partition(&[wave(records.clone())], &[]);
+    assert_eq!((p.waves, p.cycles()[0], raw(&p)), (1, 30, expect(unbound)), "unbound: its first counter");
+    let flush = HashMap::from([(2, (Counter::Ds, 0x8)), (7, (Counter::Ds, 0x8))]);
+    let p = partition(&[wave(records)], &[flush]);
+    assert_eq!(raw(&p), expect(WaitOn { counter: Counter::Ds, store: true }), "a ds_store flush");
+}
+
+/// Another wave's VALU issue over a wave's wait and gap hides them: the exposed partition takes the
+/// hidden cycles off, the raw keeps them.
+#[test]
+fn exposed_takes_off_what_other_waves_hid() {
+    let wait = svod_device::sqtt::wave::Instruction {
+        category: svod_device::sqtt::Category::Immed,
+        ..record(20, 10, 9, 0x14)
+    };
+    let waiting = wave(vec![record(10, 2, 0, 0x10), wait, record(40, 1, 0, 0x20)]);
+    let busy = wave((0..60).map(|t| record(t, 1, 0, 0x0)).collect());
+    let waves = [waiting, busy];
+    let hiding = Hiding::new(&waves, &[], &HashSet::new());
+    let pass = Buckets(&insts(&LOOP)).partition(&waves[..1], &[], 0x10..=0x20, &hiding);
+    let p = pass.partition;
+    assert_eq!((p.cycles()[0], p.waited(|_| true), p.idled(&[])), (31, [10, 0], [18, 0]));
+    assert!(exposed_within(&p));
+}
+
+/// A gfx12 barrier: the wave arrives at its signal and waits at the wait. A short wait is the last
+/// arriver's, and the record that held the wave longest before its signal is why.
+#[test]
+fn barrier_names_the_last_arrivers_delay() {
+    let lines = [
+        (0x10, "v_add_f32 v0, v1, v2"),
+        (0x14, "s_wait_dscnt 0x0"),
+        (0x18, "s_barrier_signal -1"),
+        (0x1c, "s_mov_b32 s0, 0"),
+        (0x20, "s_barrier_wait 0xffff"),
+        (0x24, "s_cbranch_scc0 65530"),
+    ];
+    let trip = |t: i64, wait: i64, barrier: i64| {
+        vec![
+            record(t, 1, 0, 0x10),
+            record(t + 1, wait, wait - 1, 0x14),
+            record(t + 1 + wait, 1, 0, 0x18),
+            record(t + 30 + wait, 1, 0, 0x1c),
+            record(t + 31 + wait, barrier, 0, 0x20),
+            record(t + 31 + wait + barrier, 1, 0, 0x24),
+        ]
+    };
+    let records = [trip(0, 50, 2), trip(200, 3, 300)].concat();
+    let waves = [wave(records)];
+    let hiding = Hiding::new(&waves, &[], &HashSet::new());
+    let pass = Buckets(&insts(&lines)).partition(&waves, &[], 0x10..=0x24, &hiding);
+    let sites: Vec<_> = pass.barriers.into_values().collect();
+    assert_eq!(sites, [super::BarrierSite { pc: 0x20, hits: 2, last: 1, causes: vec![(0x14, 1)], stmt: None }]);
+}
+
+proptest! {
+    /// Whatever the records, the buckets add up to the cycles of each wave's runs in the loop, from
+    /// a run's first record to the latest end of its records, and every exposed bucket is within
+    /// its raw one.
+    #[test]
+    fn partition_adds_up(
+        waves in prop::collection::vec(
+            prop::collection::vec((-20i64..200, 0i64..40, 0i64..40, 0usize..5), 1..40),
+            1..4,
+        ),
+    ) {
+        let lines = [
+            (0x0, "v_mov_b32 v0, 0"),
+            (0x10, "ds_load_b128 v[0:3], v4"),
+            (0x14, "s_waitcnt vmcnt(0) lgkmcnt(0)"),
+            (0x18, "s_barrier"),
+            (0x20, "s_cbranch_scc0 65530"),
+        ];
+        let pcs = [0x0, 0x10, 0x14, 0x18, 0x20];
+        let waves: Vec<_> = waves
+            .iter()
+            .map(|w| wave(w.iter().map(|&(t, d, s, pc)| record(t, d, s.min(d), pcs[pc])).collect()))
+            .collect();
+        let hiding = Hiding::new(&waves, &[], &HashSet::new());
+        let pass = Buckets(&insts(&lines)).partition(&waves, &[], 0x10..=0x20, &hiding);
+        let p = pass.partition;
+        prop_assert!(exposed_within(&p));
+        let expected: i64 = waves
+            .iter()
+            .flat_map(|w| w.instructions.chunk_by(|a, b| (a.pc != 0) == (b.pc != 0)).filter(|r| r[0].pc != 0))
+            .map(|run| run.iter().map(|r| r.time + r.duration).max().unwrap().max(run[0].time) - run[0].time)
+            .sum();
+        prop_assert_eq!(p.cycles()[0], expected);
+    }
+
+    /// A real capture with bytes overwritten, timestamps of up to 2^52 cycles spliced in and its tail
+    /// cut, at any clocks: the analysis completes or refuses, and its JSON reads back as the same analysis.
+    #[test]
+    fn corrupt_traces_analyze_and_round_trip(
+        fixture in prop::sample::select(&["amd/navi4_barriernop", "amd/strix_barrier", "gfx1200/gemm"][..]),
+        edits in prop::collection::vec((any::<prop::sample::Index>(), any::<u8>()), 0..16),
+        jumps in prop::collection::vec((any::<prop::sample::Index>(), 0u64..1 << 52), 0..512),
+        cut in any::<Option<prop::sample::Index>>(),
+        kernel_ns in any::<Option<u64>>(),
+        traced_ns in any::<Option<u64>>(),
+    ) {
+        let mut c = capture(fixture);
+        (c.kernel_ns, c.traced_ns) = (kernel_ns, traced_ns);
+        for se in &mut c.trace.per_se {
+            let bytes = &mut se.bytes;
+            for (at, byte) in &edits {
+                let at = at.index(bytes.len());
+                bytes[at] = *byte;
+            }
+            for (at, delta) in &jumps {
+                let at = at.index(bytes.len());
+                bytes.splice(at..at, (1 | delta << 12).to_le_bytes());
+            }
+            if let Some(cut) = &cut {
+                bytes.truncate(cut.index(bytes.len()));
+            }
+        }
+        match c.analyze() {
+            Ok(a) => prop_assert_eq!(serde_json::from_str::<Analysis>(&a.to_json()).unwrap(), a),
+            Err(error) => prop_assert!(matches!(error, super::Error::NoItrace | super::Error::Header { .. }), "{error}"),
+        }
+    }
+}
+
+/// A time past [`PLAUSIBLE_CYCLES`](super::verdict::PLAUSIBLE_CYCLES), whichever states it, flags every
+/// finding; the capture as recorded flags none.
+#[test_case(|a| a.ses[0].span = 1 << 38 | 1 ; "an SE's span")]
+#[test_case(|a| a.lifetime.as_mut().unwrap().max = 1 << 38 | 1 ; "a wave's lifetime")]
+#[test_case(|a| { let r = &mut a.pcs[0]; r.idle = r.hits as i64 * ((1 << 38) + 1) } ; "an instruction's idle")]
+fn implausible_times_flag_every_finding(corrupt: fn(&mut Analysis)) {
+    let flags = |a: &Analysis| {
+        let v = super::verdict::rank(a);
+        let all: Vec<_> =
+            v.bound.iter().chain(&v.findings).map(|f| f.approx.contains(&Approx::ImplausibleTime)).collect();
+        assert!(!all.is_empty());
+        all
+    };
+    let mut a = verdict_of("rdna4_gemm_v1");
+    assert!(flags(&a).iter().all(|&f| !f));
+    corrupt(&mut a);
+    assert!(flags(&a).iter().all(|&f| f));
+}
+
+/// The class findings past their thresholds, from v1 with its pipes or residency moved: a busy matrix
+/// pipe is matrix-bound on gfx12 alone, a busy SIMD mostly not on matrix work is issue-bound, and
+/// idle SIMD cycles are occupancy-limited, its knob by what the capture says of the limit.
+#[test]
+fn class_findings_fire_past_their_thresholds() {
+    use FindingKind::{IssueBound, MatrixBound, OccupancyLimited};
+    let bound = |a: &Analysis| kinds(&super::verdict::rank(a).bound);
+    let mut a = verdict_of("rdna4_gemm_v1");
+    let busy = |a: &mut Analysis, matrix: i64, any: i64| {
+        for b in a.occupancy.ses.iter_mut().filter_map(|s| s.busy.as_mut()) {
+            (b.matrix, b.any) = (b.cycles * matrix / 100, b.cycles * any / 100);
+        }
+    };
+    busy(&mut a, 69, 95);
+    assert!(bound(&a).is_empty(), "under every threshold");
+    busy(&mut a, 71, 95);
+    assert_eq!(bound(&a), [MatrixBound]);
+    a.occupancy.untimed_matrix = true;
+    assert!(!bound(&a).contains(&MatrixBound), "gfx11 cannot tell");
+    a.occupancy.untimed_matrix = false;
+    busy(&mut a, 30, 95);
+    assert_eq!(bound(&a), [IssueBound]);
+    busy(&mut a, 30, 80);
+    let f = super::verdict::rank(&a).bound.into_iter().find(|f| f.kind == OccupancyLimited).unwrap();
+    let Evidence::Occupancy { observed, need, idle, limit: None } = f.evidence else { panic!("{f:?}") };
+    assert!((f.share - 0.2).abs() < 0.01 && idle == Some(f.share) && (need - observed / 0.8).abs() < 0.01, "{f:?}");
+    assert_eq!(f.knob, Knob::MoreWaves, "no limit known");
+    let mut capped = svod_capture("rdna4_gemm_v1", [10, 6, 1]).analyze().unwrap();
+    busy(&mut capped, 30, 80);
+    let f = super::verdict::rank(&capped).bound.into_iter().find(|f| f.kind == OccupancyLimited).unwrap();
+    assert_eq!(f.knob, Knob::FreeResources, "4 of 4 waves");
+}
+
+/// The loop findings past their thresholds, from v1 with a bucket the size of its loop added: LDS
+/// load waits are lds_exposed, its knob the use behind the load; exposed barrier cycles fire the
+/// barrier past its sink.
+#[test]
+fn loop_findings_fire_past_their_thresholds() {
+    let v1 = verdict_of("rdna4_gemm_v1");
+    let with = |bucket: Bucket, exposed: i64| {
+        let mut a = v1.clone();
+        let p = &mut a.main_loop.as_mut().unwrap().partition;
+        let cycles = p.cycles()[0];
+        *p.buckets.entry(bucket).or_default() = [cycles, exposed * cycles / 100];
+        super::verdict::rank(&a)
+    };
+    assert!(find(&v1, FindingKind::LdsExposed).is_none());
+    let lds = with(Bucket::Wait(WaitOn { counter: Counter::Ds, store: false }), 50);
+    let f = lds.findings.iter().find(|f| f.kind == FindingKind::LdsExposed).unwrap();
+    assert!((0.25..0.30).contains(&f.share) && (0.5..0.6).contains(&f.raw), "{f:?}");
+    assert_eq!(f.knob, Knob::LdsUse);
+    let Evidence::Waits { load, store, .. } = &f.evidence else { panic!("{f:?}") };
+    assert!(load.exposed < load.raw && store.raw < 0.1 * load.raw, "{f:?}");
+    let sink = find(&v1, FindingKind::Barrier).unwrap();
+    assert!(sink.share < 0.10);
+    let barrier = with(Bucket::Barrier, 100);
+    let f = barrier.findings.iter().find(|f| f.kind == FindingKind::Barrier).unwrap();
+    assert!(f.share >= 0.5 && f.share == barrier.findings[0].share, "fires and leads: {:?}", barrier.findings);
+    assert_eq!(f.knob, Knob::Barrier);
+    let Evidence::Barrier { cycles, sites } = &f.evidence else { panic!("{f:?}") };
+    assert!(cycles.exposed > 0.0 && !sites.is_empty(), "{f:?}");
+}
+
+/// A load whose binding the replay guessed flags v3's load_exposed approximate; the capture as
+/// recorded guesses none.
+#[test]
+fn guessed_bindings_flag_the_load_finding() {
+    let flagged = |a: &Analysis| {
+        let f = find(a, FindingKind::LoadExposed).unwrap();
+        f.approx.contains(&Approx::ApproxBindings)
+    };
+    let mut v3 = verdict_of("rdna4_gemm_v3");
+    assert!(!flagged(&v3));
+    v3.main_loop.as_mut().unwrap().bindings.iter_mut().for_each(|b| b.approx = 1);
+    v3.verdict = super::verdict::rank(&v3);
+    assert!(flagged(&v3));
+}
+
+/// Findings of one share order by kind, whatever order they came in.
+#[test]
+fn tied_findings_order_by_kind() {
+    let f = |kind, share| Finding {
+        kind,
+        share,
+        raw: share,
+        evidence: Evidence::Busy { matrix: 0.0, valu: 0.0, any: 0.0 },
+        knob: Knob::Hoist,
+        approx: vec![],
+    };
+    use FindingKind::{Barrier, LdsExposed, LoadExposed, LoopOverhead};
+    let findings: super::Findings =
+        vec![f(LoopOverhead, 0.2), f(Barrier, 0.2), f(LoadExposed, 0.3), f(LdsExposed, 0.2)].into();
+    assert_eq!(kinds(&findings), [LoadExposed, LdsExposed, Barrier, LoopOverhead]);
+}
+
+/// A side without a main loop: the comparison says so, pairs no rows and shows none.
+#[test]
+fn compare_without_a_loop() {
+    let v1 = verdict_of("rdna4_gemm_v1");
+    let mut flat = v1.clone();
+    flat.main_loop = None;
+    let d = v1.compare(&flat);
+    assert!(d.cautions.contains(&Caution::NoLoop), "{:?}", d.cautions);
+    assert!(d.rows.matched.is_empty() && d.rows.inserted.is_empty() && !d.rows.removed.is_empty());
+    let text = d.text(4);
+    assert!(text.contains("!! NO LOOP on a side") && !text.contains("== matched rows"), "{text}");
+}
+
+fn compared(a: &str, b: &str) -> Diff {
+    Diff::load(&fixtures().join("svod").join(a), &fixtures().join("svod").join(b)).unwrap()
+}
+
+fn bucket<'a>(d: &'a Diff, name: &str) -> &'a Delta {
+    let found = d.buckets.iter().find(|b| b.bucket.to_string() == name);
+    &found.unwrap_or_else(|| panic!("{name}: {:?}", d.buckets)).delta
+}
+
+fn finding_delta(d: &Diff, kind: FindingKind) -> [Option<f64>; 2] {
+    d.findings.iter().find(|f| f.kind == kind).map_or([None; 2], |f| f.share)
+}
+
+/// The same GEMM at the same pinned clock, its figures an iteration of two trips (neither capture
+/// counts them): v3's zero-select on loaded data pulls the ring fill's wait up behind its load
+/// (+~740 load-wait cycles a trip, ~600 of them exposed) and inserts 34 `v_cndmask` rows (17 ops a
+/// trip, ~250 cycles a trip with their stall); load_exposed appears.
+#[test]
+fn compare_v1_v3_shows_the_select() {
+    let d = compared("rdna4_gemm_v1", "rdna4_gemm_v3");
+    assert_eq!(d.unit, Unit::Iteration);
+    assert!(d.cautions.is_empty(), "both standard, ratios 1.60x and 1.74x: {:?}", d.cautions);
+    let wait = bucket(&d, "wait load");
+    assert!((560.0..600.0).contains(&wait.raw[0]) && (2040.0..2090.0).contains(&wait.raw[1]), "{wait:?}");
+    assert!(
+        (1440.0..1520.0).contains(&wait.delta_raw()) && (1160.0..1240.0).contains(&wait.delta_exposed()),
+        "{wait:?}"
+    );
+    let load = WaitOn { counter: Counter::Load, store: false };
+    assert_eq!(d.buckets[0].bucket, Bucket::Wait(load), "the largest exposed delta leads");
+    let total = d.total.unwrap();
+    let sum = |side: usize| d.buckets.iter().map(|b| b.delta.raw[side]).sum::<f64>();
+    assert!((total.raw[0] - sum(0)).abs() < 1e-6 && (total.raw[1] - sum(1)).abs() < 1e-6, "{total:?}");
+    let alu = ["issue valu", "stall valu", "issue salu"].map(|n| bucket(&d, n).delta_raw()).iter().sum::<f64>();
+    assert!((520.0..600.0).contains(&alu), "v3's guards: {alu:.1} VALU+SALU cycles an iteration");
+    let cnd: Vec<&LoopRow> = d.rows.inserted.iter().filter(|r| r.asm.starts_with("v_cndmask_b32")).collect();
+    let (ops, cycles) = cnd.iter().fold((0.0, 0.0), |(h, c), r| (h + r.hits, c + r.cycles));
+    assert_eq!(cnd.len(), 34);
+    assert!((ops - 34.0f64).abs() < 1e-9 && (500.0..600.0).contains(&cycles), "{ops} ops, {cycles:.1} cycles");
+    let valu: f64 = d.rows.inserted.iter().filter(|r| r.class == Class::Valu).map(|r| r.hits).sum();
+    assert!((60.0..80.0).contains(&valu), "v1's 10 VALU ops an iteration grow to 80: {valu} inserted");
+    assert!(!d.rows.matched.iter().any(|[a, _]| a.asm.starts_with("v_cndmask")), "v1's loop has no select");
+    assert!(d.rows.matched.iter().all(|[a, b]| a.asm.split(' ').next() == b.asm.split(' ').next()));
+    assert!(matches!(finding_delta(&d, FindingKind::LoadExposed), [None, Some(s)] if s > 0.10));
+    assert!(matches!(finding_delta(&d, FindingKind::MatrixBound), [Some(_), None]));
+    let busy = d.a.matrix_busy.zip(d.b.matrix_busy).unwrap();
+    assert!(busy.1 < busy.0, "{busy:?}");
+}
+
+/// The 1500-row twin guards its ragged rows: exec-mask branches inserted in the loop, loop_overhead
+/// appears. Both ran unpinned at ~1.04x: no caution.
+#[test]
+fn compare_1536_1500_shows_the_guards() {
+    let d = compared("rdna4_gemm_1536", "rdna4_gemm_1500");
+    assert!(d.cautions.is_empty(), "{:?}", d.cautions);
+    let inserted = |m: &str| d.rows.inserted.iter().filter(|r| r.asm.starts_with(m)).count();
+    assert_eq!((inserted("s_and_saveexec_b32"), inserted("s_cbranch_execz")), (4, 4));
+    let removed = |m: &str| d.rows.removed.iter().filter(|r| r.asm.starts_with(m)).count();
+    assert_eq!(removed("s_and_saveexec") + removed("s_cbranch_exec"), 0);
+    assert!(matches!(finding_delta(&d, FindingKind::LoopOverhead), [None, Some(_)]));
+    assert!(bucket(&d, "stall valu").delta_raw() > 200.0, "{:?}", bucket(&d, "stall valu"));
+    let a = d.a.limit.as_ref().unwrap();
+    assert_eq!((a.waves_per_simd, &a.by), (8, &d.b.limit.as_ref().unwrap().by));
+}
+
+/// The same nearest config on gfx1201 without and with the split barrier (an unsplit build of the
+/// same commit against the shipped one), each statement read from its own code object. The trip's
+/// `barrier` becomes `arrive` + `await`: gfx12 spells a whole barrier as an adjacent
+/// `s_barrier_signal`/`s_barrier_wait` pair, which the split moves apart, and the barrier's exposed
+/// cycles a trip fall from ~960 to ~200.
+#[test]
+fn compare_split_barrier_names_its_statements() {
+    let d = compared("rdna4_nearest_joined", "rdna4_nearest_split");
+    assert!(d.cautions.is_empty(), "same cfg, both unpinned: {:?}", d.cautions);
+    let statement = |text: &str| d.statements.iter().find(|s| s.statement == text);
+    let barrier = statement("barrier [steady]").unwrap_or_else(|| panic!("{:?}", d.statements));
+    assert!(barrier.exposed[0] > 900.0 && barrier.raw[1] == 0.0, "{barrier:?}");
+    let wait = statement("await [steady]").unwrap();
+    assert!(wait.raw[0] == 0.0 && (150.0..260.0).contains(&wait.exposed[1]), "{wait:?}");
+    let arrive = statement("arrive [steady]").unwrap();
+    assert!(arrive.raw[0] == 0.0, "{arrive:?}");
+    for m in ["s_barrier_signal", "s_barrier_wait"] {
+        assert!(
+            d.rows.inserted.iter().any(|r| r.asm.starts_with(m)) && d.rows.removed.iter().any(|r| r.asm.starts_with(m))
+        );
+    }
+    let delta = bucket(&d, "barrier");
+    assert!(delta.delta_exposed() < -700.0, "{delta:?}");
+    assert!(matches!(finding_delta(&d, FindingKind::Barrier), [Some(a), Some(b)] if a > 2.0 * b));
+}
+
+/// A capture against itself: nothing inserted or removed, every delta zero.
+#[test]
+fn compare_with_itself_is_empty() {
+    let d = compared("rdna4_gemm_v1", "rdna4_gemm_v1");
+    assert!(d.rows.inserted.is_empty() && d.rows.removed.is_empty() && d.cautions.is_empty());
+    assert!(d.rows.matched.iter().all(|[a, b]| a == b));
+    assert!(d.buckets.iter().all(|b| b.delta.delta_raw() == 0.0 && b.delta.delta_exposed() == 0.0));
+    assert!(d.findings.iter().all(|f| f.share[0] == f.share[1]));
+}
+
+/// Different clocks and perturbation, and trips over different K: each named in the header; a side
+/// that does not count its trips puts both an iteration.
+#[test]
+fn compare_cautions() {
+    let (v1, plain) = (verdict_of("rdna4_gemm_v1"), verdict_of("rdna4_gemm_1536"));
+    let d = v1.compare(&plain);
+    assert!(d.cautions.contains(&Caution::Pstate { a: Some(Pstate::Standard), b: Some(Pstate::Unpinned) }));
+    assert!(d.cautions.iter().any(|c| matches!(c, Caution::Slowdown { .. })), "{:?}", d.cautions);
+    let control = with_lines(Capture::load(&fixtures().join("svod/rdna4_gemm_1536")).unwrap()).analyze().unwrap();
+    let mut wide = control.clone();
+    let k = |elems| Some(Reduction { axis: Axis::K, elems });
+    wide.model.as_mut().unwrap().per_trip = k(64);
+    let d = control.compare(&wide);
+    assert_eq!(d.cautions, [Caution::TripsDiffer { a: k(32).unwrap(), b: k(64).unwrap() }]);
+    let text = d.text(4);
+    assert!(text.contains("Δ/k exp") && text.contains("!! TRIPS differ: 32 K vs 64 K elements a trip"), "{text}");
+    let d = control.compare(&plain);
+    assert_eq!(d.unit, Unit::Iteration);
+    assert_eq!(d.a.units * 2, control.main_loop.as_ref().unwrap().trips.total);
+    let text = d.text(4);
+    assert!(text.contains("per loop iteration") && text.contains("an iteration of each"), "{text}");
+}
+
+/// What an agent reads, fixed: `SVOD_SQTT_BLESS=1` rewrites it after a deliberate change.
+#[test]
+fn compare_text_is_stable() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/test/fixtures/sqtt_compare_v1_v3.txt");
+    let text = compared("rdna4_gemm_v1", "rdna4_gemm_v3").text(6);
+    if std::env::var_os("SVOD_SQTT_BLESS").is_some() {
+        std::fs::write(&path, &text).unwrap();
+    }
+    assert_eq!(text, std::fs::read_to_string(&path).unwrap());
+    let json: serde_json::Value = serde_json::from_str(&compared("rdna4_gemm_v1", "rdna4_gemm_v3").to_json()).unwrap();
+    for key in ["a", "b", "unit", "cautions", "buckets", "findings", "rows"] {
+        assert!(json.get(key).is_some(), "{key}");
+    }
+}
+
+#[test_case(&[], &[], &[])]
+#[test_case(&[1, 2, 3], &[1, 2, 3], &[(Some(0), Some(0)), (Some(1), Some(1)), (Some(2), Some(2))])]
+#[test_case(&[1, 3], &[1, 2, 3], &[(Some(0), Some(0)), (None, Some(1)), (Some(1), Some(2))])]
+#[test_case(&[1, 2, 3], &[1, 3], &[(Some(0), Some(0)), (Some(1), None), (Some(2), Some(1))])]
+#[test_case(&[1, 2], &[3], &[(Some(0), None), (Some(1), None), (None, Some(0))])]
+fn aligns(a: &[u8], b: &[u8], pairs: &[(Option<usize>, Option<usize>)]) {
+    assert_eq!(align(a, b), pairs);
+}
+
+proptest! {
+    /// An alignment walks both sequences once, in order, and pairs only equal items, as many as a
+    /// longest common subsequence holds.
+    #[test]
+    fn alignment_is_a_longest_common_subsequence(
+        a in prop::collection::vec(0u8..4, 0..40),
+        b in prop::collection::vec(0u8..4, 0..40),
+    ) {
+        let pairs = align(&a, &b);
+        let left: Vec<usize> = pairs.iter().filter_map(|p| p.0).collect();
+        let right: Vec<usize> = pairs.iter().filter_map(|p| p.1).collect();
+        prop_assert_eq!(left, (0..a.len()).collect::<Vec<_>>());
+        prop_assert_eq!(right, (0..b.len()).collect::<Vec<_>>());
+        let matched: Vec<(usize, usize)> = pairs.iter().filter_map(|&(i, j)| i.zip(j)).collect();
+        prop_assert!(matched.iter().all(|&(i, j)| a[i] == b[j]));
+        // The common subsequence's length by the textbook recurrence, forward.
+        let mut lcs = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+        for i in 0..a.len() {
+            for j in 0..b.len() {
+                lcs[i + 1][j + 1] = if a[i] == b[j] { lcs[i][j] + 1 } else { lcs[i][j + 1].max(lcs[i + 1][j]) };
+            }
+        }
+        prop_assert_eq!(matched.len(), lcs[a.len()][b.len()]);
+    }
+}
+
+/// A line table's rows: one sequence over 0x0..0x60, line 0 at 0x50.
+fn rows() -> Vec<LineRow> {
+    let row = |address, line, column, end| LineRow { address, line, column, end };
+    vec![
+        row(0, 3, 0, false),
+        row(0x4c, 4, 2, false),
+        row(0x50, 0, 0, false),
+        row(0x58, 7, 1, false),
+        row(0x60, 7, 1, true),
+    ]
+}
+
+/// The statement on `line`, unroll copy `copy`.
+fn stmt(line: u32, copy: u32) -> Stmt {
+    Stmt { line: line.try_into().unwrap(), copy }
+}
+
+#[test_case(0x0, Some((3, 0)); "a sequence's first row")]
+#[test_case(0x48, Some((3, 0)); "the row before it")]
+#[test_case(0x4c, Some((4, 2)); "its own row")]
+#[test_case(0x54, None; "line 0 is no statement")]
+#[test_case(0x5c, Some((7, 1)); "the last row")]
+#[test_case(0x60, None; "the sequence's end")]
+#[test_case(0x64, None; "past it")]
+fn locates_an_instruction(pc: u64, at: Option<(u32, u32)>) {
+    assert_eq!(locate(&rows(), [pc]).get(&pc).copied(), at.map(|(l, c)| stmt(l, c)));
+}
+
+/// Two sequences meeting at one address: the second's start wins over the first's end.
+#[test]
+fn a_sequence_start_wins_over_an_end() {
+    let row = |address, line, end| LineRow { address, line, column: 0, end };
+    let rows = [row(0x20, 5, false), row(0x0, 2, false), row(0x20, 0, true), row(0x40, 0, true)];
+    let want = Lines::from([(0x10, stmt(2, 0)), (0x20, stmt(5, 0)), (0x30, stmt(5, 0))]);
+    assert_eq!(locate(&rows, [0x10, 0x20, 0x30, 0x40]), want);
+}
+
+/// Synthetic statements over a capture's instructions, by what they do: products, global loads,
+/// LDS ops, the rest; waits on none.
+fn with_lines(mut c: Capture) -> Capture {
+    let lines = objdump_lines(&c.disassembly)
+        .into_iter()
+        .filter_map(|(pc, line)| {
+            let line = match Class::of(line) {
+                Class::Matrix => 1,
+                Class::VmemLoad => 2,
+                Class::Lds => 3,
+                Class::WaitVmem | Class::WaitLgkm => return None,
+                _ => 4,
+            };
+            Some((pc, stmt(line, 1 + (pc as u32 / 4) % 2)))
+        })
+        .collect();
+    let listing = "mma a_s·b_s [steady]\n  fill a staged issue [steady]\n  lds read a_s [steady]\nother\n".into();
+    c.statements = Some(Statements { lines, listing });
+    c
+}
+
+/// A capture's statements are its code object's: saved, nothing but `kernel.co` holds them, so
+/// Strix's (whose code object carries its line table) load back and synthetic ones do not.
+#[test]
+fn statements_come_from_the_code_object() {
+    let strix = Capture::load(&fixtures().join("svod/strix_smoke")).unwrap();
+    let s = strix.statements.as_ref().expect("Strix's line table");
+    assert!(s.listing.lines().any(|l| l.trim() == "mma a_s·b_s [steady]") && s.lines.len() > 100, "{s:?}");
+    let synthetic = with_lines(Capture::load(&fixtures().join("svod/rdna4_gemm_v3")).unwrap());
+    for (c, kept) in [(&strix, true), (&synthetic, false)] {
+        let dir = tempfile::tempdir().unwrap();
+        c.save(dir.path()).unwrap();
+        let mut saved: Vec<String> =
+            std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        saved.sort();
+        assert!(
+            saved.iter().all(|f| f.ends_with(".att") || ["kernel.co", "kernel.s", "meta.json"].contains(&f.as_str()))
+        );
+        let back = Capture::load(dir.path()).unwrap().statements;
+        assert_eq!(back.as_ref(), c.statements.as_ref().filter(|_| kept));
+    }
+}
+
+/// A capture's rows carry their statements, and its loop's cycles split over them exactly as over
+/// the partition's buckets, the waits on the statements of the loads that bound them.
+#[test]
+fn statements_split_the_loop_exactly() {
+    let c = with_lines(Capture::load(&fixtures().join("svod/rdna4_gemm_v3")).unwrap());
+    let a = c.analyze().unwrap();
+    assert!(a.pcs.iter().filter(|r| r.class == Class::Matrix).all(|r| r.stmt.is_some_and(|s| s.line.get() == 1)));
+    assert_eq!(a.listing.len(), 4);
+    let l = a.main_loop.as_ref().unwrap();
+    let trips = l.trips.total as f64;
+    let raw: f64 = l.statements.iter().map(Statement::raw).sum();
+    let exposed: f64 = l.statements.iter().map(Statement::exposed).sum();
+    let [cycles, exposed_cycles] = l.partition.cycles().map(|c| c as f64 / trips);
+    assert!((raw - cycles).abs() < 1e-6, "{raw} vs {cycles}");
+    assert!((exposed - exposed_cycles).abs() < 1e-6);
+    let at = |line: u32| l.statements.iter().find(|s| s.line.map_or(0, |l| l.get()) == line).unwrap();
+    let matrix = l.partition.issued(&[Class::Matrix])[0] as f64 / trips;
+    assert!((at(1).parts[Part::Issue].raw - matrix).abs() < 1e-6, "the products' issue is the mma statement's");
+    let waits = l.partition.waited(|_| true)[0] as f64 / trips;
+    let bound = at(2).parts[Part::Wait].raw + at(3).parts[Part::Wait].raw;
+    assert!(bound > 0.9 * waits, "waits sit on their loads' statements: {bound:.1} of {waits:.1}");
+    assert_eq!(at(0).text, "unattributed");
+    assert_eq!(l.statements.last().unwrap().line, None, "the unattributed last");
+    assert_eq!(a.line(stmt(2, 1)), "fill a staged issue [steady]");
+    assert_eq!(a.line(stmt(9, 1)), "?", "past the listing");
+    let Evidence::Waits { loads, .. } = &find(&a, FindingKind::LoadExposed).unwrap().evidence else { panic!() };
+    assert!(loads.iter().all(|l| l.stmt.is_some_and(|s| s.line.get() == 2)), "{loads:?}");
+    let sites = &l.barriers;
+    assert!(!sites.is_empty() && sites.iter().all(|s| s.stmt.is_some_and(|s| s.line.get() == 4)), "{sites:?}");
+    let stalls: Vec<_> = [FindingKind::LoadExposed, FindingKind::LdsExposed]
+        .into_iter()
+        .filter_map(|k| find(&a, k))
+        .flat_map(|f| match &f.evidence {
+            Evidence::Waits { stalls, .. } => stalls.clone(),
+            _ => vec![],
+        })
+        .collect();
+    assert!(stalls.iter().all(|s| s.stmt == a.stmt(s.pc)), "{stalls:?}");
+    let text = a.text(4);
+    assert!(text.contains("== statements: main loop cycles a trip by kernel.tk line"), "{text}");
+    assert!(text.contains("fill a staged issue [steady]") && text.contains("unattributed"), "{text}");
+    assert!(text.lines().any(|l| l.contains(" load exposed ") && l.contains("@2 fill a staged issue")), "{text}");
+    assert!(text.lines().any(|l| l.contains(" arrived last ") && l.ends_with("@4 other")), "{text}");
+    let json: serde_json::Value = serde_json::from_str(&a.to_json()).unwrap();
+    assert!(json["main_loop"]["statements"].is_array() && json["pcs"][0].get("stmt").is_some());
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&verdict_of("rdna4_gemm_v3").to_json()).unwrap()["pcs"][0]
+            .get("stmt")
+            .is_none()
+    );
+}
+
+/// Two captures with lines compare by statement text, and their rows pair within a statement.
+#[test]
+fn compare_aligns_by_statement() {
+    let load = |name: &str| with_lines(Capture::load(&fixtures().join("svod").join(name)).unwrap()).analyze().unwrap();
+    let d = load("rdna4_gemm_v1").compare(&load("rdna4_gemm_v3"));
+    let texts: Vec<&str> = d.statements.iter().map(|s| s.statement.as_str()).collect();
+    assert!(texts.contains(&"fill a staged issue [steady]") && texts.contains(&"unattributed"), "{texts:?}");
+    let fill = d.statements.iter().find(|s| s.statement == "fill a staged issue [steady]").unwrap();
+    assert!(fill.exposed[1] > fill.exposed[0], "v3 pulls the fill's wait up behind its load: {fill:?}");
+    assert!(d.rows.matched.iter().all(|[a, b]| a.statement == b.statement));
+    let text = d.text(6);
+    assert!(
+        text.contains("== statements an iteration by kernel.tk text")
+            || text.contains("== statements a trip by kernel.tk text"),
+        "{text}"
+    );
+    assert!(text.contains("aligned by statement and mnemonic"), "{text}");
+    let plain = compared("rdna4_gemm_v1", "rdna4_gemm_v3");
+    assert!(plain.statements.is_empty() && plain.text(6).contains("aligned by mnemonic:"));
+}
+
+fn charge(issue: i64, stall: i64, wait: i64, idle: i64) -> Charge {
+    let c = |raw: i64, exposed: i64| PerTrip { raw: raw as f64, exposed: exposed as f64 };
+    Charge([c(issue, issue / 2), c(stall, 0), c(wait, wait / 4), c(0, 0), c(idle, idle)])
+}
+
+/// Charges roll up by line over the trips: a wait charged to its binding load lands on the load's
+/// statement, a PC with no line on the unattributed row, which sorts last; the rest by exposed.
+#[test_case(1, 6.0, 2.0; "the load's statement holds its issue and its waits")]
+#[test_case(2, 10.0, 3.0; "the product's issue and stall")]
+#[test_case(0, 2.0, 2.0; "unattributed idle")]
+fn rolls_charges_up_by_statement(line: u32, raw: f64, exposed: f64) {
+    let lines = Lines::from([(0x10, stmt(1, 1)), (0x14, stmt(1, 2)), (0x20, stmt(2, 1))]);
+    let listing = ["fill a staged issue [steady]", "mma a_s·b_s [steady]"].map(String::from);
+    let charges = BTreeMap::from([
+        (0x10, charge(4, 0, 0, 0)),
+        (0x14, charge(0, 0, 8, 0)),
+        (0x20, charge(12, 8, 0, 0)),
+        (0x30, charge(0, 0, 0, 4)),
+    ]);
+    let rolled = rollup(&charges, [0x10, 0x14, 0x20, 0x24, 0x30], &lines, &listing, 2);
+    assert_eq!(rolled.iter().map(|s| s.line.map_or(0, |l| l.get())).collect::<Vec<_>>(), [2, 1, 0]);
+    let s = rolled.iter().find(|s| s.line == std::num::NonZeroU32::new(line)).unwrap();
+    assert!((s.raw() - raw).abs() < 1e-9 && (s.exposed() - exposed).abs() < 1e-9, "{s:?}");
+    assert_eq!(s.pcs, [(0, 2), (1, 2), (2, 1)].iter().find(|p| p.0 == line).unwrap().1);
+    assert_eq!(
+        s.text,
+        match line {
+            0 => "unattributed",
+            1 => listing[0].as_str(),
+            _ => listing[1].as_str(),
+        }
+    );
+}

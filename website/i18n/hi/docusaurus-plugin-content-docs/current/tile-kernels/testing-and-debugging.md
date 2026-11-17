@@ -142,7 +142,10 @@ cargo run -p svod-model --release --example nemotron_diarize -- audio_1.wav --dt
 tk kernels अपने कर्नेल नामों (`gemm`, `conv`, `flash_attention`, `heads`, `layer_norm`, …) के तहत
 graph kernels के बगल में दिखते हैं, उसी तरह मापे हुए।
 
+कोई कर्नेल AMD RDNA card पर धीमा क्यों है, यह देखने के लिए उसे trace करें: [Profiling](./profiling) उसकी
+thread trace को tile statements तक पढ़ता है।
+
 :::tip[शांत GPU पर मापें]
-GPU पर कोई दूसरा process हर आँकड़े को बिगाड़ देता है। Probes और tune store पहले clock को warm करते हैं।
-Probes को `--test-threads=1` के साथ चलाएँ।
+GPU पर कोई दूसरा process हर आँकड़े को बिगाड़ देता है। `tk_bench`, probes और tune store पहले clock को warm करते हैं।
+एक बार में एक `tk_bench` command चलाएँ, और probe tests को `--test-threads=1` के साथ।
 :::
