@@ -21,6 +21,10 @@ const GC_BASES_NAVI: [u64; 4] = [0x1260, 0xA000, 0x1C000, 0x0240_2C00];
 const SET_SH_START: u64 = pm4::PACKET3_SET_SH_REG_START as u64;
 const SET_SH_END: u64 = 0x3000;
 const SET_UCONFIG_START: u64 = pm4::PACKET3_SET_UCONFIG_REG_START as u64;
+/// Mesa's `CIK_UCONFIG_REG_END` (byte 0x40000). The kernel's
+/// `PACKET3_SET_UCONFIG_REG_END` (0xc400) stops short of the perf-counter and
+/// thread-trace registers.
+const SET_UCONFIG_END: u64 = 0x10000;
 
 /// The GC IP version a target reports in IP discovery.
 pub fn gc_ip_version(arch: AmdArch) -> (u8, u8, u8) {
@@ -63,8 +67,10 @@ impl RegWriter {
     }
 
     /// The named register. Panics when the table lacks it: the profilers only
-    /// name registers every table they select carries.
+    /// name registers every table they select carries, the
+    /// [`PROFILER_REGS`](regs::PROFILER_REGS) the generator keeps.
     pub fn reg(&self, name: &str) -> &'static RegDef {
+        debug_assert!(regs::PROFILER_REGS.iter().any(|r| r.0 == name), "{name} is not in PROFILER_REGS");
         regs::find(self.table, name).unwrap_or_else(|| panic!("GC register table missing {name}"))
     }
 
@@ -85,6 +91,7 @@ impl RegWriter {
         if (SET_SH_START..SET_SH_END).contains(&a) {
             out.extend(pm4::set_sh_reg((a - SET_SH_START) as u32, &[value]));
         } else {
+            assert!((SET_UCONFIG_START..SET_UCONFIG_END).contains(&a), "{name} at {a:#x} is in no SET_*_REG window");
             out.extend(pm4::set_uconfig_reg((a - SET_UCONFIG_START) as u32, &[value]));
         }
     }

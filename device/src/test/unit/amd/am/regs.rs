@@ -1,4 +1,8 @@
+use svod_dtype::AmdArch;
+use test_case::test_case;
+
 use crate::amd::am::regs::*;
+use crate::amd::regwrite::RegWriter;
 
 #[test]
 fn selects_gfx1151_gc_module() {
@@ -67,4 +71,21 @@ fn multi_bit_field_masks_correctly() {
     assert_eq!(grbm.get(word, "me0pipe0_cmdfifo_avail"), 0xF);
     // High bits of an over-wide value don't bleed past the field on decode.
     assert_eq!(grbm.get(0xFF, "me0pipe0_cmdfifo_avail"), 0xF);
+}
+
+#[test_case(AmdArch::Gfx1100)]
+#[test_case(AmdArch::Gfx1101)]
+#[test_case(AmdArch::Gfx1102)]
+#[test_case(AmdArch::Gfx1151)]
+#[test_case(AmdArch::Gfx1200)]
+#[test_case(AmdArch::Gfx1201)]
+fn profiler_regs_resolve(arch: AmdArch) {
+    let gc = RegWriter::for_arch(arch).expect("a gfx11/gfx12 GC table");
+    let regs = PROFILER_REGS.iter().filter(|(_, _, majors)| majors.contains(&arch.gfx_major()));
+    for &(name, fields, _) in regs {
+        let reg = gc.reg(name);
+        for field in fields {
+            assert!(reg.field(field).is_some(), "{arch}: {name} lacks {field}");
+        }
+    }
 }

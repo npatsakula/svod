@@ -27,6 +27,9 @@ pub struct RegDef {
 /// A vendored register module: `(prefix, (maj, min, rev), table)`.
 pub type RegModule = (&'static str, (u8, u8, u8), &'static [RegDef]);
 
+/// A GC register the profilers name: `(name, fields, GC majors carrying it)`.
+pub type ProfilerReg = (&'static str, &'static [&'static str], &'static [u32]);
+
 include!("regs_gen.rs");
 
 impl RegDef {
