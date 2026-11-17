@@ -42,7 +42,7 @@
 //!   (the tuner's pick by default, `I` the planner's `I`th) timed untraced,
 //!   then traced once on an AMD RDNA3/RDNA4 card (SQTT), its trace saved
 //!   under `DIR` (`./sqtt`) with its tile statements (the traced code
-//!   object's own line table over `kernel.tk`, `lines.json`), and its
+//!   object's own line table over its `kernel.tk` listing), and its
 //!   report printed (`--top` rows a table,
 //!   `--json` one line); `--attribute` (GEMM only) sets the model's terms
 //!   (`price` less each) beside the traced SIMD's cycles of their counterparts.

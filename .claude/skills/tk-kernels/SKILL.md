@@ -276,10 +276,11 @@ of AMD's rocprof-trace-decoder, checked against its control CSVs) over `llvm-obj
 - **Any plan**: `ProfileOptions { sqtt: Some(SqttOptions::default()), .. }` adds Tier 5 (`SqttOptions::from_env()?` reads
   `SVOD_SQTT=1`); the profile report then ends with one summary line a kernel, the dirs under `Sink::Disk` (`./sqtt`,
   `SVOD_SQTT_DIR`), or each capture held with `Sink::Memory`. The traced pass syncs after each kernel and frees its `64 MiB × SEs` before the next.
-- **Offline replay**: a dir holds `se<N>.att` (raw), `kernel.co`, `kernel.s`, `meta.json` (`format`, which a load
-  checks; arch, load base, untraced and traced ns, labels: cfg, shape; `model`: the trip's reduction, the trips an
-  iteration, the price terms), `lines.json` and `kernel.tk` where the twin build attached. `tk_bench sqtt --load DIR [--json] [--attribute]` or
-  `svod_runtime::sqtt::Analysis::load(dir)` re-analyze with no GPU (`llvm-objdump` only if `kernel.s` is gone).
+- **Offline replay**: a dir holds `se<N>.att` (raw), `kernel.co` (a tk kernel's with its line table and `kernel.tk`
+  listing in its DWARF), `kernel.s`, `meta.json` (`format` 2, which a load checks; arch, load base, untraced and
+  traced ns, labels: cfg, shape; `model`: the trip's reduction, the price terms). `tk_bench sqtt --load DIR [--json]
+  [--attribute]` or `svod_runtime::sqtt::Analysis::load(dir)` re-analyze with no GPU (`llvm-objdump` only if
+  `kernel.s` is gone; the statements are read again from `kernel.co`, in-process with gimli).
 - **Reading the report** (`Analysis::text`, fixed format, `== ` a section; `--json` is one line):
   `!! TRUNCATED` (buffer filled: totals undercount) or `!! UNSTITCHED` first; `verdict`: `ceiling` (matrix pipe busy
   over the steady window, so removing every stall gains at most 1/busy; idle queued for the matrix pipe), `demand`
@@ -294,29 +295,28 @@ of AMD's rocprof-trace-decoder, checked against its control CSVs) over `llvm-obj
   untraced/traced ns and ratio, wave span, sclk (span over the traced ns), pstate; `traced` each SE's SIMD; `waves`; `time by class` (cycles summed over the
   traced SIMD's waves, `stall` the wait before issue, `exec` the rest: a barrier's or waitcnt's wait sits in `exec`
   where AMD's model books it as latency); `main loop` (innermost backward branch holding a `v_wmma`/`v_mfma`, else the
-  hottest; iterations a wave = back-edge executions, cycles/iteration = gaps between them; trips an iteration from the
-  `model.trips` label, else per-iteration units; the loop's wave-cycles a trip, raw and exposed, split exactly into
+  hottest; iterations a wave = back-edge executions, cycles/iteration = gaps between them; trips an iteration = the
+  largest unroll copy among the loop's statements (`Trips::counted`), else per-iteration units and `approx:
+  per_iteration`; the loop's wave-cycles a trip, raw and exposed, split exactly into
   issue/stall by class, waits by what bound them, barrier and idle by the class after it, per SE) with its top rows by stall;
   `hottest` by cycles. PCs are ELF addresses, as in `kernel.s`.
 - **`--compare DIR_A DIR_B`** (`Diff::load(a, b)`, `Analysis::compare`; Δ = B − A): header with both cfg/shape,
   untraced ns and Δ%, traced/untraced ratios, sclk, pstate, `!! PSTATE`/`!! PERTURBATION` (ratios >10% apart: shares
   compare less)/`!! TRIPS` (different K a trip: read the `Δ/k exp` column); occupancy, ceiling and bound A → B;
-  findings appearing/gone/changed; loop buckets a trip (each side's own trips; per iteration without `model.trips`)
+  findings appearing/gone/changed; loop buckets a trip (each side's own trips; per iteration where a side has no statements)
   by |Δ exposed|; loop rows aligned by mnemonic (LCS): inserted/removed grouped by mnemonic with ops, cycles, exposed
   a trip, then matched rows by |Δ exposed|. Golden: `runtime/src/test/fixtures/sqtt_compare_v1_v3.txt`.
-- **Statements** (every `tk_bench sqtt` op): after the trace, `tune::twin` lowers each program again as the launch
-  did (`launch::lowered_as_launched`: parameters numbered `[out, ins...]`, not `lower::standalone`'s declared order,
-  which loads the kernel arguments in another order) and renders it through the device's renderer
-  (`svod_runtime::amd::renderer`) with a line table over its listing (`Lowered::located_text_by`,
-  `Lowered::listing`), compiles it on the host with the device's
-  flags and keeps its lines when its `.text` is `kernel.co`'s byte for byte (`Capture::attach_twin`): the dir gains
-  `kernel.tk` (a line a statement in `Program::walk` order: `fill a staged issue`, `lds read a_s`, `mma a_s·b_s`,
-  `store c`, with `[prologue|head|steady|drain|epilogue]`) and `lines.json` (ELF address → `[line, unroll copy]`);
-  else the labels `lines=mismatch` and `lines.why`. With lines, rows carry `stmt`, the report adds `== statements`
-  (the loop's cycles a trip by line, a wait on its binding load's statement, unattributed last), evidence lines end
-  in `@line text`, and `--compare` pairs rows within one statement text and diffs statements by text.
-  `lines::a_line_table_leaves_the_code_alone` gates the line table (`.text` unchanged, coverage floors; the whole
-  sweep is its `#[ignore]`d twin); `lines::a_twin_is_the_launched_kernel` holds the twin to the launched IR and `.text`.
+- **Statements** (every tk kernel launched on AMD): the launch hands the graph its SOURCE stage (`launch::body`,
+  `Lowered::source`: the device's renderer, `svod_runtime::amd::LocatedAmd`, with a line table over
+  `Lowered::listing` and the listing as `kernel.tk`'s DWARF 5 source), so the traced code object carries them;
+  `Capture::new`/`load` read them (`Statements::of`: `sqtt::line_table` over the disassembly's PCs). `kernel.tk`
+  is a line a statement in `Program::walk` order (`fill a staged issue`, `lds read a_s`, `mma a_s·b_s`, `store c`,
+  with `[prologue|head|steady|drain|epilogue]`); a row's `stmt` is `[line, unroll copy]`. The report adds
+  `== statements` (the loop's cycles a trip by line, a wait on its binding load's statement, unattributed last),
+  evidence lines end in `@line text`, and `--compare` pairs rows within one statement text and diffs statements by
+  text. `lines::a_line_table_leaves_the_code_alone` gates the line table (`.text` unchanged, coverage floors); its
+  `#[ignore]`d sweep `a_line_table_leaves_every_kernel_alone` (~20 min) allows a pinned few head-dim-48 attention
+  kernels whose schedule clang 23 picks by heap address (their bare build varies run to run too).
 - **`--attribute`** (report only; GEMM captures alone carry the `model.price` it reads): each `Planner::price` term as `price − price with its costs zeroed` (`steps`,
   `reads`, `fill`, `wait`, `lone_trip`, `trip`; they overlap, so they need not sum) beside the traced cycles of its
   counterpart: steps ↔ matrix issue less stall, reads ↔ `ds_*` + lgkm/ds waits, fill ↔ global memory + vm/load waits,
