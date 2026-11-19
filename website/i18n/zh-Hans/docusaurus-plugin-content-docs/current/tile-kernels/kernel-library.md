@@ -34,7 +34,7 @@ sidebar_label: 内核库
 | `out_f32` | f32 输出与残差，累加器不经舍入直接存储 |
 | `rope` | `Rope { heads, head_dim, seq }`：前 `heads` 个宽 `head_dim` 列的头用 `[seq, head_dim/2]` 的 cos 和 sin 表旋转（输出行 `m` 位于位置 `m % seq`），其后的列原样存储；只能与偏置单独组合，且仅用于其 warp 持有完整头的 tile（`GemmCfg::turns`） |
 
-`GemmCfg { tile: [bm, bn, bk], warps: [rows, cols], core, schedule, order, tail }`。超出 `m` 的行和超出 `n` 的列是带边界的视图，因此 `m` 和 `n` 不受限制。`k` 必须是 `bk` 的倍数。`core: Core::Group` 在 `wgmma` 上发出乘积（sm_90）；`schedule: Schedule::ping_pong(k)` 让两行 warp 在同一个槽上以乒乓方式运行（CDNA）。各块按每组 `order` 个 tile 行（`gemm::TileOrder`，默认 8，即 `TileOrder::DEFAULT`；一行即行优先，网格的全部行即列优先）遍历输出 tile，使同时驻留的块读取相同的 B tile。规划器为每个配置都采用默认值；配置也可以携带其他组高（其编码中的 `g` 字段）。
+`GemmCfg { tile: [bm, bn, bk], warps: [rows, cols], core, schedule, order, tail, store }`。超出 `m` 的行和超出 `n` 的列是带边界的视图，因此 `m` 和 `n` 不受限制。`k` 必须是 `bk` 的倍数。`core: Core::Group` 在 `wgmma` 上发出乘积（sm_90）；`schedule: Schedule::ping_pong(k)` 让两行 warp 在同一个槽上以乒乓方式运行（CDNA）。在 warpgroup 核心上，`Schedule::bulk(stages, unroll)` 通过 TMA 填充环，`store: Store::Staged` 经由环以 16 字节连续段写出输出 tile；调优器把两者都作为普通流水线的孪生配置计时，未调优时两者都不会成为首选。各块按每组 `order` 个 tile 行（`gemm::TileOrder`，默认 8，即 `TileOrder::DEFAULT`；一行即行优先，网格的全部行即列优先）遍历输出 tile，使同时驻留的块读取相同的 B tile。规划器为每个配置都采用默认值；配置也可以携带其他组高（其编码中的 `g` 字段）。
 
 旋转通过按列的 `flip` 读取每个元素相隔半个头的配对半部。当一个 warp 的列持有完整的头时，一个 lane 同时持有两个半部，`flip` 只是寄存器重命名。表通过周期视图读取，因此一行中的每个头都读取同一行 `[head_dim/2]`。旋转在排序中并非免费：其运算和对表的读取与尾处理的一起计入声明，不持有完整头的 tile 会被拒绝。
 

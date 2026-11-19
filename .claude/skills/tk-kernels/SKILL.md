@@ -49,7 +49,9 @@ optimization"), `do_linearize` returns before the `SVOD_DUMP_LINEAR` dump (`code
    `Error::SharedPast`) → `materialize_operands` (non-register `mma` operands become loads;
    on `Core::Group` shared operands stay in place) → `sync::insert_barriers` (fences from shared-memory effects) →
    `schedule::expand` (each `Pipeline`'s `Schedule` under the target's `Fill`; on the warpgroup
-   core a `cp.async` ring of ≥ 3 slots whose consume only chains products leaves them in flight) → `layouts::infer`
+   core a `cp.async` ring of ≥ 3 slots whose consume only chains products leaves them in flight; `Schedule::Bulk`
+   fills that ring by TMA on slot barriers where `SyncCaps::slot_barrier`, sm_90, each fill `lower::bulk::frame`
+   takes, else `NotBulk`, the threads' chunks) → `layouts::infer`
    (F2 `TileLayout` per register tile, priced relayouts; a product whose result is dealt issues the narrow way,
    `MmaAtom::narrow`; each shared allocation's `Storage`, its axis and bank halves) → `emit::emit` (`lower/emit/{mod,address,
    copy,compute,nvptx,amdgpu}.rs`; vendor intrinsics only in the last two). A program's phase is its type
@@ -62,7 +64,7 @@ optimization"), `do_linearize` returns before the `SVOD_DUMP_LINEAR` dump (`code
    planner prices, `geometry_of(Int8)` the 8-bit one into i32: NVIDIA m16n8k32, CDNA 16×16×32, RDNA `iu8` 16×16×16), `fill: Fill::{CpAsync, Staged}`
    (`Fill::stages` clamps a staged ring to 1–2), `ldmatrix`, `tr_load`, `sync: SyncCaps { warp_barrier, commit_fence,
    priority }`, `occupancy`, `crews`, `sms`, `xcds`. Built by `Target::for_device(&spec)`, `for_arch(arch)`,
-   `offline(arch, sms, xcds)` or `card(name)` from `atoms::CARDS` (rtx3060, h100-pcie, h100-sxm, rtx5070, rtx5090,
+   `offline(arch, sms, xcds)` or `card(name)` from `atoms::CARDS` (rtx3060, h100-pcie, h100-sxm, h200-sxm, h200-nvl, rtx5070, rtx5090,
    mi300x, mi355x, rx9070xt, strix-halo). Kernels never name an instruction.
 4. **Costs** (`atoms::Costs`, ns of SM time per unit): `probe::costs(&target)` measures them on the device as
    `[baseline, probe]` pairs stored as `value|probe:<field>|…` lines; `probe::GUESSED` where nothing measured;
@@ -110,7 +112,7 @@ Rules the code enforces:
 
 Tests live in `tk/src/test/unit/<topic>.rs` (never in-place; `test_case` tables, `proptest` shapes). Shared helpers in
 `mod.rs`: `device_target()`, `device_planner()`, `cp_async_target()`, `group_target()`, `tuned_on_device`, `measure`,
-`first_eight`, `costs()` (`sweep::costs`, GUESSED), `gfx1151_costs()`, `gfx1151_store_costs()`, `sm86_costs()`, `gfx1201_costs()`, `gfx942_costs()` (declared from each device's probes), `declared`, `planner`, `rounded`, `decode`,
+`first_eight`, `costs()` (`sweep::costs`, GUESSED), `gfx1151_costs()`, `gfx1151_store_costs()`, `sm86_costs()`, `h200_costs()`, `gfx1201_costs()`, `gfx942_costs()` (declared from each device's probes), `declared`, `planner`, `rounded`, `decode`,
 `assert_rel_close`, `Scratch` (a temp directory a test drops, for a tune store), `self_join` (a nearest problem). Targets: `atoms::sm86()`, `targets::hopper()`, `targets::amd(AmdArch::Gfx1201, 64)`.
 
 | Level | Example |
@@ -192,7 +194,7 @@ side (`isa::table`; a `.cubin` through `nvdisasm -c`, a `.co`/`.hsaco` through `
 anything else as SASS/PTX/AMDGCN text; `--fun` is required when the file holds several kernels, the error lists them;
 `reference.*` keeps the text). Compare per main-loop step: matrix
 instructions, global/shared loads and stores, waits and barriers, address arithmetic; plus registers, spills, LDS/smem,
-occupancy. Local toolchains: CUDA 13.4 in `/opt/cuda/bin` (`nvcc`, `ptxas`, `nvdisasm`, `cuobjdump`), ROCm in
+occupancy. Local toolchains: CUDA 13.4 in `/opt/cuda/bin` (`nvcc`, `ptxas`, `nvdisasm`, `cuobjdump`; `/usr/local/cuda/bin` on the H200 box), ROCm in
 `/opt/rocm` (`hipcc`, `roc-obj-ls`/`roc-obj-extract`; `llvm-objdump`, `llvm-readelf`, `llvm-mca` in `/opt/rocm/llvm/bin`).
 Reference sources are local checkouts under `submodules/` (untracked; may be absent on a fresh clone).
 
@@ -211,7 +213,7 @@ rocprof, or tk's probes). `llvm-mca` on AMDGPU is a one-wave, no-memory model an
 ## Tune store
 
 `$SVOD_TK_TUNE_DIR`, else `$XDG_CACHE_HOME/svod/tk_tune`, else `~/.cache/svod/tk_tune`; one file per device
-`<arch>_<sms>sm-v<crate version>.txt` (`sm_86_28sm-v<crate version>.txt`) under a `format 11` line (`tune::FORMAT`); lines
+`<arch>_<sms>sm[_<model>]-v<crate version>.txt` (`sm_90_132sm_h200_nvl-v<crate version>.txt`; `tune::device`: the model is the CUDA driver's name for the card, `atoms::model_of`, so an H200 and an H100 SXM keep separate stores; AMD names none) under a `format 11` line (`tune::FORMAT`); lines
 `choice|…` (`idx:code ns` pairs, fastest first, each candidate's config as its family's compact code —
 `Tiled::code`, a GEMM's `w,128,256,64,2,4,r3u,g8,~` ending in its raster and tail split, `~` or `t4`, a nearest's list `~` in registers, `q16` queued or `m,4,2,0` a score matrix), `admitted|…`/`first|…` (`idx:code`), `value|…` (one number; probes in femtoseconds) keyed by op,
 device, dtype, shape, candidate digest, compiler digest and the
@@ -236,7 +238,7 @@ does (`tune::measure`: a config's programs from `ops::candidates`, its merge or 
 | `raster [--shape MxNxK,…]` | every raster (`TileOrder`, groups of 1, 2, 4, … tile rows and column-major) of the tuner's pick and the planner's first, × the default's beside the model's ×, on 4096³, 4096×1024×4096, 8192²×1024 by default |
 | `fit [--only LABEL,…] [--picks]` | the cost model against the device on a few GEMM (4096³, Nemotron, Qwen3, Whisper projections), attention and nearest shapes: `costs\|…`, a `fit\|label\|rank\|verdict\|ns predicted\|ns measured\|cfg` line a ranked config, `pick\|label\|ns\|cfg` and `tune\|label\|s` (the tuner's wall time; cold on a store of the device's probes alone); `--picks` times the picks alone, an A/B across builds |
 | `trips` | `residency\|op\|blocks\|trip\|wall\|spread\|base\|measurable` of the trip probes at 1–48 blocks an SM (`probe::trip_at`): what `TRIP_HIDING` is fitted to |
-| `pin --cfg BMxBNxBK:S:WRxWC[:rolled],… [--shape MxNxK,…] [--residual] [--gated]` | `pin\|shape\|cfg\|blocks\|measured\|model\|less latency\|less lone trip\|less step` a pinned GEMM config (3-part code unrolled; Whisper's fc2 1500×1280×5120 by default, `--gated` a SwiGLU epilogue): the model's ns with each term zeroed beside the measured ns |
+| `pin --cfg BMxBNxBK:S:WRxWC[:rolled][:group][:bulk][:staged],… [--shape MxNxK,…] [--residual] [--gated]` | `pin\|shape\|cfg\|blocks\|measured\|model\|less latency\|less lone trip\|less step` a pinned GEMM config (3-part code unrolled; Whisper's fc2 1500×1280×5120 by default, `--gated` a SwiGLU epilogue): the model's ns with each term zeroed beside the measured ns |
 | `sqtt gemm M N K [--cfg I\|tuned\|CODE,…] [--top N] [--out DIR] [--json] [--attribute]`, `sqtt attention B H T D`, `sqtt nearest N D K`, `sqtt conv H W CIN COUT KERNEL STRIDE`, `sqtt --load DIR`, `sqtt --compare DIR_A DIR_B [--json] [--top N]` | AMD RDNA3/RDNA4 thread trace of each config; see [Thread trace (SQTT)](#thread-trace-sqtt) |
 
 The `#[ignore]` probe tests left print and never assert:
@@ -261,6 +263,36 @@ into registers costs the matrix pipe ~1/64 cycle a SIMD. A 64×64 warp tile read
 (−14 %) and VALU moves (~1 cycle each) cost less. gfx1151 (Strix Halo): 46–49 TOPS f16 = bf16 = int8 (the `iu8`
 WMMA runs at the 16-bit rate there, so 8-bit search gains only operand bytes), a `ds_load_b128` a product −12 %,
 two −16 %: its GEMM (31 TF tk, 26 hipBLASLt) is bound by memory, not the loop.
+
+**Hopper ceilings (H200 NVL, 132 SMs, 600 W cap, CUDA 13.4; measured 2026-11-19).** `scripts/tk_ceilings`:
+`cublaslt_bench.cu` (`nvcc -O3 -std=c++17 -arch=sm_90a cublaslt_bench.cu -lcublasLt`; every heuristic algorithm, tk's
+operand layout) and `attn_bench.py` (torch + FA3 `hopper/` built with only the bf16 forward hdim64/128
+instantiations, 50 s; ThunderKittens `mha_h100` through `TK_ATTN_DIR`, its grid's `seq_len/192` made a ceil or it
+skips the last rows of T 2048). bf16 TFLOP/s, a kernel's device time alone (CUPTI), tk from `tk_bench`:
+
+| GEMM M×N×K | tk | cuBLASLt | ThunderKittens | tk / best |
+|---|---|---|---|---|
+| 4096³ | 587 | 743 | 706 | 79 % |
+| 8192³ | 639 | 658 | 710 | 90 % |
+| 4096×1024×4096 | 579 | 711 | 683 | 81 % |
+| 8192×8192×1024 | 443 | 669 | 604 | 66 % |
+| 1500×1280×5120 | 413 | 652 | — (needs M % 128) | 63 % |
+
+| Attention H 8, T 2048 | tk | FA3 | cuDNN 9.26 | ThunderKittens | tk / best |
+|---|---|---|---|---|---|
+| B 4, d 64 | 305 | 395 | 407 | 342 | 75 % |
+| B 4, d 64 causal | 196 | 331 | 279 | 210 | 59 % |
+| B 4, d 128 | 354 | 547 | 522 | 495 | 65 % |
+| B 4, d 128 causal | 241 | 471 | 386 | 278 | 51 % |
+| B 16, d 64 | 327 | 425 | 403 | 378 | 77 % |
+| B 16, d 64 causal | 243 | 360 | 340 | 260 | 68 % |
+| B 16, d 128 | 382 | 581 | 538 | 526 | 66 % |
+| B 16, d 128 causal | 286 | 475 | 429 | 354 | 60 % |
+
+The card sits at its power cap under GEMM (SM clock 1215–1500 of 1785 MHz): a GEMM minimum moves ±5–10 % between
+runs and sustained cuBLASLt is ~620–635 TF; attention repeats within ~1 %. ThunderKittens' GEMM takes B as `[K, N]`
+and cuDNN/ThunderKittens attention `[B, H, T, D]` (transposed before timing). tk's 4096³ pick is
+`[128, 256, 64] s4 [8, 1]` on `Core::Group`, behind the ranking's first (`[256, 128, 64] s4 [16, 1]`, 492–544 TF).
 
 ## Thread trace (SQTT)
 
@@ -354,7 +386,7 @@ For a change under `ops/config.rs`, `probe.rs`, `tune.rs`, `schedule.rs`, `layou
 
 | File | Purpose |
 |------|---------|
-| `tk/src/ir.rs`, `build.rs` | statement tree, `Kernel` builder, `Sc` scalars, `CopyMode::{Sync,Async,Staged}`, `SmemRef`, `CmpOp` |
+| `tk/src/ir.rs`, `build.rs` | statement tree, `Kernel` builder, `Sc` scalars, `CopyMode::{Sync,Async,Staged,Bulk}`, `SmemRef`, `CmpOp` |
 | `tk/src/kernels/{gemm,attention,conv,heads,rows,mod}.rs` | the kernels; `Batch`, `Act`, `bound`, `batch_offset` |
 | `tk/src/lower/{mod,sync}.rs`, `lower/emit/*.rs` | `lower`, `standalone`, `render`, errors; barrier pass; emitter (`TK_DUMP_LIST`) |
 | `tk/src/schedule.rs`, `layouts.rs`, `layout/`, `atoms.rs` | templates; inference, `Swizzle`; F2 algebra; `Target`, `CARDS`, `Costs` |

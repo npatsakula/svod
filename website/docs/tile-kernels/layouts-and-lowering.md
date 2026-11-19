@@ -129,6 +129,7 @@ crews a cluster apart over one register-staged slot (CDNA GEMM, `Schedule::PingP
 |---|---|
 | `Fill::CpAsync`, `stages ≥ 2` | One loop of `extent + stages − 1` iterations. Each iteration waits until at most `stages − 2` copy groups are pending, then barriers and consumes step `i − (stages − 1)`. It then issues step `i`'s `cp.async` copies into the slot freed one iteration earlier and commits them as one group (an empty group past the end keeps the count uniform). |
 | `Fill::CpAsync`, `stages ≥ 3`, warpgroup core, a consume whose products only feed products | The same, with the consume's `wgmma` chains left in flight over the next fill: the slot consumed two trips ago is refilled, and after each consume every thread waits for all but its youngest chain (`Sync::WaitProducts`). |
+| `Schedule::Bulk`, warpgroup core, slot barriers (sm_90) | The ring above with each fill one thread's bulk copies (`cp.async.bulk.tensor`, TMA) through a tensor map of the parameter, a kernel argument the launch encodes from the buffer's address. A slot's fill completes on the slot's own `mbarrier`, which the consume waits for (`Sync::SlotInit`, `SlotArrive`, `SlotWait`); no thread commits a copy group. A fill a bulk copy does not move keeps its threads' chunks (`lower::bulk::NotBulk`: gathered rows, a column bound, a row bound read from a parameter, rows no constant 16-byte multiple apart). Without slot barriers the schedule is the ring it names. |
 | `Fill::CpAsync`, `stages = 1` | Copy, wait, consume, and a barrier before the slot is refilled. |
 | `Fill::Staged`, 2 stages | Three loops over one induction variable: the first trip loads step 0 into registers and stores it to its slot; a steady trip loads step `i` into registers, fences, consumes step `i − 1`, fences, and stores the registers to step `i`'s slot, with no branch in its body (the fences keep the loads ahead of the products and the commit behind them on RDNA); the last trip only consumes. |
 | `Fill::Staged`, 1 stage | The same three loops over one slot: the store waits behind a barrier for every warp to finish the slot, then barriers again, so a tile twice as deep fits the same shared memory. |
@@ -147,7 +148,8 @@ bounds are gated: loads read zero and stores are dropped. Shared rows are XOR-sw
 16-byte chunks where the row's chunk count is a power of two (`layouts::Swizzle`). Shared to register loads of 16-bit tiles use `ldmatrix.x4` where the layout
 allows, and of 8-bit ones its untransposed form over 16×32 bytes; on RDNA4 global to register loads use `global_load_tr_b128` where the layout is what it
 leaves. A `Warps` statement runs its body on each warp alone, with its own copies and barriers.
-On AMD an f32 `exp2` is the hardware `v_exp_f32`, which flushes results below 2⁻¹²⁶ to zero.
+An f32 `exp2` is the hardware instruction alone (`v_exp_f32` on AMD, `ex2.approx.ftz.f32` on NVIDIA), which flushes
+results below 2⁻¹²⁶ to zero.
 Shared memory above 48 KB is one dynamic array on CUDA; candidates are filtered against
 `Target::smem_bytes`.
 

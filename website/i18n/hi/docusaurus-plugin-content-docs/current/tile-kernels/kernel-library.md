@@ -51,10 +51,13 @@ bind हुए runtime variable की live गिनती launch करता 
 | `out_f32` | f32 output और residual; accumulator बिना round किए store होता है |
 | `rope` | `Rope { heads, head_dim, seq }`: `head_dim` columns वाले पहले `heads` heads `[seq, head_dim/2]` cos और sin tables से घुमाए जाते हैं (output row `m` position `m % seq` पर), उनके बाद के columns जैसे हैं वैसे store होते हैं; केवल bias के साथ, उस tile पर जिसके warps पूरे heads रखते हैं (`GemmCfg::turns`) |
 
-`GemmCfg { tile: [bm, bn, bk], warps: [rows, cols], core, schedule, order, tail }`। `m` से आगे की
+`GemmCfg { tile: [bm, bn, bk], warps: [rows, cols], core, schedule, order, tail, store }`। `m` से आगे की
 rows और `n` से आगे के columns bounded views हैं, इसलिए `m` और `n` मुक्त हैं। `k` का `bk` का गुणज
 होना ज़रूरी है। `core: Core::Group` products को `wgmma` (sm_90) पर issue करता है;
 `schedule: Schedule::ping_pong(k)` दोनों warp rows को एक slot पर ping-pong में चलाता है (CDNA)।
+Warpgroup core पर `Schedule::bulk(stages, unroll)` ring को TMA से भरता है और `store: Store::Staged`
+output tile को ring के ज़रिए 16-byte runs में store करता है; tuner दोनों को सादे pipeline के twins की
+तरह मापता है और बिना tuning के इनमें से कोई पहला चुनाव नहीं बनता।
 Blocks output tiles पर `order` tile rows (`gemm::TileOrder`, default 8, `TileOrder::DEFAULT`; एक
 row यानी row-major, grid की सभी rows यानी column-major) के समूहों में चलते हैं, ताकि एक साथ resident
 blocks वही B tiles पढ़ें। Planner हर config को default पर plan करता है; कोई config दूसरी group height

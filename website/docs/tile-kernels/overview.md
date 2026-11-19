@@ -51,7 +51,7 @@ model code ──► svod_tk::ops          always a Tensor; picks a kernel and c
 | Target | Matrix core | Fills |
 |---|---|---|
 | CUDA sm_80+ | `mma.sync` m16n8k16, `ldmatrix` | `cp.async` |
-| CUDA sm_90 | adds `wgmma` (GEMM and attention) | `cp.async` |
+| CUDA sm_90 | adds `wgmma` (GEMM and attention) | `cp.async`; GEMM also TMA |
 | AMD RDNA4 | WMMA 16×16×16 | registers, 1–2 slots |
 | AMD RDNA3 / 3.5 | WMMA 16×16×16 | registers, 1–2 slots |
 | AMD CDNA3 / 4 | MFMA 16×16×16, and 32×32×8 for attention; wave64 | registers, two crews in ping-pong |
@@ -64,7 +64,7 @@ run the `gemm` and `attention` commands of
 ([Tuning](./tuning#benchmarks)): they print the tuner's pick in TFLOP/s.
 
 :::note[Not in this release]
-Hopper TMA and mbarrier producers (sm_90 runs `wgmma` fed by `cp.async`), Blackwell `tcgen05`,
+Hopper warp-specialized producers (sm_90 runs `wgmma` fed by `cp.async`, GEMM also by TMA from its consumer threads), Blackwell `tcgen05`,
 32×32 MFMA for GEMM, Apple kernels, fp8, int8 beyond the nearest-neighbour search, attention backward, and
 the convolution's image-staged form.
 See [Portability](./portability#not-in-this-release).

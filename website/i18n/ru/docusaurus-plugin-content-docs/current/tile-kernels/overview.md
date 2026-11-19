@@ -52,7 +52,7 @@ model code ──► svod_tk::ops          always a Tensor; picks a kernel and c
 | Цель | Матричное ядро | Заполнение |
 |---|---|---|
 | CUDA sm_80+ | `mma.sync` m16n8k16, `ldmatrix` | `cp.async` |
-| CUDA sm_90 | плюс `wgmma` (GEMM и внимание) | `cp.async` |
+| CUDA sm_90 | плюс `wgmma` (GEMM и внимание) | `cp.async`; GEMM также TMA |
 | AMD RDNA4 | WMMA 16×16×16 | регистры, 1–2 слота |
 | AMD RDNA3 / 3.5 | WMMA 16×16×16 | регистры, 1–2 слота |
 | AMD CDNA3 / 4 | MFMA 16×16×16 и 32×32×8 для внимания; wave64 | регистры, две бригады в режиме ping-pong |
@@ -65,7 +65,7 @@ model code ──► svod_tk::ops          always a Tensor; picks a kernel and c
 ([Тюнинг](./tuning#benchmarks)): они печатают выбор тюнера в TFLOP/s.
 
 :::note[Не в этом релизе]
-Производители на Hopper TMA и mbarrier (sm_90 выполняет `wgmma`, питаемый через `cp.async`),
+Производители Hopper с warp specialization (sm_90 выполняет `wgmma`, питаемый через `cp.async`, а GEMM также через TMA из потоков-потребителей),
 Blackwell `tcgen05`, MFMA 32×32 для GEMM, ядра Apple, fp8, int8 за пределами поиска ближайших соседей,
 обратный проход внимания и вариант свёртки с подготовкой изображения в разделяемой памяти. См. [Переносимость](./portability#not-in-this-release).
 :::

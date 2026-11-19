@@ -128,6 +128,7 @@ crews: block के warps एक register-staged slot पर एक cluster क�
 |---|---|
 | `Fill::CpAsync`, `stages ≥ 2` | `extent + stages − 1` iterations का एक loop। हर iteration तब तक रुकता है जब तक अधिकतम `stages − 2` copy groups बाक़ी न रहें, फिर barrier करके step `i − (stages − 1)` consume करता है। फिर step `i` की `cp.async` copies को एक iteration पहले ख़ाली हुए slot में भेजता है और उन्हें एक group के रूप में commit करता है (अंत के बाद एक ख़ाली group गिनती को एकसमान रखता है)। |
 | `Fill::CpAsync`, `stages ≥ 3`, warpgroup core, ऐसा consume जिसके products सिर्फ़ products को feed करते हैं | वही, पर consume की `wgmma` chains अगले fill के दौरान चलती रहती हैं: दो trips पहले consume हुआ slot फिर से भरा जाता है, और हर consume के बाद हर thread अपनी सबसे नई chain को छोड़कर बाक़ी सबका wait करता है (`Sync::WaitProducts`)। |
+| `Schedule::Bulk`, warpgroup core, slot barriers (sm_90) | ऊपर वाला ring, पर हर fill एक thread की bulk copies (`cp.async.bulk.tensor`, TMA) से होता है, parameter के tensor map के ज़रिए: एक kernel argument जिसे launch buffer के address से encode करता है। Slot का fill उसी slot के `mbarrier` पर पूरा होता है, जिसका consume wait करता है (`Sync::SlotInit`, `SlotArrive`, `SlotWait`); कोई thread copy group commit नहीं करता। जिस fill को bulk copy नहीं ले जा सकती वह अपने threads के chunks ही रहता है (`lower::bulk::NotBulk`: gathered rows, column bound, parameter से पढ़ा गया row bound, rows जो 16 bytes के स्थिर गुणज की दूरी पर नहीं हैं)। Slot barriers के बिना यह schedule वही ring है जिसका यह नाम लेता है। |
 | `Fill::CpAsync`, `stages = 1` | Copy, wait, consume, और slot फिर से भरने से पहले एक barrier। |
 | `Fill::Staged`, 2 stages | एक ही induction variable पर तीन loops: पहला trip step 0 को registers में load करके उसके slot में store करता है; steady trip step `i` को registers में load करता है, fence करता है, step `i − 1` consume करता है, fence करता है, और registers को step `i` के slot में store करता है, उसकी body में कोई branch नहीं (RDNA पर fences loads को products से पहले और commit को उनके बाद रखते हैं); आख़िरी trip सिर्फ़ consume करता है। |
 | `Fill::Staged`, 1 stage | एक ही slot पर वही तीन loops: store एक barrier के पीछे तब तक रुकता है जब तक हर warp slot से निपट न जाए, फिर दोबारा barrier, ताकि उसी shared memory में दोगुना गहरा tile समा जाए। |
@@ -148,7 +149,8 @@ Emitter हर statement के instructions को program order में ए�
 (`layouts::Swizzle`)। 16-bit tiles के shared से register loads, जहाँ layout अनुमति दे, `ldmatrix.x4`
 इस्तेमाल करते हैं, और 8-bit tiles के loads 16×32 bytes पर उसका untransposed रूप; RDNA4 पर global से register loads `global_load_tr_b128` इस्तेमाल करते हैं जहाँ
 layout वही हो जो वह छोड़ता है। एक `Warps` statement अपनी body को हर warp पर अकेले, अपनी copies और
-barriers के साथ चलाता है। AMD पर f32 `exp2` hardware का `v_exp_f32` है, जो 2⁻¹²⁶ से नीचे के results को
+barriers के साथ चलाता है। f32 `exp2` अकेला hardware instruction है (AMD पर `v_exp_f32`, NVIDIA पर
+`ex2.approx.ftz.f32`), जो 2⁻¹²⁶ से नीचे के results को
 शून्य कर देता है। CUDA पर 48 KB से ऊपर की shared memory एक dynamic array है; candidates
 `Target::smem_bytes` के ख़िलाफ़ छाने जाते हैं।
 

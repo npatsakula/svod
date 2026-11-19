@@ -99,7 +99,7 @@ cargo run -p svod-tk --release --example tk_dump -- --card h100-pcie --op gemm -
 cargo run -p svod-tk --release --example tk_dump -- --arch gfx942 --op attention --shape 8x16x1024x128 --causal --store DIR
 ```
 
-`--card` takes a name of `atoms::CARDS` (`rtx3060`, `h100-pcie`, `h100-sxm`, `rtx5070`,
+`--card` takes a name of `atoms::CARDS` (`rtx3060`, `h100-pcie`, `h100-sxm`, `h200-sxm`, `h200-nvl`, `rtx5070`,
 `rtx5090`, `mi300x`, `mi355x`, `rx9070xt`, `strix-halo`); `--arch` takes an architecture with
 `--sms`/`--xcds` or the first listed card's. `--store` is a tune store directory copied from the
 card, whose probe lines price the ranking; without it the guessed costs do. `--cfg N` emits the

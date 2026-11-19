@@ -99,7 +99,7 @@ cargo run -p svod-tk --release --example tk_dump -- --card h100-pcie --op gemm -
 cargo run -p svod-tk --release --example tk_dump -- --arch gfx942 --op attention --shape 8x16x1024x128 --causal --store DIR
 ```
 
-`--card` `atoms::CARDS` का एक नाम लेता है (`rtx3060`, `h100-pcie`, `h100-sxm`, `rtx5070`,
+`--card` `atoms::CARDS` का एक नाम लेता है (`rtx3060`, `h100-pcie`, `h100-sxm`, `h200-sxm`, `h200-nvl`, `rtx5070`,
 `rtx5090`, `mi300x`, `mi355x`, `rx9070xt`, `strix-halo`); `--arch` `--sms`/`--xcds` के साथ या सूची
 के पहले कार्ड वाले मानों के साथ एक architecture लेता है। `--store` कार्ड से copy की गई tune store
 directory है, जिसकी probe lines ranking की कीमत तय करती हैं; उसके बिना guessed costs यह करती हैं।
