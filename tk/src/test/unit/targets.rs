@@ -20,7 +20,7 @@ use crate::ir::{Axis, ParamKind, Program, Schedule};
 use crate::kernels::Batch;
 use crate::kernels::attention::{AttnMask, AttnSpec, Bias, CombineSpec, Forms, attention, combine};
 use crate::kernels::conv::ConvSpec;
-use crate::kernels::gemm::{Epilogue, GemmSpec, gemm};
+use crate::kernels::gemm::{Epilogue, GemmSpec, Store, gemm};
 use crate::kernels::nearest::{Floors, Metric, NearestSpec, nearest};
 use crate::kernels::rows::NormCfg;
 use crate::launch::{self, aliasing, graph_launch_all};
@@ -369,7 +369,8 @@ fn every_family_lowers_keeps_its_numbers_and_compiles(target: Target, facts: Fac
             // The operands stay in shared memory: the one 16-bit load is a
             // staged output tile's, back from the ring.
             let loads = tile.walk().filter(|(_, s)| reg_operand(s)).count();
-            check(loads == usize::from(name.ends_with("staged")), "an operand was loaded into registers");
+            let flushed = name.ends_with("flushed");
+            check(loads == usize::from(name.ends_with("staged") || flushed), "an operand was loaded into registers");
             check(ir.contains("wgmma.mma_async.sync.aligned.m64n"), "no warpgroup product");
             check(!ir.contains("@llvm.nvvm.mma.") && !ir.contains("ldmatrix"), "a warp-level product");
             check(ir.contains("wgmma.fence") && ir.contains("fence.proxy.async"), "an unfenced chain");
@@ -383,7 +384,12 @@ fn every_family_lowers_keeps_its_numbers_and_compiles(target: Target, facts: Fac
             check(ir.contains("@llvm.nvvm.cp.async.bulk.tensor.g2s.tile.2d(") == bulk, "the bulk copies");
             check(ir.contains("mbarrier.try_wait.parity") == bulk, "the slot barriers");
             check(ir.contains("@llvm.nvvm.cp.async.cg.shared.global") != bulk, "the threads' chunks");
-            check(ir.matches("\"nvvm.grid_constant\"").count() == 2 * usize::from(bulk), "a tensor map an operand");
+            // A tile stored in bulk leaves by the output's tensor map, the
+            // thread waiting for its copies.
+            let maps = 2 * usize::from(bulk) + usize::from(flushed);
+            check(ir.matches("\"nvvm.grid_constant\"").count() == maps, "a tensor map an operand, and the output");
+            check(ir.contains("@llvm.nvvm.cp.async.bulk.tensor.s2g.tile.2d(") == flushed, "the bulk store");
+            check(ir.contains("cp.async.bulk.wait_group 0;") == flushed, "the bulk store's wait");
         }
 
         match target.arch {
@@ -1304,9 +1310,11 @@ fn the_probabilities_reach_pv_through_the_lanes_on_a_no_feed_target(mask: AttnMa
 /// A ring filled in bulk reads an operand that is a view into a larger
 /// buffer, whose address is no multiple of the 16 bytes a tensor map's
 /// buffer starts on, over trips enough to refill every slot three times:
-/// each slot's barrier is waited for on both parities.
-#[test]
-fn a_bulk_fill_reads_an_offset_view_on_the_device() {
+/// each slot's barrier is waited for on both parities. Its tiles, all
+/// within the output, leave in bulk too where stored so.
+#[test_case(Store::Direct; "stored direct")]
+#[test_case(Store::Bulk; "stored in bulk")]
+fn a_bulk_fill_reads_an_offset_view_on_the_device(store: Store) {
     let Some(planner) = super::device_planner() else { return };
     if !planner.device.target.sync.slot_barrier {
         return;
@@ -1319,7 +1327,7 @@ fn a_bulk_fill_reads_an_offset_view_on_the_device() {
         schedule: Schedule::bulk(4, true),
         order: Default::default(),
         tail: None,
-        store: Default::default(),
+        store,
     };
     let prog = gemm::<BF16>(&assumed(gemm_spec(m, m, k), cfg));
     let mut seed = 5;

@@ -1,7 +1,7 @@
-//! Which fills one bulk copy moves (`cp.async.bulk.tensor`, Hopper's TMA):
-//! a whole tile, global → shared, by one thread, addressed through a tensor
-//! map of the parameter ([`svod_ir::TensorMap`]) by the tile's column and
-//! row in it.
+//! Which fills and stores one bulk copy moves (`cp.async.bulk.tensor`,
+//! Hopper's TMA): a whole tile, global → shared or back, by one thread,
+//! addressed through a tensor map of the parameter ([`svod_ir::TensorMap`])
+//! by the tile's column and row in it.
 
 use snafu::Snafu;
 use svod_ir::{TensorMap, TensorMapSwizzle};
@@ -10,7 +10,8 @@ use crate::atoms::Core;
 use crate::ir::{Phase, Place, Program, Scalar, ScalarId, ValId};
 use crate::layouts::Swizzle;
 
-/// Why a fill stays its threads' 16-byte chunks.
+/// Why a fill stays its threads' 16-byte chunks, or a shared tile is not
+/// stored whole ([`stored`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Snafu)]
 pub enum NotBulk {
     /// Its rows are gathered: no two lie a stride apart.
@@ -26,6 +27,10 @@ pub enum NotBulk {
     /// copy would bring in, where the chunks re-read the last valid row.
     #[snafu(display("its row bound is loaded"))]
     LoadedBound,
+    /// A row bound on a store: a bulk copy cuts a tile at the parameter's
+    /// end alone.
+    #[snafu(display("it has a row bound"))]
+    RowBound,
     /// The rows' stride is not a constant, or no multiple of 16 bytes that
     /// divides the parameter.
     #[snafu(display("its rows are no constant whole 16-byte chunks apart"))]
@@ -36,7 +41,7 @@ pub enum NotBulk {
     Tile,
 }
 
-/// A bulk fill: `panels` boxes of `map`'s tile side by side, the rows of
+/// A bulk copy: `panels` boxes of `map`'s tile side by side, the rows of
 /// the parameter `row` elements apart.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
@@ -46,17 +51,25 @@ pub struct Frame {
 }
 
 impl Frame {
-    /// The bytes the fill moves.
+    /// The bytes the copy moves.
     pub fn bytes(&self) -> u32 {
         self.panels as u32 * self.map.tile[0] * self.map.tile[1] * self.map.dtype.bytes() as u32
     }
 }
 
-/// The bulk fill of shared tile `dst` from global view `src` on `core`,
+/// The bulk store of shared tile `src` into global view `dst` on `core`:
+/// a [`frame`] whose view has no row bound either.
+pub fn stored<P: Phase>(prog: &Program<P>, core: Core, dst: ValId, src: ValId) -> Result<Frame, NotBulk> {
+    let Place::Global { bounds, .. } = &prog.value(dst).place else { unreachable!("a store's destination") };
+    snafu::ensure!(bounds[0].is_none(), RowBoundSnafu);
+    frame(prog, core, src, dst)
+}
+
+/// The bulk copy between shared tile `dst` and global view `src` on `core`,
 /// whose shared rows past the widest swizzle span are panels of it.
 pub fn frame<P: Phase>(prog: &Program<P>, core: Core, dst: ValId, src: ValId) -> Result<Frame, NotBulk> {
     let (d, s) = (prog.value(dst), prog.value(src));
-    let Place::Global { param, stride, bounds, rows, period, .. } = &s.place else { unreachable!("a fill's source") };
+    let Place::Global { param, stride, bounds, rows, period, .. } = &s.place else { unreachable!("a global view") };
     snafu::ensure!(rows.is_none(), GatheredSnafu);
     let constant = |id: ScalarId| match prog.scalar(id) {
         Scalar::Const(v) => usize::try_from(*v).ok(),

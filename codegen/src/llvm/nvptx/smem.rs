@@ -277,3 +277,51 @@ pub fn ldmatrix(shared_ptr: &Arc<UOp>, count: usize, trans: bool, fragment: DTyp
 #[cfg(test)]
 #[path = "../../test/unit/llvm_nvptx_smem.rs"]
 mod tests;
+
+/// One thread's bulk copy of a shared tile into global memory through the
+/// tensor map `map` (`cp.async.bulk.tensor`, shared → global), its box at
+/// column `at[0]`, row `at[1]` of the tensor; what of the box lies past the
+/// tensor is not written. `written` is an index into the parameter the map
+/// describes, which the statement so writes in place
+/// ([`UOp::read_modify_writes`]). The copy joins the thread's bulk group
+/// ([`bulk_store_wait`]).
+pub fn bulk_tensor_store(src_shared: &Arc<UOp>, map: &Arc<UOp>, at: [&Arc<UOp>; 2], written: &Arc<UOp>) -> Arc<UOp> {
+    assert!(matches!(written.op(), Op::Index(..)), "a bulk store names the memory it writes by an index");
+    assert!(at.iter().all(|c| c.dtype() == DType::Int32), "a tensor-map coordinate is i32");
+    let intrinsic = "llvm.nvvm.cp.async.bulk.tensor.s2g.tile.2d";
+    UOp::custom(
+        smallvec![
+            specific_ptr(src_shared, AddrSpace::Local),
+            map.clone(),
+            at[0].clone(),
+            at[1].clone(),
+            written.clone()
+        ],
+        format!(
+            "declare void @{intrinsic}(ptr addrspace(3), ptr, i32, i32, i64, i1)\n\
+             call void @{intrinsic}(ptr addrspace(3) {{0}}, ptr {{1}}, i32 {{2}}, i32 {{3}}, i64 0, i1 false)"
+        ),
+        DType::Void,
+    )
+}
+
+/// What the generic proxy stored in shared memory at and past `shared`,
+/// fenced for the bulk copies that read it through the async proxy
+/// (`fence.proxy.async`).
+pub fn bulk_store_fence(shared: &Arc<UOp>) -> Arc<UOp> {
+    UOp::custom(
+        smallvec![specific_ptr(shared, AddrSpace::Local)],
+        "call void asm sideeffect \"fence.proxy.async.shared::cta;\", \"~{{{{memory}}}}\"()".to_string(),
+        DType::Void,
+    )
+}
+
+/// The thread's bulk stores so far, committed as a group and complete.
+pub fn bulk_store_wait(last: &Arc<UOp>) -> Arc<UOp> {
+    UOp::custom(
+        smallvec![last.clone()],
+        "call void asm sideeffect \"cp.async.bulk.commit_group;\\0Acp.async.bulk.wait_group 0;\", \"~{{{{memory}}}}\"()"
+            .to_string(),
+        DType::Void,
+    )
+}

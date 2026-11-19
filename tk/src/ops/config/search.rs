@@ -453,16 +453,20 @@ impl Field for TailSplit {
     }
 }
 
-/// `s` where staged, nothing where direct: a code written before the field
-/// reads as direct.
+/// `s` where staged, `sb` where stored from the ring in bulk, nothing where
+/// direct: a code written before the field reads as direct.
 impl Field for Store {
     fn put(&self, out: &mut Vec<String>) {
-        if *self == Store::Staged {
-            out.push("s".into());
+        match self {
+            Store::Direct => {}
+            Store::Staged => out.push("s".into()),
+            Store::Bulk => out.push("sb".into()),
         }
     }
     fn take(fields: &mut Fields<'_>) -> Option<Self> {
-        Some(if fields.next_if_eq(&"s").is_some() { Store::Staged } else { Store::Direct })
+        let coded = [("s", Store::Staged), ("sb", Store::Bulk)];
+        let store = coded.into_iter().find_map(|(code, store)| fields.next_if_eq(&code).map(|_| store));
+        Some(store.unwrap_or(Store::Direct))
     }
 }
 

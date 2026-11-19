@@ -10,7 +10,8 @@ use smallvec::smallvec;
 use svod_codegen::llvm::Location;
 use svod_codegen::llvm::common::gpu::specific_ptr;
 use svod_codegen::llvm::nvptx::smem::{
-    bulk_tensor_load, cp_async_commit, cp_async_wait, mbarrier_arrive_expect, mbarrier_init, mbarrier_wait,
+    bulk_store_fence, bulk_store_wait, bulk_tensor_load, bulk_tensor_store, cp_async_commit, cp_async_wait,
+    mbarrier_arrive_expect, mbarrier_init, mbarrier_wait,
 };
 use svod_codegen::llvm::nvptx::wgmma;
 use svod_dtype::{AddrSpace, DType, DeviceSpec, ScalarDType};

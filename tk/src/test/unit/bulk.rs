@@ -1,11 +1,11 @@
-//! Which fills one bulk copy moves ([`crate::lower::bulk`]).
+//! Which fills and stores one bulk copy moves ([`crate::lower::bulk`]).
 
 use test_case::test_case;
 
 use super::targets::{families, group_families, hopper};
 use crate::atoms::Core;
 use crate::ir::{Stmt, Tier};
-use crate::lower::bulk::{NotBulk, frame};
+use crate::lower::bulk::{NotBulk, frame, stored};
 
 /// A fill's boxes, `(panels, [columns, rows])`.
 type Boxes = (usize, [u32; 2]);
@@ -35,4 +35,29 @@ fn a_bulk_copy_moves_plain_matrix_tiles(name: &str) -> Vec<Result<Boxes, NotBulk
     let mut fills: Vec<_> = prog.walk().filter_map(|(_, stmt)| fill(stmt)).collect();
     fills.dedup();
     fills
+}
+
+/// A tile stored in bulk leaves its ring as panels through an unbounded
+/// window of the output; the bounded window an edge tile stores through is
+/// none a bulk copy takes, which cuts a tile at the parameter's end alone.
+#[test]
+fn a_bulk_store_takes_an_unbounded_window() {
+    let target = hopper();
+    let flushed = |(name, ..): &(String, _, _)| name.ends_with("[128, 128, 64] [8, 1] flushed");
+    let (_, prog, _) = group_families(&target).into_iter().find(flushed).expect("a family");
+    let prog = &prog;
+    let copies = |to: Tier, from: Tier| -> Vec<_> {
+        let copy = |stmt: &Stmt| match stmt {
+            Stmt::Copy { dst, src, .. } if (prog.value(*dst).tier(), prog.value(*src).tier()) == (to, from) => {
+                Some((*dst, *src))
+            }
+            _ => None,
+        };
+        prog.walk().filter_map(|(_, stmt)| copy(stmt)).collect()
+    };
+    let [(whole, scratch)] = copies(Tier::Global, Tier::Smem)[..] else { panic!("one bulk store") };
+    let boxes = stored(prog, Core::Group, whole, scratch).map(|f| (f.panels, f.map.tile));
+    assert_eq!(boxes, Ok((2, [64, 128])));
+    let (bounded, _) = copies(Tier::Global, Tier::Reg)[0];
+    assert_eq!(stored(prog, Core::Group, bounded, scratch), Err(NotBulk::RowBound));
 }

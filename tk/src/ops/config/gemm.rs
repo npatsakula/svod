@@ -62,7 +62,12 @@ impl GemmCfg {
         let ([bm, bn, bk], [wr, wc]) = (self.tile, self.warps.map(|w| w as usize));
         let threads = target.wave as usize * wr * wc;
         let fills = |rows| fills_in_chunks(Shape::new(rows, bk), ELEM, threads);
-        let stored = self.store == Store::Direct || (self.stages_output(ELEM) && self.tail.is_none());
+        let staged = self.stages_output(ELEM) && self.tail.is_none();
+        let stored = match self.store {
+            Store::Direct => true,
+            Store::Staged => staged,
+            Store::Bulk => staged && self.core == Core::Group && target.sync.slot_barrier,
+        };
         self.tiles(target) && fills(bm) && fills(bn) && stored
     }
 
@@ -645,8 +650,10 @@ impl GemmProblem {
             let twins = [
                 Some((cost, cfg)),
                 fits(GemmCfg { store: Store::Staged, ..cfg }),
+                fits(GemmCfg { store: Store::Bulk, ..cfg }),
                 bulk.and_then(fits),
                 bulk.and_then(|bulk| fits(GemmCfg { store: Store::Staged, ..bulk })),
+                bulk.and_then(|bulk| fits(GemmCfg { store: Store::Bulk, ..bulk })),
                 split.map(|&(_, s)| (cost, s)),
             ];
             twins.into_iter().flatten()

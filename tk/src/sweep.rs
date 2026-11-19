@@ -622,13 +622,13 @@ pub(crate) fn hopper() -> Target {
 /// GEMM tiles on Hopper's warpgroup core: one to four warpgroups down the
 /// rows, one or two across, every swizzle span (16-, 32- and 64-deep rings
 /// are 32-, 64- and 128-byte rows), a 96-wide tile of three `n32` and a
-/// `k` of several trips, tiles staged through their rings on the way out
-/// and rings filled in bulk. Shapes stay small for the interpreter.
+/// `k` of several trips, tiles staged through their rings on the way out,
+/// stored from them in bulk, and rings filled in bulk. Shapes stay small for the interpreter.
 pub(crate) fn group_families(target: &Target) -> Vec<Launch> {
     let planner = planner(target.clone());
-    let (direct, staged) = (Store::Direct, Store::Staged);
+    let (direct, staged, flushed) = (Store::Direct, Store::Staged, Store::Bulk);
     let (ring, bulk) = (Schedule::ring as fn(usize, bool) -> Schedule, Schedule::bulk as fn(usize, bool) -> Schedule);
-    let tiles: [([usize; 3], [u32; 2], Schedule, Store); 14] = [
+    let tiles: [([usize; 3], [u32; 2], Schedule, Store); 16] = [
         ([128, 128, 64], [8, 1], ring(3, false), direct),
         ([128, 256, 64], [8, 1], ring(2, false), direct),
         ([64, 128, 32], [4, 1], ring(3, false), direct),
@@ -643,6 +643,8 @@ pub(crate) fn group_families(target: &Target) -> Vec<Launch> {
         ([64, 128, 32], [4, 1], bulk(3, false), direct),
         ([64, 64, 16], [4, 1], bulk(3, false), direct),
         ([128, 256, 64], [8, 2], bulk(4, false), staged),
+        ([128, 128, 64], [8, 1], ring(4, false), flushed),
+        ([128, 256, 64], [8, 2], bulk(4, false), flushed),
     ];
     tiles
         .into_iter()
@@ -650,13 +652,20 @@ pub(crate) fn group_families(target: &Target) -> Vec<Launch> {
             let cfg =
                 GemmCfg { tile, warps, core: Core::Group, schedule, order: TileOrder::DEFAULT, tail: None, store };
             assert!(cfg.fits(target), "{cfg:?} fits the warpgroup core");
-            let (m, n, k) = (tile[0] + 2, tile[1] - 3, 3 * tile[2]);
+            // A bulk store takes rows whole 16-byte chunks apart: two tiles
+            // across, the lower row of tiles cut at the output's edge.
+            let n = if store == Store::Bulk { 2 * tile[1] } else { tile[1] - 3 };
+            let (m, k) = (tile[0] + 2, 3 * tile[2]);
             let spec = assumed(
                 GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, windows: Default::default() },
                 cfg,
             );
             let fill = if matches!(schedule, Schedule::Bulk { .. }) { " bulk" } else { "" };
-            let store = if store == Store::Staged { " staged" } else { "" };
+            let store = match store {
+                Store::Direct => "",
+                Store::Staged => " staged",
+                Store::Bulk => " flushed",
+            };
             let name = format!("group gemm {:?} {:?}{fill}{store}", cfg.tile, cfg.warps);
             (name, gemm::<BF16>(&spec), cfg.lowering(&planner.device))
         })

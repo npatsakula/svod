@@ -100,6 +100,9 @@ pub enum Store {
     /// Through the operand ring, dead once the reduction ends, and back in
     /// the natural layout: whole 16-byte stores ([`GemmCfg::stages_output`]).
     Staged,
+    /// Through the ring alike, and from it in bulk ([`Kernel::flush`]) where
+    /// the tile lies within the output; a tile across its edge is `Staged`.
+    Bulk,
 }
 
 /// The tune store keys by this text ([`Schedule`]'s included, the
@@ -589,7 +592,7 @@ fn build<'k, T: MmaIn, U: Elem>(
         cfg.store == Store::Direct || (!partial && cfg.stages_output(T::DTYPE.bytes())),
         "{cfg:?} stages no output"
     );
-    let staged = (cfg.store == Store::Staged).then_some(ring);
+    let staged = (cfg.store != Store::Direct).then_some((ring, cfg.store == Store::Bulk));
     let accs = accs.into_iter().map(|acc| T::widened(k, acc)).collect();
     let tile = Tile2 { m, n, bm, bn, row0, col0, bounds: [bound(m, bm), bound(n, bn)] };
     let dest = match slots {
@@ -633,7 +636,8 @@ enum Dest<'k, U> {
 }
 
 /// The epilogue on the f32 accumulators (two when gated) and the store,
-/// through `staged` where the tile is [`Store::Staged`].
+/// through the ring `staged` where the tile is [`Store::Staged`], in bulk
+/// from it where its flag is set ([`Store::Bulk`]).
 #[allow(clippy::too_many_arguments)]
 fn finish<'k, T: Elem, U: Elem>(
     k: &mut Kernel<'k>,
@@ -645,7 +649,7 @@ fn finish<'k, T: Elem, U: Elem>(
     c: Dest<'k, U>,
     bb: &Option<Sc<'k>>,
     t: &Tile2<'k>,
-    staged: Option<Ring<'k, T>>,
+    staged: Option<(Ring<'k, T>, bool)>,
 ) {
     let Tile2 { n, bn, ref col0, ref bounds, .. } = *t;
     let n_bound = bounds[1].clone();
@@ -677,20 +681,34 @@ fn finish<'k, T: Elem, U: Elem>(
         out = k.binary(out, r, BinaryOp::Add);
     }
     let out = k.cast::<F32, U>(out);
+    let window = if let Dest::Tile(c, w) = &c { Some((*c, *w)) } else { None };
     let c_view = match c {
         Dest::Tile(c, w) => tile(k, c, w, bb, t),
         Dest::Slot(c, at) => k.view(c, at, [bn, 1], Shape::new(t.bm, bn), t.within()),
     };
-    let out = match staged {
-        // SAFETY: the reduction's pipeline, the ring's only one, has ended.
-        Some(ring) => {
-            let scratch = unsafe { k.ring_scratch::<U>(ring, 0, Shape::new(t.bm, bn)) };
-            k.store(scratch, out);
-            k.load(scratch)
-        }
-        None => out,
+    let Some((ring, bulk)) = staged else { return k.store(c_view, out) };
+    // SAFETY: the reduction's pipeline, the ring's only one, has ended.
+    let scratch = unsafe { k.ring_scratch::<U>(ring, 0, Shape::new(t.bm, bn)) };
+    k.store(scratch, out);
+    let natural = |k: &mut Kernel<'k>| {
+        let out = k.load(scratch);
+        k.store(c_view, out);
     };
-    k.store(c_view, out);
+    let Some((c, w)) = window.filter(|_| bulk) else { return natural(k) };
+    let whole = |k: &mut Kernel<'k>| {
+        let c_view =
+            tile(k, c, w, bb, &Tile2 { bounds: [None, None], row0: t.row0.clone(), col0: t.col0.clone(), ..*t });
+        k.flush(c_view, scratch);
+    };
+    // A tile within the output on both axes; one across an edge is cut there.
+    let within = [(&t.bounds[0], &t.row0, t.bm), (&t.bounds[1], &t.col0, bn)]
+        .into_iter()
+        .filter_map(|(bound, at, len)| Some((at.clone() + len).le(bound.clone()?)))
+        .reduce(|a, b| a.and(b));
+    match within {
+        Some(within) => k.if_(within, whole, natural),
+        None => whole(k),
+    }
 }
 
 /// The block's `[bm, bn]` tile of an `[m, n]` parameter laid out in `w`.

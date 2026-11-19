@@ -319,3 +319,38 @@ fn a_slot_barrier_compiles_to_ptx() {
         assert!(ptx.contains(needle), "missing {needle}:\n{ptx}");
     }
 }
+
+/// One lane stores a shared tile through a tensor map in bulk: the fence
+/// over what the generic proxy wrote there, the copy, and its group's wait.
+#[test]
+fn a_bulk_store_compiles_to_ptx() {
+    let l = lane();
+    let tile = UOp::buffer(0, 256, DType::BFloat16, AddrSpace::Local, None);
+    let map = svod_ir::TensorMap::new(
+        1,
+        svod_dtype::ScalarDType::BFloat16,
+        [16, 16],
+        [16, 16],
+        svod_ir::TensorMapSwizzle::None,
+    );
+    let map = UOp::tensor_map_param(2, map.unwrap());
+    let from = shared_at(&tile, UOp::native_const(0i32));
+    let zero = UOp::native_const(0i32);
+    let fence = bulk_store_fence(&from);
+    let from = shared_at(&tile.after(smallvec![fence]), UOp::native_const(0i32));
+    let store = bulk_tensor_store(&from, &map, [&zero, &zero], &global_at(1, DType::BFloat16, l));
+    let sink = UOp::sink(vec![bulk_store_wait(&store)]);
+
+    let rendered = render_nvptx_linearized(&sink, SM90, "nvptx_bulk_store");
+    for needle in [
+        "fence.proxy.async.shared::cta;",
+        "call void @llvm.nvvm.cp.async.bulk.tensor.s2g.tile.2d(ptr addrspace(3) %",
+        "cp.async.bulk.commit_group;\\0Acp.async.bulk.wait_group 0;",
+    ] {
+        assert!(rendered.code.contains(needle), "missing {needle}:\n{}", rendered.code);
+    }
+    let Some(ptx) = assert_ptx_compiles(&rendered.code, SM90) else { return };
+    for needle in ["cp.async.bulk.tensor.2d.global.shared::cta.tile", "cp.async.bulk.wait_group 0"] {
+        assert!(ptx.contains(needle), "missing {needle}:\n{ptx}");
+    }
+}
