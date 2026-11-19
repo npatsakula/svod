@@ -19,6 +19,8 @@ use crate::tune;
 #[test_case("rtx3060", 28, 1, 99 << 10; "sm_86")]
 #[test_case("h100-pcie", 114, 1, 227 << 10; "sm_90 pcie")]
 #[test_case("h100-sxm", 132, 1, 227 << 10; "sm_90 sxm")]
+#[test_case("h200-sxm", 132, 1, 227 << 10; "sm_90 h200 sxm")]
+#[test_case("h200-nvl", 132, 1, 227 << 10; "sm_90 h200 nvl")]
 #[test_case("rtx5070", 48, 1, 99 << 10; "sm_120 5070")]
 #[test_case("rtx5090", 170, 1, 99 << 10; "sm_120 5090")]
 #[test_case("mi300x", 304, 8, 64 << 10; "gfx942")]
@@ -38,6 +40,28 @@ fn every_card_is_named_once() {
     names.dedup();
     assert_eq!(names.len(), CARDS.len());
     assert_eq!(Target::card("no such card").map(|t| t.arch), None);
+}
+
+/// Every card keeps a store of its own, cards of one architecture and SM
+/// count told apart by the model their driver names, and a store's device
+/// name reads back as the card's target.
+#[test]
+fn every_card_has_its_own_store() {
+    let mut devices: Vec<String> = CARDS.iter().map(|c| tune::device(&Target::card(c.0).unwrap())).collect();
+    assert!(devices.contains(&"sm_90-132sm-h200-nvl".to_string()), "{devices:?}");
+    for (card, device) in CARDS.iter().zip(&devices) {
+        assert_eq!(crate::rank::target(device), Target::card(card.0), "{device}");
+    }
+    devices.sort_unstable();
+    devices.dedup();
+    assert_eq!(devices.len(), CARDS.len());
+}
+
+#[test_case("NVIDIA H200 NVL", "h200-nvl")]
+#[test_case("NVIDIA H100 80GB HBM3", "h100-80gb-hbm3")]
+#[test_case("NVIDIA GeForce RTX 3060", "rtx-3060")]
+fn a_drivers_name_is_spelled_for_the_store(name: &str, model: &str) {
+    assert_eq!(crate::atoms::model_of(name), model);
 }
 
 /// The probe values an H100 PCIe stored on 2026-10-18, in femtoseconds per unit.
@@ -65,6 +89,9 @@ const H100: [(&str, u64); 21] = [
     ("cached_128m", 43500),
 ];
 
+/// The H100 PCIe's name in the store.
+const PCIE: &str = "sm_90-114sm-h100-pcie";
+
 /// A probe's store line for `device` under another compiler and probe
 /// programs (`programs`) than this build's.
 pub(super) fn line(device: &str, op: &str, programs: &str, fs: u64) -> String {
@@ -85,20 +112,20 @@ fn store(name: &str, target: &Target, lines: &[String]) -> Scratch {
 #[test]
 fn costs_read_from_a_copied_store() {
     let target = Target::card("h100-pcie").expect("a listed card");
-    let mut lines: Vec<String> = H100.iter().map(|&(op, fs)| line("sm_90-114sm", op, "0000000000000001", fs)).collect();
-    lines.push(line("sm_90-132sm", "step", "0000000000000001", 1));
-    lines.push(
-        "choice|gemm|sm_90-114sm|BFloat16|1x4096x4096x4096|0000000000000003|00000000000000aa|0000000000000004 0 100"
-            .into(),
-    );
+    let mut lines: Vec<String> = H100.iter().map(|&(op, fs)| line(PCIE, op, "0000000000000001", fs)).collect();
+    lines.push(line("sm_90-132sm-h100-80gb-hbm3", "step", "0000000000000001", 1));
+    lines.push(format!(
+        "choice|gemm|{PCIE}|BFloat16|1x4096x4096x4096|0000000000000003|00000000000000aa|0000000000000004 0 100"
+    ));
     let dir = store("copied", &target, &lines);
     let before: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| std::fs::read(e.unwrap().path()).unwrap()).collect();
     let Measured { costs, unmeasured } = probe::stored(&dir, &target).expect("the device's file");
     // Probes added since the store was copied are unmeasured.
-    assert_eq!(unmeasured, ["step_i8", "step_lone_i8", "trip_lone", "trip_one_lone", "latency_one"]);
+    assert_eq!(unmeasured, ["step_i8", "step_lone_i8", "step_lone_group", "trip_lone", "trip_one_lone", "latency_one"]);
     // A rolled ring is not probed where fills are `cp.async`: its line is passed over.
     let want = |op: &str| match op {
-        "step_wide" | "step_i8" | "step_lone_i8" | "trip_rolled" | "trip_lone" | "trip_one_lone" | "latency_one" => 0.0,
+        "step_wide" | "step_i8" | "step_lone_i8" | "step_lone_group" | "trip_rolled" | "trip_lone"
+        | "trip_one_lone" | "latency_one" => 0.0,
         _ => H100.iter().find(|f| f.0 == op).expect("a probe").1 as f64 * 1e-6,
     };
     let mut costs = costs;
@@ -110,7 +137,7 @@ fn costs_read_from_a_copied_store() {
     assert!((40e6..60e6).contains(&costs.l2_bytes), "{}", costs.l2_bytes);
     let after: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| std::fs::read(e.unwrap().path()).unwrap()).collect();
     assert_eq!(before, after, "the store is read, never written");
-    assert_eq!(probe::stored(&dir, &Target::card("h100-sxm").unwrap()), None, "no file for 132 SMs");
+    assert_eq!(probe::stored(&dir, &Target::card("h100-sxm").unwrap()), None, "no file for the SXM");
 }
 
 /// Of a probe's several lines the one this build's programs measured
@@ -124,13 +151,13 @@ fn a_probe_of_several_lines_takes_this_builds() {
     let mut lines: Vec<String> = H100
         .iter()
         .filter(|f| !matches!(f.0, "step" | "trip" | "latency" | "cached_2m"))
-        .map(|&(op, fs)| line("sm_90-114sm", op, "0000000000000001", fs))
+        .map(|&(op, fs)| line(PCIE, op, "0000000000000001", fs))
         .collect();
     lines.extend([
-        line("sm_90-114sm", "step", "0000000000000001", 9_000_000),
-        line("sm_90-114sm", "step", &ours, 2_000_000),
-        line("sm_90-114sm", "trip", "0000000000000001", 1),
-        line("sm_90-114sm", "trip", "0000000000000002", 2),
+        line(PCIE, "step", "0000000000000001", 9_000_000),
+        line(PCIE, "step", &ours, 2_000_000),
+        line(PCIE, "trip", "0000000000000001", 1),
+        line(PCIE, "trip", "0000000000000002", 2),
     ]);
     let dir = store("several", &target, &lines);
     let Measured { costs, unmeasured } = probe::stored(&dir, &target).expect("the device's file");
@@ -141,7 +168,10 @@ fn a_probe_of_several_lines_takes_this_builds() {
     // only past 128 MB).
     assert!(costs.l2_bytes > 0.0, "{}", costs.l2_bytes);
     assert_eq!(costs.ladder.iter().filter(|&&(f, _)| f > 0).count(), 7);
-    assert_eq!(unmeasured, ["step_i8", "step_lone_i8", "trip", "trip_lone", "trip_one_lone", "latency", "latency_one"]);
+    assert_eq!(
+        unmeasured,
+        ["step_i8", "step_lone_i8", "step_lone_group", "trip", "trip_lone", "trip_one_lone", "latency", "latency_one"]
+    );
 }
 
 /// A planner needs no device: a card's target under its stored costs
@@ -151,7 +181,7 @@ fn a_probe_of_several_lines_takes_this_builds() {
 #[test]
 fn a_planner_plans_for_a_card_without_it() {
     let target = Target::card("h100-pcie").expect("a listed card");
-    let lines: Vec<String> = H100.iter().map(|&(op, fs)| line("sm_90-114sm", op, "0000000000000001", fs)).collect();
+    let lines: Vec<String> = H100.iter().map(|&(op, fs)| line(PCIE, op, "0000000000000001", fs)).collect();
     let dir = store("planner", &target, &lines);
     let planner = Planner::measured(target, probe::stored(&dir, &Target::card("h100-pcie").unwrap()).unwrap())
         .expect("an H100 has SMs");

@@ -20,7 +20,7 @@ use crate::ir::{Program, Schedule, Var};
 use crate::kernels::attention::{AttnMask, AttnSpec, Bias, CacheLayout, Chunk, CombineSpec, FaCfg, attention, combine};
 use crate::kernels::conv::{ConvCfg, ConvGeom, ConvSpec};
 use crate::kernels::gemm::{
-    Epilogue, GemmCfg, GemmSpec, Scale, TailPlan, TailSpec, TailSplit, TileOrder, gemm, gemm_tail,
+    Epilogue, GemmCfg, GemmSpec, Scale, Store, TailPlan, TailSpec, TailSplit, TileOrder, gemm, gemm_tail,
 };
 use crate::kernels::heads::{HeadsSpec, Rope, heads};
 use crate::kernels::nearest::{
@@ -622,36 +622,38 @@ pub(crate) fn hopper() -> Target {
 /// GEMM tiles on Hopper's warpgroup core: one to four warpgroups down the
 /// rows, one or two across, every swizzle span (16-, 32- and 64-deep rings
 /// are 32-, 64- and 128-byte rows), a 96-wide tile of three `n32` and a
-/// `k` of several trips. Shapes stay small for the interpreter.
+/// `k` of several trips and tiles staged through their rings on the way
+/// out. Shapes stay small for the interpreter.
 pub(crate) fn group_families(target: &Target) -> Vec<Launch> {
     let planner = planner(target.clone());
-    let tiles: [([usize; 3], [u32; 2], usize); 7] = [
-        ([128, 128, 64], [8, 1], 3),
-        ([128, 256, 64], [8, 1], 2),
-        ([64, 128, 32], [4, 1], 3),
-        ([64, 64, 16], [4, 1], 3),
-        ([128, 96, 64], [8, 1], 2),
-        ([256, 128, 64], [16, 1], 2),
-        ([128, 256, 64], [8, 2], 2),
+    let (direct, staged) = (Store::Direct, Store::Staged);
+    let ring = Schedule::ring;
+    let tiles: [([usize; 3], [u32; 2], Schedule, Store); 10] = [
+        ([128, 128, 64], [8, 1], ring(3, false), direct),
+        ([128, 256, 64], [8, 1], ring(2, false), direct),
+        ([64, 128, 32], [4, 1], ring(3, false), direct),
+        ([64, 64, 16], [4, 1], ring(3, false), direct),
+        ([128, 96, 64], [8, 1], ring(2, false), direct),
+        ([256, 128, 64], [16, 1], ring(2, false), direct),
+        ([128, 256, 64], [8, 2], ring(2, false), direct),
+        ([128, 128, 64], [8, 1], ring(4, false), staged),
+        ([64, 128, 32], [4, 1], ring(4, false), staged),
+        ([128, 256, 64], [8, 2], ring(4, false), staged),
     ];
     tiles
         .into_iter()
-        .map(|(tile, warps, stages)| {
-            let cfg = GemmCfg {
-                tile,
-                warps,
-                core: Core::Group,
-                schedule: Schedule::ring(stages, false),
-                order: TileOrder::DEFAULT,
-                tail: None,
-            };
+        .map(|(tile, warps, schedule, store)| {
+            let cfg =
+                GemmCfg { tile, warps, core: Core::Group, schedule, order: TileOrder::DEFAULT, tail: None, store };
             assert!(cfg.fits(target), "{cfg:?} fits the warpgroup core");
             let (m, n, k) = (tile[0] + 2, tile[1] - 3, 3 * tile[2]);
             let spec = assumed(
                 GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, windows: Default::default() },
                 cfg,
             );
-            (format!("group gemm {:?} {:?}", cfg.tile, cfg.warps), gemm::<BF16>(&spec), cfg.lowering(&planner.device))
+            let store = if store == Store::Staged { " staged" } else { "" };
+            let name = format!("group gemm {:?} {:?}{store}", cfg.tile, cfg.warps);
+            (name, gemm::<BF16>(&spec), cfg.lowering(&planner.device))
         })
         .collect()
 }

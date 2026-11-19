@@ -10,7 +10,7 @@ use std::num::NonZeroUsize;
 
 use crate::ir::{Axis, Schedule, Shape};
 use crate::kernels::Act;
-use crate::kernels::gemm::{Epilogue, GemmCfg, Rope, TAIL_MERGE, TailPlan, TailSpec, TailSplit, TileOrder};
+use crate::kernels::gemm::{Epilogue, GemmCfg, Rope, Store, TAIL_MERGE, TailPlan, TailSpec, TailSplit, TileOrder};
 use crate::layouts::{Issue, Swizzle, WarpGrid, chunked, fills_in_chunks};
 use crate::tune::SETTLED;
 
@@ -58,7 +58,8 @@ impl GemmCfg {
         let ([bm, bn, bk], [wr, wc]) = (self.tile, self.warps.map(|w| w as usize));
         let threads = target.wave as usize * wr * wc;
         let fills = |rows| fills_in_chunks(Shape::new(rows, bk), ELEM, threads);
-        self.tiles(target) && fills(bm) && fills(bn)
+        let stored = self.store == Store::Direct || (self.stages_output(ELEM) && self.tail.is_none());
+        self.tiles(target) && fills(bm) && fills(bn) && stored
     }
 
     /// The registers a lane holds for a GEMM over a weight of `halves`
@@ -116,6 +117,7 @@ pub(crate) const fn gemm_cfg(tile: [usize; 3], stages: usize, warps: [u32; 2], u
         schedule: Schedule::ring(stages, unroll),
         order: TileOrder::DEFAULT,
         tail: None,
+        store: Store::Direct,
     }
 }
 
@@ -190,7 +192,7 @@ pub fn gemm_lattice(target: &Target) -> Vec<GemmCfg> {
         (Fill::Staged, _) => &[(Core::Warp, &GRIDS, &[2, 1])],
         (Fill::CpAsync, true) => &[(Core::Warp, &GRIDS, &[3, 2, 1])],
         // A warpgroup ring keeps a chain in flight in a slot of its own.
-        (Fill::CpAsync, false) => &[(Core::Warp, &GRIDS, &[3, 2, 1]), (Core::Group, &GROUP_GRIDS, &[4, 3])],
+        (Fill::CpAsync, false) => &[(Core::Warp, &GRIDS, &[3, 2, 1]), (Core::Group, &GROUP_GRIDS, &[6, 5, 4, 3])],
     };
     let mut out = vec![];
     for bm in ROWS {
@@ -519,6 +521,7 @@ impl GemmProblem {
             stores: 0.0,
             out: if split { bm * bn * F32 } else { bm * bn * self.out + bn * self.bias } as f64,
             ring: stages,
+            ahead: stages.saturating_sub(1 + usize::from(crate::schedule::in_flight(target.fill, cfg.core, stages))),
             unroll: cfg.unroll(),
             waits: 0.0,
             sections: [merge, Spread::default()],
@@ -609,7 +612,11 @@ impl GemmProblem {
     /// pipeline it splits, a twin the tuner times beside that pipeline
     /// ([`Tiled::twins`]) and nothing else reaches: a split never stands
     /// for its tile ([`Tiled::represents`]), so neither the shortlist nor
-    /// the untuned first pick takes one.
+    /// the untuned first pick takes one. A warpgroup pipeline whose ring
+    /// holds its output tile carries its [`Store::Staged`] twin alike, at
+    /// the pipeline's price: the model has no term that tells the stores
+    /// apart, and the device's order of them turns with the trips a tile
+    /// runs.
     pub(crate) fn ranked(&self, planner: &Planner) -> Vec<GemmCfg> {
         let feasible = planner.feasible(self);
         let planned: Vec<_> = feasible.iter().filter_map(|f| self.planned(planner, f)).collect();
@@ -626,7 +633,11 @@ impl GemmProblem {
         }
         let twinned = ranked.into_iter().flat_map(|(cost, _, cfg)| {
             let split = splits.get(&cfg.tile()).filter(|(_, s)| GemmCfg { tail: None, ..*s } == cfg);
-            [Some((cost, cfg)), split.map(|&(_, s)| (cost, s))].into_iter().flatten()
+            let target = &planner.device.target;
+            let fits = |twin: GemmCfg| (cfg.core == Core::Group && twin.fits(target)).then_some((cost, twin));
+            let twins =
+                [Some((cost, cfg)), fits(GemmCfg { store: Store::Staged, ..cfg }), split.map(|&(_, s)| (cost, s))];
+            twins.into_iter().flatten()
         });
         spread(twinned.collect(), |c| [c.tile[0], c.tile[1]])
     }

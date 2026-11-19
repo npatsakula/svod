@@ -80,7 +80,7 @@ fn main() -> Result<()> {
     let num = |name: &str| opt(name).map(str::parse::<usize>).transpose();
 
     let target = target(opt("--card"), opt("--arch"), num("--sms")?, num("--xcds")?)?;
-    let device = format!("{}-{}sm", target.arch.target_name(), target.sms.unwrap_or(0));
+    let device = svod_tk::tune::device(&target);
     let stored = opt("--store").and_then(|dir| probe::stored(Path::new(dir), &target));
     let measured = match stored {
         Some(m) => {

@@ -474,6 +474,7 @@ impl NearestProblem {
             stores,
             out: 0.0,
             ring: stages,
+            ahead: stages.saturating_sub(1),
             unroll: cfg.unroll(),
             waits,
             sections,

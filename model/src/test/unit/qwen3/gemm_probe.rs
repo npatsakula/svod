@@ -37,6 +37,7 @@ const fn cfg(tile: [usize; 3], warps: [u32; 2], unroll: bool) -> GemmCfg {
         schedule: Schedule::ring(2, unroll),
         order: TileOrder::DEFAULT,
         tail: None,
+        store: svod_tk::kernels::gemm::Store::Direct,
     }
 }
 

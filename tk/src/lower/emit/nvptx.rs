@@ -206,6 +206,16 @@ impl Emit<'_> {
     }
 }
 
+/// An f32 `2^x` as the hardware instruction alone (`ex2.approx.ftz.f32`).
+pub(super) fn exp2_f32(x: &Arc<UOp>) -> Arc<UOp> {
+    UOp::custom(
+        smallvec![x.clone()],
+        "declare float @llvm.nvvm.ex2.approx.ftz.f(float)\ncall float @llvm.nvvm.ex2.approx.ftz.f(float {0})"
+            .to_string(),
+        DType::Float32,
+    )
+}
+
 /// A warp's own barrier over its shared accesses (`bar.warp.sync`), after `last`.
 pub(super) fn warp_barrier(last: &Arc<UOp>) -> Arc<UOp> {
     UOp::custom(

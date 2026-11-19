@@ -312,6 +312,10 @@ pub(crate) struct Claim {
     /// prefetch runs.
     pub ring: usize,
     pub unroll: bool,
+    /// The trips ahead of its consume the ring's fill runs: one fewer than
+    /// its slots, and one fewer again where a warpgroup's chained products
+    /// stay in flight in a slot ([`crate::schedule::in_flight`]).
+    pub ahead: usize,
     /// Whole-ring restarts outside the trips, in memory latencies: a
     /// streamed tile's ring starts empty at every tile.
     pub waits: f64,
@@ -523,7 +527,7 @@ impl Planner {
     /// many times slower. A round of blocks is at least one wave's own issue
     /// (a block of fewer waves than SIMDs leaves the rest idle), and every
     /// round of every trip pays the memory latency the ring cannot hide (it
-    /// prefetches `stages - 1` trips ahead; a one-slot `cp.async` ring none,
+    /// prefetches [`Claim::ahead`] trips ahead; a one-slot `cp.async` ring none,
     /// [`crate::atoms::Costs::latency_one`]) on top of its issue: the latency
     /// adds rather than hides under the issue. The blocks
     /// the SM runs at once hide that round's wait among themselves as far as
@@ -542,6 +546,11 @@ impl Planner {
             // does not scale with its step's throughput.
             Steps::I8(_) if costs.step_lone_i8 > 0.0 && costs.step_i8 > 0.0 => {
                 (costs.step_lone_i8 / costs.step_i8).max(1.0)
+            }
+            // A warpgroup's chain hides with its own lone ratio alike: its
+            // one instruction spans what a wave's chains pipeline over.
+            Steps::Group(_) if costs.step_lone_group > 0.0 && costs.step_group > 0.0 => {
+                (costs.step_lone_group / costs.step_group).max(1.0)
             }
             _ => costs.hide(),
         };
@@ -590,7 +599,7 @@ impl Planner {
         // at least what a ring one trip ahead leaves.
         let wait = match stages {
             ..=1 if serial => costs.latency_one.max(costs.latency),
-            s => costs.latency / s.saturating_sub(1).max(1) as f64,
+            _ => costs.latency / claim.ahead.max(1) as f64,
         };
         let hiding = costs.wait_hiding(serial, crate::probe::trip_blocks(target));
         let wait = wait * (at_once as f64).powf(1.0 - hiding);

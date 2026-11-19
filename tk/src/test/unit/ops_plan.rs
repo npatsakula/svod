@@ -16,7 +16,7 @@ use crate::build::BF16 as BF16T;
 use crate::ir::Schedule;
 use crate::kernels::attention::{FaCfg, Forms, WARP_ROWS, narrowest_warp_rows};
 use crate::kernels::conv::ConvCfg;
-use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Scale, gemm};
+use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Scale, Store, gemm};
 use crate::kernels::nearest::{Floors, Metric, NearestCfg};
 use crate::kernels::rows::NormCfg;
 use crate::ops::attention::{descend, split_ranked};
@@ -106,6 +106,31 @@ fn the_ranking_drops_what_a_lane_cannot_hold(target: Target, gated: bool) {
     }));
     let has = |tile: [usize; 3], warps: [u32; 2]| ranked.iter().any(|c| c.tile == tile && c.warps == warps);
     assert_eq!((has([256, 96, 32], [2, 1]), has([64, 64, 32], [2, 2])), (false, true));
+}
+
+/// A warpgroup pipeline whose ring holds its output tile is ranked with its
+/// staged twin right behind it, which stands for no tile and so is never
+/// the untuned pick; a ring too small for the tile, a tail split and the
+/// warp-level core carry none.
+#[test_case(crate::sweep::hopper(), true; "sm_90")]
+#[test_case(sm86(), false; "sm_86")]
+#[test_case(amd(AmdArch::Gfx942, 304), false; "gfx942")]
+fn a_staged_store_is_a_twin_of_its_warpgroup_pipeline(target: Target, staged: bool) {
+    let ranked = planner(target.clone()).gemm_ranked(1, 4096, 4096, 4096, &Epilogue::DEFAULT);
+    let twins: Vec<usize> = (0..ranked.len()).filter(|&i| ranked[i].store == Store::Staged).collect();
+    assert_eq!(!twins.is_empty(), staged, "{target:?}");
+    for i in twins {
+        let (twin, plain) = (ranked[i], ranked[i - 1]);
+        assert_eq!(GemmCfg { store: Store::Direct, ..twin }, plain, "behind its pipeline");
+        assert!(twin.core == Core::Group && twin.stages_output(2) && twin.tail.is_none(), "{twin:?}");
+        assert!(!twin.represents() && twin.tile() == plain.tile() && twin.fits(&target), "{twin:?}");
+    }
+    let plain = |c: &&GemmCfg| c.core == Core::Group && c.store == Store::Direct && c.tail.is_none();
+    for c in ranked.iter().filter(plain) {
+        let twin = GemmCfg { store: Store::Staged, ..*c };
+        assert_eq!(ranked.contains(&twin), c.stages_output(2), "{c:?}");
+    }
+    assert!(config::representatives(&ranked).iter().all(|c| c.store == Store::Direct));
 }
 
 /// Under sm_86's shared memory and under a static 48 KB cap alike.
@@ -227,6 +252,7 @@ impl Planner {
             stores: 0.0,
             out: 0.0,
             ring: g.stages,
+            ahead: g.stages.saturating_sub(1),
             unroll: false,
             waits: 0.0,
             sections: [config::Spread::default(); 2],

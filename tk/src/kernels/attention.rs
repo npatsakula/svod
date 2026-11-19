@@ -968,15 +968,16 @@ fn merged<'k>(k: &mut Kernel<'k>, parts: &[State<'k>]) -> State<'k> {
     State { m, l: l.expect("a part"), o: o.expect("a part") }
 }
 
-/// `acc / l` row by row, where a row no key reached (its sum `l` is zero,
-/// and so is its accumulator) comes out as zeros, as the graph writes it,
-/// rather than as the NaN of a division by zero.
+/// `acc / l` row by row, as one reciprocal a row; a row no key reached (its
+/// sum `l` is zero, and so is its accumulator) comes out as zeros, as the
+/// graph writes it, rather than as the NaN of a division by zero.
 fn normalized<'k>(k: &mut Kernel<'k>, acc: Regs<'k, F32>, l: Regs<'k, F32>, rows: usize) -> Regs<'k, F32> {
     let zero = k.zeros::<F32>(Shape::new(rows, 1));
     let one = k.fill::<F32>(Shape::new(rows, 1), Const::Float(1.0));
     let empty = k.compare(l, zero, CmpOp::Eq);
     let l = k.where_(empty, one, l);
-    k.binary(acc, l, BinaryOp::Div)
+    let per = k.unary(l, UnaryOp::Recip);
+    k.binary(acc, per, BinaryOp::Mul)
 }
 
 /// Parameters in order: `o_part`, `m_part`, `l_part` (f32, as the

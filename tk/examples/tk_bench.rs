@@ -31,7 +31,7 @@
 //!   chosen from); `--picks` times the picks alone, an A/B across builds.
 //! - `trips`: the trip probes at 1–48 blocks an SM, per block-trip and per
 //!   round ([`svod_tk::probe::trip_at`]): what `TRIP_HIDING` is fitted to.
-//! - `pin --cfg BMxBNxBK:S:WRxWC[:rolled],… [--shape MxNxK,…] [--residual]
+//! - `pin --cfg BMxBNxBK:S:WRxWC[:rolled][:group][:staged],… [--shape MxNxK,…] [--residual]
 //!   [--gated]`: each pinned GEMM config on each shape (Whisper's fc2 by
 //!   default, a SwiGLU epilogue under `--gated`),
 //!   timed beside the model's price and that price with one term zeroed at
@@ -74,7 +74,7 @@ use svod_tk::atoms::{Core, Costs, Device};
 use svod_tk::ir::Schedule;
 use svod_tk::kernels::attention::{AttnMask, AttnSpec, Bias, FaCfg};
 use svod_tk::kernels::conv::{ConvCfg, ConvGeom, ConvSpec};
-use svod_tk::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, TileOrder};
+use svod_tk::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Store, TileOrder};
 use svod_tk::kernels::nearest::{Floors, Metric, NearestCfg, NearestSpec};
 use svod_tk::kernels::{Act, Batch};
 use svod_tk::ops::config::{AttentionProblem, ConvProblem, GemmProblem, NearestProblem, Planner};
@@ -184,7 +184,9 @@ fn rate(t: Option<Duration>, work: f64, unit: &str) -> String {
 }
 
 fn gemm_label(c: &GemmCfg) -> String {
-    format!("{:?} s{} {:?} unroll={} {:?} crews={}", c.tile, c.stages(), c.warps, c.unroll(), c.core, c.crews())
+    let staged = if c.store == Store::Staged { " staged" } else { "" };
+    let (tile, stages, warps, unroll) = (c.tile, c.stages(), c.warps, c.unroll());
+    format!("{tile:?} s{stages} {warps:?} unroll={unroll} {:?} crews={}{staged}", c.core, c.crews())
 }
 
 /// A bf16 GEMM at `cfg`, admitted: the programs the op launches.
@@ -576,25 +578,29 @@ fn trips_bench() -> Result<()> {
     Ok(())
 }
 
-/// A pinned config, `BMxBNxBK:S:WRxWC[:rolled]`, on the warp core in the
+/// A pinned config, `BMxBNxBK:S:WRxWC[:rolled][:group][:staged]`, on the warp core unless `group`, in the
 /// default raster.
 fn pinned(code: &str) -> Result<GemmCfg> {
     let dims = |s: &str| -> Result<Vec<usize>> { Ok(s.split('x').map(str::parse).collect::<Result<_, _>>()?) };
     let parts: Vec<&str> = code.split(':').collect();
-    let (tile, stages, warps) = match parts[..] {
-        [tile, stages, warps] | [tile, stages, warps, "rolled"] => (dims(tile)?, stages.parse()?, dims(warps)?),
-        _ => return Err(format!("{code}: BMxBNxBK:S:WRxWC[:rolled]").into()),
-    };
+    let usage = || format!("{code}: BMxBNxBK:S:WRxWC[:rolled][:group][:staged]");
+    let [tile, stages, warps, flags @ ..] = &parts[..] else { return Err(usage().into()) };
+    if let Some(flag) = flags.iter().find(|flag| !["rolled", "group", "staged"].contains(flag)) {
+        return Err(format!("{}: no flag {flag}", usage()).into());
+    }
+    let flag = |name: &str| flags.contains(&name);
+    let (tile, stages, warps): (_, usize, _) = (dims(tile)?, stages.parse()?, dims(warps)?);
     let (&[bm, bn, bk], &[wr, wc]) = (&tile[..], &warps[..]) else {
         return Err(format!("{code}: three tile dims, two warp dims").into());
     };
     Ok(GemmCfg {
         tile: [bm, bn, bk],
         warps: [wr as u32, wc as u32],
-        core: Core::Warp,
-        schedule: Schedule::ring(stages, parts.len() == 3),
+        core: if flag("group") { Core::Group } else { Core::Warp },
+        schedule: Schedule::ring(stages, !flag("rolled")),
         order: TileOrder::DEFAULT,
         tail: None,
+        store: if flag("staged") { Store::Staged } else { Store::Direct },
     })
 }
 

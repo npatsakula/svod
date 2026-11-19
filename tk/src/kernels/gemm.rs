@@ -91,8 +91,19 @@ impl fmt::Debug for Scale {
     }
 }
 
+/// How a block's output tile reaches global memory.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Store {
+    /// From the accumulators' layout, a product's short runs each a store.
+    #[default]
+    Direct,
+    /// Through the operand ring, dead once the reduction ends, and back in
+    /// the natural layout: whole 16-byte stores ([`GemmCfg::stages_output`]).
+    Staged,
+}
+
 /// The tune store keys by this text ([`Schedule`]'s included, the
-/// [`TileOrder`] only off its default).
+/// [`TileOrder`] and the [`Store`] only off their defaults).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GemmCfg {
     /// `[bm, bn, bk]`.
@@ -109,11 +120,12 @@ pub struct GemmCfg {
     /// The last, partial wave of tiles split along K ([`TailPlan`]); every
     /// tile data-parallel where `None`.
     pub tail: Option<TailSplit>,
+    pub store: Store,
 }
 
-/// The raster prints only off [`TileOrder::DEFAULT`] and the tail split
-/// only where there is one, so a ranking's text names them only where a
-/// config differs.
+/// The raster prints only off [`TileOrder::DEFAULT`], the tail split only
+/// where there is one and the store only where staged, so a ranking's text
+/// names them only where a config differs.
 impl fmt::Debug for GemmCfg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut s = f.debug_struct("GemmCfg");
@@ -124,6 +136,9 @@ impl fmt::Debug for GemmCfg {
         }
         if let Some(tail) = self.tail {
             s.field("tail", &tail);
+        }
+        if self.store != Store::Direct {
+            s.field("store", &self.store);
         }
         s.finish()
     }
@@ -346,6 +361,14 @@ impl GemmCfg {
         (head_dim / 2).is_power_of_two() && bn.is_multiple_of(head_dim) && warp_cols.is_multiple_of(head_dim)
     }
 
+    /// Whether the ring's larger operand allocation, over elements of
+    /// `bytes` bytes, holds the output tile whatever its type (f32 the
+    /// widest), so the tile may be [`Store::Staged`] through it.
+    pub fn stages_output(&self, bytes: usize) -> bool {
+        let [bm, bn, bk] = self.tile;
+        self.stages() * bm.max(bn) * bk * bytes >= bm * bn * F32::DTYPE.bytes()
+    }
+
     /// Static shared memory of the operand ring over elements of `bytes`
     /// bytes: what [`mainloop`] allocates, a slot of the A tile and of
     /// each B tile (two gated) per stage.
@@ -551,13 +574,20 @@ fn build<'k, T: MmaIn, U: Elem>(
     let schedule = cfg.schedule;
     let first_step = partial.then(|| bb.clone().expect("the split index") * (trips / split));
     let sa = Shape::new(bm, bk);
-    let accs = if epi.gated {
+    let (accs, ring) = if epi.gated {
         let halves = [b_view(k, 0), b_view(k, 1)];
-        Vec::from(mainloop(k, sa, &a_tile, halves, trips / split, schedule, bk, first_step, cfg.slices()))
+        let (accs, ring) = mainloop(k, sa, &a_tile, halves, trips / split, schedule, bk, first_step, cfg.slices());
+        (Vec::from(accs), ring)
     } else {
         let whole = [b_view(k, 0)];
-        Vec::from(mainloop(k, sa, &a_tile, whole, trips / split, schedule, bk, first_step, cfg.slices()))
+        let (accs, ring) = mainloop(k, sa, &a_tile, whole, trips / split, schedule, bk, first_step, cfg.slices());
+        (Vec::from(accs), ring)
     };
+    assert!(
+        cfg.store == Store::Direct || (!partial && cfg.stages_output(T::DTYPE.bytes())),
+        "{cfg:?} stages no output"
+    );
+    let staged = (cfg.store == Store::Staged).then_some(ring);
     let accs = accs.into_iter().map(|acc| T::widened(k, acc)).collect();
     let tile = Tile2 { m, n, bm, bn, row0, col0, bounds: [bound(m, bm), bound(n, bn)] };
     let dest = match slots {
@@ -567,7 +597,7 @@ fn build<'k, T: MmaIn, U: Elem>(
         }
         None => Dest::Tile(c, cw),
     };
-    finish::<T, U>(k, accs, epi, bias, residual.map(|r| (r, rw)), rope, dest, &bb, &tile);
+    finish::<T, U>(k, accs, epi, bias, residual.map(|r| (r, rw)), rope, dest, &bb, &tile, staged);
 }
 
 /// Where a block's `[bm, bn]` output tile sits in an `[m, n]` output, and
@@ -600,7 +630,8 @@ enum Dest<'k, U> {
     Slot(ParamRef<'k, U, Out>, Sc<'k>),
 }
 
-/// The epilogue on the f32 accumulators (two when gated) and the store.
+/// The epilogue on the f32 accumulators (two when gated) and the store,
+/// through `staged` where the tile is [`Store::Staged`].
 #[allow(clippy::too_many_arguments)]
 fn finish<'k, T: Elem, U: Elem>(
     k: &mut Kernel<'k>,
@@ -612,6 +643,7 @@ fn finish<'k, T: Elem, U: Elem>(
     c: Dest<'k, U>,
     bb: &Option<Sc<'k>>,
     t: &Tile2<'k>,
+    staged: Option<Ring<'k, T>>,
 ) {
     let Tile2 { n, bn, ref col0, ref bounds, .. } = *t;
     let n_bound = bounds[1].clone();
@@ -646,6 +678,15 @@ fn finish<'k, T: Elem, U: Elem>(
     let c_view = match c {
         Dest::Tile(c, w) => tile(k, c, w, bb, t),
         Dest::Slot(c, at) => k.view(c, at, [bn, 1], Shape::new(t.bm, bn), t.within()),
+    };
+    let out = match staged {
+        // SAFETY: the reduction's pipeline, the ring's only one, has ended.
+        Some(ring) => {
+            let scratch = unsafe { k.ring_scratch::<U>(ring, 0, Shape::new(t.bm, bn)) };
+            k.store(scratch, out);
+            k.load(scratch)
+        }
+        None => out,
     };
     k.store(c_view, out);
 }
@@ -804,7 +845,7 @@ fn merge_body<'k, T: Elem, U: Elem>(k: &mut Kernel<'k>, spec: &SplitMergeSpec) {
             (sum, tile)
         }
     };
-    finish::<T, U>(k, vec![sum], epi, bias, residual.map(|r| (r, rw)), None, Dest::Tile(c, cw), &None, &tile);
+    finish::<T, U>(k, vec![sum], epi, bias, residual.map(|r| (r, rw)), None, Dest::Tile(c, cw), &None, &tile, None);
 }
 
 /// The sum of the `split` f32 partials `part` views at each split.
@@ -826,7 +867,8 @@ fn summed<'k>(
 /// The K-streaming pipeline: the `sa`-shaped A tile `a(step, step·bk)` and
 /// `N` B tiles per step into shared rings run as `schedule` says, each
 /// operand of a slot held as `slices` k-slices ([`GemmCfg::slices`]), one
-/// accumulator per B ([`MmaIn::Acc`]).
+/// accumulator per B ([`MmaIn::Acc`]); with them, the ring's larger operand
+/// allocation, scratch once the pipeline has ended.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn mainloop<'k, T: MmaIn, const N: usize>(
     k: &mut Kernel<'k>,
@@ -838,13 +880,13 @@ pub(super) fn mainloop<'k, T: MmaIn, const N: usize>(
     bk: usize,
     first_step: Option<Sc<'k>>,
     slices: usize,
-) -> [Acc<'k, T::Acc>; N] {
+) -> ([Acc<'k, T::Acc>; N], Ring<'k, T>) {
     let sb = k.shape(bs[0]);
     let (sa_s, sb_s) = (Shape::new(sa.rows, bk / slices), Shape::new(sb.rows, bk / slices));
     let a_s = k.ring::<T>("a_s", sa.elems(), schedule);
     let b_s = [(); N].map(|()| k.ring::<T>("b_s", sb.elems(), schedule));
     let init = [(); N].map(|()| k.zeros::<T::Acc>(Shape::new(sa.rows, sb.rows)));
-    k.pipeline(
+    let accs = k.pipeline(
         trips,
         a_s,
         init,
@@ -877,5 +919,6 @@ pub(super) fn mainloop<'k, T: MmaIn, const N: usize>(
             }
             accs
         },
-    )
+    );
+    (accs, if sa.rows >= sb.rows { a_s } else { b_s[0] })
 }

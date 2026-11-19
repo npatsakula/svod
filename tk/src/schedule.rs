@@ -91,9 +91,8 @@ impl Expander<'_> {
             return self.ping_pong(extent, carried, produce, consume, crew);
         };
         let stages = depth.get();
-        let in_flight = self.core == Core::Group && chains_only(&consume.body);
         let mut out = match self.fill {
-            Fill::CpAsync if stages >= 3 && in_flight => {
+            Fill::CpAsync if in_flight(self.fill, self.core, stages) && chains_only(&consume.body) => {
                 self.cp_async_products(extent, stages, carried, produce, consume)
             }
             Fill::CpAsync if stages >= 2 => self.cp_async(extent, stages, carried, produce, consume),
@@ -442,6 +441,13 @@ impl Expander<'_> {
         let branches = consume.0[cut..].iter().any(|s| matches!(s, Stmt::If { .. } | Stmt::Loop(_)));
         branches.then_some(cut)
     }
+}
+
+/// Whether a ring `stages` deep leaves a consume's chained products in
+/// flight on `core`, a slot of the ring theirs: its fill then runs one trip
+/// less ahead than its slots allow.
+pub(crate) fn in_flight(fill: Fill, core: Core, stages: usize) -> bool {
+    fill == Fill::CpAsync && core == Core::Group && stages >= 3
 }
 
 /// Whether every product `consume` issues feeds only later products'

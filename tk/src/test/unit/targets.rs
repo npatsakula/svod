@@ -128,7 +128,7 @@ pub(super) fn run(mut command: Command, input: &[u8], what: &str) -> Result<Vec<
     }
 }
 
-fn ptxas() -> Option<std::path::PathBuf> {
+pub(super) fn ptxas() -> Option<std::path::PathBuf> {
     let on_path = std::env::var_os("PATH")
         .into_iter()
         .flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
@@ -142,11 +142,11 @@ fn ptxas() -> Option<std::path::PathBuf> {
 const NO_AMDGPU: &[&str] = &["AMDGPU target", "too old"];
 
 /// What a failed PTX compile says where clang has no NVPTX backend.
-const NO_NVPTX: &[&str] = &["NVPTX target"];
+pub(super) const NO_NVPTX: &[&str] = &["NVPTX target"];
 
 /// What a toolchain call made, `None` (logged) where its error says one of
 /// `missing`: the toolchain cannot target the arch at all.
-fn built<T>(made: Result<T, impl std::fmt::Display>, missing: &[&str]) -> Result<Option<T>, String> {
+pub(super) fn built<T>(made: Result<T, impl std::fmt::Display>, missing: &[&str]) -> Result<Option<T>, String> {
     let e = match made {
         Ok(made) => return Ok(Some(made)),
         Err(e) => e.to_string(),
@@ -217,9 +217,6 @@ struct Facts {
     /// fill scatters through registers, row-major where a `cp.async` fill
     /// copies chunks, which cannot scatter (`ldmatrix.trans` transposes).
     values: Axis,
-    /// The softmax's `exp2` is the hardware `v_exp_f32` alone, with no
-    /// denormal range reduction around it, rather than `llvm.exp2`.
-    raw_exp2: bool,
     /// A lane reads another lane's register on the vector unit (DPP within a
     /// row of 16, `permlanex16` across them) rather than through the LDS
     /// crossbar; `None` off AMD.
@@ -235,8 +232,8 @@ struct Facts {
     free_scores: Option<bool>,
 }
 
-const fn facts(values: Axis, raw_exp2: bool, dpp: Option<bool>, free_scores: Option<bool>) -> Facts {
-    Facts { values, raw_exp2, dpp, free_scores }
+const fn facts(values: Axis, dpp: Option<bool>, free_scores: Option<bool>) -> Facts {
+    Facts { values, dpp, free_scores }
 }
 
 /// Every family the op layer plans on `target` (and on Hopper every
@@ -268,12 +265,12 @@ const fn facts(values: Axis, raw_exp2: bool, dpp: Option<bool>, free_scores: Opt
 /// operands stay in shared memory and no operand tile is loaded into
 /// registers; a ring of three slots or more leaves the chain in flight, the
 /// wait the template's intrinsic rather than the chain's own.
-#[test_case(crate::atoms::sm86(), facts(Axis::Col, false, None, None); "sm_86")]
-#[test_case(hopper(), facts(Axis::Col, false, None, None); "sm_90")]
-#[test_case(amd(AmdArch::Gfx1201, 64), facts(Axis::Row, true, Some(true), Some(true)); "gfx1201")]
-#[test_case(amd(AmdArch::Gfx1151, 40), facts(Axis::Row, true, Some(true), Some(false)); "gfx1151")]
-#[test_case(amd(AmdArch::Gfx1100, 96), facts(Axis::Row, true, Some(true), Some(false)); "gfx1100")]
-#[test_case(amd(AmdArch::Gfx942, 304), facts(Axis::Row, true, Some(false), Some(true)); "gfx942")]
+#[test_case(crate::atoms::sm86(), facts(Axis::Col, None, None); "sm_86")]
+#[test_case(hopper(), facts(Axis::Col, None, None); "sm_90")]
+#[test_case(amd(AmdArch::Gfx1201, 64), facts(Axis::Row, Some(true), Some(true)); "gfx1201")]
+#[test_case(amd(AmdArch::Gfx1151, 40), facts(Axis::Row, Some(true), Some(false)); "gfx1151")]
+#[test_case(amd(AmdArch::Gfx1100, 96), facts(Axis::Row, Some(true), Some(false)); "gfx1100")]
+#[test_case(amd(AmdArch::Gfx942, 304), facts(Axis::Row, Some(false), Some(true)); "gfx942")]
 fn every_family_lowers_keeps_its_numbers_and_compiles(target: Target, facts: Facts) {
     assert!(config::has_kernels(&target));
     if let Some(free) = facts.free_scores {
@@ -349,8 +346,14 @@ fn every_family_lowers_keeps_its_numbers_and_compiles(target: Target, facts: Fac
         check(tr_loads == 0 || transposing, &format!("{tr_loads} transposing loads"));
         if attention {
             check((tr_loads > 0) == transposing, &format!("{tr_loads} transposing loads of the values"));
-            let (raw, exp2) = (ir.contains("@llvm.amdgcn.exp2.f32("), ir.contains("@llvm.exp2.f32("));
-            check((raw, exp2) == (facts.raw_exp2, !facts.raw_exp2), &format!("v_exp_f32 {raw}, llvm.exp2 {exp2}"));
+            // The softmax's `exp2` is the hardware instruction alone, with no
+            // denormal range reduction around it, rather than `llvm.exp2`.
+            let hardware = match target.arch {
+                GpuArch::Amd(_) => "@llvm.amdgcn.exp2.f32(",
+                _ => "@llvm.nvvm.ex2.approx.ftz.f(",
+            };
+            let (raw, exp2) = (ir.contains(hardware), ir.contains("@llvm.exp2.f32("));
+            check(raw && !exp2, &format!("the hardware exp2 {raw}, llvm.exp2 {exp2}"));
         }
         if let (Some(dpp), true) = (facts.dpp, name.ends_with("norm")) {
             let moves = (ir.contains("@llvm.amdgcn.update.dpp.i32("), ir.contains("@llvm.amdgcn.ds.bpermute("));
@@ -363,7 +366,10 @@ fn every_family_lowers_keeps_its_numbers_and_compiles(target: Target, facts: Fac
         }
         if name.starts_with("group gemm") {
             let reg_operand = |s: &crate::ir::Stmt<crate::ir::Laid>| matches!(s, crate::ir::Stmt::Copy { dst, .. } if tile.value(*dst).place == crate::ir::Place::Reg && tile.value(*dst).dtype == ScalarDType::BFloat16);
-            check(!tile.walk().any(|(_, s)| reg_operand(s)), "an operand was loaded into registers");
+            // The operands stay in shared memory: the one 16-bit load is a
+            // staged output tile's, back from the ring.
+            let loads = tile.walk().filter(|(_, s)| reg_operand(s)).count();
+            check(loads == usize::from(name.ends_with("staged")), "an operand was loaded into registers");
             check(ir.contains("wgmma.mma_async.sync.aligned.m64n"), "no warpgroup product");
             check(!ir.contains("@llvm.nvvm.mma.") && !ir.contains("ldmatrix"), "a warp-level product");
             check(ir.contains("wgmma.fence") && ir.contains("fence.proxy.async"), "an unfenced chain");
@@ -610,7 +616,10 @@ fn launched(
 /// Each family on the GPU against the interpreter: within two 16-bit ulps
 /// of the output scale (accumulation order differs), NaN where it is NaN.
 fn check_on_device(target: &Target) {
-    for (name, prog, lowering) in families(target) {
+    // The warpgroup families fill their rings by `cp.async`.
+    let group = !target.group_mma.is_empty() && target.fill == Fill::CpAsync;
+    let group = if group { group_families(target) } else { vec![] };
+    for (name, prog, lowering) in families(target).into_iter().chain(group) {
         let params = inputs(&name, &prog);
         let vars: Vec<(&str, i64)> = prog.vars.iter().map(|v| (v.name.as_str(), v.max)).collect();
         let want = interp::run(&prog, params.clone(), &vars).unwrap();

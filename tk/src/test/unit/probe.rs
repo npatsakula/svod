@@ -97,6 +97,8 @@ fn counted(target: &Target, probes: &[Probe], field: &str) -> f64 {
         // One wave's chain: every wave runs its own alongside the others.
         "scatter" => (extent * loads_from(probe, Tier::Global)[0].0.elems() / warps) as f64,
         "step_lone" | "step_lone_i8" => (extent * mma(probe) / 4096 / warps) as f64,
+        // One block's chain: a group alone on its SM.
+        "step_lone_group" => (extent * mma(probe) / 4096) as f64,
         // The work of every relayout of a trip, as the inference prices it.
         "smem_trip" | "lane_move" => {
             let moved: f64 = relayouts(target, find(probes, field), 1).iter().map(Relayout::work).sum();
@@ -125,7 +127,7 @@ fn an_unmeasured_field_leaves_its_default() {
     let target = sm86();
     let measured = crate::probe::assemble(&target, probes(&target), |p| match p.op {
         "probe:step" => Err(crate::probe::Error::Unmeasured { probe: p.op, last: "no stamps".into() }),
-        "probe:step_group" | "probe:step_wide" | "probe:trip_rolled" => {
+        "probe:step_group" | "probe:step_lone_group" | "probe:step_wide" | "probe:trip_rolled" => {
             unreachable!("an absent primitive is not measured")
         }
         _ => Ok(1.5),
@@ -135,7 +137,11 @@ fn an_unmeasured_field_leaves_its_default() {
     for (name, value) in costs.fields() {
         assert_eq!(
             *value,
-            if ["step", "step_group", "step_wide", "trip_rolled"].contains(&name) { 0.0 } else { 1.5 },
+            if ["step", "step_group", "step_lone_group", "step_wide", "trip_rolled"].contains(&name) {
+                0.0
+            } else {
+                1.5
+            },
             "{name}"
         );
     }
@@ -245,7 +251,7 @@ fn units_count_the_primitive(target: Target) {
         let field = p.op.strip_prefix("probe:").expect("a probe op");
         if p.candidates.is_empty() {
             let absent = match field {
-                "step_group" => target.group_mma.is_empty(),
+                "step_group" | "step_lone_group" => target.group_mma.is_empty(),
                 "step_wide" => target.wide_mma.is_empty(),
                 "step_i8" => target.geometry_of(svod_dtype::ScalarDType::Int8).is_none(),
                 "trip_rolled" => target.fill == Fill::CpAsync,
@@ -376,7 +382,7 @@ fn in_loop(ir: &str) -> &str {
 #[test_case(amd(AmdArch::Gfx942, 304), "lane_move", "@llvm.amdgcn.ds.bpermute"; "gfx942 permute")]
 #[test_case(gfx1151(), "smem_trip", "@llvm.amdgcn.s.barrier"; "gfx1151 fenced round trip")]
 #[test_case(sm86(), "smem_trip", "@llvm.nvvm.barrier0"; "sm86 fenced round trip")]
-#[test_case(sm86(), "score", "@llvm.exp2.f32"; "sm86 exp2")]
+#[test_case(sm86(), "score", "@llvm.nvvm.ex2.approx.ftz.f"; "sm86 exp2")]
 #[test_case(gfx1151(), "score", "@llvm.amdgcn.exp2.f32"; "gfx1151 exp2")]
 fn probes_issue_their_primitive(target: Target, field: &str, needle: &str) {
     let probes = probes(&target);
@@ -533,7 +539,8 @@ fn device_costs_are_physical() {
 
 /// Every probe's signal on the attached GPU: a dominant one at least half
 /// the probe's own time, else the probe times its scaffolding more than its
-/// primitive; a resolved one clear of its pair's run-to-run spread. Another
+/// primitive; a resolved one clear of its pair's run-to-run spread; a
+/// present one either. Another
 /// kernel sharing the device breaks this, so it runs alone; a primitive the
 /// target lacks has no pair.
 #[test]
@@ -544,20 +551,23 @@ fn probe_signals_are_strong() {
         let [Some(base), Some(with)] = super::measure(p.candidates.clone())[..] else { panic!("{}: not timed", p.op) };
         let signal = (with as f64 - base as f64) / with as f64;
         eprintln!("{}: baseline {base} ns, probe {with} ns, signal {signal:.3} of the probe", p.op);
+        let resolves = || {
+            let mut built = crate::tune::compile(p.candidates.clone(), &crate::tune::ScratchPool::default());
+            let pairs = probe::resolve_pairs(&mut built);
+            let resolved = probe::resolved(&pairs);
+            assert!(
+                resolved.is_some_and(|r| r.measurable() && r.clear()),
+                "{}: {pairs:?} resolve to {resolved:?}",
+                p.op
+            );
+        };
         match p.signal {
             probe::Signal::Dominant => {
                 assert!(probe::strong(base, with), "{}: the signal is {signal:.3} of the probe's time", p.op)
             }
-            probe::Signal::Resolved => {
-                let mut built = crate::tune::compile(p.candidates.clone(), &crate::tune::ScratchPool::default());
-                let pairs = probe::resolve_pairs(&mut built);
-                let resolved = probe::resolved(&pairs);
-                assert!(
-                    resolved.is_some_and(|r| r.measurable() && r.clear()),
-                    "{}: {pairs:?} resolve to {resolved:?}",
-                    p.op
-                );
-            }
+            probe::Signal::Resolved => resolves(),
+            probe::Signal::Present if probe::strong(base, with) => {}
+            probe::Signal::Present => resolves(),
         }
     }
 }

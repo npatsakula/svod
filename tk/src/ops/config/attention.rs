@@ -262,6 +262,7 @@ impl AttentionProblem {
             stores: parts,
             out: 0.0,
             ring: stages,
+            ahead: stages.saturating_sub(1),
             unroll: cfg.unroll(),
             waits: 0.0,
             sections: [combine, Spread::default()],

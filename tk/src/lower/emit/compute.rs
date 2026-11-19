@@ -2,6 +2,7 @@
 //! lane moves a reduction or an exchange issues.
 
 use svod_codegen::llvm::nvptx::ops::shfl_bfly;
+use svod_dtype::GpuArch;
 use svod_ir::ConstValue;
 
 use crate::atoms::LaneMove;
@@ -291,14 +292,16 @@ impl Emit<'_> {
     }
 
     /// `2^x`. Where the target has [`crate::atoms::Target::hardware_exp2`], an f32
-    /// one is the hardware instruction alone (`v_exp_f32`), without the
-    /// range reduction LLVM wraps `llvm.exp2` in to keep results below 2^-126
-    /// denormal: those flush to zero, which no kernel tells apart.
+    /// one is the hardware instruction alone (`v_exp_f32`,
+    /// `ex2.approx.ftz.f32`), without the range reduction LLVM wraps
+    /// `llvm.exp2` in to keep results below 2^-126 denormal: those flush to
+    /// zero, which no kernel tells apart.
     pub(super) fn exp2(&mut self, x: &Arc<UOp>) -> Arc<UOp> {
-        if self.low.device.target.hardware_exp2 && x.dtype() == DType::Float32 {
-            super::amdgpu::exp2_f32(x)
-        } else {
-            x.try_exp2().expect("exp2")
+        let target = &self.low.device.target;
+        match target.arch {
+            GpuArch::Amd(_) if target.hardware_exp2 && x.dtype() == DType::Float32 => super::amdgpu::exp2_f32(x),
+            GpuArch::Cuda(_) if target.hardware_exp2 && x.dtype() == DType::Float32 => super::nvptx::exp2_f32(x),
+            _ => x.try_exp2().expect("exp2"),
         }
     }
 

@@ -215,6 +215,11 @@ pub struct Target {
     /// Bytes of device memory, when the device reports them: the share a
     /// planner's scratch may take scales with it.
     pub memory_bytes: Option<u64>,
+    /// The driver's name for the card as the tune store spells it
+    /// ([`model_of`]), where a driver names it: cards of one architecture and
+    /// SM count (an H100 SXM and an H200) differ in what their probes measure
+    /// and their tuner picks.
+    pub model: Option<String>,
     /// Crews a block's warps may split into, one stream of clusters offset by
     /// a cluster so one crew's products overlap the other's loads: two where
     /// the matrix core runs beside the vector units and a lane's file holds
@@ -239,7 +244,8 @@ pub struct Target {
     pub lane_move: LaneMove,
     /// An f32 `exp2` is the hardware instruction alone, without the range
     /// reduction that keeps results below 2^-126 denormal (they flush to
-    /// zero, which no kernel tells apart): AMD's `v_exp_f32`.
+    /// zero, which no kernel tells apart): AMD's `v_exp_f32`, NVIDIA's
+    /// `ex2.approx.ftz.f32`.
     pub hardware_exp2: bool,
 }
 
@@ -366,6 +372,12 @@ pub struct Costs {
     /// 16-bit ratio (the chain's latency does not scale with its step's
     /// throughput). 0 where unmeasured: the 16-bit ratio then stands.
     pub step_lone_i8: f64,
+    /// The warpgroup step of a group alone on its SM: the groups an SM
+    /// hides a warpgroup product's chain with are `step_lone_group /
+    /// step_group`, not the warp-level ratio (a group's instruction spans
+    /// the accumulators a wave's chains pipeline over). 0 where unmeasured
+    /// or the target has no such core: the warp-level ratio then stands.
+    pub step_lone_group: f64,
     /// One score element's softmax vector work (scale, max, exp2, sum).
     pub score: f64,
     /// One pipeline trip's fixed overhead (barrier, ring bubble), unrolled,
@@ -426,7 +438,7 @@ pub const LADDER: usize = 9;
 impl Costs {
     /// Every field a pair of programs measures, by name, in declaration
     /// order: all but the cache's, which a series of footprints measures.
-    pub fn fields(&mut self) -> [(&'static str, &mut f64); 19] {
+    pub fn fields(&mut self) -> [(&'static str, &mut f64); 20] {
         let Costs {
             smem_byte,
             global_byte,
@@ -437,6 +449,7 @@ impl Costs {
             step_i8,
             step_lone,
             step_lone_i8,
+            step_lone_group,
             score,
             trip,
             trip_rolled,
@@ -461,6 +474,7 @@ impl Costs {
             ("step_i8", step_i8),
             ("step_lone", step_lone),
             ("step_lone_i8", step_lone_i8),
+            ("step_lone_group", step_lone_group),
             ("score", score),
             ("trip", trip),
             ("trip_rolled", trip_rolled),
@@ -548,7 +562,8 @@ impl Target {
 
     /// The [`Self::offline`] target of a card of [`CARDS`] by name.
     pub fn card(name: &str) -> Option<Self> {
-        CARDS.iter().find(|c| c.0 == name).map(|&(_, arch, sms, xcds)| Self::offline(arch, sms, xcds))
+        let &(_, arch, sms, xcds, model) = CARDS.iter().find(|c| c.0 == name)?;
+        Some(Self { model: model.map(str::to_string), ..Self::offline(arch, sms, xcds) })
     }
 
     /// The target behind a device, when the backend reports its architecture.
@@ -587,6 +602,7 @@ impl Target {
         let mut target = Self::for_arch(arch);
         if let DeviceSpec::Cuda { device_id } = spec {
             target.memory_bytes = reg::resolve_cuda_memory(*device_id).ok().map(|b| b as u64);
+            target.model = reg::resolve_cuda_name(*device_id).ok().map(|name| model_of(&name));
         }
         if let Some(limits) = limits {
             target.smem_bytes = limits.shared_per_block_optin as usize;
@@ -711,6 +727,7 @@ fn cuda(c: CudaArch) -> Target {
         smem_bytes: c.max_shared_per_block_optin(),
         sms: None,
         memory_bytes: None,
+        model: None,
         crews: 1,
         xcds: 1,
         shared_banks: None,
@@ -718,7 +735,7 @@ fn cuda(c: CudaArch) -> Target {
         occupancy: Occupancy { simds: 4, file: 512, waves, registers: 255, acc_file: 0, blocks },
         sync: SyncCaps { warp_barrier: true, commit_fence: false, priority: false, split_barrier: false },
         lane_move: LaneMove::Shuffle,
-        hardware_exp2: false,
+        hardware_exp2: true,
     }
 }
 
@@ -788,6 +805,7 @@ fn amd(a: AmdArch) -> Target {
         smem_bytes: if a == AmdArch::Gfx950 { 160 << 10 } else { 64 << 10 },
         sms: None,
         memory_bytes: None,
+        model: None,
         crews: if cdna { 2 } else { 1 },
         xcds: 1,
         shared_banks: (a == AmdArch::Gfx942).then_some(SharedBanks { count: 16, bytes: 8 }),
@@ -820,6 +838,7 @@ fn metal(f: MetalFamily) -> Target {
         smem_bytes: 32 << 10,
         sms: None,
         memory_bytes: None,
+        model: None,
         crews: 1,
         xcds: 1,
         shared_banks: None,
@@ -987,18 +1006,30 @@ const fn sm(major: u8, minor: u8) -> GpuArch {
     GpuArch::Cuda(CudaArch { major, minor })
 }
 
-/// Cards as a device query reports them: name, architecture, SMs (CUs) and
-/// dies (CDNA's XCDs).
-pub const CARDS: [(&str, GpuArch, u32, u32); 9] = [
-    ("rtx3060", sm(8, 6), 28, 1),
-    ("h100-pcie", sm(9, 0), 114, 1),
-    ("h100-sxm", sm(9, 0), 132, 1),
-    ("rtx5070", sm(12, 0), 48, 1),
-    ("rtx5090", sm(12, 0), 170, 1),
-    ("mi300x", GpuArch::Amd(AmdArch::Gfx942), 304, 8),
-    ("mi355x", GpuArch::Amd(AmdArch::Gfx950), 256, 8),
-    ("rx9070xt", GpuArch::Amd(AmdArch::Gfx1201), 64, 1),
-    ("strix-halo", GpuArch::Amd(AmdArch::Gfx1151), 40, 1),
+/// A driver's name for a card as the tune store spells it: its words in
+/// lower case joined by `-`, the vendor's dropped (`NVIDIA H200 NVL` is
+/// `h200-nvl`).
+pub fn model_of(name: &str) -> String {
+    let name = name.to_ascii_lowercase();
+    let words = name.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty());
+    words.filter(|w| !matches!(*w, "nvidia" | "geforce")).collect::<Vec<_>>().join("-")
+}
+
+/// Cards as a device query reports them: name, architecture, SMs (CUs), dies
+/// (CDNA's XCDs) and the driver's name for it ([`Target::model`]) where a
+/// driver names it.
+pub const CARDS: [(&str, GpuArch, u32, u32, Option<&str>); 11] = [
+    ("rtx3060", sm(8, 6), 28, 1, Some("rtx-3060")),
+    ("h100-pcie", sm(9, 0), 114, 1, Some("h100-pcie")),
+    ("h100-sxm", sm(9, 0), 132, 1, Some("h100-80gb-hbm3")),
+    ("h200-sxm", sm(9, 0), 132, 1, Some("h200")),
+    ("h200-nvl", sm(9, 0), 132, 1, Some("h200-nvl")),
+    ("rtx5070", sm(12, 0), 48, 1, Some("rtx-5070")),
+    ("rtx5090", sm(12, 0), 170, 1, Some("rtx-5090")),
+    ("mi300x", GpuArch::Amd(AmdArch::Gfx942), 304, 8, None),
+    ("mi355x", GpuArch::Amd(AmdArch::Gfx950), 256, 8, None),
+    ("rx9070xt", GpuArch::Amd(AmdArch::Gfx1201), 64, 1, None),
+    ("strix-halo", GpuArch::Amd(AmdArch::Gfx1151), 40, 1, None),
 ];
 
 /// The CUDA sm_86 target of the development machine's RTX 3060 (28 SMs):

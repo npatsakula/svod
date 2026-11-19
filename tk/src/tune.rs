@@ -141,7 +141,8 @@ fn digest(value: &impl Hash) -> u64 {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TuneKey {
     pub op: &'static str,
-    /// Arch and SM count, e.g. `sm_86-28sm`.
+    /// Arch, SM count and the card's model where its driver names it, e.g.
+    /// `sm_86-28sm-rtx-3060` ([`device`]).
     pub device: String,
     pub dtype: ScalarDType,
     pub shape: Vec<usize>,
@@ -182,9 +183,11 @@ impl TuneKey {
     }
 }
 
-/// A target's name in the store: arch and SM count ([`TuneKey::device`]).
-pub(crate) fn device(target: &Target) -> String {
-    format!("{}-{}sm", target.arch.target_name(), target.sms.unwrap_or(0))
+/// A target's name in the store ([`TuneKey::device`]): arch and SM count,
+/// then the card's model where its driver names it ([`Target::model`]).
+pub fn device(target: &Target) -> String {
+    let model = target.model.iter().map(|model| format!("-{model}"));
+    format!("{}-{}sm{}", target.arch.target_name(), target.sms.unwrap_or(0), model.collect::<String>())
 }
 
 /// A digest of `spec`'s compiler identity (backend, toolchain, flags) for

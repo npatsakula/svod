@@ -13,7 +13,7 @@ use crate::atoms::Target;
 use crate::ir::Schedule;
 use crate::kernels::attention::{FaCfg, Forms, WARP_ROWS, narrowest_warp_rows};
 use crate::kernels::conv::ConvCfg;
-use crate::kernels::gemm::{GemmCfg, TailSplit, TileOrder};
+use crate::kernels::gemm::{GemmCfg, Store, TailSplit, TileOrder};
 use crate::kernels::nearest::{LaneQueue, NearestCfg, Pow2, SelectCfg, Way};
 use crate::kernels::rows::NormCfg;
 use crate::tune::Compiled;
@@ -447,6 +447,19 @@ impl Field for TailSplit {
     }
 }
 
+/// `s` where staged, nothing where direct: a code written before the field
+/// reads as direct.
+impl Field for Store {
+    fn put(&self, out: &mut Vec<String>) {
+        if *self == Store::Staged {
+            out.push("s".into());
+        }
+    }
+    fn take(fields: &mut Fields<'_>) -> Option<Self> {
+        Some(if fields.next_if_eq(&"s").is_some() { Store::Staged } else { Store::Direct })
+    }
+}
+
 /// A config's code: its fields in order, each a [`Field`]; the comment
 /// gives a code.
 macro_rules! coded {
@@ -466,8 +479,9 @@ coded!(SelectCfg { warps, queue, filter });
 coded!(LaneQueue { width, depth, passes });
 coded!(Forms { truncate_p, sum_after, skip_rescale, raw_max, bias_direct });
 coded!(
-    /// `w,128,256,64,2,4,r3u,g8,~` (`t4` for a tail split four ways)
-    GemmCfg { core, tile, warps, schedule, order, tail }
+    /// `w,128,256,64,2,4,r3u,g8,~` (`t4` for a tail split four ways, a
+    /// trailing `s` a staged store)
+    GemmCfg { core, tile, warps, schedule, order, tail, store }
 );
 coded!(
     /// `w,64,64,32,2,2,r2,g8,~,4`
@@ -500,17 +514,19 @@ pub(crate) fn representatives<C: Tiled>(ranked: &[C]) -> Vec<C> {
 impl Tiled for GemmCfg {
     fn tile(&self) -> Self {
         let tile = [self.tile[0], self.tile[1], 0];
-        GemmCfg { tile, schedule: self.schedule.tile(), order: TileOrder::DEFAULT, tail: None, ..*self }
+        let (order, store) = (TileOrder::DEFAULT, Store::Direct);
+        GemmCfg { tile, schedule: self.schedule.tile(), order, tail: None, store, ..*self }
     }
 
     fn twins(&self, ranked: &[Self]) -> Vec<Self> {
         ranked.iter().filter(|c| c.tile() == self.tile()).copied().collect()
     }
 
-    /// A split stands for no tile: it runs only where the tuner timed it
-    /// against its unsplit pipeline, never as the untuned first pick.
+    /// Neither a split nor a staged store stands for a tile: each runs only
+    /// where the tuner timed it against its plain pipeline, never as the
+    /// untuned first pick.
     fn represents(&self) -> bool {
-        self.tail.is_none()
+        self.tail.is_none() && self.store == Store::Direct
     }
 }
 

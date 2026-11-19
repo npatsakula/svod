@@ -72,6 +72,12 @@ pub(crate) enum Signal {
     /// that rides on work it cannot shed, as a trip moves its tile's bytes,
     /// and is small next to it.
     Resolved,
+    /// [`Self::Dominant`] where the pair makes it so, else
+    /// [`Self::Resolved`]: a primitive whose share of its pair is the
+    /// device's, as a lone block's trip is most of its time where memory
+    /// answers fast and under half where its latency fills the baseline too
+    /// (an H200's two-slot ring).
+    Present,
 }
 
 /// Measurement: timings of a [`Signal::Resolved`] pair, compiled once: the
@@ -210,7 +216,7 @@ fn priced(target: &Target, mut measure: impl FnMut(Probe) -> Result<f64>) -> Res
 /// compiler, store format or probe programs measured it (its value is ns
 /// per unit of the device); of several, the one of this build's programs.
 /// A probe no line settles is unmeasured. `None` where the store has no
-/// file for the target's device ([`tune::device`]: its arch and SM count),
+/// file for the target's device ([`tune::device`]: its arch, SM count and model),
 /// or the target no SM count.
 pub fn stored(dir: &std::path::Path, target: &Target) -> Option<Measured> {
     let device = tune::device(target);
@@ -257,6 +263,7 @@ pub const GUESSED: Costs = Costs {
     step_lone: 15.0,
     // Unmeasured: the 16-bit ratio stands.
     step_lone_i8: 0.0,
+    step_lone_group: 0.0,
     score: 0.5,
     trip: 150.0,
     trip_rolled: 170.0,
@@ -313,30 +320,37 @@ fn measured(target: &Target, compiler: u64, probe: Probe) -> Result<f64> {
         || programs,
         || {
             let mut built = tune::compile(candidates, &ScratchPool::default());
-            if signal == Signal::Resolved {
-                let pairs = resolve_pairs(&mut built);
-                last = format!("no difference resolved from {pairs:?}");
+            let dominant = |built: &mut [Built], last: &mut String| {
+                least((0..TRIES).filter_map(|_| match timed(built, scale / units) {
+                    Ok((fs, base_ns, probe_ns)) => {
+                        tracing::debug!(op, base_ns, probe_ns, fs, "probe pair timed");
+                        Some(fs)
+                    }
+                    Err(e) => {
+                        *last = e;
+                        None
+                    }
+                }))
+            };
+            let resolve = |built: &mut [Built], last: &mut String| {
+                let pairs = resolve_pairs(built);
+                *last = format!("no difference resolved from {pairs:?}");
                 let r = resolved(&pairs)?;
                 tracing::debug!(op, ?pairs, ?r, "probe pair resolved");
                 if !r.measurable() {
-                    last = format!(
+                    *last = format!(
                         "a baseline of {} ns under half the probe's {} ns: it does not move the probe's bytes",
                         r.baseline, r.probe
                     );
                     return None;
                 }
-                return Some((r.value() * scale / units * 1e6).round() as u64);
+                Some((r.value() * scale / units * 1e6).round() as u64)
+            };
+            match signal {
+                Signal::Dominant => dominant(&mut built, &mut last),
+                Signal::Resolved => resolve(&mut built, &mut last),
+                Signal::Present => dominant(&mut built, &mut last).or_else(|| resolve(&mut built, &mut last)),
             }
-            least((0..TRIES).filter_map(|_| match timed(&mut built, scale / units) {
-                Ok((fs, base_ns, probe_ns)) => {
-                    tracing::debug!(op, base_ns, probe_ns, fs, "probe pair timed");
-                    Some(fs)
-                }
-                Err(e) => {
-                    last = e;
-                    None
-                }
-            }))
         },
     );
     Ok(fs.context(UnmeasuredSnafu { probe: op, last })? as f64 * 1e-6)
@@ -486,6 +500,7 @@ pub(crate) fn probes(target: &Target) -> Result<Vec<Probe>> {
         p.step_i8(),
         p.step_lone(),
         p.step_lone_i8(),
+        p.step_lone_group(),
         p.score(),
         p.trips("probe:trip", true, 2),
         p.rolled_trips(),
@@ -774,13 +789,27 @@ impl<'a> Probes<'a> {
     /// `k16` instructions a statement, the operands written to shared memory
     /// once; no candidates where the target has no such core.
     fn step_group(&self) -> Probe {
-        let (op, [bm, bn, bk]) = ("probe:step_group", [64usize, 256, 64]);
+        self.group_steps("probe:step_group", self.blocks, true)
+    }
+
+    /// [`Self::step_group`] of a group alone on its SM, a block per SM: the
+    /// chain's latency per step of the SM, whose ratio to the full SM's is
+    /// the groups an SM hides it with.
+    fn step_lone_group(&self) -> Probe {
+        self.group_steps("probe:step_lone_group", self.sms as usize, false)
+    }
+
+    /// `blocks` of one warpgroup each chaining its product; a unit is a
+    /// 16×16×16 step of the SM (`per_sm`) or of one block.
+    fn group_steps(&self, op: &'static str, blocks: usize, per_sm: bool) -> Probe {
+        let [bm, bn, bk] = [64usize, 256, 64];
         let iters = 1024;
-        let units = (self.blocks * iters * bm * bn * bk / 4096) as f64;
+        let steps = iters * bm * bn * bk / 4096;
+        let units = if per_sm { blocks * steps } else { steps } as f64;
         let mut lowering = self.lowering();
         lowering.core = Core::Group;
-        let mut probe = self.make(op, ScalarDType::BFloat16, units, true, lowering, |on| {
-            probe_kernel(op, self.blocks, WARPS, |k| {
+        let mut probe = self.make(op, ScalarDType::BFloat16, units, per_sm, lowering, |on| {
+            probe_kernel(op, blocks, WARPS, |k| {
                 let (sa, sb) = (Shape::new(bm, bk), Shape::new(bn, bk));
                 let (a, b) = (input::<BF16>(k, sa), input::<BF16>(k, sb));
                 let (a_s, b_s) = (k.smem::<BF16>("a_s", sa.elems()), k.smem::<BF16>("b_s", sb.elems()));
@@ -793,7 +822,7 @@ impl<'a> Probes<'a> {
                 } else {
                     [zero.into()]
                 };
-                output(k, self.blocks, *acc);
+                output(k, blocks, *acc);
             })
         });
         if self.target.group_mma.is_empty() {
@@ -940,10 +969,11 @@ impl<'a> Probes<'a> {
 
     /// [`Self::trips`] of a block alone on each SM: its trip waits out what
     /// no other block's work hides. The ring dominates a lone block's time
-    /// (its baseline is a load's latency, too short for
-    /// [`Resolved::measurable`]), so the pair is [`Signal::Dominant`].
+    /// where its baseline is a load's latency alone, and rides on it where
+    /// the baseline's loads in flight wait as long, so the pair is
+    /// [`Signal::Present`].
     fn lone_trips(&self, op: &'static str, unroll: bool, stages: usize) -> Probe {
-        Probe { signal: Signal::Dominant, ..self.trips_of(op, unroll, stages, self.sms as usize) }
+        Probe { signal: Signal::Present, ..self.trips_of(op, unroll, stages, self.sms as usize) }
     }
 
     /// [`Self::trips`] over `blocks` blocks.
