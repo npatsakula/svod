@@ -405,12 +405,14 @@ impl Field for Core {
     }
 }
 
-/// A ring `r<depth>`, `u` after it when unrolled; two crews `p<kslice>`.
+/// A ring `r<depth>`, `u` after it when unrolled; two crews `p<kslice>`; a
+/// ring filled in bulk `b<depth>`, as a ring.
 impl Field for Schedule {
     fn put(&self, out: &mut Vec<String>) {
         out.push(match self {
             Schedule::Ring { depth, unroll } => format!("r{depth}{}", if *unroll { "u" } else { "" }),
             Schedule::PingPong { kslice } => format!("p{kslice}"),
+            Schedule::Bulk { depth, unroll } => format!("b{depth}{}", if *unroll { "u" } else { "" }),
         });
     }
     fn take(fields: &mut Fields<'_>) -> Option<Self> {
@@ -422,6 +424,10 @@ impl Field for Schedule {
                 Some(Schedule::Ring { depth: depth.parse().ok()?, unroll })
             }
             "p" => Some(Schedule::PingPong { kslice: rest.parse().ok()? }),
+            "b" => {
+                let (depth, unroll) = rest.strip_suffix('u').map_or((rest, false), |depth| (depth, true));
+                Some(Schedule::Bulk { depth: depth.parse().ok()?, unroll })
+            }
             _ => None,
         }
     }
@@ -522,11 +528,11 @@ impl Tiled for GemmCfg {
         ranked.iter().filter(|c| c.tile() == self.tile()).copied().collect()
     }
 
-    /// Neither a split nor a staged store stands for a tile: each runs only
-    /// where the tuner timed it against its plain pipeline, never as the
-    /// untuned first pick.
+    /// Neither a split, a staged store nor a bulk fill stands for a tile:
+    /// each runs only where the tuner timed it against its plain pipeline,
+    /// never as the untuned first pick.
     fn represents(&self) -> bool {
-        self.tail.is_none() && self.store == Store::Direct
+        self.tail.is_none() && self.store == Store::Direct && !matches!(self.schedule, Schedule::Bulk { .. })
     }
 }
 

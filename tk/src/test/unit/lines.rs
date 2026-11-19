@@ -22,7 +22,7 @@ use svod_runtime::amd::{LocatedAmd, compile_ir_to_amd_object, compile_ir_to_amd_
 use svod_runtime::sqtt::{Capture, Class, Lines, Statements, disassemble, line_table, locate};
 use test_case::test_case;
 
-use crate::atoms::{Core, Fill};
+use crate::atoms::{Core, Fill, SyncCaps};
 use crate::build::{BF16, I8};
 use crate::ir::{Expanded, Program, Stmt, Trip};
 use crate::kernels::gemm::{Epilogue, GemmSpec, gemm};
@@ -387,7 +387,7 @@ fn the_listing_names_statements_and_roles() {
 #[test_case(Fill::CpAsync, &[Trip::Steady]; "one loop")]
 #[test_case(Fill::Staged, &[Trip::Head, Trip::Steady, Trip::Drain]; "peeled")]
 fn the_roles_are_the_templates_trips(fill: Fill, trips: &[Trip]) {
-    let mut prog = expand(super::gemm_nt(64, 32, 160, 32, 32, 32, 2), fill, Core::Warp, false);
+    let mut prog = expand(super::gemm_nt(64, 32, 160, 32, 32, 32, 2), fill, Core::Warp, SyncCaps::default());
     let trip = |s: &Stmt<Expanded>| if let Stmt::Loop(l) = s { l.trip } else { None };
     assert_eq!(prog.body.0.iter().filter_map(trip).collect::<Vec<_>>(), trips);
     // The one pipeline twice in a row: roles read only the statements' shapes.

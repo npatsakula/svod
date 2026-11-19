@@ -374,7 +374,9 @@ impl GemmCfg {
     /// each B tile (two gated) per stage.
     pub fn smem_bytes(&self, gated: bool, bytes: usize) -> usize {
         let [bm, bn, bk] = self.tile;
-        self.stages() * (bm + bn * if gated { 2 } else { 1 }) * bk * bytes
+        // A ring filled in bulk holds its slots' barriers, an aligned kilobyte.
+        let barriers = if matches!(self.schedule, Schedule::Bulk { .. }) { 1024 } else { 0 };
+        self.stages() * (bm + bn * if gated { 2 } else { 1 }) * bk * bytes + barriers
     }
 }
 

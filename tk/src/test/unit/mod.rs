@@ -3,6 +3,7 @@ mod atoms;
 mod attention;
 mod banks;
 mod build;
+mod bulk;
 mod conv;
 mod cost_model;
 mod device;
@@ -448,7 +449,7 @@ pub(crate) fn lane_moves_dear() -> Costs {
 /// target fills, then inferred, as the lowering does before it emits.
 pub(crate) fn laid(prog: Program, device: &crate::atoms::Device) -> crate::layouts::Result<Program<crate::ir::Laid>> {
     crate::layouts::infer(
-        crate::schedule::expand(prog, device.target.fill, Core::Warp, device.target.sync.split_barrier),
+        crate::schedule::expand(prog, device.target.fill, Core::Warp, device.target.sync),
         device,
         Core::Warp,
     )

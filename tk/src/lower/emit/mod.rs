@@ -8,7 +8,10 @@ use std::sync::Arc;
 
 use smallvec::smallvec;
 use svod_codegen::llvm::Location;
-use svod_codegen::llvm::nvptx::smem::{cp_async_commit, cp_async_wait};
+use svod_codegen::llvm::common::gpu::specific_ptr;
+use svod_codegen::llvm::nvptx::smem::{
+    bulk_tensor_load, cp_async_commit, cp_async_wait, mbarrier_arrive_expect, mbarrier_init, mbarrier_wait,
+};
 use svod_codegen::llvm::nvptx::wgmma;
 use svod_dtype::{AddrSpace, DType, DeviceSpec, ScalarDType};
 use svod_ir::{AxisId, AxisType, BarrierFence, ConstValue, KernelInfo, Op, UOp};
@@ -174,6 +177,9 @@ struct Emit<'a> {
     /// Per open block: carried values defined in it, moved at its end.
     pending: Vec<Vec<Carried>>,
     smem: Vec<Arc<UOp>>,
+    /// The tensor-map parameters of the program's bulk fills, past its
+    /// buffers and variables in slot order.
+    maps: Vec<(svod_ir::TensorMap, Arc<UOp>)>,
     /// A shared allocation's buffer read under another type, per pair.
     typed: HashMap<(usize, ScalarDType), Arc<UOp>>,
     scratch: HashMap<ScalarDType, (Arc<UOp>, usize)>,
@@ -303,6 +309,7 @@ impl<'a> Emit<'a> {
             carried: vec![],
             pending: vec![],
             smem: vec![],
+            maps: vec![],
             typed: HashMap::new(),
             scratch: HashMap::new(),
             moves: Moves::new(prog.warp_grid.count(), low.device.target.wave),
@@ -970,8 +977,59 @@ impl<'a> Emit<'a> {
             Sync::WaitProducts { .. } => return Ok(()),
             Sync::Prio { level } if target.sync.priority => amdgpu::setprio(level),
             Sync::Prio { .. } => return Ok(()),
+            Sync::SlotInit { bar } if target.sync.slot_barrier => {
+                let bar = self.slot_bar(bar);
+                return self.elected(mbarrier_init(&bar, 1));
+            }
+            Sync::SlotArrive { bar, bytes } if target.sync.slot_barrier => {
+                let bar = self.slot_bar(bar);
+                return self.elected(mbarrier_arrive_expect(&bar, bytes));
+            }
+            Sync::SlotWait { bar, phase } if target.sync.slot_barrier => {
+                let (bar, phase) = (self.slot_bar(bar), self.sc(phase));
+                mbarrier_wait(&bar, &phase.cast(DType::Int32))
+            }
+            Sync::SlotInit { .. } | Sync::SlotArrive { .. } | Sync::SlotWait { .. } => return Ok(()),
         };
         self.push(u);
+        Ok(())
+    }
+
+    /// The tensor-map parameter of `map`, one per distinct map.
+    fn tensor_map(&mut self, map: svod_ir::TensorMap) -> Arc<UOp> {
+        if let Some((_, param)) = self.maps.iter().find(|(known, _)| *known == map) {
+            return param.clone();
+        }
+        let slot = self.params.len() + self.prog.vars.len() + self.maps.len();
+        let param = self.hoist(UOp::tensor_map_param(slot, map.clone()));
+        self.maps.push((map, param.clone()));
+        param
+    }
+
+    /// The barrier object `bar` names, its shared address listed here: ahead
+    /// of the branch that elects a thread.
+    fn slot_bar(&mut self, bar: SlotBar) -> Arc<UOp> {
+        let slot = self.sc(bar.slot);
+        let bars = self.smem[bar.bars.index()].clone();
+        let object = self.access(&bars, &slot, 1);
+        self.hoist(specific_ptr(&object, AddrSpace::Local));
+        object
+    }
+
+    /// `u` on the block's first thread alone.
+    fn elected(&mut self, u: Arc<UOp>) -> Result<()> {
+        self.elected_all(vec![u])
+    }
+
+    /// `us` in order on the block's first thread alone.
+    fn elected_all(&mut self, us: Vec<Arc<UOp>>) -> Result<()> {
+        let first = self.tid.try_cmpeq(&c32(0)).expect("thread compare");
+        let tag = self.next_tag();
+        let if_ = self.push(UOp::if_(first, smallvec![]).rtag(Some(smallvec![tag as usize])));
+        for u in us {
+            self.push(u);
+        }
+        self.push(UOp::endif(if_));
         Ok(())
     }
 }

@@ -39,6 +39,10 @@ impl GemmCfg {
         // overlap, on a target that interleaves crews.
         let crews = match self.schedule {
             Schedule::Ring { .. } => true,
+            // In bulk where the template fills so: a ring of products in flight.
+            Schedule::Bulk { depth, .. } => {
+                target.sync.slot_barrier && crate::schedule::in_flight(target.fill, self.core, depth.get())
+            }
             Schedule::PingPong { kslice } => {
                 let k = kslice.get();
                 self.core == Core::Warp
@@ -616,7 +620,8 @@ impl GemmProblem {
     /// holds its output tile carries its [`Store::Staged`] twin alike, at
     /// the pipeline's price: the model has no term that tells the stores
     /// apart, and the device's order of them turns with the trips a tile
-    /// runs.
+    /// runs. A ring of products in flight carries its bulk-filled twins
+    /// ([`Schedule::Bulk`]) so too, where the target fills in bulk.
     pub(crate) fn ranked(&self, planner: &Planner) -> Vec<GemmCfg> {
         let feasible = planner.feasible(self);
         let planned: Vec<_> = feasible.iter().filter_map(|f| self.planned(planner, f)).collect();
@@ -635,8 +640,15 @@ impl GemmProblem {
             let split = splits.get(&cfg.tile()).filter(|(_, s)| GemmCfg { tail: None, ..*s } == cfg);
             let target = &planner.device.target;
             let fits = |twin: GemmCfg| (cfg.core == Core::Group && twin.fits(target)).then_some((cost, twin));
-            let twins =
-                [Some((cost, cfg)), fits(GemmCfg { store: Store::Staged, ..cfg }), split.map(|&(_, s)| (cost, s))];
+            let bulk = cfg.schedule.as_ring().map(|(depth, unroll, _)| Schedule::bulk(depth, unroll));
+            let bulk = bulk.map(|schedule| GemmCfg { schedule, ..cfg });
+            let twins = [
+                Some((cost, cfg)),
+                fits(GemmCfg { store: Store::Staged, ..cfg }),
+                bulk.and_then(fits),
+                bulk.and_then(|bulk| fits(GemmCfg { store: Store::Staged, ..bulk })),
+                split.map(|&(_, s)| (cost, s)),
+            ];
             twins.into_iter().flatten()
         });
         spread(twinned.collect(), |c| [c.tile[0], c.tile[1]])

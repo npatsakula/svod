@@ -39,6 +39,9 @@ impl Emit<'_> {
     /// Global → shared, every thread of the copy's scope (the block's, or
     /// one warp's own) moving 16-byte chunks.
     pub(super) fn fill(&mut self, dst: ValId, src: ValId, mode: CopyMode, scope: Scope) -> Result<()> {
+        if let CopyMode::Bulk { bar } = mode {
+            return self.fill_bulk(dst, src, bar);
+        }
         let (d, s) = (self.view(dst), self.view(src));
         let chunk = 16 / d.dtype.bytes() as i64;
         let cols = d.shape.cols as i64;
@@ -121,6 +124,42 @@ impl Emit<'_> {
             }
         }
         Ok(())
+    }
+
+    /// Global → shared in bulk: the block's first thread issues one bulk
+    /// copy a panel of the tile ([`crate::lower::bulk::frame`]), addressed
+    /// by the tile's column and row in the parameter, completing on `bar`.
+    fn fill_bulk(&mut self, dst: ValId, src: ValId, bar: SlotBar) -> Result<()> {
+        let frame = crate::lower::bulk::frame(self.prog, self.low.core, dst, src)
+            .map_err(|why| UnsupportedSnafu { what: format!("a bulk fill of a view where {why}") }.build())?;
+        let (d, s) = (self.view(dst), self.view(src));
+        snafu::ensure!(
+            self.low.device.target.sync.slot_barrier && self.along(&d).0 == Axis::Col && self.halves(&d).is_none(),
+            UnsupportedSnafu { what: "a bulk fill of other than a row-major tile on a target with slot barriers" }
+        );
+        let Some(Place::Global { param, offset, .. }) = &s.place else { unreachable!("a fill's source") };
+        let (_, offset) = self.scalar(*offset);
+        let row = offset.const_like(frame.row as i64);
+        let x = self.hoist(offset.try_cmod(&row).expect("column").cast(DType::Int32));
+        let y = self.hoist(offset.try_cdiv(&row).expect("row").cast(DType::Int32));
+        // The kernel numbers its buffers as the launch hands them, which is
+        // the program's parameter order only standalone.
+        let buffer = self.params[param.index()].clone();
+        let base = buffer.base();
+        let Op::Param(svod_ir::ops::Param { arg, .. }) = base.op() else { unreachable!("a parameter") };
+        let panel = i64::from(frame.map.tile[0]);
+        let map = svod_ir::TensorMap { buffer: arg.slot, ..frame.map };
+        let (map, bar) = (self.tensor_map(map), self.slot_bar(bar));
+        let copies = (0..frame.panels as i64)
+            .map(|p| {
+                let (at, _) = self.address(&d, &Coord::plain(c32(0), c32(p * panel)));
+                let to = self.access(&d.buf, &at, 1);
+                self.hoist(specific_ptr(&to, AddrSpace::Local));
+                let x = self.hoist(add(&x, &c32(p * panel)));
+                bulk_tensor_load(&to, &bar, &map, [&x, &y], &buffer)
+            })
+            .collect();
+        self.elected_all(copies)
     }
 
     /// Shared → registers under the destination's layout: `ldmatrix.x4` per

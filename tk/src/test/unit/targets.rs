@@ -377,6 +377,13 @@ fn every_family_lowers_keeps_its_numbers_and_compiles(target: Target, facts: Fac
                 prog.walk().any(|(_, s)| matches!(s, crate::ir::Stmt::Pipeline(p) if p.schedule.stages() >= 3));
             check(ir.contains("@llvm.nvvm.wgmma.wait_group") == in_flight, "the template's wait");
             check(ir.contains("wgmma.wait_group.sync.aligned 0;") == !in_flight, "the chain's own wait");
+            // A ring filled in bulk moves both operands by tensor map, on
+            // its slots' barriers, and no thread copies a chunk.
+            let bulk = name.contains(" bulk");
+            check(ir.contains("@llvm.nvvm.cp.async.bulk.tensor.g2s.tile.2d(") == bulk, "the bulk copies");
+            check(ir.contains("mbarrier.try_wait.parity") == bulk, "the slot barriers");
+            check(ir.contains("@llvm.nvvm.cp.async.cg.shared.global") != bulk, "the threads' chunks");
+            check(ir.matches("\"nvvm.grid_constant\"").count() == 2 * usize::from(bulk), "a tensor map an operand");
         }
 
         match target.arch {
@@ -1292,4 +1299,41 @@ fn the_probabilities_reach_pv_through_the_lanes_on_a_no_feed_target(mask: AttnMa
     let spec = assumed(probe_spec(2, 4, 100, 100, 64, mask), cfg);
     let declared = shared_bytes(&linear(attention::<F16>(&spec), &cfg.lowering(&device)));
     assert_eq!(declared, cfg.smem_bytes(64, false), "its rings alone, at the target's whole 64 KB");
+}
+
+/// A ring filled in bulk reads an operand that is a view into a larger
+/// buffer, whose address is no multiple of the 16 bytes a tensor map's
+/// buffer starts on, over trips enough to refill every slot three times:
+/// each slot's barrier is waited for on both parities.
+#[test]
+fn a_bulk_fill_reads_an_offset_view_on_the_device() {
+    let Some(planner) = super::device_planner() else { return };
+    if !planner.device.target.sync.slot_barrier {
+        return;
+    }
+    let (m, k) = (256, 1024);
+    let cfg = crate::kernels::gemm::GemmCfg {
+        tile: [128, 128, 64],
+        warps: [8, 1],
+        core: Core::Group,
+        schedule: Schedule::bulk(4, true),
+        order: Default::default(),
+        tail: None,
+        store: Default::default(),
+    };
+    let prog = gemm::<BF16>(&assumed(gemm_spec(m, m, k), cfg));
+    let mut seed = 5;
+    let a = super::rounded(ScalarDType::BFloat16, m * k + 3, &mut seed, |x| x);
+    let want = interp::run(&prog, vec![a[3..].to_vec(), a[3..].to_vec(), vec![0.0; m * m]], &[]).unwrap().remove(2);
+    let whole = Tensor::from_slice(a.iter().map(|&x| x as f32).collect::<Vec<_>>()).cast(DType::BFloat16);
+    whole.prepare().unwrap().execute().unwrap();
+    let t = whole.try_shrink([(3, m * k + 3)]).unwrap();
+    let out = Tensor::empty(&[m * m], DType::BFloat16);
+    let out = crate::launch::graph_launch(prog, &cfg.lowering(&planner.device), &[&t, &t, &out]).unwrap();
+    out.prepare().unwrap().execute().unwrap();
+    let mut bytes = vec![0u8; m * m * 2];
+    out.buffer().unwrap().copyout(&mut bytes).unwrap();
+    for (i, (g, w)) in super::decode(ScalarDType::BFloat16, &bytes).iter().zip(&want).enumerate() {
+        assert!((g - w).abs() <= 2e-2 * w.abs().max(1.0), "[{i}] = {g} vs {w}");
+    }
 }

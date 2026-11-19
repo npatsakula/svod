@@ -58,6 +58,7 @@ mod fields {
     fn schedule() -> impl Strategy<Value = Schedule> {
         prop_oneof![
             (1usize.., any::<bool>()).prop_map(|(d, u)| Schedule::ring(d, u)),
+            (1usize.., any::<bool>()).prop_map(|(d, u)| Schedule::bulk(d, u)),
             (1usize..).prop_map(Schedule::ping_pong)
         ]
     }
@@ -172,6 +173,8 @@ fn a_config_code_keeps_its_stored_form() {
     // A staged store trails the code; one written before stores were coded reads as direct.
     let staged = GemmCfg { store: Store::Staged, ..cfg };
     assert_eq!(staged.code(), "w,128,256,64,2,4,r3u,g8,~,s");
+    let bulk = GemmCfg { schedule: crate::ir::Schedule::bulk(4, false), ..cfg };
+    assert_eq!(bulk.code(), "w,128,256,64,2,4,b4,g8,~");
     assert_eq!(GemmCfg::of_code("w,128,256,64,2,4,r3u,g8,~"), Some(cfg));
     let plain = format!("{cfg:?}");
     assert_eq!(format!("{staged:?}"), format!("{}, store: Staged }}", plain.strip_suffix(" }").expect("a struct")));

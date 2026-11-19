@@ -31,7 +31,7 @@
 //!   chosen from); `--picks` times the picks alone, an A/B across builds.
 //! - `trips`: the trip probes at 1–48 blocks an SM, per block-trip and per
 //!   round ([`svod_tk::probe::trip_at`]): what `TRIP_HIDING` is fitted to.
-//! - `pin --cfg BMxBNxBK:S:WRxWC[:rolled][:group][:staged],… [--shape MxNxK,…] [--residual]
+//! - `pin --cfg BMxBNxBK:S:WRxWC[:rolled][:group][:bulk][:staged],… [--shape MxNxK,…] [--residual]
 //!   [--gated]`: each pinned GEMM config on each shape (Whisper's fc2 by
 //!   default, a SwiGLU epilogue under `--gated`),
 //!   timed beside the model's price and that price with one term zeroed at
@@ -185,8 +185,9 @@ fn rate(t: Option<Duration>, work: f64, unit: &str) -> String {
 
 fn gemm_label(c: &GemmCfg) -> String {
     let staged = if c.store == Store::Staged { " staged" } else { "" };
+    let bulk = if matches!(c.schedule, Schedule::Bulk { .. }) { " bulk" } else { "" };
     let (tile, stages, warps, unroll) = (c.tile, c.stages(), c.warps, c.unroll());
-    format!("{tile:?} s{stages} {warps:?} unroll={unroll} {:?} crews={}{staged}", c.core, c.crews())
+    format!("{tile:?} s{stages} {warps:?} unroll={unroll} {:?} crews={}{bulk}{staged}", c.core, c.crews())
 }
 
 /// A bf16 GEMM at `cfg`, admitted: the programs the op launches.
@@ -578,14 +579,14 @@ fn trips_bench() -> Result<()> {
     Ok(())
 }
 
-/// A pinned config, `BMxBNxBK:S:WRxWC[:rolled][:group][:staged]`, on the warp core unless `group`, in the
+/// A pinned config, `BMxBNxBK:S:WRxWC[:rolled][:group][:bulk][:staged]`, on the warp core unless `group`, in the
 /// default raster.
 fn pinned(code: &str) -> Result<GemmCfg> {
     let dims = |s: &str| -> Result<Vec<usize>> { Ok(s.split('x').map(str::parse).collect::<Result<_, _>>()?) };
     let parts: Vec<&str> = code.split(':').collect();
-    let usage = || format!("{code}: BMxBNxBK:S:WRxWC[:rolled][:group][:staged]");
+    let usage = || format!("{code}: BMxBNxBK:S:WRxWC[:rolled][:group][:bulk][:staged]");
     let [tile, stages, warps, flags @ ..] = &parts[..] else { return Err(usage().into()) };
-    if let Some(flag) = flags.iter().find(|flag| !["rolled", "group", "staged"].contains(flag)) {
+    if let Some(flag) = flags.iter().find(|flag| !["rolled", "group", "bulk", "staged"].contains(flag)) {
         return Err(format!("{}: no flag {flag}", usage()).into());
     }
     let flag = |name: &str| flags.contains(&name);
@@ -597,7 +598,7 @@ fn pinned(code: &str) -> Result<GemmCfg> {
         tile: [bm, bn, bk],
         warps: [wr as u32, wc as u32],
         core: if flag("group") { Core::Group } else { Core::Warp },
-        schedule: Schedule::ring(stages, !flag("rolled")),
+        schedule: if flag("bulk") { Schedule::bulk } else { Schedule::ring }(stages, !flag("rolled")),
         order: TileOrder::DEFAULT,
         tail: None,
         store: if flag("staged") { Store::Staged } else { Store::Direct },

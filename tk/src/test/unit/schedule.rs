@@ -1,9 +1,12 @@
+use proptest::prelude::*;
 use svod_dtype::ScalarDType;
 use test_case::test_case;
 
-use crate::atoms::{Core, Fill};
+use crate::atoms::{Core, Fill, SyncCaps};
+use crate::build::BF16;
 use crate::interp::{round_to, run};
 use crate::ir::*;
+use crate::kernels::gemm::{GemmCfg, gemm};
 use crate::schedule::expand;
 use crate::sweep::assumed;
 
@@ -30,7 +33,7 @@ fn expansion_preserves_the_result(fill: Fill, stages: usize) {
     let (m, n, k) = (64usize, 32usize, 160usize);
     let prog = super::gemm_nt(m, n, k, 32, 32, 32, stages);
     let want = run(&prog, operands(m, n, k), &[("b", 1)]).unwrap();
-    let prog = expand(prog, fill, Core::Warp, false);
+    let prog = expand(prog, fill, Core::Warp, SyncCaps::default());
     let got = run(&prog, operands(m, n, k), &[("b", 1)]).unwrap();
     assert_eq!(got[2], want[2]);
     assert_eq!(count(&prog, |s| matches!(s, Stmt::Pipeline(_))), 0);
@@ -68,7 +71,7 @@ fn products_in_flight_preserve_the_result(stages: usize) {
     let (m, n, k) = (64usize, 32usize, 160usize);
     let prog = super::gemm_nt(m, n, k, 32, 32, 32, stages);
     let want = run(&prog, operands(m, n, k), &[("b", 1)]).unwrap();
-    let prog = expand(prog, Fill::CpAsync, Core::Group, false);
+    let prog = expand(prog, Fill::CpAsync, Core::Group, SyncCaps::default());
     let got = run(&prog, operands(m, n, k), &[("b", 1)]).unwrap();
     assert_eq!(got[2], want[2]);
     let syncs: Vec<Sync> =
@@ -95,6 +98,93 @@ fn products_in_flight_preserve_the_result(stages: usize) {
     assert!(matches!(prog.scalar(*started), Scalar::Bin(BinOp::Le, _, iv) if *iv == l.iv));
 }
 
+/// Scalar `id` of `prog` where induction `iv` holds `at`: the arithmetic a
+/// template's slots and phases are.
+fn scalar_at(prog: &Program<Expanded>, id: ScalarId, iv: ScalarId, at: i64) -> i64 {
+    let eval = |id| scalar_at(prog, id, iv, at);
+    match prog.scalar(id) {
+        Scalar::Const(v) => *v,
+        Scalar::Induction if id == iv => at,
+        Scalar::Bin(op, a, b) => match (op, eval(*a), eval(*b)) {
+            (BinOp::Add, a, b) => a + b,
+            (BinOp::Sub, a, b) => a - b,
+            (BinOp::Div, a, b) => a / b,
+            (BinOp::Rem, a, b) => a % b,
+            (BinOp::Le, a, b) => i64::from(a <= b),
+            (BinOp::Lt, a, b) => i64::from(a < b),
+            (BinOp::And, a, b) => a & b,
+            (op, ..) => panic!("{op:?} in a slot or a phase"),
+        },
+        other => panic!("{other:?} in a slot or a phase"),
+    }
+}
+
+/// A ring filled in bulk on a target with slot barriers: the result is the
+/// ring's, every slot's barrier is made ahead of the loop, a trip's fill
+/// arrives at its slot's barrier with the bytes of both operands and no
+/// thread commits or waits for a copy group.
+#[test_case(3; "three stages")]
+#[test_case(4; "four stages")]
+fn a_bulk_ring_fills_on_its_slots_barriers(stages: usize) {
+    let (m, n, k) = (64usize, 32usize, 160usize);
+    let cfg = |schedule| GemmCfg { schedule, ..super::gemm_nt_cfg([32, 32, 32], stages) };
+    let prog = |schedule| gemm::<BF16>(&assumed(super::gemm_spec(m, n, k), cfg(schedule)));
+    let want = run(&prog(Schedule::ring(stages, true)), operands(m, n, k), &[("b", 1)]).unwrap();
+    let slots = SyncCaps { slot_barrier: true, ..SyncCaps::default() };
+    let bulk = expand(prog(Schedule::bulk(stages, true)), Fill::CpAsync, Core::Group, slots);
+    assert_eq!(run(&bulk, operands(m, n, k), &[("b", 1)]).unwrap()[2], want[2]);
+    let syncs: Vec<Sync> =
+        bulk.walk().filter_map(|(_, s)| if let Stmt::Sync(s) = s { Some(*s) } else { None }).collect();
+    assert_eq!(syncs.iter().filter(|s| matches!(s, Sync::SlotInit { .. })).count(), stages);
+    assert!(syncs.iter().any(|s| matches!(s, Sync::SlotArrive { bytes, .. } if *bytes as usize == (32 + 32) * 32 * 2)));
+    assert!(!syncs.iter().any(|s| matches!(s, Sync::CommitAsync | Sync::WaitAsync { .. })), "{syncs:?}");
+    let modes = bulk.walk().filter_map(|(_, s)| if let Stmt::Copy { mode, .. } = s { Some(*mode) } else { None });
+    assert_eq!(modes.filter(|mode| matches!(mode, CopyMode::Bulk { .. })).count(), 2, "both operands");
+    // Without slot barriers the schedule is the ring it names.
+    let plain = expand(prog(Schedule::bulk(stages, true)), Fill::CpAsync, Core::Group, SyncCaps::default());
+    let ring = expand(prog(Schedule::ring(stages, true)), Fill::CpAsync, Core::Group, SyncCaps::default());
+    assert_eq!(plain.body, ring.body);
+}
+
+proptest! {
+    /// A slot's barrier completes a phase a fill, the phases alternating
+    /// from 0: every consume waits for the parity of the one fill its slot
+    /// has taken since the consume before it, which was issued a trip
+    /// earlier at least, and the slot is refilled only after.
+    #[test]
+    fn a_consume_waits_for_its_slots_latest_fill(stages in 3usize..=6, trips in 1usize..=24) {
+        let (m, n, k) = (64, 32, 32 * trips);
+        let cfg = GemmCfg { schedule: Schedule::bulk(stages, false), ..super::gemm_nt_cfg([32, 32, 32], stages) };
+        let slots = SyncCaps { slot_barrier: true, ..SyncCaps::default() };
+        let prog = expand(gemm::<BF16>(&assumed(super::gemm_spec(m, n, k), cfg)), Fill::CpAsync, Core::Group, slots);
+        let Some(Stmt::Loop(l)) = prog.body.0.iter().find(|s| matches!(s, Stmt::Loop(_))) else { panic!("the ring") };
+        let [Stmt::If { pred: consuming, then: consume, .. }, Stmt::If { pred: producing, then: produce, .. }] =
+            &l.body.0[..] else { panic!("a consume and a produce") };
+        let Some(Stmt::Sync(Sync::SlotWait { bar: waited, phase })) = consume.0.first() else { panic!("the wait") };
+        let Some(Stmt::Sync(Sync::SlotArrive { bar: filled, .. })) = produce.0.first() else { panic!("the arrival") };
+        let holds = |pred: ScalarId, at: i64| scalar_at(&prog, pred, l.iv, at) != 0;
+        // Per slot: the fills issued and the fills consumed.
+        let mut fills = vec![(0i64, 0i64); stages];
+        let extent = scalar_at(&prog, l.extent, l.iv, 0);
+        prop_assert_eq!(extent as usize, trips + stages - 1);
+        for at in 0..extent {
+            if holds(*consuming, at) {
+                let slot = scalar_at(&prog, waited.slot, l.iv, at) as usize;
+                let (issued, consumed) = &mut fills[slot];
+                prop_assert_eq!(*issued, *consumed + 1, "one fill since the last consume");
+                prop_assert_eq!(scalar_at(&prog, *phase, l.iv, at), *consumed % 2, "its parity");
+                *consumed += 1;
+            }
+            if holds(*producing, at) {
+                let (issued, consumed) = &mut fills[scalar_at(&prog, filled.slot, l.iv, at) as usize];
+                prop_assert_eq!(*issued, *consumed, "a slot is refilled once consumed");
+                *issued += 1;
+            }
+        }
+        prop_assert_eq!(fills.iter().map(|f| f.1).sum::<i64>() as usize, trips);
+    }
+}
+
 /// The two-crew expansion keeps the GEMM's result (the interpreter runs the
 /// crews as one, its barriers and priorities no-ops) and leaves no pipeline:
 /// a head trip, the second crew's extra barrier, the steady loop, the first
@@ -107,7 +197,7 @@ fn ping_pong_expansion_preserves_the_result(bk: usize, slices: usize) {
     let want = run(&prog, operands(m, n, k), &[("b", 1)]).unwrap();
     // As the lowering: a product's shared operands become explicit reads first.
     crate::lower::materialize_operands(&mut prog, Core::Warp);
-    let prog = expand(prog, Fill::Staged, Core::Warp, false);
+    let prog = expand(prog, Fill::Staged, Core::Warp, SyncCaps::default());
     let got = run(&prog, operands(m, n, k), &[("b", 1)]).unwrap();
     assert_eq!(got[2], want[2]);
     assert_eq!(count(&prog, |s| matches!(s, Stmt::Pipeline(_))), 0);
@@ -128,7 +218,7 @@ fn ping_pong_expansion_preserves_the_result(bk: usize, slices: usize) {
 fn ping_pong_cuts_a_trip_into_clusters() {
     let mut prog = super::gemm_nt_crews(64, 64, 256, [64, 64, 64]);
     crate::lower::materialize_operands(&mut prog, Core::Warp);
-    let prog = expand(prog, Fill::Staged, Core::Warp, false);
+    let prog = expand(prog, Fill::Staged, Core::Warp, SyncCaps::default());
     let kind = |s: &Stmt<Expanded>| match s {
         Stmt::Copy { dst, src, mode: CopyMode::Staged, .. } => match (&prog.value(*src).place, prog.value(*dst).tier())
         {
@@ -199,7 +289,7 @@ fn staged_halves_keep_their_copys_scope() {
     use crate::kernels::attention::{AttnMask, FaCfg, attention};
     let cfg = FaCfg { key_warps: 4, ..FaCfg::new(16, 16, 2) };
     let spec = assumed(super::attention::probe_spec(1, 1, 1, 64, 64, AttnMask::default()), cfg);
-    let prog = expand(attention::<BF16>(&spec), Fill::Staged, Core::Warp, false);
+    let prog = expand(attention::<BF16>(&spec), Fill::Staged, Core::Warp, SyncCaps::default());
     fn copies(block: &Block<Expanded>, inside: bool, out: &mut Vec<(bool, Scope, CopyMode)>) {
         for s in &block.0 {
             if let Stmt::Copy { mode, scope, .. } = s {
@@ -241,7 +331,7 @@ fn register_staging_peels_the_ring_into_three_branch_free_loops(stages: usize, t
         .flatten()
         .collect();
     let schedule = prog.walk().find_map(|(_, s)| if let Stmt::Pipeline(p) = s { Some(p.schedule) } else { None });
-    let prog = expand(prog, Fill::Staged, Core::Warp, false);
+    let prog = expand(prog, Fill::Staged, Core::Warp, SyncCaps::default());
     let constant = slots.iter().all(|&s| *prog.scalar(s) == Scalar::Const(0));
     assert!(!slots.is_empty() && constant == (stages == 1), "slot scalars constant: {constant}");
     let loops: Vec<&Loop<Expanded>> =
@@ -333,7 +423,7 @@ fn a_branching_tail_runs_between_the_barriers_halves(k: usize, stages: usize, sp
         .map(|(p, param)| (0..param.elems).map(|i| ((i * 7 + p * 5) % 23) as f64 / 8.0 - 1.0).collect())
         .collect();
     let want = run(&authored, params.clone(), &[]).unwrap();
-    let prog = expand(authored, Fill::Staged, Core::Warp, split);
+    let prog = expand(authored, Fill::Staged, Core::Warp, SyncCaps { split_barrier: split, ..SyncCaps::default() });
     assert_eq!(run(&prog, params, &[]).unwrap(), want, "the template moved a read past the commit");
     let halves = |s: &Stmt<Expanded>| matches!(s, Stmt::Sync(Sync::Arrive | Sync::Await));
     if !parted {

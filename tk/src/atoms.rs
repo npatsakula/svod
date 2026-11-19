@@ -282,13 +282,13 @@ impl Fill {
     /// Whether this fill runs `schedule`: a ring it builds ([`Self::ring`]),
     /// or two crews, whose one slot any fill stages.
     pub fn runs(self, schedule: crate::ir::Schedule) -> bool {
-        !matches!(schedule, crate::ir::Schedule::Ring { depth, .. } if self.stages(depth.get()) != depth.get())
+        schedule.as_ring().is_none_or(|(depth, _, bulk)| self.stages(depth) == depth && !(bulk && self == Fill::Staged))
     }
 }
 
 /// The semantic syncs ([`crate::ir::Sync`]) that are an instruction on a
 /// target; each is nothing elsewhere.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SyncCaps {
     /// A warp's own barrier is `bar.warp.sync`: CUDA's lanes schedule
     /// independently, where an AMD wave issues its LDS accesses in order and
@@ -305,6 +305,9 @@ pub struct SyncCaps {
     /// `Sync::Await` → `s_barrier_wait`): RDNA4. Elsewhere an arrive is
     /// nothing and an await the whole barrier.
     pub split_barrier: bool,
+    /// A ring slot's fill completes on a barrier object of its own
+    /// (`Sync::SlotInit`, `SlotArrive`, `SlotWait` → `mbarrier`): Hopper.
+    pub slot_barrier: bool,
 }
 
 /// How a lane reads the register of lane `lane ^ mask`.
@@ -733,7 +736,13 @@ fn cuda(c: CudaArch) -> Target {
         shared_banks: None,
         cache_swizzle: None,
         occupancy: Occupancy { simds: 4, file: 512, waves, registers: 255, acc_file: 0, blocks },
-        sync: SyncCaps { warp_barrier: true, commit_fence: false, priority: false, split_barrier: false },
+        sync: SyncCaps {
+            warp_barrier: true,
+            commit_fence: false,
+            priority: false,
+            split_barrier: false,
+            slot_barrier: c.major == 9,
+        },
         lane_move: LaneMove::Shuffle,
         hardware_exp2: true,
     }
@@ -815,7 +824,13 @@ fn amd(a: AmdArch) -> Target {
             max_stride: 8 << 10,
         }),
         occupancy,
-        sync: SyncCaps { warp_barrier: false, commit_fence: !cdna, priority: true, split_barrier: a.gfx_major() == 12 },
+        sync: SyncCaps {
+            warp_barrier: false,
+            commit_fence: !cdna,
+            priority: true,
+            split_barrier: a.gfx_major() == 12,
+            slot_barrier: false,
+        },
         lane_move: if cdna { LaneMove::Permute } else { LaneMove::Dpp },
         hardware_exp2: true,
     }
@@ -844,7 +859,13 @@ fn metal(f: MetalFamily) -> Target {
         shared_banks: None,
         cache_swizzle: None,
         occupancy: Occupancy { simds: 4, file: 1024, waves: 8, registers: 128, acc_file: 0, blocks: 32 },
-        sync: SyncCaps { warp_barrier: false, commit_fence: false, priority: false, split_barrier: false },
+        sync: SyncCaps {
+            warp_barrier: false,
+            commit_fence: false,
+            priority: false,
+            split_barrier: false,
+            slot_barrier: false,
+        },
         lane_move: LaneMove::SimdShuffle,
         hardware_exp2: false,
     }

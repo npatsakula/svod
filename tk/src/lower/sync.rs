@@ -123,7 +123,7 @@ fn walk(prog: &Program, block: Block, mut state: State, scope: Scope, divergent:
                 state.meet(state.need(rd, false).max(state.need(wr, true)), scope, divergent, &mut out)?;
                 if let Some(a) = wr {
                     match mode {
-                        CopyMode::Async => state.pending.insert(a),
+                        CopyMode::Async | CopyMode::Bulk { .. } => state.pending.insert(a),
                         CopyMode::Sync | CopyMode::Staged => state.dirty.insert(a),
                     };
                 }

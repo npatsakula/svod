@@ -694,3 +694,67 @@ enum Escape {
     Warps,
     None,
 }
+
+/// A ring slot's barrier on Hopper: one thread initializes it and arrives
+/// with the fill's bytes, every thread waits for its phase in one retry
+/// loop, each on the slot's own 64-bit object; ptxas takes the kernel. A
+/// target without slot barriers emits nothing for the three.
+#[test_case(crate::sweep::hopper(), true; "hopper")]
+#[test_case(crate::atoms::sm86(), false; "ampere")]
+#[test_case(amd(AmdArch::Gfx942, 304), false; "cdna")]
+fn slot_barriers_emit_on_hopper_alone(target: Target, barriers: bool) {
+    let spec = NormSpec {
+        batch: Batch::Static(1),
+        rows: 4,
+        d: 64,
+        norm: Norm::Rms,
+        eps: 1e-5,
+        residual: false,
+        bias: false,
+        cfg: NormCfg { br: 4 },
+    };
+    let device = Device { target, costs: Costs::default() };
+    let (target, lowering) = (&device.target, Lowering::new(&device));
+    let mut prog = crate::schedule::expand(norm::<F16>(&spec), target.fill, Core::Warp, target.sync);
+    prog.smem.push(SmemAlloc { name: "full".into(), dtype: svod_dtype::ScalarDType::UInt64, elems: 4, storage: () });
+    let bars = SmemId(prog.smem.len() as u32 - 1);
+    let [slot, phase] = [3, 1].map(|v| {
+        prog.scalars.push(Scalar::Const(v));
+        ScalarId(prog.scalars.len() as u32 - 1)
+    });
+    let bar = SlotBar { bars, slot };
+    let syncs = [Sync::SlotInit { bar }, Sync::SlotArrive { bar, bytes: 4096 }, Sync::SlotWait { bar, phase }];
+    prog.body.0.splice(0..0, syncs.map(Stmt::Sync));
+    let laid = crate::layouts::infer(prog, &device, Core::Warp).unwrap();
+    let params =
+        laid.params.iter().enumerate().map(|(i, p)| UOp::param(i, p.elems, DType::Scalar(p.dtype), None)).collect();
+    let (program, linear, marks) =
+        crate::lower::emit::emit(&laid, &lowering, params, crate::lower::standalone_device(&lowering)).unwrap();
+    let ir = crate::lower::Lowered { program, linear, tile: laid, marks }.text(target).unwrap();
+    let needles = [
+        "call void @llvm.nvvm.mbarrier.init.shared(ptr addrspace(3) %",
+        "call i64 @llvm.nvvm.mbarrier.arrive.expect.tx.scope.cta.space.cta(ptr addrspace(3) %",
+        ", i32 4096)",
+        "mbarrier.try_wait.parity.shared::cta.b64 p, [$0], $1;",
+    ];
+    for needle in needles {
+        assert_eq!(ir.contains(needle), barriers, "{needle}:\n{ir}");
+    }
+    let svod_dtype::GpuArch::Cuda(arch) = target.arch else { return };
+    if !barriers {
+        return;
+    }
+    let compiled = svod_runtime::cuda::compile_ir_to_ptx(&ir, arch);
+    let Some(ptx) = super::targets::built(compiled, super::targets::NO_NVPTX).unwrap_or_else(|e| panic!("{e}")) else {
+        return;
+    };
+    let ptx = String::from_utf8(ptx).unwrap();
+    // One thread initializes and arrives; the barrier is slot 3's object.
+    assert_eq!(ptx.matches("mbarrier.init.shared").count(), 1, "{ptx}");
+    assert_eq!(ptx.matches("mbarrier.arrive.expect_tx.shared").count(), 1, "{ptx}");
+    assert_eq!(ptx.matches("mbarrier.try_wait.parity.shared::cta.b64").count(), 1, "{ptx}");
+    let Some(ptxas) = super::targets::ptxas() else { return };
+    let mut command = std::process::Command::new(ptxas);
+    command.args(["-arch=sm_90a", "-o", "/dev/null", "/dev/stdin"]);
+    super::targets::run(command, ptx.as_bytes(), "ptxas sm_90a slot barriers").unwrap_or_else(|e| panic!("{e}"));
+}
