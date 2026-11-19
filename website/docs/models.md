@@ -71,7 +71,7 @@ cargo run -p svod-model --release --example vad_stream     -- audio.wav         
 cargo run -p svod-model --release --example vad_bench      -- audio.wav                # Silero vs FireRedVAD
 cargo run -p svod-model --release --example gtcrn_enhance  -- --in noisy.wav --out clean.wav --hub
 cargo run -p svod-model --release --example nemotron_diarize -- audio.wav [--stream low|very-low|ultra-low]
-cargo run -p svod-model --release --example qwen3_embed    -- --texts texts.txt --batch 8 --max-len 512
+cargo run -p svod-model --release --example qwen3_embed    -- --texts texts.txt --batches 1,8,32 --max-len 512
 cargo run -p svod-model --release --example resnet_classify -- --hub --image dog.bin --side 224
 cargo run -p svod-model --release --example yolo_detect    -- --hub --scale small --image photo.bin --side 640
 ```

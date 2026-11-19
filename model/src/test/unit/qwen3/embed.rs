@@ -109,3 +109,45 @@ fn profiled_run_records_one_stage_per_batch() {
     assert_eq!(profile.stages.len(), 2);
     assert_eq!(profile.stages[0].name, format!("embed[2x{TILE}]"));
 }
+
+/// `buckets` names the bucket of every plan execution `embed` makes, in order:
+/// a row past `max_len` counts truncated, an empty one as one token. Here the
+/// truncated row fills a plan row alone, the next two (and the empty row)
+/// share one, and the 20-token row runs in the smaller bucket.
+#[test]
+fn buckets_name_each_execution() {
+    let model = Qwen3Embedding::empty(tiny_cfg()).unwrap();
+    let mut e = embedder_of(&model, 1, 2 * TILE);
+    let rows = [row(1, TILE + 5), row(2, TILE - 10), row(3, 20), row(4, 3 * TILE), Vec::new()];
+    let buckets = e.buckets(&rows);
+    assert_eq!(buckets, [2 * TILE, 2 * TILE, TILE]);
+    let (_, profile) = e.embed_profiled(&rows).unwrap();
+    let ran: Vec<&str> = profile.stages.iter().map(|s| s.name.as_str()).collect();
+    let named: Vec<String> = buckets.iter().map(|b| format!("embed[1x{b}]")).collect();
+    assert_eq!(ran, named);
+}
+
+#[test_case::test_case(0, TILE; "an empty length takes the smallest bucket")]
+#[test_case::test_case(1, TILE; "one token")]
+#[test_case::test_case(TILE, TILE; "a full tile stays")]
+#[test_case::test_case(TILE + 1, 2 * TILE; "one past a tile rounds up")]
+#[test_case::test_case(10 * TILE, 2 * TILE; "past max_len clamps")]
+fn warm_up_returns_the_bucket(len: usize, bucket: usize) {
+    let model = Qwen3Embedding::empty(tiny_cfg()).unwrap();
+    assert_eq!(embedder_of(&model, 1, 2 * TILE).warm_up(len).unwrap(), bucket);
+}
+
+/// A warmed-up plan embeds rows as a cold one does: the padding run leaves
+/// nothing behind in the plan's buffers.
+#[test]
+fn warm_up_leaves_the_plan_clean() {
+    let rows = [row(1, 7), row(2, 30)];
+    let model = Qwen3Embedding::empty(tiny_cfg()).unwrap();
+    let cold = embedder_of(&model, 2, TILE).embed(&rows).unwrap();
+    let mut warm = embedder_of(&model, 2, TILE);
+    assert_eq!(warm.warm_up(30).unwrap(), TILE);
+    for (i, (a, b)) in cold.iter().zip(&warm.embed(&rows).unwrap()).enumerate() {
+        let c = cosine(a, b);
+        assert!(c > 1.0 - 1e-4, "row {i} differs after warm-up: cosine {c}");
+    }
+}
