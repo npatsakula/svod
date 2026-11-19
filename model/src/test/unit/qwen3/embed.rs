@@ -43,7 +43,7 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 #[test]
 fn packing_preserves_order_and_rows() {
     let rows = [row(1, 7), row(2, 2), row(3, 12)];
-    let model = Qwen3Embedding::empty(tiny_cfg());
+    let model = Qwen3Embedding::empty(tiny_cfg()).unwrap();
     let batched = embedder_of(&model, 2, TILE).embed(&rows).unwrap();
     assert_eq!(batched.len(), 3);
     for (i, out) in batched.iter().enumerate() {
@@ -63,7 +63,7 @@ fn packing_preserves_order_and_rows() {
 fn rows_that_do_not_fit_spill_to_the_next_batch() {
     let long = TILE - 10;
     let rows = [row(1, 20), row(2, long), row(3, long), row(4, long), row(5, 3)];
-    let model = Qwen3Embedding::empty(tiny_cfg());
+    let model = Qwen3Embedding::empty(tiny_cfg()).unwrap();
     let (out, profile) = embedder_of(&model, 2, TILE).embed_profiled(&rows).unwrap();
     // Three long rows and a 20-token one: two plan rows take two long rows and
     // the 3-token row, the third long row and the 20-token one wait.
@@ -80,7 +80,7 @@ fn rows_that_do_not_fit_spill_to_the_next_batch() {
 /// another row's slot.
 #[test]
 fn empty_rows_embed_as_one_pad_token() {
-    let model = Qwen3Embedding::empty(tiny_cfg());
+    let model = Qwen3Embedding::empty(tiny_cfg()).unwrap();
     let mut e = embedder_of(&model, 2, TILE);
     let out = e.embed(&[Vec::new(), row(1, 5)]).unwrap();
     let pad = &e.embed(&[vec![EOS]]).unwrap()[0];
@@ -90,7 +90,7 @@ fn empty_rows_embed_as_one_pad_token() {
 
 #[test]
 fn rows_longer_than_max_len_are_truncated() {
-    let model = Qwen3Embedding::empty(tiny_cfg());
+    let model = Qwen3Embedding::empty(tiny_cfg()).unwrap();
     let mut e = embedder_of(&model, 1, TILE);
     let long = row(5, 2 * TILE);
     let truncated = &e.embed(&[&long]).unwrap()[0];
@@ -102,7 +102,7 @@ fn rows_longer_than_max_len_are_truncated() {
 /// (`TILE / 16` per row), so `2 · TILE / 16 + 1` rows take two batches.
 #[test]
 fn profiled_run_records_one_stage_per_batch() {
-    let model = Qwen3Embedding::empty(tiny_cfg());
+    let model = Qwen3Embedding::empty(tiny_cfg()).unwrap();
     let rows: Vec<Vec<u32>> = (0..2 * TILE / 16 + 1).map(|i| row(i as u32, 2)).collect();
     let (out, profile) = embedder_of(&model, 2, TILE).embed_profiled(&rows).unwrap();
     assert_eq!(out.len(), rows.len());

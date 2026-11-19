@@ -26,8 +26,8 @@ pub struct Qwen3Embedding {
 }
 
 impl Qwen3Embedding {
-    pub fn empty(config: Qwen3Config) -> Self {
-        Self { model: Qwen3Model::empty(config), normalize: true }
+    pub fn empty(config: Qwen3Config) -> Result<Self> {
+        Ok(Self { model: Qwen3Model::empty(config)?, normalize: true })
     }
 
     /// Right-padded `input_ids` `(B, L)` + `lengths` `(B)` → f32 embeddings
@@ -78,7 +78,7 @@ impl Qwen3Embedding {
 
     pub fn from_state_dict(sd: &StateDict, config: Qwen3Config) -> Result<Self> {
         let dtype = config.dtype.clone();
-        let mut model = Self::empty(config);
+        let mut model = Self::empty(config)?;
         model.load_state_dict(&state::cast_all(sd, dtype)?, "")?;
         Ok(model)
     }

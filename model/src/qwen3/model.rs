@@ -110,15 +110,16 @@ pub struct Packing<'a> {
 }
 
 impl Qwen3Model {
-    pub fn empty(config: Qwen3Config) -> Self {
+    /// Fails when the rope tables cannot be realized on the default device.
+    pub fn empty(config: Qwen3Config) -> Result<Self> {
         let dtype = config.dtype.clone();
         let embeddings = crate::init::embedding(config.vocab_size, config.hidden_size, dtype.clone());
         let layers = (0..config.num_hidden_layers).map(|_| Qwen3DecoderLayer::empty(&config)).collect();
         let norm = RmsNorm::with_dims(config.hidden_size, config.rms_norm_eps, dtype);
-        let rope = rope_cache(&config, rope_positions(&config)).expect("even head_dim, positive context");
-        let inv_freq = Tensor::rope_inv_freq(config.rope_theta, config.head_dim).expect("even head_dim");
-        inv_freq.realize().expect("a [Dh/2] constant");
-        Self { config, embeddings, layers, norm, rope, inv_freq }
+        let rope = rope_cache(&config, rope_positions(&config))?;
+        let inv_freq = Tensor::rope_inv_freq(config.rope_theta, config.head_dim)?;
+        inv_freq.realize()?;
+        Ok(Self { config, embeddings, layers, norm, rope, inv_freq })
     }
 
     /// The `(cos, sin)` prefix of the realized cache covering `positions`
@@ -216,7 +217,7 @@ impl Qwen3Model {
 
     pub fn from_state_dict(sd: &StateDict, config: Qwen3Config) -> Result<Self> {
         let dtype = config.dtype.clone();
-        let mut model = Self::empty(config);
+        let mut model = Self::empty(config)?;
         model.load_state_dict(&state::cast_all(sd, dtype)?, "")?;
         Ok(model)
     }

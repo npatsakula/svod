@@ -27,7 +27,7 @@ fn tiny_cfg() -> Qwen3Config {
 
 #[test]
 fn forward_output_shape() {
-    let model = Qwen3Model::empty(tiny_cfg());
+    let model = Qwen3Model::empty(tiny_cfg()).unwrap();
     let ids = Tensor::from_slice([0i32, 1, 2, 3, 4, 5, 6, 7]).try_reshape([1isize, 8]).unwrap();
 
     let out = model.forward(&ids).unwrap();
@@ -43,7 +43,7 @@ fn forward_output_shape() {
 
 #[test]
 fn embedding_output_shape() {
-    let emb = Qwen3Embedding::empty(tiny_cfg());
+    let emb = Qwen3Embedding::empty(tiny_cfg()).unwrap();
     let ids = Tensor::from_slice([0i32, 1, 2, 3, 4, 5, 6, 7]).try_reshape([1isize, 8]).unwrap();
     let lengths = Tensor::from_slice([8i32]);
 
@@ -71,7 +71,7 @@ fn realized(t: &Tensor) -> Vec<f32> {
 fn right_padding_leaves_real_tokens_unchanged() {
     let cfg = tiny_cfg();
     let hidden = cfg.hidden_size;
-    let emb = Qwen3Embedding::empty(cfg);
+    let emb = Qwen3Embedding::empty(cfg).unwrap();
     let ids: Vec<i32> = (0..5).collect();
     let alone = realized(&emb.model.forward(&Tensor::from_slice(&ids).try_reshape([1isize, 5]).unwrap()).unwrap());
 
@@ -105,7 +105,7 @@ fn packed_rows_match_separate_forwards() {
     use crate::qwen3::Packing;
     let cfg = tiny_cfg();
     let hidden = cfg.hidden_size;
-    let model = Qwen3Model::empty(cfg);
+    let model = Qwen3Model::empty(cfg).unwrap();
     let (a, b): (Vec<i32>, Vec<i32>) = ((1..6).collect(), (10..13).collect());
     let alone = |ids: &[i32]| {
         realized(&model.forward(&Tensor::from_slice(ids).try_reshape([1isize, ids.len() as isize]).unwrap()).unwrap())
@@ -172,7 +172,7 @@ fn sorted_keys(sd: &StateDict) -> Vec<String> {
 /// under a prefix (which must not grow a leading dot).
 #[test]
 fn state_dict_keys_match_published_layout() {
-    let model = Qwen3Model::empty(tiny_cfg());
+    let model = Qwen3Model::empty(tiny_cfg()).unwrap();
     let want = expected_keys();
     assert_eq!(sorted_keys(&model.state_dict("")), want);
 
@@ -183,16 +183,16 @@ fn state_dict_keys_match_published_layout() {
 /// The embedding wrapper is transparent: it emits the backbone's keys verbatim.
 #[test]
 fn embedding_state_dict_is_transparent() {
-    let emb = Qwen3Embedding::empty(tiny_cfg());
+    let emb = Qwen3Embedding::empty(tiny_cfg()).unwrap();
     assert_eq!(sorted_keys(&emb.state_dict("")), expected_keys());
 }
 
 #[test]
 fn state_dict_round_trip() {
-    let model = Qwen3Model::empty(tiny_cfg());
+    let model = Qwen3Model::empty(tiny_cfg()).unwrap();
     let sd = model.state_dict("");
 
-    let mut model2 = Qwen3Model::empty(tiny_cfg());
+    let mut model2 = Qwen3Model::empty(tiny_cfg()).unwrap();
     model2.load_state_dict(&sd, "").unwrap();
     assert_eq!(sorted_keys(&sd), sorted_keys(&model2.state_dict("")));
 }
@@ -200,7 +200,7 @@ fn state_dict_round_trip() {
 #[test]
 fn key_count_matches_checkpoint_layout() {
     let cfg = qwen3_0_6b_structural();
-    let model = Qwen3Model::empty(cfg);
+    let model = Qwen3Model::empty(cfg).unwrap();
     let sd = model.state_dict("");
     // embed + 28 × (input_ln, q/k/v/o, q/k_norm, post_ln, gate/up/down) + norm
     let expected = 1 + 28 * 11 + 1;
@@ -251,7 +251,7 @@ fn residual_stream_matches_the_eager_layer_chain() {
 
     let cfg = fusable_cfg();
     let (len, dtype) = (128usize, cfg.dtype.clone());
-    let model = Qwen3Model::empty(cfg);
+    let model = Qwen3Model::empty(cfg).unwrap();
     let ids = Tensor::from_slice((0..len as i32).collect::<Vec<_>>()).try_reshape([1isize, len as isize]).unwrap();
 
     // The sequence already tiles the attention kernel, so `forward` pads nothing
@@ -283,7 +283,7 @@ fn residual_stream_matches_the_eager_layer_chain() {
 #[test_case(128; "exactly one tile")]
 #[test_case(200; "between tiles")]
 fn rope_cache_covers_the_padded_context(max_positions: usize) {
-    let model = Qwen3Model::empty(Qwen3Config { max_position_embeddings: max_positions, ..tiny_cfg() });
+    let model = Qwen3Model::empty(Qwen3Config { max_position_embeddings: max_positions, ..tiny_cfg() }).unwrap();
     let padded = max_positions.next_multiple_of(crate::qwen3::SEQUENCE_TILE);
     let (cos, sin) = model.rope_prefix(padded).expect("the cache must reach the padded context");
     assert_eq!(cos.dim_const(1).unwrap(), padded);
@@ -295,7 +295,7 @@ fn rope_cache_covers_the_padded_context(max_positions: usize) {
 #[test]
 fn rope_cache_rounding_leaves_positions_put() {
     let rows = |max_positions: usize| {
-        let model = Qwen3Model::empty(Qwen3Config { max_position_embeddings: max_positions, ..tiny_cfg() });
+        let model = Qwen3Model::empty(Qwen3Config { max_position_embeddings: max_positions, ..tiny_cfg() }).unwrap();
         let (cos, sin) = model.rope_prefix(100).expect("100 positions");
         (realized(&cos.contiguous()), realized(&sin.contiguous()))
     };
@@ -309,7 +309,7 @@ fn rope_cache_rounding_leaves_positions_put() {
 /// same rule `Qwen3Embedder` applies when it embeds an empty row as one pad token.
 #[test]
 fn out_of_range_lengths_saturate_into_the_row() {
-    let emb = Qwen3Embedding::empty(tiny_cfg());
+    let emb = Qwen3Embedding::empty(tiny_cfg()).unwrap();
     let ids = Tensor::from_slice([3i32, 1, 4, 1, 5, 9, 2, 6]).try_reshape([1isize, 8]).unwrap();
     let at = |len: i32| realized(&emb.encode(&ids, &Tensor::from_slice([len])).unwrap());
 
@@ -326,7 +326,7 @@ fn out_of_range_lengths_saturate_into_the_row() {
 fn reranker_scores_a_real_token_at_a_zero_length() {
     use crate::qwen3::Qwen3Reranker;
 
-    let mut reranker = Qwen3Reranker::empty(tiny_cfg());
+    let mut reranker = Qwen3Reranker::empty(tiny_cfg()).unwrap();
     reranker.yes_loc = 5;
     let ids = Tensor::from_slice([3i32, 1, 4, 1, 5, 9, 2, 6]).try_reshape([1isize, 8]).unwrap();
     let at = |len: i32| realized(&reranker.forward(&ids, &Tensor::from_slice([len])).unwrap());
@@ -339,7 +339,7 @@ fn reranker_scores_a_real_token_at_a_zero_length() {
 /// narrow that ran off the end of the rope cache.
 #[test]
 fn a_sequence_past_the_context_is_rejected() {
-    let model = Qwen3Model::empty(Qwen3Config { max_position_embeddings: 4, ..tiny_cfg() });
+    let model = Qwen3Model::empty(Qwen3Config { max_position_embeddings: 4, ..tiny_cfg() }).unwrap();
     let ids = Tensor::from_slice([0i32; 5]).try_reshape([1isize, 5]).unwrap();
     let err = model.forward(&ids).expect_err("five tokens do not fit a four-position context");
     assert!(matches!(err, crate::qwen3::Error::ContextLength { seq_len: 5, max_position_embeddings: 4 }), "got {err}");
@@ -352,7 +352,7 @@ fn a_sequence_past_the_context_is_rejected() {
 /// take the graph and `forward` must still produce a hidden state.
 #[test]
 fn a_norm_weight_off_the_stream_dtype_falls_back_to_the_graph() {
-    let mut model = Qwen3Model::empty(Qwen3Config { dtype: crate::default_compute_dtype(), ..fusable_cfg() });
+    let mut model = Qwen3Model::empty(Qwen3Config { dtype: crate::default_compute_dtype(), ..fusable_cfg() }).unwrap();
     for layer in &mut model.layers {
         layer.input_layernorm.weight = layer.input_layernorm.weight.cast(DType::Float32);
         layer.post_attention_layernorm.weight = layer.post_attention_layernorm.weight.cast(DType::Float32);

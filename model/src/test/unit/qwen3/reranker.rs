@@ -25,7 +25,7 @@ fn tiny_cfg() -> Qwen3Config {
 
 #[test]
 fn forward_output_shape() {
-    let mut reranker = Qwen3Reranker::empty(tiny_cfg());
+    let mut reranker = Qwen3Reranker::empty(tiny_cfg()).unwrap();
     reranker.yes_loc = 5; // within tiny vocab_size=100
     let ids = Tensor::from_slice([0i32, 1, 2, 3, 4, 5, 6, 7]).try_reshape([1isize, 8]).unwrap();
     let lengths = Tensor::from_slice([8i32]);
@@ -45,7 +45,7 @@ fn forward_output_shape() {
 
 #[test]
 fn lm_head_tied_to_embeddings() {
-    let reranker = Qwen3Reranker::empty(tiny_cfg());
+    let reranker = Qwen3Reranker::empty(tiny_cfg()).unwrap();
     // The lm_head_weight should have the same shape as embed_tokens.weight
     let lm_shape = reranker.lm_head_weight.dims().unwrap();
     assert_eq!(lm_shape[0], 100); // vocab_size
@@ -57,7 +57,7 @@ fn lm_head_tied_to_embeddings() {
 /// `embed_tokens.weight` and resolved on load).
 #[test]
 fn state_dict_nests_backbone_under_model_prefix() {
-    let reranker = Qwen3Reranker::empty(tiny_cfg());
+    let reranker = Qwen3Reranker::empty(tiny_cfg()).unwrap();
     let sd = reranker.state_dict("");
     assert!(sd.contains_key("model.embed_tokens.weight"));
     assert!(sd.contains_key("model.layers.0.self_attn.q_proj.weight"));
@@ -65,7 +65,7 @@ fn state_dict_nests_backbone_under_model_prefix() {
     assert!(!sd.contains_key("lm_head.weight"), "the LM head is tied, never stored");
 
     // The tie is resolved on load: a fresh reranker picks the embedding table up.
-    let mut reloaded = Qwen3Reranker::empty(tiny_cfg());
+    let mut reloaded = Qwen3Reranker::empty(tiny_cfg()).unwrap();
     reloaded.load_state_dict(&sd, "").unwrap();
     let want = sd["model.embed_tokens.weight"].clone();
     want.realize().unwrap();
