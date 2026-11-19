@@ -82,7 +82,7 @@ SVOD_DEVICE=CUDA cargo run --release -p svod-tk --example tk_bench -- gemm --top
 | `raster [--shape MxNxK,…]` | 调优器的 GEMM 选择和规划器第一个配置的每种光栅顺序，与默认顺序对比，并列出代价模型对每种顺序的估价 |
 | `fit [--only LABEL,…] [--picks]` | 代价模型与设备的对比：若干 GEMM、注意力和 nearest 形状上每个排名配置的预测时间与实测时间、调优器的选择及调优器的墙钟时间；`--picks` 只为选择计时 |
 | `trips` | 每个 SM 驻留 1 到 48 个块时的流水线迭代探针 |
-| `pin --cfg BMxBNxBK:S:WRxWC[:rolled][:group][:bulk][:staged],… [--shape MxNxK,…] [--residual] [--gated]` | 每个固定的 GEMM 配置的时间（默认为 Whisper 的 fc2），旁边是模型的价格，以及分别将内存延迟、单独行程或矩阵核步骤置零后的价格：每一项占该配置时间的多少 |
+| `pin --cfg BMxBNxBK:S:WRxWC[:rolled][:group][:bulk][:staged|:flushed],… [--shape MxNxK,…] [--residual] [--gated]` | 每个固定的 GEMM 配置的时间（默认为 Whisper 的 fc2），旁边是模型的价格，以及分别将内存延迟、单独行程或矩阵核步骤置零后的价格：每一项占该配置时间的多少 |
 | `sqtt gemm M N K [--cfg I\|tuned\|BMxBNxBK:S:WRxWC[:rolled],…] [--top N] [--out DIR] [--json] [--attribute]` | 仅限 AMD RDNA3/RDNA4：每个配置的线程追踪报告（见[线程追踪](#thread-trace)）；`sqtt --load DIR` 重新读取已保存的追踪 |
 
 `--metric` 可取 `squared-l2`、`l2` 或 `neg-dot`。每个命令都按调优器的方式计时：一个配置的所有内核一起计时（拆分的合并、尾部的部分和），算子的计划也一样。

@@ -56,8 +56,9 @@ rows और `n` से आगे के columns bounded views हैं, इस�
 होना ज़रूरी है। `core: Core::Group` products को `wgmma` (sm_90) पर issue करता है;
 `schedule: Schedule::ping_pong(k)` दोनों warp rows को एक slot पर ping-pong में चलाता है (CDNA)।
 Warpgroup core पर `Schedule::bulk(stages, unroll)` ring को TMA से भरता है और `store: Store::Staged`
-output tile को ring के ज़रिए 16-byte runs में store करता है; tuner दोनों को सादे pipeline के twins की
-तरह मापता है और बिना tuning के इनमें से कोई पहला चुनाव नहीं बनता।
+output tile को ring के ज़रिए 16-byte runs में store करता है, और `Store::Bulk` उसे ring से एक thread की
+TMA copies से लिखता है (`Kernel::flush`; output के किनारे वाली tile staged की तरह store होती है); tuner
+हर एक को सादे pipeline के twin की तरह मापता है और बिना tuning के इनमें से कोई पहला चुनाव नहीं बनता।
 Blocks output tiles पर `order` tile rows (`gemm::TileOrder`, default 8, `TileOrder::DEFAULT`; एक
 row यानी row-major, grid की सभी rows यानी column-major) के समूहों में चलते हैं, ताकि एक साथ resident
 blocks वही B tiles पढ़ें। Planner हर config को default पर plan करता है; कोई config दूसरी group height

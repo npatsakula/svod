@@ -51,7 +51,8 @@ optimization"), `do_linearize` returns before the `SVOD_DUMP_LINEAR` dump (`code
    `schedule::expand` (each `Pipeline`'s `Schedule` under the target's `Fill`; on the warpgroup
    core a `cp.async` ring of ≥ 3 slots whose consume only chains products leaves them in flight; `Schedule::Bulk`
    fills that ring by TMA on slot barriers where `SyncCaps::slot_barrier`, sm_90, each fill `lower::bulk::frame`
-   takes, else `NotBulk`, the threads' chunks) → `layouts::infer`
+   takes, else `NotBulk`, the threads' chunks; a shared tile leaves whole by `Kernel::flush`, one thread's TMA store
+   through the output's tensor map, `lower::bulk::stored`) → `layouts::infer`
    (F2 `TileLayout` per register tile, priced relayouts; a product whose result is dealt issues the narrow way,
    `MmaAtom::narrow`; each shared allocation's `Storage`, its axis and bank halves) → `emit::emit` (`lower/emit/{mod,address,
    copy,compute,nvptx,amdgpu}.rs`; vendor intrinsics only in the last two). A program's phase is its type
@@ -238,7 +239,7 @@ does (`tune::measure`: a config's programs from `ops::candidates`, its merge or 
 | `raster [--shape MxNxK,…]` | every raster (`TileOrder`, groups of 1, 2, 4, … tile rows and column-major) of the tuner's pick and the planner's first, × the default's beside the model's ×, on 4096³, 4096×1024×4096, 8192²×1024 by default |
 | `fit [--only LABEL,…] [--picks]` | the cost model against the device on a few GEMM (4096³, Nemotron, Qwen3, Whisper projections), attention and nearest shapes: `costs\|…`, a `fit\|label\|rank\|verdict\|ns predicted\|ns measured\|cfg` line a ranked config, `pick\|label\|ns\|cfg` and `tune\|label\|s` (the tuner's wall time; cold on a store of the device's probes alone); `--picks` times the picks alone, an A/B across builds |
 | `trips` | `residency\|op\|blocks\|trip\|wall\|spread\|base\|measurable` of the trip probes at 1–48 blocks an SM (`probe::trip_at`): what `TRIP_HIDING` is fitted to |
-| `pin --cfg BMxBNxBK:S:WRxWC[:rolled][:group][:bulk][:staged],… [--shape MxNxK,…] [--residual] [--gated]` | `pin\|shape\|cfg\|blocks\|measured\|model\|less latency\|less lone trip\|less step` a pinned GEMM config (3-part code unrolled; Whisper's fc2 1500×1280×5120 by default, `--gated` a SwiGLU epilogue): the model's ns with each term zeroed beside the measured ns |
+| `pin --cfg BMxBNxBK:S:WRxWC[:rolled][:group][:bulk][:staged|:flushed],… [--shape MxNxK,…] [--residual] [--gated]` | `pin\|shape\|cfg\|blocks\|measured\|model\|less latency\|less lone trip\|less step` a pinned GEMM config (3-part code unrolled; Whisper's fc2 1500×1280×5120 by default, `--gated` a SwiGLU epilogue): the model's ns with each term zeroed beside the measured ns |
 | `sqtt gemm M N K [--cfg I\|tuned\|CODE,…] [--top N] [--out DIR] [--json] [--attribute]`, `sqtt attention B H T D`, `sqtt nearest N D K`, `sqtt conv H W CIN COUT KERNEL STRIDE`, `sqtt --load DIR`, `sqtt --compare DIR_A DIR_B [--json] [--top N]` | AMD RDNA3/RDNA4 thread trace of each config; see [Thread trace (SQTT)](#thread-trace-sqtt) |
 
 The `#[ignore]` probe tests left print and never assert:

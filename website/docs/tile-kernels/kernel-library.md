@@ -56,8 +56,9 @@ past `m` and columns past `n` are bounded views, so `m` and `n` are free. `k` mu
 of `bk`. `core: Core::Group` issues the products on `wgmma` (sm_90);
 `schedule: Schedule::ping_pong(k)` runs the two warp rows in ping-pong over one slot (CDNA). On
 the warpgroup core `Schedule::bulk(stages, unroll)` fills the ring by TMA and `store: Store::Staged`
-stores the output tile through the ring in 16-byte runs; the tuner times both as twins of the plain
-pipeline and neither is an untuned first pick. The
+stores the output tile through the ring in 16-byte runs, `Store::Bulk` from the ring by one thread's
+TMA copies (`Kernel::flush`; a tile across the output's edge stores as staged); the tuner times each
+as a twin of the plain pipeline and none is an untuned first pick. The
 blocks walk the output tiles in groups of `order` tile rows (`gemm::TileOrder`, 8 by default,
 `TileOrder::DEFAULT`; one row is row-major, the grid's rows column-major), so blocks resident
 together read the same B tiles. The planner plans every config at the default; a config may
