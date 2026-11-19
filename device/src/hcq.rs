@@ -1260,28 +1260,78 @@ fn apply_sites(
     Ok(())
 }
 
-/// Canonical Tinygrad C-like kernarg ABI in ascending PARAM slot order.
+/// One kernel argument of a [`ClikeKernargLayout`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Kernarg {
+    /// An 8-byte device pointer: the next `globals` binding.
+    Storage,
+    /// A 4-byte `i32`: the next `vars` binding.
+    Scalar,
+    /// A 128-byte tensor map over the `storage`-th `globals` binding.
+    TensorMap { slot: usize, storage: usize, map: svod_ir::TensorMap },
+}
+
+impl Kernarg {
+    /// `(size, alignment)` of the argument in the blob.
+    fn footprint(&self) -> (usize, usize) {
+        match self {
+            Self::Storage => (8, 8),
+            Self::Scalar => (4, 4),
+            Self::TensorMap { .. } => (svod_ir::TensorMap::BYTES, svod_ir::TensorMap::ALIGN),
+        }
+    }
+}
+
+/// A backend's tensor-map encoding: the 128-byte descriptor of `map` over
+/// the buffer at `address` (16-byte aligned).
+pub type TensorMapEncoder<'a> = dyn FnMut(&svod_ir::TensorMap, u64) -> Result<[u8; svod_ir::TensorMap::BYTES]> + 'a;
+
+/// Canonical Tinygrad C-like kernarg ABI in ascending PARAM slot order: each
+/// argument at the next multiple of its own alignment. A tensor map binds no
+/// value of its own; packing encodes it from its storage's address.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClikeKernargLayout {
     pub globals: usize,
     pub vars: usize,
-    storage_order: Vec<bool>,
+    params: Vec<(usize, Kernarg)>,
+    size: usize,
 }
 
 impl ClikeKernargLayout {
-    pub fn from_abi(abi: &[crate::device::AbiParamDescriptor]) -> Self {
-        let storage_order = abi.iter().map(crate::device::AbiParamDescriptor::is_storage).collect::<Vec<_>>();
-        let globals = storage_order.iter().filter(|&&storage| storage).count();
-        Self { globals, vars: storage_order.len() - globals, storage_order }
+    pub fn from_abi(abi: &[crate::device::AbiParamDescriptor]) -> Result<Self> {
+        use crate::device::AbiParamKind;
+        let storage_index = |slot: usize| abi.iter().filter(|arg| arg.is_storage()).position(|arg| arg.slot == slot);
+        let (mut params, mut size) = (Vec::with_capacity(abi.len()), 0usize);
+        for arg in abi {
+            let kernarg = match &arg.kind {
+                AbiParamKind::Storage(_) => Kernarg::Storage,
+                AbiParamKind::Scalar => Kernarg::Scalar,
+                AbiParamKind::TensorMap(map) => Kernarg::TensorMap {
+                    slot: arg.slot,
+                    storage: storage_index(map.buffer).ok_or(Error::TensorMapWithoutStorage {
+                        slot: arg.slot,
+                        buffer: map.buffer,
+                        dtype: map.dtype,
+                    })?,
+                    map: map.clone(),
+                },
+            };
+            let (width, align) = kernarg.footprint();
+            let offset = size.next_multiple_of(align);
+            size = offset + width;
+            params.push((offset, kernarg));
+        }
+        let count = |kind: Kernarg| params.iter().filter(|(_, param)| *param == kind).count();
+        Ok(Self { globals: count(Kernarg::Storage), vars: count(Kernarg::Scalar), params, size })
     }
 
     pub fn packed_size(&self) -> usize {
-        let mut cursor = 0usize;
-        for &storage in &self.storage_order {
-            let width = if storage { 8 } else { 4 };
-            cursor = cursor.next_multiple_of(width) + width;
-        }
-        cursor
+        self.size
+    }
+
+    /// Byte offset of every argument, in ABI order.
+    pub fn offsets(&self) -> impl Iterator<Item = usize> + '_ {
+        self.params.iter().map(|(offset, _)| *offset)
     }
 
     /// Resolve PROGRAM globals from positional call-buffer GETADDR values and
@@ -1294,7 +1344,7 @@ impl ClikeKernargLayout {
         vars: &[i64],
     ) -> Result<usize> {
         let abi_globals = abi.iter().filter(|arg| arg.is_storage()).map(|arg| arg.slot).collect::<Vec<_>>();
-        let abi_vars = abi.iter().filter(|arg| !arg.is_storage()).cloned().collect::<Vec<_>>();
+        let abi_vars = abi.iter().filter(|arg| arg.is_scalar()).cloned().collect::<Vec<_>>();
         let info_vars =
             info.vars.iter().map(crate::device::AbiParamDescriptor::from_param).collect::<Result<Vec<_>>>()?;
         let var_names = info_vars.iter().map(|arg| arg.name.clone().unwrap_or_default()).collect::<Vec<_>>();
@@ -1317,12 +1367,27 @@ impl ClikeKernargLayout {
                 ),
             });
         }
-        Self::from_abi(abi).pack(dst, call_buffer_addresses, vars)
+        Self::from_abi(abi)?.pack(dst, call_buffer_addresses, vars)
+    }
+
+    /// [`Self::pack_encoded`] for a layout without tensor maps.
+    pub fn pack(&self, dst: &mut [u8], globals: &[u64], vars: &[i64]) -> Result<usize> {
+        if let Some(slot) = self.tensor_maps().next() {
+            return Err(Error::TensorMapEncoderMissing { slot });
+        }
+        self.pack_encoded(dst, globals, vars, &mut |_, _| unreachable!("the layout has no tensor map"))
     }
 
     /// Pack resolved GETADDR and scalar values in the descriptor's unified
-    /// ascending-slot order.
-    pub fn pack(&self, dst: &mut [u8], globals: &[u64], vars: &[i64]) -> Result<usize> {
+    /// ascending-slot order, each tensor map encoded by `encode` from its
+    /// storage's address.
+    pub fn pack_encoded(
+        &self,
+        dst: &mut [u8],
+        globals: &[u64],
+        vars: &[i64],
+        encode: &mut TensorMapEncoder<'_>,
+    ) -> Result<usize> {
         if globals.len() != self.globals || vars.len() != self.vars {
             return Err(Error::ProgramAbiMismatch {
                 reason: format!(
@@ -1341,22 +1406,30 @@ impl ClikeKernargLayout {
             });
         }
         dst[..needed].fill(0);
-        let (mut global, mut var) = (0usize, 0usize);
-        let mut cursor = 0usize;
-        for &storage in &self.storage_order {
-            if storage {
-                cursor = cursor.next_multiple_of(8);
-                dst[cursor..cursor + 8].copy_from_slice(&globals[global].to_le_bytes());
-                global += 1;
-                cursor += 8;
-            } else {
-                cursor = cursor.next_multiple_of(4);
-                dst[cursor..cursor + 4].copy_from_slice(&(vars[var] as i32).to_le_bytes());
-                var += 1;
-                cursor += 4;
+        let (mut globals_left, mut vars_left) = (globals.iter(), vars.iter());
+        for (offset, param) in &self.params {
+            let bytes = &mut dst[*offset..*offset + param.footprint().0];
+            match param {
+                Kernarg::Storage => bytes.copy_from_slice(&globals_left.next().expect("counted").to_le_bytes()),
+                Kernarg::Scalar => bytes.copy_from_slice(&(*vars_left.next().expect("counted") as i32).to_le_bytes()),
+                Kernarg::TensorMap { slot, storage, map } => {
+                    let address = globals[*storage];
+                    if !address.is_multiple_of(16) {
+                        return Err(Error::MisalignedTensorMapAddress { slot: *slot, address });
+                    }
+                    bytes.copy_from_slice(&encode(map, address)?);
+                }
             }
         }
-        Ok(cursor)
+        Ok(needed)
+    }
+
+    /// Slots of the tensor maps, in ABI order.
+    fn tensor_maps(&self) -> impl Iterator<Item = usize> + '_ {
+        self.params.iter().filter_map(|(_, param)| match param {
+            Kernarg::TensorMap { slot, .. } => Some(*slot),
+            _ => None,
+        })
     }
 }
 

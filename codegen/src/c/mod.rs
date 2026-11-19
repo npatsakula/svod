@@ -118,7 +118,7 @@ impl crate::Renderer for CRenderer {
         let mut var_names: Vec<String> = Vec::new();
         for var in abi_params
             .iter()
-            .filter(|param| matches!(param.op(), Op::Param(svod_ir::ops::Param { arg, .. }) if arg.addrspace.is_none()))
+            .filter(|param| matches!(param.op(), Op::Param(svod_ir::ops::Param { arg, .. }) if arg.is_scalar()))
         {
             let name = match var.op() {
                 Op::Param(svod_ir::ops::Param { arg, .. }) => arg.name.as_ref().ok_or_else(|| Error::InvalidGraph {
@@ -169,6 +169,9 @@ impl crate::Renderer for CRenderer {
                 return Err(Error::InvalidGraph { reason: "non-PARAM in ABI list".into() });
             };
             let source_name = format!("data{}", arg.slot);
+            if arg.tensor_map.is_some() {
+                return Err(Error::UnsupportedTensorMapParam { slot: arg.slot, target: format!("{d:?}") });
+            }
             if arg.addrspace.is_some() {
                 let dtype = param.dtype();
                 let elem_type = match &dtype {

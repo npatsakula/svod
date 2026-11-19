@@ -14,7 +14,7 @@ use crate::ops;
 use crate::{AxisId, BarrierFence, BinaryOp, ConstValue, Op, SInt, TernaryOp, UOp};
 
 /// Version of the canonical graph schema.
-pub const CANONICAL_SCHEMA_VERSION: u32 = 7;
+pub const CANONICAL_SCHEMA_VERSION: u32 = 8;
 
 /// Canonical graph representation used by cross-implementation parity tests.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -122,6 +122,8 @@ pub enum CanonicalArg {
         axis: Option<usize>,
         device: Option<String>,
         volatile: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tensor_map: Option<crate::TensorMap>,
     },
     Size {
         value: usize,
@@ -615,6 +617,7 @@ fn canonical_arg(node: &Arc<UOp>, ids: &FxHashMap<u64, usize>, verbose: bool) ->
             axis: arg.axis,
             device: arg.device.as_ref().map(|device| device.canonicalize()),
             volatile: arg.volatile,
+            tensor_map: arg.tensor_map.clone(),
         },
         Op::Slice(ops::Slice { size, .. }) => CanonicalArg::Size { value: *size },
         Op::Stage(ops::Stage { opts, .. }) => CanonicalArg::Stage {

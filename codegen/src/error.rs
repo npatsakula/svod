@@ -34,6 +34,10 @@ pub enum Error {
     #[snafu(display("intrinsic @{intrinsic} is not available on the {target} target"))]
     ForeignIntrinsic { intrinsic: String, target: String },
 
+    /// A tensor-map PARAM reached a target that cannot pass one by value.
+    #[snafu(display("tensor-map PARAM slot {slot} cannot be passed to a {target} kernel"))]
+    UnsupportedTensorMapParam { slot: usize, target: String },
+
     /// Invalid configuration or parameters.
     #[snafu(display("Invalid configuration: {reason}"))]
     InvalidConfig { reason: String },

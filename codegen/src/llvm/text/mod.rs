@@ -161,9 +161,8 @@ impl Renderer for LlvmTextRenderer {
             }
         }
 
-        for var in abi_params
-            .iter()
-            .filter(|param| matches!(param.op(), Op::Param(ops::Param { arg, .. }) if arg.addrspace.is_none()))
+        for var in
+            abi_params.iter().filter(|param| matches!(param.op(), Op::Param(ops::Param { arg, .. }) if arg.is_scalar()))
         {
             let name = match var.op() {
                 Op::Param(ops::Param { arg, .. }) => arg.name.as_ref().ok_or_else(|| Error::InvalidGraph {
@@ -181,7 +180,19 @@ impl Renderer for LlvmTextRenderer {
                 return Err(Error::InvalidGraph { reason: "non-PARAM in ABI list".into() });
             };
             let source_name = format!("%data{}", arg.slot);
-            if arg.addrspace.is_some() {
+            if arg.tensor_map.is_some() {
+                // The descriptor stays in the parameter space: without
+                // `nvvm.grid_constant` LLVM copies it to a local depot, whose
+                // generic address TMA faults on.
+                if !self.target.is_nvptx() {
+                    return Err(Error::UnsupportedTensorMapParam { slot: arg.slot, target: self.target.to_string() });
+                }
+                inner_params.push(format!(
+                    "ptr byval([{} x i8]) align {} \"nvvm.grid_constant\" {source_name}",
+                    svod_ir::TensorMap::BYTES,
+                    svod_ir::TensorMap::ALIGN
+                ));
+            } else if arg.addrspace.is_some() {
                 let readonly = if arg.readonly { " readonly" } else { "" };
                 inner_params.push(format!("ptr noalias{readonly} align 32 {source_name}"));
             } else {

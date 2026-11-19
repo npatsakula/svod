@@ -10,7 +10,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use super::device::{CudaDevice, CudaEvent, CudaStream};
-use super::program::{CudaModule, CudaProgram, Launch, extra_array};
+use super::program::{CudaModule, CudaProgram, Launch, kernel_params};
 use super::sync::{CudaCompletionToken, CudaDispatchTimestamps};
 use super::sys::{CUfunction, CUgraph, CUgraphExec, CUgraphNode, CudaKernelNodeParams};
 use crate::device::{Graph, GraphKernel, Program};
@@ -232,7 +232,7 @@ impl Exec {
         };
         let mut tails: Vec<CUgraphNode> = Vec::with_capacity(nodes.len());
         for (index, (node, (buffer_range, var_range))) in nodes.iter().zip(slot_ranges(nodes)).enumerate() {
-            node.layout.pack(&mut blobs[index], &buffers[buffer_range], &vals[var_range])?;
+            super::tensor_map::pack(api, &node.layout, &mut blobs[index], &buffers[buffer_range], &vals[var_range])?;
 
             let mut deps: Vec<CUgraphNode> = match topology {
                 Topology::Dag => node.deps.iter().map(|&dep| tails[dep]).collect(),
@@ -265,14 +265,8 @@ impl Exec {
         Ok(this)
     }
 
-    fn params(
-        node: &Node,
-        blob: &mut [u8],
-        size: &mut usize,
-        extra: &mut [*mut std::ffi::c_void; 5],
-    ) -> CudaKernelNodeParams {
-        *size = blob.len();
-        *extra = extra_array(blob, size);
+    /// The node payload; `arguments` are its `kernelParams`.
+    fn params(node: &Node, arguments: &mut [*mut std::ffi::c_void]) -> CudaKernelNodeParams {
         let [gx, gy, gz] = node.launch.grid;
         let [bx, by, bz] = node.launch.block;
         CudaKernelNodeParams {
@@ -284,8 +278,8 @@ impl Exec {
             block_dim_y: by,
             block_dim_z: bz,
             shared_mem_bytes: node.launch.dynamic_shared_bytes,
-            kernel_params: std::ptr::null_mut(),
-            extra: extra.as_mut_ptr(),
+            kernel_params: arguments.as_mut_ptr(),
+            extra: std::ptr::null_mut(),
             kern: super::sys::CUkernel::NULL,
             ctx: super::sys::CUcontext::NULL,
         }
@@ -293,9 +287,8 @@ impl Exec {
 
     fn add_kernel_node(&self, deps: &[CUgraphNode], node: &Node, blob: &mut [u8]) -> Result<CUgraphNode> {
         let api = self.dev.api();
-        let mut size = 0;
-        let mut extra = [std::ptr::null_mut(); 5];
-        let params = Self::params(node, blob, &mut size, &mut extra);
+        let mut arguments = kernel_params(&node.layout, blob);
+        let params = Self::params(node, &mut arguments);
         let mut handle = CUgraphNode::NULL;
         // SAFETY: the params and the blob they point to outlive the call,
         // which copies them.
@@ -328,10 +321,15 @@ impl Exec {
                 continue;
             }
             let repoint = || -> Result<()> {
-                node.layout.pack(&mut blobs[index], &buffers[buffer_range], &vals[var_range])?;
-                let mut size = 0;
-                let mut extra = [std::ptr::null_mut(); 5];
-                let params = Self::params(node, &mut blobs[index], &mut size, &mut extra);
+                super::tensor_map::pack(
+                    api,
+                    &node.layout,
+                    &mut blobs[index],
+                    &buffers[buffer_range],
+                    &vals[var_range],
+                )?;
+                let mut arguments = kernel_params(&node.layout, &mut blobs[index]);
+                let params = Self::params(node, &mut arguments);
                 // SAFETY: as `add_kernel_node`; only future launches see the update.
                 unsafe { (api.graph_exec_kernel_node_set_params)(self.exec, self.kernels[index], &params) }
                     .check("cuGraphExecKernelNodeSetParams")

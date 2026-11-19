@@ -1,8 +1,8 @@
 //! A kernel module — a `ptxas` cubin loaded as is, or PTX text JIT-compiled
-//! by the driver — dispatched with `cuLaunchKernel`; kernel arguments travel
-//! as one packed blob in the `extra` array, laid out by [`ClikeKernargLayout`]
-//! (8-byte device pointers, 4-byte `i32` scalars, ascending PARAM slot order
-//! — PTX's natural `.param` layout).
+//! by the driver — dispatched with `cuLaunchKernel`; kernel arguments are
+//! packed into one blob laid out by [`ClikeKernargLayout`] (8-byte device
+//! pointers, 4-byte `i32` scalars, 128-byte tensor maps, ascending PARAM slot
+//! order) and passed as `kernelParams`, a pointer to each one.
 
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::ptr::null_mut;
@@ -12,13 +12,11 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use object::elf::{ELFDATA2LSB, EM_CUDA, FileHeader64};
 use object::read::elf::{ElfFile64, FileHeader};
 use object::{LittleEndian, Object, ObjectSymbol, SymbolKind};
+use smallvec::SmallVec;
 
 use super::device::{CudaDevice, CudaEvent};
-use super::sys::{
-    Api, CU_LAUNCH_PARAM_BUFFER_POINTER, CU_LAUNCH_PARAM_BUFFER_SIZE, CU_LAUNCH_PARAM_END, CUfunction, CUmodule,
-    CUresult, CUstream, func_attribute, jit_option,
-};
-use crate::device::{AbiParamDescriptor, CompiledSpec, Program};
+use super::sys::{Api, CUfunction, CUmodule, CUresult, CUstream, func_attribute, jit_option};
+use crate::device::{AbiParamDescriptor, AbiParamKind, CompiledSpec, Program};
 use crate::hcq::ClikeKernargLayout;
 use crate::profile::KernelResources;
 use crate::{Error, Result};
@@ -92,7 +90,7 @@ impl CudaProgram {
 
     /// JIT PTX text; the entry's `.param` list is checked against `abi` first.
     pub fn load_ptx(dev: Arc<CudaDevice>, ptx: &[u8], name: &str, abi: &[AbiParamDescriptor]) -> Result<Self> {
-        let layout = validate_abi(abi)?;
+        let layout = validate_abi(&dev, name, abi)?;
         let jit_error = |cause: &str| Error::CudaJit { kernel: name.into(), cause: cause.into(), log: String::new() };
         if ptx.is_empty() {
             return Err(jit_error("empty PTX image"));
@@ -108,7 +106,7 @@ impl CudaProgram {
     /// Load a cubin produced by `ptxas` for this device's architecture; the
     /// image is validated by [`validate_cubin`] before it reaches the driver.
     pub fn load_cubin(dev: Arc<CudaDevice>, cubin: &[u8], name: &str, abi: &[AbiParamDescriptor]) -> Result<Self> {
-        let layout = validate_abi(abi)?;
+        let layout = validate_abi(&dev, name, abi)?;
         validate_cubin(cubin, name)?;
         Self::load_image(dev, cubin, name, layout)
     }
@@ -264,7 +262,8 @@ impl CudaProgram {
     /// Pack `buffers`/`vals` into a fresh kernarg blob.
     pub(crate) fn pack(&self, buffers: &[u64], vals: &[i64]) -> Result<Vec<u8>> {
         let mut blob = vec![0u8; self.layout.packed_size()];
-        self.layout.pack(&mut blob, buffers, vals).map_err(|error| match error {
+        let api = self.dev.enter()?;
+        super::tensor_map::pack(api, &self.layout, &mut blob, buffers, vals).map_err(|error| match error {
             Error::ProgramAbiMismatch { reason } => {
                 Error::ProgramAbiMismatch { reason: format!("kernel {}: {reason}", self.name) }
             }
@@ -290,12 +289,11 @@ impl CudaProgram {
         let mut blob = self.pack(&addresses, vals)?;
         let launch = self.launch_dims(global_size, local_size)?;
         let api = self.dev.enter()?;
-        let mut size = blob.len();
-        let mut extra = extra_array(&mut blob, &mut size);
+        let mut params = kernel_params(&self.layout, &mut blob);
         let [gx, gy, gz] = launch.grid;
         let [bx, by, bz] = launch.block;
-        // SAFETY: `extra` follows the sentinel protocol and points into live
-        // locals; the caller guarantees the buffer addresses.
+        // SAFETY: one pointer per kernel parameter, each to its packed bytes
+        // in a live local; the caller guarantees the buffer addresses.
         let result = unsafe {
             (api.launch_kernel)(
                 self.function,
@@ -307,8 +305,8 @@ impl CudaProgram {
                 bz,
                 launch.dynamic_shared_bytes,
                 stream,
+                params.as_mut_ptr(),
                 null_mut(),
-                extra.as_mut_ptr(),
             )
         };
         self.dev.check(result, "cuLaunchKernel")?;
@@ -359,13 +357,17 @@ fn exported_dynamic_shared_bytes(api: &Api, module: CUmodule, kernel: &str) -> R
     Ok(u32::from_le_bytes(bytes))
 }
 
-/// The kernarg layout of `abi`, once the descriptors pass the shared checks.
-fn validate_abi(abi: &[AbiParamDescriptor]) -> Result<ClikeKernargLayout> {
-    let layout = ClikeKernargLayout::from_abi(abi);
+/// The kernarg layout of `abi`, once the descriptors pass the shared checks
+/// and `dev` can access the tensor maps it takes.
+fn validate_abi(dev: &CudaDevice, name: &str, abi: &[AbiParamDescriptor]) -> Result<ClikeKernargLayout> {
     let var_names: Vec<String> =
-        abi.iter().filter(|param| !param.is_storage()).map(|param| param.name.clone().unwrap_or_default()).collect();
-    crate::device::validate_abi_descriptors(abi, layout.globals, &var_names)?;
-    Ok(layout)
+        abi.iter().filter(|param| param.is_scalar()).map(|param| param.name.clone().unwrap_or_default()).collect();
+    let buffers = abi.iter().filter(|param| param.is_storage()).count();
+    crate::device::validate_abi_descriptors(abi, buffers, &var_names)?;
+    if !dev.limits().tensor_map_access && abi.iter().any(|param| matches!(param.kind, AbiParamKind::TensorMap(_))) {
+        return Err(Error::TensorMapUnsupportedDevice { kernel: name.into(), device: dev.name().into() });
+    }
+    ClikeKernargLayout::from_abi(abi)
 }
 
 /// Does `image` start like an ELF (a cubin) rather than PTX text?
@@ -414,21 +416,29 @@ pub fn check_ptx_entry_abi(ptx: &str, entry: &str, abi: &[AbiParamDescriptor]) -
     }
 }
 
-/// The kernarg blob is laid out from `abi` (8-byte buffers, 4-byte scalars),
-/// so the entry must declare exactly those parameters at those widths; the
-/// driver checks neither and a short or misaligned blob is read past its end
-/// on the GPU.
-fn check_entry_params(name: &str, params: &[(String, Option<usize>)], abi: &[AbiParamDescriptor]) -> Result<()> {
+/// The driver copies each argument from its packed bytes (8-byte buffers,
+/// 4-byte scalars, 128-byte tensor maps) at the size the entry declares, so
+/// the entry must declare exactly those footprints — a tensor map as a
+/// 64-aligned 128-byte array; the driver checks none of it and a wider
+/// parameter is read past its bytes. A parameter of a type this parser cannot
+/// size passes, except where a tensor map belongs.
+fn check_entry_params(name: &str, params: &[(String, PtxParam)], abi: &[AbiParamDescriptor]) -> Result<()> {
     let mismatch = |reason: String| Err(Error::ProgramAbiMismatch { reason: format!("kernel {name}: {reason}") });
     if params.len() != abi.len() {
         return mismatch(format!("PTX entry declares {} parameters, the ABI describes {}", params.len(), abi.len()));
     }
-    for (index, ((param, width), descriptor)) in params.iter().zip(abi).enumerate() {
-        let expected = if descriptor.is_storage() { 8 } else { 4 };
-        if width.is_some_and(|width| width != expected) {
+    for (index, ((param, actual), descriptor)) in params.iter().zip(abi).enumerate() {
+        let expected = match descriptor.kind {
+            AbiParamKind::Storage(_) => PtxParam::Scalar(8),
+            AbiParamKind::Scalar => PtxParam::Scalar(4),
+            AbiParamKind::TensorMap(_) => {
+                PtxParam::Array { align: Some(svod_ir::TensorMap::ALIGN), bytes: svod_ir::TensorMap::BYTES }
+            }
+        };
+        let unsized_scalar = *actual == PtxParam::Unknown && matches!(expected, PtxParam::Scalar(_));
+        if *actual != expected && !unsized_scalar {
             return mismatch(format!(
-                "PTX parameter {index} ({param}) is {} bytes wide, the ABI slot {} needs {expected}",
-                width.unwrap_or_default(),
+                "PTX parameter {index} ({param}) is {actual}, the ABI slot {} needs {expected}",
                 descriptor.slot
             ));
         }
@@ -436,10 +446,32 @@ fn check_entry_params(name: &str, params: &[(String, Option<usize>)], abi: &[Abi
     Ok(())
 }
 
-/// `(name, byte width)` of every `.param` of PTX entry `entry` (`None` width
-/// for aggregates such as `.b8 x[16]`), or `None` when the module declares
-/// no such entry. Accepts `.visible`/`.weak` prefixes and multi-line lists.
-pub(crate) fn ptx_entry_params(ptx: &str, entry: &str) -> Option<Vec<(String, Option<usize>)>> {
+/// The footprint of one PTX `.param`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PtxParam {
+    /// A scalar of this many bytes.
+    Scalar(usize),
+    /// A by-value array (`.align A .b8 x[N]`) of `bytes` bytes.
+    Array { align: Option<usize>, bytes: usize },
+    /// A type this parser does not size.
+    Unknown,
+}
+
+impl std::fmt::Display for PtxParam {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Scalar(bytes) => write!(f, "{bytes} bytes wide"),
+            Self::Array { align: Some(align), bytes } => write!(f, "a {bytes}-byte array aligned to {align}"),
+            Self::Array { align: None, bytes } => write!(f, "a {bytes}-byte array"),
+            Self::Unknown => write!(f, "of an unknown size"),
+        }
+    }
+}
+
+/// `(name, footprint)` of every `.param` of PTX entry `entry`, or `None` when
+/// the module declares no such entry. Accepts `.visible`/`.weak` prefixes and
+/// multi-line lists.
+pub(crate) fn ptx_entry_params(ptx: &str, entry: &str) -> Option<Vec<(String, PtxParam)>> {
     let list = ptx.match_indices(".entry ").find_map(|(at, directive)| {
         let after = ptx[at + directive.len()..].trim_start().strip_prefix(entry)?.trim_start().strip_prefix('(')?;
         after.split_once(')').map(|(list, _)| list)
@@ -454,24 +486,34 @@ pub(crate) fn ptx_entry_params(ptx: &str, entry: &str) -> Option<Vec<(String, Op
         .filter_map(|mut tokens| {
             tokens.next().filter(|token| *token == ".param")?;
             let tokens: Vec<&str> = tokens.collect();
-            let name = tokens.last()?;
-            let (name, aggregate) = name.split_once('[').map_or((*name, false), |(name, _)| (name, true));
-            let scalar = tokens.iter().find_map(|token| width(token)).filter(|_| !aggregate);
-            Some((name.to_string(), scalar))
+            let element = tokens.iter().find_map(|token| width(token));
+            let (name, param) = match tokens.last()?.split_once('[') {
+                Some((name, count)) => {
+                    let count = count.strip_suffix(']').and_then(|count| count.parse::<usize>().ok());
+                    let align =
+                        tokens.windows(2).find(|pair| pair[0] == ".align").and_then(|pair| pair[1].parse().ok());
+                    let param = element.zip(count).map_or(PtxParam::Unknown, |(element, count)| PtxParam::Array {
+                        align,
+                        bytes: element * count,
+                    });
+                    (name, param)
+                }
+                None => (*tokens.last()?, element.map_or(PtxParam::Unknown, PtxParam::Scalar)),
+            };
+            Some((name.to_string(), param))
         })
         .collect();
     Some(params)
 }
 
-/// The `cuLaunchKernel` / kernel-node `extra` array for a packed blob.
-pub(crate) fn extra_array(blob: &mut [u8], size: &mut usize) -> [*mut c_void; 5] {
-    [
-        CU_LAUNCH_PARAM_BUFFER_POINTER,
-        blob.as_mut_ptr().cast(),
-        CU_LAUNCH_PARAM_BUFFER_SIZE,
-        (size as *mut usize).cast(),
-        CU_LAUNCH_PARAM_END,
-    ]
+/// The `cuLaunchKernel` / kernel-node `kernelParams` of a blob `layout`
+/// packed: a pointer to each argument's bytes. The driver places every
+/// argument in the parameter space itself, at its alignment relative to an
+/// arch-specific base (0x210 on sm_90), so a 64-aligned tensor map sits at a
+/// blob offset no packed `extra` buffer could know (48 after one pointer on
+/// sm_90, not 64).
+pub(crate) fn kernel_params(layout: &ClikeKernargLayout, blob: &mut [u8]) -> SmallVec<[*mut c_void; 8]> {
+    layout.offsets().map(|offset| blob[offset..].as_mut_ptr().cast()).collect()
 }
 
 impl Program for CudaProgram {

@@ -106,7 +106,7 @@ pub(crate) fn cuda_compiler_identity(
         target_architecture: format!("nvptx64-nvidia-cuda/{arch}"),
         toolchain,
         flags,
-        abi: format!("ptx-kernel-abi-v1;warp-size={}", arch.wave_size()),
+        abi: format!("ptx-kernel-abi-v2;warp-size={}", arch.wave_size()),
         object_format: object_format.into(),
     }
 }

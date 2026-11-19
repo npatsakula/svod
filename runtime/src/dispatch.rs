@@ -21,21 +21,23 @@ use smallvec::SmallVec;
 pub(crate) struct KernelCif {
     cif: Cif,
     arg_count: usize,
-    abi: Vec<svod_device::device::AbiParamKind>,
+    /// Per argument: a pointer (storage) or an `i32` scalar.
+    abi: Vec<bool>,
 }
 
 unsafe impl Send for KernelCif {}
 unsafe impl Sync for KernelCif {}
 
 impl KernelCif {
-    pub fn from_abi(abi: &[svod_device::device::AbiParamDescriptor]) -> Self {
+    pub fn from_abi(abi: &[svod_device::device::AbiParamDescriptor]) -> svod_device::Result<Self> {
+        svod_device::device::reject_tensor_maps(abi, "CPU")?;
         let types =
             abi.iter().map(|arg| if arg.is_storage() { Type::pointer() } else { Type::i32() }).collect::<Vec<_>>();
-        Self {
+        Ok(Self {
             cif: Cif::new(types, Type::void()),
             arg_count: abi.len(),
-            abi: abi.iter().map(|arg| arg.kind.clone()).collect(),
-        }
+            abi: abi.iter().map(|arg| arg.is_storage()).collect(),
+        })
     }
 
     /// Call the kernel, packing buffers and scalars into slots that match the
@@ -62,8 +64,7 @@ impl KernelCif {
         vals: &[i64],
         var_patch: Option<(usize, usize)>,
     ) -> svod_device::Result<()> {
-        let expected_buffers =
-            self.abi.iter().filter(|kind| matches!(kind, svod_device::device::AbiParamKind::Storage(_))).count();
+        let expected_buffers = self.abi.iter().filter(|&&storage| storage).count();
         let expected_vals = self.arg_count - expected_buffers;
         if buffers.len() != expected_buffers || vals.len() != expected_vals {
             return Err(svod_device::Error::ProgramAbiMismatch {
@@ -83,16 +84,13 @@ impl KernelCif {
             packed.ptrs.clear();
             packed.scalars.clear();
             let (mut buffer_idx, mut var_idx) = (0usize, 0usize);
-            for kind in &self.abi {
-                match kind {
-                    svod_device::device::AbiParamKind::Storage(_) => {
-                        packed.ptrs.push(buffers[buffer_idx]);
-                        buffer_idx += 1;
-                    }
-                    svod_device::device::AbiParamKind::Scalar => {
-                        packed.scalars.push(vals[var_idx] as i32);
-                        var_idx += 1;
-                    }
+            for &storage in &self.abi {
+                if storage {
+                    packed.ptrs.push(buffers[buffer_idx]);
+                    buffer_idx += 1;
+                } else {
+                    packed.scalars.push(vals[var_idx] as i32);
+                    var_idx += 1;
                 }
             }
 
@@ -103,16 +101,13 @@ impl KernelCif {
 
             let mut ffi_args: SmallVec<[middle::Arg; 32]> = SmallVec::with_capacity(self.arg_count);
             let (mut buffer_idx, mut var_idx) = (0usize, 0usize);
-            for kind in &self.abi {
-                match kind {
-                    svod_device::device::AbiParamKind::Storage(_) => {
-                        ffi_args.push(middle::arg(&packed.ptrs[buffer_idx]));
-                        buffer_idx += 1;
-                    }
-                    svod_device::device::AbiParamKind::Scalar => {
-                        ffi_args.push(middle::arg(&packed.scalars[var_idx]));
-                        var_idx += 1;
-                    }
+            for &storage in &self.abi {
+                if storage {
+                    ffi_args.push(middle::arg(&packed.ptrs[buffer_idx]));
+                    buffer_idx += 1;
+                } else {
+                    ffi_args.push(middle::arg(&packed.scalars[var_idx]));
+                    var_idx += 1;
                 }
             }
 

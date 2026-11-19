@@ -457,7 +457,7 @@ impl AmdLinkedPlan {
                     });
                 }
                 let dst = unsafe { std::slice::from_raw_parts_mut(slot.host, slot.record_size) };
-                crate::hcq::ClikeKernargLayout::from_abi(&slot.abi).pack(dst, buffers, vals)?;
+                crate::hcq::ClikeKernargLayout::from_abi(&slot.abi)?.pack(dst, buffers, vals)?;
             }
 
             let mut runtime = RuntimePatchValues { buffers: vec![0; calls.len() * 2], vars: vec![0; calls.len() * 6] };

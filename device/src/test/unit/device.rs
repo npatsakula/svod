@@ -523,3 +523,93 @@ fn program_spec_from_uop_rechecks_every_minted_identity_field_but_the_linear_dig
         assert!(matches!(err, crate::Error::ProgramStageMismatch { stage: "SOURCE", .. }), "{err:?}");
     }
 }
+
+// ------------------------------------------------------------ tensor-map ABI
+
+fn f32_map(buffer: usize) -> svod_ir::TensorMap {
+    svod_ir::TensorMap::new(
+        buffer,
+        svod_dtype::ScalarDType::Float32,
+        [64, 32],
+        [16, 8],
+        svod_ir::TensorMapSwizzle::None,
+    )
+    .unwrap()
+}
+
+fn abi_storage(slot: usize, space: svod_dtype::AddrSpace, dtype: DType) -> crate::device::AbiParamDescriptor {
+    crate::device::AbiParamDescriptor { slot, kind: crate::device::AbiParamKind::Storage(space), dtype, name: None }
+}
+
+fn abi_map(slot: usize, map: svod_ir::TensorMap) -> crate::device::AbiParamDescriptor {
+    let dtype = DType::Scalar(map.dtype);
+    crate::device::AbiParamDescriptor { slot, kind: crate::device::AbiParamKind::TensorMap(map), dtype, name: None }
+}
+
+fn abi_scalar(slot: usize) -> crate::device::AbiParamDescriptor {
+    let name = Some("n".to_string());
+    crate::device::AbiParamDescriptor { slot, kind: crate::device::AbiParamKind::Scalar, dtype: DType::Int32, name }
+}
+
+/// A map binds nothing of its own (neither a buffer nor a var) and must name a
+/// global storage PARAM of its element dtype in the same ABI.
+#[test_case(vec![abi_storage(0, svod_dtype::AddrSpace::Global, DType::Float32), abi_map(1, f32_map(0))] => matches Ok(()); "map of a global f32 buffer")]
+#[test_case(vec![abi_map(0, f32_map(1)), abi_storage(1, svod_dtype::AddrSpace::Global, DType::Float32)] => matches Ok(()); "map before its buffer")]
+#[test_case(vec![abi_scalar(0), abi_map(1, f32_map(0))] => matches Err(crate::Error::TensorMapWithoutStorage { slot: 1, buffer: 0, .. }); "map of a scalar")]
+#[test_case(vec![abi_storage(0, svod_dtype::AddrSpace::Global, DType::Float32), abi_map(1, f32_map(2))] => matches Err(crate::Error::TensorMapWithoutStorage { slot: 1, buffer: 2, .. }); "map of an absent slot")]
+#[test_case(vec![abi_storage(0, svod_dtype::AddrSpace::Global, DType::Float16), abi_map(1, f32_map(0))] => matches Err(crate::Error::TensorMapWithoutStorage { .. }); "map of another dtype")]
+#[test_case(vec![abi_storage(0, svod_dtype::AddrSpace::Local, DType::Float32), abi_map(1, f32_map(0))] => matches Err(crate::Error::TensorMapWithoutStorage { .. }); "map of local storage")]
+#[test_case(vec![abi_map(0, f32_map(0))] => matches Err(crate::Error::TensorMapWithoutStorage { .. }); "map of itself")]
+#[test_case(vec![abi_storage(0, svod_dtype::AddrSpace::Global, DType::Float32), crate::device::AbiParamDescriptor { name: Some("m".into()), ..abi_map(1, f32_map(0)) }] => matches Err(crate::Error::ProgramAbiMismatch { .. }); "named map")]
+#[test_case(vec![abi_storage(0, svod_dtype::AddrSpace::Global, DType::Float32), crate::device::AbiParamDescriptor { dtype: DType::Float16, ..abi_map(1, f32_map(0)) }] => matches Err(crate::Error::ProgramAbiMismatch { .. }); "map typed off its template")]
+#[test_case(vec![abi_storage(0, svod_dtype::AddrSpace::Global, DType::Float32), abi_map(1, svod_ir::TensorMap { tile: [16, 0], ..f32_map(0) })] => matches Err(crate::Error::InvalidTensorMap { slot: 1, source }) if matches!(*source, svod_ir::Error::TensorMapTile { .. }); "forged template")]
+fn tensor_map_descriptors_validate(abi: Vec<crate::device::AbiParamDescriptor>) -> crate::Result<()> {
+    let buffers = abi.iter().filter(|param| param.is_storage()).count();
+    let vars: Vec<String> = abi.iter().filter(|param| param.is_scalar()).map(|_| "n".to_string()).collect();
+    crate::device::validate_abi_descriptors(&abi, buffers, &vars)
+}
+
+/// Compiled specs project a map to neither their buffers nor their vars.
+#[test]
+fn compiled_spec_counts_a_map_as_neither_buffer_nor_var() {
+    let abi =
+        vec![abi_storage(0, svod_dtype::AddrSpace::Global, DType::Float32), abi_map(1, f32_map(0)), abi_scalar(2)];
+    let spec = crate::device::CompiledSpec::from_source("k".into(), String::new(), UOp::sink(vec![]), abi).unwrap();
+    assert_eq!((spec.buf_count, spec.var_names.as_slice()), (1, ["n".to_string()].as_slice()));
+}
+
+#[test_case("AMD"; "amd")]
+#[test_case("Metal"; "metal")]
+#[test_case("CPU"; "cpu")]
+fn backends_without_tensor_maps_reject_them_by_slot(backend: &'static str) {
+    let abi = [abi_storage(0, svod_dtype::AddrSpace::Global, DType::Float32), abi_map(3, f32_map(0))];
+    let err = crate::device::reject_tensor_maps(&abi, backend).unwrap_err();
+    assert!(matches!(err, crate::Error::UnsupportedTensorMapParam { backend: b, slot: 3 } if b == backend), "{err:?}");
+    crate::device::reject_tensor_maps(&abi[..1], backend).unwrap();
+}
+
+/// A program reads a mapped buffer through its map: the sink's ABI takes the
+/// map in its slot and the buffer as a read; without the buffer PARAM the
+/// program has no storage to map.
+#[test]
+fn program_abi_takes_a_map_with_its_buffer() {
+    let map = UOp::tensor_map_param(1, f32_map(0));
+    let dst = UOp::param(2, 128, DType::Float32, None);
+    let src = UOp::param(0, 64 * 32, DType::Float32, None);
+    let read = UOp::custom(smallvec::smallvec![map.clone(), src], "{0} {1}".into(), DType::Float32);
+    let at = UOp::index().buffer(dst).indices(vec![UOp::native_const(0i32)]).call().unwrap();
+    let sink = UOp::sink(vec![at.store(read)]);
+    let info = svod_ir::ProgramInfo::from_sink(&sink, DeviceSpec::Cuda { device_id: 0 });
+    assert_eq!((info.globals.as_slice(), info.ins.as_slice(), info.outs.as_slice()), (&[0, 2][..], &[0][..], &[2][..]));
+    let abi = crate::device::ProgramSpec::validate_program_param_abi(&sink, &info).unwrap();
+    assert_eq!(abi.iter().map(|param| param.slot).collect::<Vec<_>>(), [0, 1, 2]);
+    assert_eq!(abi[1], abi_map(1, f32_map(0)));
+
+    let orphan = UOp::custom(smallvec::smallvec![map], "{0}".into(), DType::Float32);
+    let dst = UOp::param(2, 128, DType::Float32, None);
+    let at = UOp::index().buffer(dst).indices(vec![UOp::native_const(0i32)]).call().unwrap();
+    let sink = UOp::sink(vec![at.store(orphan)]);
+    let info = svod_ir::ProgramInfo::from_sink(&sink, DeviceSpec::Cuda { device_id: 0 });
+    let err = crate::device::ProgramSpec::validate_program_param_abi(&sink, &info).unwrap_err();
+    assert!(matches!(err, crate::Error::TensorMapWithoutStorage { slot: 1, buffer: 0, .. }), "{err:?}");
+}

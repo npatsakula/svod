@@ -68,7 +68,7 @@ impl LlvmKernel {
         svod_device::device::validate_abi_descriptors(abi, buffer_count, &var_names)?;
         crate::clang::validate_relocatable_object(object, &entry_point)?;
         let (fn_ptr, mmap) = crate::jit_loader::jit_load(object, &entry_point)?;
-        let cif = KernelCif::from_abi(abi);
+        let cif = KernelCif::from_abi(abi)?;
         debug!(kernel.name = %name, "LLVM kernel object loaded");
         Ok(Self { _mmap: mmap, fn_ptr, entry_point, name, var_names, cif })
     }

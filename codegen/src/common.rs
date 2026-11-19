@@ -114,15 +114,20 @@ pub type BuffersAndVars = (Vec<Arc<UOp>>, Vec<Arc<UOp>>);
 ///
 /// Collects:
 /// - Buffers: address-space PARAM operations
-/// - Variables: DEFINE_VAR and scalar PARAM operations
+/// - Variables: scalar PARAM operations (tensor maps are neither)
 ///
 /// Returns (buffers, variables) sorted for deterministic function signatures.
 pub fn collect_buffers_and_vars(root: &Arc<UOp>) -> Result<BuffersAndVars> {
     let nodes = root.toposort();
     let params = collect_abi_params(&nodes)?;
-    Ok(params
+    let (buffers, rest): (Vec<_>, Vec<_>) = params
         .into_iter()
-        .partition(|param| matches!(param.op(), Op::Param(ops::Param { arg, .. }) if arg.addrspace.is_some())))
+        .partition(|param| matches!(param.op(), Op::Param(ops::Param { arg, .. }) if arg.addrspace.is_some()));
+    let vars = rest
+        .into_iter()
+        .filter(|param| matches!(param.op(), Op::Param(ops::Param { arg, .. }) if arg.is_scalar()))
+        .collect();
+    Ok((buffers, vars))
 }
 
 /// Collect PARAMs in the canonical external ABI order. All PARAM address
@@ -136,7 +141,7 @@ pub(crate) fn collect_abi_params(nodes: &[Arc<UOp>]) -> Result<Vec<Arc<UOp>>> {
         if arg.slot == usize::MAX {
             return Err(Error::InvalidGraph { reason: "unassigned PARAM reached renderer ABI collection".into() });
         }
-        if arg.addrspace.is_none() && arg.name.is_none() {
+        if arg.is_scalar() && arg.name.is_none() {
             return Err(Error::InvalidGraph { reason: format!("scalar PARAM in slot {} has no name", arg.slot) });
         }
         if let Some(first) = occupied.insert(arg.slot, node.id) {

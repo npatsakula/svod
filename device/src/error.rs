@@ -87,6 +87,33 @@ pub enum Error {
     #[snafu(display("renderer PROGRAM ABI mismatch: {reason}"))]
     ProgramAbiMismatch { reason: String },
 
+    /// A tensor-map PARAM's template breaks the driver's encoding rules.
+    #[snafu(display("tensor-map PARAM slot {slot}: {source}"))]
+    InvalidTensorMap { slot: usize, source: Box<svod_ir::Error> },
+
+    /// A tensor-map PARAM names a slot that holds no global storage PARAM of
+    /// its element dtype in the same program.
+    #[snafu(display(
+        "tensor-map PARAM slot {slot} maps slot {buffer}, which is not a global {dtype:?} storage PARAM of the program"
+    ))]
+    TensorMapWithoutStorage { slot: usize, buffer: usize, dtype: svod_dtype::ScalarDType },
+
+    /// A backend that cannot pass tensor maps was handed a kernel taking one.
+    #[snafu(display("{backend} kernels take no tensor-map PARAM, got one in slot {slot}"))]
+    UnsupportedTensorMapParam { backend: &'static str, slot: usize },
+
+    /// A tensor-map kernel was loaded on a device without TMA.
+    #[snafu(display("kernel {kernel} takes a tensor map, which {device} cannot access"))]
+    TensorMapUnsupportedDevice { kernel: String, device: String },
+
+    /// A tensor map's buffer is bound at an address TMA cannot start from.
+    #[snafu(display("tensor-map PARAM slot {slot} binds address {address:#x}, which is not 16-byte aligned"))]
+    MisalignedTensorMapAddress { slot: usize, address: u64 },
+
+    /// A kernarg blob holding tensor maps was packed without an encoder.
+    #[snafu(display("tensor-map PARAM slot {slot} needs a backend encoder to pack"))]
+    TensorMapEncoderMissing { slot: usize },
+
     /// A cached SOURCE/BINARY payload does not belong to the executable
     /// PROGRAM identity that is attempting to reuse it.
     #[snafu(display("PROGRAM {stage} stage identity mismatch: {reason}"))]

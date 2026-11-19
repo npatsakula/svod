@@ -139,10 +139,35 @@ const _: () = assert!(std::mem::offset_of!(CudaKernelNodeParams, extra) == 48);
 const _: () = assert!(std::mem::offset_of!(CudaKernelNodeParams, kern) == 56);
 const _: () = assert!(std::mem::offset_of!(CudaKernelNodeParams, ctx) == 64);
 
-/// `cuLaunchKernel` / kernel-node `extra` sentinels.
-pub const CU_LAUNCH_PARAM_END: *mut c_void = null_mut();
-pub const CU_LAUNCH_PARAM_BUFFER_POINTER: *mut c_void = std::ptr::without_provenance_mut(0x01);
-pub const CU_LAUNCH_PARAM_BUFFER_SIZE: *mut c_void = std::ptr::without_provenance_mut(0x02);
+/// `CUtensorMap`: the opaque 128-byte TMA descriptor (64-byte alignment is
+/// what the driver requires, 128 what `cuda.h` declares).
+#[repr(C, align(128))]
+#[derive(Clone, Copy, Debug)]
+pub struct CUtensorMap(pub [u64; 16]);
+
+const _: () = assert!(std::mem::size_of::<CUtensorMap>() == svod_ir::TensorMap::BYTES);
+
+/// `CUtensorMapDataType`, `CUtensorMapSwizzle` and the `NONE` values of the
+/// other `cuTensorMapEncodeTiled` enums.
+pub mod tensor_map {
+    pub const DATA_TYPE_UINT8: i32 = 0;
+    pub const DATA_TYPE_UINT16: i32 = 1;
+    pub const DATA_TYPE_UINT32: i32 = 2;
+    pub const DATA_TYPE_INT32: i32 = 3;
+    pub const DATA_TYPE_UINT64: i32 = 4;
+    pub const DATA_TYPE_INT64: i32 = 5;
+    pub const DATA_TYPE_FLOAT16: i32 = 6;
+    pub const DATA_TYPE_FLOAT32: i32 = 7;
+    pub const DATA_TYPE_FLOAT64: i32 = 8;
+    pub const DATA_TYPE_BFLOAT16: i32 = 9;
+    pub const SWIZZLE_NONE: i32 = 0;
+    pub const SWIZZLE_32B: i32 = 1;
+    pub const SWIZZLE_64B: i32 = 2;
+    pub const SWIZZLE_128B: i32 = 3;
+    pub const INTERLEAVE_NONE: i32 = 0;
+    pub const L2_PROMOTION_NONE: i32 = 0;
+    pub const FLOAT_OOB_FILL_NONE: i32 = 0;
+}
 
 pub const CU_STREAM_NON_BLOCKING: u32 = 0x1;
 pub const CU_EVENT_DEFAULT: u32 = 0x0;
@@ -261,6 +286,10 @@ dl_api! {
         "cuGraphExecEventRecordNodeSetEvent": fn(CUgraphExec, CUgraphNode, CUevent);
     graph_exec_destroy = "cuGraphExecDestroy": fn(CUgraphExec);
     graph_launch = "cuGraphLaunch": fn(CUgraphExec, CUstream);
+    tensor_map_encode_tiled = "cuTensorMapEncodeTiled": fn(
+        *mut CUtensorMap, c_int, u32, *mut c_void, *const u64, *const u64, *const u32, *const u32,
+        c_int, c_int, c_int, c_int
+    );
 }
 
 // SAFETY: immutable after construction; the driver's entry points are

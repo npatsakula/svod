@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use test_case::test_case;
 
-use super::{Hardware, cuda_alloc_or_skip, device_ptr, download, load, scale_abi, upload, vadd_abi};
+use super::{
+    Hardware, TMA_PTX, cuda_alloc_or_skip, device_ptr, download, load, scale_abi, tma_tile_abi, tma_tile_of, upload,
+    vadd_abi,
+};
 use crate::allocator::{Allocator, RawBuffer};
 use crate::cuda::graph::alias_signature;
 use crate::cuda::{CudaAllocator, CudaGraph, CudaProgram};
@@ -227,6 +230,66 @@ fn scalar_arguments_are_captured_and_patched() {
     assert_eq!(handles.len(), 1);
     assert_eq!(download(&alloc, &out, 64), a.iter().map(|x| x * 7.0).collect::<Vec<_>>());
     assert!(CudaGraph::capture(Arc::clone(&alloc.dev), &[]).unwrap().is_none());
+}
+
+/// A tensor map embeds its buffer's address, so every pack re-encodes it: a
+/// TMA kernel runs eagerly, from a captured graph, and from replays rebound
+/// to a new buffer and to a 16-byte-aligned view of it, each loading the box
+/// of the source it is bound to. A view off the 16-byte grid fails with the
+/// map's slot and address, and the next replay re-packs every node.
+#[test]
+fn replay_reencodes_tensor_maps() {
+    let Some(alloc) = cuda_alloc_or_skip() else { return };
+    if !alloc.dev.limits().tensor_map_access {
+        eprintln!("skipping tensor-map test: {} has no TMA", alloc.dev.name());
+        return;
+    }
+    let program = CudaProgram::load_ptx(Arc::clone(&alloc.dev), TMA_PTX.as_bytes(), "tma_tile", &tma_tile_abi())
+        .expect("JIT of the TMA kernel");
+    // Room for a 16-byte (4-element) view of a 64x32 source.
+    let values = |seed: f32| (0..64 * 32 + 4).map(|i| seed + i as f32).collect::<Vec<_>>();
+    let (src_a, src_b) = (values(0.0), values(10_000.0));
+    let (src_a_buf, src_b_buf) = (upload(&alloc, &src_a), upload(&alloc, &src_b));
+    let (dst_a, dst_b) = (upload(&alloc, &[0.0; 128]), upload(&alloc, &[0.0; 128]));
+    // The map binds nothing: the kernel takes its two buffers.
+    let kernel = GraphKernel {
+        program: &program,
+        buffers: vec![device_ptr(&src_a_buf), device_ptr(&dst_a)],
+        vals: vec![],
+        global_size: Some([1, 1, 1]),
+        local_size: Some([128, 1, 1]),
+        deps: vec![],
+    };
+    let (grid, block) = (kernel.global_size, kernel.local_size);
+    unsafe { program.execute(&kernel.buffers, &[], grid, block, true) }.unwrap();
+    assert_eq!(download(&alloc, &dst_a, 128), tma_tile_of(&src_a));
+
+    alloc._copyin(&dst_a, 0, &[0; 512]).unwrap();
+    let graph = CudaGraph::capture(Arc::clone(&alloc.dev), std::slice::from_ref(&kernel))
+        .unwrap()
+        .expect("TMA kernels are graphable");
+    graph.replay(&[], &[]).unwrap();
+    assert_eq!(download(&alloc, &dst_a, 128), tma_tile_of(&src_a));
+
+    let src_b_ptr = device_ptr(&src_b_buf);
+    graph.replay(&[src_b_ptr as u64, device_ptr(&dst_b) as u64], &[]).unwrap();
+    assert_eq!(download(&alloc, &dst_b, 128), tma_tile_of(&src_b));
+    assert_eq!(download(&alloc, &dst_a, 128), tma_tile_of(&src_a), "the captured output is untouched");
+
+    let view = unsafe { src_b_ptr.add(16) } as u64;
+    graph.replay(&[view, device_ptr(&dst_b) as u64], &[]).unwrap();
+    assert_eq!(download(&alloc, &dst_b, 128), tma_tile_of(&src_b[4..]));
+
+    let misaligned = unsafe { src_b_ptr.add(4) } as u64;
+    let error = graph.replay(&[misaligned, device_ptr(&dst_b) as u64], &[]).unwrap_err();
+    assert!(matches!(error, crate::Error::MisalignedTensorMapAddress { slot: 1, address } if address == misaligned));
+    let error =
+        unsafe { program.execute(&[misaligned as *mut u8, device_ptr(&dst_b)], &[], grid, block, true) }.unwrap_err();
+    assert!(matches!(error, crate::Error::MisalignedTensorMapAddress { slot: 1, .. }), "{error:?}");
+
+    alloc._copyin(&dst_a, 0, &[0; 512]).unwrap();
+    graph.replay(&[], &[]).unwrap();
+    assert_eq!(download(&alloc, &dst_a, 128), tma_tile_of(&src_a));
 }
 
 struct NotCuda;

@@ -14,6 +14,7 @@ pub mod pattern;
 pub mod reduction;
 pub mod shape;
 pub mod sint;
+pub mod tensor_map;
 pub mod ternary;
 pub mod transcendental;
 pub mod tree;

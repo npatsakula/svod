@@ -1,5 +1,5 @@
-use svod_dtype::{AddrSpace, CudaArch, DType};
-use svod_ir::{BarrierFence, UOp};
+use svod_dtype::{AddrSpace, CudaArch, DType, ScalarDType};
+use svod_ir::{BarrierFence, TensorMapSwizzle, UOp};
 
 use super::*;
 use crate::Renderer;
@@ -8,6 +8,7 @@ use crate::llvm::LlvmTextRenderer;
 pub(crate) const SM75: CudaArch = CudaArch { major: 7, minor: 5 };
 pub(crate) const SM86: CudaArch = CudaArch { major: 8, minor: 6 };
 pub(crate) const SM89: CudaArch = CudaArch { major: 8, minor: 9 };
+pub(crate) const SM90: CudaArch = CudaArch { major: 9, minor: 0 };
 
 /// Run the scheduler's post-optimization with the CUDA profile for `arch`
 /// (renderer ops left at `all()` so the renderer's own lowering is exercised),
@@ -91,7 +92,7 @@ pub(crate) fn assert_ptx_compiles(ir: &str, arch: CudaArch) -> Option<String> {
         let serial = PTX_FILES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("svod-nvptx-{}-{serial}-{arch}.ptx", std::process::id()));
         std::fs::write(&path, &ptx).expect("write PTX");
-        let arch_flag = format!("-arch={arch}");
+        let arch_flag = format!("-arch={}", crate::llvm::nvptx::march(arch));
         let output = Command::new(ptxas).args([&arch_flag, "-o", "/dev/null"]).arg(&path).output().expect("run ptxas");
         let _ = std::fs::remove_file(&path);
         assert!(output.status.success(), "ptxas rejected the PTX:\n{}\n{ptx}", String::from_utf8_lossy(&output.stderr));
@@ -126,6 +127,91 @@ fn nvptx_emits_kernel_abi_datalayout_and_launch_bound() {
     if let Some(ptx) = assert_ptx_compiles(&result.code, SM86) {
         assert!(ptx.contains(".visible .entry nvptx_smoke("), "{ptx}");
         assert!(ptx.contains(".maxntid 1"), "{ptx}");
+    }
+}
+
+/// One thread TMA-loads the 16x8 f32 box at (16, 8) of the map over slot 0
+/// into shared memory, completing on an mbarrier, waited on by every lane.
+const TMA_LOAD: &str = "declare void @llvm.nvvm.mbarrier.init.shared(ptr addrspace(3), i32)
+declare i64 @llvm.nvvm.mbarrier.arrive.expect.tx.scope.cta.space.cta(ptr addrspace(3), i32)
+declare void @llvm.nvvm.cp.async.bulk.tensor.g2s.tile.2d(ptr addrspace(7), ptr addrspace(3), ptr, i32, i32, i16, i64, i1, i1, i32)
+declare i1 @llvm.nvvm.mbarrier.try.wait.parity.scope.cta.space.cta(ptr addrspace(3), i32)
+call void @llvm.nvvm.mbarrier.init.shared(ptr addrspace(3) {1}, i32 1)
+%tma.state = call i64 @llvm.nvvm.mbarrier.arrive.expect.tx.scope.cta.space.cta(ptr addrspace(3) {1}, i32 512)
+%tma.dst = addrspacecast ptr addrspace(3) {0} to ptr addrspace(7)
+call void @llvm.nvvm.cp.async.bulk.tensor.g2s.tile.2d(ptr addrspace(7) %tma.dst, ptr addrspace(3) {1}, ptr {2}, i32 16, i32 8, i16 0, i64 0, i1 0, i1 0, i32 0)
+br label %tma.wait
+tma.wait:
+%tma.done = call i1 @llvm.nvvm.mbarrier.try.wait.parity.scope.cta.space.cta(ptr addrspace(3) {1}, i32 0)
+br i1 %tma.done, label %tma.ready, label %tma.wait
+tma.ready:";
+
+/// `out[lane] = box[lane]`, the box loaded through a tensor-map PARAM in
+/// slot 1 over the f32 storage in slot 0, which the load keeps as a source.
+fn tma_kernel() -> Arc<UOp> {
+    use crate::llvm::common::gpu::specific_ptr;
+    let map = svod_ir::TensorMap::new(0, ScalarDType::Float32, [64, 32], [16, 8], TensorMapSwizzle::None).unwrap();
+    let tile = UOp::buffer(0, 128, DType::Float32, AddrSpace::Local, None);
+    let barrier = UOp::buffer(1, 1, DType::Int64, AddrSpace::Local, None);
+    let first = |buffer: &Arc<UOp>| {
+        let at = UOp::index().buffer(buffer.clone()).indices(vec![UOp::native_const(0i32)]).call().unwrap();
+        specific_ptr(&at, AddrSpace::Local)
+    };
+    let load = UOp::custom(
+        smallvec::smallvec![
+            first(&tile),
+            first(&barrier),
+            UOp::tensor_map_param(1, map),
+            UOp::param(0, 64 * 32, DType::Float32, None)
+        ],
+        TMA_LOAD.to_string(),
+        DType::Void,
+    );
+    let lane = UOp::special(UOp::native_const(128i32), "lidx0".to_string());
+    let loaded = tile.after(smallvec::smallvec![load]);
+    let value = UOp::load().index(UOp::index().buffer(loaded).indices(vec![lane.clone()]).call().unwrap()).call();
+    UOp::sink(vec![indexed(2, DType::Float32, lane).store(value)])
+}
+
+/// A tensor-map PARAM is a `byval` `[128 x i8]` that `nvvm.grid_constant`
+/// keeps in the parameter space: its PTX is a 64-aligned 128-byte `.param`
+/// whose own address feeds the TMA copy, never a copy in a local depot (whose
+/// generic address TMA faults on).
+#[test]
+fn nvptx_tensor_map_param_stays_in_the_param_space() {
+    let hopper = CudaArch::from_compute_capability(9, 0);
+    let rendered = render_nvptx_linearized(&tma_kernel(), hopper, "tma_load");
+    let signature = "define ptx_kernel void @tma_load(ptr noalias align 32 %data0, \
+        ptr byval([128 x i8]) align 64 \"nvvm.grid_constant\" %data1, ptr noalias align 32 %data2)";
+    assert!(rendered.code.contains(signature), "{}", rendered.code);
+    assert_eq!(rendered.buffer_args.iter().map(|arg| arg.index).collect::<Vec<_>>(), [0, 2]);
+    assert!(rendered.var_names.is_empty());
+    assert!(
+        matches!(&rendered.abi[1].kind, svod_device::device::AbiParamKind::TensorMap(map) if map.buffer == 0),
+        "{:?}",
+        rendered.abi
+    );
+    if let Some(ptx) = assert_ptx_compiles(&rendered.code, hopper) {
+        assert!(ptx.contains(".param .align 64 .b8 tma_load_param_1[128]"), "{ptx}");
+        assert!(ptx.contains("cvta.param.u64"), "{ptx}");
+        assert!(ptx.contains("cp.async.bulk.tensor.2d.shared::cluster.global.tile"), "{ptx}");
+        assert!(!ptx.contains("__local_depot"), "{ptx}");
+    }
+}
+
+/// Only NVPTX passes a tensor map: the CPU and AMD targets refuse one.
+#[test]
+fn llvm_targets_without_tma_reject_a_tensor_map_param() {
+    let map = svod_ir::TensorMap::new(0, ScalarDType::Float32, [64, 32], [16, 8], TensorMapSwizzle::None).unwrap();
+    let read = UOp::custom(
+        smallvec::smallvec![UOp::tensor_map_param(1, map), UOp::param(0, 64 * 32, DType::Float32, None)],
+        "; {0} {1}".to_string(),
+        DType::Void,
+    );
+    let linear = UOp::linear(svod_schedule::linearize_with_cfg(UOp::sink(vec![read])).into());
+    for renderer in [LlvmTextRenderer::new(), LlvmTextRenderer::amd(svod_dtype::AmdArch::Gfx1100)] {
+        let error = renderer.render(&linear, Some("k")).unwrap_err();
+        assert!(matches!(error, crate::Error::UnsupportedTensorMapParam { slot: 1, .. }), "{error:?}");
     }
 }
 

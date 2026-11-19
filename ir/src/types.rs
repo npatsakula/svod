@@ -29,6 +29,7 @@ pub struct StageDigest(pub [u8; 32]);
 pub enum StageAbiParamKind {
     Storage(svod_dtype::AddrSpace),
     Scalar,
+    TensorMap(crate::TensorMap),
 }
 
 /// One ordered external ABI argument in an executable SOURCE identity.
@@ -423,6 +424,9 @@ pub struct ParamArg {
     pub volatile: bool,
     /// No store of the kernel reaches it: `readonly` to the backend.
     pub readonly: bool,
+    /// A tensor map over another PARAM's storage, passed by value; such a
+    /// PARAM has no address space and is neither storage nor a scalar.
+    pub tensor_map: Option<crate::TensorMap>,
 }
 
 impl ParamArg {
@@ -438,6 +442,7 @@ impl ParamArg {
             device,
             volatile: false,
             readonly: false,
+            tensor_map: None,
         }
     }
 
@@ -453,6 +458,7 @@ impl ParamArg {
             device: None,
             volatile: false,
             readonly: false,
+            tensor_map: None,
         }
     }
 
@@ -469,7 +475,30 @@ impl ParamArg {
             device: None,
             volatile: false,
             readonly: false,
+            tensor_map: None,
         }
+    }
+
+    /// A tensor-map PARAM in `slot`, typed by the map's element dtype.
+    pub fn tensor_map(slot: usize, map: crate::TensorMap) -> Self {
+        Self {
+            slot,
+            dtype: DType::Scalar(map.dtype),
+            vmin_vmax: None,
+            multiple_of: None,
+            name: None,
+            addrspace: None,
+            axis: None,
+            device: None,
+            volatile: false,
+            readonly: false,
+            tensor_map: Some(map),
+        }
+    }
+
+    /// A positional runtime value: neither storage nor a tensor map.
+    pub fn is_scalar(&self) -> bool {
+        self.addrspace.is_none() && self.tensor_map.is_none()
     }
 }
 
@@ -809,6 +838,8 @@ impl ProgramInfo {
         // arguments belong to the enclosing executable PROGRAM ABI.
         for u in sink.toposort_call_aware(false) {
             match u.op() {
+                // A kernel reads a mapped buffer through its map alone.
+                Op::Param(ops::Param { arg, .. }) if let Some(map) = &arg.tensor_map => ins.push(map.buffer),
                 Op::Param(ops::Param { arg, .. }) if arg.addrspace.is_none() => {
                     vars.push(u.clone());
                     if arg.name.as_deref() == Some("core_id")

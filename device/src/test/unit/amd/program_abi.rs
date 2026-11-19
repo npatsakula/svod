@@ -41,3 +41,12 @@ fn loaded_program_rejects_malformed_descriptors_before_elf_loading(abi: Vec<AbiP
         "{err:?}"
     );
 }
+
+/// AMD kernels take no tensor map: one is rejected by slot before any ELF is
+/// touched, never counted as a scalar.
+#[test]
+fn loaded_program_rejects_a_tensor_map() {
+    let abi = vec![storage(0, None), crate::test::unit::hcq::tensor_map(1, 0)];
+    let err = retain_program_abi(&abi).expect_err("AMD cannot pass a tensor map");
+    assert!(matches!(err, crate::Error::UnsupportedTensorMapParam { backend: "AMD", slot: 1 }), "{err:?}");
+}
