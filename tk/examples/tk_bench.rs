@@ -37,6 +37,9 @@
 //!   timed beside the model's price and that price with one term zeroed at
 //!   a time (the memory latency, the lone trip, the matrix step): what each
 //!   term holds of the config's time.
+//! - `trace gemm M N K | attention B H T D [--cfg …] [--out DIR]`, `trace
+//!   --compare A B`: on NVIDIA, each config's time by tile statement
+//!   ([`svod_tk::trace`]).
 //! - `sqtt gemm M N K [--cfg I|tuned|BMxBNxBK:S:WRxWC[:rolled],…] [--top N]
 //!   [--out DIR] [--json] [--attribute] [--residual] [--gated]`: each config
 //!   (the tuner's pick by default, `I` the planner's `I`th) timed untraced,
@@ -80,6 +83,7 @@ use svod_tk::kernels::{Act, Batch};
 use svod_tk::ops::config::{AttentionProblem, ConvProblem, GemmProblem, NearestProblem, Planner};
 use svod_tk::ops::shape::{self, Extent, Plan};
 use svod_tk::ops::{self, Attn, Nearest, Quantized, Rerank, Search, candidates, tuned};
+use svod_tk::trace::Report;
 use svod_tk::tune::{self, Candidate, Compiled, TuneStore};
 
 type Result<T, E = Box<dyn std::error::Error>> = std::result::Result<T, E>;
@@ -106,6 +110,7 @@ fn main() -> Result<()> {
         "fit" => fit_bench(&args),
         "trips" => trips_bench(),
         "pin" => pin_bench(&args),
+        "trace" => trace_bench(&args),
         "sqtt" => sqtt_bench(&args),
         other => Err(format!("{other}: {USAGE}").into()),
     }
@@ -755,6 +760,53 @@ fn sqtt_bench(args: &Args) -> Result<()> {
             capture.save(dir)?;
             println!("saved {}", dir.display());
             sqtt_print(&capture, args, top)?;
+        }
+    }
+    Ok(())
+}
+
+/// `trace gemm M N K | attention B H T D` (the configs of `sqtt`'s `--cfg`,
+/// a GEMM's `--residual`/`--gated`): each config's statements with the time
+/// a block spends in them ([`svod_tk::trace`]), beside the kernel's time
+/// bare and stamped; `--out DIR` keeps each report, `--compare A B` sets two
+/// kept reports side by side.
+fn trace_bench(args: &Args) -> Result<()> {
+    const RUNS: usize = 16;
+    if let Some(at) = args.0.iter().position(|a| a == "--compare") {
+        let (Some(a), Some(b)) = (args.0.get(at + 1), args.0.get(at + 2)) else {
+            return Err("trace --compare FILE_A FILE_B".into());
+        };
+        let load = |path: &String| -> Result<Report> {
+            Report::parse(&std::fs::read_to_string(path)?).ok_or_else(|| format!("{path}: no trace report").into())
+        };
+        print!("{}", load(a)?.compare(&load(b)?));
+        return Ok(());
+    }
+    let positional: Vec<&str> = args.0.iter().map(String::as_str).take_while(|a| !a.starts_with("--")).collect();
+    let planner = planner()?;
+    let traced: Vec<Traced> = match positional[..] {
+        ["gemm", m, n, k] => gemm_traced(&planner, [m.parse()?, n.parse()?, k.parse()?], args)?,
+        ["attention", b, h, t, d] => {
+            attention_traced(&planner, [b.parse()?, h.parse()?, t.parse()?, d.parse()?], args)?
+        }
+        _ => return Err("trace gemm M N K | attention B H T D [--cfg …] [--out DIR], or trace --compare A B".into()),
+    };
+    for Traced { name, candidate, labels, .. } in traced {
+        let bare = timed_candidates(vec![candidate()?]).pop().and_then(|t| t.1);
+        for (program, (stamped, report)) in tune::trace(candidate()?, RUNS)?.into_iter().enumerate() {
+            let stamped = timed_candidates(vec![stamped]).pop().and_then(|t| t.1);
+            let ns = |t: Option<Duration>| t.map_or("failed".into(), |t| t.as_nanos().to_string());
+            let Some(report) = report else { return Err(format!("{name}: no block was sampled").into()) };
+            // The blocks running at once, about: a stamped kernel that holds fewer than the bare one is another kernel.
+            let blocks = report.blocks as f64 / RUNS as f64 * svod_tk::trace::EVERY as f64;
+            let at_once = stamped.map_or(f64::NAN, |t| blocks * report.block_ns / t.as_nanos() as f64);
+            let cfg = &labels["cfg"];
+            println!("traced|{name}|p{program}|{cfg}|bare {}|stamped {}|at once {at_once:.0}", ns(bare), ns(stamped));
+            print!("{report}");
+            if let Some(dir) = args.opt("--out") {
+                std::fs::create_dir_all(dir)?;
+                std::fs::write(Path::new(dir).join(format!("{name}_p{program}.trace")), report.to_string())?;
+            }
         }
     }
     Ok(())

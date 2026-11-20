@@ -45,6 +45,7 @@ Svod 的剖析器分为五层。每一层都在下一层之上增加细节：
 | 3，静态占用率 | 寄存器、LDS、scratch 以及占用率估计，无需派发 | AMD、CUDA；Metal 部分支持 |
 | 4，硬件计数器 | 繁忙周期、wave、指令（`SVOD_PMC`） | AMD（PM4）、CUDA（CUPTI） |
 | 5，线程追踪 | 每个被追踪 wave 的指令及其周期，只需额外一遍运行 | AMD gfx11 和 gfx12 |
+| 5，语句打点 | tk 内核按 tile 语句划分的时间，取自 SM 的周期计数器（`tk_bench trace`） | CUDA |
 
 ## 追踪记录了什么 {/* #what-the-trace-records */}
 
@@ -308,6 +309,18 @@ barrier              1081.7    255.1   -826.6    962.9    202.6   -760.2
 ```
 
 M 不是 tile 的倍数时，边界检查会以 exec 分支的形式出现在循环内部；而 1536 的采集是其 128 行 tile 的倍数，没有这样的分支。这个结论是定性的：不规整的边缘会耗费循环指令，而填充到 tile 倍数的形状不需要付出这一代价，因此在为不规整形状调整调度之前，先检查填充后的形状。
+
+## NVIDIA 上的语句打点
+
+CUDA 没有线程追踪，其计数器和 PC 采样归主机管理员所有（容器中为 `ERR_NVGPUCTRPERM`）。tk 内核在那里自己追踪自己：设置了 `Lowering::trace` 的下降会在每第 16 个块的每个 warp 的 0 号 lane 上读取 SM 的周期计数器（`%clock64`），并把该 warp 自上次打点以来的周期加到刚结束的语句的字上。拷贝、同步和需要等待的乘积各占一个打点；它们之前的寄存器语句共用一个打点，其行写作 `… 语句`。
+
+```bash
+SVOD_DEVICE=CUDA cargo run --release -p svod-tk --example tk_bench -- trace gemm 8192 4096 1024 --cfg tuned --out traces
+```
+
+`traced|…|bare ns|stamped ns|at once N` 是内核不打点与打点时的时间，以及大约同时运行的块数。每个 `trace|` 行是一条语句：每块纳秒数（各 warp 的平均值）、扣除打点后的值、其占比、每块打点数、单个 warp 的最小值和最大值。`trace --compare A B` 按语句并排比较两份保存的报告。
+
+阅读时注意三点限制。一行是某个 warp 的墙上时间，因此包含它等待 SM 上其他 warp 的时间，而留在飞行中的乘积会在其后的行下运行。打点占用寄存器：如果 `stamped` 远高于 `bare`，或 `at once` 低于不打点内核每个 SM 的块数，则打点内核容纳的块更少，已是另一个内核。语句内部的时间不再细分。
 
 ## 注意事项 {/* #caveats */}
 

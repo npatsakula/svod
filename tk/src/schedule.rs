@@ -207,10 +207,11 @@ impl Expander<'_> {
 
     /// `fill` with its ring's slots left rather than fenced, where every
     /// copy of `produce` is the bulk fill's and the ring is run by every
-    /// warp of a block of several warpgroups (one's warps run in step
-    /// through their products, and the block barrier is the cheaper fence:
-    /// 0.306 ms against 0.341 over 64×32 tiles of a causal 64×16×512×128,
-    /// H200, 2026-11-20): a second barrier a slot, behind the fills' in
+    /// warp of a block of several warpgroups (one's blocks run shorter
+    /// leaving their slots, 18.5 µs against 20.5 traced, but fewer of them
+    /// at once and the kernel longer: 0.341 ms against 0.306 over 64×32
+    /// tiles of a causal 64×16×512×128, H200, 2026-11-20): a second barrier
+    /// a slot, behind the fills' in
     /// their allocation, which every warp arrives at once it has read the
     /// slot's step. The fill of step `p` waits for the phase of step
     /// `p - stages`, of parity `p / stages + 1`: the one before a slot's

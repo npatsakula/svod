@@ -29,6 +29,7 @@ mod amdgpu;
 mod compute;
 mod copy;
 mod nvptx;
+mod trace;
 
 /// What a renderer is told of an emitted program beside its instructions.
 #[derive(Debug, Default)]
@@ -56,7 +57,9 @@ pub fn emit(
     let params = amdgpu::swizzled(params, prog, &low.device.target);
     let mut e = Emit::new(prog, low, params);
     e.prologue()?;
+    e.trace_open()?;
     e.block(&prog.body)?;
+    e.trace_close();
     e.list.within(&prog.name)?;
     let list = e.list.listed();
     if std::env::var_os("TK_DUMP_LIST").is_some() {
@@ -215,6 +218,7 @@ struct Emit<'a> {
     /// The location of the statement being emitted, if any.
     at: Option<Location>,
     marks: Marks,
+    trace: Option<trace::Tracer>,
 }
 
 /// A register-side view of a tiled value for addressing shared/global memory.
@@ -330,6 +334,7 @@ impl<'a> Emit<'a> {
             lines: prog.walk().enumerate().map(|(i, (_, s))| (s as *const _, i as u32 + 1)).collect(),
             at: None,
             marks: Marks::default(),
+            trace: None,
         }
     }
 
@@ -709,6 +714,7 @@ impl<'a> Emit<'a> {
             self.stmt(stmt)?;
             self.list.within(&self.prog.name)?;
         }
+        self.trace_flush();
         self.async_products = outer;
         // A carried tile moves a fragment at a time, as the products read
         // it, so the backend carries vectors and never unpacks them.
@@ -726,7 +732,14 @@ impl<'a> Emit<'a> {
         let line = self.lines[&(stmt as *const _)];
         let column = self.at.map_or(0, |at| at.column);
         let outer = self.at.replace(Location { line, column });
+        let lone = !crate::trace::shared(stmt, self.async_products);
+        if lone {
+            self.trace_flush();
+        }
         let out = self.stmt_inner(stmt);
+        if matches!(stmt, Stmt::Let { .. } | Stmt::Copy { .. } | Stmt::Sync(_)) {
+            self.trace_after(line, lone);
+        }
         self.at = outer;
         out
     }

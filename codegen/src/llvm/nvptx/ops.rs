@@ -320,6 +320,29 @@ pub fn globaltimer() -> Arc<UOp> {
     )
 }
 
+/// `%clock64`: the SM's cycle counter, which in-kernel stamps difference
+/// ([`globaltimer`] ticks too coarsely for a statement).
+pub fn clock64() -> Arc<UOp> {
+    UOp::custom(
+        smallvec![],
+        "declare i64 @llvm.nvvm.read.ptx.sreg.clock64()\n\
+         call i64 @llvm.nvvm.read.ptx.sreg.clock64()"
+            .to_string(),
+        DType::Int64,
+    )
+}
+
+/// `red.global.add.u64`: `value` added to the word at `at`, atomically and
+/// returning nothing, so the thread does not wait for the memory.
+pub fn red_add(at: &Arc<UOp>, value: &Arc<UOp>) -> Arc<UOp> {
+    let address = UOp::custom(smallvec![at.clone()], "ptrtoint ptr {0} to i64".to_string(), DType::Int64);
+    UOp::custom(
+        smallvec![address, value.clone()],
+        "call void asm sideeffect \"red.global.add.u64 [$0], $1;\", \"l,l,~{{memory}}\"(i64 {0}, i64 {1})".to_string(),
+        DType::Void,
+    )
+}
+
 #[cfg(test)]
 #[path = "../../test/unit/llvm_nvptx_ops.rs"]
 pub(crate) mod tests;

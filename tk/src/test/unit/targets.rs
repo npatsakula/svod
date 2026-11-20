@@ -37,7 +37,7 @@ pub(super) use crate::sweep::{Launch, amd, families, group_families, hopper, lin
 /// Random parameters of `prog` rounded to their types; every i32 parameter
 /// (key counts, masks, segment starts, row maps) is 1, every i8 one an
 /// integer of the full range.
-fn inputs(name: &str, prog: &Program) -> Vec<Vec<f64>> {
+pub(super) fn inputs(name: &str, prog: &Program) -> Vec<Vec<f64>> {
     let mut seed = name.len() as u64;
     // Indices over the rows and past them, colliding, for a scatter to drop
     // and to sum; integers, whose sums are exact in either type, so no order
@@ -71,7 +71,7 @@ fn lowered_tile(prog: Program, lowering: &Lowering) -> Program<crate::ir::Laid> 
 
 /// `check` on every launch at once, failing with every launch whose check
 /// panics, so one failure does not hide another.
-fn each(launches: Vec<Launch>, check: impl Fn(&str, Program, Lowering) + Sync) {
+pub(super) fn each(launches: Vec<Launch>, check: impl Fn(&str, Program, Lowering) + Sync) {
     let failed: Vec<String> = crate::tune::in_parallel(launches, |(name, prog, lowering)| {
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check(&name, prog, lowering))).err()?;
         let why = panic.downcast_ref::<String>().map(String::as_str).or_else(|| panic.downcast_ref::<&str>().copied());
@@ -239,7 +239,7 @@ fn a_bulk_store_under_a_branch_shares_its_election_with_a_later_one() {
         let out = k.view(y, (first + 1) * tile.elems(), [tile.cols, 1], tile, [None, None]);
         k.flush(out, staged);
     });
-    let ir = render(prog, &Lowering { device: declared(target), core: Core::Group });
+    let ir = render(prog, &Lowering { core: Core::Group, ..Lowering::new(&declared(target)) });
     assert_eq!(ir.matches("@llvm.nvvm.cp.async.bulk.tensor.s2g.tile.2d(").count(), 3, "a declaration and two stores");
     built(svod_runtime::cuda::compile_ir_to_ptx(&ir, arch), NO_NVPTX).unwrap_or_else(|e| panic!("{e}"));
 }

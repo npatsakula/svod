@@ -242,6 +242,7 @@ does (`tune::measure`: a config's programs from `ops::candidates`, its merge or 
 | `trips` | `residency\|op\|blocks\|trip\|wall\|spread\|base\|measurable` of the trip probes at 1–48 blocks an SM (`probe::trip_at`): what `TRIP_HIDING` is fitted to |
 | `pin --cfg BMxBNxBK:S:WRxWC[:rolled][:group][:bulk][:staged|:flushed],… [--shape MxNxK,…] [--residual] [--gated]` | `pin\|shape\|cfg\|blocks\|measured\|model\|less latency\|less lone trip\|less step` a pinned GEMM config (3-part code unrolled; Whisper's fc2 1500×1280×5120 by default, `--gated` a SwiGLU epilogue): the model's ns with each term zeroed beside the measured ns |
 | `sqtt gemm M N K [--cfg I\|tuned\|CODE,…] [--top N] [--out DIR] [--json] [--attribute]`, `sqtt attention B H T D`, `sqtt nearest N D K`, `sqtt conv H W CIN COUT KERNEL STRIDE`, `sqtt --load DIR`, `sqtt --compare DIR_A DIR_B [--json] [--top N]` | AMD RDNA3/RDNA4 thread trace of each config; see [Thread trace (SQTT)](#thread-trace-sqtt) |
+| `trace gemm M N K [--cfg …] [--residual] [--gated] [--out DIR]`, `trace attention B H T D [--causal]`, `trace --compare A B` | NVIDIA: each config's time by tile statement from `%clock64` stamps (`svod_tk::trace`, `tune::trace`); rows are a warp's wall time, `… stmt` rows hold the register statements before them; `stamped` far above `bare` or a low `at once` means the stamps' registers cost a block an SM (check `ptxas -v`) |
 
 The `#[ignore]` probe tests left print and never assert:
 `-- --ignored --nocapture --test-threads=1`.

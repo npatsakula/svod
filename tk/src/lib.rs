@@ -32,6 +32,7 @@ pub mod rank;
 pub mod schedule;
 #[doc(hidden)]
 pub mod sweep;
+pub mod trace;
 pub mod tune;
 
 #[cfg(test)]

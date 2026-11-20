@@ -34,6 +34,7 @@ mod sweep;
 mod sync;
 mod tail;
 mod targets;
+mod trace;
 mod tune;
 mod windows;
 
@@ -515,6 +516,7 @@ fn decode(dtype: ScalarDType, bytes: &[u8]) -> Vec<f64> {
         ScalarDType::BFloat16 => bytes.chunks(2).map(|b| bf16(half(b))).collect(),
         ScalarDType::Float16 => bytes.chunks(2).map(|b| half::f16::from_bits(half(b)).to_f64()).collect(),
         ScalarDType::Int32 => bytes.chunks(4).map(|b| f64::from(i32::from_le_bytes(b.try_into().unwrap()))).collect(),
+        ScalarDType::Int64 => bytes.chunks(8).map(|b| i64::from_le_bytes(b.try_into().unwrap()) as f64).collect(),
         other => unreachable!("{other:?} output"),
     }
 }

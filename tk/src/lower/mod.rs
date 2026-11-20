@@ -71,12 +71,14 @@ pub struct Lowering {
     /// rows are warpgroups of four warps, shared operands are read through
     /// descriptors (over the swizzled rows) and never loaded into registers.
     pub core: Core,
+    /// Stamp the statements' cycles into the program's last parameter ([`crate::trace`]).
+    pub trace: bool,
 }
 
 impl Lowering {
     /// `device`'s warp-level core.
     pub fn new(device: &Device) -> Self {
-        Self { device: device.clone(), core: Core::Warp }
+        Self { device: device.clone(), core: Core::Warp, trace: false }
     }
 }
 

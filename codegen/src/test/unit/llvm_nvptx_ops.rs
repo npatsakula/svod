@@ -511,6 +511,24 @@ fn nvptx_shfl_bfly_and_globaltimer_hoist_their_declares() {
     }
 }
 
+/// Two stamps are two reads of the cycle counter (a tag keeps them apart),
+/// their difference added to memory without a value read back.
+#[test]
+fn nvptx_clock64_reads_the_cycle_counter_once_a_stamp_and_a_reduction_adds_it() {
+    let l = UOp::special(UOp::native_const(32i32), "lidx0".to_string());
+    let stamp = |tag| clock64().rtag(Some(smallvec::smallvec![tag]));
+    let elapsed = stamp(2).try_sub(&stamp(1)).unwrap();
+    let out = red_add(&indexed(1, DType::Int64, l), &elapsed);
+    let rendered = render_nvptx_linearized(&UOp::sink(vec![out]), SM86, "nvptx_clock");
+    assert_eq!(rendered.code.matches("call i64 @llvm.nvvm.read.ptx.sreg.clock64()").count(), 2, "{}", rendered.code);
+    assert_eq!(rendered.code.matches("declare i64 @llvm.nvvm.read.ptx.sreg.clock64()").count(), 1, "{}", rendered.code);
+    if let Some(ptx) = assert_ptx_compiles(&rendered.code, SM86) {
+        for needle in ["%clock64", "red.global.add.u64"] {
+            assert!(ptx.contains(needle), "missing {needle}:\n{ptx}");
+        }
+    }
+}
+
 /// Register-resident scratch stays a generic `alloca` (PTX `.local`), unlike
 /// AMD's addrspace(5) form.
 #[test]

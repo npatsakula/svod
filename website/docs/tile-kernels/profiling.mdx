@@ -51,6 +51,7 @@ Svod's profiler has five tiers. Each adds detail to the one below:
 | 3, static occupancy | Registers, LDS, scratch and an occupancy estimate, without a dispatch | AMD, CUDA; Metal in part |
 | 4, hardware counters | Busy cycles, waves, instructions (`SVOD_PMC`) | AMD (PM4), CUDA (CUPTI) |
 | 5, thread trace | Every traced wave's instructions with their cycles, in one extra pass | AMD gfx11 and gfx12 |
+| 5, statement stamps | A tk kernel's time by tile statement, read from the SM's cycle counter (`tk_bench trace`) | CUDA |
 
 ## What the trace records
 
@@ -381,6 +382,29 @@ An M that is not a multiple of the tile puts the edge guards inside the loop as 
 and the 1536 capture, a multiple of its 128-row tile, has none. The lesson is qualitative: a ragged
 edge costs loop instructions that a shape padded to the tile does not pay, so check the padded
 shape before tuning the schedule of a ragged one.
+
+## Statement stamps on NVIDIA
+
+CUDA has no thread trace, and its counters and PC sampling belong to the host's administrator
+(`ERR_NVGPUCTRPERM` in a container). A tk kernel is traced there by itself: a lowering with
+`Lowering::trace` set stamps the SM's cycle counter (`%clock64`) on lane 0 of each warp of every
+16th block, and adds the cycles since the warp's last stamp to the word of the statement that just
+ended. A copy, a sync and a product that waits take a stamp each; the register statements before one
+share a stamp, and their row reads `… statement`.
+
+```bash
+SVOD_DEVICE=CUDA cargo run --release -p svod-tk --example tk_bench -- trace gemm 8192 4096 1024 --cfg tuned --out traces
+```
+
+`traced|…|bare ns|stamped ns|at once N` is the kernel bare and stamped, and about how many blocks
+ran at once. Each `trace|` row is a statement: nanoseconds a block (the warps' mean), the same less
+its stamps, that as a share, stamps a block, the least and the most a warp spent. `trace --compare
+A B` sets two kept reports side by side by statement.
+
+Read it with three limits in mind. A row is a warp's wall time, so it holds the time the warp waited
+for the SM's other warps, and a product left in flight runs under the rows after it. The stamps take
+registers: where `stamped` is far above `bare` or `at once` is below the bare kernel's blocks an SM,
+the stamped kernel fits fewer blocks and is another kernel. A statement's time is not split further.
 
 ## Caveats
 
