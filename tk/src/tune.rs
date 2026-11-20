@@ -1259,14 +1259,18 @@ pub fn trace(candidate: Candidate, runs: usize) -> Result<Vec<(Candidate, Option
         let words = pool.buffers(&t.prog.params).pop().expect("the trace parameter");
         let (mut plan, vars) = scratch_plan(t.prog.clone(), &t.lowering, &pool)?;
         let vars: Vec<(&str, i64)> = vars.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+        let elems = t.prog.params.last().expect("the trace parameter").elems;
+        let (mut buffer, mut bytes, zeros) =
+            (words.buffer().expect("a realized buffer"), vec![0u8; 8 * elems], vec![0u8; 8 * elems]);
+        let mut sums = vec![(0.0, 0.0); elems];
         for _ in 0..runs {
             plan.execute_with_vars(&vars).context(RunSnafu { program })?;
+            let read = buffer.copyout(&mut bytes).and_then(|()| buffer.copyin(&zeros));
+            read.map_err(svod_runtime::Error::from).context(RunSnafu { program })?;
+            let words: Vec<i64> = bytes.chunks(8).map(|b| i64::from_le_bytes(b.try_into().expect("a word"))).collect();
+            crate::trace::tally(&mut sums, &words);
         }
-        let mut bytes = vec![0u8; 8 * t.prog.params.last().expect("the trace parameter").elems];
-        let read = words.buffer().expect("a realized buffer").copyout(&mut bytes);
-        read.map_err(svod_runtime::Error::from).context(RunSnafu { program })?;
-        let words: Vec<i64> = bytes.chunks(8).map(|b| i64::from_le_bytes(b.try_into().expect("a word"))).collect();
-        let report = Report::decode(&t.listing, t.prog.warps as usize, &words);
+        let report = Report::decode(&t.listing, t.prog.warps as usize, &sums);
         Ok((vec![(t.prog, t.lowering)], report))
     });
     traced.collect()

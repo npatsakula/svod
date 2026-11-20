@@ -17,8 +17,17 @@ use crate::lower::{self, Lowering, listing::listing};
 
 /// A block is sampled where its grid indices sum to a multiple of this.
 pub const EVERY: i64 = 16;
-/// A word holds its cycles below this and its stamps above.
+/// A word holds its cycles below this and its stamps above, a launch's
+/// alone: a run's words are read and zeroed before the next.
 pub const COUNT: i64 = 1 << 40;
+
+/// A launch's `words` added to `sums` as cycles and stamps.
+pub fn tally(sums: &mut [(f64, f64)], words: &[i64]) {
+    for (sum, &w) in sums.iter_mut().zip(words) {
+        assert!(w >= 0, "a trace word past 2^63: over 2^23 stamps a statement and warp in one launch");
+        *sum = (sum.0 + (w % COUNT) as f64, sum.1 + (w / COUNT) as f64);
+    }
+}
 
 /// The rows of a trace of `lines` statements: the unattributed tail, the
 /// statements by line, the sampled blocks' nanoseconds, then [`BARE`] stamps
@@ -95,11 +104,11 @@ pub struct Report {
 }
 
 impl Report {
-    /// The trace parameter's `words` after a launch of a program of `warps`
-    /// warps listed as `listing`; `None` where no block was sampled.
-    pub fn decode(listing: &str, warps: usize, words: &[i64]) -> Option<Self> {
-        let split =
-            |row: usize| words[row * warps..][..warps].iter().map(|&w| ((w % COUNT) as f64, (w / COUNT) as f64));
+    /// The trace parameter's words [tallied](tally) over launches of a
+    /// program of `warps` warps listed as `listing`; `None` where no block
+    /// was sampled.
+    pub fn decode(listing: &str, warps: usize, words: &[(f64, f64)]) -> Option<Self> {
+        let split = |row: usize| words[row * warps..][..warps].iter().copied();
         let lines: Vec<&str> = listing.lines().collect();
         assert_eq!(words.len(), rows(lines.len()) * warps, "a trace of another listing");
         let blocks = split(0).next()?.1;

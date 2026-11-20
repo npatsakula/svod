@@ -6,7 +6,14 @@ use crate::atoms::{Fill, sm86};
 use crate::interp;
 use crate::lower::Error;
 use crate::sweep::{families, group_families};
-use crate::trace::{BARE, COUNT, Report, rows, traced};
+use crate::trace::{BARE, COUNT, Report, rows, tally, traced};
+
+/// `words` of one launch, tallied.
+fn tallied(words: &[i64]) -> Vec<(f64, f64)> {
+    let mut sums = vec![(0.0, 0.0); words.len()];
+    tally(&mut sums, words);
+    sums
+}
 
 /// The words of a trace of `cycles[line][warp]` (the tail first, the bare
 /// stamps last) at `hits` stamps a word, over `blocks` blocks of `ns` each.
@@ -25,7 +32,7 @@ fn words(cycles: &[Vec<i64>], hits: i64, blocks: i64, ns: i64) -> Vec<i64> {
 fn a_report_splits_the_block_as_the_cycles_and_nets_the_stamps() {
     // 1000 cycles a warp over 500 ns: half a nanosecond a cycle.
     let cycles = [vec![40, 40], vec![300, 100], vec![500, 700], vec![160, 160]];
-    let report = Report::decode("load\n  … mma [steady]\n", 2, &words(&cycles, 4, 3, 500)).unwrap();
+    let report = Report::decode("load\n  … mma [steady]\n", 2, &tallied(&words(&cycles, 4, 3, 500))).unwrap();
     assert_eq!((report.blocks, report.block_ns, report.tail_ns, report.stamp_ns), (3, 500.0, 20.0, 20.0));
     let [load, mma] = &report.rows[..] else { panic!("two rows: {report:?}") };
     assert_eq!((load.ns, load.least, load.most, load.hits), (100.0, 50.0, 150.0, 4.0));
@@ -33,7 +40,34 @@ fn a_report_splits_the_block_as_the_cycles_and_nets_the_stamps() {
         (mma.ns, mma.text.as_str(), report.net(mma), report.net(load)),
         (300.0, "  … mma [steady]", 220.0, 20.0)
     );
-    assert_eq!(Report::decode("load\n  … mma [steady]\n", 2, &vec![0; rows(2) * 2]), None, "no block sampled");
+    assert_eq!(
+        Report::decode("load\n  … mma [steady]\n", 2, &tallied(&vec![0; rows(2) * 2])),
+        None,
+        "no block sampled"
+    );
+}
+
+/// Launches tallied apart hold what no one word could: past 2^23 stamps and
+/// 2^40 cycles a statement and warp.
+#[test]
+fn launches_tally_past_a_words_reach() {
+    let cycles = [vec![40, 40], vec![300, 100], vec![COUNT - 1, COUNT - 1], vec![160, 160]];
+    let launch = words(&cycles, 1 << 22, 1, 500);
+    let mut sums = vec![(0.0, 0.0); launch.len()];
+    for _ in 0..4 {
+        tally(&mut sums, &launch);
+    }
+    let mma = &sums[2 * 2..][..2];
+    assert!(mma.iter().all(|&(c, h)| c == 4.0 * (COUNT - 1) as f64 && h == (1u64 << 24) as f64), "{mma:?}");
+    let report = Report::decode("load\n  … mma [steady]\n", 2, &sums).unwrap();
+    assert_eq!((report.blocks, report.rows[1].hits), (4, (1u64 << 22) as f64));
+}
+
+/// A word past 2^63 in one launch is refused, never read as a negative time.
+#[test]
+#[should_panic(expected = "a trace word past 2^63")]
+fn a_word_past_its_reach_in_one_launch_is_refused() {
+    tally(&mut [(0.0, 0.0)], &[i64::MIN + 1]);
 }
 
 proptest! {
@@ -47,7 +81,7 @@ proptest! {
     ) {
         let lines = cycles.len() - 2;
         let listing: String = (0..lines).map(|i| format!("{}copy {} [steady]\n", "  ".repeat(i % 3), i % 2)).collect();
-        let report = Report::decode(&listing, 3, &words(&cycles, hits, blocks, 1 << 20)).unwrap();
+        let report = Report::decode(&listing, 3, &tallied(&words(&cycles, hits, blocks, 1 << 20))).unwrap();
         let read = Report::parse(&report.to_string()).unwrap();
         prop_assert_eq!((read.blocks, read.rows.len()), (report.blocks, report.rows.len()));
         prop_assert!((read.block_ns - report.block_ns).abs() <= 0.5 && (read.stamp_ns - report.stamp_ns).abs() <= 0.05);
@@ -114,7 +148,7 @@ fn traced_families_match_the_interpreter_and_account_for_their_blocks() {
         let warps = t.prog.warps as usize;
         assert!(words[..warps].iter().all(|w| w / COUNT == words[0] / COUNT), "{name}: warps sampled apart");
         // A grid whose every index sum misses the sample holds no report.
-        let Some(report) = Report::decode(&t.listing, warps, &words) else { continue };
+        let Some(report) = Report::decode(&t.listing, warps, &tallied(&words)) else { continue };
         let net: f64 = report.rows.iter().map(|r| report.net(r)).sum();
         assert!(net > 0.0 && net <= report.block_ns, "{name}: rows {net} ns of a {} ns block", report.block_ns);
     }
