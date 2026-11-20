@@ -64,7 +64,7 @@ impl Emit<'_> {
                         BinaryOp::Add => x.try_add(&y),
                         BinaryOp::Sub => x.try_sub(&y),
                         BinaryOp::Mul | BinaryOp::Scale => x.try_mul(&y),
-                        BinaryOp::Div if x.dtype().is_float() => x.try_div(&y),
+                        BinaryOp::Div if x.dtype().is_float() => Ok(self.quotient(&x, &y)),
                         BinaryOp::Div => x.try_cdiv(&y),
                         BinaryOp::Max => x.try_max(&y),
                         BinaryOp::Min => minimum(&x, &y),
@@ -302,6 +302,16 @@ impl Emit<'_> {
             GpuArch::Amd(_) if target.hardware_exp2 && x.dtype() == DType::Float32 => super::amdgpu::exp2_f32(x),
             GpuArch::Cuda(_) if target.hardware_exp2 && x.dtype() == DType::Float32 => super::nvptx::exp2_f32(x),
             _ => x.try_exp2().expect("exp2"),
+        }
+    }
+
+    /// `x / y` of floats: an f32 one the hardware's approximate quotient
+    /// where the target has [`crate::atoms::Target::approx_div`].
+    fn quotient(&self, x: &Arc<UOp>, y: &Arc<UOp>) -> Arc<UOp> {
+        let target = &self.low.device.target;
+        match target.arch {
+            GpuArch::Cuda(_) if target.approx_div && x.dtype() == DType::Float32 => super::nvptx::div_f32(x, y),
+            _ => x.try_div(y).expect("quotient"),
         }
     }
 

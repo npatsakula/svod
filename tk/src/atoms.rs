@@ -247,6 +247,10 @@ pub struct Target {
     /// zero, which no kernel tells apart): AMD's `v_exp_f32`, NVIDIA's
     /// `ex2.approx.ftz.f32`.
     pub hardware_exp2: bool,
+    /// An f32 quotient is the hardware's approximate one, within 2 ulp
+    /// before the store rounds it: NVIDIA's `div.approx.f32`, a reciprocal
+    /// and a product in place of the IEEE division's dozen instructions.
+    pub approx_div: bool,
 }
 
 /// How global memory reaches a shared ring.
@@ -745,6 +749,7 @@ fn cuda(c: CudaArch) -> Target {
         },
         lane_move: LaneMove::Shuffle,
         hardware_exp2: true,
+        approx_div: true,
     }
 }
 
@@ -833,6 +838,7 @@ fn amd(a: AmdArch) -> Target {
         },
         lane_move: if cdna { LaneMove::Permute } else { LaneMove::Dpp },
         hardware_exp2: true,
+        approx_div: false,
     }
 }
 
@@ -868,6 +874,7 @@ fn metal(f: MetalFamily) -> Target {
         },
         lane_move: LaneMove::SimdShuffle,
         hardware_exp2: false,
+        approx_div: false,
     }
 }
 

@@ -216,6 +216,16 @@ pub(super) fn exp2_f32(x: &Arc<UOp>) -> Arc<UOp> {
     )
 }
 
+/// An f32 `x / y` as the hardware's approximate quotient (`div.approx.f32`).
+pub(super) fn div_f32(x: &Arc<UOp>, y: &Arc<UOp>) -> Arc<UOp> {
+    UOp::custom(
+        smallvec![x.clone(), y.clone()],
+        "declare float @llvm.nvvm.div.approx.f(float, float)\ncall float @llvm.nvvm.div.approx.f(float {0}, float {1})"
+            .to_string(),
+        DType::Float32,
+    )
+}
+
 /// A warp's own barrier over its shared accesses (`bar.warp.sync`), after `last`.
 pub(super) fn warp_barrier(last: &Arc<UOp>) -> Arc<UOp> {
     UOp::custom(

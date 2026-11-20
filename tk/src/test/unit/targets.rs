@@ -355,6 +355,11 @@ fn every_family_lowers_keeps_its_numbers_and_compiles(target: Target, facts: Fac
             let (raw, exp2) = (ir.contains(hardware), ir.contains("@llvm.exp2.f32("));
             check(raw && !exp2, &format!("the hardware exp2 {raw}, llvm.exp2 {exp2}"));
         }
+        if name == "gemm swiglu" {
+            // SiLU's quotient is the hardware's approximate one where the target has it.
+            let (approx, ieee) = (ir.contains("@llvm.nvvm.div.approx.f("), ir.contains("fdiv "));
+            check((approx, ieee) == (target.approx_div, !target.approx_div), &format!("quotients: {approx} {ieee}"));
+        }
         if let (Some(dpp), true) = (facts.dpp, name.ends_with("norm")) {
             let moves = (ir.contains("@llvm.amdgcn.update.dpp.i32("), ir.contains("@llvm.amdgcn.ds.bpermute("));
             check(moves == (dpp, !dpp), &format!("DPP and ds_bpermute: {moves:?}"));
