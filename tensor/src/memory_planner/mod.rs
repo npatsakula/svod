@@ -257,10 +257,11 @@ pub struct MemoryPlannerMetrics {
 struct ExcludedBufferIds {
     aliased: HashSet<u64>,
     non_sink: HashSet<u64>,
-    /// Written by a gated STORE: only part of the buffer is written, so arena
-    /// mode must not pack a later tenant over the untouched bytes. Tinygrad's
-    /// TLSF planner (`engine/memory.py:17,70`) has no equivalent because it
-    /// never packs a new tenant over a live one.
+    /// Written by a gated STORE: only part of the buffer is written. A
+    /// conservative exclusion, not a guarantee: a fresh allocation is not
+    /// zeroed either, so the untouched bytes are undefined both ways, and a
+    /// PROGRAM's guarded stores (under an IF, or in bulk) are not seen here.
+    /// Tinygrad's TLSF planner (`engine/memory.py:17,70`) has no equivalent.
     gated_store: HashSet<u64>,
     /// In one PROGRAM alone: an output of a multi-output kernel nothing here reads.
     lone: HashSet<u64>,
