@@ -802,6 +802,13 @@ fn trace_bench(args: &Args) -> Result<()> {
             let at_once = stamped.map_or(f64::NAN, |t| blocks * report.block_ns / t.as_nanos() as f64);
             let cfg = &labels["cfg"];
             println!("traced|{name}|p{program}|{cfg}|bare {}|stamped {}|at once {at_once:.0}", ns(bare), ns(stamped));
+            // Stamps in a sixteenth of the blocks cost a few percent; more is a kernel the stamps changed.
+            if let (Some(bare), Some(stamped)) = (bare, stamped)
+                && stamped.as_secs_f64() > 1.08 * bare.as_secs_f64()
+            {
+                let over = 100.0 * (stamped.as_secs_f64() / bare.as_secs_f64() - 1.0);
+                println!("perturbed|{name}|stamped runs {over:.0} % over bare: the rows are another kernel's");
+            }
             print!("{report}");
             if let Some(dir) = args.opt("--out") {
                 std::fs::create_dir_all(dir)?;
