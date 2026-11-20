@@ -387,10 +387,7 @@ impl GemmProblem {
         target: &Target,
         &(halves, rope): &(usize, Option<Rope>),
     ) -> Result<u32, TargetRejected> {
-        if rope.is_some_and(|rope| !cfg.turns(rope.head_dim))
-            || target.geometry_on(cfg.core).is_none()
-            || !cfg.fits(target)
-        {
+        if rope.is_some_and(|rope| !cfg.carries(&rope)) || target.geometry_on(cfg.core).is_none() || !cfg.fits(target) {
             return Err(TargetRejected::Lowers);
         }
         let smem = cfg.smem_bytes(halves == 2, ELEM);

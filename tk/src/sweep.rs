@@ -256,13 +256,24 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
     // of nine, positions wrapping every 50 rows.
     let turning = planner.gemm_ranked(1, 4096, 2304, 768, &Epilogue::DEFAULT).iter().copied().find(|c| c.turns(64));
     if let Some(cfg) = turning {
-        let rope = crate::kernels::gemm::Rope { heads: 6, head_dim: 64, seq: 50 };
+        let rope = crate::kernels::gemm::Rope { heads: 6, head_dim: 64, seq: 50, norm: None };
         let epilogue = Epilogue { rope: Some(rope), ..Epilogue::DEFAULT };
         let spec = assumed(
             GemmSpec { m: 130, n: 576, k: 128, batch: Batch::Static(1), epilogue, windows: Default::default() },
             cfg,
         );
         push("gemm rope", gemm::<BF16>(&spec), cfg.lowering(&planner.device));
+    }
+    // The same projection's turned heads normed first, on the lead tile
+    // that carries the norm (a head's row within one warp).
+    let normed = crate::kernels::gemm::Rope { heads: 6, head_dim: 64, seq: 50, norm: Some(Scale::new(1e-6)) };
+    let epilogue = Epilogue { rope: Some(normed), ..Epilogue::DEFAULT };
+    if let Some(&cfg) = planner.gemm_ranked(1, 4096, 576, 768, &epilogue).first() {
+        let spec = assumed(
+            GemmSpec { m: 130, n: 576, k: 128, batch: Batch::Static(1), epilogue, windows: Default::default() },
+            cfg,
+        );
+        push("gemm normed rope", gemm::<BF16>(&spec), cfg.lowering(&planner.device));
     }
 
     // The planner's lead for the shape; a head size it plans no kernel for

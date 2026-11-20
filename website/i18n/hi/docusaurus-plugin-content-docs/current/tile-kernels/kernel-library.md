@@ -49,7 +49,7 @@ bind हुए runtime variable की live गिनती launch करता 
 | `scale` | residual से पहले activated value को गुणा करता है |
 | `residual` | `[batch·m, n]`, सबसे आख़िर में जोड़ा जाता है |
 | `out_f32` | f32 output और residual; accumulator बिना round किए store होता है |
-| `rope` | `Rope { heads, head_dim, seq }`: `head_dim` columns वाले पहले `heads` heads `[seq, head_dim/2]` cos और sin tables से घुमाए जाते हैं (output row `m` position `m % seq` पर), उनके बाद के columns जैसे हैं वैसे store होते हैं; केवल bias के साथ, उस tile पर जिसके warps पूरे heads रखते हैं (`GemmCfg::turns`) |
+| `rope` | `Rope { heads, head_dim, seq, norm }`: `head_dim` columns वाले पहले `heads` heads `[seq, head_dim/2]` cos और sin tables से घुमाए जाते हैं (output row `m` position `m % seq` पर), उनके बाद के columns जैसे हैं वैसे store होते हैं; केवल bias के साथ, उस tile पर जिसके warps पूरे heads रखते हैं (`GemmCfg::turns`) |
 
 `GemmCfg { tile: [bm, bn, bk], warps: [rows, cols], core, schedule, order, tail, store }`। `m` से आगे की
 rows और `n` से आगे के columns bounded views हैं, इसलिए `m` और `n` मुक्त हैं। `k` का `bk` का गुणज

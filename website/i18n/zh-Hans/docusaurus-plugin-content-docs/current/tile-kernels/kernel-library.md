@@ -32,7 +32,7 @@ sidebar_label: 内核库
 | `scale` | 在加残差之前乘以激活后的值 |
 | `residual` | 最后加上的 `[batch·m, n]` |
 | `out_f32` | f32 输出与残差，累加器不经舍入直接存储 |
-| `rope` | `Rope { heads, head_dim, seq }`：前 `heads` 个宽 `head_dim` 列的头用 `[seq, head_dim/2]` 的 cos 和 sin 表旋转（输出行 `m` 位于位置 `m % seq`），其后的列原样存储；只能与偏置单独组合，且仅用于其 warp 持有完整头的 tile（`GemmCfg::turns`） |
+| `rope` | `Rope { heads, head_dim, seq, norm }`：前 `heads` 个宽 `head_dim` 列的头用 `[seq, head_dim/2]` 的 cos 和 sin 表旋转（输出行 `m` 位于位置 `m % seq`），其后的列原样存储；只能与偏置单独组合，且仅用于其 warp 持有完整头的 tile（`GemmCfg::turns`） |
 
 `GemmCfg { tile: [bm, bn, bk], warps: [rows, cols], core, schedule, order, tail, store }`。超出 `m` 的行和超出 `n` 的列是带边界的视图，因此 `m` 和 `n` 不受限制。`k` 必须是 `bk` 的倍数。`core: Core::Group` 在 `wgmma` 上发出乘积（sm_90）；`schedule: Schedule::ping_pong(k)` 让两行 warp 在同一个槽上以乒乓方式运行（CDNA）。在 warpgroup 核心上，`Schedule::bulk(stages, unroll)` 通过 TMA 填充环，`store: Store::Staged` 经由环以 16 字节连续段写出输出 tile，`Store::Bulk` 则由一个线程用 TMA 批量拷贝从环中写出（`Kernel::flush`；跨越输出边缘的 tile 按 staged 写出）；调优器把它们都作为普通流水线的孪生配置计时，未调优时都不会成为首选。各块按每组 `order` 个 tile 行（`gemm::TileOrder`，默认 8，即 `TileOrder::DEFAULT`；一行即行优先，网格的全部行即列优先）遍历输出 tile，使同时驻留的块读取相同的 B tile。规划器为每个配置都采用默认值；配置也可以携带其他组高（其编码中的 `g` 字段）。
 

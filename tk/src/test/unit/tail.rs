@@ -303,7 +303,7 @@ fn a_split_the_problem_cannot_run_is_refused() {
     let p = GemmProblem::new(1, 8192, 4096, 4096, &Epilogue::DEFAULT);
     assert!(p.admit(&planner, &split(4)).is_ok());
     assert_eq!(p.admit(&planner, &split(3)).map(|_| ()), refused, "64 trips split three ways");
-    let rope = Some(crate::kernels::gemm::Rope { heads: 4, head_dim: 64, seq: 8 });
+    let rope = Some(crate::kernels::gemm::Rope { heads: 4, head_dim: 64, seq: 8, norm: None });
     for other in [GemmProblem { batches: 2, ..p }, GemmProblem { halves: 2, ..p }, GemmProblem { rope, ..p }] {
         assert_eq!(other.admit(&planner, &split(4)).map(|_| ()), refused, "{other:?}");
     }

@@ -58,7 +58,7 @@ impl ModernBertAttention {
     ) -> Result<Tensor> {
         let (b, l, d, h) = (x.dim(0)?, x.dim(1)?, self.hidden_size, self.num_heads);
         let (cos, sin) = rope;
-        let turned = Rotary { cos, sin, heads: 2 * h, head_dim: self.head_dim };
+        let turned = Rotary { cos, sin, heads: 2 * h, head_dim: self.head_dim, norm: None };
         let qkv = ops::linear(x, &self.qkv_weight, ops::Linear { rope: Some(turned), ..Default::default() })?;
         let keys = padding_mask.map_or(KeyMask::None, KeyMask::Bool);
         let attn = ops::attention_packed(&qkv, h, h, Attn { keys, window: self.window, ..Attn::default() })?;

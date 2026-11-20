@@ -49,7 +49,7 @@ the matrix product runs on the f32 accumulator, and the result is rounded once a
 | `scale` | Multiplies the activated value before the residual |
 | `residual` | `[batch·m, n]` added last |
 | `out_f32` | f32 output and residual, the accumulator stored unrounded |
-| `rope` | `Rope { heads, head_dim, seq }`: the first `heads` heads of `head_dim` columns rotated by `[seq, head_dim/2]` cos and sin tables (output row `m` at position `m % seq`), the columns after them stored as they are; with a bias alone, on a tile whose warps hold whole heads (`GemmCfg::turns`) |
+| `rope` | `Rope { heads, head_dim, seq, norm }`: the first `heads` heads of `head_dim` columns rotated by `[seq, head_dim/2]` cos and sin tables (output row `m` at position `m % seq`), the columns after them stored as they are; with a bias alone, on a tile whose warps hold whole heads (`GemmCfg::turns`); under `norm` (an `eps`) each turned head is RMS-normalized by a `[heads·head_dim]` weight first, on a tile of one warp column (`GemmCfg::carries`) |
 
 `GemmCfg { tile: [bm, bn, bk], warps: [rows, cols], core, schedule, order, tail, store }`. Rows
 past `m` and columns past `n` are bounded views, so `m` and `n` are free. `k` must be a multiple

@@ -40,7 +40,7 @@ pub fn chosen() -> Option<Chosen>;
 `Linear::scale` multiplies the activated value before the residual add:
 `scale·act(x·wᵀ + bias) + residual`, so a Conformer half-step `x + 0.5·ffn(x)` is one GEMM.
 
-`Linear::rope` is `Rotary { cos, sin, heads, head_dim }`: the output's first `heads` heads of
+`Linear::rope` is `Rotary { cos, sin, heads, head_dim, norm }` (`norm`, a `[heads·head_dim]` weight and an `eps`, RMS-normalizes each turned head before the turn, on a tile holding a head's row in one warp; the tables may also be `[B, T, 1, head_dim/2]`, by token, under a static batch): the output's first `heads` heads of
 `head_dim` columns are rotated after the bias by `(cos, sin)` tables of `[1, T, 1, head_dim/2]`,
 the head's two halves paired as `apply_rotary_emb` pairs them, for `x [B, T, K]`. Beside an
 activation, a residual or a scale the whole linear runs on the graph. Otherwise the GEMM rotates

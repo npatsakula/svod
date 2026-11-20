@@ -5,7 +5,7 @@
 use std::fmt;
 use std::num::NonZeroUsize;
 
-use super::{Act, Admits, Admitted, Batch, Spec, Window, Windows, batch_offset, bound, konst, load_f32};
+use super::{Act, Admits, Admitted, Batch, Spec, Window, Windows, affine, batch_offset, bound, konst, load_f32};
 use crate::atoms::{Core, Device};
 use crate::build::*;
 use crate::ir::*;
@@ -41,15 +41,31 @@ impl Epilogue {
 /// position `m % seq`: a head's halves turn together as `apply_rotary_emb`
 /// turns split halves, `x₁·cos − x₂·sin` and `x₂·cos + x₁·sin`. The columns
 /// after them (a fused projection's values) are stored as they are.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Rope {
     pub heads: usize,
     pub head_dim: usize,
     pub seq: usize,
+    /// Each turned head is RMS-normalized over `head_dim` under this `eps`
+    /// and a `[heads·head_dim]` weight before the turn (a `norm` parameter
+    /// after the tables).
+    pub norm: Option<Scale>,
 }
 
-/// A [`Rope`] with its cos and sin tables.
-type Turn<'k, T> = (Rope, ParamRef<'k, T, In>, ParamRef<'k, T, In>);
+/// The tune store keys by this text: a turn without a norm reads as before it.
+impl fmt::Debug for Rope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut s = f.debug_struct("Rope");
+        s.field("heads", &self.heads).field("head_dim", &self.head_dim).field("seq", &self.seq);
+        if let Some(eps) = self.norm {
+            s.field("norm", &eps);
+        }
+        s.finish()
+    }
+}
+
+/// A [`Rope`] with its cos and sin tables and its norm's weight.
+type Turn<'k, T> = (Rope, ParamRef<'k, T, In>, ParamRef<'k, T, In>, Option<ParamRef<'k, T, In>>);
 
 /// The tune store keys by this text: the fields at their default (no scale,
 /// a 16-bit output, no rope) are left out.
@@ -71,7 +87,7 @@ impl fmt::Debug for Epilogue {
     }
 }
 
-/// An f32 output scale, compared and hashed by its bits.
+/// An f32 output scale (or a norm's `eps`), compared and hashed by its bits.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Scale(u32);
 
@@ -364,6 +380,12 @@ impl GemmCfg {
         (head_dim / 2).is_power_of_two() && bn.is_multiple_of(head_dim) && warp_cols.is_multiple_of(head_dim)
     }
 
+    /// Whether the tile carries `rope`: [`Self::turns`] its heads, a normed
+    /// head's row within one warp (its sum of squares crosses none).
+    pub fn carries(&self, rope: &Rope) -> bool {
+        self.turns(rope.head_dim) && (rope.norm.is_none() || self.warps[1] == 1)
+    }
+
     /// Whether the ring's larger operand allocation, over elements of
     /// `bytes` bytes, holds the output tile whatever its type (f32 the
     /// widest), so the tile may be [`Store::Staged`] through it.
@@ -554,7 +576,8 @@ fn build<'k, T: MmaIn, U: Elem>(
         let plain = Epilogue { bias: epi.bias, rope: epi.rope, ..Epilogue::DEFAULT };
         assert!(epi == plain && rope.heads * rope.head_dim <= n, "{epi:?} turns no more than a bias");
         let table = rope.seq * rope.head_dim / 2;
-        (rope, k.input::<T>("cos", table), k.input::<T>("sin", table))
+        let (cos, sin) = (k.input::<T>("cos", table), k.input::<T>("sin", table));
+        (rope, cos, sin, rope.norm.map(|_| k.input::<T>("norm", rope.heads * rope.head_dim)))
     });
     // A run's partials take a slot a tile; the whole grid's, the output's shape.
     let slots = match tiles {
@@ -672,8 +695,8 @@ fn finish<'k, T: Elem, U: Elem>(
         let s = konst(k, out, f64::from(scale.get()));
         out = k.binary(out, s, BinaryOp::Mul);
     }
-    if let Some((rope, cos, sin)) = rope {
-        out = turn(k, out, rope, cos, sin, t);
+    if let Some(rope) = rope {
+        out = turn(k, out, rope, t);
     }
     if let Some((residual, w)) = residual {
         let r = tile(k, residual, w, bb, t);
@@ -727,13 +750,12 @@ fn tile<'k, U: Elem, A: Access>(
 /// [`Epilogue::rope`] on the output tile `x`, in a tile holding rotated
 /// columns: `x·cos + x'·sin`, `x'` the element half a head along
 /// ([`Kernel::flip`]) and `sin` negated over a head's first half.
-/// A tile across the last rotated head keeps `x` past it.
+/// A tile across the last rotated head keeps `x` past it. A normed head
+/// ([`Rope::norm`]) is normalized first.
 fn turn<'k, T: Elem>(
     k: &mut Kernel<'k>,
-    x: Regs<'k, F32>,
-    rope: Rope,
-    cos: ParamRef<'k, T, In>,
-    sin: ParamRef<'k, T, In>,
+    kept: Regs<'k, F32>,
+    (rope, cos, sin, norm): Turn<'k, T>,
     t: &Tile2<'k>,
 ) -> Regs<'k, F32> {
     let Tile2 { bm, bn, ref row0, ref col0, .. } = *t;
@@ -741,6 +763,10 @@ fn turn<'k, T: Elem>(
     let [y] = k.select_if(
         col0.clone().lt(turned),
         |k| {
+            let x = match rope.norm.zip(norm) {
+                Some((eps, w)) => normed(k, kept, rope.head_dim, f64::from(eps.get()), (w, turned), t),
+                None => kept,
+            };
             // Every head of row `r` reads the table row of its position.
             let table = |k: &mut Kernel<'k>, p: ParamRef<'k, T, In>| {
                 let at = (row0.clone() + k.row()) % rope.seq * half;
@@ -771,11 +797,52 @@ fn turn<'k, T: Elem>(
             let at = k.coord(whole, Axis::Col);
             let end = k.splat::<I32>(whole, Sc::from(turned) - col0.clone());
             let inside = k.compare(at, end, CmpOp::Lt);
-            [k.where_(inside, y, x)]
+            [k.where_(inside, y, kept)]
         },
-        |_| [x],
+        |_| [kept],
     );
     y
+}
+
+/// The tile `x` with each head of `d` columns RMS-normalized along its row
+/// and weighted by its columns of `w [turned]`: `x · rsqrt(mean(x²) + eps) · w`.
+fn normed<'k, T: Elem>(
+    k: &mut Kernel<'k>,
+    x: Regs<'k, F32>,
+    d: usize,
+    eps: f64,
+    (w, turned): (ParamRef<'k, T, In>, usize),
+    t: &Tile2<'k>,
+) -> Regs<'k, F32> {
+    let Tile2 { bm, bn, ref col0, .. } = *t;
+    let whole = Shape::new(bm, bn);
+    let sq = k.binary(x, x, BinaryOp::Mul);
+    let scaled = |k: &mut Kernel<'k>, sq: Regs<'k, F32>| {
+        let sum = k.reduce(sq, Axis::Row, ReduceOp::Sum);
+        let var = affine(k, sum, 1.0 / d as f64, eps);
+        let inv = k.unary(var, UnaryOp::Rsqrt);
+        k.binary(x, inv, BinaryOp::Mul)
+    };
+    let y = if bn == d {
+        scaled(k, sq)
+    } else {
+        // A head's sum takes its own columns of the row.
+        let col = k.coord(whole, Axis::Col);
+        let width = k.splat::<I32>(whole, Sc::from(d));
+        let head = k.binary(col, width, BinaryOp::Div);
+        let zero = konst(k, x, 0.0);
+        (0..bn / d).fold(zero, |y, h| {
+            let at = k.splat::<I32>(whole, Sc::from(h));
+            let own = k.compare(head, at, CmpOp::Eq);
+            let sq = k.where_(own, sq, zero);
+            let scaled = scaled(k, sq);
+            k.where_(own, scaled, y)
+        })
+    };
+    let v = k.view(w, 0, [0, 1], Shape::new(1, bn), [None, bound(turned, bn)]);
+    let v = k.at(v, 0, col0.clone());
+    let w = load_f32(k, v);
+    k.binary(y, w, BinaryOp::Mul)
 }
 
 /// The second program of a split reduction: `c = epilogue(Σ_z partial[z])`
