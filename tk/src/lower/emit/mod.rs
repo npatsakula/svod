@@ -1024,7 +1024,8 @@ impl<'a> Emit<'a> {
 
     /// `us` in order on the block's first thread alone.
     fn elected_all(&mut self, us: Vec<Arc<UOp>>) -> Result<()> {
-        let first = self.tid.try_cmpeq(&c32(0)).expect("thread compare");
+        // Hoisted: every election compares the thread, and a compare left under a branch dominates no later one.
+        let first = self.hoist(self.tid.try_cmpeq(&c32(0)).expect("thread compare"));
         let tag = self.next_tag();
         let if_ = self.push(UOp::if_(first, smallvec![]).rtag(Some(smallvec![tag as usize])));
         for u in us {

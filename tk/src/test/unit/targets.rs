@@ -209,6 +209,41 @@ fn every_group_attention_assembles_for_hopper() {
     }
 }
 
+/// Every election shares one compare of the thread: a bulk store under a
+/// branch leaves it where a later store's election reads it too.
+#[test]
+fn a_bulk_store_under_a_branch_shares_its_election_with_a_later_one() {
+    use crate::build::{Kernel, Sc};
+    use crate::ir::Shape;
+    use crate::layouts::WarpGrid;
+    let target = hopper();
+    let GpuArch::Cuda(arch) = target.arch else { unreachable!() };
+    let tile = Shape::new(64, 64);
+    let prog = Kernel::record("twice", |k| {
+        k.warps(WarpGrid { rows: 4, cols: 1 });
+        k.grid([Sc::from(2), Sc::from(1), Sc::from(1)]);
+        let y = k.output::<BF16>("y", 3 * tile.elems());
+        let scratch = k.smem::<BF16>("s", tile.elems());
+        let staged = k.smem_view(scratch, 0, tile);
+        let zeros = k.zeros::<BF16>(tile);
+        k.store(staged, zeros);
+        let first = k.block(0);
+        k.if_(
+            first.clone().lt(1),
+            |k| {
+                let out = k.view(y, 0, [tile.cols, 1], tile, [None, None]);
+                k.flush(out, staged);
+            },
+            |_| {},
+        );
+        let out = k.view(y, (first + 1) * tile.elems(), [tile.cols, 1], tile, [None, None]);
+        k.flush(out, staged);
+    });
+    let ir = render(prog, &Lowering { device: declared(target), core: Core::Group });
+    assert_eq!(ir.matches("@llvm.nvvm.cp.async.bulk.tensor.s2g.tile.2d(").count(), 3, "a declaration and two stores");
+    built(svod_runtime::cuda::compile_ir_to_ptx(&ir, arch), NO_NVPTX).unwrap_or_else(|e| panic!("{e}"));
+}
+
 /// What a target's families show beyond their numbers.
 struct Facts {
     /// The axis a register-staged attention's value ring lies along (its key
