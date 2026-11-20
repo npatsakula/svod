@@ -98,6 +98,10 @@ fn a_block_alone_ranks_behind_the_measured_faster_tile(
 #[test_case::test_case(crate::atoms::sm86(), crate::test::unit::sm86_costs(), 1, 1.489; "sm86 one cp.async slot")]
 #[test_case::test_case(Target::card("mi300x").unwrap(), crate::test::unit::gfx942_costs(), 1, 1.118;
     "gfx942 one register-staged slot, hidden as two")]
+#[test_case::test_case(Target::card("h200-nvl").unwrap(), crate::test::unit::h200_costs(), 2, 1.0;
+    "h200 two slots at a round's wait")]
+#[test_case::test_case(Target::card("h200-nvl").unwrap(), crate::test::unit::h200_costs(), 1, 1.224;
+    "h200 one cp.async slot")]
 #[test_case::test_case(Target::card("rx9070xt").unwrap(), crate::test::unit::gfx1201_costs(), 2, 1.0;
     "gfx1201 at a round's wait")]
 #[test_case::test_case(crate::atoms::sm86(), Costs { trip_lone: 0.0, ..crate::test::unit::sm86_costs() }, 2, 1.0;

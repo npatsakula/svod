@@ -118,6 +118,112 @@ pub fn ld_global_cg_16(src_global: &Arc<UOp>) -> [Arc<UOp>; 4] {
     })
 }
 
+/// `mbarrier.init`: the 64-bit barrier object at `bar` (shared memory)
+/// completes a phase once `arrivals` arrivals and every byte they expect
+/// have come in. One thread initializes it; the others see it past a block
+/// barrier. sm_80+; the forms below, sm_90.
+pub fn mbarrier_init(bar: &Arc<UOp>, arrivals: u32) -> Arc<UOp> {
+    UOp::custom(
+        smallvec![specific_ptr(bar, AddrSpace::Local)],
+        format!(
+            "declare void @llvm.nvvm.mbarrier.init.shared(ptr addrspace(3), i32)\n\
+             call void @llvm.nvvm.mbarrier.init.shared(ptr addrspace(3) {{0}}, i32 {arrivals})"
+        ),
+        DType::Void,
+    )
+}
+
+/// `mbarrier.arrive.expect_tx`: this thread's arrival at `bar`, expecting
+/// `bytes` of bulk copies that name the barrier: the phase completes once
+/// they have landed.
+pub fn mbarrier_arrive_expect(bar: &Arc<UOp>, bytes: u32) -> Arc<UOp> {
+    let intrinsic = "llvm.nvvm.mbarrier.arrive.expect.tx.scope.cta.space.cta";
+    UOp::custom(
+        smallvec![specific_ptr(bar, AddrSpace::Local)],
+        format!(
+            "declare i64 @{intrinsic}(ptr addrspace(3), i32)\n\
+             call i64 @{intrinsic}(ptr addrspace(3) {{0}}, i32 {bytes})"
+        ),
+        DType::Int64,
+    )
+}
+
+/// `mbarrier.arrive`: this thread's arrival at `bar`, expecting nothing.
+pub fn mbarrier_arrive(bar: &Arc<UOp>) -> Arc<UOp> {
+    let address = UOp::custom(
+        smallvec![specific_ptr(bar, AddrSpace::Local)],
+        "ptrtoint ptr addrspace(3) {0} to i32".to_string(),
+        DType::Int32,
+    );
+    let arrive = "{{\\0A.reg .b64 state;\\0Ambarrier.arrive.shared::cta.b64 state, [$0];\\0A}}";
+    UOp::custom(
+        smallvec![address],
+        format!("call void asm sideeffect \"{arrive}\", \"r,~{{{{memory}}}}\"(i32 {{0}})"),
+        DType::Void,
+    )
+}
+
+/// `mbarrier.try_wait.parity` until it succeeds: this thread waits for the
+/// phase of `bar` whose parity is `parity` (an `i32`, 0 or 1; a barrier's
+/// phases alternate from 0). One statement holds the retry loop: the
+/// intrinsic is a single try.
+///
+/// # Panics
+/// Panics unless `parity` is an `i32` value.
+pub fn mbarrier_wait(bar: &Arc<UOp>, parity: &Arc<UOp>) -> Arc<UOp> {
+    assert_eq!(parity.dtype(), DType::Int32, "an mbarrier phase parity is i32");
+    let address = UOp::custom(
+        smallvec![specific_ptr(bar, AddrSpace::Local)],
+        "ptrtoint ptr addrspace(3) {0} to i32".to_string(),
+        DType::Int32,
+    );
+    // The braces scope the predicate and the label, so every wait of a
+    // kernel may spell them alike; doubled, as CUSTOM placeholders are `{N}`.
+    let wait =
+        "{{\\0A.reg .pred p;\\0AWAIT: mbarrier.try_wait.parity.shared::cta.b64 p, [$0], $1;\\0A@!p bra WAIT;\\0A}}";
+    UOp::custom(
+        smallvec![address, parity.clone()],
+        format!("call void asm sideeffect \"{wait}\", \"r,r,~{{{{memory}}}}\"(i32 {{0}}, i32 {{1}})"),
+        DType::Void,
+    )
+}
+
+/// `cp.async.bulk.tensor.2d.shared::cluster.global.tile`: this thread's
+/// bulk copy of the box of tensor map `map` at column `at[0]`, row `at[1]`
+/// (`i32`s) into shared memory at `dst_shared`, its bytes completing on the
+/// barrier `bar` ([`mbarrier_arrive_expect`]). `map` is a tensor-map PARAM
+/// and `buffer` the storage PARAM it maps, which the copy keeps a source.
+/// sm_90.
+///
+/// # Panics
+/// Panics unless both coordinates are `i32` values.
+pub fn bulk_tensor_load(
+    dst_shared: &Arc<UOp>,
+    bar: &Arc<UOp>,
+    map: &Arc<UOp>,
+    at: [&Arc<UOp>; 2],
+    buffer: &Arc<UOp>,
+) -> Arc<UOp> {
+    assert!(at.iter().all(|c| c.dtype() == DType::Int32), "a tensor-map coordinate is i32");
+    // The destination is in the cluster's shared window (addrspace 7), of
+    // which the block's own is a part.
+    let dst = UOp::custom(
+        smallvec![specific_ptr(dst_shared, AddrSpace::Local)],
+        "addrspacecast ptr addrspace(3) {0} to ptr addrspace(7)".to_string(),
+        DType::Void.ptr(None, AddrSpace::Local).expect("void is not a pointer"),
+    );
+    let intrinsic = "llvm.nvvm.cp.async.bulk.tensor.g2s.tile.2d";
+    UOp::custom(
+        smallvec![dst, specific_ptr(bar, AddrSpace::Local), map.clone(), at[0].clone(), at[1].clone(), buffer.clone()],
+        format!(
+            "declare void @{intrinsic}(ptr addrspace(7), ptr addrspace(3), ptr, i32, i32, i16, i64, i1, i1, i32)\n\
+             call void @{intrinsic}(ptr addrspace(7) {{0}}, ptr addrspace(3) {{1}}, ptr {{2}}, i32 {{3}}, i32 {{4}}, \
+             i16 0, i64 0, i1 false, i1 false, i32 0)"
+        ),
+        DType::Void,
+    )
+}
+
 fn void_call(intrinsic: &str, args: &str, params: &str, deps: SmallVec<[Arc<UOp>; 4]>) -> Arc<UOp> {
     UOp::custom(
         deps,
@@ -186,3 +292,51 @@ pub fn ldmatrix(shared_ptr: &Arc<UOp>, count: usize, trans: bool, fragment: DTyp
 #[cfg(test)]
 #[path = "../../test/unit/llvm_nvptx_smem.rs"]
 mod tests;
+
+/// One thread's bulk copy of a shared tile into global memory through the
+/// tensor map `map` (`cp.async.bulk.tensor`, shared → global), its box at
+/// column `at[0]`, row `at[1]` of the tensor; what of the box lies past the
+/// tensor is not written. `written` is an index into the parameter the map
+/// describes, which the statement so writes in place
+/// ([`UOp::read_modify_writes`]). The copy joins the thread's bulk group
+/// ([`bulk_store_wait`]).
+pub fn bulk_tensor_store(src_shared: &Arc<UOp>, map: &Arc<UOp>, at: [&Arc<UOp>; 2], written: &Arc<UOp>) -> Arc<UOp> {
+    assert!(matches!(written.op(), Op::Index(..)), "a bulk store names the memory it writes by an index");
+    assert!(at.iter().all(|c| c.dtype() == DType::Int32), "a tensor-map coordinate is i32");
+    let intrinsic = "llvm.nvvm.cp.async.bulk.tensor.s2g.tile.2d";
+    UOp::custom(
+        smallvec![
+            specific_ptr(src_shared, AddrSpace::Local),
+            map.clone(),
+            at[0].clone(),
+            at[1].clone(),
+            written.clone()
+        ],
+        format!(
+            "declare void @{intrinsic}(ptr addrspace(3), ptr, i32, i32, i64, i1)\n\
+             call void @{intrinsic}(ptr addrspace(3) {{0}}, ptr {{1}}, i32 {{2}}, i32 {{3}}, i64 0, i1 false)"
+        ),
+        DType::Void,
+    )
+}
+
+/// What the generic proxy stored in shared memory at and past `shared`,
+/// fenced for the bulk copies that read it through the async proxy
+/// (`fence.proxy.async`).
+pub fn bulk_store_fence(shared: &Arc<UOp>) -> Arc<UOp> {
+    UOp::custom(
+        smallvec![specific_ptr(shared, AddrSpace::Local)],
+        "call void asm sideeffect \"fence.proxy.async.shared::cta;\", \"~{{{{memory}}}}\"()".to_string(),
+        DType::Void,
+    )
+}
+
+/// The thread's bulk stores so far, committed as a group and complete.
+pub fn bulk_store_wait(last: &Arc<UOp>) -> Arc<UOp> {
+    UOp::custom(
+        smallvec![last.clone()],
+        "call void asm sideeffect \"cp.async.bulk.commit_group;\\0Acp.async.bulk.wait_group 0;\", \"~{{{{memory}}}}\"()"
+            .to_string(),
+        DType::Void,
+    )
+}

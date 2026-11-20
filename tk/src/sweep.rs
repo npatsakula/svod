@@ -20,7 +20,7 @@ use crate::ir::{Program, Schedule, Var};
 use crate::kernels::attention::{AttnMask, AttnSpec, Bias, CacheLayout, Chunk, CombineSpec, FaCfg, attention, combine};
 use crate::kernels::conv::{ConvCfg, ConvGeom, ConvSpec};
 use crate::kernels::gemm::{
-    Epilogue, GemmCfg, GemmSpec, Scale, TailPlan, TailSpec, TailSplit, TileOrder, gemm, gemm_tail,
+    Epilogue, GemmCfg, GemmSpec, Scale, Store, TailPlan, TailSpec, TailSplit, TileOrder, gemm, gemm_tail,
 };
 use crate::kernels::heads::{HeadsSpec, Rope, heads};
 use crate::kernels::nearest::{
@@ -256,13 +256,24 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
     // of nine, positions wrapping every 50 rows.
     let turning = planner.gemm_ranked(1, 4096, 2304, 768, &Epilogue::DEFAULT).iter().copied().find(|c| c.turns(64));
     if let Some(cfg) = turning {
-        let rope = crate::kernels::gemm::Rope { heads: 6, head_dim: 64, seq: 50 };
+        let rope = crate::kernels::gemm::Rope { heads: 6, head_dim: 64, seq: 50, norm: None };
         let epilogue = Epilogue { rope: Some(rope), ..Epilogue::DEFAULT };
         let spec = assumed(
             GemmSpec { m: 130, n: 576, k: 128, batch: Batch::Static(1), epilogue, windows: Default::default() },
             cfg,
         );
         push("gemm rope", gemm::<BF16>(&spec), cfg.lowering(&planner.device));
+    }
+    // The same projection's turned heads normed first, on the lead tile
+    // that carries the norm (a head's row within one warp).
+    let normed = crate::kernels::gemm::Rope { heads: 6, head_dim: 64, seq: 50, norm: Some(Scale::new(1e-6)) };
+    let epilogue = Epilogue { rope: Some(normed), ..Epilogue::DEFAULT };
+    if let Some(&cfg) = planner.gemm_ranked(1, 4096, 576, 768, &epilogue).first() {
+        let spec = assumed(
+            GemmSpec { m: 130, n: 576, k: 128, batch: Batch::Static(1), epilogue, windows: Default::default() },
+            cfg,
+        );
+        push("gemm normed rope", gemm::<BF16>(&spec), cfg.lowering(&planner.device));
     }
 
     // The planner's lead for the shape; a head size it plans no kernel for
@@ -622,38 +633,84 @@ pub(crate) fn hopper() -> Target {
 /// GEMM tiles on Hopper's warpgroup core: one to four warpgroups down the
 /// rows, one or two across, every swizzle span (16-, 32- and 64-deep rings
 /// are 32-, 64- and 128-byte rows), a 96-wide tile of three `n32` and a
-/// `k` of several trips. Shapes stay small for the interpreter.
+/// `k` of several trips, tiles staged through their rings on the way out,
+/// stored from them in bulk, and rings filled in bulk; then attentions of
+/// one and two warpgroups, their rings filled by chunks and in bulk (a bias
+/// tile beside the keys stays its threads' chunks). Shapes stay small for
+/// the interpreter.
 pub(crate) fn group_families(target: &Target) -> Vec<Launch> {
     let planner = planner(target.clone());
-    let tiles: [([usize; 3], [u32; 2], usize); 7] = [
-        ([128, 128, 64], [8, 1], 3),
-        ([128, 256, 64], [8, 1], 2),
-        ([64, 128, 32], [4, 1], 3),
-        ([64, 64, 16], [4, 1], 3),
-        ([128, 96, 64], [8, 1], 2),
-        ([256, 128, 64], [16, 1], 2),
-        ([128, 256, 64], [8, 2], 2),
+    let (direct, staged, flushed) = (Store::Direct, Store::Staged, Store::Bulk);
+    let (ring, bulk) = (Schedule::ring as fn(usize, bool) -> Schedule, Schedule::bulk as fn(usize, bool) -> Schedule);
+    let tiles: [([usize; 3], [u32; 2], Schedule, Store); 16] = [
+        ([128, 128, 64], [8, 1], ring(3, false), direct),
+        ([128, 256, 64], [8, 1], ring(2, false), direct),
+        ([64, 128, 32], [4, 1], ring(3, false), direct),
+        ([64, 64, 16], [4, 1], ring(3, false), direct),
+        ([128, 96, 64], [8, 1], ring(2, false), direct),
+        ([256, 128, 64], [16, 1], ring(2, false), direct),
+        ([128, 256, 64], [8, 2], ring(2, false), direct),
+        ([128, 128, 64], [8, 1], ring(4, false), staged),
+        ([64, 128, 32], [4, 1], ring(4, false), staged),
+        ([128, 256, 64], [8, 2], ring(4, false), staged),
+        ([128, 128, 64], [8, 1], bulk(4, true), direct),
+        ([64, 128, 32], [4, 1], bulk(3, false), direct),
+        ([64, 64, 16], [4, 1], bulk(3, false), direct),
+        ([128, 256, 64], [8, 2], bulk(4, false), staged),
+        ([128, 128, 64], [8, 1], ring(4, false), flushed),
+        ([128, 256, 64], [8, 2], bulk(4, false), flushed),
     ];
     tiles
         .into_iter()
-        .map(|(tile, warps, stages)| {
-            let cfg = GemmCfg {
-                tile,
-                warps,
-                core: Core::Group,
-                schedule: Schedule::ring(stages, false),
-                order: TileOrder::DEFAULT,
-                tail: None,
-            };
+        .map(|(tile, warps, schedule, store)| {
+            let cfg =
+                GemmCfg { tile, warps, core: Core::Group, schedule, order: TileOrder::DEFAULT, tail: None, store };
             assert!(cfg.fits(target), "{cfg:?} fits the warpgroup core");
-            let (m, n, k) = (tile[0] + 2, tile[1] - 3, 3 * tile[2]);
+            // A bulk store takes rows whole 16-byte chunks apart: two tiles
+            // across, the lower row of tiles cut at the output's edge.
+            let n = if store == Store::Bulk { 2 * tile[1] } else { tile[1] - 3 };
+            let (m, k) = (tile[0] + 2, 3 * tile[2]);
             let spec = assumed(
                 GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, windows: Default::default() },
                 cfg,
             );
-            (format!("group gemm {:?} {:?}", cfg.tile, cfg.warps), gemm::<BF16>(&spec), cfg.lowering(&planner.device))
+            let fill = if matches!(schedule, Schedule::Bulk { .. }) { " bulk" } else { "" };
+            let store = match store {
+                Store::Direct => "",
+                Store::Staged => " staged",
+                Store::Bulk => " flushed",
+            };
+            let name = format!("group gemm {:?} {:?}{fill}{store}", cfg.tile, cfg.warps);
+            (name, gemm::<BF16>(&spec), cfg.lowering(&planner.device))
         })
+        .chain(group_attentions(target, &planner.device))
         .collect()
+}
+
+/// [`group_families`]' attentions over 128 keys, whole key blocks (a bulk
+/// fill takes no bounded window), two heads over one; the biased one's
+/// keys end at loaded lengths, so only its bias tile is filled in bulk.
+fn group_attentions(target: &Target, device: &Device) -> Vec<Launch> {
+    let (ring, bulk) = (Schedule::ring as fn(usize, bool) -> Schedule, Schedule::bulk as fn(usize, bool) -> Schedule);
+    let plain = AttnMask::default();
+    let causal = AttnMask { causal: true, ..plain };
+    let biased = AttnMask { bias: Some(Bias::PerBatch), key_lens: true, ..plain };
+    let cases: [(usize, usize, usize, usize, Schedule, AttnMask, &str); 5] = [
+        (128, 64, 64, 64, ring(3, false), causal, " causal"),
+        (128, 64, 64, 64, bulk(3, false), causal, " bulk causal"),
+        (128, 128, 64, 128, bulk(3, true), plain, " bulk"),
+        (128, 128, 32, 64, bulk(2, false), causal, " bulk causal"),
+        (128, 64, 64, 64, bulk(3, false), biased, " bulk bias"),
+    ];
+    let launch = |(t, bq, bkv, d, schedule, mask, how): (usize, usize, usize, usize, Schedule, AttnMask, &str)| {
+        let cfg = FaCfg { core: Core::Group, schedule, ..FaCfg::new(bq, bkv, schedule.stages()) };
+        assert!(cfg.fits(target, d, mask.bias.is_some()), "{cfg:?} fits the warpgroup core");
+        let (batch, scale) = (Batch::Static(1), 0.125);
+        let spec = AttnSpec { batch, t, tk: 128, heads: 2, kv_heads: 1, d, mask, cache: None, packed: false, scale };
+        let name = format!("group attention [{bq}, {bkv}] d{d}{how}");
+        (name, attention::<BF16>(&assumed(spec, cfg)), cfg.lowering(device))
+    };
+    cases.into_iter().map(launch).collect()
 }
 
 /// An AMD GPU with `cus` compute units and 64 KB of LDS per workgroup; a

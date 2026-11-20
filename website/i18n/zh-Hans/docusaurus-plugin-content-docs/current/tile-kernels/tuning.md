@@ -33,15 +33,15 @@ sidebar_label: 调优
 | 项目 | 值 |
 |---|---|
 | 目录 | `$SVOD_TK_TUNE_DIR`，否则 `$XDG_CACHE_HOME/svod/tk_tune`，否则 `~/.cache/svod/tk_tune` |
-| 文件 | 每个设备和 crate 版本一个，例如 `sm_86_28sm-v<crate 版本>.txt`，以其行格式作为首行（`format 11`）；其他格式或没有该行的文件整个丢弃 |
+| 文件 | 每个设备和 crate 版本一个，例如 `sm_86_28sm_rtx_3060-v<crate 版本>.txt`，以其行格式作为首行（`format 11`）；其他格式或没有该行的文件整个丢弃 |
 | 行 | `kind\|op\|device\|dtype\|shape\|candidates\|compiler\|programs numbers`：`choice` 存放运行过的候选，最快者在前，每个为 `index:code ns`，`code` 是配置自身的文本，因此一行无需其排序即可重放（程序发射结果与另一候选相同的候选——比如被调度折叠掉的反滚——按其孪生的 ns 记录，两者共用同一内核）；`value` 存放一个测得的数；`admitted` 存放准入保留的每个配置的 `index:code`；`first` 存放第一个干净配置的 `index:code` |
-| 键 | `tune::TuneKey { op, device, dtype, shape, candidates, compiler }`，其中 `device` 是架构和 SM 数量（`sm_86-28sm`），`compiler` 是设备编译器的摘要（`tune::compiler`） |
+| 键 | `tune::TuneKey { op, device, dtype, shape, candidates, compiler }`，其中 `device` 是架构、SM 数量，以及驱动为显卡命名时的型号（`sm_86-28sm-rtx-3060`、`sm_90-132sm-h200-nvl`：H200 的存储与 H100 SXM 的分开），`compiler` 是设备编译器的摘要（`tune::compiler`） |
 
 GEMM 选择行（形状 `[batch, m, n, k]`，其编码以光栅顺序和尾部拆分结尾，`~` 表示无拆分）和代价探针值行（每单位飞秒）的形式；摘要和数值为占位符：
 
 ```text
-choice|linear|sm_86-28sm|BFloat16|1x4096x4096x4096|<candidates>|<compiler>|<programs> 0:w,128,256,64,2,4,r3u,g8,~ <ns> 3:w,128,128,32,2,2,r3u,g8,~ <ns>
-value|probe:cached_1m|sm_86-28sm|Int32||<candidates>|<compiler>|<programs> <fs>
+choice|linear|sm_86-28sm-rtx-3060|BFloat16|1x4096x4096x4096|<candidates>|<compiler>|<programs> 0:w,128,256,64,2,4,r3u,g8,~ <ns> 3:w,128,128,32,2,2,r3u,g8,~ <ns>
+value|probe:cached_1m|sm_86-28sm-rtx-3060|Int32||<candidates>|<compiler>|<programs> <fs>
 ```
 
 `programs` 字段是候选所发射内核的指纹：降级后的程序以及交给后端的 LLVM 文本，因此对内核或渲染器的改动会触发重新测量，而发射出相同内核的重构不会。一个程序发射什么，按其组成内容、按可执行文件的每次构建记录在存储根目录下的 `emitted/<build>.txt` 中（一周未用的构建会被删除），因此同一构建的热进程无需降级任何东西，而重新构建后每个程序降级一次。只有存储未命中时才编译。写入时会重新读取、合并并原子地替换文件。无法读取或写入的存储视为未命中，从不报错。
@@ -50,7 +50,7 @@ value|probe:cached_1m|sm_86-28sm|Int32||<candidates>|<compiler>|<programs> <fs>
 
 排序所用的代价（`atoms::Costs`：一个共享字节、一个流式字节、一个分散元素、满载 SM 上的一步矩阵核运算，以及在 SIMD 上单独一个 wave、作为 warpgroup 乘积、在宽核心上和针对 8 位整数（满载与单独）时的一步、一个分数的 softmax、一次流水线行程（环的两个槽位，展开与不展开，以及一个槽位）、SM 上只有一个块时两个槽位和一个槽位的行程、一次 lane 移动、一次共享内存往返、经环的两个槽位（以及在 `cp.async` 填充的目标上经一个槽位）的全局延迟，以及缓存阶梯：各工作集大小下流式字节的代价，L2 的速率和容量由它读出）由 `probe::costs` 在进程第一次为该设备做规划时在设备上测量。每个字段是一对程序，其中探针做其基线所做的一切，再加上已知数量的该原语。这些值以 `value|probe:<field>` 行写入同一个存储文件，因此之后的进程会读回它们。失败的探针让其字段保持为零，发出警告，并在 `Planner::unmeasured` 中列出，而设备门控 `device_costs_are_physical` 要求该列表为空：规划器用已有的数据排序，而不是把设备丢给计算图。只有没有 SM 数量的设备才没有规划器。驻留由目标声明的内容而非探针定价：一个 SM 同时容纳的块数是其共享内存、寄存器和 wave 槽能容纳的数量，且至多为 `Occupancy::blocks`，即不论资源如何的硬件上限。
 
-主机测试则直接声明代价：猜测的夹具 `costs()`，以及 `test/unit/mod.rs` 中的 `sm86_costs()`、`gfx1201_costs()`、`gfx942_costs()` 和 `gfx1151_costs()`，各自取自对应设备的探针。对于本机没有对应设备的显卡，`Target::offline` 或 `Target::card` 给出目标，`probe::stored` 从该卡上拷贝来的调优存储中读取代价；没有这样的存储时，以 `probe::GUESSED` 代替，排序也就只是猜测。[`tk_dump` 示例](./testing-and-debugging#planning-for-another-card)两者都做。
+主机测试则直接声明代价：猜测的夹具 `costs()`，以及 `test/unit/mod.rs` 中的 `sm86_costs()`、`h200_costs()`、`gfx1201_costs()`、`gfx942_costs()` 和 `gfx1151_costs()`，各自取自对应设备的探针。对于本机没有对应设备的显卡，`Target::offline` 或 `Target::card` 给出目标，`probe::stored` 从该卡上拷贝来的调优存储中读取代价；没有这样的存储时，以 `probe::GUESSED` 代替，排序也就只是猜测。[`tk_dump` 示例](./testing-and-debugging#planning-for-another-card)两者都做。
 
 ## 规划器日志 {#the-planner-log}
 
@@ -82,10 +82,14 @@ SVOD_DEVICE=CUDA cargo run --release -p svod-tk --example tk_bench -- gemm --top
 | `raster [--shape MxNxK,…]` | 调优器的 GEMM 选择和规划器第一个配置的每种光栅顺序，与默认顺序对比，并列出代价模型对每种顺序的估价 |
 | `fit [--only LABEL,…] [--picks]` | 代价模型与设备的对比：若干 GEMM、注意力和 nearest 形状上每个排名配置的预测时间与实测时间、调优器的选择及调优器的墙钟时间；`--picks` 只为选择计时 |
 | `trips` | 每个 SM 驻留 1 到 48 个块时的流水线迭代探针 |
-| `pin --cfg BMxBNxBK:S:WRxWC[:rolled],… [--shape MxNxK,…] [--residual] [--gated]` | 每个固定的 GEMM 配置的时间（默认为 Whisper 的 fc2），旁边是模型的价格，以及分别将内存延迟、单独行程或矩阵核步骤置零后的价格：每一项占该配置时间的多少 |
+| `pin --cfg BMxBNxBK:S:WRxWC[:rolled][:group][:bulk][:staged|:flushed],… [--shape MxNxK,…] [--residual] [--gated]` | 每个固定的 GEMM 配置的时间（默认为 Whisper 的 fc2），旁边是模型的价格，以及分别将内存延迟、单独行程或矩阵核步骤置零后的价格：每一项占该配置时间的多少 |
 | `sqtt gemm M N K [--cfg I\|tuned\|BMxBNxBK:S:WRxWC[:rolled],…] [--top N] [--out DIR] [--json] [--attribute]` | 仅限 AMD RDNA3/RDNA4：每个配置的线程追踪报告（见[线程追踪](#thread-trace)）；`sqtt --load DIR` 重新读取已保存的追踪 |
 
 `--metric` 可取 `squared-l2`、`l2` 或 `neg-dot`。每个命令都按调优器的方式计时：一个配置的所有内核一起计时（拆分的合并、尾部的部分和），算子的计划也一样。
+
+### 参考上限 {#reference-ceilings}
+
+`scripts/tk_ceilings` 测量厂商内核在一张显卡上能达到的速度，使用 `tk_bench` 的形状和浮点运算计数，并按调优器的方式计时（只计内核的设备时间）：`cublaslt_bench.cu` 在 GEMM 的操作数布局上运行 cuBLASLt 启发式给出的每个算法，`attn_bench.py` 运行 FlashAttention-3、cuDNN 的注意力和 ThunderKittens 的注意力。`tk_bench gemm` 和 `tk_bench attention` 达到其中的多少，就是该卡的内核离峰值有多远。
 
 ### 线程追踪 {#thread-trace}
 

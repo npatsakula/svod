@@ -41,7 +41,7 @@ pub fn chosen() -> Option<Chosen>;
 `Linear::scale` умножает значение после активации до прибавления residual:
 `scale·act(x·wᵀ + bias) + residual`, так что полушаг Conformer `x + 0.5·ffn(x)` — это один GEMM.
 
-`Linear::rope` — это `Rotary { cos, sin, heads, head_dim }`: первые `heads` голов выхода по
+`Linear::rope` — это `Rotary { cos, sin, heads, head_dim, norm }` (`norm`, вес `[heads·head_dim]` и `eps`, RMS-нормирует каждую поворачиваемую голову перед поворотом, на тайле, где строка головы лежит в одном варпе; таблицы могут быть и `[B, T, 1, head_dim/2]`, по токену, при статическом батче): первые `heads` голов выхода по
 `head_dim` столбцов поворачиваются после смещения таблицами `(cos, sin)` формы
 `[1, T, 1, head_dim/2]`, две половины головы спариваются так же, как в `apply_rotary_emb`, для
 `x [B, T, K]`. Рядом с активацией, residual или масштабом весь linear выполняется на графе. Иначе

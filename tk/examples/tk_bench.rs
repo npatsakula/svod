@@ -31,12 +31,15 @@
 //!   chosen from); `--picks` times the picks alone, an A/B across builds.
 //! - `trips`: the trip probes at 1–48 blocks an SM, per block-trip and per
 //!   round ([`svod_tk::probe::trip_at`]): what `TRIP_HIDING` is fitted to.
-//! - `pin --cfg BMxBNxBK:S:WRxWC[:rolled],… [--shape MxNxK,…] [--residual]
+//! - `pin --cfg BMxBNxBK:S:WRxWC[:rolled][:group][:bulk][:staged|:flushed],… [--shape MxNxK,…] [--residual]
 //!   [--gated]`: each pinned GEMM config on each shape (Whisper's fc2 by
 //!   default, a SwiGLU epilogue under `--gated`),
 //!   timed beside the model's price and that price with one term zeroed at
 //!   a time (the memory latency, the lone trip, the matrix step): what each
 //!   term holds of the config's time.
+//! - `trace gemm M N K | attention B H T D [--cfg …] [--out DIR]`, `trace
+//!   --compare A B`: on NVIDIA, each config's time by tile statement
+//!   ([`svod_tk::trace`]).
 //! - `sqtt gemm M N K [--cfg I|tuned|BMxBNxBK:S:WRxWC[:rolled],…] [--top N]
 //!   [--out DIR] [--json] [--attribute] [--residual] [--gated]`: each config
 //!   (the tuner's pick by default, `I` the planner's `I`th) timed untraced,
@@ -74,12 +77,13 @@ use svod_tk::atoms::{Core, Costs, Device};
 use svod_tk::ir::Schedule;
 use svod_tk::kernels::attention::{AttnMask, AttnSpec, Bias, FaCfg};
 use svod_tk::kernels::conv::{ConvCfg, ConvGeom, ConvSpec};
-use svod_tk::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, TileOrder};
+use svod_tk::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Store, TileOrder};
 use svod_tk::kernels::nearest::{Floors, Metric, NearestCfg, NearestSpec};
 use svod_tk::kernels::{Act, Batch};
 use svod_tk::ops::config::{AttentionProblem, ConvProblem, GemmProblem, NearestProblem, Planner};
 use svod_tk::ops::shape::{self, Extent, Plan};
 use svod_tk::ops::{self, Attn, Nearest, Quantized, Rerank, Search, candidates, tuned};
+use svod_tk::trace::Report;
 use svod_tk::tune::{self, Candidate, Compiled, TuneStore};
 
 type Result<T, E = Box<dyn std::error::Error>> = std::result::Result<T, E>;
@@ -106,6 +110,7 @@ fn main() -> Result<()> {
         "fit" => fit_bench(&args),
         "trips" => trips_bench(),
         "pin" => pin_bench(&args),
+        "trace" => trace_bench(&args),
         "sqtt" => sqtt_bench(&args),
         other => Err(format!("{other}: {USAGE}").into()),
     }
@@ -184,7 +189,14 @@ fn rate(t: Option<Duration>, work: f64, unit: &str) -> String {
 }
 
 fn gemm_label(c: &GemmCfg) -> String {
-    format!("{:?} s{} {:?} unroll={} {:?} crews={}", c.tile, c.stages(), c.warps, c.unroll(), c.core, c.crews())
+    let staged = match c.store {
+        Store::Direct => "",
+        Store::Staged => " staged",
+        Store::Bulk => " flushed",
+    };
+    let bulk = if matches!(c.schedule, Schedule::Bulk { .. }) { " bulk" } else { "" };
+    let (tile, stages, warps, unroll) = (c.tile, c.stages(), c.warps, c.unroll());
+    format!("{tile:?} s{stages} {warps:?} unroll={unroll} {:?} crews={}{bulk}{staged}", c.core, c.crews())
 }
 
 /// A bf16 GEMM at `cfg`, admitted: the programs the op launches.
@@ -576,25 +588,33 @@ fn trips_bench() -> Result<()> {
     Ok(())
 }
 
-/// A pinned config, `BMxBNxBK:S:WRxWC[:rolled]`, on the warp core in the
+/// A pinned config, `BMxBNxBK:S:WRxWC[:rolled][:group][:bulk][:staged|:flushed]`, on the warp core unless `group`, in the
 /// default raster.
 fn pinned(code: &str) -> Result<GemmCfg> {
     let dims = |s: &str| -> Result<Vec<usize>> { Ok(s.split('x').map(str::parse).collect::<Result<_, _>>()?) };
     let parts: Vec<&str> = code.split(':').collect();
-    let (tile, stages, warps) = match parts[..] {
-        [tile, stages, warps] | [tile, stages, warps, "rolled"] => (dims(tile)?, stages.parse()?, dims(warps)?),
-        _ => return Err(format!("{code}: BMxBNxBK:S:WRxWC[:rolled]").into()),
-    };
+    let usage = || format!("{code}: BMxBNxBK:S:WRxWC[:rolled][:group][:bulk][:staged|:flushed]");
+    let [tile, stages, warps, flags @ ..] = &parts[..] else { return Err(usage().into()) };
+    if let Some(flag) = flags.iter().find(|flag| !["rolled", "group", "bulk", "staged", "flushed"].contains(flag)) {
+        return Err(format!("{}: no flag {flag}", usage()).into());
+    }
+    let flag = |name: &str| flags.contains(&name);
+    let (tile, stages, warps): (_, usize, _) = (dims(tile)?, stages.parse()?, dims(warps)?);
     let (&[bm, bn, bk], &[wr, wc]) = (&tile[..], &warps[..]) else {
         return Err(format!("{code}: three tile dims, two warp dims").into());
     };
     Ok(GemmCfg {
         tile: [bm, bn, bk],
         warps: [wr as u32, wc as u32],
-        core: Core::Warp,
-        schedule: Schedule::ring(stages, parts.len() == 3),
+        core: if flag("group") { Core::Group } else { Core::Warp },
+        schedule: if flag("bulk") { Schedule::bulk } else { Schedule::ring }(stages, !flag("rolled")),
         order: TileOrder::DEFAULT,
         tail: None,
+        store: match (flag("flushed"), flag("staged")) {
+            (true, _) => Store::Bulk,
+            (false, true) => Store::Staged,
+            (false, false) => Store::Direct,
+        },
     })
 }
 
@@ -740,6 +760,60 @@ fn sqtt_bench(args: &Args) -> Result<()> {
             capture.save(dir)?;
             println!("saved {}", dir.display());
             sqtt_print(&capture, args, top)?;
+        }
+    }
+    Ok(())
+}
+
+/// `trace gemm M N K | attention B H T D` (the configs of `sqtt`'s `--cfg`,
+/// a GEMM's `--residual`/`--gated`): each config's statements with the time
+/// a block spends in them ([`svod_tk::trace`]), beside the kernel's time
+/// bare and stamped; `--out DIR` keeps each report, `--compare A B` sets two
+/// kept reports side by side.
+fn trace_bench(args: &Args) -> Result<()> {
+    const RUNS: usize = 16;
+    if let Some(at) = args.0.iter().position(|a| a == "--compare") {
+        let (Some(a), Some(b)) = (args.0.get(at + 1), args.0.get(at + 2)) else {
+            return Err("trace --compare FILE_A FILE_B".into());
+        };
+        let load = |path: &String| -> Result<Report> {
+            Report::parse(&std::fs::read_to_string(path)?).ok_or_else(|| format!("{path}: no trace report").into())
+        };
+        print!("{}", load(a)?.compare(&load(b)?));
+        return Ok(());
+    }
+    let positional: Vec<&str> = args.0.iter().map(String::as_str).take_while(|a| !a.starts_with("--")).collect();
+    let planner = planner()?;
+    let traced: Vec<Traced> = match positional[..] {
+        ["gemm", m, n, k] => gemm_traced(&planner, [m.parse()?, n.parse()?, k.parse()?], args)?,
+        ["attention", b, h, t, d] => {
+            attention_traced(&planner, [b.parse()?, h.parse()?, t.parse()?, d.parse()?], args)?
+        }
+        _ => return Err("trace gemm M N K | attention B H T D [--cfg …] [--out DIR], or trace --compare A B".into()),
+    };
+    for Traced { name, candidate, labels, .. } in traced {
+        let bare = timed_candidates(vec![candidate()?]).pop().and_then(|t| t.1);
+        for (program, (stamped, report)) in tune::trace(candidate()?, RUNS)?.into_iter().enumerate() {
+            let stamped = timed_candidates(vec![stamped]).pop().and_then(|t| t.1);
+            let ns = |t: Option<Duration>| t.map_or("failed".into(), |t| t.as_nanos().to_string());
+            let Some(report) = report else { return Err(format!("{name}: no block was sampled").into()) };
+            // The blocks running at once, about: a stamped kernel that holds fewer than the bare one is another kernel.
+            let blocks = report.blocks as f64 / RUNS as f64 * svod_tk::trace::EVERY as f64;
+            let at_once = stamped.map_or(f64::NAN, |t| blocks * report.block_ns / t.as_nanos() as f64);
+            let cfg = &labels["cfg"];
+            println!("traced|{name}|p{program}|{cfg}|bare {}|stamped {}|at once {at_once:.0}", ns(bare), ns(stamped));
+            // Stamps in a sixteenth of the blocks cost a few percent; more is a kernel the stamps changed.
+            if let (Some(bare), Some(stamped)) = (bare, stamped)
+                && stamped.as_secs_f64() > 1.08 * bare.as_secs_f64()
+            {
+                let over = 100.0 * (stamped.as_secs_f64() / bare.as_secs_f64() - 1.0);
+                println!("perturbed|{name}|stamped runs {over:.0} % over bare: the rows are another kernel's");
+            }
+            print!("{report}");
+            if let Some(dir) = args.opt("--out") {
+                std::fs::create_dir_all(dir)?;
+                std::fs::write(Path::new(dir).join(format!("{name}_p{program}.trace")), report.to_string())?;
+            }
         }
     }
     Ok(())

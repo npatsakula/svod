@@ -74,17 +74,17 @@ tile के twins) वे pool के एक को छोड़ बाकी �
 | क्या | मान |
 |---|---|
 | Directory | `$SVOD_TK_TUNE_DIR`, वरना `$XDG_CACHE_HOME/svod/tk_tune`, वरना `~/.cache/svod/tk_tune` |
-| File | हर device और crate version के लिए एक, जैसे `sm_86_28sm-v<crate version>.txt`, जिसकी शुरुआत उसके line format (`format 11`) से होती है; किसी दूसरे format वाली, या बिना इस line वाली फ़ाइल पूरी हटा दी जाती है |
+| File | हर device और crate version के लिए एक, जैसे `sm_86_28sm_rtx_3060-v<crate version>.txt`, जिसकी शुरुआत उसके line format (`format 11`) से होती है; किसी दूसरे format वाली, या बिना इस line वाली फ़ाइल पूरी हटा दी जाती है |
 | Line | `kind\|op\|device\|dtype\|shape\|candidates\|compiler\|programs numbers`: एक `choice` में चले हुए candidates होते हैं, सबसे तेज़ पहले, हर एक `index:code ns`, जहाँ `code` config का अपना text है, इसलिए line अपनी ranking के बिना replay होती है (जिस candidate के programs वही emit करते हैं जो किसी और के करता है — एक unrolling जो schedule चुपके से मिटा देता है — वह अपने twin के ns पर दर्ज है, वह kernel जो दोनों बाँटते हैं); एक `value` में एक मापी गई संख्या; एक `admitted` में admission द्वारा रखे हर config का `index:code`; एक `first` में पहले clean config का `index:code` |
-| Key | `tune::TuneKey { op, device, dtype, shape, candidates, compiler }`, जहाँ `device` arch और SM count है (`sm_86-28sm`) और `compiler` device के compiler का digest है (`tune::compiler`) |
+| Key | `tune::TuneKey { op, device, dtype, shape, candidates, compiler }`, जहाँ `device` arch, SM count और, जहाँ driver card का नाम देता है, उसका model है (`sm_86-28sm-rtx-3060`, `sm_90-132sm-h200-nvl`: H200 का store H100 SXM के store से अलग रहता है) और `compiler` device के compiler का digest है (`tune::compiler`) |
 
 एक GEMM choice (shape `[batch, m, n, k]`, उसके codes raster और tail split पर ख़त्म होते हैं, बिना
 split के `~`) और एक cost probe की value (हर unit पर femtoseconds) का रूप; digests और संख्याएँ
 placeholders हैं:
 
 ```text
-choice|linear|sm_86-28sm|BFloat16|1x4096x4096x4096|<candidates>|<compiler>|<programs> 0:w,128,256,64,2,4,r3u,g8,~ <ns> 3:w,128,128,32,2,2,r3u,g8,~ <ns>
-value|probe:cached_1m|sm_86-28sm|Int32||<candidates>|<compiler>|<programs> <fs>
+choice|linear|sm_86-28sm-rtx-3060|BFloat16|1x4096x4096x4096|<candidates>|<compiler>|<programs> 0:w,128,256,64,2,4,r3u,g8,~ <ns> 3:w,128,128,32,2,2,r3u,g8,~ <ns>
+value|probe:cached_1m|sm_86-28sm-rtx-3060|Int32||<candidates>|<compiler>|<programs> <fs>
 ```
 
 `programs` field उन कर्नेलों का fingerprint है जिन्हें candidates emit करते हैं: lowered program और
@@ -116,7 +116,7 @@ memory, registers और wave slots में समाएँ, और अधि�
 hardware की सीमा।
 
 Host tests इसके बजाय costs घोषित करते हैं: `costs()`, अनुमानित fixture, और `test/unit/mod.rs` में
-`sm86_costs()`, `gfx1201_costs()`, `gfx942_costs()` और `gfx1151_costs()`, हर एक उसी device के probes
+`sm86_costs()`, `h200_costs()`, `gfx1201_costs()`, `gfx942_costs()` और `gfx1151_costs()`, हर एक उसी device के probes
 से copy किया गया। जिस कार्ड का device इस मशीन पर नहीं है, उसके लिए `Target::offline` या
 `Target::card` target देता है, और `probe::stored` उस कार्ड से copy किए गए tune store से costs पढ़ता है;
 उसके बिना `probe::GUESSED` उसकी जगह लेता है और ranking एक अनुमान है।
@@ -158,11 +158,20 @@ SVOD_DEVICE=CUDA cargo run --release -p svod-tk --example tk_bench -- gemm --top
 | `raster [--shape MxNxK,…]` | tuner के GEMM चुनाव और planner के पहले config का हर raster order, default order के ख़िलाफ़, हर एक की cost model वाली कीमत के साथ |
 | `fit [--only LABEL,…] [--picks]` | device के ख़िलाफ़ cost model: कुछ GEMM, attention और nearest shapes पर हर ranked config का predicted और measured समय, tuner का चुनाव और tuner का wall time; `--picks` सिर्फ़ चुनावों को मापता है |
 | `trips` | प्रति SM 1 से 48 blocks पर pipeline-trip probes |
-| `pin --cfg BMxBNxBK:S:WRxWC[:rolled],… [--shape MxNxK,…] [--residual] [--gated]` | हर pinned GEMM config का समय (default में Whisper का fc2), model की price के साथ और memory latency, lone trip या matrix step को शून्य करके वही price: config के समय में हर term कितना है |
+| `pin --cfg BMxBNxBK:S:WRxWC[:rolled][:group][:bulk][:staged|:flushed],… [--shape MxNxK,…] [--residual] [--gated]` | हर pinned GEMM config का समय (default में Whisper का fc2), model की price के साथ और memory latency, lone trip या matrix step को शून्य करके वही price: config के समय में हर term कितना है |
 | `sqtt gemm M N K [--cfg I\|tuned\|BMxBNxBK:S:WRxWC[:rolled],…] [--top N] [--out DIR] [--json] [--attribute]` | सिर्फ़ AMD RDNA3/RDNA4: हर config की thread trace report ([Thread trace](#thread-trace) देखें); `sqtt --load DIR` सहेजी गई trace को फिर से पढ़ता है |
 
 `--metric` में `squared-l2`, `l2` या `neg-dot` दिया जाता है। हर command tuner की तरह समय मापता है: किसी config के
 सभी kernels एक साथ (split का merge, tail के partials) और op का plan भी उसी तरह।
+
+### Reference ceilings {#reference-ceilings}
+
+`scripts/tk_ceilings` मापता है कि किसी card पर vendors के kernels कहाँ तक पहुँचते हैं, `tk_bench` के
+shapes और flop counts पर और उसी तरह timed जैसे tuner करता है (सिर्फ़ kernel का device time):
+`cublaslt_bench.cu` cuBLASLt के heuristic का हर algorithm GEMM के operand layout पर चलाता है, और
+`attn_bench.py` FlashAttention-3, cuDNN का attention और ThunderKittens का attention चलाता है।
+`tk_bench gemm` और `tk_bench attention` इनका जितना हिस्सा पाते हैं, वही बताता है कि card के kernels
+उसके peak से कितने दूर हैं।
 
 ### Thread trace {#thread-trace}
 

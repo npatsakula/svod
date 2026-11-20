@@ -51,6 +51,7 @@ Svod के profiler के पाँच tiers हैं। हर एक अप
 | 3, static occupancy | Registers, LDS, scratch और एक occupancy estimate, बिना dispatch के | AMD, CUDA; Metal में आंशिक रूप से |
 | 4, hardware counters | Busy cycles, waves, instructions (`SVOD_PMC`) | AMD (PM4), CUDA (CUPTI) |
 | 5, thread trace | हर traced wave के instructions उनके cycles के साथ, एक अतिरिक्त pass में | AMD gfx11 और gfx12 |
+| 5, statement stamps | tk kernel का समय हर tile statement पर, SM के cycle counter से (`tk_bench trace`) | CUDA |
 
 ## Trace क्या record करती है {/* #what-the-trace-records */}
 
@@ -394,6 +395,29 @@ K 5120, Whisper का fc2)। दोनों replays `bound matrix_bound` क�
 1536 वाली capture, जो अपनी 128-row tile का multiple है, में कोई नहीं है। सबक़ गुणात्मक है: ragged edge
 loop instructions की कीमत लेता है जो tile तक padded shape नहीं चुकाता, इसलिए ragged shape के schedule
 को tune करने से पहले padded shape जाँचें।
+
+## NVIDIA पर statement stamps
+
+CUDA के पास thread trace नहीं है, और उसके counters तथा PC sampling host के administrator के हैं
+(container में `ERR_NVGPUCTRPERM`)। वहाँ tk kernel खुद को trace करता है: `Lowering::trace` वाला
+lowering हर 16वें block के हर warp की lane 0 पर SM का cycle counter (`%clock64`) पढ़ता है और warp के
+पिछले stamp से बीते cycles अभी-अभी पूरे हुए statement के word में जोड़ता है। Copy, sync और रुकने वाला
+product अपना-अपना stamp लेते हैं; उनसे पहले के register statements एक stamp साझा करते हैं, और उनकी
+row `… statement` लिखी जाती है।
+
+```bash
+SVOD_DEVICE=CUDA cargo run --release -p svod-tk --example tk_bench -- trace gemm 8192 4096 1024 --cfg tuned --out traces
+```
+
+`traced|…|bare ns|stamped ns|at once N` kernel का समय बिना stamps और stamps के साथ है, और लगभग कितने
+blocks एक साथ चले। हर `trace|` row एक statement है: प्रति block nanoseconds (warps का औसत), वही stamps
+घटाकर, उसका हिस्सा, प्रति block stamps, किसी warp का न्यूनतम और अधिकतम। `trace --compare A B` दो
+सहेजी गई reports को statement के अनुसार साथ रखता है।
+
+तीन सीमाएँ ध्यान रखें। Row एक warp का wall time है, इसलिए उसमें SM के दूसरे warps की प्रतीक्षा शामिल
+है, और उड़ान में छोड़ा गया product अगली rows के नीचे चलता है। Stamps registers लेते हैं: जहाँ `stamped`
+`bare` से बहुत ऊपर है या `at once` बिना stamps वाले kernel के प्रति-SM blocks से कम है, वहाँ stamped
+kernel में कम blocks समाते हैं और वह दूसरा kernel है। Statement के भीतर का समय आगे नहीं बँटता।
 
 ## Caveats {/* #caveats */}
 

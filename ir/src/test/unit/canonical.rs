@@ -34,7 +34,7 @@ fn canonical_json_is_stable_generic_json_free_of_runtime_ids() {
     assert!(!first.contains("runtime_id"));
 
     let parsed: serde_json::Value = serde_json::from_str(&first).unwrap();
-    assert_eq!(parsed["schema_version"], 7);
+    assert_eq!(parsed["schema_version"], 8);
     assert_eq!(parsed["stage"], "tensor");
     assert_eq!(parsed["nodes"][2]["op"], "SUB");
 }
@@ -57,7 +57,7 @@ fn canonical_binary_encoding_is_stable_and_content_sensitive() {
     assert_eq!(first, encode(7));
     assert_ne!(first, encode(8));
     // schema_version as u32, then the u64 length-prefixed stage.
-    assert_eq!(first[..16], [7, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, b't', b'e', b'n', b's']);
+    assert_eq!(first[..16], [8, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, b't', b'e', b'n', b's']);
 }
 
 #[test]
@@ -210,6 +210,7 @@ fn canonical_graph_records_structured_param_and_shape_source() {
             axis: None,
             device: None,
             volatile: false,
+            tensor_map: None,
         }
     );
 }

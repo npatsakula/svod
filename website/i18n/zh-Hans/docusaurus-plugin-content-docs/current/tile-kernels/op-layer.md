@@ -37,7 +37,7 @@ pub fn chosen() -> Option<Chosen>;
 
 `Linear::scale` 在加上残差之前乘以激活后的值：`scale·act(x·wᵀ + bias) + residual`，因此 Conformer 的半步 `x + 0.5·ffn(x)` 只需一个 GEMM。
 
-`Linear::rope` 是 `Rotary { cos, sin, heads, head_dim }`：对 `x [B, T, K]`，输出的前 `heads` 个宽 `head_dim` 列的头在加偏置之后用 `[1, T, 1, head_dim/2]` 的 `(cos, sin)` 表旋转，头的两半按 `apply_rotary_emb` 的方式配对。与激活、残差或缩放同时使用时，整个 linear 在计算图上运行。否则，当表与 `x` 的 dtype 相同且一个 tile 的每个 warp 持有完整的头时，GEMM 在存储时完成旋转；不满足时运行普通 GEMM，由计算图旋转其输出。之后 `attention_packed` 原地读取这种投影的查询、键和值，而 `heads` 会把它们拷贝出来。
+`Linear::rope` 是 `Rotary { cos, sin, heads, head_dim, norm }`（`norm` 为 `[heads·head_dim]` 权重和 `eps`：每个被旋转的头在旋转前做 RMS 归一化，要求 tile 中一个头的行位于同一个 warp；表也可以是按 token 的 `[B, T, 1, head_dim/2]`，仅限静态 batch）：对 `x [B, T, K]`，输出的前 `heads` 个宽 `head_dim` 列的头在加偏置之后用 `[1, T, 1, head_dim/2]` 的 `(cos, sin)` 表旋转，头的两半按 `apply_rotary_emb` 的方式配对。与激活、残差或缩放同时使用时，整个 linear 在计算图上运行。否则，当表与 `x` 的 dtype 相同且一个 tile 的每个 warp 持有完整的头时，GEMM 在存储时完成旋转；不满足时运行普通 GEMM，由计算图旋转其输出。之后 `attention_packed` 原地读取这种投影的查询、键和值，而 `heads` 会把它们拷贝出来。
 
 `Attn::keys` 可以是 `KeyMask::None`、`KeyMask::Lens(&lens)`（`[B]` 有效键数）或 `KeyMask::Bool(&mask)`（`[B, Tk]`，被关注处为 true）。`Attn::cache` 接收 `Cache { head_start, kv_heads, row_map, appended, app_lens }`，而 `appended` 要求 `KeyMask::Lens`。`Attn::chunk` 是分块注意力（`Chunk { size, left, right }`）。`Attn::scale` 默认为 `1/√D`。`Attn::bias`（`[B, H, T, Tk]` 或 `[1, H, T, Tk]`，与数据流同一 dtype）在掩码之前加到缩放后的分数上，例如 WavLM 的相对位置偏置。`Qkv::rope` 是 `[1, T, 1, D/2]`（按位置）或 `[B, T, 1, D/2]`（按 token）的 `(cos, sin)`。掩码的说明见[注意力内核](./kernel-library#flash-attention)。
 

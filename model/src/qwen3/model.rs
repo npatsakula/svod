@@ -110,15 +110,16 @@ pub struct Packing<'a> {
 }
 
 impl Qwen3Model {
-    pub fn empty(config: Qwen3Config) -> Self {
+    /// Fails when the rope tables cannot be realized on the default device.
+    pub fn empty(config: Qwen3Config) -> Result<Self> {
         let dtype = config.dtype.clone();
         let embeddings = crate::init::embedding(config.vocab_size, config.hidden_size, dtype.clone());
         let layers = (0..config.num_hidden_layers).map(|_| Qwen3DecoderLayer::empty(&config)).collect();
         let norm = RmsNorm::with_dims(config.hidden_size, config.rms_norm_eps, dtype);
-        let rope = rope_cache(&config, rope_positions(&config)).expect("even head_dim, positive context");
-        let inv_freq = Tensor::rope_inv_freq(config.rope_theta, config.head_dim).expect("even head_dim");
-        inv_freq.realize().expect("a [Dh/2] constant");
-        Self { config, embeddings, layers, norm, rope, inv_freq }
+        let rope = rope_cache(&config, rope_positions(&config))?;
+        let inv_freq = Tensor::rope_inv_freq(config.rope_theta, config.head_dim)?;
+        inv_freq.realize()?;
+        Ok(Self { config, embeddings, layers, norm, rope, inv_freq })
     }
 
     /// The `(cos, sin)` prefix of the realized cache covering `positions`
@@ -167,7 +168,7 @@ impl Qwen3Model {
             input_ids.clone()
         };
         let rope = self.rope_prefix(padded)?;
-        let h = self.stack(&ids, &rope, None)?;
+        let h = self.stack(&ids, &rope, None, None)?;
         Ok(if padded > seq_len { h.narrow(1, 0, seq_len)? } else { h })
     }
 
@@ -176,14 +177,37 @@ impl Qwen3Model {
     /// `L` is the caller's — the packer sizes rows to [`SEQUENCE_TILE`].
     pub fn forward_packed(&self, input_ids: &Tensor, packing: &Packing) -> Result<Tensor> {
         let rope = self.rope_at(packing.positions)?;
-        self.stack(input_ids, &rope, Some(packing.seg_start))
+        self.stack(input_ids, &rope, Some(packing.seg_start), None)
     }
 
-    /// The decoder stack and final norm over embedded `ids`.
-    fn stack(&self, ids: &Tensor, rope: &(Tensor, Tensor), seg_start: Option<&Tensor>) -> Result<Tensor> {
+    /// [`Self::forward_packed`] at the tokens `at` `(B, S)` alone, `(B, S, D)`:
+    /// the last layer projects and transforms only those.
+    pub fn forward_packed_at(&self, input_ids: &Tensor, packing: &Packing, at: &Tensor) -> Result<Tensor> {
+        let rope = self.rope_at(packing.positions)?;
+        self.stack(input_ids, &rope, Some(packing.seg_start), Some(at))
+    }
+
+    /// The decoder stack and final norm over embedded `ids`, of every token
+    /// or of those at `at` `(B, S)`.
+    fn stack(
+        &self,
+        ids: &Tensor,
+        rope: &(Tensor, Tensor),
+        seg_start: Option<&Tensor>,
+        at: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let mut h = self.embeddings.forward(ids)?;
-        for layer in &self.layers {
+        let (last, rest) = match (at, self.layers.split_last()) {
+            (Some(at), Some((last, rest))) => (Some((last, at)), rest),
+            _ => (None, &self.layers[..]),
+        };
+        for layer in rest {
             h = layer.forward_packed(&h, rope, seg_start)?;
+        }
+        if let Some((last, at)) = last {
+            h = last.forward_at(&h, rope, seg_start, at)?;
+        } else if let Some(at) = at {
+            h = gather_tokens(&h, at)?;
         }
         rms_norm(&self.norm, &h)
     }
@@ -216,7 +240,7 @@ impl Qwen3Model {
 
     pub fn from_state_dict(sd: &StateDict, config: Qwen3Config) -> Result<Self> {
         let dtype = config.dtype.clone();
-        let mut model = Self::empty(config);
+        let mut model = Self::empty(config)?;
         model.load_state_dict(&state::cast_all(sd, dtype)?, "")?;
         Ok(model)
     }

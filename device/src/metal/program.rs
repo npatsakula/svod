@@ -68,6 +68,7 @@ impl MetalProgram {
     /// the caller stacks its buffers, so a list that is not ascending would pair a
     /// buffer with the wrong parameter.
     pub fn load(dev: Arc<MetalDevice>, bytes: &[u8], name: &str, abi: &[AbiParamDescriptor]) -> Result<Self> {
+        crate::device::reject_tensor_maps(abi, "Metal")?;
         let ascending = abi.windows(2).all(|pair| pair[0].slot < pair[1].slot);
         if !ascending || abi.len() > MAX_BUFFER_BINDINGS {
             return Err(Error::ProgramAbiMismatch {
@@ -165,7 +166,7 @@ impl MetalProgram {
             pipeline,
             abi: abi.to_vec(),
             buf_count: abi.iter().filter(|param| param.is_storage()).count(),
-            var_count: abi.iter().filter(|param| !param.is_storage()).count(),
+            var_count: abi.iter().filter(|param| param.is_scalar()).count(),
             max_total_threads,
             thread_execution_width,
             static_threadgroup_memory,

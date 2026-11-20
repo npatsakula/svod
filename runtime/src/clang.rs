@@ -555,7 +555,7 @@ mod dlopen_impl {
                 *func as *const ()
             };
 
-            let cif = KernelCif::from_abi(abi);
+            let cif = KernelCif::from_abi(abi)?;
             tracing::debug!(kernel.name = %name, "Clang kernel compiled and loaded (dlopen)");
 
             Ok(Self { _lib: lib, fn_ptr, name: name.to_string(), var_names, cif, _tmp_dir: tmp_dir })

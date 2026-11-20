@@ -2,19 +2,20 @@
 //! projection biases.
 //!
 //! The checkpoint's `q_proj`/`k_proj`/`v_proj` read the same input, so they are
-//! stacked into one `[(H + 2·Hkv)·Dh, D]` weight at load and split after a
-//! single GEMM; the state dict keeps the published three-key layout. Heads are
-//! kept sequence-major, `[B, L, H, Dh]`: the layout the op layer's heads and
-//! attention ops produce and consume, so the head merge is a plain reshape.
+//! stacked into one `[(H + 2·Hkv)·Dh, D]` weight at load; the state dict keeps
+//! the published three-key layout. The single GEMM norms and rotates `q` and
+//! `k` as it stores them and attention reads the three in place; heads are
+//! sequence-major, `[B, L, H, Dh]`, so the head merge is a plain reshape.
 
 use svod_ir::SInt;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Layer, Module, RmsNorm, StateDict, get_tensor, prefixed};
-use svod_tk::ops::{self, Attn, Qkv};
+use svod_tk::ops::{self, Attn, Qkv, Rotary};
 
 use crate::init::fan_in_uniform;
 
 use super::error::Result;
+use super::model::gather_tokens;
 
 #[derive(Clone)]
 pub struct Qwen3Attention {
@@ -26,6 +27,13 @@ pub struct Qwen3Attention {
     pub o_proj_weight: Tensor,
     pub q_norm: RmsNorm,
     pub k_norm: RmsNorm,
+    /// `q_norm`'s weight a query head over `k_norm`'s a key head, `[(H + Hkv)·Dh]`.
+    head_norm: Tensor,
+}
+
+/// The norm weight of each normed column of the fused projection.
+fn head_norm(q: &RmsNorm, k: &RmsNorm, heads: usize, kv_heads: usize) -> svod_tensor::error::Result<Tensor> {
+    Ok(Tensor::cat(&[&q.weight.repeat(&[heads.into()])?, &k.weight.repeat(&[kv_heads.into()])?], 0)?.contiguous())
 }
 
 impl Qwen3Attention {
@@ -38,14 +46,17 @@ impl Qwen3Attention {
         dtype: svod_dtype::DType,
     ) -> Self {
         let qkv_rows = (num_heads + 2 * num_kv_heads) * head_dim;
+        let (q_norm, k_norm) =
+            (RmsNorm::with_dims(head_dim, eps, dtype.clone()), RmsNorm::with_dims(head_dim, eps, dtype.clone()));
         Self {
             num_heads,
             num_kv_heads,
             head_dim,
             qkv_weight: fan_in_uniform(&[qkv_rows, hidden_size], hidden_size, dtype.clone()),
             o_proj_weight: fan_in_uniform(&[hidden_size, num_heads * head_dim], num_heads * head_dim, dtype.clone()),
-            q_norm: RmsNorm::with_dims(head_dim, eps, dtype.clone()),
-            k_norm: RmsNorm::with_dims(head_dim, eps, dtype),
+            head_norm: head_norm(&q_norm, &k_norm, num_heads, num_kv_heads).expect("norm weights of one size"),
+            q_norm,
+            k_norm,
         }
     }
 
@@ -73,12 +84,40 @@ impl Qwen3Attention {
         rope: &(Tensor, Tensor),
         seg_start: Option<&Tensor>,
     ) -> Result<Tensor> {
-        let (b, l) = (x.dim(0)?, x.dim(1)?);
-        let qkv = ops::linear(x, &self.qkv_weight, ops::Linear::default())?;
-        let (q, k, v) = self.prologue(&qkv, rope)?;
-        let attn = ops::attention(&q, &k, &v, Attn { causal: true, seg_start, ..Attn::default() })?;
-        let attn = attn.try_reshape([b, l, SInt::Const(self.num_heads * self.head_dim)])?;
+        let attn = self.mix(x, rope, seg_start)?;
         Ok(ops::linear(&attn, &self.o_proj_weight, ops::Linear { residual, ..Default::default() })?)
+    }
+
+    /// [`Self::forward_packed`] for the tokens at `at` `(B, S)` alone,
+    /// `(B, S, D)`: every token is attended to, but only those are projected.
+    pub(crate) fn forward_at(
+        &self,
+        x: &Tensor,
+        residual: &Tensor,
+        rope: &(Tensor, Tensor),
+        seg_start: Option<&Tensor>,
+        at: &Tensor,
+    ) -> Result<Tensor> {
+        let attn = gather_tokens(&self.mix(x, rope, seg_start)?, at)?;
+        let residual = gather_tokens(residual, at)?;
+        Ok(ops::linear(&attn, &self.o_proj_weight, ops::Linear { residual: Some(&residual), ..Default::default() })?)
+    }
+
+    /// The heads' mixed values before `o_proj`, `(B, L, H·Dh)`.
+    fn mix(&self, x: &Tensor, rope: &(Tensor, Tensor), seg_start: Option<&Tensor>) -> Result<Tensor> {
+        let (b, l) = (x.dim(0)?, x.dim(1)?);
+        let opts = Attn { causal: true, seg_start, ..Attn::default() };
+        let attn = if self.q_norm.eps == self.k_norm.eps {
+            let (heads, norm) = (self.num_heads + self.num_kv_heads, Some((&self.head_norm, self.q_norm.eps)));
+            let rope = Rotary { cos: &rope.0, sin: &rope.1, heads, head_dim: self.head_dim, norm };
+            let qkv = ops::linear(x, &self.qkv_weight, ops::Linear { rope: Some(rope), ..Default::default() })?;
+            ops::attention_packed(&qkv, self.num_heads, self.num_kv_heads, opts)?
+        } else {
+            let qkv = ops::linear(x, &self.qkv_weight, ops::Linear::default())?;
+            let (q, k, v) = self.prologue(&qkv, rope)?;
+            ops::attention(&q, &k, &v, opts)?
+        };
+        Ok(attn.try_reshape([b, l, SInt::Const(self.num_heads * self.head_dim)])?)
     }
 
     /// The fused GEMM output `[B, L, (H + 2·Hkv)·Dh]` → the three sequence-major
@@ -135,6 +174,8 @@ impl Module for Qwen3Attention {
         self.qkv_weight.realize()?;
         self.o_proj_weight = get_tensor(sd, &prefixed(prefix, "o_proj.weight"))?;
         self.q_norm.load_state_dict(sd, &prefixed(prefix, "q_norm"))?;
-        self.k_norm.load_state_dict(sd, &prefixed(prefix, "k_norm"))
+        self.k_norm.load_state_dict(sd, &prefixed(prefix, "k_norm"))?;
+        self.head_norm = head_norm(&self.q_norm, &self.k_norm, self.num_heads, self.num_kv_heads)?;
+        self.head_norm.realize()
     }
 }

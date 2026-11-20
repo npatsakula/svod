@@ -31,7 +31,8 @@ sidebar_label: 可移植性
 
 | 项目 | 状态 |
 |---|---|
-| Hopper TMA、mbarrier、warp 专用化生产者 | 未开始；GEMM 和注意力运行由 `cp.async` 供数的 `wgmma` |
+| Hopper TMA、mbarrier | GEMM 和注意力的环在槽屏障上通过 TMA 填充（`Schedule::Bulk`，作为 `cp.async` 环的孪生配置计时） |
+| Hopper warp 专用化生产者 | 未开始；填充由消费线程发出 |
 | Blackwell `tcgen05`、张量内存 | 未开始；sm_120 走 sm_80 路径 |
 | CDNA 上 GEMM 的 MFMA 32×32、`buffer_load … lds` | 未开始；注意力以 `Core::Wide` 运行 32×32×8 MFMA |
 | CDNA 之外的双工作组乒乓 | 只有在矩阵核心与向量单元并行运行、且一个 lane 的寄存器文件容纳得下两个工作组的累加器的地方（CDNA），`Target::crews` 才为 2 |

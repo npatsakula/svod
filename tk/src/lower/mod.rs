@@ -16,6 +16,7 @@ use crate::ir::*;
 use crate::layouts;
 use crate::schedule;
 
+pub mod bulk;
 pub mod emit;
 pub mod listing;
 mod scopes;
@@ -70,12 +71,14 @@ pub struct Lowering {
     /// rows are warpgroups of four warps, shared operands are read through
     /// descriptors (over the swizzled rows) and never loaded into registers.
     pub core: Core,
+    /// Stamp the statements' cycles into the program's last parameter ([`crate::trace`]).
+    pub trace: bool,
 }
 
 impl Lowering {
     /// `device`'s warp-level core.
     pub fn new(device: &Device) -> Self {
-        Self { device: device.clone(), core: Core::Warp }
+        Self { device: device.clone(), core: Core::Warp, trace: false }
     }
 }
 
@@ -107,7 +110,7 @@ pub fn lower(mut prog: Program, lowering: &Lowering, params: Vec<Arc<UOp>>, devi
     materialize_operands(&mut prog, lowering.core);
     sync::insert_barriers(&mut prog)?;
     let target = &lowering.device.target;
-    let prog = schedule::expand(prog, target.fill, lowering.core, target.sync.split_barrier);
+    let prog = schedule::expand(prog, target.fill, lowering.core, target.sync);
     let laid = layouts::infer(prog, &lowering.device, lowering.core).context(LayoutSnafu)?;
     let (program, linear, marks) = emit::emit(&laid, lowering, params, device)?;
     Ok(Lowered { program, linear, tile: laid, marks })

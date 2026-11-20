@@ -1078,7 +1078,7 @@ fn nearest_body<'k, T: MmaIn>(k: &mut Kernel<'k>, spec: &Admitted<NearestSpec>) 
             let c_g = k.at(c_view, start.clone(), 0);
             let x_chunk = |k: &mut Kernel<'k>, _: Sc<'k>, col: Sc<'k>| k.at(x_view, 0, col);
             let chunks = d.div_ceil(depth);
-            let [dot] = mainloop(k, Shape::new(bq, depth), &x_chunk, [c_g], chunks, cfg.schedule, depth, None, 1);
+            let ([dot], _) = mainloop(k, Shape::new(bq, depth), &x_chunk, [c_g], chunks, cfg.schedule, depth, None, 1);
             let dot = T::widened(k, dot);
             folded(k, dot, start, carried)
         }),

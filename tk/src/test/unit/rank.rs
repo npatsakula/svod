@@ -44,9 +44,11 @@ fn store(dir: &std::path::Path, ns: impl Fn(usize) -> u64) -> Planner {
     let mut lines: Vec<String> = guessed
         .fields()
         .into_iter()
-        .map(|(name, value)| format!("value|probe:{name}|sm_86-28sm|Float16|0|0|0|0 {}", (*value * 1e6) as u64))
+        .map(|(name, value)| {
+            format!("value|probe:{name}|sm_86-28sm-rtx-3060|Float16|0|0|0|0 {}", (*value * 1e6) as u64)
+        })
         .collect();
-    write_store(dir, "sm_86-28sm", FORMAT, &lines);
+    write_store(dir, "sm_86-28sm-rtx-3060", FORMAT, &lines);
     let measured = crate::probe::stored(dir, &target).expect("the file's costs");
     let planner = Planner::measured(target.clone(), measured).expect("an SM count");
     let ranked = planner.gemm_ranked(1, 512, 512, 512, &Epilogue::DEFAULT);
@@ -68,7 +70,7 @@ fn store(dir: &std::path::Path, ns: impl Fn(usize) -> u64) -> Planner {
         keyed(" screened", &admitted).line(Kind::Choice, 1),
         Entry::Choice(timed.into()).render()
     ));
-    write_store(dir, "sm_86-28sm", FORMAT, &lines);
+    write_store(dir, "sm_86-28sm-rtx-3060", FORMAT, &lines);
     planner
 }
 
@@ -114,13 +116,13 @@ fn a_store_replays_through_the_op_layers_keys(ns: fn(f64) -> u64) {
 fn a_line_no_ranking_makes_replays_from_its_own_configs() {
     let dir = Scratch::new("rank-drift");
     let planner = store(&dir, |at| 100 + at as u64);
-    let file = TuneStore::at(Some(dir.to_path_buf())).file("sm_86-28sm").expect("a file");
+    let file = TuneStore::at(Some(dir.to_path_buf())).file("sm_86-28sm-rtx-3060").expect("a file");
     let text = std::fs::read_to_string(&file).expect("read");
     let ranked = planner.gemm_ranked(1, 512, 512, 512, &Epilogue::DEFAULT);
     let drifted: Vec<GemmCfg> = representatives(&ranked).into_iter().skip(1).take(4).collect();
     let made = |key: u64| {
         format!(
-            "choice|linear|sm_86-28sm|BFloat16|1x512x512x512|{key:016x}|0|0 {}\n",
+            "choice|linear|sm_86-28sm-rtx-3060|BFloat16|1x512x512x512|{key:016x}|0|0 {}\n",
             (0..drifted.len())
                 .map(|i| format!("{}:{} {}", i, drifted[i].code(), 400 + 10 * i))
                 .collect::<Vec<_>>()

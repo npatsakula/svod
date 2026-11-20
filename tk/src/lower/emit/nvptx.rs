@@ -91,6 +91,26 @@ impl Emit<'_> {
         }
     }
 
+    /// Whether anything but a bulk copy writes a shared allocation one of
+    /// `operands` is read from: what the generic proxy writes, a product
+    /// reads past a proxy fence; a bulk copy's bytes are the async proxy's.
+    /// Every statement is matched by name, so a new one that writes shared
+    /// memory says which proxy it writes through.
+    fn generic_writes(&self, operands: &[ValId]) -> bool {
+        let alloc = |v: ValId| match self.value(v).place {
+            Place::Smem { alloc, .. } => Some(alloc),
+            _ => None,
+        };
+        let read: Vec<SmemId> = operands.iter().filter_map(|&v| alloc(v)).collect();
+        let reads = |v: &ValId| alloc(*v).is_some_and(|a| read.contains(&a));
+        self.prog.walk().any(|(_, stmt)| match stmt {
+            Stmt::Copy { mode: CopyMode::Bulk { .. }, .. } => false,
+            Stmt::Copy { dst, .. } | Stmt::Let { dst, .. } => reads(dst),
+            Stmt::If { results, .. } => results.iter().any(|(dst, ..)| reads(dst)),
+            Stmt::Loop(_) | Stmt::Warps { .. } | Stmt::Sync(_) | Stmt::Pipeline(_) => false,
+        })
+    }
+
     /// A product on the warpgroup atom: per instruction column block, one
     /// `Wmma` over the whole K chain, its shared operands as the descriptors
     /// of this warp's group rows (and the block's columns of `B`) at every
@@ -184,7 +204,7 @@ impl Emit<'_> {
             gather(describe(self, a, rows, true)?)
         };
         let meta = WmmaMetadata {
-            name: wgmma::name(from_registers, !b_t, !self.async_products),
+            name: wgmma::name(from_registers, !b_t, !self.async_products, self.generic_writes(&[a, b])),
             dims: (n_atom, wgmma::M, k),
             dtype_in: DType::Scalar(va.dtype),
             dtype_out: DType::Scalar(vd.dtype),
@@ -204,6 +224,26 @@ impl Emit<'_> {
         }
         Ok(())
     }
+}
+
+/// An f32 `2^x` as the hardware instruction alone (`ex2.approx.ftz.f32`).
+pub(super) fn exp2_f32(x: &Arc<UOp>) -> Arc<UOp> {
+    UOp::custom(
+        smallvec![x.clone()],
+        "declare float @llvm.nvvm.ex2.approx.ftz.f(float)\ncall float @llvm.nvvm.ex2.approx.ftz.f(float {0})"
+            .to_string(),
+        DType::Float32,
+    )
+}
+
+/// An f32 `x / y` as the hardware's approximate quotient (`div.approx.f32`).
+pub(super) fn div_f32(x: &Arc<UOp>, y: &Arc<UOp>) -> Arc<UOp> {
+    UOp::custom(
+        smallvec![x.clone(), y.clone()],
+        "declare float @llvm.nvvm.div.approx.f(float, float)\ncall float @llvm.nvvm.div.approx.f(float {0}, float {1})"
+            .to_string(),
+        DType::Float32,
+    )
 }
 
 /// A warp's own barrier over its shared accesses (`bar.warp.sync`), after `last`.

@@ -4,7 +4,7 @@ use svod_ir::{BinaryOp, UOp};
 
 use super::*;
 use crate::llvm::common::ldt;
-use crate::llvm::nvptx::ops::tests::{SM86, assert_ptx_compiles, render_nvptx_linearized};
+use crate::llvm::nvptx::ops::tests::{SM86, SM90, assert_ptx_compiles, render_nvptx_linearized};
 use crate::llvm::nvptx::shfl_idx;
 
 fn lane() -> Arc<UOp> {
@@ -279,5 +279,78 @@ fn ld_global_cg_16_loads_four_words_at_l2() {
     assert_eq!(extracted, 4, "{}", rendered.code);
     if let Some(ptx) = assert_ptx_compiles(&rendered.code, SM86) {
         assert!(ptx.contains("ld.global.cg.v4.u32"), "{ptx}");
+    }
+}
+
+/// A slot barrier end to end on Hopper: initialized, arrived at with the
+/// bytes its fill moves, and waited for by parity in one retry loop, each on
+/// the barrier object's shared address.
+#[test]
+fn a_slot_barrier_compiles_to_ptx() {
+    let l = lane();
+    let bars = UOp::buffer(0, 4, DType::UInt64, AddrSpace::Local, None);
+    let slot = UOp::native_const(1i32);
+    let init = mbarrier_init(&shared_at(&bars, slot.clone()), 1);
+    let bars = bars.after(smallvec![init]);
+    let arrive = mbarrier_arrive_expect(&shared_at(&bars, slot.clone()), 4096);
+    let bars = bars.after(smallvec![arrive]);
+    let parity = UOp::alu(BinaryOp::And, l.clone(), UOp::native_const(1i32)).cast(DType::Int32);
+    let wait = mbarrier_wait(&shared_at(&bars, slot), &parity);
+    let sink = UOp::sink(vec![global_at(1, DType::Int32, l.clone()).store(l).after(smallvec![wait])]);
+
+    let rendered = render_nvptx_linearized(&sink, SM90, "nvptx_slot_barrier");
+    for needle in [
+        "call void @llvm.nvvm.mbarrier.init.shared(ptr addrspace(3) %",
+        ", i32 1)",
+        "call i64 @llvm.nvvm.mbarrier.arrive.expect.tx.scope.cta.space.cta(ptr addrspace(3) %",
+        ", i32 4096)",
+        "WAIT: mbarrier.try_wait.parity.shared::cta.b64 p, [$0], $1;\\0A@!p bra WAIT;",
+        "\"r,r,~{memory}\"(i32 %",
+    ] {
+        assert!(rendered.code.contains(needle), "missing {needle}:\n{}", rendered.code);
+    }
+    let Some(ptx) = assert_ptx_compiles(&rendered.code, SM90) else { return };
+    for needle in [
+        "mbarrier.init.shared.b64",
+        "mbarrier.arrive.expect_tx.shared.b64",
+        "mbarrier.try_wait.parity.shared::cta.b64",
+        "bra WAIT",
+    ] {
+        assert!(ptx.contains(needle), "missing {needle}:\n{ptx}");
+    }
+}
+
+/// One lane stores a shared tile through a tensor map in bulk: the fence
+/// over what the generic proxy wrote there, the copy, and its group's wait.
+#[test]
+fn a_bulk_store_compiles_to_ptx() {
+    let l = lane();
+    let tile = UOp::buffer(0, 256, DType::BFloat16, AddrSpace::Local, None);
+    let map = svod_ir::TensorMap::new(
+        1,
+        svod_dtype::ScalarDType::BFloat16,
+        [16, 16],
+        [16, 16],
+        svod_ir::TensorMapSwizzle::None,
+    );
+    let map = UOp::tensor_map_param(2, map.unwrap());
+    let from = shared_at(&tile, UOp::native_const(0i32));
+    let zero = UOp::native_const(0i32);
+    let fence = bulk_store_fence(&from);
+    let from = shared_at(&tile.after(smallvec![fence]), UOp::native_const(0i32));
+    let store = bulk_tensor_store(&from, &map, [&zero, &zero], &global_at(1, DType::BFloat16, l));
+    let sink = UOp::sink(vec![bulk_store_wait(&store)]);
+
+    let rendered = render_nvptx_linearized(&sink, SM90, "nvptx_bulk_store");
+    for needle in [
+        "fence.proxy.async.shared::cta;",
+        "call void @llvm.nvvm.cp.async.bulk.tensor.s2g.tile.2d(ptr addrspace(3) %",
+        "cp.async.bulk.commit_group;\\0Acp.async.bulk.wait_group 0;",
+    ] {
+        assert!(rendered.code.contains(needle), "missing {needle}:\n{}", rendered.code);
+    }
+    let Some(ptx) = assert_ptx_compiles(&rendered.code, SM90) else { return };
+    for needle in ["cp.async.bulk.tensor.2d.global.shared::cta.tile", "cp.async.bulk.wait_group 0"] {
+        assert!(ptx.contains(needle), "missing {needle}:\n{ptx}");
     }
 }

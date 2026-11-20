@@ -74,17 +74,17 @@ Two guards keep a time honest:
 | What | Value |
 |---|---|
 | Directory | `$SVOD_TK_TUNE_DIR`, else `$XDG_CACHE_HOME/svod/tk_tune`, else `~/.cache/svod/tk_tune` |
-| File | One per device and crate version, e.g. `sm_86_28sm-v<crate version>.txt`, headed by its line format (`format 11`); a file of another format, or without the line, is dropped whole |
+| File | One per device and crate version, e.g. `sm_86_28sm_rtx_3060-v<crate version>.txt`, headed by its line format (`format 11`); a file of another format, or without the line, is dropped whole |
 | Line | `kind\|op\|device\|dtype\|shape\|candidates\|compiler\|programs numbers`: a `choice` holds the candidates that ran, fastest first, each `index:code ns`, `code` the config's own text, so a line replays without its ranking (a candidate whose programs emit what another's do — an unrolling the schedule folds away — is recorded at its twin's ns, the kernel the two share); a `value` a measured number; an `admitted` the `index:code` of each config admission kept; a `first` the `index:code` of the first clean config |
-| Key | `tune::TuneKey { op, device, dtype, shape, candidates, compiler }`, where `device` is arch and SM count (`sm_86-28sm`) and `compiler` digests the device's compiler (`tune::compiler`) |
+| Key | `tune::TuneKey { op, device, dtype, shape, candidates, compiler }`, where `device` is arch, SM count and, where the driver names the card, its model (`sm_86-28sm-rtx-3060`, `sm_90-132sm-h200-nvl`: an H200 keeps a store apart from an H100 SXM's) and `compiler` digests the device's compiler (`tune::compiler`) |
 
 The shape of a GEMM choice (shape `[batch, m, n, k]`, its codes ending in the raster and the
 tail split, `~` for none) and of a cost probe's value (femtoseconds per unit); the digests and
 numbers are placeholders:
 
 ```text
-choice|linear|sm_86-28sm|BFloat16|1x4096x4096x4096|<candidates>|<compiler>|<programs> 0:w,128,256,64,2,4,r3u,g8,~ <ns> 3:w,128,128,32,2,2,r3u,g8,~ <ns>
-value|probe:cached_1m|sm_86-28sm|Int32||<candidates>|<compiler>|<programs> <fs>
+choice|linear|sm_86-28sm-rtx-3060|BFloat16|1x4096x4096x4096|<candidates>|<compiler>|<programs> 0:w,128,256,64,2,4,r3u,g8,~ <ns> 3:w,128,128,32,2,2,r3u,g8,~ <ns>
+value|probe:cached_1m|sm_86-28sm-rtx-3060|Int32||<candidates>|<compiler>|<programs> <fs>
 ```
 
 The `programs` field fingerprints the kernels the candidates emit: the lowered program and the
@@ -115,7 +115,7 @@ at once are those its shared memory, registers and wave slots fit, and at most
 `Occupancy::blocks`, the hardware's limit whatever their resources.
 
 Host tests declare costs instead: `costs()`, the guessed fixture, and `sm86_costs()`,
-`gfx1201_costs()`, `gfx942_costs()` and `gfx1151_costs()` in `test/unit/mod.rs`, each copied
+`h200_costs()`, `gfx1201_costs()`, `gfx942_costs()` and `gfx1151_costs()` in `test/unit/mod.rs`, each copied
 from that device's probes. For a card this machine has no device for, `Target::offline` or `Target::card`
 gives the target, and `probe::stored` reads the costs from a tune store copied from that card;
 without one, `probe::GUESSED` stands in and the ranking is a guess. The
@@ -157,11 +157,20 @@ SVOD_DEVICE=CUDA cargo run --release -p svod-tk --example tk_bench -- gemm --top
 | `raster [--shape MxNxK,…]` | Every raster order of the tuner's GEMM pick and of the planner's first config against the default order, beside the cost model's price of each |
 | `fit [--only LABEL,…] [--picks]` | The cost model against the device: the predicted and measured time of each ranked config on a few GEMM, attention and nearest shapes, the tuner's pick and the tuner's wall time; `--picks` times the picks alone |
 | `trips` | The pipeline-trip probes at 1 to 48 blocks per SM |
-| `pin --cfg BMxBNxBK:S:WRxWC[:rolled],… [--shape MxNxK,…] [--residual] [--gated]` | Each pinned GEMM config's time (Whisper's fc2 by default) beside the model's price and that price with the memory latency, the lone trip or the matrix step zeroed: what each term holds of the config's time |
+| `pin --cfg BMxBNxBK:S:WRxWC[:rolled][:group][:bulk][:staged|:flushed],… [--shape MxNxK,…] [--residual] [--gated]` | Each pinned GEMM config's time (Whisper's fc2 by default) beside the model's price and that price with the memory latency, the lone trip or the matrix step zeroed: what each term holds of the config's time |
 | `sqtt gemm M N K [--cfg I\|tuned\|BMxBNxBK:S:WRxWC[:rolled],…] [--top N] [--out DIR] [--json] [--attribute]` | AMD RDNA3/RDNA4 only: each config's thread trace report (see [Thread trace](#thread-trace)); `sqtt --load DIR` reads a saved trace again |
 
 `--metric` takes `squared-l2`, `l2` or `neg-dot`. Every command times as the tuner does: a config's
 kernels together (a split's merge, a tail's partials) and an op's plan alike.
+
+### Reference ceilings
+
+`scripts/tk_ceilings` measures what the vendors' kernels reach on a card, at `tk_bench`'s shapes
+and flop counts and timed as the tuner times (a kernel's device time alone): `cublaslt_bench.cu`
+runs every algorithm cuBLASLt's heuristic offers over the GEMM's operand layout, and
+`attn_bench.py` runs FlashAttention-3, cuDNN's attention and ThunderKittens' on the attention's.
+The share of them `tk_bench gemm` and `tk_bench attention` reach is how far a card's kernels
+stand from its peak.
 
 ### Thread trace
 

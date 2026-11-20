@@ -42,7 +42,7 @@ model code ──► svod_tk::ops          always a Tensor; picks a kernel and c
 | 目标 | 矩阵核心 | 填充方式 |
 |---|---|---|
 | CUDA sm_80+ | `mma.sync` m16n8k16、`ldmatrix` | `cp.async` |
-| CUDA sm_90 | 增加 `wgmma`（GEMM 与注意力） | `cp.async` |
+| CUDA sm_90 | 增加 `wgmma`（GEMM 与注意力） | `cp.async`；GEMM 另有 TMA |
 | AMD RDNA4 | WMMA 16×16×16 | 寄存器，1–2 个槽位 |
 | AMD RDNA3 / 3.5 | WMMA 16×16×16 | 寄存器，1–2 个槽位 |
 | AMD CDNA3 / 4 | MFMA 16×16×16，注意力另有 32×32×8；wave64 | 寄存器，两个工作组乒乓交替 |
@@ -51,7 +51,7 @@ model code ──► svod_tk::ops          always a Tensor; picks a kernel and c
 只有当 `targets::families_match_the_interpreter_on_the_device` 在某个目标上通过后，该目标才算已测量。要了解某张卡能达到的性能，请在其上运行 `cargo run --release -p svod-tk --example tk_bench` 的 `gemm` 和 `attention` 命令（[调优](./tuning#benchmarks)）：它们以 TFLOP/s 打印调优器的选择。
 
 :::note[本版本未包含]
-Hopper TMA 与 mbarrier 生产者（sm_90 运行由 `cp.async` 供数的 `wgmma`）、Blackwell `tcgen05`、GEMM 的 32×32 MFMA、Apple 内核、fp8、最近邻搜索之外的 int8、注意力反向传播，以及卷积的图像暂存形式。参见[可移植性](./portability#not-in-this-release)。
+Hopper warp 专用化生产者（sm_90 运行由 `cp.async` 供数的 `wgmma`，GEMM 还可由消费线程通过 TMA 供数）、Blackwell `tcgen05`、GEMM 的 32×32 MFMA、Apple 内核、fp8、最近邻搜索之外的 int8、注意力反向传播，以及卷积的图像暂存形式。参见[可移植性](./portability#not-in-this-release)。
 :::
 
 ## 阅读顺序 {#reading-order}

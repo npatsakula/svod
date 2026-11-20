@@ -18,7 +18,7 @@ pub mod smem;
 pub mod wgmma;
 pub mod wmma;
 
-pub use ops::{ShflMode, globaltimer, render_uop, shfl, shfl_bfly, shfl_down, shfl_idx, shfl_up};
+pub use ops::{ShflMode, clock64, globaltimer, red_add, render_uop, shfl, shfl_bfly, shfl_down, shfl_idx, shfl_up};
 
 /// The PTX ISA the emitted module declares, hence the oldest driver that
 /// JITs it: 7.8 (CUDA 11.8 / R520) carries every `mma.sync` shape the

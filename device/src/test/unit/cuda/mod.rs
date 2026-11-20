@@ -201,6 +201,65 @@ $L_work:
 }
 "#;
 
+/// `tma_tile(src, map, dst)`: one 128-thread block TMA-loads the 16x8 f32
+/// box at column 16, row 8 of the tensor map over `src` (64 columns, swizzle
+/// none, so the box lands row-major) into shared memory, completing on an
+/// mbarrier, and every thread copies one element of it to `dst[tid]`. `src`
+/// itself is only the map's storage.
+pub(crate) const TMA_PTX: &str = r#"
+.version 8.4
+.target sm_90a
+.address_size 64
+
+.visible .entry tma_tile(
+	.param .u64 tma_tile_param_0,
+	.param .align 64 .b8 tma_tile_param_1[128],
+	.param .u64 tma_tile_param_2
+)
+{
+	.reg .pred 	%p<3>;
+	.reg .b32 	%r<5>;
+	.reg .b64 	%rd<9>;
+	.shared .align 128 .b8 tile[512];
+	.shared .align 8 .b64 bar;
+
+	mov.u32 	%r1, %tid.x;
+	setp.eq.u32 	%p1, %r1, 0;
+	@%p1 mbarrier.init.shared::cta.b64 	[bar], 1;
+	@%p1 fence.proxy.async.shared::cta;
+	bar.sync 	0;
+	@!%p1 bra 	$L_wait;
+	mov.b64 	%rd1, tma_tile_param_1;
+	cvta.param.u64 	%rd2, %rd1;
+	mov.b32 	%r2, 16;
+	mov.b32 	%r3, 8;
+	mbarrier.arrive.expect_tx.shared::cta.b64 	_, [bar], 512;
+	cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [tile], [%rd2, {%r2, %r3}], [bar];
+$L_wait:
+	mbarrier.try_wait.parity.shared::cta.b64 	%p2, [bar], 0;
+	@!%p2 bra 	$L_wait;
+	ld.param.u64 	%rd3, [tma_tile_param_2];
+	cvta.to.global.u64 	%rd4, %rd3;
+	mul.wide.u32 	%rd5, %r1, 4;
+	mov.u64 	%rd6, tile;
+	add.s64 	%rd7, %rd6, %rd5;
+	ld.shared.b32 	%r4, [%rd7];
+	add.s64 	%rd8, %rd4, %rd5;
+	st.global.b32 	[%rd8], %r4;
+	ret;
+}
+"#;
+
+/// The map `tma_tile` loads through: 32 rows of 64 f32 over slot 0, 16x8 box.
+pub(crate) fn tma_tile_abi() -> Vec<AbiParamDescriptor> {
+    vec![storage(0), super::hcq::tensor_map(1, 0), storage(2)]
+}
+
+/// What `tma_tile` writes for `src`: its 16x8 box at column 16, row 8.
+pub(crate) fn tma_tile_of(src: &[f32]) -> Vec<f32> {
+    (0..128).map(|i| src[(8 + i / 16) * 64 + 16 + i % 16]).collect()
+}
+
 pub(crate) fn storage(slot: usize) -> AbiParamDescriptor {
     AbiParamDescriptor { slot, kind: AbiParamKind::Storage(AddrSpace::Global), dtype: DType::Float32, name: None }
 }

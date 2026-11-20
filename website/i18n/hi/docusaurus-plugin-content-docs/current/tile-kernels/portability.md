@@ -51,7 +51,8 @@ slots पर। यही path CUDA पर एक device test में चल�
 
 | चीज़ | स्थिति |
 |---|---|
-| Hopper TMA, mbarrier, warp-specialized producers | शुरू नहीं हुआ; GEMM और attention `cp.async` से भरे जाने वाले `wgmma` चलाते हैं |
+| Hopper TMA, mbarrier | GEMM और attention rings slot barriers पर TMA से भरते हैं (`Schedule::Bulk`, `cp.async` ring के twin के रूप में मापा जाता है) |
+| Hopper warp-specialized producers | शुरू नहीं हुआ; fills consumer threads ही जारी करते हैं |
 | Blackwell `tcgen05`, tensor memory | शुरू नहीं हुआ; sm_120 sm_80 path चलाता है |
 | GEMM के लिए CDNA MFMA 32×32, `buffer_load … lds` | शुरू नहीं हुआ; attention 32×32×8 MFMA को `Core::Wide` के रूप में चलाता है |
 | CDNA के बाहर two-crew ping-pong | `Target::crews` सिर्फ़ वहीं 2 है जहाँ matrix core vector units के बगल में चलता है और एक lane की file दो crews के accumulators रखती है (CDNA) |

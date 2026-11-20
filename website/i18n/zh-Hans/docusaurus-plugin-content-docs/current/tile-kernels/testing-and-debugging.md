@@ -73,7 +73,7 @@ cargo run -p svod-tk --release --example tk_dump -- --card h100-pcie --op gemm -
 cargo run -p svod-tk --release --example tk_dump -- --arch gfx942 --op attention --shape 8x16x1024x128 --causal --store DIR
 ```
 
-`--card` 接受 `atoms::CARDS` 中的名称（`rtx3060`、`h100-pcie`、`h100-sxm`、`rtx5070`、`rtx5090`、`mi300x`、`mi355x`、`rx9070xt`、`strix-halo`）；`--arch` 接受一个架构，配合 `--sms`/`--xcds` 使用，否则取列出的第一张卡的值。`--store` 是从该卡拷贝来的调优存储目录，其探针行为排序定价；没有它时则用猜测的代价。`--cfg N` 发射排序中第 N 个配置，`--out DIR` 指定输出目录（`tk_dump`）。
+`--card` 接受 `atoms::CARDS` 中的名称（`rtx3060`、`h100-pcie`、`h100-sxm`、`h200-sxm`、`h200-nvl`、`rtx5070`、`rtx5090`、`mi300x`、`mi355x`、`rx9070xt`、`strix-halo`）；`--arch` 接受一个架构，配合 `--sms`/`--xcds` 使用，否则取列出的第一张卡的值。`--store` 是从该卡拷贝来的调优存储目录，其探针行为排序定价；没有它时则用猜测的代价。`--cfg N` 发射排序中第 N 个配置，`--out DIR` 指定输出目录（`tk_dump`）。
 
 `--op` 接受 `gemm`（`--shape MxNxK`）、`attention`（`BxHxTxD`）、`norm`（`RxD`）、`conv`（`BxHxWxCINxCOUT`）、`heads`（`BxTxHxKVxD`）或 `nearest`（`NxMxD`、`--metric`、`--k K`），每一种都经过算子层自己的形状关卡和调优。`--cfg tuned` 发射调优器在该卡上选中的配置，从 `--store` 副本中读取且不向其写入任何内容：存储的行按算子、设备、数据类型、形状以及算子层作为键的配置列表匹配，不论写入它的是哪个编译器或哪次内核构建；转储会打印读取的每个键，或指出缺少哪一行。`--compare FILE [--fun NAME]` 把参考内核（`.cubin`、AMD 代码对象，或 SASS、PTX、AMDGCN 文本）的主循环与 tk 的主循环并排打印，二者按同一方式计数。
 

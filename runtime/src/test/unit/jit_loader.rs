@@ -18,6 +18,37 @@ fn abi(buffers: usize, vars: &[&str]) -> Vec<svod_device::device::AbiParamDescri
         .collect()
 }
 
+/// CPU kernels take no tensor map: a loaded object whose ABI carries one is
+/// refused by slot rather than called with the map as an `i32`.
+#[test]
+fn jit_loader_rejects_a_tensor_map_param() {
+    let map = svod_ir::TensorMap::new(
+        0,
+        svod_dtype::ScalarDType::Float32,
+        [64, 32],
+        [16, 8],
+        svod_ir::TensorMapSwizzle::None,
+    )
+    .unwrap();
+    let mut abi = abi(1, &[]);
+    abi.push(svod_device::device::AbiParamDescriptor {
+        slot: 1,
+        kind: svod_device::device::AbiParamKind::TensorMap(map),
+        dtype: svod_dtype::DType::Float32,
+        name: None,
+    });
+    let error = JitKernel::compile_with_abi("void k(float* restrict a) { }\n", "k", vec![], &abi)
+        .err()
+        .expect("CPU cannot pass a tensor map");
+    assert!(
+        matches!(
+            error,
+            crate::Error::Device { source: svod_device::Error::UnsupportedTensorMapParam { backend: "CPU", slot: 1 } }
+        ),
+        "{error:?}"
+    );
+}
+
 #[test]
 fn test_jit_loader_noop() {
     let kernel =

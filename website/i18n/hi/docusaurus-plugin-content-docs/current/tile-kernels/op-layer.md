@@ -40,7 +40,7 @@ pub fn chosen() -> Option<Chosen>;
 `Linear::scale` residual जोड़ने से पहले activated मान को गुणा करता है:
 `scale·act(x·wᵀ + bias) + residual`, इसलिए Conformer का half-step `x + 0.5·ffn(x)` एक ही GEMM है।
 
-`Linear::rope` `Rotary { cos, sin, heads, head_dim }` है: `x [B, T, K]` के लिए output के पहले
+`Linear::rope` `Rotary { cos, sin, heads, head_dim, norm }` (`norm`, `[heads·head_dim]` का weight और `eps`, हर घुमाए जाने वाले head को घुमाने से पहले RMS-normalize करता है, उस tile पर जहाँ head की row एक ही warp में हो; tables `[B, T, 1, head_dim/2]`, token के अनुसार, भी हो सकती हैं, static batch में) है: `x [B, T, K]` के लिए output के पहले
 `heads` heads, हर एक `head_dim` columns का, bias के बाद `[1, T, 1, head_dim/2]` की `(cos, sin)`
 tables से घुमाए जाते हैं, head के दोनों halves वैसे ही जोड़े जाते हैं जैसे `apply_rotary_emb`
 जोड़ता है। Activation, residual या scale के साथ पूरा linear graph पर चलता है। वरना, जब tables का

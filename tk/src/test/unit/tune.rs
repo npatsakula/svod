@@ -20,7 +20,7 @@ use test_case::test_case;
 use crate::atoms::{Device, sm86};
 use crate::build::BF16;
 use crate::kernels::Batch;
-use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, TailSplit, gemm};
+use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Store, TailSplit, gemm};
 use crate::tune::{self, Bench, Entry, FORMAT, Kind, Pass, ScratchPool, TuneKey, TuneStore, fingerprint};
 
 /// A host key: no device, so no compiler digest.
@@ -48,7 +48,7 @@ mod fields {
     use crate::atoms::Core;
     use crate::ir::Schedule;
     use crate::kernels::attention::{FaCfg, Forms};
-    use crate::kernels::gemm::{GemmCfg, TailSplit, TileOrder};
+    use crate::kernels::gemm::{GemmCfg, Store, TailSplit, TileOrder};
     use crate::kernels::nearest::{LaneQueue, NearestCfg, Pow2, SelectCfg, Way};
 
     fn core() -> impl Strategy<Value = Core> {
@@ -58,6 +58,7 @@ mod fields {
     fn schedule() -> impl Strategy<Value = Schedule> {
         prop_oneof![
             (1usize.., any::<bool>()).prop_map(|(d, u)| Schedule::ring(d, u)),
+            (1usize.., any::<bool>()).prop_map(|(d, u)| Schedule::bulk(d, u)),
             (1usize..).prop_map(Schedule::ping_pong)
         ]
     }
@@ -69,8 +70,18 @@ mod fields {
     pub(super) fn gemm() -> impl Strategy<Value = GemmCfg> {
         let order = (1..=TileOrder::MOST_ROWS).prop_map(|rows| TileOrder::grouped(rows).expect("a group of rows"));
         let tail = proptest::option::of((2usize..).prop_map(|split| TailSplit::new(split).expect("a split")));
-        (core(), any::<[usize; 3]>(), any::<[u32; 2]>(), schedule(), order, tail)
-            .prop_map(|(core, tile, warps, schedule, order, tail)| GemmCfg { tile, warps, core, schedule, order, tail })
+        let store = prop_oneof![Just(Store::Direct), Just(Store::Staged), Just(Store::Bulk)];
+        (core(), any::<[usize; 3]>(), any::<[u32; 2]>(), schedule(), order, tail, store).prop_map(
+            |(core, tile, warps, schedule, order, tail, store)| GemmCfg {
+                tile,
+                warps,
+                core,
+                schedule,
+                order,
+                tail,
+                store,
+            },
+        )
     }
 
     pub(super) fn attention() -> impl Strategy<Value = FaCfg> {
@@ -159,6 +170,15 @@ fn a_config_code_keeps_its_stored_form() {
     let cfg = gemm_cfg([128, 256, 64], 3, [2, 4], true);
     assert_eq!(cfg.code(), "w,128,256,64,2,4,r3u,g8,~");
     assert_eq!(GemmCfg { tail: TailSplit::new(4), ..cfg }.code(), "w,128,256,64,2,4,r3u,g8,t4");
+    // A staged store trails the code; one written before stores were coded reads as direct.
+    let staged = GemmCfg { store: Store::Staged, ..cfg };
+    assert_eq!(staged.code(), "w,128,256,64,2,4,r3u,g8,~,s");
+    assert_eq!(GemmCfg { store: Store::Bulk, ..cfg }.code(), "w,128,256,64,2,4,r3u,g8,~,sb");
+    let bulk = GemmCfg { schedule: crate::ir::Schedule::bulk(4, false), ..cfg };
+    assert_eq!(bulk.code(), "w,128,256,64,2,4,b4,g8,~");
+    assert_eq!(GemmCfg::of_code("w,128,256,64,2,4,r3u,g8,~"), Some(cfg));
+    let plain = format!("{cfg:?}");
+    assert_eq!(format!("{staged:?}"), format!("{}, store: Staged }}", plain.strip_suffix(" }").expect("a struct")));
     let cfg = NearestCfg::new(64, 64, 2);
     assert_eq!(cfg.code(), "64,64,r2,16,~,1,~,~");
     assert_eq!(NearestCfg { list: Way::Queued(Pow2::of(32)), ..cfg }.code(), "64,64,r2,16,~,1,q32,~");
@@ -448,7 +468,7 @@ fn an_unreadable_line_is_dropped_at_the_next_write() {
     let dir = Scratch::new("tune-unreadable");
     let k = key(&[3, 3, 3], &[0, 1]);
     let kept = format!("{} 42", k.line(Kind::Value, 1));
-    let stale = "gemm|sm_86-28sm|BFloat16|3x3x3|0|0|0 1 100".to_string();
+    let stale = "gemm|sm_86-28sm-rtx-3060|BFloat16|3x3x3|0|0|0 1 100".to_string();
     write_store(&dir, &k.device, FORMAT, &[stale, kept.clone(), "nonsense".into()]);
     let store = TuneStore::at(Some(dir.to_path_buf()));
     assert_eq!(store.entries(&k).len(), 1);
@@ -479,7 +499,7 @@ fn keys_are_stable(shape: &[usize], candidates: &[usize], compiler: u64, same: b
     let other = TuneKey { compiler: base.compiler ^ compiler, ..key(shape, candidates) };
     assert_eq!(base.line(Kind::Choice, 3) == other.line(Kind::Choice, 3), same);
     let line = base.line(Kind::Choice, 3);
-    assert!(line.starts_with("choice|gemm|sm_86-28sm|BFloat16|1x704x512x512|"), "{line}");
+    assert!(line.starts_with("choice|gemm|sm_86-28sm-rtx-3060|BFloat16|1x704x512x512|"), "{line}");
     assert!(line.contains(&format!("|{:016x}|", base.compiler)), "{line}");
     assert_ne!(line, base.line(Kind::Choice, 4), "the program fingerprint is part of the line");
     assert_ne!(line, base.line(Kind::Admitted, 3), "the kind is part of the line");
@@ -1132,23 +1152,6 @@ fn timed_candidates_clear_their_physical_floor() {
             _ => None,
         }
     }
-    fn target(device: &str) -> Option<crate::atoms::Target> {
-        use svod_dtype::{AmdArch, CudaArch, GpuArch};
-        let (arch, sms) = device.rsplit_once('-')?;
-        let sms = sms.strip_suffix("sm")?.parse().ok()?;
-        let arch = match AmdArch::parse(arch) {
-            Some(a) => GpuArch::Amd(a),
-            None => GpuArch::Cuda(arch.trim_end_matches('a').parse::<CudaArch>().ok()?),
-        };
-        let xcds = crate::atoms::CARDS.iter().find(|c| c.1 == arch).map_or(
-            match arch {
-                GpuArch::Amd(a) if a.is_cdna() => 8,
-                _ => 1,
-            },
-            |c| c.3,
-        );
-        Some(crate::atoms::Target::offline(arch, sms, xcds))
-    }
     fn floor(
         planner: &crate::ops::config::Planner,
         op: &str,
@@ -1237,7 +1240,7 @@ fn timed_candidates_clear_their_physical_floor() {
                     continue;
                 };
                 let planner = planners.entry(fields[2].to_string()).or_insert_with(|| {
-                    let t = target(fields[2])?;
+                    let t = crate::rank::target(fields[2])?;
                     crate::probe::stored(dir, &t).and_then(|m| crate::ops::config::Planner::measured(t, m))
                 });
                 let Some(planner) = planner else { continue };

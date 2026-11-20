@@ -49,12 +49,16 @@ the matrix product runs on the f32 accumulator, and the result is rounded once a
 | `scale` | Multiplies the activated value before the residual |
 | `residual` | `[batch·m, n]` added last |
 | `out_f32` | f32 output and residual, the accumulator stored unrounded |
-| `rope` | `Rope { heads, head_dim, seq }`: the first `heads` heads of `head_dim` columns rotated by `[seq, head_dim/2]` cos and sin tables (output row `m` at position `m % seq`), the columns after them stored as they are; with a bias alone, on a tile whose warps hold whole heads (`GemmCfg::turns`) |
+| `rope` | `Rope { heads, head_dim, seq, norm }`: the first `heads` heads of `head_dim` columns rotated by `[seq, head_dim/2]` cos and sin tables (output row `m` at position `m % seq`), the columns after them stored as they are; with a bias alone, on a tile whose warps hold whole heads (`GemmCfg::turns`); under `norm` (an `eps`) each turned head is RMS-normalized by a `[heads·head_dim]` weight first, on a tile of one warp column (`GemmCfg::carries`) |
 
-`GemmCfg { tile: [bm, bn, bk], warps: [rows, cols], core, schedule, order, tail }`. Rows
+`GemmCfg { tile: [bm, bn, bk], warps: [rows, cols], core, schedule, order, tail, store }`. Rows
 past `m` and columns past `n` are bounded views, so `m` and `n` are free. `k` must be a multiple
 of `bk`. `core: Core::Group` issues the products on `wgmma` (sm_90);
-`schedule: Schedule::ping_pong(k)` runs the two warp rows in ping-pong over one slot (CDNA). The
+`schedule: Schedule::ping_pong(k)` runs the two warp rows in ping-pong over one slot (CDNA). On
+the warpgroup core `Schedule::bulk(stages, unroll)` fills the ring by TMA and `store: Store::Staged`
+stores the output tile through the ring in 16-byte runs, `Store::Bulk` from the ring by one thread's
+TMA copies (`Kernel::flush`; a tile across the output's edge stores as staged); the tuner times each
+as a twin of the plain pipeline and none is an untuned first pick. The
 blocks walk the output tiles in groups of `order` tile rows (`gemm::TileOrder`, 8 by default,
 `TileOrder::DEFAULT`; one row is row-major, the grid's rows column-major), so blocks resident
 together read the same B tiles. The planner plans every config at the default; a config may

@@ -41,13 +41,13 @@ pub struct Qwen3Reranker {
 }
 
 impl Qwen3Reranker {
-    pub fn empty(config: Qwen3Config) -> Self {
-        let model = Qwen3Model::empty(config);
+    pub fn empty(config: Qwen3Config) -> Result<Self> {
+        let model = Qwen3Model::empty(config)?;
         let hidden = model.config.hidden_size;
         let vocab = model.config.vocab_size;
         let dtype = model.config.dtype.clone();
         let lm_head_weight = crate::init::fan_in_uniform(&[vocab, hidden], hidden, dtype);
-        Self { model, lm_head_weight, yes_loc: YES_LOC, normalize: true }
+        Ok(Self { model, lm_head_weight, yes_loc: YES_LOC, normalize: true })
     }
 
     /// Right-padded `input_ids` `(B, L)` + `lengths` `(B)` → `(B,)` relevance
@@ -90,7 +90,7 @@ impl Qwen3Reranker {
 
     pub fn from_state_dict(sd: &StateDict, config: Qwen3Config) -> Result<Self> {
         let dtype = config.dtype.clone();
-        let mut model = Self::empty(config);
+        let mut model = Self::empty(config)?;
         model.load_state_dict(&state::cast_all(sd, dtype)?, "")?;
         Ok(model)
     }

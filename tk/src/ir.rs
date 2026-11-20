@@ -520,6 +520,9 @@ pub enum CopyMode {
     /// where they are register-staged), so a register load in this mode
     /// moves bytes exactly as a fill would.
     Staged,
+    /// One thread's bulk copy of the whole tile, global → shared, completing
+    /// on `bar`, which the schedule template arrives at and waits for.
+    Bulk { bar: SlotBar },
 }
 
 /// A loop-carried register: `phi` holds `init` on entry, is assigned `next`
@@ -580,9 +583,30 @@ pub enum Schedule {
     /// operand held as k-slices `kslice` deep, the target atom's k, so a
     /// slice is one product's fragments ([`crate::schedule`]'s ping-pong).
     PingPong { kslice: NonZeroUsize },
+    /// A [`Schedule::Ring`] one thread fills a slot at a time, each fill
+    /// completing on the slot's own barrier ([`CopyMode::Bulk`]), where the
+    /// target has slot barriers and the ring leaves its products in flight;
+    /// its copies no bulk copy moves ([`crate::lower::bulk::NotBulk`]), and
+    /// all of them elsewhere, are the ring's.
+    Bulk { depth: NonZeroUsize, unroll: bool },
 }
 
 impl Schedule {
+    /// A ring of `stages` slots filled in bulk.
+    pub const fn bulk(stages: usize, unroll: bool) -> Self {
+        Self::Bulk { depth: NonZeroUsize::new(stages).expect("a ring has a slot"), unroll }
+    }
+
+    /// The ring's depth, whether its loop is unrolled and whether it fills
+    /// in bulk; `None` for two crews.
+    pub fn as_ring(self) -> Option<(usize, bool, bool)> {
+        match self {
+            Self::Ring { depth, unroll } => Some((depth.get(), unroll, false)),
+            Self::Bulk { depth, unroll } => Some((depth.get(), unroll, true)),
+            Self::PingPong { .. } => None,
+        }
+    }
+
     /// A ring of `stages` slots, which is at least one, over one crew.
     pub const fn ring(stages: usize, unroll: bool) -> Self {
         Self::Ring { depth: NonZeroUsize::new(stages).expect("a ring has a slot"), unroll }
@@ -595,14 +619,11 @@ impl Schedule {
     }
 
     pub fn stages(self) -> usize {
-        match self {
-            Self::Ring { depth, .. } => depth.get(),
-            Self::PingPong { .. } => 1,
-        }
+        self.as_ring().map_or(1, |(depth, ..)| depth)
     }
 
     pub fn unroll(self) -> bool {
-        matches!(self, Self::Ring { unroll: true, .. })
+        matches!(self.as_ring(), Some((_, true, _)))
     }
 
     pub fn crews(self) -> u32 {
@@ -612,16 +633,13 @@ impl Schedule {
     /// The trips one iteration of the steady loop runs: the ring's depth
     /// where the loop is copied once per slot, else one.
     pub fn per_iteration(self) -> usize {
-        match self {
-            Self::Ring { depth, unroll: true } => depth.get(),
-            _ => 1,
-        }
+        if self.unroll() { self.stages() } else { 1 }
     }
 
     pub fn kslice(self) -> Option<usize> {
         match self {
             Self::PingPong { kslice } => Some(kslice.get()),
-            Self::Ring { .. } => None,
+            Self::Ring { .. } | Self::Bulk { .. } => None,
         }
     }
 
@@ -629,8 +647,8 @@ impl Schedule {
     /// pipelines, erased; the crews stay.
     pub fn tile(self) -> Self {
         match self {
-            Self::Ring { .. } => Self::ring(1, false),
-            pong => pong,
+            Self::Ring { .. } | Self::Bulk { .. } => Self::ring(1, false),
+            pong @ Self::PingPong { .. } => pong,
         }
     }
 
@@ -695,6 +713,14 @@ impl From<AuthoredSync> for Sync {
     }
 }
 
+/// A ring slot's completion barrier: element `slot` of `bars`, a shared
+/// allocation of one 64-bit barrier object a slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SlotBar {
+    pub bars: SmemId,
+    pub slot: ScalarId,
+}
+
 /// Synchronization the schedule templates and the sync pass emit
 /// ([`AuthoredSync`] before the templates expand).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -732,6 +758,26 @@ pub enum Sync {
     /// crew's products so the SIMD's other wave, loading, yields its issue
     /// slots to them. Nothing where waves have no priority.
     Prio { level: u8 },
+    /// One thread of the block makes `bar` a barrier whose every phase one
+    /// arrival completes, with the bytes it expects; the block sees it past
+    /// its next block barrier. Nothing to a target without slot barriers,
+    /// as the two below.
+    SlotInit { bar: SlotBar },
+    /// One thread of the block arrives at `bar` expecting `bytes` of the
+    /// slot's fill: the phase completes once they have landed.
+    SlotArrive { bar: SlotBar, bytes: u32 },
+    /// Every thread waits for `bar`'s phase of parity `phase` (0 or 1: a
+    /// barrier's phases alternate from 0, one a fill of its slot).
+    SlotWait { bar: SlotBar, phase: ScalarId },
+    /// [`Sync::SlotInit`] of a barrier whose every phase the arrivals of
+    /// all the block's warps complete: one a consume of its slot.
+    SlotOpen { bar: SlotBar },
+    /// Every warp arrives at `bar`: it has read its slot's step.
+    SlotLeave { bar: SlotBar },
+    /// One thread of the block waits for `bar`'s phase of parity `phase`:
+    /// every warp has left the slot's step before the one it refills
+    /// for. The phase before the first is complete from the start.
+    SlotVacant { bar: SlotBar, phase: ScalarId },
 }
 
 #[derive(Clone, Debug, PartialEq)]

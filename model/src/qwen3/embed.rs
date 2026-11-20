@@ -94,64 +94,36 @@ impl Qwen3Embedder {
         Ok((embeddings, profile))
     }
 
+    /// The length bucket of each plan execution [`embed`](Self::embed) makes
+    /// for `rows`, in order.
+    pub fn buckets<R: AsRef<[u32]>>(&self, rows: &[R]) -> Vec<usize> {
+        pack(&self.lens(rows), self.max_batch).iter().map(|batch| batch.bucket).collect()
+    }
+
+    /// Compile the plan for the bucket holding `len` tokens and execute it once
+    /// on padding: prepare compiles and tunes, but the first execute still
+    /// captures the graph, makes the plan's context and leases queues. A
+    /// bucket already prepared only executes. Returns the bucket.
+    pub fn warm_up(&mut self, len: usize) -> Result<usize> {
+        let bucket = len.clamp(1, self.max_len).next_multiple_of(SEQUENCE_TILE);
+        self.execute(&[], &[], &Batch { bucket, rows: Vec::new() }, None)?;
+        Ok(bucket)
+    }
+
+    /// Each row's token count as the plans see it: truncated to `max_len`, an
+    /// empty row embedding as one pad token.
+    fn lens<R: AsRef<[u32]>>(&self, rows: &[R]) -> Vec<usize> {
+        rows.iter().map(|r| r.as_ref().len().clamp(1, self.max_len)).collect()
+    }
+
     fn run<R: AsRef<[u32]>>(&mut self, rows: &[R], mut profile: Option<&mut RunProfile>) -> Result<Vec<Vec<f32>>> {
         let rows: Vec<&[u32]> = rows.iter().map(|r| &r.as_ref()[..r.as_ref().len().min(self.max_len)]).collect();
-        // An empty row embeds as one pad token.
-        let lens: Vec<usize> = rows.iter().map(|r| r.len().max(1)).collect();
+        let lens = self.lens(&rows);
         let mut out = vec![Vec::new(); rows.len()];
         for batch in pack(&lens, self.max_batch) {
-            let (max_batch, pad_id, bucket) = (self.max_batch, self.pad_id, batch.bucket);
-            let slots = bucket / SLOT_TOKENS;
-            let jit = match self.plans.entry(bucket) {
-                std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
-                std::collections::btree_map::Entry::Vacant(e) => {
-                    let mut jit = Qwen3EmbeddingJit::new(self.model.clone());
-                    jit.prepare_with_config(
-                        InputSpec::i32(&[max_batch, bucket]),
-                        InputSpec::i32(&[max_batch, bucket]),
-                        InputSpec::i32(&[max_batch, bucket]),
-                        InputSpec::i32(&[max_batch, slots]),
-                        &PrepareConfig::device_local(),
-                    )?;
-                    e.insert(jit)
-                }
-            };
-            // Padding: pad tokens at position 0, each its own segment (a token
-            // always sees itself), pooled nowhere.
-            let mut ids = vec![pad_id; max_batch * bucket];
-            let mut positions = vec![0i32; max_batch * bucket];
-            let mut seg_start: Vec<i32> = (0..max_batch * bucket).map(|j| (j % bucket) as i32).collect();
-            let mut pool_idx = vec![0i32; max_batch * slots];
-            for (r, packed) in batch.rows.iter().enumerate() {
-                let mut cursor = r * bucket;
-                for (slot, &i) in packed.iter().enumerate() {
-                    for (j, &id) in rows[i].iter().enumerate() {
-                        ids[cursor + j] = id as i32;
-                        positions[cursor + j] = j as i32;
-                    }
-                    seg_start[cursor..cursor + lens[i]].fill((cursor % bucket) as i32);
-                    cursor += lens[i];
-                    pool_idx[r * slots + slot] = ((cursor - 1) % bucket) as i32;
-                }
-            }
-            let write = |input: crate::jit::Result<crate::jit::rt::HostWrite<'_, i32>>, data: &[i32]| {
-                input?.copy_from(data).map_err(crate::jit::JitError::from)
-            };
-            write(jit.input_ids_host_write::<i32>(), &ids)?;
-            write(jit.positions_host_write::<i32>(), &positions)?;
-            write(jit.seg_start_host_write::<i32>(), &seg_start)?;
-            write(jit.pool_idx_host_write::<i32>(), &pool_idx)?;
-            let started = Instant::now();
-            match profile.as_deref_mut() {
-                Some(profile) => {
-                    let kernels = jit.execute_profiled()?;
-                    let name = format!("embed[{max_batch}x{bucket}]");
-                    profile.stages.push(StageProfile::gpu(name, started.elapsed(), kernels));
-                }
-                None => jit.execute()?,
-            }
-            let flat = jit.embeddings_to_vec::<f32>()?;
-            let dim = flat.len() / (max_batch * slots);
+            let flat = self.execute(&rows, &lens, &batch, profile.as_deref_mut())?;
+            let slots = batch.bucket / SLOT_TOKENS;
+            let dim = flat.len() / (self.max_batch * slots);
             for (r, packed) in batch.rows.iter().enumerate() {
                 for (slot, &i) in packed.iter().enumerate() {
                     let at = (r * slots + slot) * dim;
@@ -160,5 +132,67 @@ impl Qwen3Embedder {
             }
         }
         Ok(out)
+    }
+
+    /// Run `batch` (indices into `rows` and `lens`) through its bucket's plan,
+    /// compiling it on first use: the flat `[max_batch · slots, D]` embeddings.
+    fn execute(
+        &mut self,
+        rows: &[&[u32]],
+        lens: &[usize],
+        batch: &Batch,
+        profile: Option<&mut RunProfile>,
+    ) -> Result<Vec<f32>> {
+        let (max_batch, pad_id, bucket) = (self.max_batch, self.pad_id, batch.bucket);
+        let slots = bucket / SLOT_TOKENS;
+        let jit = match self.plans.entry(bucket) {
+            std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::btree_map::Entry::Vacant(e) => {
+                let mut jit = Qwen3EmbeddingJit::new(self.model.clone());
+                jit.prepare_with_config(
+                    InputSpec::i32(&[max_batch, bucket]),
+                    InputSpec::i32(&[max_batch, bucket]),
+                    InputSpec::i32(&[max_batch, bucket]),
+                    InputSpec::i32(&[max_batch, slots]),
+                    &PrepareConfig::device_local(),
+                )?;
+                e.insert(jit)
+            }
+        };
+        // Padding: pad tokens at position 0, each its own segment (a token
+        // always sees itself), pooled nowhere.
+        let mut ids = vec![pad_id; max_batch * bucket];
+        let mut positions = vec![0i32; max_batch * bucket];
+        let mut seg_start: Vec<i32> = (0..max_batch * bucket).map(|j| (j % bucket) as i32).collect();
+        let mut pool_idx = vec![0i32; max_batch * slots];
+        for (r, packed) in batch.rows.iter().enumerate() {
+            let mut cursor = r * bucket;
+            for (slot, &i) in packed.iter().enumerate() {
+                for (j, &id) in rows[i].iter().enumerate() {
+                    ids[cursor + j] = id as i32;
+                    positions[cursor + j] = j as i32;
+                }
+                seg_start[cursor..cursor + lens[i]].fill((cursor % bucket) as i32);
+                cursor += lens[i];
+                pool_idx[r * slots + slot] = ((cursor - 1) % bucket) as i32;
+            }
+        }
+        let write = |input: crate::jit::Result<crate::jit::rt::HostWrite<'_, i32>>, data: &[i32]| {
+            input?.copy_from(data).map_err(crate::jit::JitError::from)
+        };
+        write(jit.input_ids_host_write::<i32>(), &ids)?;
+        write(jit.positions_host_write::<i32>(), &positions)?;
+        write(jit.seg_start_host_write::<i32>(), &seg_start)?;
+        write(jit.pool_idx_host_write::<i32>(), &pool_idx)?;
+        let started = Instant::now();
+        match profile {
+            Some(profile) => {
+                let kernels = jit.execute_profiled()?;
+                let name = format!("embed[{max_batch}x{bucket}]");
+                profile.stages.push(StageProfile::gpu(name, started.elapsed(), kernels));
+            }
+            None => jit.execute()?,
+        }
+        Ok(jit.embeddings_to_vec::<f32>()?)
     }
 }

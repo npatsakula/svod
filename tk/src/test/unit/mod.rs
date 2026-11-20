@@ -3,6 +3,7 @@ mod atoms;
 mod attention;
 mod banks;
 mod build;
+mod bulk;
 mod conv;
 mod cost_model;
 mod device;
@@ -33,6 +34,7 @@ mod sweep;
 mod sync;
 mod tail;
 mod targets;
+mod trace;
 mod tune;
 mod windows;
 
@@ -194,6 +196,7 @@ pub(crate) fn gfx1151_costs() -> Costs {
         // Unmeasured there: equal to `step`, so a lone wave hides nothing.
         step_lone: 6.25,
         step_lone_i8: 0.0,
+        step_lone_group: 0.0,
         score: 0.0773,
         trip: 11.67,
         trip_rolled: 13.85,
@@ -242,6 +245,7 @@ pub(crate) fn gfx1151_store_costs() -> Costs {
         step_i8: 6.152153,
         step_lone: 12.841797,
         step_lone_i8: 0.0,
+        step_lone_group: 0.0,
         score: 0.079565,
         trip: 1.905518,
         trip_rolled: 1.893921,
@@ -276,6 +280,7 @@ pub(crate) fn sm86_costs() -> Costs {
         step_i8: STEP_I8_SM86,
         step_lone: 33.25,
         step_lone_i8: 0.0,
+        step_lone_group: 0.0,
         score: 0.07915,
         trip: 1.81,
         trip_rolled: 0.0,
@@ -286,6 +291,52 @@ pub(crate) fn sm86_costs() -> Costs {
         smem_trip: 0.2449,
         latency: 311.79,
         latency_one: 324.77,
+        l2_byte: 0.0,
+        l2_bytes: 0.0,
+        ladder: [(0, 0.0); crate::atoms::LADDER],
+    };
+    set_ladder(&mut costs, &rungs);
+    costs
+}
+
+/// sm_90's costs on an H200 NVL (132 SMs) as `probe::costs` measured them on
+/// the device on 2026-11-19, alone on a fresh store: its 4.8 TB/s memory
+/// streams a byte at under half an H100 PCIe's cost, and a lone two-slot
+/// ring's trip is under half its pair's time ([`crate::probe::Signal::Present`]).
+pub(crate) fn h200_costs() -> Costs {
+    let rungs = [
+        (1 << 20, 9313.0),
+        (2 << 20, 11313.0),
+        (4 << 20, 13735.0),
+        (8 << 20, 15147.0),
+        (16 << 20, 14804.0),
+        (32 << 20, 15690.0),
+        (64 << 20, 16692.0),
+        (128 << 20, 20299.0),
+        (256 << 20, 29521.0),
+    ]
+    .map(|(f, fs)| (f, fs * 1e-6));
+    let mut costs = Costs {
+        smem_byte: 0.003517,
+        global_byte: 0.032455,
+        scatter: 2.415039,
+        step: 1.847351,
+        step_group: 1.263134,
+        step_wide: 0.0,
+        step_i8: 0.922684,
+        step_lone: 7.710938,
+        step_lone_i8: 3.84375,
+        step_lone_group: 1.456299,
+        score: 0.059238,
+        trip: 8.071167,
+        trip_rolled: 0.0,
+        trip_one: 4.505005,
+        trip_lone: 113.796875,
+        trip_one_lone: 134.164063,
+        lane_move: 0.117724,
+        smem_trip: 0.12735,
+        latency: 425.848634,
+        latency_one: 433.462604,
         l2_byte: 0.0,
         l2_bytes: 0.0,
         ladder: [(0, 0.0); crate::atoms::LADDER],
@@ -321,6 +372,7 @@ pub(crate) fn gfx1201_costs() -> Costs {
         step_i8: STEP_I8_GFX1201,
         step_lone: 5.5957,
         step_lone_i8: 0.0,
+        step_lone_group: 0.0,
         score: 0.059305,
         trip: 7.3026,
         trip_rolled: 7.1622,
@@ -362,6 +414,7 @@ pub(crate) fn gfx942_costs() -> Costs {
         step_i8: 0.996552,
         step_lone: 11.875,
         step_lone_i8: 5.449219,
+        step_lone_group: 0.0,
         score: 0.277415,
         trip: 14.852905,
         trip_rolled: 14.172974,
@@ -397,7 +450,7 @@ pub(crate) fn lane_moves_dear() -> Costs {
 /// target fills, then inferred, as the lowering does before it emits.
 pub(crate) fn laid(prog: Program, device: &crate::atoms::Device) -> crate::layouts::Result<Program<crate::ir::Laid>> {
     crate::layouts::infer(
-        crate::schedule::expand(prog, device.target.fill, Core::Warp, device.target.sync.split_barrier),
+        crate::schedule::expand(prog, device.target.fill, Core::Warp, device.target.sync),
         device,
         Core::Warp,
     )
@@ -417,20 +470,26 @@ fn gemm_nt_crews(m: usize, n: usize, k: usize, tile: [usize; 3]) -> Program {
         schedule: Schedule::ping_pong(16),
         order: Default::default(),
         tail: None,
+        store: Default::default(),
     };
     gemm::<BF16>(&assumed(gemm_spec(m, n, k), cfg))
 }
 
 fn gemm_nt_batched(m: usize, n: usize, k: usize, tile: [usize; 3], stages: usize, batch: Batch) -> Program {
-    let cfg = GemmCfg {
+    gemm::<BF16>(&assumed(GemmSpec { batch, ..gemm_spec(m, n, k) }, gemm_nt_cfg(tile, stages)))
+}
+
+/// The config of [`gemm_nt`]: an unrolled ring of `stages` slots on a 2×4 warp grid.
+fn gemm_nt_cfg(tile: [usize; 3], stages: usize) -> GemmCfg {
+    GemmCfg {
         core: Core::Warp,
         tile,
         warps: [2, 4],
         schedule: Schedule::ring(stages, true),
         order: Default::default(),
         tail: None,
-    };
-    gemm::<BF16>(&assumed(GemmSpec { batch, ..gemm_spec(m, n, k) }, cfg))
+        store: Default::default(),
+    }
 }
 
 /// A single `m×n×k` GEMM with no epilogue.
@@ -457,6 +516,7 @@ fn decode(dtype: ScalarDType, bytes: &[u8]) -> Vec<f64> {
         ScalarDType::BFloat16 => bytes.chunks(2).map(|b| bf16(half(b))).collect(),
         ScalarDType::Float16 => bytes.chunks(2).map(|b| half::f16::from_bits(half(b)).to_f64()).collect(),
         ScalarDType::Int32 => bytes.chunks(4).map(|b| f64::from(i32::from_le_bytes(b.try_into().unwrap()))).collect(),
+        ScalarDType::Int64 => bytes.chunks(8).map(|b| i64::from_le_bytes(b.try_into().unwrap()) as f64).collect(),
         other => unreachable!("{other:?} output"),
     }
 }

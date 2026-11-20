@@ -51,7 +51,7 @@ impl JitKernel {
         svod_device::device::validate_abi_descriptors(abi, buffer_count, &var_names)?;
         crate::clang::validate_relocatable_object(object, name)?;
         let (fn_ptr, mmap) = jit_load(object, name)?;
-        let cif = KernelCif::from_abi(abi);
+        let cif = KernelCif::from_abi(abi)?;
         Ok(Self { _mmap: mmap, fn_ptr, name: name.to_string(), var_names, cif })
     }
 

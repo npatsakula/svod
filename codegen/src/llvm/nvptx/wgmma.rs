@@ -48,13 +48,17 @@ pub const B_MN: &str = ".bmn";
 /// The suffix of a chain left in flight: committed but not waited for, a
 /// later [`wait`] being the caller's.
 pub const ASYNC: &str = ".async";
+/// The suffix of a product whose shared operands only bulk copies wrote:
+/// the async proxy's own writes, read without a proxy fence.
+pub const UNFENCED: &str = ".unfenced";
 
 /// The `metadata.name` of a product: its A operand's form, its B operand's
-/// major axis, and whether the statement waits for its chain.
-pub fn name(from_registers: bool, b_mn: bool, waits: bool) -> String {
+/// major axis, whether the statement waits for its chain, and whether the
+/// generic proxy wrote what it reads from shared memory (`fenced`).
+pub fn name(from_registers: bool, b_mn: bool, waits: bool, fenced: bool) -> String {
     let (a, b, wait) =
         (if from_registers { RS } else { SS }, if b_mn { B_MN } else { "" }, if waits { "" } else { ASYNC });
-    format!("{a}{b}{wait}")
+    format!("{a}{b}{wait}{}", if fenced { "" } else { UNFENCED })
 }
 
 /// The swizzle a descriptor declares over its operand's shared rows: the
@@ -164,9 +168,13 @@ pub fn render(
     kernel: &mut Vec<String>,
 ) -> Option<()> {
     let (n, m, k) = metadata.dims;
-    let (form, waits) = match metadata.name.strip_suffix(ASYNC) {
+    let (form, fenced) = match metadata.name.strip_suffix(UNFENCED) {
         Some(form) => (form, false),
         None => (metadata.name.as_str(), true),
+    };
+    let (form, waits) = match form.strip_suffix(ASYNC) {
+        Some(form) => (form, false),
+        None => (form, true),
     };
     let (form, b_mn) = match form.strip_suffix(B_MN) {
         Some(form) => (form, true),
@@ -224,7 +232,8 @@ pub fn render(
     let d_list = (0..regs).map(|i| format!("${i}")).collect::<Vec<_>>().join(",");
     // The core reads shared memory through the async proxy: what the generic
     // proxy wrote there (a staged store, a landed `cp.async`) is fenced first.
-    let mut text = String::from("fence.proxy.async.shared::cta;\\0Awgmma.fence.sync.aligned;\\0A");
+    let mut text = String::from(if fenced { "fence.proxy.async.shared::cta;\\0A" } else { "" });
+    text.push_str("wgmma.fence.sync.aligned;\\0A");
     let mut operand = regs;
     for _ in 0..steps {
         let a_text = if from_registers {

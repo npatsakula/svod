@@ -7,8 +7,8 @@ use crate::hcq::{
     SystemField, SystemPatchValues, TopologyOperation, TopologyOperationKind, TopologyResource, schedule_device_lanes,
 };
 use proptest::strategy::Strategy;
-use svod_dtype::{AddrSpace, DType, DeviceSpec};
-use svod_ir::ops;
+use svod_dtype::{AddrSpace, DType, DeviceSpec, ScalarDType};
+use svod_ir::{TensorMap, TensorMapSwizzle, ops};
 
 fn storage(slot: usize) -> AbiParamDescriptor {
     AbiParamDescriptor { slot, kind: AbiParamKind::Storage(AddrSpace::Global), dtype: DType::Float32, name: None }
@@ -24,7 +24,7 @@ fn scalar(slot: usize, name: &str) -> AbiParamDescriptor {
 #[test]
 fn clike_kernargs_pack_in_slot_order_at_natural_alignment() {
     let mut dst = [0xcc; 32];
-    let dense = ClikeKernargLayout::from_abi(&[storage(0), storage(1), scalar(2, "low"), scalar(3, "high")]);
+    let dense = ClikeKernargLayout::from_abi(&[storage(0), storage(1), scalar(2, "low"), scalar(3, "high")]).unwrap();
     let written = dense.pack(&mut dst, &[0x1122_3344_5566_7788, 0x99aa_bbcc_ddee_ff00], &[-2, 0x1234_5678]).unwrap();
     assert_eq!(written, 24);
     assert_eq!(&dst[0..8], &0x1122_3344_5566_7788u64.to_le_bytes());
@@ -37,6 +37,7 @@ fn clike_kernargs_pack_in_slot_order_at_natural_alignment() {
     // scalar is realigned rather than packed tight.
     let mut dst = [0u8; 24];
     ClikeKernargLayout::from_abi(&[storage(0), scalar(1, "n"), storage(5)])
+        .unwrap()
         .pack(&mut dst, &[0x1000, 0x5000], &[7])
         .unwrap();
     assert_eq!(&dst[..8], &0x1000u64.to_le_bytes());
@@ -92,6 +93,127 @@ fn program_kernargs_interleave_storage_and_scalars_by_slot() {
 #[test_case::test_case(&[] => (vec![], 0); "no records")]
 fn kernarg_offsets_pack_records_at_one_alignment(sizes: &[usize]) -> (Vec<usize>, usize) {
     crate::hcq::kernarg_offsets(sizes.iter().copied(), 16)
+}
+
+// ------------------------------------------------------------ tensor-map kernargs
+
+pub(crate) fn tensor_map(slot: usize, buffer: usize) -> AbiParamDescriptor {
+    let map = TensorMap::new(buffer, ScalarDType::Float32, [64, 32], [16, 8], TensorMapSwizzle::None).unwrap();
+    AbiParamDescriptor { slot, kind: AbiParamKind::TensorMap(map), dtype: DType::Float32, name: None }
+}
+
+/// A recording encoder: each map's descriptor is its address in every 8-byte
+/// word, so the packed blob shows which storage each map was encoded from.
+fn encode_address(
+    calls: &mut Vec<(usize, u64)>,
+) -> impl FnMut(&TensorMap, u64) -> crate::Result<[u8; TensorMap::BYTES]> + '_ {
+    |map, address| {
+        calls.push((map.buffer, address));
+        Ok(std::array::from_fn(|byte| address.to_le_bytes()[byte % 8]))
+    }
+}
+
+/// Every argument lands at the next multiple of its own alignment (8 for a
+/// pointer, 4 for a scalar, 64 for a 128-byte map) and the total is not padded
+/// past the last argument.
+#[test_case::test_case(vec![storage(0), tensor_map(1, 0), storage(2)] => (vec![0, 64, 192], 200); "pointer, map, pointer")]
+#[test_case::test_case(vec![tensor_map(0, 1), storage(1)] => (vec![0, 128], 136); "map first")]
+#[test_case::test_case(vec![storage(0), scalar(1, "n"), tensor_map(2, 0), scalar(3, "m")] => (vec![0, 8, 64, 192], 196); "scalars around a map")]
+#[test_case::test_case(vec![storage(0), tensor_map(1, 0), tensor_map(2, 0)] => (vec![0, 64, 192], 320); "two maps of one buffer")]
+fn tensor_maps_sit_at_64_byte_offsets(abi: Vec<AbiParamDescriptor>) -> (Vec<usize>, usize) {
+    let layout = ClikeKernargLayout::from_abi(&abi).unwrap();
+    (layout.offsets().collect(), layout.packed_size())
+}
+
+/// A map is encoded from its storage's binding and takes none of its own:
+/// the layout counts it as neither a global nor a var.
+#[test]
+fn tensor_maps_encode_from_their_storage_address() {
+    let abi = [storage(0), scalar(1, "n"), tensor_map(2, 3), storage(3), tensor_map(4, 0)];
+    let layout = ClikeKernargLayout::from_abi(&abi).unwrap();
+    assert_eq!((layout.globals, layout.vars), (2, 1));
+    let mut dst = vec![0xcc; layout.packed_size()];
+    let mut calls = Vec::new();
+    let written = layout.pack_encoded(&mut dst, &[0x1000, 0x3000], &[5], &mut encode_address(&mut calls)).unwrap();
+    assert_eq!(written, layout.packed_size());
+    assert_eq!(calls, [(3, 0x3000), (0, 0x1000)]);
+    let offsets: Vec<usize> = layout.offsets().collect();
+    assert_eq!(offsets, [0, 8, 64, 192, 256]);
+    assert_eq!(&dst[0..8], &0x1000u64.to_le_bytes());
+    assert_eq!(&dst[8..12], &5i32.to_le_bytes());
+    assert_eq!(&dst[12..64], &[0; 52], "padding before a map is zeroed");
+    assert!(dst[64..192].chunks(8).all(|word| word == 0x3000u64.to_le_bytes()));
+    assert_eq!(&dst[192..200], &0x3000u64.to_le_bytes());
+    assert!(dst[256..384].chunks(8).all(|word| word == 0x1000u64.to_le_bytes()));
+}
+
+/// TMA starts from a 16-byte-aligned address: a view bound off that grid
+/// fails with the map's slot and address, before any encoding.
+#[test]
+fn tensor_maps_reject_a_misaligned_storage_address() {
+    let layout = ClikeKernargLayout::from_abi(&[storage(0), tensor_map(1, 0)]).unwrap();
+    let mut dst = vec![0; layout.packed_size()];
+    let mut calls = Vec::new();
+    let error = layout.pack_encoded(&mut dst, &[0x1004], &[], &mut encode_address(&mut calls)).unwrap_err();
+    assert!(matches!(error, crate::Error::MisalignedTensorMapAddress { slot: 1, address: 0x1004 }), "{error:?}");
+    assert!(calls.is_empty());
+    layout.pack_encoded(&mut dst, &[0x1010], &[], &mut encode_address(&mut calls)).unwrap();
+    assert_eq!(calls, [(0, 0x1010)]);
+}
+
+/// A layout without maps packs without an encoder; one with a map needs one,
+/// and one whose map names no storage has no layout.
+#[test]
+fn tensor_maps_need_an_encoder_and_a_storage() {
+    let layout = ClikeKernargLayout::from_abi(&[storage(0), tensor_map(1, 0)]).unwrap();
+    let error = layout.pack(&mut [0; 200], &[0x1000], &[]).unwrap_err();
+    assert!(matches!(error, crate::Error::TensorMapEncoderMissing { slot: 1 }), "{error:?}");
+    let error = ClikeKernargLayout::from_abi(&[storage(0), tensor_map(1, 2)]).unwrap_err();
+    assert!(matches!(error, crate::Error::TensorMapWithoutStorage { slot: 1, buffer: 2, .. }), "{error:?}");
+}
+
+/// The kind of one generated argument; maps refer to the first storage.
+#[derive(Debug, Clone, Copy)]
+enum ArgKind {
+    Storage,
+    Scalar,
+    Map,
+}
+
+proptest::proptest! {
+    /// Any mix of pointers, scalars and maps: each argument starts at the
+    /// first multiple of its alignment past the previous one's end, and the
+    /// blob ends at the last argument's end.
+    #[test]
+    fn kernarg_arguments_start_at_the_next_multiple_of_their_alignment(
+        kinds in proptest::collection::vec(
+            proptest::prop_oneof![
+                proptest::strategy::Just(ArgKind::Storage),
+                proptest::strategy::Just(ArgKind::Scalar),
+                proptest::strategy::Just(ArgKind::Map),
+            ],
+            0..12,
+        )
+    ) {
+        let mut abi = vec![storage(0)];
+        abi.extend(kinds.iter().enumerate().map(|(index, kind)| match kind {
+            ArgKind::Storage => storage(index + 1),
+            ArgKind::Scalar => scalar(index + 1, &format!("v{index}")),
+            ArgKind::Map => tensor_map(index + 1, 0),
+        }));
+        let layout = ClikeKernargLayout::from_abi(&abi).unwrap();
+        let mut end = 0usize;
+        for (offset, param) in layout.offsets().zip(&abi) {
+            let (size, align) = match param.kind {
+                AbiParamKind::Storage(_) => (8, 8),
+                AbiParamKind::Scalar => (4, 4),
+                AbiParamKind::TensorMap(_) => (128, 64),
+            };
+            proptest::prop_assert_eq!(offset, end.next_multiple_of(align));
+            end = offset + size;
+        }
+        proptest::prop_assert_eq!(layout.packed_size(), end);
+    }
 }
 
 #[test]

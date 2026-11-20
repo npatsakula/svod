@@ -11,7 +11,7 @@ use svod_dtype::ScalarDType;
 use test_case::test_case;
 
 use super::raster::walked;
-use super::{costs, gfx942_costs, gfx1201_costs, sm86_costs};
+use super::{costs, gfx942_costs, gfx1201_costs, h200_costs, sm86_costs};
 use crate::atoms::{Costs, Device};
 use crate::atoms::{Target, sm86};
 use crate::build::*;
@@ -303,7 +303,7 @@ fn a_split_the_problem_cannot_run_is_refused() {
     let p = GemmProblem::new(1, 8192, 4096, 4096, &Epilogue::DEFAULT);
     assert!(p.admit(&planner, &split(4)).is_ok());
     assert_eq!(p.admit(&planner, &split(3)).map(|_| ()), refused, "64 trips split three ways");
-    let rope = Some(crate::kernels::gemm::Rope { heads: 4, head_dim: 64, seq: 8 });
+    let rope = Some(crate::kernels::gemm::Rope { heads: 4, head_dim: 64, seq: 8, norm: None });
     for other in [GemmProblem { batches: 2, ..p }, GemmProblem { halves: 2, ..p }, GemmProblem { rope, ..p }] {
         assert_eq!(other.admit(&planner, &split(4)).map(|_| ()), refused, "{other:?}");
     }
@@ -496,6 +496,21 @@ fn gfx1201_probed() -> Vec<Probed> {
     ]
 }
 
+/// H200 NVL (132 SMs), 2026-11-19, under [`h200_costs`]' store: the
+/// ranking's first tile on the warpgroup core.
+fn h200_probed() -> Vec<Probed> {
+    let probed = |shape, dp, whole, tail| {
+        let Probed { cfg, .. } = probed(shape, [256, 128, 64], 4, [16, 1], 8, dp, whole, tail);
+        Probed { shape, cfg: GemmCfg { core: crate::atoms::Core::Group, ..cfg }, dp, whole, tail }
+    };
+    vec![
+        probed([8192, 4096, 4096], 549.0, (2, 707.6), Some((2, 579.4))),
+        probed([4096, 4096, 4096], 271.9, (2, 352.1), Some((2, 303.8))),
+        probed([8192, 8192, 1024], 361.6, (2, 575.8), Some((2, 385.8))),
+        probed([6144, 4096, 8192], 863.1, (2, 970.8), Some((2, 896.0))),
+    ]
+}
+
 /// Measurement: plans whose device times are this close are a tie the
 /// probe does not resolve (its two passes drift by as much).
 const TIE: f64 = 1.01;
@@ -509,6 +524,7 @@ const TIE: f64 = 1.01;
 #[test_case(Target::card("mi300x").expect("a card"), gfx942_costs(), mi300x_probed(); "mi300x")]
 #[test_case(sm86(), sm86_costs(), sm86_probed(); "sm_86")]
 #[test_case(Target::card("rx9070xt").expect("a card"), gfx1201_costs(), gfx1201_probed(); "gfx1201")]
+#[test_case(Target::card("h200-nvl").expect("a card"), h200_costs(), h200_probed(); "h200")]
 fn the_model_orders_the_probed_plans_as_the_device_did(target: Target, costs: Costs, rows: Vec<Probed>) {
     for epilogue in [1.0, 0.0] {
         let mut planner = Planner::new(Device { target: target.clone(), costs }).expect("an SM count");

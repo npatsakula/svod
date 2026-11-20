@@ -20,7 +20,7 @@ use crate::ir::{Axis, ParamKind, Program, Schedule};
 use crate::kernels::Batch;
 use crate::kernels::attention::{AttnMask, AttnSpec, Bias, CombineSpec, Forms, attention, combine};
 use crate::kernels::conv::ConvSpec;
-use crate::kernels::gemm::{Epilogue, GemmSpec, gemm};
+use crate::kernels::gemm::{Epilogue, GemmSpec, Store, gemm};
 use crate::kernels::nearest::{Floors, Metric, NearestSpec, nearest};
 use crate::kernels::rows::NormCfg;
 use crate::launch::{self, aliasing, graph_launch_all};
@@ -37,7 +37,7 @@ pub(super) use crate::sweep::{Launch, amd, families, group_families, hopper, lin
 /// Random parameters of `prog` rounded to their types; every i32 parameter
 /// (key counts, masks, segment starts, row maps) is 1, every i8 one an
 /// integer of the full range.
-fn inputs(name: &str, prog: &Program) -> Vec<Vec<f64>> {
+pub(super) fn inputs(name: &str, prog: &Program) -> Vec<Vec<f64>> {
     let mut seed = name.len() as u64;
     // Indices over the rows and past them, colliding, for a scatter to drop
     // and to sum; integers, whose sums are exact in either type, so no order
@@ -71,7 +71,7 @@ fn lowered_tile(prog: Program, lowering: &Lowering) -> Program<crate::ir::Laid> 
 
 /// `check` on every launch at once, failing with every launch whose check
 /// panics, so one failure does not hide another.
-fn each(launches: Vec<Launch>, check: impl Fn(&str, Program, Lowering) + Sync) {
+pub(super) fn each(launches: Vec<Launch>, check: impl Fn(&str, Program, Lowering) + Sync) {
     let failed: Vec<String> = crate::tune::in_parallel(launches, |(name, prog, lowering)| {
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check(&name, prog, lowering))).err()?;
         let why = panic.downcast_ref::<String>().map(String::as_str).or_else(|| panic.downcast_ref::<&str>().copied());
@@ -128,7 +128,7 @@ pub(super) fn run(mut command: Command, input: &[u8], what: &str) -> Result<Vec<
     }
 }
 
-fn ptxas() -> Option<std::path::PathBuf> {
+pub(super) fn ptxas() -> Option<std::path::PathBuf> {
     let on_path = std::env::var_os("PATH")
         .into_iter()
         .flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
@@ -142,11 +142,11 @@ fn ptxas() -> Option<std::path::PathBuf> {
 const NO_AMDGPU: &[&str] = &["AMDGPU target", "too old"];
 
 /// What a failed PTX compile says where clang has no NVPTX backend.
-const NO_NVPTX: &[&str] = &["NVPTX target"];
+pub(super) const NO_NVPTX: &[&str] = &["NVPTX target"];
 
 /// What a toolchain call made, `None` (logged) where its error says one of
 /// `missing`: the toolchain cannot target the arch at all.
-fn built<T>(made: Result<T, impl std::fmt::Display>, missing: &[&str]) -> Result<Option<T>, String> {
+pub(super) fn built<T>(made: Result<T, impl std::fmt::Display>, missing: &[&str]) -> Result<Option<T>, String> {
     let e = match made {
         Ok(made) => return Ok(Some(made)),
         Err(e) => e.to_string(),
@@ -209,6 +209,41 @@ fn every_group_attention_assembles_for_hopper() {
     }
 }
 
+/// Every election shares one compare of the thread: a bulk store under a
+/// branch leaves it where a later store's election reads it too.
+#[test]
+fn a_bulk_store_under_a_branch_shares_its_election_with_a_later_one() {
+    use crate::build::{Kernel, Sc};
+    use crate::ir::Shape;
+    use crate::layouts::WarpGrid;
+    let target = hopper();
+    let GpuArch::Cuda(arch) = target.arch else { unreachable!() };
+    let tile = Shape::new(64, 64);
+    let prog = Kernel::record("twice", |k| {
+        k.warps(WarpGrid { rows: 4, cols: 1 });
+        k.grid([Sc::from(2), Sc::from(1), Sc::from(1)]);
+        let y = k.output::<BF16>("y", 3 * tile.elems());
+        let scratch = k.smem::<BF16>("s", tile.elems());
+        let staged = k.smem_view(scratch, 0, tile);
+        let zeros = k.zeros::<BF16>(tile);
+        k.store(staged, zeros);
+        let first = k.block(0);
+        k.if_(
+            first.clone().lt(1),
+            |k| {
+                let out = k.view(y, 0, [tile.cols, 1], tile, [None, None]);
+                k.flush(out, staged);
+            },
+            |_| {},
+        );
+        let out = k.view(y, (first + 1) * tile.elems(), [tile.cols, 1], tile, [None, None]);
+        k.flush(out, staged);
+    });
+    let ir = render(prog, &Lowering { core: Core::Group, ..Lowering::new(&declared(target)) });
+    assert_eq!(ir.matches("@llvm.nvvm.cp.async.bulk.tensor.s2g.tile.2d(").count(), 3, "a declaration and two stores");
+    built(svod_runtime::cuda::compile_ir_to_ptx(&ir, arch), NO_NVPTX).unwrap_or_else(|e| panic!("{e}"));
+}
+
 /// What a target's families show beyond their numbers.
 struct Facts {
     /// The axis a register-staged attention's value ring lies along (its key
@@ -217,9 +252,6 @@ struct Facts {
     /// fill scatters through registers, row-major where a `cp.async` fill
     /// copies chunks, which cannot scatter (`ldmatrix.trans` transposes).
     values: Axis,
-    /// The softmax's `exp2` is the hardware `v_exp_f32` alone, with no
-    /// denormal range reduction around it, rather than `llvm.exp2`.
-    raw_exp2: bool,
     /// A lane reads another lane's register on the vector unit (DPP within a
     /// row of 16, `permlanex16` across them) rather than through the LDS
     /// crossbar; `None` off AMD.
@@ -235,8 +267,8 @@ struct Facts {
     free_scores: Option<bool>,
 }
 
-const fn facts(values: Axis, raw_exp2: bool, dpp: Option<bool>, free_scores: Option<bool>) -> Facts {
-    Facts { values, raw_exp2, dpp, free_scores }
+const fn facts(values: Axis, dpp: Option<bool>, free_scores: Option<bool>) -> Facts {
+    Facts { values, dpp, free_scores }
 }
 
 /// Every family the op layer plans on `target` (and on Hopper every
@@ -268,12 +300,12 @@ const fn facts(values: Axis, raw_exp2: bool, dpp: Option<bool>, free_scores: Opt
 /// operands stay in shared memory and no operand tile is loaded into
 /// registers; a ring of three slots or more leaves the chain in flight, the
 /// wait the template's intrinsic rather than the chain's own.
-#[test_case(crate::atoms::sm86(), facts(Axis::Col, false, None, None); "sm_86")]
-#[test_case(hopper(), facts(Axis::Col, false, None, None); "sm_90")]
-#[test_case(amd(AmdArch::Gfx1201, 64), facts(Axis::Row, true, Some(true), Some(true)); "gfx1201")]
-#[test_case(amd(AmdArch::Gfx1151, 40), facts(Axis::Row, true, Some(true), Some(false)); "gfx1151")]
-#[test_case(amd(AmdArch::Gfx1100, 96), facts(Axis::Row, true, Some(true), Some(false)); "gfx1100")]
-#[test_case(amd(AmdArch::Gfx942, 304), facts(Axis::Row, true, Some(false), Some(true)); "gfx942")]
+#[test_case(crate::atoms::sm86(), facts(Axis::Col, None, None); "sm_86")]
+#[test_case(hopper(), facts(Axis::Col, None, None); "sm_90")]
+#[test_case(amd(AmdArch::Gfx1201, 64), facts(Axis::Row, Some(true), Some(true)); "gfx1201")]
+#[test_case(amd(AmdArch::Gfx1151, 40), facts(Axis::Row, Some(true), Some(false)); "gfx1151")]
+#[test_case(amd(AmdArch::Gfx1100, 96), facts(Axis::Row, Some(true), Some(false)); "gfx1100")]
+#[test_case(amd(AmdArch::Gfx942, 304), facts(Axis::Row, Some(false), Some(true)); "gfx942")]
 fn every_family_lowers_keeps_its_numbers_and_compiles(target: Target, facts: Facts) {
     assert!(config::has_kernels(&target));
     if let Some(free) = facts.free_scores {
@@ -349,8 +381,19 @@ fn every_family_lowers_keeps_its_numbers_and_compiles(target: Target, facts: Fac
         check(tr_loads == 0 || transposing, &format!("{tr_loads} transposing loads"));
         if attention {
             check((tr_loads > 0) == transposing, &format!("{tr_loads} transposing loads of the values"));
-            let (raw, exp2) = (ir.contains("@llvm.amdgcn.exp2.f32("), ir.contains("@llvm.exp2.f32("));
-            check((raw, exp2) == (facts.raw_exp2, !facts.raw_exp2), &format!("v_exp_f32 {raw}, llvm.exp2 {exp2}"));
+            // The softmax's `exp2` is the hardware instruction alone, with no
+            // denormal range reduction around it, rather than `llvm.exp2`.
+            let hardware = match target.arch {
+                GpuArch::Amd(_) => "@llvm.amdgcn.exp2.f32(",
+                _ => "@llvm.nvvm.ex2.approx.ftz.f(",
+            };
+            let (raw, exp2) = (ir.contains(hardware), ir.contains("@llvm.exp2.f32("));
+            check(raw && !exp2, &format!("the hardware exp2 {raw}, llvm.exp2 {exp2}"));
+        }
+        if name == "gemm swiglu" {
+            // SiLU's quotient is the hardware's approximate one where the target has it.
+            let (approx, ieee) = (ir.contains("@llvm.nvvm.div.approx.f("), ir.contains("fdiv "));
+            check((approx, ieee) == (target.approx_div, !target.approx_div), &format!("quotients: {approx} {ieee}"));
         }
         if let (Some(dpp), true) = (facts.dpp, name.ends_with("norm")) {
             let moves = (ir.contains("@llvm.amdgcn.update.dpp.i32("), ir.contains("@llvm.amdgcn.ds.bpermute("));
@@ -361,16 +404,50 @@ fn every_family_lowers_keeps_its_numbers_and_compiles(target: Target, facts: Fac
             check(cores.iter().any(|c| ir.contains(c)), "no 8-bit product");
             check(ir.contains("ldmatrix") == target.ldmatrix, "fragments not read by ldmatrix where it is");
         }
+        if name.starts_with("group attention") {
+            let (bulk, bias) = (name.contains(" bulk"), name.ends_with(" bias"));
+            check(ir.contains("wgmma.mma_async.sync.aligned.m64n"), "no warpgroup product");
+            check(ir.contains("@llvm.nvvm.cp.async.bulk.tensor.g2s.tile.2d(") == bulk, "the bulk fill");
+            // Filled in bulk alone, the ring is the async proxy's: no proxy
+            // fence before a product; and two warpgroups leave its slots
+            // rather than meet at a block barrier each trip.
+            let left = bulk && !bias && name.starts_with("group attention [128");
+            check(ir.contains("mbarrier.arrive.shared::cta.b64 state") == left, "the slots' leaving");
+            check(ir.contains("fence.proxy.async") != (bulk && !bias), "the chain's proxy fence");
+            let listing = crate::lower::listing::listing(tile);
+            let steady = |s: &str| listing.lines().any(|l| l.trim_start().starts_with(s) && l.ends_with("[steady]"));
+            check(steady("barrier") != left, "the trip's block barrier");
+            check(steady("slot vacant") == left && steady("slot leave") == left, "the refill's wait");
+        }
         if name.starts_with("group gemm") {
             let reg_operand = |s: &crate::ir::Stmt<crate::ir::Laid>| matches!(s, crate::ir::Stmt::Copy { dst, .. } if tile.value(*dst).place == crate::ir::Place::Reg && tile.value(*dst).dtype == ScalarDType::BFloat16);
-            check(!tile.walk().any(|(_, s)| reg_operand(s)), "an operand was loaded into registers");
+            // The operands stay in shared memory: the one 16-bit load is a
+            // staged output tile's, back from the ring.
+            let loads = tile.walk().filter(|(_, s)| reg_operand(s)).count();
+            let flushed = name.ends_with("flushed");
+            check(loads == usize::from(name.ends_with("staged") || flushed), "an operand was loaded into registers");
             check(ir.contains("wgmma.mma_async.sync.aligned.m64n"), "no warpgroup product");
             check(!ir.contains("@llvm.nvvm.mma.") && !ir.contains("ldmatrix"), "a warp-level product");
-            check(ir.contains("wgmma.fence") && ir.contains("fence.proxy.async"), "an unfenced chain");
+            // Only what the generic proxy wrote is fenced: a ring filled in
+            // bulk that holds no staged tile is the async proxy's alone.
+            let generic = !name.ends_with(" bulk");
+            check(ir.contains("wgmma.fence") && ir.contains("fence.proxy.async") == generic, "the chain's fences");
             let in_flight =
                 prog.walk().any(|(_, s)| matches!(s, crate::ir::Stmt::Pipeline(p) if p.schedule.stages() >= 3));
             check(ir.contains("@llvm.nvvm.wgmma.wait_group") == in_flight, "the template's wait");
             check(ir.contains("wgmma.wait_group.sync.aligned 0;") == !in_flight, "the chain's own wait");
+            // A ring filled in bulk moves both operands by tensor map, on
+            // its slots' barriers, and no thread copies a chunk.
+            let bulk = name.contains(" bulk");
+            check(ir.contains("@llvm.nvvm.cp.async.bulk.tensor.g2s.tile.2d(") == bulk, "the bulk copies");
+            check(ir.contains("mbarrier.try_wait.parity") == bulk, "the slot barriers");
+            check(ir.contains("@llvm.nvvm.cp.async.cg.shared.global") != bulk, "the threads' chunks");
+            // A tile stored in bulk leaves by the output's tensor map, the
+            // thread waiting for its copies.
+            let maps = 2 * usize::from(bulk) + usize::from(flushed);
+            check(ir.matches("\"nvvm.grid_constant\"").count() == maps, "a tensor map an operand, and the output");
+            check(ir.contains("@llvm.nvvm.cp.async.bulk.tensor.s2g.tile.2d(") == flushed, "the bulk store");
+            check(ir.contains("cp.async.bulk.wait_group 0;") == flushed, "the bulk store's wait");
         }
 
         match target.arch {
@@ -610,7 +687,10 @@ fn launched(
 /// Each family on the GPU against the interpreter: within two 16-bit ulps
 /// of the output scale (accumulation order differs), NaN where it is NaN.
 fn check_on_device(target: &Target) {
-    for (name, prog, lowering) in families(target) {
+    // The warpgroup families fill their rings by `cp.async`.
+    let group = !target.group_mma.is_empty() && target.fill == Fill::CpAsync;
+    let group = if group { group_families(target) } else { vec![] };
+    for (name, prog, lowering) in families(target).into_iter().chain(group) {
         let params = inputs(&name, &prog);
         let vars: Vec<(&str, i64)> = prog.vars.iter().map(|v| (v.name.as_str(), v.max)).collect();
         let want = interp::run(&prog, params.clone(), &vars).unwrap();
@@ -1283,4 +1363,43 @@ fn the_probabilities_reach_pv_through_the_lanes_on_a_no_feed_target(mask: AttnMa
     let spec = assumed(probe_spec(2, 4, 100, 100, 64, mask), cfg);
     let declared = shared_bytes(&linear(attention::<F16>(&spec), &cfg.lowering(&device)));
     assert_eq!(declared, cfg.smem_bytes(64, false), "its rings alone, at the target's whole 64 KB");
+}
+
+/// A ring filled in bulk reads an operand that is a view into a larger
+/// buffer, whose address is no multiple of the 16 bytes a tensor map's
+/// buffer starts on, over trips enough to refill every slot three times:
+/// each slot's barrier is waited for on both parities. Its tiles, all
+/// within the output, leave in bulk too where stored so.
+#[test_case(Store::Direct; "stored direct")]
+#[test_case(Store::Bulk; "stored in bulk")]
+fn a_bulk_fill_reads_an_offset_view_on_the_device(store: Store) {
+    let Some(planner) = super::device_planner() else { return };
+    if !planner.device.target.sync.slot_barrier {
+        return;
+    }
+    let (m, k) = (256, 1024);
+    let cfg = crate::kernels::gemm::GemmCfg {
+        tile: [128, 128, 64],
+        warps: [8, 1],
+        core: Core::Group,
+        schedule: Schedule::bulk(4, true),
+        order: Default::default(),
+        tail: None,
+        store,
+    };
+    let prog = gemm::<BF16>(&assumed(gemm_spec(m, m, k), cfg));
+    let mut seed = 5;
+    let a = super::rounded(ScalarDType::BFloat16, m * k + 3, &mut seed, |x| x);
+    let want = interp::run(&prog, vec![a[3..].to_vec(), a[3..].to_vec(), vec![0.0; m * m]], &[]).unwrap().remove(2);
+    let whole = Tensor::from_slice(a.iter().map(|&x| x as f32).collect::<Vec<_>>()).cast(DType::BFloat16);
+    whole.prepare().unwrap().execute().unwrap();
+    let t = whole.try_shrink([(3, m * k + 3)]).unwrap();
+    let out = Tensor::empty(&[m * m], DType::BFloat16);
+    let out = crate::launch::graph_launch(prog, &cfg.lowering(&planner.device), &[&t, &t, &out]).unwrap();
+    out.prepare().unwrap().execute().unwrap();
+    let mut bytes = vec![0u8; m * m * 2];
+    out.buffer().unwrap().copyout(&mut bytes).unwrap();
+    for (i, (g, w)) in super::decode(ScalarDType::BFloat16, &bytes).iter().zip(&want).enumerate() {
+        assert!((g - w).abs() <= 2e-2 * w.abs().max(1.0), "[{i}] = {g} vs {w}");
+    }
 }

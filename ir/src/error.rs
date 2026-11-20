@@ -258,4 +258,28 @@ pub enum Error {
         "linear program: {op} (id={id}) is listed twice; only void CUSTOM, STORE and BARRIER statements repeat (tag a value to emit it twice)"
     ))]
     LinearRepeat { op: String, id: u64 },
+
+    /// A tensor map's element dtype has no TMA data type.
+    #[snafu(display("tensor map: {dtype:?} has no TMA data type"))]
+    TensorMapDType { dtype: svod_dtype::ScalarDType },
+
+    /// A tensor map dimension is empty or longer than TMA addresses (2^32 elements).
+    #[snafu(display("tensor map: extent {extent:?} must be within 1..=2^32 elements per dimension"))]
+    TensorMapExtent { extent: [u64; 2] },
+
+    /// A tensor map's row stride is not a whole number of 16-byte chunks.
+    #[snafu(display("tensor map: a row stride of {bytes} bytes must be a multiple of 16"))]
+    TensorMapRowStride { bytes: u64 },
+
+    /// A tensor map's box dimension is empty or longer than 256 elements.
+    #[snafu(display("tensor map: tile {tile:?} must be within 1..=256 elements per dimension"))]
+    TensorMapTile { tile: [u32; 2] },
+
+    /// A tensor map's box row is not a whole number of 16-byte chunks.
+    #[snafu(display("tensor map: a tile row of {bytes} bytes must be a multiple of 16"))]
+    TensorMapTileRow { bytes: u64 },
+
+    /// A swizzled tensor map's box row is wider than its swizzle span.
+    #[snafu(display("tensor map: a tile row of {bytes} bytes exceeds its {span}-byte swizzle span"))]
+    TensorMapSwizzleSpan { bytes: u64, span: u64 },
 }

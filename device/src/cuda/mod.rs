@@ -54,6 +54,7 @@ pub mod program;
 pub mod sync;
 #[doc(hidden)]
 pub mod sys;
+mod tensor_map;
 
 pub use allocator::{CudaAllocator, CudaMemory};
 pub use device::{CudaDevice, CudaEvent, CudaLimits, CudaStream, has_devices};

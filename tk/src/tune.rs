@@ -41,6 +41,7 @@ use crate::ir::{Param, Program};
 use crate::launch;
 use crate::lower::Lowering;
 use crate::ops::config::LAUNCH;
+use crate::trace::Report;
 
 /// The store's line format, bumped when a line's meaning changes; a file of
 /// another format, or without the line, is dropped whole. A timed candidate
@@ -141,7 +142,8 @@ fn digest(value: &impl Hash) -> u64 {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TuneKey {
     pub op: &'static str,
-    /// Arch and SM count, e.g. `sm_86-28sm`.
+    /// Arch, SM count and the card's model where its driver names it, e.g.
+    /// `sm_86-28sm-rtx-3060` ([`device`]).
     pub device: String,
     pub dtype: ScalarDType,
     pub shape: Vec<usize>,
@@ -182,9 +184,11 @@ impl TuneKey {
     }
 }
 
-/// A target's name in the store: arch and SM count ([`TuneKey::device`]).
-pub(crate) fn device(target: &Target) -> String {
-    format!("{}-{}sm", target.arch.target_name(), target.sms.unwrap_or(0))
+/// A target's name in the store ([`TuneKey::device`]): arch and SM count,
+/// then the card's model where its driver names it ([`Target::model`]).
+pub fn device(target: &Target) -> String {
+    let model = target.model.iter().map(|model| format!("-{model}"));
+    format!("{}-{}sm{}", target.arch.target_name(), target.sms.unwrap_or(0), model.collect::<String>())
 }
 
 /// A digest of `spec`'s compiler identity (backend, toolchain, flags) for
@@ -1239,6 +1243,37 @@ pub fn profile(candidate: Candidate, opts: &ProfileOptions) -> Result<Vec<RunPro
         plan.profile(&ProfileOptions { sqtt, ..opts.clone() }).context(RunSnafu { program })
     });
     profiled.collect()
+}
+
+/// A candidate's programs each [traced](crate::trace) over `runs` launches
+/// on scratch buffers, under the timing lock: the program and lowering that
+/// ran, and its report (`None` where no block was sampled).
+pub fn trace(candidate: Candidate, runs: usize) -> Result<Vec<(Candidate, Option<Report>)>, Error> {
+    let pool = ScratchPool::default();
+    let _device = DEVICE.lock().unwrap_or_else(PoisonError::into_inner);
+    let traced = candidate.into_iter().enumerate().map(|(program, (prog, lowering))| {
+        let name = prog.name.clone();
+        let lowered = crate::trace::traced(prog, &lowering);
+        let t =
+            lowered.map_err(|source| launch::Error::Lower { name, source: Box::new(source) }).context(LaunchSnafu)?;
+        let words = pool.buffers(&t.prog.params).pop().expect("the trace parameter");
+        let (mut plan, vars) = scratch_plan(t.prog.clone(), &t.lowering, &pool)?;
+        let vars: Vec<(&str, i64)> = vars.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+        let elems = t.prog.params.last().expect("the trace parameter").elems;
+        let (mut buffer, mut bytes, zeros) =
+            (words.buffer().expect("a realized buffer"), vec![0u8; 8 * elems], vec![0u8; 8 * elems]);
+        let mut sums = vec![(0.0, 0.0); elems];
+        for _ in 0..runs {
+            plan.execute_with_vars(&vars).context(RunSnafu { program })?;
+            let read = buffer.copyout(&mut bytes).and_then(|()| buffer.copyin(&zeros));
+            read.map_err(svod_runtime::Error::from).context(RunSnafu { program })?;
+            let words: Vec<i64> = bytes.chunks(8).map(|b| i64::from_le_bytes(b.try_into().expect("a word"))).collect();
+            crate::trace::tally(&mut sums, &words);
+        }
+        let report = Report::decode(&t.listing, t.prog.warps as usize, &sums);
+        Ok((vec![(t.prog, t.lowering)], report))
+    });
+    traced.collect()
 }
 
 /// Why a candidate's program did not build or run on scratch buffers.

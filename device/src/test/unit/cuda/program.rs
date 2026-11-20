@@ -7,43 +7,47 @@ use super::{
     KERNELS_PTX, cuda_alloc_or_skip, cuda_device_or_skip, device_ptr, download, load, scalar, scale_abi, storage,
     upload, vadd_abi,
 };
-use crate::cuda::program::{extra_array, ptx_entry_params};
+use crate::cuda::program::{PtxParam, check_ptx_entry_abi, kernel_params, ptx_entry_params};
 use crate::cuda::{CudaProgram, Launch, is_cubin, validate_cubin};
 use crate::device::{AbiParamDescriptor, Program};
 use crate::hcq::ClikeKernargLayout;
 
-/// The kernarg blob a launch hands the driver: pointers at 8-byte and scalars
-/// at 4-byte alignment in slot order, exactly PTX's `.param` layout.
+/// The kernarg blob a launch packs: pointers at 8-byte and scalars at 4-byte
+/// alignment in slot order, each handed to the driver by a `kernelParams`
+/// pointer to its bytes.
 #[test_case(vec![storage(0), storage(1), storage(2)], &[0x1000, 0x2000, 0x3000], &[], 24; "buffers only")]
 #[test_case(vec![storage(0), storage(1), scalar(2, "n")], &[0x1000, 0x2000], &[7], 20; "trailing scalar")]
 #[test_case(vec![scalar(0, "a"), storage(1)], &[0xABCD], &[-1], 16; "scalar then pointer pads")]
 #[test_case(vec![scalar(0, "a"), scalar(1, "b"), storage(2)], &[0x10], &[1, 2], 16; "two scalars pack")]
-fn kernarg_blob_follows_ptx_param_layout(abi: Vec<AbiParamDescriptor>, buffers: &[u64], vals: &[i64], size: usize) {
-    let layout = ClikeKernargLayout::from_abi(&abi);
+fn kernarg_blob_backs_one_kernel_param_per_argument(
+    abi: Vec<AbiParamDescriptor>,
+    buffers: &[u64],
+    vals: &[i64],
+    size: usize,
+) {
+    let layout = ClikeKernargLayout::from_abi(&abi).unwrap();
     assert_eq!(layout.packed_size(), size);
     let mut blob = vec![0u8; size];
     assert_eq!(layout.pack(&mut blob, buffers, vals).unwrap(), size);
+    let base = blob.as_ptr() as usize;
+    let arguments = kernel_params(&layout, &mut blob);
+    assert_eq!(arguments.len(), abi.len());
     let (mut cursor, mut buffer, mut val) = (0usize, 0usize, 0usize);
-    for param in &abi {
+    for (param, argument) in abi.iter().zip(arguments) {
+        let width = if param.is_storage() { 8 } else { 4 };
+        cursor = cursor.next_multiple_of(width);
+        assert_eq!(argument as usize - base, cursor);
+        // SAFETY: the pointer addresses `width` packed bytes of the live blob.
+        let bytes = unsafe { std::slice::from_raw_parts(argument.cast::<u8>(), width) };
         if param.is_storage() {
-            cursor = cursor.next_multiple_of(8);
-            assert_eq!(u64::from_le_bytes(blob[cursor..cursor + 8].try_into().unwrap()), buffers[buffer]);
+            assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), buffers[buffer]);
             buffer += 1;
-            cursor += 8;
         } else {
-            cursor = cursor.next_multiple_of(4);
-            assert_eq!(i32::from_le_bytes(blob[cursor..cursor + 4].try_into().unwrap()), vals[val] as i32);
+            assert_eq!(i32::from_le_bytes(bytes.try_into().unwrap()), vals[val] as i32);
             val += 1;
-            cursor += 4;
         }
+        cursor += width;
     }
-    let mut blob_size = blob.len();
-    let extra = extra_array(&mut blob, &mut blob_size);
-    assert_eq!(extra[0] as usize, 1);
-    assert_eq!(extra[1], blob.as_mut_ptr().cast());
-    assert_eq!(extra[2] as usize, 2);
-    assert_eq!(unsafe { *extra[3].cast::<usize>() }, size);
-    assert!(extra[4].is_null());
 }
 
 #[test]
@@ -210,20 +214,49 @@ fn load_rejects_an_abi_that_disagrees_with_the_ptx_entry() {
     assert!(CudaProgram::load_ptx(Arc::clone(&*dev), KERNELS_PTX.as_bytes(), "scale", &scale_abi()).is_ok());
 }
 
-/// `(name, byte width)` of every `.param` of the named entry, across
+fn scalar_params(names: &[(&str, usize)]) -> Option<Vec<(String, PtxParam)>> {
+    Some(names.iter().map(|(name, bytes)| (name.to_string(), PtxParam::Scalar(*bytes))).collect())
+}
+
+/// `(name, footprint)` of every `.param` of the named entry, across
 /// `.visible`/`.weak` prefixes, multi-line lists and name prefixes.
-#[test_case(KERNELS_PTX, "vadd" => Some(vec![("vadd_param_0".into(), Some(8)), ("vadd_param_1".into(), Some(8)), ("vadd_param_2".into(), Some(8))]); "visible entry, multi-line")]
-#[test_case(KERNELS_PTX, "scale" => Some(vec![("scale_param_0".into(), Some(8)), ("scale_param_1".into(), Some(8)), ("scale_param_2".into(), Some(4))]); "trailing u32 scalar")]
-#[test_case(KERNELS_PTX, "tile" => Some(vec![("tile_param_0".into(), Some(8))]); "one parameter")]
+#[test_case(KERNELS_PTX, "vadd" => scalar_params(&[("vadd_param_0", 8), ("vadd_param_1", 8), ("vadd_param_2", 8)]); "visible entry, multi-line")]
+#[test_case(KERNELS_PTX, "scale" => scalar_params(&[("scale_param_0", 8), ("scale_param_1", 8), ("scale_param_2", 4)]); "trailing u32 scalar")]
+#[test_case(KERNELS_PTX, "tile" => scalar_params(&[("tile_param_0", 8)]); "one parameter")]
 #[test_case(KERNELS_PTX, "va" => None; "entry name is a prefix")]
 #[test_case(KERNELS_PTX, "vadd_" => None; "entry name is longer")]
 #[test_case(".entry k()\n{ ret; }", "k" => Some(vec![]); "bare entry without parameters")]
-#[test_case(".weak .entry k(.param .u64 .ptr .align 1 k_param_0, .param .s32 k_param_1)\n{ ret; }", "k" => Some(vec![("k_param_0".into(), Some(8)), ("k_param_1".into(), Some(4))]); "weak entry, one line, pointer attributes")]
-#[test_case(".visible .entry k(\n\t.param .align 8 .b8 k_param_0[16],\n\t.param .f16 k_param_1\n)\n{ ret; }", "k" => Some(vec![("k_param_0".into(), None), ("k_param_1".into(), Some(2))]); "byte array has no scalar width")]
+#[test_case(".weak .entry k(.param .u64 .ptr .align 1 k_param_0, .param .s32 k_param_1)\n{ ret; }", "k" => scalar_params(&[("k_param_0", 8), ("k_param_1", 4)]); "weak entry, one line, pointer attributes")]
+#[test_case(".visible .entry k(\n\t.param .align 8 .b8 k_param_0[16],\n\t.param .f16 k_param_1\n)\n{ ret; }", "k" => Some(vec![("k_param_0".into(), PtxParam::Array { align: Some(8), bytes: 16 }), ("k_param_1".into(), PtxParam::Scalar(2))]); "byte array with its alignment")]
+#[test_case(".entry k(\n\t.param .align 64 .b8 k_param_0[128]\n)\n{ ret; }", "k" => Some(vec![("k_param_0".into(), PtxParam::Array { align: Some(64), bytes: 128 })]); "tensor map")]
+#[test_case(".entry k(.param .b32 k_param_0[4])\n{ ret; }", "k" => Some(vec![("k_param_0".into(), PtxParam::Array { align: None, bytes: 16 })]); "word array without alignment")]
+#[test_case(".entry k(.param .pred k_param_0)\n{ ret; }", "k" => Some(vec![("k_param_0".into(), PtxParam::Unknown)]); "unsized type")]
 #[test_case(".func f(.param .u64 f_param_0)\n{ ret; }", "f" => None; "func is not an entry")]
-#[test_case(".visible .entry k\n(\n.param .u64 k_param_0\n)\n{ ret; }", "k" => Some(vec![("k_param_0".into(), Some(8))]); "parenthesis on the next line")]
-fn ptx_entry_params_are_parsed_from_the_text(ptx: &str, entry: &str) -> Option<Vec<(String, Option<usize>)>> {
+#[test_case(".visible .entry k\n(\n.param .u64 k_param_0\n)\n{ ret; }", "k" => scalar_params(&[("k_param_0", 8)]); "parenthesis on the next line")]
+fn ptx_entry_params_are_parsed_from_the_text(ptx: &str, entry: &str) -> Option<Vec<(String, PtxParam)>> {
     ptx_entry_params(ptx, entry)
+}
+
+/// A tensor-map slot needs exactly a 64-aligned 128-byte array, and a
+/// pointer or scalar slot never takes an array.
+#[test_case(".align 64 .b8 k_param_1[128]" => true; "tensor map")]
+#[test_case(".align 16 .b8 k_param_1[128]" => false; "under-aligned")]
+#[test_case(".b8 k_param_1[128]" => false; "unaligned")]
+#[test_case(".align 64 .b8 k_param_1[64]" => false; "short")]
+#[test_case(".u64 k_param_1" => false; "a pointer")]
+#[test_case(".pred k_param_1" => false; "unsized")]
+fn ptx_entry_check_requires_the_tensor_map_footprint(map: &str) -> bool {
+    let ptx = format!(".entry k(.param .u64 k_param_0, .param {map}, .param .u64 k_param_2)\n{{ ret; }}");
+    let abi = [storage(0), crate::test::unit::hcq::tensor_map(1, 0), storage(2)];
+    check_ptx_entry_abi(&ptx, "k", &abi).is_ok()
+}
+
+#[test_case(".align 8 .b8 k_param_0[8]"; "array for a pointer")]
+#[test_case(".u32 k_param_0"; "narrow pointer")]
+fn ptx_entry_check_rejects_a_mismatched_pointer(param: &str) {
+    let ptx = format!(".entry k(.param {param})\n{{ ret; }}");
+    let error = check_ptx_entry_abi(&ptx, "k", &[storage(0)]).unwrap_err();
+    assert!(matches!(error, crate::Error::ProgramAbiMismatch { .. }), "{error:?}");
 }
 
 #[test]

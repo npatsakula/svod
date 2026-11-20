@@ -50,7 +50,7 @@ model code ──► svod_tk::ops          always a Tensor; picks a kernel and c
 | Target | Matrix core | Fills |
 |---|---|---|
 | CUDA sm_80+ | `mma.sync` m16n8k16, `ldmatrix` | `cp.async` |
-| CUDA sm_90 | `wgmma` जोड़ता है (GEMM और attention) | `cp.async` |
+| CUDA sm_90 | `wgmma` जोड़ता है (GEMM और attention) | `cp.async`; GEMM TMA भी |
 | AMD RDNA4 | WMMA 16×16×16 | registers, 1–2 slots |
 | AMD RDNA3 / 3.5 | WMMA 16×16×16 | registers, 1–2 slots |
 | AMD CDNA3 / 4 | MFMA 16×16×16, और attention के लिए 32×32×8; wave64 | registers, ping-pong में दो crews |
@@ -63,7 +63,7 @@ model code ──► svod_tk::ops          always a Tensor; picks a kernel and c
 ([Tuning](./tuning#benchmarks)): ये tuner के चुनाव को TFLOP/s में print करते हैं।
 
 :::note[इस रिलीज़ में नहीं]
-Hopper TMA और mbarrier producers (sm_90 `cp.async` से भरे जाने वाले `wgmma` चलाता है), Blackwell
+Hopper warp-specialized producers (sm_90 `cp.async` से भरे जाने वाले `wgmma` चलाता है, GEMM consumer threads से TMA द्वारा भी), Blackwell
 `tcgen05`, GEMM के लिए 32×32 MFMA, Apple kernels, fp8, nearest-neighbour search के अलावा int8, attention
 backward, और convolution का image-staged रूप। देखें [पोर्टेबिलिटी](./portability#not-in-this-release)।
 :::

@@ -236,7 +236,7 @@ impl AmdGraph {
                 buffer_count,
                 var_count,
                 record_size: program.kernarg_record_size(),
-                layout: crate::hcq::ClikeKernargLayout::from_abi(program.abi()),
+                layout: crate::hcq::ClikeKernargLayout::from_abi(program.abi())?,
             });
 
             let g = kernel.global_size.unwrap_or([1, 1, 1]);

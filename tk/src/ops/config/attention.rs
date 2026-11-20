@@ -262,6 +262,7 @@ impl AttentionProblem {
             stores: parts,
             out: 0.0,
             ring: stages,
+            ahead: stages.saturating_sub(1),
             unroll: cfg.unroll(),
             waits: 0.0,
             sections: [combine, Spread::default()],
@@ -316,7 +317,11 @@ impl AttentionProblem {
     /// where that can pay ([`Self::two_rows_pay`]), in their twins' order: a
     /// variant of a tile (its rows per warp are not part of it), so the
     /// shortlist holds the one-row representatives and the twins stage times
-    /// the variant beside them for the contender tiles.
+    /// the variant beside them for the contender tiles. A warpgroup ring
+    /// carries its bulk-filled twin ([`Schedule::Bulk`]) alike, where the
+    /// target fills in bulk and its key blocks tile the keys: a last block
+    /// past them would bring in the next sequence's values, whose zero
+    /// weights still carry a non-finite one into the output.
     pub(crate) fn ranked(&self, planner: &Planner) -> Vec<FaCfg> {
         let feasible = planner.feasible(self);
         let priced = |f: &Feasible<FaCfg>| planner.price_of(self, f).map(|(cost, regs)| (cost, regs, f.cfg));
@@ -328,7 +333,17 @@ impl AttentionProblem {
             .filter(|&(c, wide)| self.two_rows_pay(planner, &c, &wide))
             .map(|(_, wide)| wide)
             .collect::<Vec<_>>();
-        [one, two].concat()
+        let target = &planner.device.target;
+        let bulk = |c: &FaCfg| {
+            let tiled = self.tk.is_multiple_of(c.bkv);
+            let (depth, unroll, _) =
+                c.schedule.as_ring().filter(|_| c.core == Core::Group && c.key_warps == 1 && tiled)?;
+            let twin = FaCfg { schedule: Schedule::bulk(depth, unroll), ..*c };
+            let fits = target.sync.slot_barrier && twin.smem_bytes(self.d, self.bias) <= target.smem_bytes;
+            fits.then_some(twin)
+        };
+        let bulk = one.iter().filter_map(bulk).collect();
+        [one, bulk, two].concat()
     }
 
     /// Whether `wide`, `one` at two atom rows per warp, can pay: the

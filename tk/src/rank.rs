@@ -720,9 +720,10 @@ fn dtype_of(name: &str) -> Option<ScalarDType> {
 }
 
 /// The offline target of a device's name in the store ([`tune::device`]):
-/// its arch and SM count, the dies of its arch's first listed card.
-fn target(device: &str) -> Option<Target> {
-    let (arch, sms) = device.rsplit_once('-')?;
+/// its arch, SM count and model, the dies of its arch's first listed card.
+pub(crate) fn target(device: &str) -> Option<Target> {
+    let mut fields = device.splitn(3, '-');
+    let (arch, sms, model) = (fields.next()?, fields.next()?, fields.next());
     let sms = sms.strip_suffix("sm")?.parse().ok()?;
     let arch = match AmdArch::parse(arch) {
         Some(a) => GpuArch::Amd(a),
@@ -735,7 +736,7 @@ fn target(device: &str) -> Option<Target> {
         },
         |c| c.3,
     );
-    let target = Target::offline(arch, sms, xcds);
+    let target = Target { model: model.map(str::to_string), ..Target::offline(arch, sms, xcds) };
     (tune::device(&target) == device).then_some(target)
 }
 

@@ -44,15 +44,18 @@ pub struct Linear<'a> {
 
 /// A rotary embedding of the output's first `heads` heads of `head_dim`
 /// columns by `(cos, sin)` tables of `[1, T, 1, head_dim / 2]`, row `t` of
-/// `x [B, T, K]` at position `t`, as `apply_rotary_emb` rotates split
-/// halves: a fused projection's queries and keys turned in place, its values
-/// after them stored as they are.
+/// `x [B, T, K]` at position `t`, or of `[B, T, 1, head_dim / 2]` by token, as
+/// `apply_rotary_emb` rotates split halves: a fused projection's queries and
+/// keys turned in place, its values after them stored as they are.
 #[derive(Clone, Copy, Debug)]
 pub struct Rotary<'a> {
     pub cos: &'a Tensor,
     pub sin: &'a Tensor,
     pub heads: usize,
     pub head_dim: usize,
+    /// A `[heads·head_dim]` weight and an `eps`: each turned head is
+    /// RMS-normalized over `head_dim` before the turn.
+    pub norm: Option<(&'a Tensor, f64)>,
 }
 
 const OP: &str = "linear";
@@ -82,14 +85,19 @@ pub fn linear(x: &Tensor, w: &Tensor, opts: Linear) -> Result<Tensor> {
         let got = shape(residual)?;
         ensure!(got == out, shape_err("residual", &got, fmt_shape(&out)));
     }
-    if let Some(Rotary { cos, sin, heads, head_dim }) = opts.rope {
+    if let Some(Rotary { cos, sin, heads, head_dim, norm }) = opts.rope {
         ensure!(xs.len() == 3 && !opts.gated, shape_err("x", &xs, "[B, T, K] under a plain weight".into()));
         let fits = head_dim > 0 && head_dim.is_multiple_of(2) && n.as_const().is_some_and(|n| heads * head_dim <= n);
         ensure!(fits, shape_err("w", &ws, format!("[≥ {heads}·{head_dim}, {k}] of even heads")));
         let table = vec![SInt::Const(1), xs[1].clone(), SInt::Const(1), SInt::Const(head_dim / 2)];
         for (operand, t) in [("cos", cos), ("sin", sin)] {
             let got = shape(t)?;
-            ensure!(got == table, shape_err(operand, &got, fmt_shape(&table)));
+            let by_token = got[1..] == table[1..] && got.first() == xs.first();
+            ensure!(got == table || by_token, shape_err(operand, &got, fmt_shape(&table)));
+        }
+        if let Some((weight, _)) = norm {
+            let got = shape(weight)?;
+            ensure!(got == [SInt::Const(heads * head_dim)], shape_err("norm", &got, format!("[{heads}·{head_dim}]")));
         }
     }
 
@@ -137,9 +145,17 @@ pub fn linear(x: &Tensor, w: &Tensor, opts: Linear) -> Result<Tensor> {
     if opts.rope.is_some() && !(opts.act == Act::None && opts.residual.is_none() && opts.scale.is_none()) {
         return graph(x, w, opts).context(GraphSnafu { op: OP });
     }
-    let tables = |r: &Rotary| r.cos.dtype() == x.dtype() && r.sin.dtype() == x.dtype();
-    let seq = ext.dims[ext.dims.len() - 2];
-    let rope = opts.rope.filter(|r| tables(r)).map(|r| Rope { heads: r.heads, head_dim: r.head_dim, seq });
+    // Tables by token hold a row per output row: a static batch's alone.
+    let tables = |r: &Rotary| {
+        let by_token = r.cos.dim(0).is_ok_and(|b| b != SInt::Const(1));
+        let stream = [Some(r.cos), Some(r.sin), r.norm.map(|(w, _)| w)];
+        stream.into_iter().flatten().all(|t| t.dtype() == x.dtype()) && !(by_token && ext.var)
+    };
+    let rope = opts.rope.filter(tables).map(|r| {
+        let by_token = r.cos.dim(0).is_ok_and(|b| b != SInt::Const(1));
+        let seq = if by_token { m } else { ext.dims[ext.dims.len() - 2] };
+        Rope { heads: r.heads, head_dim: r.head_dim, seq, norm: r.norm.map(|(_, eps)| Scale::new(eps as f32)) }
+    });
     let cfgs: Vec<GemmCfg> = match rope {
         Some(rope) => {
             let batches = if ext.var { lead[0] } else { 1 };
@@ -176,7 +192,8 @@ pub fn linear(x: &Tensor, w: &Tensor, opts: Linear) -> Result<Tensor> {
     // The tables bind only where the kernel turns: `epilogue.rope` is the
     // kernel's own word for it (`opts.rope` may have fallen back to the
     // graph's rotation).
-    let (cos, sin) = spec.epilogue.rope.zip(opts.rope).map(|(_, r)| (r.cos, r.sin)).unzip();
+    let turn = spec.epilogue.rope.zip(opts.rope).map(|(_, r)| r);
+    let (cos, sin, norm) = (turn.map(|r| r.cos), turn.map(|r| r.sin), turn.and_then(|r| r.norm).map(|(w, _)| w));
     let mut programs = programs(&spec, &x.dtype(), &planner);
     let ranges = Ranges { x: channels(xw, k), residual: channels(rw, n), y: channels(cw, n) };
     match tail(&spec, &planner) {
@@ -184,8 +201,8 @@ pub fn linear(x: &Tensor, w: &Tensor, opts: Linear) -> Result<Tensor> {
         None => {
             let (prog, lowering) = programs.remove(0);
             let Ranges { x: xc, residual: rc, y: yc } = ranges;
-            let ins = [Some(&x), Some(w), opts.bias, residual, cos, sin, Some(&y)];
-            launched(prog, &lowering, &ins, [xc, None, None, rc, None, None, yc])
+            let ins = [Some(&x), Some(w), opts.bias, residual, cos, sin, norm, Some(&y)];
+            launched(prog, &lowering, &ins, [xc, None, None, rc, None, None, None, yc])
         }
     }
 }
@@ -330,14 +347,19 @@ pub(crate) fn graph(x: &Tensor, w: &Tensor, opts: Linear) -> svod_tensor::error:
     }
 }
 
-/// `y [B, T, N]` with its first heads rotated as `rope` says.
+/// `y [B, T, N]` with its first heads normed and rotated as `rope` says.
 fn turned(y: &Tensor, rope: Rotary) -> svod_tensor::error::Result<Tensor> {
-    let Rotary { cos, sin, heads, head_dim } = rope;
+    let Rotary { cos, sin, heads, head_dim, norm } = rope;
     let (b, t, n) = (y.dim(0)?, y.dim(1)?, y.dim_const(2)?);
     let width = heads * head_dim;
     let turn = |part: &Tensor| -> svod_tensor::error::Result<Tensor> {
         let split = [b.clone(), t.clone(), SInt::Const(heads), SInt::Const(head_dim)];
-        part.try_reshape(split)?.apply_rotary_emb(cos, sin, false)?.try_reshape([b.clone(), t.clone(), width.into()])
+        let part = part.try_reshape(split)?;
+        let part = match norm {
+            Some((w, eps)) => part.rms_norm(-1, eps)?.try_mul(&w.try_reshape([heads, head_dim])?)?,
+            None => part,
+        };
+        part.apply_rotary_emb(cos, sin, false)?.try_reshape([b.clone(), t.clone(), width.into()])
     };
     if width == n {
         return turn(y);

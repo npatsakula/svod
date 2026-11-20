@@ -2,6 +2,7 @@
 //! lane moves a reduction or an exchange issues.
 
 use svod_codegen::llvm::nvptx::ops::shfl_bfly;
+use svod_dtype::GpuArch;
 use svod_ir::ConstValue;
 
 use crate::atoms::LaneMove;
@@ -63,7 +64,7 @@ impl Emit<'_> {
                         BinaryOp::Add => x.try_add(&y),
                         BinaryOp::Sub => x.try_sub(&y),
                         BinaryOp::Mul | BinaryOp::Scale => x.try_mul(&y),
-                        BinaryOp::Div if x.dtype().is_float() => x.try_div(&y),
+                        BinaryOp::Div if x.dtype().is_float() => Ok(self.quotient(&x, &y)),
                         BinaryOp::Div => x.try_cdiv(&y),
                         BinaryOp::Max => x.try_max(&y),
                         BinaryOp::Min => minimum(&x, &y),
@@ -291,14 +292,26 @@ impl Emit<'_> {
     }
 
     /// `2^x`. Where the target has [`crate::atoms::Target::hardware_exp2`], an f32
-    /// one is the hardware instruction alone (`v_exp_f32`), without the
-    /// range reduction LLVM wraps `llvm.exp2` in to keep results below 2^-126
-    /// denormal: those flush to zero, which no kernel tells apart.
+    /// one is the hardware instruction alone (`v_exp_f32`,
+    /// `ex2.approx.ftz.f32`), without the range reduction LLVM wraps
+    /// `llvm.exp2` in to keep results below 2^-126 denormal: those flush to
+    /// zero, which no kernel tells apart.
     pub(super) fn exp2(&mut self, x: &Arc<UOp>) -> Arc<UOp> {
-        if self.low.device.target.hardware_exp2 && x.dtype() == DType::Float32 {
-            super::amdgpu::exp2_f32(x)
-        } else {
-            x.try_exp2().expect("exp2")
+        let target = &self.low.device.target;
+        match target.arch {
+            GpuArch::Amd(_) if target.hardware_exp2 && x.dtype() == DType::Float32 => super::amdgpu::exp2_f32(x),
+            GpuArch::Cuda(_) if target.hardware_exp2 && x.dtype() == DType::Float32 => super::nvptx::exp2_f32(x),
+            _ => x.try_exp2().expect("exp2"),
+        }
+    }
+
+    /// `x / y` of floats: an f32 one the hardware's approximate quotient
+    /// where the target has [`crate::atoms::Target::approx_div`].
+    fn quotient(&self, x: &Arc<UOp>, y: &Arc<UOp>) -> Arc<UOp> {
+        let target = &self.low.device.target;
+        match target.arch {
+            GpuArch::Cuda(_) if target.approx_div && x.dtype() == DType::Float32 => super::nvptx::div_f32(x, y),
+            _ => x.try_div(y).expect("quotient"),
         }
     }
 

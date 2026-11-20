@@ -119,6 +119,9 @@ fn preserve_program_context(new_program: Arc<UOp>, old_program: &Arc<UOp>) -> Ar
 
 fn param_class(node: &Arc<UOp>) -> String {
     let Op::Param(ops::Param { arg, .. }) = node.op() else { return format!("{:?}", node.op()) };
+    if let Some(map) = &arg.tensor_map {
+        return format!("tensor-map PARAM over slot {}", map.buffer);
+    }
     match arg.addrspace {
         None if arg.name.as_deref() == Some("_device_num") => "device scalar PARAM".to_string(),
         None => format!("scalar PARAM {}", arg.name.as_deref().unwrap_or("<unnamed>")),
@@ -401,7 +404,7 @@ pub fn do_render(program: &Arc<UOp>, renderer: &dyn Renderer) -> Result<(Arc<UOp
     let rendered_vars = rendered_spec
         .abi
         .iter()
-        .filter(|param| !param.is_storage())
+        .filter(|param| param.is_scalar())
         .map(|param| param.name.clone().unwrap_or_default())
         .collect::<Vec<_>>();
     let rendered_buffers = rendered_spec.abi.iter().filter(|param| param.is_storage()).count();

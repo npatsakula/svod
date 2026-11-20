@@ -104,7 +104,7 @@ cargo run -p svod-tk --release --example tk_dump -- --card h100-pcie --op gemm -
 cargo run -p svod-tk --release --example tk_dump -- --arch gfx942 --op attention --shape 8x16x1024x128 --causal --store DIR
 ```
 
-`--card` принимает имя из `atoms::CARDS` (`rtx3060`, `h100-pcie`, `h100-sxm`, `rtx5070`,
+`--card` принимает имя из `atoms::CARDS` (`rtx3060`, `h100-pcie`, `h100-sxm`, `h200-sxm`, `h200-nvl`, `rtx5070`,
 `rtx5090`, `mi300x`, `mi355x`, `rx9070xt`, `strix-halo`); `--arch` принимает архитектуру с
 `--sms`/`--xcds` или с параметрами первой карты из списка. `--store` — каталог хранилища
 тюнинга, скопированный с карты, строки проб которого задают цены ранжирования; без него это

@@ -5,7 +5,7 @@
 use std::fmt;
 use std::num::NonZeroUsize;
 
-use super::{Act, Admits, Admitted, Batch, Spec, Window, Windows, batch_offset, bound, konst, load_f32};
+use super::{Act, Admits, Admitted, Batch, Spec, Window, Windows, affine, batch_offset, bound, konst, load_f32};
 use crate::atoms::{Core, Device};
 use crate::build::*;
 use crate::ir::*;
@@ -41,15 +41,31 @@ impl Epilogue {
 /// position `m % seq`: a head's halves turn together as `apply_rotary_emb`
 /// turns split halves, `x₁·cos − x₂·sin` and `x₂·cos + x₁·sin`. The columns
 /// after them (a fused projection's values) are stored as they are.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Rope {
     pub heads: usize,
     pub head_dim: usize,
     pub seq: usize,
+    /// Each turned head is RMS-normalized over `head_dim` under this `eps`
+    /// and a `[heads·head_dim]` weight before the turn (a `norm` parameter
+    /// after the tables).
+    pub norm: Option<Scale>,
 }
 
-/// A [`Rope`] with its cos and sin tables.
-type Turn<'k, T> = (Rope, ParamRef<'k, T, In>, ParamRef<'k, T, In>);
+/// The tune store keys by this text: a turn without a norm reads as before it.
+impl fmt::Debug for Rope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut s = f.debug_struct("Rope");
+        s.field("heads", &self.heads).field("head_dim", &self.head_dim).field("seq", &self.seq);
+        if let Some(eps) = self.norm {
+            s.field("norm", &eps);
+        }
+        s.finish()
+    }
+}
+
+/// A [`Rope`] with its cos and sin tables and its norm's weight.
+type Turn<'k, T> = (Rope, ParamRef<'k, T, In>, ParamRef<'k, T, In>, Option<ParamRef<'k, T, In>>);
 
 /// The tune store keys by this text: the fields at their default (no scale,
 /// a 16-bit output, no rope) are left out.
@@ -71,7 +87,7 @@ impl fmt::Debug for Epilogue {
     }
 }
 
-/// An f32 output scale, compared and hashed by its bits.
+/// An f32 output scale (or a norm's `eps`), compared and hashed by its bits.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Scale(u32);
 
@@ -91,8 +107,22 @@ impl fmt::Debug for Scale {
     }
 }
 
+/// How a block's output tile reaches global memory.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Store {
+    /// From the accumulators' layout, a product's short runs each a store.
+    #[default]
+    Direct,
+    /// Through the operand ring, dead once the reduction ends, and back in
+    /// the natural layout: whole 16-byte stores ([`GemmCfg::stages_output`]).
+    Staged,
+    /// Through the ring alike, and from it in bulk ([`Kernel::flush`]) where
+    /// the tile lies within the output; a tile across its edge is `Staged`.
+    Bulk,
+}
+
 /// The tune store keys by this text ([`Schedule`]'s included, the
-/// [`TileOrder`] only off its default).
+/// [`TileOrder`] and the [`Store`] only off their defaults).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GemmCfg {
     /// `[bm, bn, bk]`.
@@ -109,11 +139,12 @@ pub struct GemmCfg {
     /// The last, partial wave of tiles split along K ([`TailPlan`]); every
     /// tile data-parallel where `None`.
     pub tail: Option<TailSplit>,
+    pub store: Store,
 }
 
-/// The raster prints only off [`TileOrder::DEFAULT`] and the tail split
-/// only where there is one, so a ranking's text names them only where a
-/// config differs.
+/// The raster prints only off [`TileOrder::DEFAULT`], the tail split only
+/// where there is one and the store only where staged, so a ranking's text
+/// names them only where a config differs.
 impl fmt::Debug for GemmCfg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut s = f.debug_struct("GemmCfg");
@@ -124,6 +155,9 @@ impl fmt::Debug for GemmCfg {
         }
         if let Some(tail) = self.tail {
             s.field("tail", &tail);
+        }
+        if self.store != Store::Direct {
+            s.field("store", &self.store);
         }
         s.finish()
     }
@@ -346,12 +380,28 @@ impl GemmCfg {
         (head_dim / 2).is_power_of_two() && bn.is_multiple_of(head_dim) && warp_cols.is_multiple_of(head_dim)
     }
 
+    /// Whether the tile carries `rope`: [`Self::turns`] its heads, a normed
+    /// head's row within one warp (its sum of squares crosses none).
+    pub fn carries(&self, rope: &Rope) -> bool {
+        self.turns(rope.head_dim) && (rope.norm.is_none() || self.warps[1] == 1)
+    }
+
+    /// Whether the ring's larger operand allocation, over elements of
+    /// `bytes` bytes, holds the output tile whatever its type (f32 the
+    /// widest), so the tile may be [`Store::Staged`] through it.
+    pub fn stages_output(&self, bytes: usize) -> bool {
+        let [bm, bn, bk] = self.tile;
+        self.stages() * bm.max(bn) * bk * bytes >= bm * bn * F32::DTYPE.bytes()
+    }
+
     /// Static shared memory of the operand ring over elements of `bytes`
     /// bytes: what [`mainloop`] allocates, a slot of the A tile and of
     /// each B tile (two gated) per stage.
     pub fn smem_bytes(&self, gated: bool, bytes: usize) -> usize {
         let [bm, bn, bk] = self.tile;
-        self.stages() * (bm + bn * if gated { 2 } else { 1 }) * bk * bytes
+        // A ring filled in bulk holds its slots' barriers, an aligned kilobyte.
+        let barriers = if matches!(self.schedule, Schedule::Bulk { .. }) { 1024 } else { 0 };
+        self.stages() * (bm + bn * if gated { 2 } else { 1 }) * bk * bytes + barriers
     }
 }
 
@@ -526,7 +576,8 @@ fn build<'k, T: MmaIn, U: Elem>(
         let plain = Epilogue { bias: epi.bias, rope: epi.rope, ..Epilogue::DEFAULT };
         assert!(epi == plain && rope.heads * rope.head_dim <= n, "{epi:?} turns no more than a bias");
         let table = rope.seq * rope.head_dim / 2;
-        (rope, k.input::<T>("cos", table), k.input::<T>("sin", table))
+        let (cos, sin) = (k.input::<T>("cos", table), k.input::<T>("sin", table));
+        (rope, cos, sin, rope.norm.map(|_| k.input::<T>("norm", rope.heads * rope.head_dim)))
     });
     // A run's partials take a slot a tile; the whole grid's, the output's shape.
     let slots = match tiles {
@@ -551,13 +602,20 @@ fn build<'k, T: MmaIn, U: Elem>(
     let schedule = cfg.schedule;
     let first_step = partial.then(|| bb.clone().expect("the split index") * (trips / split));
     let sa = Shape::new(bm, bk);
-    let accs = if epi.gated {
+    let (accs, ring) = if epi.gated {
         let halves = [b_view(k, 0), b_view(k, 1)];
-        Vec::from(mainloop(k, sa, &a_tile, halves, trips / split, schedule, bk, first_step, cfg.slices()))
+        let (accs, ring) = mainloop(k, sa, &a_tile, halves, trips / split, schedule, bk, first_step, cfg.slices());
+        (Vec::from(accs), ring)
     } else {
         let whole = [b_view(k, 0)];
-        Vec::from(mainloop(k, sa, &a_tile, whole, trips / split, schedule, bk, first_step, cfg.slices()))
+        let (accs, ring) = mainloop(k, sa, &a_tile, whole, trips / split, schedule, bk, first_step, cfg.slices());
+        (Vec::from(accs), ring)
     };
+    assert!(
+        cfg.store == Store::Direct || (!partial && cfg.stages_output(T::DTYPE.bytes())),
+        "{cfg:?} stages no output"
+    );
+    let staged = (cfg.store != Store::Direct).then_some((ring, cfg.store == Store::Bulk));
     let accs = accs.into_iter().map(|acc| T::widened(k, acc)).collect();
     let tile = Tile2 { m, n, bm, bn, row0, col0, bounds: [bound(m, bm), bound(n, bn)] };
     let dest = match slots {
@@ -567,7 +625,7 @@ fn build<'k, T: MmaIn, U: Elem>(
         }
         None => Dest::Tile(c, cw),
     };
-    finish::<T, U>(k, accs, epi, bias, residual.map(|r| (r, rw)), rope, dest, &bb, &tile);
+    finish::<T, U>(k, accs, epi, bias, residual.map(|r| (r, rw)), rope, dest, &bb, &tile, staged);
 }
 
 /// Where a block's `[bm, bn]` output tile sits in an `[m, n]` output, and
@@ -600,7 +658,9 @@ enum Dest<'k, U> {
     Slot(ParamRef<'k, U, Out>, Sc<'k>),
 }
 
-/// The epilogue on the f32 accumulators (two when gated) and the store.
+/// The epilogue on the f32 accumulators (two when gated) and the store,
+/// through the ring `staged` where the tile is [`Store::Staged`], in bulk
+/// from it where its flag is set ([`Store::Bulk`]).
 #[allow(clippy::too_many_arguments)]
 fn finish<'k, T: Elem, U: Elem>(
     k: &mut Kernel<'k>,
@@ -612,6 +672,7 @@ fn finish<'k, T: Elem, U: Elem>(
     c: Dest<'k, U>,
     bb: &Option<Sc<'k>>,
     t: &Tile2<'k>,
+    staged: Option<(Ring<'k, T>, bool)>,
 ) {
     let Tile2 { n, bn, ref col0, ref bounds, .. } = *t;
     let n_bound = bounds[1].clone();
@@ -634,8 +695,8 @@ fn finish<'k, T: Elem, U: Elem>(
         let s = konst(k, out, f64::from(scale.get()));
         out = k.binary(out, s, BinaryOp::Mul);
     }
-    if let Some((rope, cos, sin)) = rope {
-        out = turn(k, out, rope, cos, sin, t);
+    if let Some(rope) = rope {
+        out = turn(k, out, rope, t);
     }
     if let Some((residual, w)) = residual {
         let r = tile(k, residual, w, bb, t);
@@ -643,11 +704,34 @@ fn finish<'k, T: Elem, U: Elem>(
         out = k.binary(out, r, BinaryOp::Add);
     }
     let out = k.cast::<F32, U>(out);
+    let window = if let Dest::Tile(c, w) = &c { Some((*c, *w)) } else { None };
     let c_view = match c {
         Dest::Tile(c, w) => tile(k, c, w, bb, t),
         Dest::Slot(c, at) => k.view(c, at, [bn, 1], Shape::new(t.bm, bn), t.within()),
     };
-    k.store(c_view, out);
+    let Some((ring, bulk)) = staged else { return k.store(c_view, out) };
+    // SAFETY: the reduction's pipeline, the ring's only one, has ended.
+    let scratch = unsafe { k.ring_scratch::<U>(ring, 0, Shape::new(t.bm, bn)) };
+    k.store(scratch, out);
+    let natural = |k: &mut Kernel<'k>| {
+        let out = k.load(scratch);
+        k.store(c_view, out);
+    };
+    let Some((c, w)) = window.filter(|_| bulk) else { return natural(k) };
+    let whole = |k: &mut Kernel<'k>| {
+        let c_view =
+            tile(k, c, w, bb, &Tile2 { bounds: [None, None], row0: t.row0.clone(), col0: t.col0.clone(), ..*t });
+        k.flush(c_view, scratch);
+    };
+    // A tile within the output on both axes; one across an edge is cut there.
+    let within = [(&t.bounds[0], &t.row0, t.bm), (&t.bounds[1], &t.col0, bn)]
+        .into_iter()
+        .filter_map(|(bound, at, len)| Some((at.clone() + len).le(bound.clone()?)))
+        .reduce(|a, b| a.and(b));
+    match within {
+        Some(within) => k.if_(within, whole, natural),
+        None => whole(k),
+    }
 }
 
 /// The block's `[bm, bn]` tile of an `[m, n]` parameter laid out in `w`.
@@ -666,13 +750,12 @@ fn tile<'k, U: Elem, A: Access>(
 /// [`Epilogue::rope`] on the output tile `x`, in a tile holding rotated
 /// columns: `x·cos + x'·sin`, `x'` the element half a head along
 /// ([`Kernel::flip`]) and `sin` negated over a head's first half.
-/// A tile across the last rotated head keeps `x` past it.
+/// A tile across the last rotated head keeps `x` past it. A normed head
+/// ([`Rope::norm`]) is normalized first.
 fn turn<'k, T: Elem>(
     k: &mut Kernel<'k>,
-    x: Regs<'k, F32>,
-    rope: Rope,
-    cos: ParamRef<'k, T, In>,
-    sin: ParamRef<'k, T, In>,
+    kept: Regs<'k, F32>,
+    (rope, cos, sin, norm): Turn<'k, T>,
     t: &Tile2<'k>,
 ) -> Regs<'k, F32> {
     let Tile2 { bm, bn, ref row0, ref col0, .. } = *t;
@@ -680,6 +763,10 @@ fn turn<'k, T: Elem>(
     let [y] = k.select_if(
         col0.clone().lt(turned),
         |k| {
+            let x = match rope.norm.zip(norm) {
+                Some((eps, w)) => normed(k, kept, rope.head_dim, f64::from(eps.get()), (w, turned), t),
+                None => kept,
+            };
             // Every head of row `r` reads the table row of its position.
             let table = |k: &mut Kernel<'k>, p: ParamRef<'k, T, In>| {
                 let at = (row0.clone() + k.row()) % rope.seq * half;
@@ -710,11 +797,52 @@ fn turn<'k, T: Elem>(
             let at = k.coord(whole, Axis::Col);
             let end = k.splat::<I32>(whole, Sc::from(turned) - col0.clone());
             let inside = k.compare(at, end, CmpOp::Lt);
-            [k.where_(inside, y, x)]
+            [k.where_(inside, y, kept)]
         },
-        |_| [x],
+        |_| [kept],
     );
     y
+}
+
+/// The tile `x` with each head of `d` columns RMS-normalized along its row
+/// and weighted by its columns of `w [turned]`: `x · rsqrt(mean(x²) + eps) · w`.
+fn normed<'k, T: Elem>(
+    k: &mut Kernel<'k>,
+    x: Regs<'k, F32>,
+    d: usize,
+    eps: f64,
+    (w, turned): (ParamRef<'k, T, In>, usize),
+    t: &Tile2<'k>,
+) -> Regs<'k, F32> {
+    let Tile2 { bm, bn, ref col0, .. } = *t;
+    let whole = Shape::new(bm, bn);
+    let sq = k.binary(x, x, BinaryOp::Mul);
+    let scaled = |k: &mut Kernel<'k>, sq: Regs<'k, F32>| {
+        let sum = k.reduce(sq, Axis::Row, ReduceOp::Sum);
+        let var = affine(k, sum, 1.0 / d as f64, eps);
+        let inv = k.unary(var, UnaryOp::Rsqrt);
+        k.binary(x, inv, BinaryOp::Mul)
+    };
+    let y = if bn == d {
+        scaled(k, sq)
+    } else {
+        // A head's sum takes its own columns of the row.
+        let col = k.coord(whole, Axis::Col);
+        let width = k.splat::<I32>(whole, Sc::from(d));
+        let head = k.binary(col, width, BinaryOp::Div);
+        let zero = konst(k, x, 0.0);
+        (0..bn / d).fold(zero, |y, h| {
+            let at = k.splat::<I32>(whole, Sc::from(h));
+            let own = k.compare(head, at, CmpOp::Eq);
+            let sq = k.where_(own, sq, zero);
+            let scaled = scaled(k, sq);
+            k.where_(own, scaled, y)
+        })
+    };
+    let v = k.view(w, 0, [0, 1], Shape::new(1, bn), [None, bound(turned, bn)]);
+    let v = k.at(v, 0, col0.clone());
+    let w = load_f32(k, v);
+    k.binary(y, w, BinaryOp::Mul)
 }
 
 /// The second program of a split reduction: `c = epilogue(Σ_z partial[z])`
@@ -804,7 +932,7 @@ fn merge_body<'k, T: Elem, U: Elem>(k: &mut Kernel<'k>, spec: &SplitMergeSpec) {
             (sum, tile)
         }
     };
-    finish::<T, U>(k, vec![sum], epi, bias, residual.map(|r| (r, rw)), None, Dest::Tile(c, cw), &None, &tile);
+    finish::<T, U>(k, vec![sum], epi, bias, residual.map(|r| (r, rw)), None, Dest::Tile(c, cw), &None, &tile, None);
 }
 
 /// The sum of the `split` f32 partials `part` views at each split.
@@ -826,7 +954,8 @@ fn summed<'k>(
 /// The K-streaming pipeline: the `sa`-shaped A tile `a(step, step·bk)` and
 /// `N` B tiles per step into shared rings run as `schedule` says, each
 /// operand of a slot held as `slices` k-slices ([`GemmCfg::slices`]), one
-/// accumulator per B ([`MmaIn::Acc`]).
+/// accumulator per B ([`MmaIn::Acc`]); with them, the ring's larger operand
+/// allocation, scratch once the pipeline has ended.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn mainloop<'k, T: MmaIn, const N: usize>(
     k: &mut Kernel<'k>,
@@ -838,13 +967,13 @@ pub(super) fn mainloop<'k, T: MmaIn, const N: usize>(
     bk: usize,
     first_step: Option<Sc<'k>>,
     slices: usize,
-) -> [Acc<'k, T::Acc>; N] {
+) -> ([Acc<'k, T::Acc>; N], Ring<'k, T>) {
     let sb = k.shape(bs[0]);
     let (sa_s, sb_s) = (Shape::new(sa.rows, bk / slices), Shape::new(sb.rows, bk / slices));
     let a_s = k.ring::<T>("a_s", sa.elems(), schedule);
     let b_s = [(); N].map(|()| k.ring::<T>("b_s", sb.elems(), schedule));
     let init = [(); N].map(|()| k.zeros::<T::Acc>(Shape::new(sa.rows, sb.rows)));
-    k.pipeline(
+    let accs = k.pipeline(
         trips,
         a_s,
         init,
@@ -877,5 +1006,6 @@ pub(super) fn mainloop<'k, T: MmaIn, const N: usize>(
             }
             accs
         },
-    )
+    );
+    (accs, if sa.rows >= sb.rows { a_s } else { b_s[0] })
 }

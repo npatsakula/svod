@@ -3,8 +3,9 @@
 //! ring (the sync pass fences only where the ring meets the code around it);
 //! the author's `produce`/`consume` bodies are placed, never edited.
 
-use crate::atoms::{Core, Fill};
+use crate::atoms::{Core, Fill, GroupMmaAtom, SyncCaps};
 use crate::ir::*;
+use crate::lower::bulk;
 
 /// The highest issue priority a wave takes (`s_setprio 3`), a crew's over
 /// its products.
@@ -24,21 +25,44 @@ const RAISED: u8 = 3;
 /// trip stops touching shared memory and waits at the trip's end
 /// ([`Expander::register_staged`]). Each loop a template places is tagged
 /// with the trip it runs ([`Loop::trip`]). The result's phase has no
-/// pipeline statement.
-pub fn expand(prog: Program, fill: Fill, core: Core, split: bool) -> Program<Expanded> {
+/// pipeline statement. A ring filled in bulk ([`Schedule::Bulk`]) fills its
+/// slots so where the target has slot barriers ([`Expander::bulk`]), and is
+/// the plain ring elsewhere.
+pub fn expand(prog: Program, fill: Fill, core: Core, sync: SyncCaps) -> Program<Expanded> {
     let (mut out, body) = prog.rephase(|_, ()| (), ());
-    out.body = Expander { prog: &mut out, fill, core, split, scope: Scope::Block }.block(body);
+    out.body = Expander { prog: &mut out, fill, core, sync, scope: Scope::Block, repeated: false }.block(body);
     out
+}
+
+/// A ring's fill in bulk ([`Expander::bulk`]).
+struct BulkFill {
+    /// The barrier of the slot a trip produces into.
+    bar: SlotBar,
+    /// The parity of the phase a trip's consume waits for.
+    phase: ScalarId,
+    /// The bytes a trip's bulk copies move.
+    bytes: u32,
+    /// The produce's statements that are those copies.
+    moved: Vec<usize>,
+    /// Every slot's barrier made, ahead of the ring.
+    inits: Vec<Stmt<Expanded>>,
+    /// Where the ring's threads leave their slots ([`Expander::left`]): the
+    /// barrier of the slot a consume read, the one a produce refills and
+    /// the parity it waits for.
+    left: Option<(SlotBar, SlotBar, ScalarId)>,
 }
 
 struct Expander<'p> {
     prog: &'p mut Program<Expanded>,
     fill: Fill,
     core: Core,
-    split: bool,
+    sync: SyncCaps,
     /// Whose barriers a pipeline's template emits: the block's, or one
     /// warp's own inside a [`Stmt::Warps`].
     scope: Scope,
+    /// Whether the statement expanded runs more than once a block: inside a
+    /// loop or a pipeline's stage.
+    repeated: bool,
 }
 
 impl Expander<'_> {
@@ -69,9 +93,10 @@ impl Expander<'_> {
     /// its template's statements.
     fn stmt(&mut self, stmt: Stmt) -> Vec<Stmt<Expanded>> {
         let scope = if matches!(stmt, Stmt::Warps { .. }) { Scope::Warp } else { self.scope };
-        let outer = std::mem::replace(&mut self.scope, scope);
+        let repeated = self.repeated || matches!(stmt, Stmt::Loop(_));
+        let outer = (std::mem::replace(&mut self.scope, scope), std::mem::replace(&mut self.repeated, repeated));
         let mapped = stmt.map(&mut |b| self.block(b), &mut |_, op| op.map(|orient| orient, |()| ()));
-        self.scope = outer;
+        (self.scope, self.repeated) = outer;
         match mapped {
             Ok(stmt) => vec![stmt],
             Err(p) => self.pipeline(p),
@@ -84,19 +109,24 @@ impl Expander<'_> {
 
     fn pipeline(&mut self, p: Pipeline) -> Vec<Stmt<Expanded>> {
         let Pipeline { extent, schedule, carried, produce, consume } = p;
+        let outer = std::mem::replace(&mut self.repeated, true);
         let produce = Stage { step: produce.step, slot: produce.slot, body: self.block(produce.body) };
         let consume = Stage { step: consume.step, slot: consume.slot, body: self.block(consume.body) };
-        let Schedule::Ring { depth, unroll } = schedule else {
+        self.repeated = outer;
+        let Some((stages, unroll, in_bulk)) = schedule.as_ring() else {
             let crew = self.prog.warps / schedule.crews();
             return self.ping_pong(extent, carried, produce, consume, crew);
         };
-        let stages = depth.get();
-        let in_flight = self.core == Core::Group && chains_only(&consume.body);
         let mut out = match self.fill {
-            Fill::CpAsync if stages >= 3 && in_flight => {
-                self.cp_async_products(extent, stages, carried, produce, consume)
+            Fill::CpAsync if in_flight(self.fill, self.core, stages) && chains_only(&consume.body) => {
+                let fill = if in_bulk { self.bulk(stages, produce.slot, consume.step, &produce.body) } else { None };
+                self.cp_async_products(extent, stages, carried, produce, consume, fill)
             }
-            Fill::CpAsync if stages >= 2 => self.cp_async(extent, stages, carried, produce, consume),
+            Fill::CpAsync if stages >= 2 => {
+                let fill = if in_bulk { self.bulk(stages, produce.slot, consume.step, &produce.body) } else { None };
+                let fill = fill.map(|fill| self.left(stages, fill, &produce, &consume));
+                self.cp_async(extent, stages, carried, produce, consume, fill)
+            }
             Fill::CpAsync => self.single_stage(extent, carried, produce, consume),
             Fill::Staged => self.register_staged(extent, stages, carried, produce, consume),
         };
@@ -118,13 +148,19 @@ impl Expander<'_> {
     /// its copies landed and everyone can see them, then issue step `i`'s
     /// copies into the slot consumed one iteration ago, and commit them as one
     /// group (an empty one past the end, so the group count stays uniform).
+    /// Under a `bulk` fill a consume waits on its slot's barrier, and where
+    /// every copy is the bulk fill's the block barrier goes: each warp
+    /// leaves the slot it read and the fill of a slot waits for every
+    /// warp to have left it ([`Self::left`]), so the block's warpgroups
+    /// run their trips apart, one's products over the other's softmax.
     fn cp_async(
         &mut self,
         extent: ScalarId,
         stages: usize,
         carried: Vec<Carried>,
-        produce: Stage<Expanded>,
+        mut produce: Stage<Expanded>,
         consume: Stage<Expanded>,
+        bulk: Option<BulkFill>,
     ) -> Vec<Stmt<Expanded>> {
         let iv = self.scalar(Scalar::Induction);
         let ahead = self.c(stages as i64 - 1);
@@ -138,14 +174,32 @@ impl Expander<'_> {
         self.define(consume.slot, Scalar::Bin(BinOp::Rem, consume.step, nstages));
         let consuming = self.bin(BinOp::Le, ahead, iv);
         let producing = self.bin(BinOp::Lt, iv, extent);
-        let mut consume_body = vec![Stmt::Sync(Sync::WaitAsync { pending: stages as u32 - 2 }), self.barrier()];
+        let (mut consume_body, mut head, mut chunks, mut leave) = (vec![], vec![], true, None);
+        if let Some(BulkFill { bar, phase, bytes, moved, inits, left }) = bulk {
+            consume_body.push(Stmt::Sync(Sync::SlotWait { bar: SlotBar { slot: consume.slot, ..bar }, phase }));
+            chunks = left.is_none();
+            for at in moved {
+                let Stmt::Copy { mode, .. } = &mut produce.body.0[at] else { unreachable!("a bulk fill is a copy") };
+                *mode = CopyMode::Bulk { bar };
+            }
+            produce.body.0.insert(0, Stmt::Sync(Sync::SlotArrive { bar, bytes }));
+            if let Some((read, refilled, phase)) = left {
+                produce.body.0.insert(0, Stmt::Sync(Sync::SlotVacant { bar: refilled, phase }));
+                leave = Some(Stmt::Sync(Sync::SlotLeave { bar: read }));
+            }
+            head = inits;
+            head.push(self.barrier());
+        }
+        if chunks {
+            consume_body.extend([Stmt::Sync(Sync::WaitAsync { pending: stages as u32 - 2 }), self.barrier()]);
+        }
         consume_body.extend(consume.body.0);
-        let body = vec![
-            Self::if_(consuming, consume_body),
-            Self::if_(producing, produce.body.0),
-            Stmt::Sync(Sync::CommitAsync),
-        ];
-        vec![Stmt::Loop(Loop {
+        consume_body.extend(leave);
+        let mut body = vec![Self::if_(consuming, consume_body), Self::if_(producing, produce.body.0)];
+        if chunks {
+            body.push(Stmt::Sync(Sync::CommitAsync));
+        }
+        head.push(Stmt::Loop(Loop {
             iv,
             start,
             extent: total,
@@ -153,7 +207,65 @@ impl Expander<'_> {
             body: Block(body),
             unroll: stages as u32,
             trip: Some(Trip::Steady),
-        })]
+        }));
+        head
+    }
+
+    /// `fill` with its ring's slots left rather than fenced, where every
+    /// copy of `produce` is the bulk fill's and the ring is run by every
+    /// warp of a block of several warpgroups (one's blocks run shorter
+    /// leaving their slots, 18.5 µs against 20.5 traced, but fewer of them
+    /// at once and the kernel longer: 0.341 ms against 0.306 over 64×32
+    /// tiles of a causal 64×16×512×128, H200, 2026-11-20): a second barrier
+    /// a slot, behind the fills' in
+    /// their allocation, which every warp's first lane arrives at once the
+    /// warp has read the slot's step. Only products read the slots, so the
+    /// warp's wait for them covers every lane's read; a lane's own read
+    /// would not be, and keeps the block barrier. The fill of step `p` waits for the phase of step
+    /// `p - stages`, of parity `p / stages + 1`: the one before a slot's
+    /// first is complete from the start.
+    fn left(
+        &mut self,
+        stages: usize,
+        mut fill: BulkFill,
+        produce: &Stage<Expanded>,
+        consume: &Stage<Expanded>,
+    ) -> BulkFill {
+        let warps = self.prog.warps;
+        let apart = self.core == Core::Group && warps > GroupMmaAtom::WARPS && warps == self.prog.warp_grid.count();
+        let place = |v: ValId| match self.prog.value(v).place {
+            Place::Smem { alloc, .. } => Some(alloc),
+            _ => None,
+        };
+        let ring: Vec<SmemId> = fill
+            .moved
+            .iter()
+            .filter_map(|&at| match &produce.body.0[at] {
+                Stmt::Copy { dst, .. } => place(*dst),
+                _ => None,
+            })
+            .collect();
+        let in_ring = |v: ValId| place(v).is_some_and(|a| ring.contains(&a));
+        let lanes_read = consume.body.walk().any(|(_, stmt)| match stmt {
+            Stmt::Copy { src, .. } => in_ring(*src),
+            Stmt::Let { op, .. } => !matches!(op, TileOp::Mma { .. }) && op.srcs().any(in_ring),
+            _ => false,
+        });
+        if fill.moved.len() < produce.body.0.len() || !apart || lanes_read {
+            return fill;
+        }
+        let bars = fill.bar.bars;
+        self.prog.smem[bars.index()].elems = 2 * stages;
+        let (nstages, one, two) = (self.c(stages as i64), self.c(1), self.c(2));
+        let behind = |it: &mut Self, slot: ScalarId| SlotBar { bars, slot: it.bin(BinOp::Add, slot, nstages) };
+        let (read, refilled) = (behind(self, consume.slot), behind(self, produce.slot));
+        fill.inits.extend(
+            (stages..2 * stages).map(|s| Stmt::Sync(Sync::SlotOpen { bar: SlotBar { bars, slot: self.c(s as i64) } })),
+        );
+        let fills = self.bin(BinOp::Div, produce.step, nstages);
+        let after = self.bin(BinOp::Add, fills, one);
+        fill.left = Some((read, refilled, self.bin(BinOp::Rem, after, two)));
+        fill
     }
 
     /// [`Self::cp_async`] with the consume's products left in flight: step
@@ -168,8 +280,9 @@ impl Expander<'_> {
         extent: ScalarId,
         stages: usize,
         carried: Vec<Carried>,
-        produce: Stage<Expanded>,
+        mut produce: Stage<Expanded>,
         consume: Stage<Expanded>,
+        bulk: Option<BulkFill>,
     ) -> Vec<Stmt<Expanded>> {
         assert!(stages >= 3, "a chain in flight takes a slot of its own");
         let iv = self.scalar(Scalar::Induction);
@@ -191,17 +304,34 @@ impl Expander<'_> {
         // accumulators the consume rewrote since, and `ptxas` would
         // serialize every chain of the kernel.
         let waits = consume.body.0.iter().any(|s| matches!(s, Stmt::Sync(Sync::WaitProducts { .. })));
-        let mut consume_body = vec![Stmt::Sync(Sync::WaitAsync { pending: stages as u32 - 3 }), self.barrier()];
+        // A slot's fill is waited for on its barrier where a bulk copy moved
+        // it, and as the thread's copy groups where its chunks did.
+        let mut consume_body = vec![];
+        let (mut head, mut chunks) = (vec![], true);
+        if let Some(BulkFill { bar, phase, bytes, moved, inits, .. }) = bulk {
+            consume_body.push(Stmt::Sync(Sync::SlotWait { bar: SlotBar { slot: consume.slot, ..bar }, phase }));
+            chunks = moved.len() < produce.body.0.len();
+            for at in moved {
+                let Stmt::Copy { mode, .. } = &mut produce.body.0[at] else { unreachable!("a bulk fill is a copy") };
+                *mode = CopyMode::Bulk { bar };
+            }
+            produce.body.0.insert(0, Stmt::Sync(Sync::SlotArrive { bar, bytes }));
+            head = inits;
+            head.push(self.barrier());
+        }
+        if chunks {
+            consume_body.push(Stmt::Sync(Sync::WaitAsync { pending: stages as u32 - 3 }));
+        }
+        consume_body.push(self.barrier());
         consume_body.extend(consume.body.0);
         if !waits {
             consume_body.push(Stmt::Sync(Sync::WaitProducts { pending: 1 }));
         }
-        let body = vec![
-            Self::if_(consuming, consume_body),
-            Self::if_(producing, produce.body.0),
-            Stmt::Sync(Sync::CommitAsync),
-        ];
-        vec![
+        let mut body = vec![Self::if_(consuming, consume_body), Self::if_(producing, produce.body.0)];
+        if chunks {
+            body.push(Stmt::Sync(Sync::CommitAsync));
+        }
+        head.extend([
             Stmt::Loop(Loop {
                 iv,
                 start,
@@ -212,7 +342,46 @@ impl Expander<'_> {
                 trip: Some(Trip::Steady),
             }),
             Stmt::Sync(Sync::WaitProducts { pending: 0 }),
-        ]
+        ]);
+        head
+    }
+
+    /// The bulk fill of a ring of `stages` slots whose trips produce
+    /// `produce` into slot `slot`: the block's copies one bulk copy moves
+    /// each ([`bulk::frame`]), completing on the slot's barrier of a new
+    /// allocation, whose phases alternate with the slot's fills, so the
+    /// consume of step `step` waits for parity `step / stages`. `None` where
+    /// the target has no slot barriers, no copy is so moved, or the ring runs
+    /// more than once a block: its barriers are initialized once, and one
+    /// initialized again while a lagging warp still arrives at it is
+    /// undefined.
+    fn bulk(&mut self, stages: usize, slot: ScalarId, step: ScalarId, produce: &Block<Expanded>) -> Option<BulkFill> {
+        if !self.sync.slot_barrier || self.scope != Scope::Block || self.repeated {
+            return None;
+        }
+        let frames = produce.0.iter().enumerate().filter_map(|(at, stmt)| match stmt {
+            Stmt::Copy { dst, src, mode: CopyMode::Async, .. } => {
+                Some((at, bulk::frame(self.prog, self.core, *dst, *src).ok()?.bytes()))
+            }
+            _ => None,
+        });
+        let (moved, bytes): (Vec<usize>, Vec<u32>) = frames.unzip();
+        if moved.is_empty() {
+            return None;
+        }
+        self.prog.smem.push(SmemAlloc {
+            name: "full".into(),
+            dtype: svod_dtype::ScalarDType::UInt64,
+            elems: stages,
+            storage: (),
+        });
+        let bars = SmemId(self.prog.smem.len() as u32 - 1);
+        let inits =
+            (0..stages).map(|s| Stmt::Sync(Sync::SlotInit { bar: SlotBar { bars, slot: self.c(s as i64) } })).collect();
+        let (nstages, two) = (self.c(stages as i64), self.c(2));
+        let fills = self.bin(BinOp::Div, step, nstages);
+        let phase = self.bin(BinOp::Rem, fills, two);
+        Some(BulkFill { bar: SlotBar { bars, slot }, phase, bytes: bytes.iter().sum(), moved, inits, left: None })
     }
 
     /// One slot: copy, wait, consume, and fence before the slot is refilled.
@@ -428,7 +597,7 @@ impl Expander<'_> {
     /// barrier may part around it; `None` otherwise (a warp's own ring, a
     /// tail of products alone, no tail).
     fn branching_tail(&self, consume: &Block<Expanded>) -> Option<usize> {
-        if !self.split || self.scope != Scope::Block {
+        if !self.sync.split_barrier || self.scope != Scope::Block {
             return None;
         }
         let shared = |v: ValId| self.prog.value(v).tier() == Tier::Smem;
@@ -442,6 +611,13 @@ impl Expander<'_> {
         let branches = consume.0[cut..].iter().any(|s| matches!(s, Stmt::If { .. } | Stmt::Loop(_)));
         branches.then_some(cut)
     }
+}
+
+/// Whether a ring `stages` deep leaves a consume's chained products in
+/// flight on `core`, a slot of the ring theirs: its fill then runs one trip
+/// less ahead than its slots allow.
+pub(crate) fn in_flight(fill: Fill, core: Core, stages: usize) -> bool {
+    fill == Fill::CpAsync && core == Core::Group && stages >= 3
 }
 
 /// Whether every product `consume` issues feeds only later products'

@@ -1187,6 +1187,17 @@ impl<'k> Kernel<'k> {
         self.copy(dst.0, src.0, CopyMode::Sync);
     }
 
+    /// Shared → global: the whole tile in bulk, by one thread, on a target
+    /// that copies so, complete before the next statement. `dst` is a window
+    /// with no bounds over adjacent columns; what of the tile lies past the
+    /// parameter's rows is not written.
+    pub fn flush<T: Elem, P: SharedTier + Readable, A: Access>(&mut self, dst: Gmem<'k, T, A>, src: Tile<'k, P, T>)
+    where
+        Global<A>: Writable,
+    {
+        self.copy(dst.0, src.0, CopyMode::Sync);
+    }
+
     /// `dst += src`, element by element: every thread adds what it holds and
     /// no thread sees another's add before the dispatch ends. The sum is
     /// exact for `i32`, which wraps; for `f32` its rounding depends on the

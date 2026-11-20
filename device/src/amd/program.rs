@@ -517,11 +517,12 @@ impl AmdProgram {
 pub(crate) fn retain_program_abi(
     abi: &[crate::device::AbiParamDescriptor],
 ) -> Result<(Vec<crate::device::AbiParamDescriptor>, usize, usize)> {
+    crate::device::reject_tensor_maps(abi, "AMD")?;
     let abi = abi.to_vec();
     let buf_count = abi.iter().filter(|arg| arg.is_storage()).count();
     let var_count = abi.len() - buf_count;
     let var_names =
-        abi.iter().filter(|arg| !arg.is_storage()).map(|arg| arg.name.clone().unwrap_or_default()).collect::<Vec<_>>();
+        abi.iter().filter(|arg| arg.is_scalar()).map(|arg| arg.name.clone().unwrap_or_default()).collect::<Vec<_>>();
     crate::device::validate_abi_descriptors(&abi, buf_count, &var_names)?;
     Ok((abi, buf_count, var_count))
 }
@@ -658,7 +659,7 @@ impl AmdProgram {
         // %v0, i32 %v1)` has `kernarg_size = bufs*8 + vars*4`, NOT bufs*8 +
         // vars*8. Packing each val as 8 bytes here would overflow the
         // descriptor and corrupt the next kernarg slot in the arena.
-        let layout = crate::hcq::ClikeKernargLayout::from_abi(&self.abi);
+        let layout = crate::hcq::ClikeKernargLayout::from_abi(&self.abi)?;
         let needed = layout.packed_size();
         if needed > self.kernarg_size() {
             return Err(Error::Runtime {

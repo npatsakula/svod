@@ -230,6 +230,17 @@ impl UOp {
         Self::new(Op::Param(ops::Param { shape, arg: arg.into() }), dtype)
     }
 
+    /// Create a tensor-map PARAM: the descriptor of `map` over the storage PARAM
+    /// in slot `map.buffer`, passed by value and usable as a `ptr` operand. The
+    /// program must keep that storage PARAM (e.g. as a source of the op that
+    /// uses the map); a map whose slot holds no storage is rejected.
+    pub fn tensor_map_param(slot: usize, map: crate::TensorMap) -> Arc<Self> {
+        let shape = crate::shape::shape_to_uop(&smallvec::SmallVec::new());
+        let arg = crate::ParamArg::tensor_map(slot, map);
+        let dtype = arg.dtype.clone();
+        Self::new(Op::Param(ops::Param { shape, arg: arg.into() }), dtype)
+    }
+
     /// Create flattened storage and restore its logical shape, matching Tinygrad's
     /// `UOp.placeholder`.
     pub fn placeholder(

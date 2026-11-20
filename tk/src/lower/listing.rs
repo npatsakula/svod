@@ -131,6 +131,7 @@ fn describe<'p, P: Phase>(prog: &'p Program<P>, stmt: &Stmt<P>, origin: &mut Has
                         CopyMode::Sync => "",
                         CopyMode::Async => " async",
                         CopyMode::Staged => " staged",
+                        CopyMode::Bulk { .. } => " bulk",
                     };
                     format!("fill {sn} -> {dn}{mode}")
                 }
@@ -179,6 +180,12 @@ fn describe<'p, P: Phase>(prog: &'p Program<P>, stmt: &Stmt<P>, origin: &mut Has
             Sync::Fence => "fence".into(),
             Sync::WaitProducts { pending } => format!("wait products {pending}"),
             Sync::Prio { level } => format!("prio {level}"),
+            Sync::SlotInit { .. } => "slot init".into(),
+            Sync::SlotArrive { bytes, .. } => format!("slot arrive {bytes}"),
+            Sync::SlotWait { .. } => "slot wait".into(),
+            Sync::SlotOpen { .. } => "slot open".into(),
+            Sync::SlotLeave { .. } => "slot leave".into(),
+            Sync::SlotVacant { .. } => "slot vacant".into(),
         },
     }
 }

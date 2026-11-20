@@ -3,10 +3,7 @@ use std::mem::{offset_of, size_of};
 
 use test_case::test_case;
 
-use crate::cuda::sys::{
-    CU_LAUNCH_PARAM_BUFFER_POINTER, CU_LAUNCH_PARAM_BUFFER_SIZE, CU_LAUNCH_PARAM_END, CUdeviceptr, CUresult, CUstream,
-    CudaKernelNodeParams, SYMBOLS, api,
-};
+use crate::cuda::sys::{CUdeviceptr, CUresult, CUstream, CUtensorMap, CudaKernelNodeParams, SYMBOLS, api, tensor_map};
 
 /// `CUDA_KERNEL_NODE_PARAMS_v2` as `cuda.h` lays it out on LP64.
 #[test]
@@ -23,8 +20,7 @@ fn kernel_node_params_matches_cuda_h() {
     assert_eq!(size_of::<CUdeviceptr>(), 8);
     assert_eq!(size_of::<CUstream>(), size_of::<*mut ()>());
     assert_eq!(size_of::<CUresult>(), 4);
-    assert_eq!((CU_LAUNCH_PARAM_END as usize, CU_LAUNCH_PARAM_BUFFER_POINTER as usize), (0, 1));
-    assert_eq!(CU_LAUNCH_PARAM_BUFFER_SIZE as usize, 2);
+    assert_eq!((size_of::<CUtensorMap>(), std::mem::align_of::<CUtensorMap>()), (128, 128));
 }
 
 /// The C compiler's view of the same layouts, when the toolkit headers are
@@ -45,10 +41,10 @@ fn kernel_node_params_matches_the_c_compiler() {
     std::fs::write(
         &source,
         "#include <cuda.h>\n#include <stdio.h>\n#include <stddef.h>\nint main(void){\n\
-         printf(\"%zu %zu %zu %zu %zu %d %d %d %d %d %d %d\\n\", sizeof(CUDA_KERNEL_NODE_PARAMS_v2),\n\
+         printf(\"%zu %zu %zu %zu %zu %d %d %d %d %d %d %d %d\\n\", sizeof(CUDA_KERNEL_NODE_PARAMS_v2),\n\
          offsetof(CUDA_KERNEL_NODE_PARAMS_v2, kernelParams), offsetof(CUDA_KERNEL_NODE_PARAMS_v2, extra),\n\
          offsetof(CUDA_KERNEL_NODE_PARAMS_v2, kern), offsetof(CUDA_KERNEL_NODE_PARAMS_v2, ctx),\n\
-         (int)(size_t)CU_LAUNCH_PARAM_BUFFER_POINTER, (int)(size_t)CU_LAUNCH_PARAM_BUFFER_SIZE,\n\
+         (int)sizeof(CUtensorMap), CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, CU_TENSOR_MAP_SWIZZLE_128B,\n\
          CU_STREAM_NON_BLOCKING, CU_EVENT_DISABLE_TIMING, CU_MEMHOSTALLOC_DEVICEMAP,\n\
          CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, CU_FUNC_ATTRIBUTE_NUM_REGS);\n\
          return 0;}\n",
@@ -65,7 +61,11 @@ fn kernel_node_params_matches_the_c_compiler() {
     let _ = std::fs::remove_dir_all(&dir);
     let text = String::from_utf8_lossy(&output.stdout);
     let values: Vec<usize> = text.split_whitespace().map(|v| v.parse().unwrap()).collect();
-    assert_eq!(values, [72, 40, 48, 56, 64, 1, 2, 1, 2, 2, 75, 4], "{text}");
+    let tensor_map =
+        [size_of::<CUtensorMap>(), tensor_map::DATA_TYPE_BFLOAT16 as usize, tensor_map::SWIZZLE_128B as usize];
+    assert_eq!(values[..5], [72, 40, 48, 56, 64], "{text}");
+    assert_eq!(values[5..8], tensor_map, "{text}");
+    assert_eq!(values[8..], [1, 2, 2, 75, 4], "{text}");
 }
 
 #[test]

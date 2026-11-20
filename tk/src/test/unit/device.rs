@@ -12,7 +12,7 @@ use crate::build::*;
 use crate::interp::{round_to, run};
 use crate::ir::*;
 use crate::kernels::Batch;
-use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Rope, gemm};
+use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Rope, Scale, gemm};
 use crate::launch::graph_launch;
 use crate::layouts::WarpGrid;
 use crate::lower::Lowering;
@@ -386,12 +386,15 @@ fn a_periodic_table_matches_the_interpreter(period: usize) {
 /// The configs the tuner admits for a fused projection that turns its
 /// heads ([`GemmCfg::turns`]), and a 256-wide tile across the last turned
 /// head, compute what the interpreter computes: 6 turned heads of 64 and 3
-/// plain ones, rows no tile divides, positions wrapping every 50 rows.
-#[test]
-fn turning_gemms_match_the_interpreter() {
+/// plain ones, rows no tile divides, positions wrapping every 50 rows;
+/// `normed`, the turned heads RMS-normalized under a weight first, on the
+/// tiles that carry it ([`GemmCfg::carries`]).
+#[test_case(false; "turned")]
+#[test_case(true; "normed and turned")]
+fn turning_gemms_match_the_interpreter(normed: bool) {
     let Some(planner) = super::device_planner() else { return };
     let (m, n, k, d) = (200, 576, 128, 64);
-    let rope = Rope { heads: 6, head_dim: d, seq: 50 };
+    let rope = Rope { heads: 6, head_dim: d, seq: 50, norm: normed.then_some(Scale::new(1e-6)) };
     let epilogue = Epilogue { rope: Some(rope), ..Epilogue::DEFAULT };
     let spec = GemmSpec { epilogue, ..gemm_spec(m, n, k) };
     let ranked: Vec<GemmCfg> = planner.gemm_ranked(1, m, n, k, &epilogue).to_vec();
@@ -404,8 +407,8 @@ fn turning_gemms_match_the_interpreter() {
         <[_]>::to_vec,
         build,
     );
-    let across = crate::ops::config::gemm_cfg([64, 256, 32], 2, [1, 4], false);
-    assert!(across.turns(d) && !(6 * d).is_multiple_of(256), "a tile across the last turned head");
+    let across = crate::ops::config::gemm_cfg([64, 256, 32], 2, if normed { [4, 1] } else { [1, 4] }, false);
+    assert!(across.carries(&rope) && !(6 * d).is_multiple_of(256), "a tile across the last turned head");
     cfgs.push(across);
     let mut seed = 13;
     let mut data = |n: usize| super::rounded(ScalarDType::BFloat16, n, &mut seed, |x| x);
@@ -416,14 +419,16 @@ fn turning_gemms_match_the_interpreter() {
             (round_to(ScalarDType::BFloat16, angle.cos()), round_to(ScalarDType::BFloat16, angle.sin()))
         })
         .unzip();
-    let params = vec![a, b, cos, sin, vec![0.0; m * n]];
+    let weight = normed.then(|| data(6 * d));
+    let params: Vec<Vec<f64>> = [a, b, cos, sin].into_iter().chain(weight).chain([vec![0.0; m * n]]).collect();
+    let c = params.len() - 1;
     for cfg in &cfgs {
         let prog = gemm::<BF16>(&assumed(spec.clone(), *cfg));
         let want = run(&prog, params.clone(), &[]).unwrap();
         let device_params = poisoned(&prog, &params);
         let got = super::targets::on_device(prog, &cfg.lowering(&planner.device), &device_params).pop().flatten();
         let got = got.expect("c");
-        for (i, (g, w)) in got.iter().zip(&want[4]).enumerate() {
+        for (i, (g, w)) in got.iter().zip(&want[c]).enumerate() {
             let diff = (g - w).abs();
             assert!(diff <= 1.6e-2 * w.abs().max(1.0), "{cfg:?}: c[{}, {}] = {g}, interpreter {w}", i / n, i % n);
         }

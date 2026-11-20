@@ -367,6 +367,9 @@ pub struct CompiledSpec {
 pub enum AbiParamKind {
     Storage(AddrSpace),
     Scalar,
+    /// A by-value tensor map over the storage in slot `TensorMap::buffer`; it
+    /// takes no launch binding of its own.
+    TensorMap(svod_ir::TensorMap),
 }
 
 /// One external PARAM argument. The vector containing these descriptors is
@@ -392,7 +395,7 @@ impl AbiParamDescriptor {
                 param: arg.name.clone().unwrap_or_else(|| format!("{:?} storage", arg.addrspace)),
             });
         }
-        if arg.addrspace.is_none() && arg.name.is_none() {
+        if arg.is_scalar() && arg.name.is_none() {
             return Err(Error::ProgramAbiMismatch { reason: format!("scalar PARAM in slot {} has no name", arg.slot) });
         }
         if arg.dtype != param.dtype() {
@@ -405,21 +408,39 @@ impl AbiParamDescriptor {
                 ),
             });
         }
-        if arg.addrspace.is_none() && param.dtype() != DType::Int32 {
+        if arg.is_scalar() && param.dtype() != DType::Int32 {
             return Err(Error::ProgramAbiMismatch {
                 reason: format!("scalar PARAM slot {} has non-canonical final ABI dtype {:?}", arg.slot, param.dtype()),
             });
         }
-        Ok(Self {
-            slot: arg.slot,
-            kind: arg.addrspace.map_or(AbiParamKind::Scalar, AbiParamKind::Storage),
-            dtype: param.dtype(),
-            name: arg.name.clone(),
-        })
+        let kind = match (&arg.tensor_map, arg.addrspace) {
+            (Some(map), None) => AbiParamKind::TensorMap(map.clone()),
+            (Some(_), Some(space)) => {
+                return Err(Error::ProgramAbiMismatch {
+                    reason: format!("tensor-map PARAM slot {} has address space {space:?}", arg.slot),
+                });
+            }
+            (None, space) => space.map_or(AbiParamKind::Scalar, AbiParamKind::Storage),
+        };
+        Ok(Self { slot: arg.slot, kind, dtype: param.dtype(), name: arg.name.clone() })
     }
 
     pub fn is_storage(&self) -> bool {
         matches!(self.kind, AbiParamKind::Storage(_))
+    }
+
+    /// A launch value: what `vals` binds, in descriptor order.
+    pub fn is_scalar(&self) -> bool {
+        matches!(self.kind, AbiParamKind::Scalar)
+    }
+}
+
+/// `Err` naming the first tensor-map PARAM of `abi`, for a `backend` that
+/// cannot pass one.
+pub fn reject_tensor_maps(abi: &[AbiParamDescriptor], backend: &'static str) -> Result<()> {
+    match abi.iter().find(|param| matches!(param.kind, AbiParamKind::TensorMap(_))) {
+        Some(param) => Err(Error::UnsupportedTensorMapParam { backend, slot: param.slot }),
+        None => Ok(()),
     }
 }
 
@@ -427,9 +448,10 @@ fn stage_abi(abi: &[AbiParamDescriptor]) -> Vec<StageAbiParam> {
     abi.iter()
         .map(|param| StageAbiParam {
             slot: param.slot,
-            kind: match param.kind {
-                AbiParamKind::Storage(space) => StageAbiParamKind::Storage(space),
+            kind: match &param.kind {
+                AbiParamKind::Storage(space) => StageAbiParamKind::Storage(*space),
                 AbiParamKind::Scalar => StageAbiParamKind::Scalar,
+                AbiParamKind::TensorMap(map) => StageAbiParamKind::TensorMap(map.clone()),
             },
             dtype: param.dtype.clone(),
             name: param.name.clone(),
@@ -664,6 +686,30 @@ pub fn validate_abi_descriptors(
                 }
                 var_names.push(name.to_string());
             }
+            AbiParamKind::TensorMap(map) => {
+                if descriptor.name.is_some() || descriptor.dtype != DType::Scalar(map.dtype) {
+                    return Err(Error::ProgramAbiMismatch {
+                        reason: format!(
+                            "tensor-map PARAM slot {} must be unnamed and typed {:?}, got {:?} {:?}",
+                            descriptor.slot, map.dtype, descriptor.name, descriptor.dtype
+                        ),
+                    });
+                }
+                map.validate()
+                    .map_err(|source| Error::InvalidTensorMap { slot: descriptor.slot, source: source.into() })?;
+                let mapped = abi.iter().any(|param| {
+                    param.slot == map.buffer
+                        && param.kind == AbiParamKind::Storage(AddrSpace::Global)
+                        && param.dtype == descriptor.dtype
+                });
+                if !mapped {
+                    return Err(Error::TensorMapWithoutStorage {
+                        slot: descriptor.slot,
+                        buffer: map.buffer,
+                        dtype: map.dtype,
+                    });
+                }
+            }
         }
     }
 
@@ -699,7 +745,7 @@ impl CompiledSpec {
         let buf_count = abi.iter().filter(|arg| arg.is_storage()).count();
         let var_names = abi
             .iter()
-            .filter(|arg| !arg.is_storage())
+            .filter(|arg| arg.is_scalar())
             .map(|arg| arg.name.clone().unwrap_or_default())
             .collect::<Vec<_>>();
         validate_abi_descriptors(&abi, buf_count, &var_names)?;
@@ -724,7 +770,7 @@ impl CompiledSpec {
         let buf_count = abi.iter().filter(|arg| arg.is_storage()).count();
         let var_names = abi
             .iter()
-            .filter(|arg| !arg.is_storage())
+            .filter(|arg| arg.is_scalar())
             .map(|arg| arg.name.clone().unwrap_or_default())
             .collect::<Vec<_>>();
         validate_abi_descriptors(&abi, buf_count, &var_names)?;
@@ -747,7 +793,7 @@ impl CompiledSpec {
         let buf_count = abi.iter().filter(|arg| arg.is_storage()).count();
         let var_names = abi
             .iter()
-            .filter(|arg| !arg.is_storage())
+            .filter(|arg| arg.is_scalar())
             .map(|arg| arg.name.clone().unwrap_or_default())
             .collect::<Vec<_>>();
         validate_abi_descriptors(&abi, buf_count, &var_names)?;
@@ -777,7 +823,7 @@ impl CompiledSpec {
         let buf_count = abi.iter().filter(|arg| arg.is_storage()).count();
         let var_names = abi
             .iter()
-            .filter(|arg| !arg.is_storage())
+            .filter(|arg| arg.is_scalar())
             .map(|arg| arg.name.clone().unwrap_or_default())
             .collect::<Vec<_>>();
         validate_abi_descriptors(&abi, buf_count, &var_names)?;
@@ -1412,15 +1458,17 @@ impl ProgramSpec {
             .iter()
             .map(|var| {
                 let descriptor = AbiParamDescriptor::from_param(var)?;
-                if descriptor.is_storage() {
+                if !descriptor.is_scalar() {
                     return Err(Error::ProgramAbiMismatch {
-                        reason: format!("ProgramInfo.vars contains storage PARAM in slot {}", descriptor.slot),
+                        reason: format!("ProgramInfo.vars contains non-scalar PARAM in slot {}", descriptor.slot),
                     });
                 }
                 Ok(descriptor)
             })
             .collect::<Result<Vec<_>>>()?;
-        let vars = abi.iter().filter(|param| !param.is_storage()).cloned().collect::<Vec<_>>();
+        let vars = abi.iter().filter(|param| param.is_scalar()).cloned().collect::<Vec<_>>();
+        let var_names = vars.iter().map(|param| param.name.clone().unwrap_or_default()).collect::<Vec<_>>();
+        validate_abi_descriptors(&abi, globals.len(), &var_names)?;
         let expected = svod_ir::ProgramInfo::from_sink(sink, info.target.clone());
         if info.vars.len() != expected.vars.len()
             || !info
@@ -1477,8 +1525,6 @@ impl ProgramSpec {
         if info.outs.iter().chain(&info.ins).any(|slot| !info.globals.contains(slot)) {
             return Err(Error::ProgramAbiMismatch { reason: "ProgramInfo ins/outs contains a non-global slot".into() });
         }
-        let var_names = vars.iter().map(|param| param.name.clone().unwrap_or_default()).collect::<Vec<_>>();
-        validate_abi_descriptors(&abi, globals.len(), &var_names)?;
         Ok(abi)
     }
 

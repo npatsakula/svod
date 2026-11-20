@@ -432,3 +432,27 @@ fn assert_c_compiles(src: &str) {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// Neither C dialect passes a tensor map: the PARAM is refused by slot, not
+/// rendered as a scalar.
+#[test]
+fn c_dialects_reject_a_tensor_map_param() {
+    let map = svod_ir::TensorMap::new(
+        0,
+        svod_dtype::ScalarDType::Float32,
+        [64, 32],
+        [16, 8],
+        svod_ir::TensorMapSwizzle::None,
+    )
+    .unwrap();
+    let read = UOp::custom(
+        smallvec::smallvec![UOp::tensor_map_param(1, map), UOp::param(0, 64 * 32, DType::Float32, None)],
+        "/* {0} {1} */".to_string(),
+        DType::Void,
+    );
+    let linear = UOp::linear(svod_schedule::linearize_with_cfg(UOp::sink(vec![read])).into());
+    for rendered in [render(&linear, Some("k")), crate::c::render_metal(&linear, Some("k"))] {
+        let error = rendered.unwrap_err();
+        assert!(matches!(error, crate::Error::UnsupportedTensorMapParam { slot: 1, .. }), "{error:?}");
+    }
+}

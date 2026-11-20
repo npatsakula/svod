@@ -186,7 +186,9 @@ impl FaCfg {
     /// that may already fill the block's shared memory.
     pub fn smem_bytes(&self, d: usize, bias: bool) -> usize {
         let slot = 2 * self.bkv * d + usize::from(self.bias_ring(bias)) * self.bq * self.bkv;
-        self.key_warps * self.stages() * slot * 2
+        // A ring filled in bulk holds its slots' barriers, an aligned kilobyte.
+        let barriers = if matches!(self.schedule, Schedule::Bulk { .. }) { 1024 } else { 0 };
+        self.key_warps * self.stages() * slot * 2 + barriers
     }
 }
 
@@ -513,7 +515,7 @@ fn attention_body<'k, T: Half>(k: &mut Kernel<'k>, spec: &Admitted<AttnSpec>) {
     let kw = cfg.key_warps;
     k.warps(cfg.row_warps());
     k.lone_warps(cfg.warps());
-    let ring = Schedule::ring(stages, cfg.unroll());
+    let ring = cfg.schedule;
     let k_s = k.ring_runs::<T>("k_s", bkv * d, ring, kw);
     let v_s = k.ring_runs::<T>("v_s", bkv * d, ring, kw);
     // The bias streams through a ring of its own beside K and V, unless the
@@ -968,15 +970,16 @@ fn merged<'k>(k: &mut Kernel<'k>, parts: &[State<'k>]) -> State<'k> {
     State { m, l: l.expect("a part"), o: o.expect("a part") }
 }
 
-/// `acc / l` row by row, where a row no key reached (its sum `l` is zero,
-/// and so is its accumulator) comes out as zeros, as the graph writes it,
-/// rather than as the NaN of a division by zero.
+/// `acc / l` row by row, as one reciprocal a row; a row no key reached (its
+/// sum `l` is zero, and so is its accumulator) comes out as zeros, as the
+/// graph writes it, rather than as the NaN of a division by zero.
 fn normalized<'k>(k: &mut Kernel<'k>, acc: Regs<'k, F32>, l: Regs<'k, F32>, rows: usize) -> Regs<'k, F32> {
     let zero = k.zeros::<F32>(Shape::new(rows, 1));
     let one = k.fill::<F32>(Shape::new(rows, 1), Const::Float(1.0));
     let empty = k.compare(l, zero, CmpOp::Eq);
     let l = k.where_(empty, one, l);
-    k.binary(acc, l, BinaryOp::Div)
+    let per = k.unary(l, UnaryOp::Recip);
+    k.binary(acc, per, BinaryOp::Mul)
 }
 
 /// Parameters in order: `o_part`, `m_part`, `l_part` (f32, as the

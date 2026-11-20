@@ -29,6 +29,7 @@ pub mod origin;
 pub mod prelude;
 pub mod shape;
 pub mod sint;
+pub mod tensor_map;
 pub mod types;
 pub mod uop;
 
@@ -47,6 +48,7 @@ pub use op::{Op, ops};
 pub use opt::{Opt, OptArg, OptOps};
 pub use origin::{Origin, OriginFrame, OriginId, OriginScope, OriginSet, SourceLocation};
 pub use sint::{IntoShrinkRange, SInt, ShrinkRange, sint_max, sint_min, sint_prod};
+pub use tensor_map::{TensorMap, TensorMapSwizzle};
 pub use types::{
     AddrSpace, AxisId, AxisType, BINARY_STAGE_IDENTITY_VERSION, BarrierFence, BinaryOp, BinaryStageIdentity,
     BufferizeOpts, CallInfo, ConstValue, ConstValueHash, ContiguousHint, CustomFunctionKind, InsArg, KernelInfo,

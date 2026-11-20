@@ -151,8 +151,13 @@ fn first(t: &Tensor, n: usize) -> Tensor {
 fn linear_reference(x: &Tensor, w: &Tensor, opts: Linear) -> Tensor {
     let f32 = |t: &Tensor| t.cast(DType::Float32);
     let (bias, residual) = (opts.bias.map(f32), opts.residual.map(f32));
-    let tables = opts.rope.map(|r| (f32(r.cos), f32(r.sin)));
-    let rope = opts.rope.zip(tables.as_ref()).map(|(r, (cos, sin))| Rotary { cos, sin, ..r });
+    let tables = opts.rope.map(|r| (f32(r.cos), f32(r.sin), r.norm.map(|(w, eps)| (f32(w), eps))));
+    let rope = opts.rope.zip(tables.as_ref()).map(|(r, (cos, sin, norm))| Rotary {
+        cos,
+        sin,
+        norm: norm.as_ref().map(|(w, eps)| (w, *eps)),
+        ..r
+    });
     let opts = Linear { bias: bias.as_ref(), residual: residual.as_ref(), rope, ..opts };
     tk::linear::graph(&f32(x), &f32(w), opts).unwrap()
 }
@@ -293,19 +298,42 @@ fn linear_under_a_batch_variable() {
 /// after them stored as they are: against the graph's rotation of the f32
 /// product, on rows no tile divides and under a bias; tables off the stream
 /// dtype leave the turn to the graph, after a plain kernel. `args`: the
-/// tensors the kernel binds, the tables among them where it turns.
-#[test_case(&[2, 37], [4, 2, 64], false, DType::BFloat16, 5; "grouped heads, partial rows")]
-#[test_case(&[1, 100], [12, 12, 64], true, DType::BFloat16, 6; "ModernBERT's heads under a bias")]
-#[test_case(&[3, 16], [2, 1, 128], false, DType::BFloat16, 5; "d 128")]
-#[test_case(&[2, 37], [4, 2, 64], false, DType::Float32, 3; "f32 tables")]
-fn turned_linear_matches_the_graph(lead: &[usize], [h, h_kv, d]: [usize; 3], bias: bool, tables: DType, args: usize) {
+/// tensors the kernel binds, the tables among them where it turns. `normed`
+/// heads are RMS-normalized before the turn (Qwen3's), `by_token` tables
+/// hold a row per token of every batch.
+#[test_case(&[2, 37], [4, 2, 64], false, DType::BFloat16, [false, false], 5; "grouped heads, partial rows")]
+#[test_case(&[1, 100], [12, 12, 64], true, DType::BFloat16, [false, false], 6; "ModernBERT's heads under a bias")]
+#[test_case(&[3, 16], [2, 1, 128], false, DType::BFloat16, [false, false], 5; "d 128")]
+#[test_case(&[2, 37], [4, 2, 64], false, DType::Float32, [false, false], 3; "f32 tables")]
+#[test_case(&[2, 37], [4, 2, 64], false, DType::BFloat16, [true, false], 6; "normed heads")]
+#[test_case(&[3, 70], [16, 8, 128], false, DType::BFloat16, [true, true], 6; "Qwen3's heads, tables by token")]
+#[test_case(&[2, 37], [4, 2, 64], true, DType::BFloat16, [false, true], 6; "tables by token under a bias")]
+#[test_case(&[2, 37], [4, 2, 64], false, DType::Float32, [true, false], 3; "normed heads under f32 tables")]
+fn turned_linear_matches_the_graph(
+    lead: &[usize],
+    [h, h_kv, d]: [usize; 3],
+    bias: bool,
+    tables: DType,
+    [normed, by_token]: [bool; 2],
+    args: usize,
+) {
     untuned(|| {
         let (k, n) = (128, (h + 2 * h_kv) * d);
         let x = rand(&[lead, &[k]].concat(), 40, 1.0, DType::BFloat16);
         let w = rand(&[n, k], 41, 0.3, DType::BFloat16);
         let b = rand(&[n], 42, 1.0, DType::BFloat16);
-        let (cos, sin) = rope_tables(1, lead[1], d, tables);
-        let rope = Rotary { cos: &cos, sin: &sin, heads: h + h_kv, head_dim: d };
+        // By token, batch `b`'s token `t` sits at position `b·T + t`.
+        let (cos, sin) = match by_token {
+            true => {
+                let (cos, sin) = rope_tables(1, lead[0] * lead[1], d, tables);
+                let rows = |x: Tensor| x.try_reshape([lead[0], lead[1], 1, d / 2]).unwrap();
+                (rows(cos), rows(sin))
+            }
+            false => rope_tables(1, lead[1], d, tables),
+        };
+        let weight = rand(&[(h + h_kv) * d], 45, 1.0, DType::BFloat16);
+        let norm = normed.then_some((&weight, 1e-6));
+        let rope = Rotary { cos: &cos, sin: &sin, heads: h + h_kv, head_dim: d, norm };
         let opts = Linear { bias: bias.then_some(&b), rope: Some(rope), ..Linear::default() };
         let y = tk::linear(&x, &w, opts).unwrap();
         assert_eq!(kernel_args(&y, "gemm"), args, "the tensors the GEMM binds");
@@ -325,8 +353,10 @@ fn turned_linear_under_a_batch_variable() {
         let (cos, sin) = rope_tables(1, t, d, DType::BFloat16);
         let var = batch(cap, live);
         let xb = bound(&x, &var);
-        let opts =
-            Linear { rope: Some(Rotary { cos: &cos, sin: &sin, heads: h + h_kv, head_dim: d }), ..Linear::default() };
+        let opts = Linear {
+            rope: Some(Rotary { cos: &cos, sin: &sin, heads: h + h_kv, head_dim: d, norm: None }),
+            ..Linear::default()
+        };
         let y = tk::linear(&xb, &w, opts).unwrap();
         assert_eq!(kernel_args(&y, "gemm"), 5, "the kernel turns");
         let want = linear_reference(&first(&x, live), &w, opts);

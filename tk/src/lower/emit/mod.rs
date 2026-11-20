@@ -8,7 +8,11 @@ use std::sync::Arc;
 
 use smallvec::smallvec;
 use svod_codegen::llvm::Location;
-use svod_codegen::llvm::nvptx::smem::{cp_async_commit, cp_async_wait};
+use svod_codegen::llvm::common::gpu::specific_ptr;
+use svod_codegen::llvm::nvptx::smem::{
+    bulk_store_fence, bulk_store_wait, bulk_tensor_load, bulk_tensor_store, cp_async_commit, cp_async_wait,
+    mbarrier_arrive, mbarrier_arrive_expect, mbarrier_init, mbarrier_wait,
+};
 use svod_codegen::llvm::nvptx::wgmma;
 use svod_dtype::{AddrSpace, DType, DeviceSpec, ScalarDType};
 use svod_ir::{AxisId, AxisType, BarrierFence, ConstValue, KernelInfo, Op, UOp};
@@ -25,6 +29,7 @@ mod amdgpu;
 mod compute;
 mod copy;
 mod nvptx;
+mod trace;
 
 /// What a renderer is told of an emitted program beside its instructions.
 #[derive(Debug, Default)]
@@ -52,7 +57,9 @@ pub fn emit(
     let params = amdgpu::swizzled(params, prog, &low.device.target);
     let mut e = Emit::new(prog, low, params);
     e.prologue()?;
+    e.trace_open()?;
     e.block(&prog.body)?;
+    e.trace_close();
     e.list.within(&prog.name)?;
     let list = e.list.listed();
     if std::env::var_os("TK_DUMP_LIST").is_some() {
@@ -174,6 +181,9 @@ struct Emit<'a> {
     /// Per open block: carried values defined in it, moved at its end.
     pending: Vec<Vec<Carried>>,
     smem: Vec<Arc<UOp>>,
+    /// The tensor-map parameters of the program's bulk fills, past its
+    /// buffers and variables in slot order.
+    maps: Vec<(svod_ir::TensorMap, Arc<UOp>)>,
     /// A shared allocation's buffer read under another type, per pair.
     typed: HashMap<(usize, ScalarDType), Arc<UOp>>,
     scratch: HashMap<ScalarDType, (Arc<UOp>, usize)>,
@@ -208,6 +218,7 @@ struct Emit<'a> {
     /// The location of the statement being emitted, if any.
     at: Option<Location>,
     marks: Marks,
+    trace: Option<trace::Tracer>,
 }
 
 /// A register-side view of a tiled value for addressing shared/global memory.
@@ -303,6 +314,7 @@ impl<'a> Emit<'a> {
             carried: vec![],
             pending: vec![],
             smem: vec![],
+            maps: vec![],
             typed: HashMap::new(),
             scratch: HashMap::new(),
             moves: Moves::new(prog.warp_grid.count(), low.device.target.wave),
@@ -322,6 +334,7 @@ impl<'a> Emit<'a> {
             lines: prog.walk().enumerate().map(|(i, (_, s))| (s as *const _, i as u32 + 1)).collect(),
             at: None,
             marks: Marks::default(),
+            trace: None,
         }
     }
 
@@ -701,6 +714,7 @@ impl<'a> Emit<'a> {
             self.stmt(stmt)?;
             self.list.within(&self.prog.name)?;
         }
+        self.trace_flush();
         self.async_products = outer;
         // A carried tile moves a fragment at a time, as the products read
         // it, so the backend carries vectors and never unpacks them.
@@ -718,7 +732,14 @@ impl<'a> Emit<'a> {
         let line = self.lines[&(stmt as *const _)];
         let column = self.at.map_or(0, |at| at.column);
         let outer = self.at.replace(Location { line, column });
+        let lone = !crate::trace::shared(stmt, self.async_products);
+        if lone {
+            self.trace_flush();
+        }
         let out = self.stmt_inner(stmt);
+        if matches!(stmt, Stmt::Let { .. } | Stmt::Copy { .. } | Stmt::Sync(_)) {
+            self.trace_after(line, lone);
+        }
         self.at = outer;
         out
     }
@@ -970,8 +991,83 @@ impl<'a> Emit<'a> {
             Sync::WaitProducts { .. } => return Ok(()),
             Sync::Prio { level } if target.sync.priority => amdgpu::setprio(level),
             Sync::Prio { .. } => return Ok(()),
+            Sync::SlotInit { bar } if target.sync.slot_barrier => {
+                let bar = self.slot_bar(bar);
+                return self.elected(mbarrier_init(&bar, 1));
+            }
+            Sync::SlotArrive { bar, bytes } if target.sync.slot_barrier => {
+                let bar = self.slot_bar(bar);
+                return self.elected(mbarrier_arrive_expect(&bar, bytes));
+            }
+            Sync::SlotWait { bar, phase } if target.sync.slot_barrier => {
+                let (bar, phase) = (self.slot_bar(bar), self.sc(phase));
+                mbarrier_wait(&bar, &phase.cast(DType::Int32))
+            }
+            Sync::SlotOpen { bar } if target.sync.slot_barrier => {
+                let (bar, warps) = (self.slot_bar(bar), self.prog.warps);
+                return self.elected(mbarrier_init(&bar, warps));
+            }
+            // A warp's lanes read in step: its first arrives for them all.
+            Sync::SlotLeave { bar } if target.sync.slot_barrier => {
+                let (arrive, first) = (mbarrier_arrive(&self.slot_bar(bar)), self.lane.clone());
+                return self.only(first, vec![arrive]);
+            }
+            Sync::SlotVacant { bar, phase } if target.sync.slot_barrier => {
+                let (bar, phase) = (self.slot_bar(bar), self.sc(phase));
+                return self.elected(mbarrier_wait(&bar, &phase.cast(DType::Int32)));
+            }
+            Sync::SlotInit { .. }
+            | Sync::SlotArrive { .. }
+            | Sync::SlotWait { .. }
+            | Sync::SlotOpen { .. }
+            | Sync::SlotLeave { .. }
+            | Sync::SlotVacant { .. } => return Ok(()),
         };
         self.push(u);
+        Ok(())
+    }
+
+    /// The tensor-map parameter of `map`, one per distinct map.
+    fn tensor_map(&mut self, map: svod_ir::TensorMap) -> Arc<UOp> {
+        if let Some((_, param)) = self.maps.iter().find(|(known, _)| *known == map) {
+            return param.clone();
+        }
+        let slot = self.params.len() + self.prog.vars.len() + self.maps.len();
+        let param = self.hoist(UOp::tensor_map_param(slot, map.clone()));
+        self.maps.push((map, param.clone()));
+        param
+    }
+
+    /// The barrier object `bar` names, its shared address listed here: ahead
+    /// of the branch that elects a thread.
+    fn slot_bar(&mut self, bar: SlotBar) -> Arc<UOp> {
+        let slot = self.sc(bar.slot);
+        let bars = self.smem[bar.bars.index()].clone();
+        let object = self.access(&bars, &slot, 1);
+        self.hoist(specific_ptr(&object, AddrSpace::Local));
+        object
+    }
+
+    /// `u` on the block's first thread alone.
+    fn elected(&mut self, u: Arc<UOp>) -> Result<()> {
+        self.elected_all(vec![u])
+    }
+
+    /// `us` in order on the block's first thread alone.
+    fn elected_all(&mut self, us: Vec<Arc<UOp>>) -> Result<()> {
+        self.only(self.tid.clone(), us)
+    }
+
+    /// `us` in order on the threads whose `index` is zero.
+    fn only(&mut self, index: Arc<UOp>, us: Vec<Arc<UOp>>) -> Result<()> {
+        // Hoisted: every election compares the thread, and a compare left under a branch dominates no later one.
+        let first = self.hoist(index.try_cmpeq(&c32(0)).expect("thread compare"));
+        let tag = self.next_tag();
+        let if_ = self.push(UOp::if_(first, smallvec![]).rtag(Some(smallvec![tag as usize])));
+        for u in us {
+            self.push(u);
+        }
+        self.push(UOp::endif(if_));
         Ok(())
     }
 }

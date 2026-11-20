@@ -52,7 +52,8 @@ A forked kernel program for one vendor is allowed only as a bounded exception.
 
 | Item | State |
 |---|---|
-| Hopper TMA, mbarrier, warp-specialized producers | Not started; GEMM and attention run `wgmma` fed by `cp.async` |
+| Hopper TMA, mbarrier | GEMM and attention rings fill by TMA on slot barriers (`Schedule::Bulk`, timed as a twin of the `cp.async` ring) |
+| Hopper warp-specialized producers | Not started; the consumer threads issue the fills |
 | Blackwell `tcgen05`, tensor memory | Not started; sm_120 runs the sm_80 path |
 | CDNA MFMA 32×32 for GEMM, `buffer_load … lds` | Not started; attention runs the 32×32×8 MFMA as `Core::Wide` |
 | Two-crew ping-pong off CDNA | `Target::crews` is 2 only where the matrix core runs beside the vector units and a lane's file holds two crews' accumulators (CDNA) |
