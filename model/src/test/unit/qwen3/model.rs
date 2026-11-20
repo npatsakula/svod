@@ -130,6 +130,12 @@ fn packed_rows_match_separate_forwards() {
     assert!(worst(&got[..a.len() * hidden], &want_a) < 1e-4, "the first segment drifted");
     assert!(worst(&got[a.len() * hidden..(a.len() + b.len()) * hidden], &want_b) < 1e-4, "the second segment drifted");
     assert!(got.iter().all(|x| x.is_finite()), "the one-token pad segments must stay finite");
+    // The stack at each sequence's last token alone is those rows of the whole.
+    let at = Tensor::from_slice([a.len() as i32 - 1, (a.len() + b.len()) as i32 - 1]).try_reshape([1isize, 2]).unwrap();
+    let packing = Packing { positions: &positions, seg_start: &seg_start };
+    let pooled = realized(&model.forward_packed_at(&ids, &packing, &at).unwrap());
+    let rows = [a.len() - 1, a.len() + b.len() - 1].map(|r| &got[r * hidden..(r + 1) * hidden]).concat();
+    assert!(worst(&pooled, &rows) < 1e-4, "the pooled tokens drifted");
     // Without the segment mask the second sequence sees the first.
     let seg_start = Tensor::from_slice(vec![0i32; len]).try_reshape([1isize, len as isize]).unwrap();
     let leaked =

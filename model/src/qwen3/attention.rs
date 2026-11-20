@@ -15,6 +15,7 @@ use svod_tk::ops::{self, Attn, Qkv};
 use crate::init::fan_in_uniform;
 
 use super::error::Result;
+use super::model::gather_tokens;
 
 #[derive(Clone)]
 pub struct Qwen3Attention {
@@ -73,12 +74,32 @@ impl Qwen3Attention {
         rope: &(Tensor, Tensor),
         seg_start: Option<&Tensor>,
     ) -> Result<Tensor> {
+        let attn = self.mix(x, rope, seg_start)?;
+        Ok(ops::linear(&attn, &self.o_proj_weight, ops::Linear { residual, ..Default::default() })?)
+    }
+
+    /// [`Self::forward_packed`] for the tokens at `at` `(B, S)` alone,
+    /// `(B, S, D)`: every token is attended to, but only those are projected.
+    pub(crate) fn forward_at(
+        &self,
+        x: &Tensor,
+        residual: &Tensor,
+        rope: &(Tensor, Tensor),
+        seg_start: Option<&Tensor>,
+        at: &Tensor,
+    ) -> Result<Tensor> {
+        let attn = gather_tokens(&self.mix(x, rope, seg_start)?, at)?;
+        let residual = gather_tokens(residual, at)?;
+        Ok(ops::linear(&attn, &self.o_proj_weight, ops::Linear { residual: Some(&residual), ..Default::default() })?)
+    }
+
+    /// The heads' mixed values before `o_proj`, `(B, L, H·Dh)`.
+    fn mix(&self, x: &Tensor, rope: &(Tensor, Tensor), seg_start: Option<&Tensor>) -> Result<Tensor> {
         let (b, l) = (x.dim(0)?, x.dim(1)?);
         let qkv = ops::linear(x, &self.qkv_weight, ops::Linear::default())?;
         let (q, k, v) = self.prologue(&qkv, rope)?;
         let attn = ops::attention(&q, &k, &v, Attn { causal: true, seg_start, ..Attn::default() })?;
-        let attn = attn.try_reshape([b, l, SInt::Const(self.num_heads * self.head_dim)])?;
-        Ok(ops::linear(&attn, &self.o_proj_weight, ops::Linear { residual, ..Default::default() })?)
+        Ok(attn.try_reshape([b, l, SInt::Const(self.num_heads * self.head_dim)])?)
     }
 
     /// The fused GEMM output `[B, L, (H + 2·Hkv)·Dh]` → the three sequence-major

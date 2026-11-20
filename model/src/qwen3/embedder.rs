@@ -16,7 +16,7 @@ use crate::state::{self, StateDict};
 
 use super::config::Qwen3Config;
 use super::error::Result;
-use super::model::{Packing, Qwen3Model, gather_tokens, last_token};
+use super::model::{Packing, Qwen3Model, last_token};
 
 #[derive(Clone, Module)]
 pub struct Qwen3Embedding {
@@ -41,9 +41,9 @@ impl Qwen3Embedding {
     /// Packed `input_ids` `(B, L)` (see [`Packing`]) → f32 embeddings
     /// `(B·S, D)` of the tokens at `pool_idx` `(B, S)`, each sequence's last.
     pub fn encode_packed(&self, input_ids: &Tensor, packing: &Packing, pool_idx: &Tensor) -> Result<Tensor> {
-        let hidden = self.model.forward_packed(input_ids, packing)?;
-        let d = hidden.dim(2)?;
-        self.pool(gather_tokens(&hidden, pool_idx)?.try_reshape([SInt::from(-1isize), d])?)
+        let pooled = self.model.forward_packed_at(input_ids, packing, pool_idx)?;
+        let d = pooled.dim(2)?;
+        self.pool(pooled.try_reshape([SInt::from(-1isize), d])?)
     }
 
     fn pool(&self, pooled: Tensor) -> Result<Tensor> {

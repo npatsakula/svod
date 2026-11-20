@@ -63,4 +63,19 @@ impl Qwen3DecoderLayer {
         let h_norm = rms_norm(&self.post_attention_layernorm, &h)?;
         self.mlp.forward_into(&h_norm, Some(&h))
     }
+
+    /// [`Self::forward_packed`] for the tokens at `at` `(B, S)` alone,
+    /// `(B, S, D)`: what a stack's last layer owes a pooled output.
+    pub(crate) fn forward_at(
+        &self,
+        x: &Tensor,
+        rope: &(Tensor, Tensor),
+        seg_start: Option<&Tensor>,
+        at: &Tensor,
+    ) -> Result<Tensor> {
+        let x_norm = rms_norm(&self.input_layernorm, x)?;
+        let h = self.attention.forward_at(&x_norm, x, rope, seg_start, at)?;
+        let h_norm = rms_norm(&self.post_attention_layernorm, &h)?;
+        self.mlp.forward_into(&h_norm, Some(&h))
+    }
 }

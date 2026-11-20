@@ -168,7 +168,7 @@ impl Qwen3Model {
             input_ids.clone()
         };
         let rope = self.rope_prefix(padded)?;
-        let h = self.stack(&ids, &rope, None)?;
+        let h = self.stack(&ids, &rope, None, None)?;
         Ok(if padded > seq_len { h.narrow(1, 0, seq_len)? } else { h })
     }
 
@@ -177,14 +177,37 @@ impl Qwen3Model {
     /// `L` is the caller's — the packer sizes rows to [`SEQUENCE_TILE`].
     pub fn forward_packed(&self, input_ids: &Tensor, packing: &Packing) -> Result<Tensor> {
         let rope = self.rope_at(packing.positions)?;
-        self.stack(input_ids, &rope, Some(packing.seg_start))
+        self.stack(input_ids, &rope, Some(packing.seg_start), None)
     }
 
-    /// The decoder stack and final norm over embedded `ids`.
-    fn stack(&self, ids: &Tensor, rope: &(Tensor, Tensor), seg_start: Option<&Tensor>) -> Result<Tensor> {
+    /// [`Self::forward_packed`] at the tokens `at` `(B, S)` alone, `(B, S, D)`:
+    /// the last layer projects and transforms only those.
+    pub fn forward_packed_at(&self, input_ids: &Tensor, packing: &Packing, at: &Tensor) -> Result<Tensor> {
+        let rope = self.rope_at(packing.positions)?;
+        self.stack(input_ids, &rope, Some(packing.seg_start), Some(at))
+    }
+
+    /// The decoder stack and final norm over embedded `ids`, of every token
+    /// or of those at `at` `(B, S)`.
+    fn stack(
+        &self,
+        ids: &Tensor,
+        rope: &(Tensor, Tensor),
+        seg_start: Option<&Tensor>,
+        at: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let mut h = self.embeddings.forward(ids)?;
-        for layer in &self.layers {
+        let (last, rest) = match (at, self.layers.split_last()) {
+            (Some(at), Some((last, rest))) => (Some((last, at)), rest),
+            _ => (None, &self.layers[..]),
+        };
+        for layer in rest {
             h = layer.forward_packed(&h, rope, seg_start)?;
+        }
+        if let Some((last, at)) = last {
+            h = last.forward_at(&h, rope, seg_start, at)?;
+        } else if let Some(at) = at {
+            h = gather_tokens(&h, at)?;
         }
         rms_norm(&self.norm, &h)
     }
