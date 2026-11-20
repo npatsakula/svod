@@ -184,6 +184,74 @@ fn a_ring_of_mixed_fills_keeps_its_block_barrier() {
     assert!(!has(|s| matches!(s, Sync::SlotLeave { .. } | Sync::SlotVacant { .. })), "{syncs:?}");
 }
 
+/// A ring filled in bulk inside a loop stays its threads' chunks: its slot
+/// barriers are initialized once, and initializing one again while a
+/// lagging warp still arrives at it is undefined.
+#[test_case(false => true; "once a block")]
+#[test_case(true => false; "inside a loop")]
+fn a_bulk_ring_runs_once_a_block(nested: bool) -> bool {
+    let stages = 3;
+    let cfg = GemmCfg { schedule: Schedule::bulk(stages, true), ..super::gemm_nt_cfg([32, 32, 32], stages) };
+    let mut prog = gemm::<BF16>(&assumed(super::gemm_spec(64, 32, 160), cfg));
+    if nested {
+        let at = prog.body.0.iter().position(|s| matches!(s, Stmt::Pipeline(_))).expect("the ring");
+        let ring = prog.body.0.remove(at);
+        let mut scalar = |s: Scalar| {
+            prog.scalars.push(s);
+            ScalarId(prog.scalars.len() as u32 - 1)
+        };
+        let (iv, start, extent) = (scalar(Scalar::Induction), scalar(Scalar::Const(0)), scalar(Scalar::Const(2)));
+        let body = Block(vec![ring]);
+        prog.body.0.insert(at, Stmt::Loop(Loop { iv, start, extent, carried: vec![], body, unroll: 1, trip: None }));
+    }
+    let slots = SyncCaps { slot_barrier: true, ..SyncCaps::default() };
+    let out = expand(prog, Fill::CpAsync, Core::Group, slots);
+    count(&out, |s| matches!(s, Stmt::Sync(Sync::SlotInit { .. }))) == stages
+}
+
+/// The ring's first pipeline, wherever it is nested.
+fn pipeline_of(block: &mut Block) -> Option<&mut Pipeline> {
+    block.0.iter_mut().find_map(|stmt| match stmt {
+        Stmt::Pipeline(p) => Some(p),
+        Stmt::Loop(l) => pipeline_of(&mut l.body),
+        Stmt::Warps { body } => pipeline_of(body),
+        Stmt::If { then, otherwise, .. } => pipeline_of(then).or_else(|| pipeline_of(otherwise)),
+        _ => None,
+    })
+}
+
+/// Two warpgroups leave a slot only where products alone read it: the
+/// warp's wait for them covers every lane, where a lane's own read of the
+/// slot is not covered by its first lane's arrival, and keeps the block
+/// barrier.
+#[test_case(false => true; "products read the slots")]
+#[test_case(true => false; "a lane reads a slot")]
+fn a_slot_is_left_where_products_alone_read_it(lanes_read: bool) -> bool {
+    let cfg = FaCfg { core: Core::Group, schedule: Schedule::bulk(3, false), ..FaCfg::new(128, 32, 3) };
+    let (batch, scale) = (crate::kernels::Batch::Static(1), 0.125);
+    let mask = AttnMask::default();
+    let spec =
+        AttnSpec { batch, t: 128, tk: 128, heads: 2, kv_heads: 1, d: 64, mask, cache: None, packed: false, scale };
+    let mut prog = attention::<BF16>(&assumed(spec, cfg));
+    if lanes_read {
+        let smem = |prog: &Program, v: ValId| matches!(prog.value(v).place, Place::Smem { .. });
+        let consume = pipeline_of(&mut prog.body).expect("the ring").consume.body.clone();
+        let keys = consume.walk().find_map(|(_, stmt)| match stmt {
+            Stmt::Let { op: TileOp::Mma { b, .. }, .. } if smem(&prog, *b) => Some(*b),
+            _ => None,
+        });
+        let keys = keys.expect("a product of the keys' slot");
+        let Value { dtype, shape, .. } = prog.value(keys).clone();
+        prog.values.push(Value { dtype, shape, place: Place::Reg });
+        let dst = ValId(prog.values.len() as u32 - 1);
+        let read = Stmt::Copy { dst, src: keys, mode: CopyMode::Sync, scope: Scope::Block };
+        pipeline_of(&mut prog.body).expect("the ring").consume.body.0.push(read);
+    }
+    let slots = SyncCaps { slot_barrier: true, ..SyncCaps::default() };
+    let out = expand(prog, Fill::CpAsync, Core::Group, slots);
+    count(&out, |s| matches!(s, Stmt::Sync(Sync::SlotLeave { .. }))) > 0
+}
+
 proptest! {
     /// Two warpgroups over a ring filled in bulk alone meet at no block
     /// barrier inside it: each leaves the slot it read on a barrier of the
