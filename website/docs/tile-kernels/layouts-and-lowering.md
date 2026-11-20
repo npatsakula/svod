@@ -149,7 +149,7 @@ bounds are gated: loads read zero and stores are dropped. Shared rows are XOR-sw
 allows, and of 8-bit ones its untransposed form over 16×32 bytes; on RDNA4 global to register loads use `global_load_tr_b128` where the layout is what it
 leaves. A `Warps` statement runs its body on each warp alone, with its own copies and barriers.
 An f32 `exp2` is the hardware instruction alone (`v_exp_f32` on AMD, `ex2.approx.ftz.f32` on NVIDIA), which flushes
-results below 2⁻¹²⁶ to zero.
+results below 2⁻¹²⁶ to zero; an f32 quotient on NVIDIA is `div.approx.f32`, within 2 ulp before the store rounds it.
 Shared memory above 48 KB is one dynamic array on CUDA; candidates are filtered against
 `Target::smem_bytes`.
 

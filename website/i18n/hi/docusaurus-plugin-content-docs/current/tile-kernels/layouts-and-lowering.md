@@ -151,7 +151,7 @@ Emitter हर statement के instructions को program order में ए�
 layout वही हो जो वह छोड़ता है। एक `Warps` statement अपनी body को हर warp पर अकेले, अपनी copies और
 barriers के साथ चलाता है। f32 `exp2` अकेला hardware instruction है (AMD पर `v_exp_f32`, NVIDIA पर
 `ex2.approx.ftz.f32`), जो 2⁻¹²⁶ से नीचे के results को
-शून्य कर देता है। CUDA पर 48 KB से ऊपर की shared memory एक dynamic array है; candidates
+शून्य कर देता है; NVIDIA पर f32 का भागफल `div.approx.f32` है, store की rounding से पहले 2 ulp के भीतर। CUDA पर 48 KB से ऊपर की shared memory एक dynamic array है; candidates
 `Target::smem_bytes` के ख़िलाफ़ छाने जाते हैं।
 
 :::note[Emitter के invariants, लेखक के नहीं]
