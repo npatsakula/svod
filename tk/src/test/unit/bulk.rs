@@ -19,7 +19,7 @@ type Boxes = (usize, [u32; 2]);
 #[test_case("group gemm [64, 64, 16] [4, 1]" => vec![Ok((1, [16, 64]))]; "a narrow row")]
 #[test_case("gemm one slot" => matches boxes if boxes.iter().all(Result::is_ok); "a warp-level gemm")]
 #[test_case("conv 3x3" => matches boxes if boxes.contains(&Err(NotBulk::Gathered)); "a gathered operand")]
-#[test_case("attention d64 cache" => vec![Err(NotBulk::LoadedBound)]; "keys under loaded lengths")]
+#[test_case("attention d64 cache" => vec![Err(NotBulk::VariableBound)]; "keys under loaded lengths")]
 fn a_bulk_copy_moves_plain_matrix_tiles(name: &str) -> Vec<Result<Boxes, NotBulk>> {
     let target = hopper();
     let launches = families(&target).into_iter().chain(group_families(&target));
@@ -60,4 +60,41 @@ fn a_bulk_store_takes_an_unbounded_window() {
     assert_eq!(boxes, Ok((2, [64, 128])));
     let (bounded, _) = copies(Tier::Global, Tier::Reg)[0];
     assert_eq!(stored(prog, Core::Group, bounded, scratch), Err(NotBulk::RowBound));
+}
+
+/// A fill's row bound fixed when the program is recorded leaves it a bulk
+/// copy (the rows past it feed only what the kernel drops); one the launch
+/// or a parameter sets is refused, as the tensor map's extent cannot follow it.
+#[test_case(Bound::Fixed => Ok(()); "a fixed bound")]
+#[test_case(Bound::Launch => Err(NotBulk::VariableBound); "the launch's")]
+#[test_case(Bound::Loaded => Err(NotBulk::VariableBound); "a parameter's")]
+fn a_bulk_fill_takes_a_row_bound_fixed_at_recording(bound: Bound) -> Result<(), NotBulk> {
+    use crate::build::{BF16, I32, Kernel, Sc};
+    use crate::ir::{CopyMode, Shape};
+    let prog = Kernel::record("bounded", |k| {
+        let x = k.input::<BF16>("x", 256 * 64);
+        let lens = k.input::<I32>("lens", 1);
+        let rows = match bound {
+            Bound::Fixed => Sc::from(100),
+            Bound::Launch => k.var("rows", 1, 256),
+            Bound::Loaded => k.load_scalar(lens, 0),
+        };
+        let s = k.smem::<BF16>("s", 64 * 64);
+        let t = k.smem_view::<BF16>(s, 0, Shape::new(64, 64));
+        let g = k.view(x, 0, [64, 1], Shape::new(64, 64), [Some(rows), None]);
+        k.stage(t, g, CopyMode::Sync);
+    });
+    let copy = prog.walk().find_map(|(_, stmt)| match stmt {
+        Stmt::Copy { dst, src, .. } => Some((*dst, *src)),
+        _ => None,
+    });
+    let (dst, src) = copy.expect("a fill");
+    frame(&prog, Core::Group, dst, src).map(|_| ())
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Bound {
+    Fixed,
+    Launch,
+    Loaded,
 }

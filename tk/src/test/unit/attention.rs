@@ -589,6 +589,31 @@ fn a_non_finite_unread_element_never_reaches_the_output(cfg: FaCfg) {
     assert!(bits.iter().all(|&b| super::bf16(b).is_finite()), "a non-finite output");
 }
 
+/// The next sequence's values are infinities and NaNs (memory past the live
+/// batch, or a live sequence's own): the first sequence's output never sees
+/// them, though its last key block lies past its keys (the ring re-reads its
+/// last key there) or a bulk fill brings in whole key blocks of its own.
+#[test_case(Schedule::ring(2, false), 100, Batch::var("b", 1, 2), 1; "ring past the keys, a live batch")]
+#[test_case(Schedule::ring(2, false), 100, Batch::Static(2), 2; "ring past the keys")]
+#[test_case(Schedule::bulk(2, false), 128, Batch::var("b", 1, 2), 1; "bulk whole key blocks, a live batch")]
+#[test_case(Schedule::bulk(2, false), 128, Batch::Static(2), 2; "bulk whole key blocks")]
+fn the_next_sequence_never_reaches_the_output(schedule: Schedule, t: usize, batch: Batch, live: i64) {
+    let Some(target) = super::group_target() else { return };
+    let spec = masked(t, t, 64, 64, 64, NONE).map(|s| AttnSpec { batch, ..s });
+    let spec = reassumed(spec, |c| FaCfg { core: Core::Group, schedule, ..c });
+    let mut c = case(spec.clone(), &[t as i64; 2]);
+    let per = spec.tk * spec.kv_heads * spec.d;
+    for (i, x) in c.v[per..2 * per].iter_mut().enumerate() {
+        *x = if i % 2 == 0 { f64::NAN } else { f64::INFINITY };
+    }
+    let (prog, lowering) = (flash_attention(&spec), spec.cfg().lowering(&declared(target)));
+    let params = super::device::poisoned(&prog, &params(&c));
+    let got = super::targets::on_device_with(prog, &lowering, &params, &[("b", live)])[3].clone().expect("o");
+    let first = spec.t * spec.heads * spec.d;
+    let worst = got[..first].iter().zip(&reference(&c)).map(|(g, w)| (g - w).abs()).fold(0.0, f64::max);
+    assert!(got[..first].iter().all(|g| g.is_finite()) && worst < 2e-2, "max abs diff {worst}, or a non-finite output");
+}
+
 /// `spec`'s kernel on the device against the program in the interpreter
 /// (within 2e-2 of it), its bf16 output's bits returned.
 fn on_device(spec: &Admitted<'static, AttnSpec>, lens: &[i64], target: Target) -> Vec<u16> {

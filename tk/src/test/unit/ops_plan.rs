@@ -2126,6 +2126,21 @@ fn the_warpgroup_core_is_a_tile_of_its_own() {
     );
 }
 
+/// A bulk-filled attention twin needs key blocks that tile the keys: a last
+/// block past them would bring in the next sequence's values.
+#[test_case(2048; "whole key blocks")]
+#[test_case(2000; "a last key block past the keys")]
+fn a_bulk_filled_attention_twin_tiles_the_keys(tk: usize) {
+    let ranked = planner(super::targets::hopper()).attention_ranked(32, 2048, tk, 128, false, false);
+    let bulk = |c: &&FaCfg| matches!(c.schedule, Schedule::Bulk { .. });
+    let rings: Vec<&FaCfg> = ranked.iter().filter(|c| c.core == Core::Group && !bulk(c)).collect();
+    assert!(!rings.is_empty(), "no warpgroup ring ranked");
+    for c in rings {
+        let twinned = c.twins(&ranked).iter().any(|t| matches!(t.schedule, Schedule::Bulk { .. }));
+        assert_eq!(twinned, tk.is_multiple_of(c.bkv), "{c:?}");
+    }
+}
+
 fn gfx1151_planner() -> Planner {
     planned(Device { target: amd(AmdArch::Gfx1151, 40), costs: super::gfx1151_costs() })
 }

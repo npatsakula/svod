@@ -23,10 +23,11 @@ pub enum NotBulk {
     /// A column bound, past which the chunks land as zeros.
     #[snafu(display("it has a column bound"))]
     ColumnBound,
-    /// A row bound read from a parameter: the rows past it are data a bulk
-    /// copy would bring in, where the chunks re-read the last valid row.
-    #[snafu(display("its row bound is loaded"))]
-    LoadedBound,
+    /// A row bound read from a parameter or the launch: the rows past it
+    /// are data a bulk copy would bring in, where the chunks re-read the last
+    /// valid row.
+    #[snafu(display("its row bound is read at run time"))]
+    VariableBound,
     /// A row bound on a store: a bulk copy cuts a tile at the parameter's
     /// end alone.
     #[snafu(display("it has a row bound"))]
@@ -77,7 +78,7 @@ pub fn frame<P: Phase>(prog: &Program<P>, core: Core, dst: ValId, src: ValId) ->
     };
     snafu::ensure!(period.is_none() && constant(stride[1]) == Some(1), ColumnsSnafu);
     snafu::ensure!(bounds[1].is_none(), ColumnBoundSnafu);
-    snafu::ensure!(bounds[0].is_none_or(|bound| !loaded(prog, bound)), LoadedBoundSnafu);
+    snafu::ensure!(bounds[0].is_none_or(|bound| !variable(prog, bound)), VariableBoundSnafu);
     let (bytes, elems) = (s.dtype.bytes(), prog.params[param.index()].elems);
     let row = constant(stride[0]).filter(|row| *row > 0 && elems.is_multiple_of(*row)).ok_or(NotBulk::Stride)?;
     let cols = d.shape.cols;
@@ -104,11 +105,11 @@ pub fn frame<P: Phase>(prog: &Program<P>, core: Core, dst: ValId, src: ValId) ->
     Ok(Frame { map, row, panels: cols / panel })
 }
 
-/// Whether scalar `id` reads a parameter.
-fn loaded<P: Phase>(prog: &Program<P>, id: ScalarId) -> bool {
+/// Whether scalar `id` reads a parameter or the launch.
+fn variable<P: Phase>(prog: &Program<P>, id: ScalarId) -> bool {
     match prog.scalar(id) {
-        Scalar::Load { .. } => true,
-        Scalar::Bin(_, a, b) => loaded(prog, *a) || loaded(prog, *b),
+        Scalar::Load { .. } | Scalar::Var(_) => true,
+        Scalar::Bin(_, a, b) => variable(prog, *a) || variable(prog, *b),
         _ => false,
     }
 }
