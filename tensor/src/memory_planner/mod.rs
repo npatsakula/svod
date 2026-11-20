@@ -197,6 +197,9 @@ pub enum PlannerExclusionReason {
     AliasedStorage,
     NonSinkOperation,
     GatedStore,
+    /// A kernel's output no other item reads: kept as its run's storage for
+    /// a tensor realized later.
+    SiblingOutput,
 }
 
 /// Unique allocation count and logical bytes excluded for one reason.
@@ -259,6 +262,8 @@ struct ExcludedBufferIds {
     /// TLSF planner (`engine/memory.py:17,70`) has no equivalent because it
     /// never packs a new tenant over a live one.
     gated_store: HashSet<u64>,
+    /// In one PROGRAM alone: an output of a multi-output kernel nothing here reads.
+    lone: HashSet<u64>,
 }
 
 fn collect_excluded_buffer_ids(schedule: &Schedule) -> ExcludedBufferIds {
@@ -300,10 +305,18 @@ fn collect_excluded_buffer_ids(schedule: &Schedule) -> ExcludedBufferIds {
 
     let non_sink = schedule
         .iter()
-        .filter(|item| !matches!(item.ast.op(), Op::Sink(..)))
+        // A PROGRAM is a kernel as a SINK is: it reads and writes its buffers in its level.
+        .filter(|item| !matches!(item.ast.op(), Op::Sink(..) | Op::Program(..)))
         .flat_map(|item| item.buffers.iter().map(|b| b.id().0))
         .collect();
-    ExcludedBufferIds { aliased: aliased_ids.collect(), non_sink, gated_store }
+    let mut items_of: HashMap<u64, usize> = HashMap::new();
+    for item in schedule {
+        let ids: HashSet<u64> = item.buffers.iter().map(|b| b.id().0).collect();
+        ids.into_iter().for_each(|id| *items_of.entry(id).or_default() += 1);
+    }
+    let programs = schedule.iter().filter(|item| matches!(item.ast.op(), Op::Program(..)));
+    let lone = programs.flat_map(|item| &item.buffers).map(|b| b.id().0).filter(|id| items_of[id] == 1).collect();
+    ExcludedBufferIds { aliased: aliased_ids.collect(), non_sink, gated_store, lone }
 }
 
 /// The buffer an INDEX addresses, looking through the casts and arithmetic a
@@ -335,6 +348,8 @@ fn exclusion_reason(
         Some(PlannerExclusionReason::NonSinkOperation)
     } else if excluded.gated_store.contains(&id) {
         Some(PlannerExclusionReason::GatedStore)
+    } else if excluded.lone.contains(&id) {
+        Some(PlannerExclusionReason::SiblingOutput)
     } else {
         None
     }
@@ -464,7 +479,7 @@ fn analyze_liveness(
             .unwrap_or(0)
     });
 
-    debug!(num_optimizable = liveness.len(), "liveness analysis complete");
+    debug!(num_optimizable = liveness.len(), excluded = ?metrics.exclusions, "liveness analysis complete");
 
     PlannerInput { liveness, occurrences, metrics }
 }

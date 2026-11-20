@@ -660,3 +660,47 @@ fn test_real_numeric_result_matches_with_planner_disabled_and_arena() {
     assert_eq!(arena, disabled);
     assert_eq!(arena, [2.0, 1.0, 5.5, 26.0]);
 }
+
+/// A PROGRAM schedule item over `buffers` (`ids` their buffer-uop ids).
+fn make_program_item(id: u64, buffers: Vec<Buffer>, ids: Vec<u64>) -> ScheduleItem {
+    let ops = [UOp::native_const(id as f32)];
+    let ast = UOp::linear_program(Default::default(), ops, svod_dtype::DeviceSpec::Cpu).expect("a program");
+    ScheduleItem {
+        kernel: ast.clone(),
+        ast,
+        buffers,
+        buffer_uop_ids: ids,
+        fixedvars: HashMap::new(),
+        dependencies: Vec::new(),
+        instance_dependencies: Vec::new(),
+        loop_var_names: HashSet::new(),
+    }
+}
+
+/// A chain of PROGRAM kernels shares storage across levels as SINK kernels
+/// do; an output no other item reads keeps its own, as the storage a tensor
+/// realized later resolves to.
+#[test_case(PlannerMode::Arena, 2; "one arena holds all three")]
+#[test_case(PlannerMode::Remap, 1; "c takes the storage a left")]
+fn program_kernels_share_storage_but_keep_unread_outputs(mode: PlannerMode, reused: usize) {
+    let [a, b, c, d, sibling] = [(); 5].map(|()| make_buffer(64));
+    let mut schedule = vec![
+        make_program_item(200, vec![a.clone(), sibling.clone()], vec![300, 304]),
+        make_program_item(201, vec![b.clone(), a.clone()], vec![301, 300]),
+        make_program_item(202, vec![c.clone(), b.clone()], vec![302, 301]),
+        make_program_item(203, vec![d.clone(), c.clone()], vec![303, 302]),
+    ];
+    chain_deps(&mut schedule);
+    let result = plan(&schedule, &HashSet::from([d.id().0]), mode);
+
+    let metrics = &result.metrics;
+    assert_eq!((metrics.logical_allocations, metrics.logical_bytes), (3, 768));
+    assert_eq!(metrics.reused_allocations, reused);
+    assert_eq!(metrics.exclusions[&PlannerExclusionReason::SiblingOutput].allocations, 1);
+    assert_eq!(metrics.exclusions[&PlannerExclusionReason::Output].allocations, 1);
+    assert!(!metrics.exclusions.contains_key(&PlannerExclusionReason::NonSinkOperation));
+    assert!(
+        !result.buffer_replace.contains_key(&BufferKey { kernel_idx: 0, buffer_idx: 1 }),
+        "the sibling keeps its own"
+    );
+}
