@@ -51,7 +51,7 @@ slots पर। यही path CUDA पर एक device test में चल�
 
 | चीज़ | स्थिति |
 |---|---|
-| Hopper TMA, mbarrier | GEMM rings slot barriers पर TMA से भरते हैं (`Schedule::Bulk`, `cp.async` ring के twin के रूप में मापा जाता है); attention `cp.async` से भरता है |
+| Hopper TMA, mbarrier | GEMM और attention rings slot barriers पर TMA से भरते हैं (`Schedule::Bulk`, `cp.async` ring के twin के रूप में मापा जाता है) |
 | Hopper warp-specialized producers | शुरू नहीं हुआ; fills consumer threads ही जारी करते हैं |
 | Blackwell `tcgen05`, tensor memory | शुरू नहीं हुआ; sm_120 sm_80 path चलाता है |
 | GEMM के लिए CDNA MFMA 32×32, `buffer_load … lds` | शुरू नहीं हुआ; attention 32×32×8 MFMA को `Core::Wide` के रूप में चलाता है |

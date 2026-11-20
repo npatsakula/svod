@@ -186,7 +186,9 @@ impl FaCfg {
     /// that may already fill the block's shared memory.
     pub fn smem_bytes(&self, d: usize, bias: bool) -> usize {
         let slot = 2 * self.bkv * d + usize::from(self.bias_ring(bias)) * self.bq * self.bkv;
-        self.key_warps * self.stages() * slot * 2
+        // A ring filled in bulk holds its slots' barriers, an aligned kilobyte.
+        let barriers = if matches!(self.schedule, Schedule::Bulk { .. }) { 1024 } else { 0 };
+        self.key_warps * self.stages() * slot * 2 + barriers
     }
 }
 
@@ -513,7 +515,7 @@ fn attention_body<'k, T: Half>(k: &mut Kernel<'k>, spec: &Admitted<AttnSpec>) {
     let kw = cfg.key_warps;
     k.warps(cfg.row_warps());
     k.lone_warps(cfg.warps());
-    let ring = Schedule::ring(stages, cfg.unroll());
+    let ring = cfg.schedule;
     let k_s = k.ring_runs::<T>("k_s", bkv * d, ring, kw);
     let v_s = k.ring_runs::<T>("v_s", bkv * d, ring, kw);
     // The bias streams through a ring of its own beside K and V, unless the

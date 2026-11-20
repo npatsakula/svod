@@ -6,6 +6,7 @@ use crate::atoms::{Core, Fill, SyncCaps};
 use crate::build::BF16;
 use crate::interp::{round_to, run};
 use crate::ir::*;
+use crate::kernels::attention::{AttnMask, AttnSpec, Bias, FaCfg, attention};
 use crate::kernels::gemm::{GemmCfg, gemm};
 use crate::schedule::expand;
 use crate::sweep::assumed;
@@ -105,9 +106,14 @@ fn scalar_at(prog: &Program<Expanded>, id: ScalarId, iv: ScalarId, at: i64) -> i
     match prog.scalar(id) {
         Scalar::Const(v) => *v,
         Scalar::Induction if id == iv => at,
+        // The block at the grid's origin.
+        Scalar::Special(_) => 0,
         Scalar::Bin(op, a, b) => match (op, eval(*a), eval(*b)) {
             (BinOp::Add, a, b) => a + b,
             (BinOp::Sub, a, b) => a - b,
+            (BinOp::Mul, a, b) => a * b,
+            (BinOp::Min, a, b) => a.min(b),
+            (BinOp::Max, a, b) => a.max(b),
             (BinOp::Div, a, b) => a / b,
             (BinOp::Rem, a, b) => a % b,
             (BinOp::Le, a, b) => i64::from(a <= b),
@@ -146,7 +152,80 @@ fn a_bulk_ring_fills_on_its_slots_barriers(stages: usize) {
     assert_eq!(plain.body, ring.body);
 }
 
+/// A two-warpgroup attention over `trips` key blocks, its ring filled in
+/// bulk, expanded for a target with slot barriers.
+fn left_ring(stages: usize, trips: usize, mask: AttnMask) -> Program<Expanded> {
+    let cfg = FaCfg { core: Core::Group, schedule: Schedule::bulk(stages, false), ..FaCfg::new(128, 32, stages) };
+    let (batch, scale) = (crate::kernels::Batch::Static(1), 0.125);
+    let (t, tk) = (128, 32 * trips);
+    let spec = AttnSpec { batch, t, tk, heads: 2, kv_heads: 1, d: 64, mask, cache: None, packed: false, scale };
+    let slots = SyncCaps { slot_barrier: true, ..SyncCaps::default() };
+    expand(attention::<BF16>(&assumed(spec, cfg)), Fill::CpAsync, Core::Group, slots)
+}
+
+fn steady(prog: &Program<Expanded>) -> &Loop<Expanded> {
+    let mut loops = prog.walk().filter_map(|(_, s)| if let Stmt::Loop(l) = s { Some(l) } else { None });
+    loops.find(|l| l.trip == Some(Trip::Steady)).expect("the ring")
+}
+
+fn syncs_of(block: &Block<Expanded>) -> Vec<Sync> {
+    block.walk().filter_map(|(_, s)| if let Stmt::Sync(s) = s { Some(*s) } else { None }).collect()
+}
+
+/// A ring some of whose copies stay their threads' chunks keeps the block
+/// barrier and the copy groups beside the slots' fills: no slot is left.
+#[test]
+fn a_ring_of_mixed_fills_keeps_its_block_barrier() {
+    let prog = left_ring(3, 4, AttnMask { bias: Some(Bias::PerBatch), key_lens: true, ..AttnMask::default() });
+    let syncs = syncs_of(&steady(&prog).body);
+    let has = |want: fn(&Sync) -> bool| syncs.iter().any(want);
+    assert!(has(|s| matches!(s, Sync::SlotWait { .. })) && has(|s| matches!(s, Sync::WaitAsync { .. })), "{syncs:?}");
+    assert!(has(|s| matches!(s, Sync::Barrier { .. })) && has(|s| matches!(s, Sync::CommitAsync)), "{syncs:?}");
+    assert!(!has(|s| matches!(s, Sync::SlotLeave { .. } | Sync::SlotVacant { .. })), "{syncs:?}");
+}
+
 proptest! {
+    /// Two warpgroups over a ring filled in bulk alone meet at no block
+    /// barrier inside it: each leaves the slot it read on a barrier of the
+    /// slot's own, apart from the fills', and a slot's refill waits for the
+    /// parity of the phase its last readers completed (the phase before
+    /// the first passes: nobody has read the slot).
+    #[test]
+    fn a_refill_waits_for_its_slots_last_readers(stages in 2usize..=4, trips in 1usize..=16) {
+        let prog = left_ring(stages, trips, AttnMask::default());
+        let l = steady(&prog);
+        let [Stmt::If { pred: consuming, then: consume, .. }, Stmt::If { pred: producing, then: produce, .. }] =
+            &l.body.0[..] else { panic!("a consume and a produce") };
+        let Some(Stmt::Sync(Sync::SlotWait { bar: full, .. })) = consume.0.first() else { panic!("the fill's wait") };
+        let Some(Stmt::Sync(Sync::SlotLeave { bar: read })) = consume.0.last() else { panic!("the leaving") };
+        let [Stmt::Sync(Sync::SlotVacant { bar: refilled, phase }), Stmt::Sync(Sync::SlotArrive { bar: filled, .. })] =
+            &produce.0[..2] else { panic!("the refill's wait, then its arrival") };
+        let syncs = syncs_of(&l.body);
+        let fenced = |s: &Sync| matches!(s, Sync::Barrier { .. } | Sync::CommitAsync | Sync::WaitAsync { .. });
+        prop_assert!(!syncs.iter().any(fenced), "{:?}", syncs);
+        let opened = prog.walk().filter(|(_, s)| matches!(s, Stmt::Sync(Sync::SlotOpen { .. }))).count();
+        prop_assert_eq!((opened, prog.smem[read.bars.index()].elems), (stages, 2 * stages));
+        let at_iv = |id: ScalarId, at: i64| scalar_at(&prog, id, l.iv, at);
+        // Per slot: the steps read and left, and the fills issued.
+        let mut slots = vec![(0i64, 0i64); stages];
+        for at in 0..at_iv(l.extent, 0) {
+            if at_iv(*consuming, at) != 0 {
+                let slot = at_iv(full.slot, at) as usize;
+                prop_assert_eq!(at_iv(read.slot, at) as usize, stages + slot, "a slot's two barriers");
+                slots[slot].0 += 1;
+            }
+            if at_iv(*producing, at) != 0 {
+                let slot = at_iv(filled.slot, at) as usize;
+                prop_assert_eq!(at_iv(refilled.slot, at) as usize, stages + slot, "a slot's two barriers");
+                let (left, issued) = &mut slots[slot];
+                prop_assert_eq!(*left, *issued, "every fill before this one was read");
+                prop_assert_eq!(at_iv(*phase, at), (*left + 1) % 2, "the parity of the last phase completed");
+                *issued += 1;
+            }
+        }
+        prop_assert_eq!(slots.iter().map(|s| s.0).sum::<i64>() as usize, trips);
+    }
+
     /// A slot's barrier completes a phase a fill, the phases alternating
     /// from 0: every consume waits for the parity of the one fill its slot
     /// has taken since the consume before it, which was issued a trip

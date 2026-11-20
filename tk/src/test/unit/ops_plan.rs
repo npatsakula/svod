@@ -2112,13 +2112,17 @@ fn the_warpgroup_core_is_a_tile_of_its_own() {
     assert!(!group.is_empty(), "no warpgroup config ranked");
     assert!(group.iter().all(|c| c.warp_rows == WARP_ROWS), "{group:?}");
     assert!(ranked.iter().any(|c| c.core == Core::Warp && c.warp_rows == 2 * WARP_ROWS), "no two-row variant");
+    // A ring's bulk-filled twin is timed beside it and stands for no tile.
+    let bulk = |c: &FaCfg| matches!(c.schedule, Schedule::Bulk { .. });
     for c in &group {
-        assert!(c.represents() && c.tile() != FaCfg { core: Core::Warp, ..**c }.tile());
+        assert!(c.represents() != bulk(c) && c.tile() != FaCfg { core: Core::Warp, ..**c }.tile());
         assert!(c.twins(&ranked).iter().all(|t| t.core == Core::Group), "{c:?} twins a warp-level config");
+        assert!(c.twins(&ranked).iter().any(bulk), "{c:?} has no bulk-filled twin");
+        assert_eq!(FaCfg::of_code(&c.code()).as_ref(), Some(*c), "{c:?}");
     }
     assert_eq!(
         representatives(&ranked).len(),
-        ranked.iter().filter(|c| c.warp_rows == narrowest_warp_rows(c.core, WARP_ROWS, c.bq)).count()
+        ranked.iter().filter(|c| c.warp_rows == narrowest_warp_rows(c.core, WARP_ROWS, c.bq) && !bulk(c)).count()
     );
 }
 

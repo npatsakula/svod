@@ -698,7 +698,9 @@ enum Escape {
 /// A ring slot's barrier on Hopper: one thread initializes it and arrives
 /// with the fill's bytes, every thread waits for its phase in one retry
 /// loop, each on the slot's own 64-bit object; ptxas takes the kernel. A
-/// target without slot barriers emits nothing for the three.
+/// target without slot barriers emits nothing for them. A barrier a slot's
+/// readers leave is made for the block's warps, each arriving once, and one
+/// thread waits on it.
 #[test_case(crate::sweep::hopper(), true; "hopper")]
 #[test_case(crate::atoms::sm86(), false; "ampere")]
 #[test_case(amd(AmdArch::Gfx942, 304), false; "cdna")]
@@ -723,9 +725,17 @@ fn slot_barriers_emit_on_hopper_alone(target: Target, barriers: bool) {
         ScalarId(prog.scalars.len() as u32 - 1)
     });
     let bar = SlotBar { bars, slot };
-    let syncs = [Sync::SlotInit { bar }, Sync::SlotArrive { bar, bytes: 4096 }, Sync::SlotWait { bar, phase }];
+    let syncs = [
+        Sync::SlotInit { bar },
+        Sync::SlotArrive { bar, bytes: 4096 },
+        Sync::SlotWait { bar, phase },
+        Sync::SlotOpen { bar },
+        Sync::SlotLeave { bar },
+        Sync::SlotVacant { bar, phase },
+    ];
     prog.body.0.splice(0..0, syncs.map(Stmt::Sync));
     let laid = crate::layouts::infer(prog, &device, Core::Warp).unwrap();
+    let warps = laid.warps;
     let params =
         laid.params.iter().enumerate().map(|(i, p)| UOp::param(i, p.elems, DType::Scalar(p.dtype), None)).collect();
     let (program, linear, marks) =
@@ -736,6 +746,7 @@ fn slot_barriers_emit_on_hopper_alone(target: Target, barriers: bool) {
         "call i64 @llvm.nvvm.mbarrier.arrive.expect.tx.scope.cta.space.cta(ptr addrspace(3) %",
         ", i32 4096)",
         "mbarrier.try_wait.parity.shared::cta.b64 p, [$0], $1;",
+        "mbarrier.arrive.shared::cta.b64 state, [$0];",
     ];
     for needle in needles {
         assert_eq!(ir.contains(needle), barriers, "{needle}:\n{ir}");
@@ -750,9 +761,14 @@ fn slot_barriers_emit_on_hopper_alone(target: Target, barriers: bool) {
     };
     let ptx = String::from_utf8(ptx).unwrap();
     // One thread initializes and arrives; the barrier is slot 3's object.
-    assert_eq!(ptx.matches("mbarrier.init.shared").count(), 1, "{ptx}");
+    // A barrier its warps leave is made for their count, one arrival each.
+    let inits = ir.lines().filter(|l| l.contains("call void @llvm.nvvm.mbarrier.init.shared("));
+    let counts: Vec<&str> = inits.filter_map(|l| l.trim_end_matches(')').rsplit(", i32 ").next()).collect();
+    assert_eq!(counts, ["1", warps.to_string().as_str()]);
     assert_eq!(ptx.matches("mbarrier.arrive.expect_tx.shared").count(), 1, "{ptx}");
-    assert_eq!(ptx.matches("mbarrier.try_wait.parity.shared::cta.b64").count(), 1, "{ptx}");
+    assert_eq!(ptx.matches("mbarrier.arrive.shared::cta.b64").count(), 1, "{ptx}");
+    // Every thread's wait and the one thread's (the compiler may copy a wait into both arms of an election).
+    assert_eq!(ir.matches("mbarrier.try_wait.parity.shared::cta.b64").count(), 2, "{ir}");
     let Some(ptxas) = super::targets::ptxas() else { return };
     let mut command = std::process::Command::new(ptxas);
     command.args(["-arch=sm_90a", "-o", "/dev/null", "/dev/stdin"]);

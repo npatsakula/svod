@@ -404,6 +404,21 @@ fn every_family_lowers_keeps_its_numbers_and_compiles(target: Target, facts: Fac
             check(cores.iter().any(|c| ir.contains(c)), "no 8-bit product");
             check(ir.contains("ldmatrix") == target.ldmatrix, "fragments not read by ldmatrix where it is");
         }
+        if name.starts_with("group attention") {
+            let (bulk, bias) = (name.contains(" bulk"), name.ends_with(" bias"));
+            check(ir.contains("wgmma.mma_async.sync.aligned.m64n"), "no warpgroup product");
+            check(ir.contains("@llvm.nvvm.cp.async.bulk.tensor.g2s.tile.2d(") == bulk, "the bulk fill");
+            // Filled in bulk alone, the ring is the async proxy's: no proxy
+            // fence before a product; and two warpgroups leave its slots
+            // rather than meet at a block barrier each trip.
+            let left = bulk && !bias && name.starts_with("group attention [128");
+            check(ir.contains("mbarrier.arrive.shared::cta.b64 state") == left, "the slots' leaving");
+            check(ir.contains("fence.proxy.async") != (bulk && !bias), "the chain's proxy fence");
+            let listing = crate::lower::listing::listing(tile);
+            let steady = |s: &str| listing.lines().any(|l| l.trim_start().starts_with(s) && l.ends_with("[steady]"));
+            check(steady("barrier") != left, "the trip's block barrier");
+            check(steady("slot vacant") == left && steady("slot leave") == left, "the refill's wait");
+        }
         if name.starts_with("group gemm") {
             let reg_operand = |s: &crate::ir::Stmt<crate::ir::Laid>| matches!(s, crate::ir::Stmt::Copy { dst, .. } if tile.value(*dst).place == crate::ir::Place::Reg && tile.value(*dst).dtype == ScalarDType::BFloat16);
             // The operands stay in shared memory: the one 16-bit load is a
@@ -413,7 +428,10 @@ fn every_family_lowers_keeps_its_numbers_and_compiles(target: Target, facts: Fac
             check(loads == usize::from(name.ends_with("staged") || flushed), "an operand was loaded into registers");
             check(ir.contains("wgmma.mma_async.sync.aligned.m64n"), "no warpgroup product");
             check(!ir.contains("@llvm.nvvm.mma.") && !ir.contains("ldmatrix"), "a warp-level product");
-            check(ir.contains("wgmma.fence") && ir.contains("fence.proxy.async"), "an unfenced chain");
+            // Only what the generic proxy wrote is fenced: a ring filled in
+            // bulk that holds no staged tile is the async proxy's alone.
+            let generic = !name.ends_with(" bulk");
+            check(ir.contains("wgmma.fence") && ir.contains("fence.proxy.async") == generic, "the chain's fences");
             let in_flight =
                 prog.walk().any(|(_, s)| matches!(s, crate::ir::Stmt::Pipeline(p) if p.schedule.stages() >= 3));
             check(ir.contains("@llvm.nvvm.wgmma.wait_group") == in_flight, "the template's wait");

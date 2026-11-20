@@ -50,8 +50,9 @@ optimization"), `do_linearize` returns before the `SVOD_DUMP_LINEAR` dump (`code
    on `Core::Group` shared operands stay in place) → `sync::insert_barriers` (fences from shared-memory effects) →
    `schedule::expand` (each `Pipeline`'s `Schedule` under the target's `Fill`; on the warpgroup
    core a `cp.async` ring of ≥ 3 slots whose consume only chains products leaves them in flight; `Schedule::Bulk`
-   fills that ring by TMA on slot barriers where `SyncCaps::slot_barrier`, sm_90, each fill `lower::bulk::frame`
-   takes, else `NotBulk`, the threads' chunks; a shared tile leaves whole by `Kernel::flush`, one thread's TMA store
+   fills a ring (GEMM's, attention's) by TMA on slot barriers where `SyncCaps::slot_barrier`, sm_90, each fill
+   `lower::bulk::frame` takes, else `NotBulk`, the threads' chunks; filled in bulk alone, its products drop the proxy
+   fence and a block of several warpgroups leaves its slots (`Sync::SlotLeave`/`SlotVacant`) for the trip's barrier; a shared tile leaves whole by `Kernel::flush`, one thread's TMA store
    through the output's tensor map, `lower::bulk::stored`) → `layouts::infer`
    (F2 `TileLayout` per register tile, priced relayouts; a product whose result is dealt issues the narrow way,
    `MmaAtom::narrow`; each shared allocation's `Storage`, its axis and bank halves) → `emit::emit` (`lower/emit/{mod,address,

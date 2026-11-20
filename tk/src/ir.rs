@@ -769,6 +769,15 @@ pub enum Sync {
     /// Every thread waits for `bar`'s phase of parity `phase` (0 or 1: a
     /// barrier's phases alternate from 0, one a fill of its slot).
     SlotWait { bar: SlotBar, phase: ScalarId },
+    /// [`Sync::SlotInit`] of a barrier whose every phase the arrivals of
+    /// all the block's warps complete: one a consume of its slot.
+    SlotOpen { bar: SlotBar },
+    /// Every warp arrives at `bar`: it has read its slot's step.
+    SlotLeave { bar: SlotBar },
+    /// One thread of the block waits for `bar`'s phase of parity `phase`:
+    /// every warp has left the slot's step before the one it refills
+    /// for. The phase before the first is complete from the start.
+    SlotVacant { bar: SlotBar, phase: ScalarId },
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -148,6 +148,21 @@ pub fn mbarrier_arrive_expect(bar: &Arc<UOp>, bytes: u32) -> Arc<UOp> {
     )
 }
 
+/// `mbarrier.arrive`: this thread's arrival at `bar`, expecting nothing.
+pub fn mbarrier_arrive(bar: &Arc<UOp>) -> Arc<UOp> {
+    let address = UOp::custom(
+        smallvec![specific_ptr(bar, AddrSpace::Local)],
+        "ptrtoint ptr addrspace(3) {0} to i32".to_string(),
+        DType::Int32,
+    );
+    let arrive = "{{\\0A.reg .b64 state;\\0Ambarrier.arrive.shared::cta.b64 state, [$0];\\0A}}";
+    UOp::custom(
+        smallvec![address],
+        format!("call void asm sideeffect \"{arrive}\", \"r,~{{{{memory}}}}\"(i32 {{0}})"),
+        DType::Void,
+    )
+}
+
 /// `mbarrier.try_wait.parity` until it succeeds: this thread waits for the
 /// phase of `bar` whose parity is `parity` (an `i32`, 0 or 1; a barrier's
 /// phases alternate from 0). One statement holds the retry loop: the

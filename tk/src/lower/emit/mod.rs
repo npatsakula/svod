@@ -11,7 +11,7 @@ use svod_codegen::llvm::Location;
 use svod_codegen::llvm::common::gpu::specific_ptr;
 use svod_codegen::llvm::nvptx::smem::{
     bulk_store_fence, bulk_store_wait, bulk_tensor_load, bulk_tensor_store, cp_async_commit, cp_async_wait,
-    mbarrier_arrive_expect, mbarrier_init, mbarrier_wait,
+    mbarrier_arrive, mbarrier_arrive_expect, mbarrier_init, mbarrier_wait,
 };
 use svod_codegen::llvm::nvptx::wgmma;
 use svod_dtype::{AddrSpace, DType, DeviceSpec, ScalarDType};
@@ -990,7 +990,25 @@ impl<'a> Emit<'a> {
                 let (bar, phase) = (self.slot_bar(bar), self.sc(phase));
                 mbarrier_wait(&bar, &phase.cast(DType::Int32))
             }
-            Sync::SlotInit { .. } | Sync::SlotArrive { .. } | Sync::SlotWait { .. } => return Ok(()),
+            Sync::SlotOpen { bar } if target.sync.slot_barrier => {
+                let (bar, warps) = (self.slot_bar(bar), self.prog.warps);
+                return self.elected(mbarrier_init(&bar, warps));
+            }
+            // A warp's lanes read in step: its first arrives for them all.
+            Sync::SlotLeave { bar } if target.sync.slot_barrier => {
+                let (arrive, first) = (mbarrier_arrive(&self.slot_bar(bar)), self.lane.clone());
+                return self.only(first, vec![arrive]);
+            }
+            Sync::SlotVacant { bar, phase } if target.sync.slot_barrier => {
+                let (bar, phase) = (self.slot_bar(bar), self.sc(phase));
+                return self.elected(mbarrier_wait(&bar, &phase.cast(DType::Int32)));
+            }
+            Sync::SlotInit { .. }
+            | Sync::SlotArrive { .. }
+            | Sync::SlotWait { .. }
+            | Sync::SlotOpen { .. }
+            | Sync::SlotLeave { .. }
+            | Sync::SlotVacant { .. } => return Ok(()),
         };
         self.push(u);
         Ok(())
@@ -1024,8 +1042,13 @@ impl<'a> Emit<'a> {
 
     /// `us` in order on the block's first thread alone.
     fn elected_all(&mut self, us: Vec<Arc<UOp>>) -> Result<()> {
+        self.only(self.tid.clone(), us)
+    }
+
+    /// `us` in order on the threads whose `index` is zero.
+    fn only(&mut self, index: Arc<UOp>, us: Vec<Arc<UOp>>) -> Result<()> {
         // Hoisted: every election compares the thread, and a compare left under a branch dominates no later one.
-        let first = self.hoist(self.tid.try_cmpeq(&c32(0)).expect("thread compare"));
+        let first = self.hoist(index.try_cmpeq(&c32(0)).expect("thread compare"));
         let tag = self.next_tag();
         let if_ = self.push(UOp::if_(first, smallvec![]).rtag(Some(smallvec![tag as usize])));
         for u in us {

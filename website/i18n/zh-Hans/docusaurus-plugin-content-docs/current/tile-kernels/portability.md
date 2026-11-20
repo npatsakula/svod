@@ -31,7 +31,7 @@ sidebar_label: 可移植性
 
 | 项目 | 状态 |
 |---|---|
-| Hopper TMA、mbarrier | GEMM 的环在槽屏障上通过 TMA 填充（`Schedule::Bulk`，作为 `cp.async` 环的孪生配置计时）；注意力通过 `cp.async` 填充 |
+| Hopper TMA、mbarrier | GEMM 和注意力的环在槽屏障上通过 TMA 填充（`Schedule::Bulk`，作为 `cp.async` 环的孪生配置计时） |
 | Hopper warp 专用化生产者 | 未开始；填充由消费线程发出 |
 | Blackwell `tcgen05`、张量内存 | 未开始；sm_120 走 sm_80 路径 |
 | CDNA 上 GEMM 的 MFMA 32×32、`buffer_load … lds` | 未开始；注意力以 `Core::Wide` 运行 32×32×8 MFMA |

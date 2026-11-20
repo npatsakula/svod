@@ -577,10 +577,11 @@ impl Tiled for FaCfg {
             .collect()
     }
 
-    /// Two atom rows per warp are a variant of a tile that holds one; the
-    /// wide core offers one rows per warp a block.
+    /// Two atom rows per warp are a variant of a tile that holds one (the
+    /// wide core offers one rows per warp a block), a bulk fill of a ring.
     fn represents(&self) -> bool {
-        self.core == Core::Wide || self.warp_rows == narrowest_warp_rows(self.core, WARP_ROWS, self.bq)
+        let rows = self.core == Core::Wide || self.warp_rows == narrowest_warp_rows(self.core, WARP_ROWS, self.bq);
+        rows && !matches!(self.schedule, Schedule::Bulk { .. })
     }
 }
 

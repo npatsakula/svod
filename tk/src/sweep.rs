@@ -623,7 +623,10 @@ pub(crate) fn hopper() -> Target {
 /// rows, one or two across, every swizzle span (16-, 32- and 64-deep rings
 /// are 32-, 64- and 128-byte rows), a 96-wide tile of three `n32` and a
 /// `k` of several trips, tiles staged through their rings on the way out,
-/// stored from them in bulk, and rings filled in bulk. Shapes stay small for the interpreter.
+/// stored from them in bulk, and rings filled in bulk; then attentions of
+/// one and two warpgroups, their rings filled by chunks and in bulk (a bias
+/// tile beside the keys stays its threads' chunks). Shapes stay small for
+/// the interpreter.
 pub(crate) fn group_families(target: &Target) -> Vec<Launch> {
     let planner = planner(target.clone());
     let (direct, staged, flushed) = (Store::Direct, Store::Staged, Store::Bulk);
@@ -669,7 +672,34 @@ pub(crate) fn group_families(target: &Target) -> Vec<Launch> {
             let name = format!("group gemm {:?} {:?}{fill}{store}", cfg.tile, cfg.warps);
             (name, gemm::<BF16>(&spec), cfg.lowering(&planner.device))
         })
+        .chain(group_attentions(target, &planner.device))
         .collect()
+}
+
+/// [`group_families`]' attentions over 128 keys, whole key blocks (a bulk
+/// fill takes no bounded window), two heads over one; the biased one's
+/// keys end at loaded lengths, so only its bias tile is filled in bulk.
+fn group_attentions(target: &Target, device: &Device) -> Vec<Launch> {
+    let (ring, bulk) = (Schedule::ring as fn(usize, bool) -> Schedule, Schedule::bulk as fn(usize, bool) -> Schedule);
+    let plain = AttnMask::default();
+    let causal = AttnMask { causal: true, ..plain };
+    let biased = AttnMask { bias: Some(Bias::PerBatch), key_lens: true, ..plain };
+    let cases: [(usize, usize, usize, usize, Schedule, AttnMask, &str); 5] = [
+        (128, 64, 64, 64, ring(3, false), causal, " causal"),
+        (128, 64, 64, 64, bulk(3, false), causal, " bulk causal"),
+        (128, 128, 64, 128, bulk(3, true), plain, " bulk"),
+        (128, 128, 32, 64, bulk(2, false), causal, " bulk causal"),
+        (128, 64, 64, 64, bulk(3, false), biased, " bulk bias"),
+    ];
+    let launch = |(t, bq, bkv, d, schedule, mask, how): (usize, usize, usize, usize, Schedule, AttnMask, &str)| {
+        let cfg = FaCfg { core: Core::Group, schedule, ..FaCfg::new(bq, bkv, schedule.stages()) };
+        assert!(cfg.fits(target, d, mask.bias.is_some()), "{cfg:?} fits the warpgroup core");
+        let (batch, scale) = (Batch::Static(1), 0.125);
+        let spec = AttnSpec { batch, t, tk: 128, heads: 2, kv_heads: 1, d, mask, cache: None, packed: false, scale };
+        let name = format!("group attention [{bq}, {bkv}] d{d}{how}");
+        (name, attention::<BF16>(&assumed(spec, cfg)), cfg.lowering(device))
+    };
+    cases.into_iter().map(launch).collect()
 }
 
 /// An AMD GPU with `cus` compute units and 64 KB of LDS per workgroup; a

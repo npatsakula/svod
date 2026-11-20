@@ -3,7 +3,7 @@
 //! ring (the sync pass fences only where the ring meets the code around it);
 //! the author's `produce`/`consume` bodies are placed, never edited.
 
-use crate::atoms::{Core, Fill, SyncCaps};
+use crate::atoms::{Core, Fill, GroupMmaAtom, SyncCaps};
 use crate::ir::*;
 use crate::lower::bulk;
 
@@ -25,9 +25,9 @@ const RAISED: u8 = 3;
 /// trip stops touching shared memory and waits at the trip's end
 /// ([`Expander::register_staged`]). Each loop a template places is tagged
 /// with the trip it runs ([`Loop::trip`]). The result's phase has no
-/// pipeline statement. A ring filled in bulk ([`Schedule::Bulk`]) is such a
-/// ring of products in flight where the target has slot barriers
-/// ([`Expander::bulk`]), and the plain ring elsewhere.
+/// pipeline statement. A ring filled in bulk ([`Schedule::Bulk`]) fills its
+/// slots so where the target has slot barriers ([`Expander::bulk`]), and is
+/// the plain ring elsewhere.
 pub fn expand(prog: Program, fill: Fill, core: Core, sync: SyncCaps) -> Program<Expanded> {
     let (mut out, body) = prog.rephase(|_, ()| (), ());
     out.body = Expander { prog: &mut out, fill, core, sync, scope: Scope::Block }.block(body);
@@ -46,6 +46,10 @@ struct BulkFill {
     moved: Vec<usize>,
     /// Every slot's barrier made, ahead of the ring.
     inits: Vec<Stmt<Expanded>>,
+    /// Where the ring's threads leave their slots ([`Expander::left`]): the
+    /// barrier of the slot a consume read, the one a produce refills and
+    /// the parity it waits for.
+    left: Option<(SlotBar, SlotBar, ScalarId)>,
 }
 
 struct Expander<'p> {
@@ -112,7 +116,11 @@ impl Expander<'_> {
                 let fill = if in_bulk { self.bulk(stages, produce.slot, consume.step, &produce.body) } else { None };
                 self.cp_async_products(extent, stages, carried, produce, consume, fill)
             }
-            Fill::CpAsync if stages >= 2 => self.cp_async(extent, stages, carried, produce, consume),
+            Fill::CpAsync if stages >= 2 => {
+                let fill = if in_bulk { self.bulk(stages, produce.slot, consume.step, &produce.body) } else { None };
+                let fill = fill.map(|fill| self.left(stages, fill, &produce, &consume));
+                self.cp_async(extent, stages, carried, produce, consume, fill)
+            }
             Fill::CpAsync => self.single_stage(extent, carried, produce, consume),
             Fill::Staged => self.register_staged(extent, stages, carried, produce, consume),
         };
@@ -134,13 +142,19 @@ impl Expander<'_> {
     /// its copies landed and everyone can see them, then issue step `i`'s
     /// copies into the slot consumed one iteration ago, and commit them as one
     /// group (an empty one past the end, so the group count stays uniform).
+    /// Under a `bulk` fill a consume waits on its slot's barrier, and where
+    /// every copy is the bulk fill's the block barrier goes: each warp
+    /// leaves the slot it read and the fill of a slot waits for every
+    /// warp to have left it ([`Self::left`]), so the block's warpgroups
+    /// run their trips apart, one's products over the other's softmax.
     fn cp_async(
         &mut self,
         extent: ScalarId,
         stages: usize,
         carried: Vec<Carried>,
-        produce: Stage<Expanded>,
+        mut produce: Stage<Expanded>,
         consume: Stage<Expanded>,
+        bulk: Option<BulkFill>,
     ) -> Vec<Stmt<Expanded>> {
         let iv = self.scalar(Scalar::Induction);
         let ahead = self.c(stages as i64 - 1);
@@ -154,14 +168,32 @@ impl Expander<'_> {
         self.define(consume.slot, Scalar::Bin(BinOp::Rem, consume.step, nstages));
         let consuming = self.bin(BinOp::Le, ahead, iv);
         let producing = self.bin(BinOp::Lt, iv, extent);
-        let mut consume_body = vec![Stmt::Sync(Sync::WaitAsync { pending: stages as u32 - 2 }), self.barrier()];
+        let (mut consume_body, mut head, mut chunks, mut leave) = (vec![], vec![], true, None);
+        if let Some(BulkFill { bar, phase, bytes, moved, inits, left }) = bulk {
+            consume_body.push(Stmt::Sync(Sync::SlotWait { bar: SlotBar { slot: consume.slot, ..bar }, phase }));
+            chunks = left.is_none();
+            for at in moved {
+                let Stmt::Copy { mode, .. } = &mut produce.body.0[at] else { unreachable!("a bulk fill is a copy") };
+                *mode = CopyMode::Bulk { bar };
+            }
+            produce.body.0.insert(0, Stmt::Sync(Sync::SlotArrive { bar, bytes }));
+            if let Some((read, refilled, phase)) = left {
+                produce.body.0.insert(0, Stmt::Sync(Sync::SlotVacant { bar: refilled, phase }));
+                leave = Some(Stmt::Sync(Sync::SlotLeave { bar: read }));
+            }
+            head = inits;
+            head.push(self.barrier());
+        }
+        if chunks {
+            consume_body.extend([Stmt::Sync(Sync::WaitAsync { pending: stages as u32 - 2 }), self.barrier()]);
+        }
         consume_body.extend(consume.body.0);
-        let body = vec![
-            Self::if_(consuming, consume_body),
-            Self::if_(producing, produce.body.0),
-            Stmt::Sync(Sync::CommitAsync),
-        ];
-        vec![Stmt::Loop(Loop {
+        consume_body.extend(leave);
+        let mut body = vec![Self::if_(consuming, consume_body), Self::if_(producing, produce.body.0)];
+        if chunks {
+            body.push(Stmt::Sync(Sync::CommitAsync));
+        }
+        head.push(Stmt::Loop(Loop {
             iv,
             start,
             extent: total,
@@ -169,7 +201,44 @@ impl Expander<'_> {
             body: Block(body),
             unroll: stages as u32,
             trip: Some(Trip::Steady),
-        })]
+        }));
+        head
+    }
+
+    /// `fill` with its ring's slots left rather than fenced, where every
+    /// copy of `produce` is the bulk fill's and the ring is run by every
+    /// warp of a block of several warpgroups (one's warps run in step
+    /// through their products, and the block barrier is the cheaper fence:
+    /// 0.306 ms against 0.341 over 64×32 tiles of a causal 64×16×512×128,
+    /// H200, 2026-11-20): a second barrier a slot, behind the fills' in
+    /// their allocation, which every warp arrives at once it has read the
+    /// slot's step. The fill of step `p` waits for the phase of step
+    /// `p - stages`, of parity `p / stages + 1`: the one before a slot's
+    /// first is complete from the start.
+    fn left(
+        &mut self,
+        stages: usize,
+        mut fill: BulkFill,
+        produce: &Stage<Expanded>,
+        consume: &Stage<Expanded>,
+    ) -> BulkFill {
+        let warps = self.prog.warps;
+        let apart = self.core == Core::Group && warps > GroupMmaAtom::WARPS && warps == self.prog.warp_grid.count();
+        if fill.moved.len() < produce.body.0.len() || !apart {
+            return fill;
+        }
+        let bars = fill.bar.bars;
+        self.prog.smem[bars.index()].elems = 2 * stages;
+        let (nstages, one, two) = (self.c(stages as i64), self.c(1), self.c(2));
+        let behind = |it: &mut Self, slot: ScalarId| SlotBar { bars, slot: it.bin(BinOp::Add, slot, nstages) };
+        let (read, refilled) = (behind(self, consume.slot), behind(self, produce.slot));
+        fill.inits.extend(
+            (stages..2 * stages).map(|s| Stmt::Sync(Sync::SlotOpen { bar: SlotBar { bars, slot: self.c(s as i64) } })),
+        );
+        let fills = self.bin(BinOp::Div, produce.step, nstages);
+        let after = self.bin(BinOp::Add, fills, one);
+        fill.left = Some((read, refilled, self.bin(BinOp::Rem, after, two)));
+        fill
     }
 
     /// [`Self::cp_async`] with the consume's products left in flight: step
@@ -212,7 +281,7 @@ impl Expander<'_> {
         // it, and as the thread's copy groups where its chunks did.
         let mut consume_body = vec![];
         let (mut head, mut chunks) = (vec![], true);
-        if let Some(BulkFill { bar, phase, bytes, moved, inits }) = bulk {
+        if let Some(BulkFill { bar, phase, bytes, moved, inits, .. }) = bulk {
             consume_body.push(Stmt::Sync(Sync::SlotWait { bar: SlotBar { slot: consume.slot, ..bar }, phase }));
             chunks = moved.len() < produce.body.0.len();
             for at in moved {
@@ -282,7 +351,7 @@ impl Expander<'_> {
         let (nstages, two) = (self.c(stages as i64), self.c(2));
         let fills = self.bin(BinOp::Div, step, nstages);
         let phase = self.bin(BinOp::Rem, fills, two);
-        Some(BulkFill { bar: SlotBar { bars, slot }, phase, bytes: bytes.iter().sum(), moved, inits })
+        Some(BulkFill { bar: SlotBar { bars, slot }, phase, bytes: bytes.iter().sum(), moved, inits, left: None })
     }
 
     /// One slot: copy, wait, consume, and fence before the slot is refilled.

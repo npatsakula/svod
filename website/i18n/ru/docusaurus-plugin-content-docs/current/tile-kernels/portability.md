@@ -54,7 +54,7 @@ tk (`config::has_kernels`) и она сообщает число SM; пробы 
 
 | Пункт | Состояние |
 |---|---|
-| Hopper TMA, mbarrier | Кольца GEMM заполняются через TMA на барьерах слотов (`Schedule::Bulk`, измеряется как близнец кольца `cp.async`); внимание заполняется через `cp.async` |
+| Hopper TMA, mbarrier | Кольца GEMM и внимания заполняются через TMA на барьерах слотов (`Schedule::Bulk`, измеряется как близнец кольца `cp.async`) |
 | Производители Hopper с warp specialization | Не начато; заполнения выдают потоки-потребители |
 | Blackwell `tcgen05`, тензорная память | Не начато; sm_120 идёт по пути sm_80 |
 | MFMA 32×32 для GEMM на CDNA, `buffer_load … lds` | Не начато; внимание выполняется на MFMA 32×32×8 как `Core::Wide` |

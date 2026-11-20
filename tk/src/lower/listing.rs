@@ -183,6 +183,9 @@ fn describe<'p, P: Phase>(prog: &'p Program<P>, stmt: &Stmt<P>, origin: &mut Has
             Sync::SlotInit { .. } => "slot init".into(),
             Sync::SlotArrive { bytes, .. } => format!("slot arrive {bytes}"),
             Sync::SlotWait { .. } => "slot wait".into(),
+            Sync::SlotOpen { .. } => "slot open".into(),
+            Sync::SlotLeave { .. } => "slot leave".into(),
+            Sync::SlotVacant { .. } => "slot vacant".into(),
         },
     }
 }
