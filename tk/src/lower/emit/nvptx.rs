@@ -91,6 +91,26 @@ impl Emit<'_> {
         }
     }
 
+    /// Whether anything but a bulk copy writes a shared allocation one of
+    /// `operands` is read from: what the generic proxy writes, a product
+    /// reads past a proxy fence; a bulk copy's bytes are the async proxy's.
+    /// Every statement is matched by name, so a new one that writes shared
+    /// memory says which proxy it writes through.
+    fn generic_writes(&self, operands: &[ValId]) -> bool {
+        let alloc = |v: ValId| match self.value(v).place {
+            Place::Smem { alloc, .. } => Some(alloc),
+            _ => None,
+        };
+        let read: Vec<SmemId> = operands.iter().filter_map(|&v| alloc(v)).collect();
+        let reads = |v: &ValId| alloc(*v).is_some_and(|a| read.contains(&a));
+        self.prog.walk().any(|(_, stmt)| match stmt {
+            Stmt::Copy { mode: CopyMode::Bulk { .. }, .. } => false,
+            Stmt::Copy { dst, .. } | Stmt::Let { dst, .. } => reads(dst),
+            Stmt::If { results, .. } => results.iter().any(|(dst, ..)| reads(dst)),
+            Stmt::Loop(_) | Stmt::Warps { .. } | Stmt::Sync(_) | Stmt::Pipeline(_) => false,
+        })
+    }
+
     /// A product on the warpgroup atom: per instruction column block, one
     /// `Wmma` over the whole K chain, its shared operands as the descriptors
     /// of this warp's group rows (and the block's columns of `B`) at every
@@ -104,23 +124,6 @@ impl Emit<'_> {
     /// committed inside the one statement (`codegen::llvm::nvptx::wgmma`) and
     /// waited for there too, unless the block holds the
     /// [`Sync::WaitProducts`] that waits for it later.
-    /// Whether anything but a bulk copy writes a shared allocation one of
-    /// `operands` is read from: what the generic proxy writes, a product
-    /// reads past a proxy fence; a bulk copy's bytes are the async proxy's.
-    fn generic_writes(&self, operands: &[ValId]) -> bool {
-        let alloc = |v: ValId| match self.value(v).place {
-            Place::Smem { alloc, .. } => Some(alloc),
-            _ => None,
-        };
-        let read: Vec<SmemId> = operands.iter().filter_map(|&v| alloc(v)).collect();
-        self.prog.walk().any(|(_, stmt)| match stmt {
-            Stmt::Copy { dst, mode, .. } if !matches!(mode, CopyMode::Bulk { .. }) => {
-                alloc(*dst).is_some_and(|a| read.contains(&a))
-            }
-            _ => false,
-        })
-    }
-
     pub(super) fn group_mma(&mut self, dst: ValId, op: &TileOp<Laid>) -> Result<()> {
         let TileOp::Mma { acc, a, b, a_t, b_t, .. } = *op else { unreachable!("a product") };
         let (va, vb, vd) = (self.value(a).clone(), self.value(b).clone(), self.value(dst).clone());
