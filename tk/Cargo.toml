@@ -24,7 +24,7 @@ tracing = "0.1"
 [dev-dependencies]
 half = "2.7.1"
 libm = "0.2.16"
-object = { version = "0.40", default-features = false, features = ["elf", "read"] }
+object = { version = "0.41", default-features = false, features = ["elf", "read"] }
 proptest = "1.9"
 tempfile = "3.27.0"
 test-case = "3.3.1"
