@@ -121,6 +121,22 @@ fn a_compile_past_its_deadline_is_killed() {
     assert_eq!(run_piped(quick, b"", "sleep").unwrap(), b"done\n");
 }
 
+/// The wait the C and LLVM-object compiles run on their own spawned process
+/// honours the thread's deadline too: an in-process BEAM candidate is bounded
+/// whichever clang path it takes.
+#[test]
+fn a_spawned_compiler_past_its_deadline_is_killed() {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    let spawn = || Command::new("sh").args(["-c", "sleep 5"]).stdin(Stdio::piped()).spawn().expect("spawn sh");
+    let start = Instant::now();
+    let killed = with_compile_deadline(start + Duration::from_millis(100), || wait_compiler(spawn(), b"", "sh"));
+    assert!(killed.is_err_and(|e| e.to_string().contains("deadline")));
+    assert!(start.elapsed() < Duration::from_secs(2), "killed at the deadline, not after the sleep");
+    let finished = wait_compiler(spawn(), b"", "sh").expect("sh exits on its own");
+    assert!(finished.status.success());
+}
+
 /// The LLVM major is read off the `clang version` line whoever packaged it; a
 /// banner without one has no version to check.
 #[test_case::test_case("clang version 22.1.8\nTarget: x86_64-pc-linux-gnu\n" => Some(22); "upstream")]

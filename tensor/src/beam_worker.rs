@@ -1,11 +1,19 @@
-//! Clean spawned worker protocol for BEAM candidate compilation.
+//! Spawned worker protocol for BEAM candidate compilation.
+//!
+//! A worker is this very program started again in worker mode: a constructor
+//! installed by this module finds the socket named by [`WORKER_SOCKET_ENV`]
+//! and serves the compile loop before `main` is ever reached. That keeps hard
+//! containment (a watchdog that kills the process group, recycling, isolation
+//! from a candidate's abort) without shipping a helper executable next to
+//! every application. A process that cannot start itself again — a library
+//! loaded into a foreign runtime — compiles its candidates in process
+//! instead, without that containment.
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver};
-use std::thread::JoinHandle;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -21,6 +29,204 @@ use svod_ir::ops;
 type Result<T> = std::result::Result<T, BeamWorker>;
 
 pub const BEAM_WORKER_PROTOCOL_VERSION: u32 = 2;
+
+/// Names the Unix socket a started worker serves. Set only on a worker, and
+/// spelled once more as a C string in `worker_socket`, which runs before
+/// `main` and cannot read this constant's storage.
+pub const WORKER_SOCKET_ENV: &str = "SVOD_BEAM_WORKER_SOCKET";
+
+/// The constructor ran in this process. Whether that makes a worker of it is
+/// [`worker_entry_armed`]: the constructor also runs in a library loaded into
+/// another program.
+static WORKER_ENTRY_ARMED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(all(unix, not(target_os = "linux")))]
+static WORKER_ENTRY_IMAGE: std::sync::Mutex<Option<(u64, u64)>> = std::sync::Mutex::new(None);
+
+/// A program linked with this module runs this before `main`. Started as a
+/// worker — the socket named in its environment — it serves the parent from
+/// here and never reaches `main`; otherwise it only records that it ran.
+#[cfg(unix)]
+#[used]
+#[cfg_attr(target_os = "macos", link_section = "__DATA,__mod_init_func")]
+#[cfg_attr(not(target_os = "macos"), unsafe(link_section = ".init_array.65535"))]
+static WORKER_ENTRY: extern "C" fn() = worker_entry;
+
+#[cfg(unix)]
+extern "C" fn worker_entry() {
+    WORKER_ENTRY_ARMED.store(true, Ordering::Release);
+    #[cfg(not(target_os = "linux"))]
+    record_image();
+    let Some(socket) = worker_socket() else { return };
+    let served = match std::os::unix::net::UnixStream::connect(&socket) {
+        Ok(stream) => worker_main_on(stream),
+        Err(source) => Err(BeamWorker::Frame { source, what: "connect to the BEAM parent's socket" }),
+    };
+    if let Err(error) = served {
+        eprintln!("svod BEAM worker: {error}");
+        std::process::exit(1);
+    }
+    std::process::exit(0);
+}
+
+/// The socket a started worker was given, read through libc: `std::env` is
+/// not filled in before `main`.
+#[cfg(unix)]
+fn worker_socket() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: a static string, and `getenv` only reads the environment.
+    let value = unsafe { libc::getenv(c"SVOD_BEAM_WORKER_SOCKET".as_ptr().cast()) };
+    if value.is_null() {
+        return None;
+    }
+    // SAFETY: `getenv` returns a pointer into the environment.
+    let bytes = unsafe { std::ffi::CStr::from_ptr(value) }.to_bytes();
+    (!bytes.is_empty()).then(|| PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+}
+
+/// Linux starts the running image through `/proc/self/exe`, which a replaced
+/// file on disk cannot change. Elsewhere the program is started by path, so
+/// the file started is compared with the one this process was loaded from.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn record_image() {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(image) = std::env::current_exe().and_then(|path| path.metadata()) else {
+        return;
+    };
+    let _ = WORKER_ENTRY_IMAGE.lock().map(|loaded| *loaded = Some((image.dev(), image.ino())));
+}
+
+/// Can this process start itself as a worker?
+pub fn worker_entry_armed() -> bool {
+    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ARMED.get_or_init(|| WORKER_ENTRY_ARMED.load(Ordering::Acquire) && hook_in_main_executable() && image_known())
+}
+
+/// Elsewhere than Linux the program is started by path, so it must have been
+/// identified at start to be checked against the running image later.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn image_known() -> bool {
+    WORKER_ENTRY_IMAGE.lock().map(|loaded| loaded.is_some()).unwrap_or(false)
+}
+
+#[cfg(any(not(unix), target_os = "linux"))]
+fn image_known() -> bool {
+    true
+}
+
+/// No constructor, so no executable that could be started again as a worker.
+#[cfg(not(unix))]
+fn hook_in_main_executable() -> bool {
+    false
+}
+
+/// Is the constructor's code part of the main executable? A library loaded
+/// into another program — a Python extension, a plugin — runs it too, but
+/// that program started again does not load the library: started as a worker
+/// it would only run its own `main`.
+#[cfg(target_os = "macos")]
+fn hook_in_main_executable() -> bool {
+    #[repr(C)]
+    struct DlInfo {
+        dli_fname: *mut std::ffi::c_char,
+        dli_fbase: *mut std::ffi::c_void,
+        dli_sname: *mut std::ffi::c_char,
+        dli_saddr: *mut std::ffi::c_void,
+    }
+    extern "C" {
+        /// dyld's header of an image; image 0 is the main executable.
+        fn _dyld_get_image_header(image_index: u32) -> *mut std::ffi::c_void;
+        fn dladdr(address: *const std::ffi::c_void, info: *mut DlInfo) -> std::ffi::c_int;
+    }
+    let mut image = DlInfo {
+        dli_fname: std::ptr::null_mut(),
+        dli_fbase: std::ptr::null_mut(),
+        dli_sname: std::ptr::null_mut(),
+        dli_saddr: std::ptr::null_mut(),
+    };
+    // SAFETY: `dladdr` writes one `DlInfo`, which `image` is, and only reads
+    // dyld's image list; `_dyld_get_image_header` only reads that list, and
+    // image 0 always exists in a process.
+    let (found, main) =
+        (unsafe { dladdr(worker_entry as *const std::ffi::c_void, &mut image) }, unsafe { _dyld_get_image_header(0) });
+    found != 0 && !image.dli_fbase.is_null() && image.dli_fbase == main
+}
+
+/// Every other Unix has no check, so none of its programs is started again.
+#[cfg(all(unix, not(target_os = "linux"), not(target_os = "macos")))]
+fn hook_in_main_executable() -> bool {
+    false
+}
+
+/// Is the constructor's code part of the main executable? A library loaded
+/// into another program — a Python extension, a plugin — runs it too, but
+/// that program started again does not load the library: started as a worker
+/// it would only run its own `main`.
+#[cfg(target_os = "linux")]
+fn hook_in_main_executable() -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let hook = worker_entry as *const () as usize;
+    let Ok(executable) = std::fs::metadata("/proc/self/exe") else { return false };
+    let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else { return false };
+    maps.lines().any(|line| {
+        // `start-end perms offset major:minor inode  path`.
+        let mut fields = line.split_ascii_whitespace();
+        let Some(range) = fields.next() else { return false };
+        let Some((start, end)) = range.split_once('-') else { return false };
+        let (Ok(start), Ok(end)) = (usize::from_str_radix(start, 16), usize::from_str_radix(end, 16)) else {
+            return false;
+        };
+        // Past `perms` and `offset`.
+        let (Some(device), Some(inode)) = (fields.nth(2), fields.next()) else { return false };
+        let Some((major, minor)) = device.split_once(':') else { return false };
+        let (Ok(major), Ok(minor), Ok(inode)) =
+            (u32::from_str_radix(major, 16), u32::from_str_radix(minor, 16), inode.parse::<u64>())
+        else {
+            return false;
+        };
+        start <= hook && hook < end && (libc::makedev(major, minor), inode) == (executable.dev(), executable.ino())
+    })
+}
+
+/// This program, as it runs now.
+fn self_executable() -> Result<PathBuf> {
+    // The running image itself: a file replaced on disk cannot change it.
+    #[cfg(target_os = "linux")]
+    {
+        Ok(PathBuf::from("/proc/self/exe"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let path = std::env::current_exe()
+            .map_err(|source| BeamWorker::SpawnWorker { source, path: "the running program".into() })?;
+        #[cfg(unix)]
+        check_image(&path)?;
+        Ok(path)
+    }
+}
+
+/// Refuse a program file that is no longer the one this process was loaded
+/// from: started, it would be another build, without this build's worker.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn check_image(path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let Some((dev, ino)) = *WORKER_ENTRY_IMAGE.lock().expect("BEAM image lock poisoned") else {
+        return Err(BeamWorker::WorkerUnavailable {
+            reason: "the running program's file was not identified at start".into(),
+        });
+    };
+    let started =
+        path.metadata().map_err(|source| BeamWorker::SpawnWorker { source, path: path.display().to_string() })?;
+    if (started.dev(), started.ino()) != (dev, ino) {
+        return Err(BeamWorker::WorkerUnavailable {
+            reason: format!(
+                "{} is no longer the file this process was loaded from; it cannot be started as a BEAM worker",
+                path.display()
+            ),
+        });
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerInit {
@@ -111,12 +317,12 @@ fn worker_codegen(init: &WorkerInit) -> Result<WorkerCodegen> {
                         break;
                     }
                 }
-                found.ok_or_else(|| BeamWorker::HelperUnavailable {
+                found.ok_or_else(|| BeamWorker::WorkerUnavailable {
                     reason: format!("no CPU backend matches compiler identity {}", init.compiler_key),
                 })?
             }
             DeviceSpec::Amd { device_id } => {
-                let arch = init.gpu_arch.and_then(GpuArch::amd).ok_or_else(|| BeamWorker::HelperUnavailable {
+                let arch = init.gpu_arch.and_then(GpuArch::amd).ok_or_else(|| BeamWorker::WorkerUnavailable {
                     reason: "AMD BEAM worker initialization has no target architecture".into(),
                 })?;
                 svod_runtime::create_amd_codegen(device_id, arch).map_err(BeamWorker::at("AMD codegen"))?
@@ -125,19 +331,19 @@ fn worker_codegen(init: &WorkerInit) -> Result<WorkerCodegen> {
                 svod_runtime::create_metal_codegen(device_id).map_err(BeamWorker::at("Metal codegen"))?
             }
             DeviceSpec::Cuda { device_id } => {
-                let arch = init.gpu_arch.and_then(GpuArch::cuda).ok_or_else(|| BeamWorker::HelperUnavailable {
+                let arch = init.gpu_arch.and_then(GpuArch::cuda).ok_or_else(|| BeamWorker::WorkerUnavailable {
                     reason: "CUDA BEAM worker initialization has no target architecture".into(),
                 })?;
                 svod_runtime::create_cuda_codegen(device_id, arch).map_err(BeamWorker::at("CUDA codegen"))?
             }
             _ => {
-                return Err(BeamWorker::HelperUnavailable {
+                return Err(BeamWorker::WorkerUnavailable {
                     reason: format!("{:?} has no device-disabled BEAM codegen factory", init.device),
                 });
             }
         };
     if compiler.cache_key() != init.compiler_key {
-        return Err(BeamWorker::HelperUnavailable {
+        return Err(BeamWorker::WorkerUnavailable {
             reason: format!(
                 "compiler identity mismatch: parent={}, worker={}",
                 init.compiler_key,
@@ -149,7 +355,7 @@ fn worker_codegen(init: &WorkerInit) -> Result<WorkerCodegen> {
         DeviceSpec::Cpu => svod_schedule::OptimizerRenderer::cpu(),
         DeviceSpec::Amd { .. } => {
             init.gpu_arch.and_then(GpuArch::amd).map(svod_schedule::OptimizerRenderer::for_amd_arch).ok_or_else(
-                || BeamWorker::HelperUnavailable {
+                || BeamWorker::WorkerUnavailable {
                     reason: "AMD BEAM worker initialization has no optimizer profile".into(),
                 },
             )?
@@ -161,13 +367,13 @@ fn worker_codegen(init: &WorkerInit) -> Result<WorkerCodegen> {
             .unwrap_or_else(svod_schedule::OptimizerRenderer::metal),
         DeviceSpec::Cuda { .. } => {
             init.gpu_arch.and_then(GpuArch::cuda).map(svod_schedule::OptimizerRenderer::for_cuda_arch).ok_or_else(
-                || BeamWorker::HelperUnavailable {
+                || BeamWorker::WorkerUnavailable {
                     reason: "CUDA BEAM worker initialization has no optimizer profile".into(),
                 },
             )?
         }
         _ => {
-            return Err(BeamWorker::HelperUnavailable {
+            return Err(BeamWorker::WorkerUnavailable {
                 reason: format!("{:?} has no BEAM optimizer profile", init.device),
             });
         }
@@ -279,45 +485,26 @@ fn try_compile(
     }))
 }
 
-pub fn worker_main() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let mut input = std::io::stdin().lock();
-    let mut output = std::io::stdout().lock();
-    let init: WorkerInit = read_frame(&mut input)
+/// Serve one connection: read the initialization frame, answer readiness,
+/// then answer one response per job until the parent closes its end.
+fn worker_main_on(mut stream: impl Read + Write) -> Result<()> {
+    let init: WorkerInit = read_frame(&mut stream)
         .map_err(|source| BeamWorker::Frame { source, what: "read worker initialization" })?
-        .ok_or_else(|| BeamWorker::HelperUnavailable { reason: "worker stdin closed before initialization".into() })?;
-    let setup = (|| {
-        if init.protocol_version != BEAM_WORKER_PROTOCOL_VERSION {
-            return Err(BeamWorker::ProtocolMismatch {
-                expected: init.protocol_version,
-                actual: BEAM_WORKER_PROTOCOL_VERSION,
-            });
-        }
-        let base_ast = init.graph.decode_root().map_err(BeamWorker::at("decode graph"))?;
-        let codegen = worker_codegen(&init)?;
-        if codegen.optimizer_renderer.cache_fingerprint() != init.renderer_fingerprint {
-            return Err(BeamWorker::HelperUnavailable {
-                reason: format!(
-                    "renderer identity mismatch: parent={}, worker={}",
-                    init.renderer_fingerprint,
-                    codegen.optimizer_renderer.cache_fingerprint()
-                ),
-            });
-        }
-        Ok((base_ast, codegen))
-    })();
+        .ok_or_else(|| BeamWorker::WorkerUnavailable { reason: "the socket closed before initialization".into() })?;
+    let setup = worker_setup(&init);
     let (base_ast, codegen) = match setup {
         Ok(setup) => {
-            write_frame(&mut output, &WorkerReady { error: None })
+            write_frame(&mut stream, &WorkerReady { error: None })
                 .map_err(|source| BeamWorker::Frame { source, what: "write worker readiness" })?;
             setup
         }
         Err(error) => {
-            let _ = write_frame(&mut output, &WorkerReady { error: Some(error.to_string()) });
-            return Err(error.into());
+            let _ = write_frame(&mut stream, &WorkerReady { error: Some(error.to_string()) });
+            return Err(error);
         }
     };
     while let Some(job) =
-        read_frame::<WorkerJob>(&mut input).map_err(|source| BeamWorker::Frame { source, what: "read worker job" })?
+        read_frame::<WorkerJob>(&mut stream).map_err(|source| BeamWorker::Frame { source, what: "read worker job" })?
     {
         let watchdog = (init.beam.compile_timeout_secs > 0).then(|| {
             let (cancel, wait) = mpsc::channel();
@@ -326,7 +513,7 @@ pub fn worker_main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 if wait.recv_timeout(timeout).is_err() {
                     #[cfg(unix)]
                     unsafe {
-                        // The helper is its own process group. This terminates
+                        // The worker is its own process group. This terminates
                         // both Rust compilation work and any clang descendant.
                         libc::kill(0, libc::SIGKILL);
                     }
@@ -347,329 +534,482 @@ pub fn worker_main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             Ok(Err(error)) => WorkerResponse { index: job.index, result: None, error: Some(error.to_string()) },
             Err(_) => WorkerResponse { index: job.index, result: None, error: Some("candidate panicked".into()) },
         };
-        write_frame(&mut output, &response)
+        write_frame(&mut stream, &response)
             .map_err(|source| BeamWorker::Frame { source, what: "write worker response" })?;
     }
     Ok(())
 }
 
-struct BusyTask {
-    index: usize,
-    started: Instant,
-}
-
-struct SpawnedWorker {
-    child: Child,
-    input: ChildStdin,
-    responses: Receiver<std::io::Result<WorkerResponse>>,
-    reader: Option<JoinHandle<()>>,
-    busy: Option<BusyTask>,
-    tasks: usize,
-    terminated: bool,
-}
-
-impl SpawnedWorker {
-    fn terminate(&mut self) {
-        if self.terminated {
-            return;
-        }
-        self.terminated = true;
-        #[cfg(unix)]
-        unsafe {
-            // The helper owns a process group so an in-flight clang grandchild
-            // cannot survive timeout or worker replacement.
-            libc::kill(-(self.child.id() as libc::pid_t), libc::SIGKILL);
-        }
-        #[cfg(not(unix))]
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
-        }
-    }
-}
-
-impl Drop for SpawnedWorker {
-    fn drop(&mut self) {
-        self.terminate();
-    }
-}
-
-/// Locate the BEAM helper binary.
-///
-/// Only successes are cached: a transient miss — the helper not built yet, a
-/// `SVOD_BEAM_WORKER` pointing at a path that does not exist yet — used to be
-/// latched in a `OnceLock` and fail every later BEAM run in the process.
-fn helper_path() -> Result<PathBuf> {
-    static HELPER: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
-    cached_helper_path(&HELPER, resolve_helper_path)
-}
-
-fn cached_helper_path(
-    cache: &std::sync::Mutex<Option<PathBuf>>,
-    resolve: impl FnOnce() -> Result<PathBuf>,
-) -> Result<PathBuf> {
-    let mut cached = cache.lock().expect("BEAM helper path lock poisoned");
-    if let Some(path) = cached.as_ref() {
-        return Ok(path.clone());
-    }
-    let path = resolve()?;
-    *cached = Some(path.clone());
-    Ok(path)
-}
-
-fn resolve_helper_path() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("SVOD_BEAM_WORKER") {
-        let path = PathBuf::from(path);
-        if path.is_file() {
-            return Ok(path);
-        }
-        return Err(BeamWorker::HelperUnavailable {
-            reason: format!("SVOD_BEAM_WORKER={} is not a file", path.display()),
+/// Everything a worker needs before its first job: the kernel graph and a
+/// codegen identical to the parent's.
+fn worker_setup(init: &WorkerInit) -> Result<(Arc<svod_ir::UOp>, WorkerCodegen)> {
+    if init.protocol_version != BEAM_WORKER_PROTOCOL_VERSION {
+        return Err(BeamWorker::ProtocolMismatch {
+            expected: init.protocol_version,
+            actual: BEAM_WORKER_PROTOCOL_VERSION,
         });
     }
-    // Only set when the *test* harness builds this crate's binaries; a library
-    // consumer never sees it, which is why the workspace build below exists.
-    if let Some(path) = option_env!("CARGO_BIN_EXE_svod-beam-worker") {
-        let path = PathBuf::from(path);
-        if path.is_file() {
-            return Ok(path);
+    let base_ast = init.graph.decode_root().map_err(BeamWorker::at("decode graph"))?;
+    let codegen = worker_codegen(init)?;
+    if codegen.optimizer_renderer.cache_fingerprint() != init.renderer_fingerprint {
+        return Err(BeamWorker::WorkerUnavailable {
+            reason: format!(
+                "renderer identity mismatch: parent={}, worker={}",
+                init.renderer_fingerprint,
+                codegen.optimizer_renderer.cache_fingerprint()
+            ),
+        });
+    }
+    Ok((base_ast, codegen))
+}
+
+/// Compile one candidate on the calling thread, for a process that cannot
+/// start itself as a worker. The compiler processes this thread runs are
+/// killed at the deadline; Rust-side compilation and in-process libLLVM are
+/// not, and a panic is reported like a worker's.
+fn compile_in_process(
+    init: &WorkerInit,
+    base_ast: &Arc<svod_ir::UOp>,
+    codegen: &WorkerCodegen,
+    job: &WorkerJob,
+    timeout: Duration,
+) -> WorkerResponse {
+    let _detached = svod_ir::origin::OriginScope::suspend();
+    let compile = || try_compile(init, base_ast, codegen, job);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if timeout.is_zero() {
+            compile()
+        } else {
+            svod_runtime::clang::with_compile_deadline(Instant::now() + timeout, compile)
+        }
+    }));
+    match result {
+        Ok(Ok(result)) => WorkerResponse { index: job.index, result, error: None },
+        Ok(Err(error)) => WorkerResponse { index: job.index, result: None, error: Some(error.to_string()) },
+        Err(_) => WorkerResponse { index: job.index, result: None, error: Some("candidate panicked".into()) },
+    }
+}
+
+fn warn_in_process() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            "BEAM compiles its candidates in this process: it cannot start itself as a worker, \
+             so a candidate has no hard timeout and its crash would end this process"
+        );
+    });
+}
+
+/// The started workers: one copy of this program per slot, each on its own
+/// socket and in its own process group. Unix only — a process is never
+/// started again anywhere else.
+#[cfg(unix)]
+mod started {
+    use std::path::Path;
+    use std::process::{Child, Command, Stdio};
+    use std::sync::mpsc::{self, Receiver};
+    use std::thread::JoinHandle;
+
+    use super::*;
+
+    /// A worker slot's socket: one file per worker under the temporary directory,
+    /// gone once the slot no longer listens.
+    pub(super) struct WorkerListener {
+        pub(super) listener: std::os::unix::net::UnixListener,
+        pub(super) path: PathBuf,
+    }
+
+    impl Drop for WorkerListener {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
         }
     }
 
-    // Workspace development path. This makes `cargo run -p svod-model
-    // --example ...` self-hosting without requiring a manual helper build.
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let workspace = manifest_dir.parent().ok_or_else(|| BeamWorker::HelperUnavailable {
-        reason: "cannot locate workspace; set SVOD_BEAM_WORKER to an installed svod-beam-worker executable".into(),
-    })?;
-    if !workspace.join("Cargo.toml").is_file() {
-        return Err(BeamWorker::HelperUnavailable {
-            reason: "svod workspace is unavailable; set SVOD_BEAM_WORKER to an installed helper".into(),
-        });
+    pub(super) fn worker_listener() -> std::io::Result<WorkerListener> {
+        use std::os::unix::ffi::OsStrExt;
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "svod-beam-{}-{}.sock",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        // A socket address holds 108 bytes including its terminator.
+        if path.as_os_str().as_bytes().len() >= 108 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} is too long for a socket address", path.display()),
+            ));
+        }
+        let listener = std::os::unix::net::UnixListener::bind(&path)?;
+        Ok(WorkerListener { listener, path })
     }
-    let mut cargo = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
-    cargo.args(["build", "-p", "svod-tensor", "--bin", "svod-beam-worker", "--message-format=json-render-diagnostics"]);
-    if !cfg!(debug_assertions) {
-        cargo.arg("--release");
-    }
-    let output = cargo
-        .current_dir(workspace)
-        .stderr(Stdio::inherit())
-        .output()
-        .map_err(|source| BeamWorker::SpawnHelper { source, path: "cargo build svod-beam-worker".into() })?;
-    if !output.status.success() {
-        return Err(BeamWorker::HelperUnavailable {
-            reason: format!("cargo failed to build svod-beam-worker: {}", output.status),
-        });
-    }
-    // Take the path cargo reports rather than guessing `target/<profile>/`,
-    // which is wrong under `CARGO_TARGET_DIR`, a `--target` triple, or a custom
-    // profile directory.
-    last_executable(&output.stdout).ok_or_else(|| BeamWorker::HelperUnavailable {
-        reason: "cargo built svod-beam-worker but reported no executable artifact; \
-                 set SVOD_BEAM_WORKER to an installed helper"
-            .into(),
-    })
-}
 
-/// The last non-null `executable` in a cargo JSON message stream: the binary
-/// the requested `--bin` target just produced.
-fn last_executable(messages: &[u8]) -> Option<PathBuf> {
-    std::str::from_utf8(messages)
-        .ok()?
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter_map(|message| Some(PathBuf::from(message.get("executable")?.as_str()?)))
-        .next_back()
-}
-
-fn spawn_worker(path: &PathBuf, init: &WorkerInit) -> Result<SpawnedWorker> {
-    let mut command = Command::new(path);
-    command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    let mut child =
-        command.spawn().map_err(|source| BeamWorker::SpawnHelper { source, path: path.display().to_string() })?;
-    let mut input = child
-        .stdin
-        .take()
-        .ok_or_else(|| BeamWorker::HelperUnavailable { reason: "BEAM helper stdin was not piped".into() })?;
-    let mut output = child
-        .stdout
-        .take()
-        .ok_or_else(|| BeamWorker::HelperUnavailable { reason: "BEAM helper stdout was not piped".into() })?;
-    write_frame(&mut input, init).map_err(|source| BeamWorker::Frame { source, what: "initialize BEAM helper" })?;
-    let ready = read_frame::<WorkerReady>(&mut output)
-        .map_err(|source| BeamWorker::Frame { source, what: "read BEAM helper readiness" })?
-        .ok_or_else(|| BeamWorker::HelperUnavailable { reason: "BEAM helper exited during initialization".into() })?;
-    if let Some(error) = ready.error {
-        let _ = child.wait();
-        return Err(BeamWorker::HelperUnavailable { reason: format!("initialization failed: {error}") });
-    }
-    let (send, responses) = mpsc::channel();
-    let reader = std::thread::spawn(move || {
+    /// The worker's connection, or an error once `deadline` passes: the program
+    /// started could be one whose other constructors hang, so the handshake is
+    /// never waited on without a bound.
+    pub(super) fn accept_worker(
+        listener: &std::os::unix::net::UnixListener,
+        deadline: Instant,
+    ) -> std::io::Result<std::os::unix::net::UnixStream> {
+        listener.set_nonblocking(true)?;
         loop {
-            match read_frame::<WorkerResponse>(&mut output) {
-                Ok(Some(response)) => {
-                    if send.send(Ok(response)).is_err() {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false)?;
+                    return Ok(stream);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "the worker did not connect"));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    pub(super) struct BusyTask {
+        pub(super) index: usize,
+        pub(super) started: Instant,
+    }
+
+    struct SpawnedWorker {
+        child: Child,
+        input: std::os::unix::net::UnixStream,
+        responses: Receiver<std::io::Result<WorkerResponse>>,
+        reader: Option<JoinHandle<()>>,
+        busy: Option<BusyTask>,
+        tasks: usize,
+        terminated: bool,
+    }
+
+    impl SpawnedWorker {
+        fn terminate(&mut self) {
+            if self.terminated {
+                return;
+            }
+            self.terminated = true;
+            terminate_group(&mut self.child);
+            if let Some(reader) = self.reader.take() {
+                let _ = reader.join();
+            }
+        }
+    }
+
+    impl Drop for SpawnedWorker {
+        fn drop(&mut self) {
+            self.terminate();
+        }
+    }
+
+    /// Start this program as a worker and hand back its slot: the connection the
+    /// worker made, and its process group, which `terminate` kills. The handshake
+    /// — the connection and the readiness frame — is bounded by `accept_timeout`.
+    fn spawn_worker(exe: &Path, init: &WorkerInit, accept_timeout: Duration) -> Result<SpawnedWorker> {
+        let bound =
+            worker_listener().map_err(|source| BeamWorker::Frame { source, what: "bind the BEAM worker socket" })?;
+        let socket = &bound.path;
+        let mut command = Command::new(exe);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+            command.arg0(std::env::args_os().next().unwrap_or_else(|| exe.as_os_str().to_owned()));
+        }
+        // A worker owns no stdin or stdout: the frames go over the socket, so
+        // nothing the program's other constructors print can land among them.
+        command.env(WORKER_SOCKET_ENV, socket).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::inherit());
+        let mut child =
+            command.spawn().map_err(|source| BeamWorker::SpawnWorker { source, path: exe.display().to_string() })?;
+        let connected = accept_worker(&bound.listener, Instant::now() + accept_timeout);
+        // Connected or not, the slot stops listening here.
+        drop(bound);
+        let handshake = connected
+            .map_err(|source| BeamWorker::Frame { source, what: "accept the BEAM worker's connection" })
+            .and_then(|mut stream| {
+                stream
+                    .set_read_timeout(Some(accept_timeout))
+                    .map_err(|source| BeamWorker::Frame { source, what: "bound the BEAM worker handshake" })?;
+                let ready = write_frame(&mut stream, init)
+                    .map_err(|source| BeamWorker::Frame { source, what: "initialize BEAM worker" })
+                    .and_then(|()| {
+                        read_frame::<WorkerReady>(&mut stream)
+                            .map_err(|source| BeamWorker::Frame { source, what: "read BEAM worker readiness" })?
+                            .ok_or_else(|| BeamWorker::WorkerUnavailable {
+                                reason: "the BEAM worker exited during initialization".into(),
+                            })
+                    });
+                // From here a job is bounded by the parent's own watchdog, and a
+                // read blocks until the worker answers or exits.
+                stream
+                    .set_read_timeout(None)
+                    .map_err(|source| BeamWorker::Frame { source, what: "unbound the BEAM worker socket" })?;
+                ready.map(|ready| (stream, ready))
+            });
+        let (stream, ready) = match handshake {
+            Ok(connected) => connected,
+            Err(error) => {
+                // Started, it is a worker whatever happens next: it must not
+                // outlive a handshake it lost.
+                terminate_group(&mut child);
+                return Err(BeamWorker::WorkerUnavailable { reason: format!("the worker did not start: {error}") });
+            }
+        };
+        if let Some(error) = ready.error {
+            terminate_group(&mut child);
+            return Err(BeamWorker::WorkerUnavailable { reason: format!("initialization failed: {error}") });
+        }
+        let output =
+            stream.try_clone().map_err(|source| BeamWorker::Frame { source, what: "share the BEAM worker socket" })?;
+        let (send, responses) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            loop {
+                match read_frame::<WorkerResponse>(&mut &output) {
+                    Ok(Some(response)) => {
+                        if send.send(Ok(response)).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => {
+                        let _ = send.send(Err(std::io::Error::other("the BEAM worker closed its socket")));
+                        break;
+                    }
+                    Err(error) => {
+                        let _ = send.send(Err(error));
                         break;
                     }
                 }
-                Ok(None) => {
-                    let _ = send.send(Err(std::io::Error::other("BEAM helper stdout closed")));
-                    break;
-                }
-                Err(error) => {
-                    let _ = send.send(Err(error));
-                    break;
-                }
             }
-        }
-    });
-    Ok(SpawnedWorker { child, input, responses, reader: Some(reader), busy: None, tasks: 0, terminated: false })
-}
-
-pub struct WorkerPool {
-    path: PathBuf,
-    init: WorkerInit,
-    workers: Vec<SpawnedWorker>,
-    max_tasks_per_child: usize,
-    timeout: Duration,
-}
-
-impl WorkerPool {
-    pub fn new(count: usize, init: WorkerInit) -> Result<Self> {
-        #[cfg(not(unix))]
-        return Err(BeamWorker::HelperUnavailable {
-            reason: "clean BEAM timeout containment requires Unix process groups; \
-                     no safe helper backend is installed"
-                .into(),
         });
-        let path = helper_path()?;
-        let mut workers = Vec::with_capacity(count.max(1));
-        for _ in 0..count.max(1) {
-            workers.push(spawn_worker(&path, &init)?);
-        }
-        Ok(Self {
-            path,
-            max_tasks_per_child: init.beam.max_tasks_per_child.max(1),
-            timeout: Duration::from_secs(init.beam.compile_timeout_secs),
-            init,
-            workers,
+        Ok(SpawnedWorker {
+            child,
+            input: stream,
+            responses,
+            reader: Some(reader),
+            busy: None,
+            tasks: 0,
+            terminated: false,
         })
     }
 
-    fn replace(&mut self, slot: usize) -> Result<()> {
-        let mut old = self.workers.swap_remove(slot);
-        old.terminate();
-        self.workers.push(spawn_worker(&self.path, &self.init)?);
-        Ok(())
+    /// Kill a started worker's process group and reap it.
+    fn terminate_group(child: &mut Child) {
+        // SAFETY: a signal to the group the worker was started in, which is not
+        // reaped yet: an in-flight clang grandchild cannot survive a lost
+        // handshake or worker replacement.
+        unsafe {
+            libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+        }
+        let _ = child.wait();
     }
 
-    pub fn run(&mut self, candidates: &[Vec<Opt>], mut completed: impl FnMut(WorkerResponse)) -> Result<()> {
-        let mut next = 0usize;
-        let mut finished = 0usize;
-        while finished < candidates.len() {
-            for worker in &mut self.workers {
-                if worker.busy.is_none() && next < candidates.len() {
-                    let job = WorkerJob { index: next, opts: candidates[next].clone() };
-                    write_frame(&mut worker.input, &job)
-                        .map_err(|source| BeamWorker::Frame { source, what: "send candidate to BEAM helper" })?;
-                    worker.busy = Some(BusyTask { index: next, started: Instant::now() });
-                    worker.tasks += 1;
-                    next += 1;
-                }
-            }
+    /// The slots of one pool.
+    pub(super) struct Pool {
+        init: WorkerInit,
+        exe: PathBuf,
+        workers: Vec<SpawnedWorker>,
+        max_tasks_per_child: usize,
+        timeout: Duration,
+        /// The bound on a worker's handshake, as on its jobs.
+        accept_timeout: Duration,
+    }
 
-            let mut progress = false;
-            let mut slot = 0usize;
-            while slot < self.workers.len() {
-                match poll_slot(&self.workers[slot].responses, self.workers[slot].busy.as_ref(), self.timeout) {
-                    SlotOutcome::Response(response) => {
-                        let task = self.workers[slot]
-                            .busy
-                            .take()
-                            .ok_or(BeamWorker::WorkerMisorder { got: response.index, expected: None })?;
-                        if response.index != task.index {
-                            return Err(BeamWorker::WorkerMisorder { got: response.index, expected: Some(task.index) });
+    impl Pool {
+        pub(super) fn new(count: usize, init: WorkerInit, exe: PathBuf, timeout: Duration) -> Result<Self> {
+            let mut workers = Vec::with_capacity(count.max(1));
+            for _ in 0..count.max(1) {
+                // Should a later one fail to start, the ones already started
+                // are dropped, and so terminated, on the way out.
+                workers.push(spawn_worker(&exe, &init, accept_timeout_of(timeout))?);
+            }
+            Ok(Self {
+                max_tasks_per_child: init.beam.max_tasks_per_child.max(1),
+                accept_timeout: accept_timeout_of(timeout),
+                timeout,
+                workers,
+                init,
+                exe,
+            })
+        }
+
+        fn replace(&mut self, slot: usize) -> Result<()> {
+            let mut old = self.workers.swap_remove(slot);
+            old.terminate();
+            let spawned = spawn_worker(&self.exe, &self.init, self.accept_timeout);
+            self.workers.push(spawned?);
+            Ok(())
+        }
+
+        pub(super) fn run(&mut self, candidates: &[Vec<Opt>], mut completed: impl FnMut(WorkerResponse)) -> Result<()> {
+            let mut next = 0usize;
+            let mut finished = 0usize;
+            while finished < candidates.len() {
+                for worker in &mut self.workers {
+                    if worker.busy.is_none() && next < candidates.len() {
+                        let job = WorkerJob { index: next, opts: candidates[next].clone() };
+                        write_frame(&mut worker.input, &job)
+                            .map_err(|source| BeamWorker::Frame { source, what: "send candidate to BEAM worker" })?;
+                        worker.busy = Some(BusyTask { index: next, started: Instant::now() });
+                        worker.tasks += 1;
+                        next += 1;
+                    }
+                }
+
+                let mut progress = false;
+                let mut slot = 0usize;
+                while slot < self.workers.len() {
+                    match poll_slot(&self.workers[slot].responses, self.workers[slot].busy.as_ref(), self.timeout) {
+                        SlotOutcome::Response(response) => {
+                            let task = self.workers[slot]
+                                .busy
+                                .take()
+                                .ok_or(BeamWorker::WorkerMisorder { got: response.index, expected: None })?;
+                            if response.index != task.index {
+                                return Err(BeamWorker::WorkerMisorder {
+                                    got: response.index,
+                                    expected: Some(task.index),
+                                });
+                            }
+                            finished += 1;
+                            progress = true;
+                            completed(*response);
+                            if self.workers[slot].tasks >= self.max_tasks_per_child {
+                                self.replace(slot)?;
+                                continue;
+                            }
                         }
-                        finished += 1;
-                        progress = true;
-                        completed(*response);
-                        if self.workers[slot].tasks >= self.max_tasks_per_child {
+                        SlotOutcome::Failed(error) => {
+                            let failed = self.workers[slot].busy.take();
+                            if failed.is_some() {
+                                finished += 1;
+                            }
+                            progress = true;
+                            self.replace(slot)?;
+                            if let Some(error) = error
+                                && std::env::var_os("BEAM_DEBUG").is_some()
+                            {
+                                eprintln!("[BEAM drop] worker_io: {error}");
+                            }
+                            continue;
+                        }
+                        SlotOutcome::TimedOut => {
+                            let task = self.workers[slot].busy.take().expect("timeout implies a busy task");
+                            finished += 1;
+                            progress = true;
+                            if std::env::var_os("BEAM_DEBUG").is_some() {
+                                eprintln!("[BEAM drop] worker_timeout candidate={}", task.index);
+                            }
                             self.replace(slot)?;
                             continue;
                         }
+                        SlotOutcome::Idle => {}
                     }
-                    SlotOutcome::Failed(error) => {
-                        let failed = self.workers[slot].busy.take();
-                        if failed.is_some() {
-                            finished += 1;
-                        }
-                        progress = true;
-                        self.replace(slot)?;
-                        if let Some(error) = error
-                            && std::env::var_os("BEAM_DEBUG").is_some()
-                        {
-                            eprintln!("[BEAM drop] worker_io: {error}");
-                        }
-                        continue;
-                    }
-                    SlotOutcome::TimedOut => {
-                        let task = self.workers[slot].busy.take().expect("timeout implies a busy task");
-                        finished += 1;
-                        progress = true;
-                        if std::env::var_os("BEAM_DEBUG").is_some() {
-                            eprintln!("[BEAM drop] worker_timeout candidate={}", task.index);
-                        }
-                        self.replace(slot)?;
-                        continue;
-                    }
-                    SlotOutcome::Idle => {}
+                    slot += 1;
                 }
-                slot += 1;
+                if !progress {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
             }
-            if !progress {
-                std::thread::sleep(Duration::from_millis(1));
-            }
+            Ok(())
         }
-        Ok(())
+    }
+
+    /// What one poll of a worker slot found.
+    pub(super) enum SlotOutcome {
+        Response(Box<WorkerResponse>),
+        /// The worker's socket errored or closed; `None` for a disconnected channel.
+        Failed(Option<std::io::Error>),
+        TimedOut,
+        Idle,
+    }
+
+    /// Drain the worker's channel first and only call it late when the channel is
+    /// empty.
+    ///
+    /// Checking the deadline first raced the reader thread: a response written
+    /// exactly on the deadline was already queued, but the slot was declared timed
+    /// out, the candidate was dropped, and a healthy worker was SIGKILLed and
+    /// respawned.
+    pub(super) fn poll_slot(
+        responses: &Receiver<std::io::Result<WorkerResponse>>,
+        busy: Option<&BusyTask>,
+        timeout: Duration,
+    ) -> SlotOutcome {
+        match responses.try_recv() {
+            Ok(Ok(response)) => SlotOutcome::Response(Box::new(response)),
+            Ok(Err(error)) => SlotOutcome::Failed(Some(error)),
+            Err(mpsc::TryRecvError::Disconnected) => SlotOutcome::Failed(None),
+            Err(mpsc::TryRecvError::Empty) => match busy {
+                Some(task) if !timeout.is_zero() && task.started.elapsed() >= timeout => SlotOutcome::TimedOut,
+                _ => SlotOutcome::Idle,
+            },
+        }
+    }
+
+    /// A job with no timeout still cannot wait on a handshake forever.
+    fn accept_timeout_of(timeout: Duration) -> Duration {
+        if timeout.is_zero() { Duration::from_secs(60) } else { timeout }
     }
 }
 
-/// What one poll of a worker slot found.
-enum SlotOutcome {
-    Response(Box<WorkerResponse>),
-    /// The helper's stdout errored or closed; `None` for a disconnected channel.
-    Failed(Option<std::io::Error>),
-    TimedOut,
-    Idle,
+/// How the pool's candidates are compiled.
+enum Backend {
+    /// One started copy of this program per slot.
+    #[cfg(unix)]
+    Started(Box<started::Pool>),
+    /// On the calling thread, in this process.
+    InProcess { base_ast: Arc<svod_ir::UOp>, codegen: Box<WorkerCodegen>, timeout: Duration },
 }
 
-/// Drain the worker's channel first and only call it late when the channel is
-/// empty.
-///
-/// Checking the deadline first raced the reader thread: a response written
-/// exactly on the deadline was already queued, but the slot was declared timed
-/// out, the candidate was dropped, and a healthy helper was SIGKILLed and
-/// respawned.
-fn poll_slot(
-    responses: &Receiver<std::io::Result<WorkerResponse>>,
-    busy: Option<&BusyTask>,
-    timeout: Duration,
-) -> SlotOutcome {
-    match responses.try_recv() {
-        Ok(Ok(response)) => SlotOutcome::Response(Box::new(response)),
-        Ok(Err(error)) => SlotOutcome::Failed(Some(error)),
-        Err(mpsc::TryRecvError::Disconnected) => SlotOutcome::Failed(None),
-        Err(mpsc::TryRecvError::Empty) => match busy {
-            Some(task) if !timeout.is_zero() && task.started.elapsed() >= timeout => SlotOutcome::TimedOut,
-            _ => SlotOutcome::Idle,
-        },
+pub struct WorkerPool {
+    /// What a candidate is compiled with; every worker was given the same.
+    init: WorkerInit,
+    backend: Backend,
+}
+
+impl WorkerPool {
+    /// A pool of `count` workers, or of none when this process cannot start
+    /// itself as one: then every candidate is compiled on the calling thread,
+    /// without a worker's hard timeout and isolation.
+    pub fn new(count: usize, init: WorkerInit) -> Result<Self> {
+        let timeout = Duration::from_secs(init.beam.compile_timeout_secs);
+        // Only a program whose worker constructor ran is started again: any
+        // other would run its own `main` in the child's place.
+        #[cfg(unix)]
+        if worker_entry_armed() {
+            return Self::started(count, init, timeout);
+        }
+        Self::in_process(init, timeout)
+    }
+
+    /// `count` started copies of this program, each serving one slot.
+    #[cfg(unix)]
+    fn started(count: usize, init: WorkerInit, timeout: Duration) -> Result<Self> {
+        let exe = self_executable()?;
+        Ok(Self { backend: Backend::Started(Box::new(started::Pool::new(count, init.clone(), exe, timeout)?)), init })
+    }
+
+    /// Every candidate compiled on the calling thread: for a process that
+    /// cannot start itself as a worker.
+    pub(crate) fn in_process(init: WorkerInit, timeout: Duration) -> Result<Self> {
+        // Said once per process: a search per kernel would repeat it.
+        warn_in_process();
+        let (base_ast, codegen) = worker_setup(&init)?;
+        Ok(Self { backend: Backend::InProcess { base_ast, codegen: Box::new(codegen), timeout }, init })
+    }
+
+    pub fn run(&mut self, candidates: &[Vec<Opt>], mut completed: impl FnMut(WorkerResponse)) -> Result<()> {
+        match &mut self.backend {
+            #[cfg(unix)]
+            Backend::Started(pool) => pool.run(candidates, completed),
+            Backend::InProcess { base_ast, codegen, timeout } => {
+                for (index, opts) in candidates.iter().enumerate() {
+                    let job = WorkerJob { index, opts: opts.clone() };
+                    completed(compile_in_process(&self.init, base_ast, codegen, &job, *timeout));
+                }
+                Ok(())
+            }
+        }
     }
 }
 

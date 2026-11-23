@@ -1949,11 +1949,12 @@ fn beam_search_optimize(
     let beam_debug = std::env::var("BEAM_DEBUG").ok().and_then(|value| value.parse::<u8>().ok()).unwrap_or(0);
     if beam_debug > 0 {
         eprintln!(
-            "[beam] start device={} width={} parallel={} spawn_workers={} max_tasks_per_child={} timeout={}s",
+            "[beam] start device={} width={} parallel={} spawn_workers={} workers={} max_tasks_per_child={} timeout={}s",
             device.device.canonicalize(),
             beam_config.beam_width,
             beam_config.compile_workers,
             beam_config.compile_workers.max(1),
+            if crate::beam_worker::worker_entry_armed() { "processes" } else { "in-process" },
             beam_config.max_tasks_per_child,
             beam_config.compile_timeout_secs
         );

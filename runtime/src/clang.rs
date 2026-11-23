@@ -141,25 +141,8 @@ pub fn with_compile_deadline<R>(deadline: Instant, f: impl FnOnce() -> R) -> R {
 /// names the tool in both). Under a [`with_compile_deadline`] the process
 /// is killed at the deadline.
 pub(crate) fn run_piped(mut command: Command, input: &[u8], what: &str) -> Result<Vec<u8>> {
-    // Its own process group, so a kill at the deadline reaches the tools
-    // the driver runs (the linker), which would hold the pipes open.
-    #[cfg(unix)]
-    if DEADLINE.get().is_some() {
-        std::os::unix::process::CommandExt::process_group(&mut command, 0);
-    }
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .jit("spawn the compiler")?;
-    let output = match DEADLINE.get() {
-        Some(deadline) => wait_until(child, input, deadline, what)?,
-        None => {
-            child.stdin.take().expect("stdin piped").write_all(input).jit("write the compiler's stdin")?;
-            child.wait_with_output().jit("wait for the compiler")?
-        }
-    };
+    let child = spawn_compiler(&mut command, "spawn the compiler")?;
+    let output = wait_compiler(child, input, what)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(Error::JitCompilation { reason: format!("{what} failed:\n{stderr}") });
@@ -168,6 +151,31 @@ pub(crate) fn run_piped(mut command: Command, input: &[u8], what: &str) -> Resul
         return Err(Error::JitCompilation { reason: format!("{what} produced empty output") });
     }
     Ok(output.stdout)
+}
+
+/// A compiler process with its input, output and error piped. Under a
+/// [`with_compile_deadline`] it is its own process group, so a kill at the
+/// deadline reaches the tools the driver runs (the linker), which would hold
+/// the pipes open.
+fn spawn_compiler(command: &mut Command, what: &'static str) -> Result<std::process::Child> {
+    #[cfg(unix)]
+    if DEADLINE.get().is_some() {
+        std::os::unix::process::CommandExt::process_group(command, 0);
+    }
+    command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().jit(what)
+}
+
+/// A compiler's output once it exits, `input` written and its pipes drained
+/// meanwhile. Under a [`with_compile_deadline`] on this thread the process is
+/// killed there and its compile fails ([`wait_until`]).
+pub(crate) fn wait_compiler(mut child: std::process::Child, input: &[u8], what: &str) -> Result<std::process::Output> {
+    match DEADLINE.get() {
+        Some(deadline) => wait_until(child, input, deadline, what),
+        None => {
+            child.stdin.take().expect("stdin piped").write_all(input).jit("write the compiler's stdin")?;
+            child.wait_with_output().jit("wait for the compiler")
+        }
+    }
 }
 
 /// `child`'s output once it exits, `input` written and its pipes drained
@@ -180,10 +188,14 @@ fn wait_until(
 ) -> Result<std::process::Output> {
     let (mut stdin, stdout, stderr) = (child.stdin.take(), child.stdout.take(), child.stderr.take());
     std::thread::scope(|s| {
+        // A stream the caller did not pipe has nothing to drain: a compile
+        // writing its object to a file pipes no stdout.
         let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
             s.spawn(move || {
                 let mut bytes = vec![];
-                let _ = pipe.expect("piped").read_to_end(&mut bytes);
+                if let Some(mut pipe) = pipe {
+                    let _ = pipe.read_to_end(&mut bytes);
+                }
                 bytes
             })
         };
@@ -362,16 +374,8 @@ pub(crate) fn c_object_flags() -> Vec<String> {
 pub(crate) fn compile_c_object(toolchain: &ClangToolchain, src: &str, flags: &[String]) -> Result<Vec<u8>> {
     #[cfg(not(feature = "dlopen-fallback"))]
     {
-        let mut child = toolchain
-            .command()
-            .args(flags)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .jit("spawn clang (is clang installed?)")?;
-        child.stdin.take().expect("stdin was piped").write_all(src.as_bytes()).jit("write source to clang stdin")?;
-        let output = child.wait_with_output().jit("wait for clang")?;
+        let child = spawn_compiler(toolchain.command().args(flags), "spawn clang (is clang installed?)")?;
+        let output = wait_compiler(child, src.as_bytes(), "clang compilation")?;
         if !output.status.success() {
             return Err(Error::JitCompilation {
                 reason: format!(
@@ -391,15 +395,23 @@ pub(crate) fn compile_c_object(toolchain: &ClangToolchain, src: &str, flags: &[S
         let output_path = directory.path().join("kernel.so");
         let mut args = flags.to_vec();
         *args.last_mut().expect("C flags have output placeholder") = output_path.display().to_string();
-        let mut child = toolchain
-            .command()
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = toolchain.command();
+            if DEADLINE.get().is_some() {
+                std::os::unix::process::CommandExt::process_group(&mut command, 0);
+            }
+            command
+        };
+        #[cfg(not(unix))]
+        let mut command = toolchain.command();
+        let child = command
             .args(&args)
             .stdin(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .jit("spawn clang shared-object compiler")?;
-        child.stdin.take().expect("stdin was piped").write_all(src.as_bytes()).jit("write source to clang stdin")?;
-        let output = child.wait_with_output().jit("wait for clang shared-object compiler")?;
+        let output = wait_compiler(child, src.as_bytes(), "clang shared-object compilation")?;
         if !output.status.success() {
             return Err(Error::JitCompilation {
                 reason: format!("clang shared-object compilation failed:\n{}", String::from_utf8_lossy(&output.stderr)),

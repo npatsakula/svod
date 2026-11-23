@@ -9,7 +9,6 @@ use tracing::debug;
 
 use crate::Result;
 use crate::dispatch::KernelCif;
-use crate::error::JitResultExt;
 
 /// LLVM JIT-compiled kernel using external clang + mmap ELF loader.
 pub struct LlvmKernel {
@@ -221,32 +220,9 @@ pub(crate) fn compile_ir_to_object_with(
     ir: &str,
     args: &[String],
 ) -> Result<Vec<u8>> {
-    use std::io::Write;
-    use std::process::Stdio;
-
-    let mut child = toolchain
-        .command()
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .jit("spawn clang for IR (is clang installed?)")?;
-
-    child.stdin.take().expect("stdin was piped").write_all(ir.as_bytes()).jit("write IR to clang stdin")?;
-
-    let output = child.wait_with_output().jit("wait for clang (IR)")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(crate::Error::JitCompilation { reason: format!("clang IR compilation failed:\n{stderr}") });
-    }
-
-    if output.stdout.is_empty() {
-        return Err(crate::Error::JitCompilation { reason: "clang produced empty output from IR".to_string() });
-    }
-
-    Ok(output.stdout)
+    // Through the deadline-aware run: under `with_compile_deadline` a
+    // candidate's compile is killed there instead of outlasting it.
+    toolchain.compile_ir(args, ir, "IR")
 }
 
 /// Run the same `-O2` LLVM pass pipeline as the JIT compile but emit
